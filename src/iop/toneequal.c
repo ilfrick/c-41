@@ -116,6 +116,7 @@
 #include "gui/presets.h"
 #include "gui/color_picker_proxy.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 #include "iop/choleski.h"
 #include "common/iop_group.h"
 
@@ -786,18 +787,11 @@ static inline void apply_toneequalizer(const float *const restrict in,
   const float* restrict lut = d->correction_lut;
   const float lutres = LUT_RESOLUTION;
 
-  DT_OMP_FOR()
-  for(size_t k = 0; k < npixels; k++)
-  {
-    // The radial-basis interpolation is valid in [-8; 0] EV and can quickly diverge outside.
-    // Note: not doing an explicit lut[index] check is safe as long we take care of proper
-    // DT_TONEEQ_MIN_EV and DT_TONEEQ_MAX_EV and allocated lut size LUT_RESOLUTION+1
-    const float exposure = fast_clamp(log2f(luminance[k]), DT_TONEEQ_MIN_EV, DT_TONEEQ_MAX_EV);
-    const float correction = lut[(unsigned)roundf((exposure - DT_TONEEQ_MIN_EV) * lutres)];
-    // apply correction
-    for_each_channel(c)
-      out[4 * k + c] = correction * in[4 * k + c];
-  }
+  const size_t lut_len = (size_t)PIXEL_CHAN * (size_t)LUT_RESOLUTION + 1;
+  darkroom_toneequal_apply_lut(in, luminance, out, npixels,
+                                lut, lut_len,
+                                DT_TONEEQ_MIN_EV, DT_TONEEQ_MAX_EV,
+                                (float)LUT_RESOLUTION);
 }
 
 #else
@@ -964,26 +958,10 @@ static inline void display_luminance_mask(const float *const restrict in,
     ? roi_out->height
     : roi_in->height;
 
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0 ; i < out_height; ++i)
-    for(size_t j = 0; j < out_width; ++j)
-    {
-      // normalize the mask intensity between -8 EV and 0 EV for clarity,
-      // and add a "gamma" 2.0 for better legibility in shadows
-      const float intensity =
-        sqrtf(fminf(
-                fmaxf(luminance[(i + offset_y) * in_width  + (j + offset_x)] - 0.00390625f,
-                      0.f) / 0.99609375f,
-                1.f));
-      const size_t index = (i * out_width + j) * 4;
-      // set gray level for the mask
-      for_each_channel(c,aligned(out))
-      {
-        out[index + c] = intensity;
-      }
-      // copy alpha channel
-      out[index + 3] = in[((i + offset_y) * in_width + (j + offset_x)) * 4 + 3];
-    }
+  darkroom_toneequal_mask_display(in, luminance, out,
+                                   out_width, out_height,
+                                   in_width, (size_t)roi_in->height,
+                                   offset_x, offset_y);
 }
 
 
@@ -1228,18 +1206,9 @@ static void compute_correction_lut(float* restrict lut,
   const float gauss_denom = gaussian_denom(sigma);
   assert(PIXEL_CHAN == 8);
 
-  DT_OMP_FOR(shared(centers_ops))
-  for(int j = 0; j <= LUT_RESOLUTION * PIXEL_CHAN; j++)
-  {
-    // build the correction for each pixel
-    // as the sum of the contribution of each luminance channelcorrection
-    const float exposure = (float)j / (float)LUT_RESOLUTION + DT_TONEEQ_MIN_EV;
-    float result = 0.0f;
-    for(int i = 0; i < PIXEL_CHAN; i++)
-      result += gaussian_func(exposure - centers_ops[i], gauss_denom) * factors[i];
-    // the user-set correction is expected in [-2;+2] EV, so is the interpolated one
-    lut[j] = fast_clamp(result, 0.25f, 4.0f);
-  }
+  darkroom_toneequal_build_lut(lut, factors, centers_ops,
+                               (size_t)PIXEL_CHAN, (size_t)LUT_RESOLUTION,
+                               sigma, DT_TONEEQ_MIN_EV);
 }
 
 static void get_channels_gains(float factors[CHANNELS],

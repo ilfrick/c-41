@@ -1347,6 +1347,52 @@ void darkroom_colorequal_apply_prefilter(float *uv_buf,
                                          size_t satsize);
 
 /*
+ * Toneequal IOP — LUT-based correction apply.
+ * For each pixel: correction = lut[round((clamp(log2(lum), min_ev, max_ev) - min_ev) * lut_res)]
+ * All 4 channels multiplied by correction. lut_len = pixel_chan * lut_resolution + 1.
+ * Matches apply_toneequalizer() DT_OMP_FOR (toneequal.c:789).
+ */
+void darkroom_toneequal_apply_lut(const float *in_buf,
+                                   const float *luminance,
+                                   float *out_buf,
+                                   size_t npixels,
+                                   const float *lut,
+                                   size_t lut_len,
+                                   float min_ev,
+                                   float max_ev,
+                                   float lut_resolution);
+
+/*
+ * Toneequal IOP — build the correction LUT from Gaussian RBF.
+ * lut[j] = clamp(Σ_i exp(-(j/res+min_ev - centers[i])² / (2σ²)) * factors[i], 0.25, 4)
+ * Matches build_correction_lut() DT_OMP_FOR (toneequal.c:1231).
+ */
+void darkroom_toneequal_build_lut(float *lut,
+                                   const float *factors,
+                                   const float *centers,
+                                   size_t pixel_chan,
+                                   size_t lut_resolution,
+                                   float sigma,
+                                   float min_ev);
+
+/*
+ * Toneequal IOP — luminance mask display overlay.
+ * intensity = sqrt(clamp((lum - 1/256) / (1 - 1/256), 0, 1))
+ * All 4 out channels written to intensity; alpha overwritten from in.
+ * in_height is the full input-buffer height (needed for safe bounds).
+ * Matches the mask-display DT_OMP_FOR(collapse(2)) (toneequal.c:967).
+ */
+void darkroom_toneequal_mask_display(const float *in_buf,
+                                     const float *luminance,
+                                     float *out_buf,
+                                     size_t out_width,
+                                     size_t out_height,
+                                     size_t in_width,
+                                     size_t in_height,
+                                     size_t offset_x,
+                                     size_t offset_y);
+
+/*
  * CLAHE (Contrast-Limited Adaptive Histogram Equalisation).
  * Two-pass algorithm: builds a per-pixel luminance map = (max(RGB)+min(RGB))/2,
  * then for each row maintains a sliding (2*rad+1)^2 histogram of luminance

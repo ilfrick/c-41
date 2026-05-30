@@ -1106,6 +1106,7 @@ if(CARGO)
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/rawdenoise.rs"
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colormapping.rs"
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorequal.rs"
+            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/toneequal.rs"
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/math.rs"
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/raw.rs"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
