@@ -1412,6 +1412,32 @@ void darkroom_useless_process(const float *in_buf,
                                int checker_scale,
                                float factor);
 
+/* Gamma IOP — copy float RGBA to uint8 BGR (no sRGB gamma, just clamp/round).
+ * buffsize = width*height*4 (f32 element count = u8 byte count for 4-ch RGBA).
+ * Matches _copy_output() in src/iop/gamma.c:269. */
+void darkroom_gamma_copy_output(const float *in_buf, unsigned char *out_buf,
+                                 size_t buffsize);
+
+/* Gamma IOP — monochrome channel display with sRGB gamma + yellow mask overlay.
+ * Uses in[j+1] (second channel) as grey value. */
+void darkroom_gamma_display_monochrome(const float *in_buf, unsigned char *out_buf,
+                                        size_t buffsize, float alpha);
+
+/* Gamma IOP — false-colour single-channel display.
+ * mode 0=R, 1=G, 2=B, 3=saturation.
+ * Applies sRGB gamma + yellow MASK_COLOR blend. */
+void darkroom_gamma_display_false_color_simple(const float *in_buf,
+                                               unsigned char *out_buf,
+                                               size_t buffsize,
+                                               float alpha,
+                                               unsigned int mode);
+
+/* Gamma IOP — luminance mask overlay with configurable grey mix.
+ * mix = dt_conf_get_float("darkroom/ui/develop_mask_mix").
+ * interpolatef(mix, in[j+3], luma) = mix*(alpha - luma) + luma. */
+void darkroom_gamma_mask_display(const float *in_buf, unsigned char *out_buf,
+                                  size_t buffsize, float alpha, float mix);
+
 /*
  * CLAHE (Contrast-Limited Adaptive Histogram Equalisation).
  * Two-pass algorithm: builds a per-pixel luminance map = (max(RGB)+min(RGB))/2,

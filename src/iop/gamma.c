@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "common/colorspaces_inline_conversions.h"
+#include "rust_ffi/darkroom_core.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "gui/accelerators.h"
@@ -111,12 +112,7 @@ static void _channel_display_monochrome(const float *const restrict in,
   // yellow; "unused" element enables vectorization
   const dt_aligned_pixel_t mask_color = { 1.0f, 1.0f, 0.0f };
 
-  DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-  for(size_t j = 0; j < buffsize; j += 4)
-  {
-    dt_aligned_pixel_t pixel = { in[j + 1], in[j + 1], in[j + 1], in[j + 1] };
-    _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-  }
+  darkroom_gamma_display_monochrome(in, out, buffsize, alpha);
 }
 
 DT_OMP_DECLARE_SIMD(aligned(in, out: 64) uniform(buffsize, alpha, channel))
@@ -161,38 +157,18 @@ static void _channel_display_false_color(const float *const restrict in,
       }
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_R:
-      DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        const dt_aligned_pixel_t pixel = { in[j + 1], 0.0f, 0.0f, 0.0f };
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_false_color_simple(in, out, buffsize, alpha, 0);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_G:
-      DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        const dt_aligned_pixel_t pixel = { 0.0f, in[j + 1], 0.0f, 0.0f };
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_false_color_simple(in, out, buffsize, alpha, 1);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_B:
-      DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        const dt_aligned_pixel_t pixel = { 0.0f, 0.0f, in[j + 1], 0.0f };
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_false_color_simple(in, out, buffsize, alpha, 2);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_LCH_C:
     case DT_DEV_PIXELPIPE_DISPLAY_HSL_S:
     case DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Cz:
-      DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        const dt_aligned_pixel_t pixel = { 0.5f, 0.5f * (1.0f - in[j + 1]), 0.5f, 0.0f };
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_false_color_simple(in, out, buffsize, alpha, 3);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_LCH_h:
       DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
@@ -252,13 +228,7 @@ static void _mask_display(const float *const restrict in,
   // yellow, "unused" element aids vectorization
   const dt_aligned_pixel_t mask_color = { 1.0f, 1.0f, 0.0f };
   const float mix = CLIP(dt_conf_get_float("darkroom/ui/develop_mask_mix"));
-  DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-  for(size_t j = 0; j < buffsize; j+= 4)
-  {
-    const float gray = interpolatef(mix, in[j + 3], 0.3f * in[j + 0] + 0.59f * in[j + 1] + 0.11f * in[j + 2]);
-    const dt_aligned_pixel_t pixel = { gray, gray, gray, gray };
-    _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-  }
+  darkroom_gamma_mask_display(in, out, buffsize, alpha, mix);
 }
 
 DT_OMP_DECLARE_SIMD(aligned(in, out: 64) uniform(buffsize))
@@ -266,15 +236,7 @@ static void _copy_output(const float *const restrict in,
                          uint8_t *const restrict out,
                          const size_t buffsize)
 {
-  DT_OMP_FOR_SIMD(aligned(in, out: 64))
-  for(size_t j = 0; j < buffsize; j += 4)
-  {
-    // the output of this module is BGR(A) instead of RGBA, so we can't use for_each_channel
-    for(size_t c = 0; c < 3; c++)
-    {
-      out[j + 2 - c] = (uint8_t)(fminf(roundf(255.0f * fmaxf(in[j + c], 0.0f)), 255.0f));
-    }
-  }
+  darkroom_gamma_copy_output(in, out, buffsize);
 }
 
 
