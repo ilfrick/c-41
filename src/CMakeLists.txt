@@ -1110,6 +1110,7 @@ if(CARGO)
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/useless.rs"
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/gamma.rs"
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/blurs.rs"
+            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/filmicrgb.rs"
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/math.rs"
             "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/raw.rs"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"

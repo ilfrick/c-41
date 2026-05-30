@@ -69,6 +69,7 @@ pub mod toneequal;
 pub mod useless;
 pub mod gamma;
 pub mod blurs;
+pub mod filmicrgb;
 
 use crate::{params::IopParams, roi::RoiIn, Result};
 

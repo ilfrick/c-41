@@ -1459,6 +1459,28 @@ void darkroom_blurs_sparse_convolve(const float *in_buf, float *out_buf,
                                      size_t n_nonzero,
                                      const float *kernel);
 
+/* Filmicrgb IOP — build highlight reconstruction mask.
+ * weight = clamp(1/(1+2^(-pix_max*normalize+feathering)), 0, 1)
+ * Returns count of pixels where argument < 4 (non-negligible transition).
+ * Matches reconstruct_highlights_build_mask() in filmicrgb.c:1050. */
+int darkroom_filmicrgb_build_reconstruction_mask(const float *in_buf,
+                                                  float *mask_buf,
+                                                  size_t npixels,
+                                                  float normalize,
+                                                  float feathering);
+
+/* Filmicrgb IOP — broadcast scalar mask to all 4 output channels.
+ * Matches display_mask() in filmicrgb.c:2012. */
+void darkroom_filmicrgb_display_mask(const float *mask_buf, float *out_buf,
+                                      size_t npixels);
+
+/* Filmicrgb IOP — restore pixels from ratio/norm decomposition.
+ * ratios[k*4+c] = clamp(ratios[k*4+c], 0, 1) * norms[k]
+ * Matches restore_ratios() in filmicrgb.c:2051. */
+void darkroom_filmicrgb_restore_ratios(float *ratios_buf,
+                                        const float *norms_buf,
+                                        size_t npixels);
+
 /*
  * CLAHE (Contrast-Limited Adaptive Histogram Equalisation).
  * Two-pass algorithm: builds a per-pixel luminance map = (max(RGB)+min(RGB))/2,

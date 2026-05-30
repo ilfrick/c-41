@@ -35,6 +35,7 @@
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "rust_ffi/darkroom_core.h"
 #include "develop/imageop_gui.h"
 #include "develop/imageop_math.h"
 #include "develop/noise_generator.h"
@@ -1047,20 +1048,9 @@ static inline gint mask_clipped_pixels(const float *const restrict in, float *co
   int clipped = 0;
   const unsigned int oldMode = dt_mm_enable_flush_zero();
 
-  DT_OMP_FOR(reduction(+:clipped))
-  for(size_t k = 0; k < 4 * height * width; k += 4)
-  {
-    const float pix_max = sqrtf(sqf(in[k]) + sqf(in[k + 1]) + sqf(in[k + 2]));
-    const float argument = -pix_max * normalize + feathering;
-    const float weight = clamp_simd(1.0f / (1.0f + exp2f(argument)));
-    mask[k / 4] = weight;
-
-    // at x = 4, the sigmoid produces opacity = 5.882 %.
-    // any x > 4 will produce negligible changes over the image,
-    // especially since we have reduced visual sensitivity in highlights.
-    // so we discard pixels for argument > 4. for they are not worth computing.
-    clipped += (4.f > argument);
-  }
+  clipped = darkroom_filmicrgb_build_reconstruction_mask(in, mask,
+                                                         (size_t)height * width,
+                                                         normalize, feathering);
   dt_mm_restore_flush_zero(oldMode);
 
   // If clipped area is < 9 pixels, recovery is not worth the computational cost, so skip it.
@@ -2009,15 +1999,7 @@ static inline void display_mask(const float *const restrict mask,
                                 const size_t width,
                                 const size_t height)
 {
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width; k++)
-  {
-    dt_aligned_pixel_t pix;
-    for_each_channel(c,aligned(out))
-      pix[c] = mask[k];
-    copy_pixel_nontemporal(out + 4*k, pix);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  darkroom_filmicrgb_display_mask(mask, out, (size_t)height * width);
 }
 
 
@@ -2048,12 +2030,7 @@ static inline void restore_ratios(float *const restrict ratios,
                                   const size_t width,
                                   const size_t height)
 {
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width; k++)
-  {
-    for_each_channel(c,aligned(norms,ratios))
-      ratios[4*k + c] = clamp_simd(ratios[4*k + c]) * norms[k];
-  }
+  darkroom_filmicrgb_restore_ratios(ratios, norms, (size_t)height * width);
 }
 
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
