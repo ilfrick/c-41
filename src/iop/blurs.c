@@ -22,6 +22,7 @@
 #include "dtgtk/drawingarea.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 // #include <fftw3.h> // one day, include FFT convolution
 #include "common/gaussian.h"
@@ -598,9 +599,7 @@ void process(dt_iop_module_t *self,
 
     // dt_gaussian_blur_4c also blurs alpha; restore original pipeline mask
     const size_t npix = (size_t)roi_out->width * roi_out->height;
-    DT_OMP_FOR_SIMD(aligned(in, out : 64))
-    for(size_t k = 0; k < npix; k++)
-      out[k * 4 + 3] = in[k * 4 + 3];
+    darkroom_blurs_alpha_restore(in, out, npix);
   }
   else
   {
@@ -649,57 +648,12 @@ void process(dt_iop_module_t *self,
           }
         }
 
-      DT_OMP_FOR(collapse(2))
-      for(int i = 0; i < roi_out->height; i++)
-        for(int j = 0; j < roi_out->width; j++)
-        {
-          const size_t idx_out = ((size_t)i * roi_out->width + j) * 4;
-          float DT_ALIGNED_PIXEL acc[4] = { 0.f };
-
-          // Position of this output pixel inside the roi_in buffer
-          const int ci = i + oy;
-          const int cj = j + ox;
-
-          if(ci >= radius && cj >= radius && ci < in_height - radius && cj < in_width - radius)
-          {
-            // Interior: all neighbours are within roi_in — no clamping needed
-            const float *in_center = in + ((size_t)ci * in_width + cj) * 4;
-            for(int s = 0; s < n_nonzero; s++)
-            {
-              const float *p_src = in_center + offsets[s];
-              const float w = values[s];
-              acc[0] += w * p_src[0];
-              acc[1] += w * p_src[1];
-              acc[2] += w * p_src[2];
-              acc[3] += w * p_src[3];
-            }
-          }
-          else
-          {
-            // Edge: clamp neighbours to roi_in bounds
-            for(int l = -radius; l <= radius; l++)
-              for(int m = -radius; m <= radius; m++)
-              {
-                const float k = kernel[(l + radius) * kernel_width + (m + radius)];
-                if(k > 1e-6f)
-                {
-                  const int ii = CLAMP(ci + l, 0, in_height - 1);
-                  const int jj = CLAMP(cj + m, 0, in_width - 1);
-                  const float *p_src = in + ((size_t)ii * in_width + jj) * 4;
-                  acc[0] += k * p_src[0];
-                  acc[1] += k * p_src[1];
-                  acc[2] += k * p_src[2];
-                  acc[3] += k * p_src[3];
-                }
-              }
-          }
-
-          out[idx_out + 0] = acc[0];
-          out[idx_out + 1] = acc[1];
-          out[idx_out + 2] = acc[2];
-          // preserve original alpha (pipeline mask)
-          out[idx_out + 3] = in[((size_t)ci * in_width + cj) * 4 + 3];
-        }
+      darkroom_blurs_sparse_convolve(in, out,
+                                     (size_t)roi_out->width, (size_t)roi_out->height,
+                                     (size_t)in_width, (size_t)in_height,
+                                     radius, ox, oy,
+                                     offsets, values, (size_t)n_nonzero,
+                                     kernel);
 
       dt_free_align(kernel);
       dt_free_align(offsets);

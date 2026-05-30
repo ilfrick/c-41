@@ -785,8 +785,6 @@ static inline void apply_toneequalizer(const float *const restrict in,
 {
   const size_t npixels = (size_t)roi_in->width * roi_in->height;
   const float* restrict lut = d->correction_lut;
-  const float lutres = LUT_RESOLUTION;
-
   const size_t lut_len = (size_t)PIXEL_CHAN * (size_t)LUT_RESOLUTION + 1;
   darkroom_toneequal_apply_lut(in, luminance, out, npixels,
                                 lut, lut_len,

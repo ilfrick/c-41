@@ -1438,6 +1438,27 @@ void darkroom_gamma_display_false_color_simple(const float *in_buf,
 void darkroom_gamma_mask_display(const float *in_buf, unsigned char *out_buf,
                                   size_t buffsize, float alpha, float mix);
 
+/* Blurs IOP — restore alpha channel after Gaussian blur overwrites it.
+ * out[k*4+3] = in[k*4+3] for k in 0..npixels.
+ * Matches src/iop/blurs.c:601. */
+void darkroom_blurs_alpha_restore(const float *in_buf, float *out_buf,
+                                   size_t npixels);
+
+/* Blurs IOP — sparse spatial convolution for lens/motion blur paths.
+ * Uses precomputed (offsets, values) for interior pixels and full `kernel`
+ * with clamping for edge pixels. `offsets` is in f32-element units from the
+ * centre pixel pointer (maps to ptrdiff_t in C). `kernel` is (2*radius+1)^2
+ * floats. Output alpha is always taken from the input centre pixel.
+ * Matches the DT_OMP_FOR(collapse(2)) at src/iop/blurs.c:652. */
+void darkroom_blurs_sparse_convolve(const float *in_buf, float *out_buf,
+                                     size_t out_width, size_t out_height,
+                                     size_t in_width,  size_t in_height,
+                                     int radius, int ox, int oy,
+                                     const ptrdiff_t *offsets,
+                                     const float     *values,
+                                     size_t n_nonzero,
+                                     const float *kernel);
+
 /*
  * CLAHE (Contrast-Limited Adaptive Histogram Equalisation).
  * Two-pass algorithm: builds a per-pixel luminance map = (max(RGB)+min(RGB))/2,
