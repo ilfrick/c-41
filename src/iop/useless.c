@@ -22,6 +22,7 @@
 #include "gui/color_picker_proxy.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 #include <gtk/gtk.h>
 #include <stdlib.h>
@@ -389,39 +390,11 @@ void process(dt_iop_module_t *self,
   else
     g_hash_table_remove(piece->raster_masks, GINT_TO_POINTER(mask_id));
 
-// iterate over all output pixels (same coordinates as input)
-  DT_OMP_FOR()
-  for(int j = 0; j < roi_out->height; j++)
-  {
-    float *in = ((float *)ivoid)
-                + (size_t)ch * roi_in->width
-                  * j; // make sure to address input, output and temp
-                       // buffers with size_t as we want to also
-    float *out = ((float *)ovoid) + (size_t)ch * roi_out->width * j; // correctly
-                                                                     // handle
-                                                                     // huge
-                                                                     // images
-    float *out_mask = mask ? &(mask[(size_t)roi_out->width * j]) : NULL;
-    for(int i = 0; i < roi_out->width; i++)
-    {
-      // calculate world space coordinates:
-      int wi = (roi_in->x + i) * scale, wj = (roi_in->y + j) * scale;
-      if((wi / d->checker_scale + wj / d->checker_scale) & 1)
-      {
-        for_each_channel(c, aligned(in,out))  // vectorize if possible
-          out[c] = in[c] * (1.0 - d->factor); // does this for c=0..2
-                                              // or c=0..3, whichever
-                                              // is faster
-        if(out_mask) out_mask[i] = 1.0;
-      }
-      else
-      {
-        copy_pixel(out, in);
-      }
-      in += ch;
-      out += ch;
-    }
-  }
+  // iterate over all output pixels (Rust FFI)
+  darkroom_useless_process((const float *)ivoid, (float *)ovoid, mask,
+                            (size_t)roi_out->width, (size_t)roi_out->height, ch,
+                            roi_in->x, roi_in->y,
+                            scale, d->checker_scale, d->factor);
 
   // now that the mask is generated we can publish it
   if(mask)

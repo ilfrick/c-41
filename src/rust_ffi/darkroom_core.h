@@ -1393,6 +1393,26 @@ void darkroom_toneequal_mask_display(const float *in_buf,
                                      size_t offset_y);
 
 /*
+ * Useless IOP — checkerboard dimming example module.
+ * For each pixel: if ((wi/checker_scale + wj/checker_scale) & 1):
+ *   out[c] = in[c] * (1 - factor); mask[k] = 1.0 (if mask non-NULL)
+ * else: out[c] = in[c]   (passthrough)
+ * where wi = trunc((roi_in_x + i) * scale), wj = trunc((roi_in_y + j) * scale).
+ * Matches process() in src/iop/useless.c:393.
+ */
+void darkroom_useless_process(const float *in_buf,
+                               float *out_buf,
+                               float *mask_buf,
+                               size_t width,
+                               size_t height,
+                               size_t ch,
+                               int roi_in_x,
+                               int roi_in_y,
+                               float scale,
+                               int checker_scale,
+                               float factor);
+
+/*
  * CLAHE (Contrast-Limited Adaptive Histogram Equalisation).
  * Two-pass algorithm: builds a per-pixel luminance map = (max(RGB)+min(RGB))/2,
  * then for each row maintains a sliding (2*rad+1)^2 histogram of luminance
