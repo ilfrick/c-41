@@ -24,6 +24,7 @@
 #include "develop/tiling.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 #include <stdlib.h>
 
@@ -135,20 +136,9 @@ gboolean distort_transform(dt_iop_module_t *self,
 {
   const float scale = piece->buf_in.scale / piece->iscale;
 
-  DT_OMP_FOR_SIMD(if(points_count > 100) aligned(points:64))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    float pi[2], po[2];
-
-    pi[0] = points[i];
-    pi[1] = points[i + 1];
-
-    transform(piece, scale, pi, po);
-
-    points[i] = po[0];
-    points[i + 1] = po[1];
-  }
-
+  const dt_iop_rotatepixels_data_t *d = piece->data;
+  darkroom_geom_rotate_coords(points, points_count, d->m,
+                               d->rx, d->ry, scale);
   return TRUE;
 }
 
@@ -159,20 +149,9 @@ gboolean distort_backtransform(dt_iop_module_t *self,
 {
   const float scale = piece->buf_in.scale / piece->iscale;
 
-  DT_OMP_FOR_SIMD(if(points_count > 100) aligned(points:64))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    float pi[2], po[2];
-
-    pi[0] = points[i];
-    pi[1] = points[i + 1];
-
-    backtransform(piece, scale, pi, po);
-
-    points[i] = po[0];
-    points[i + 1] = po[1];
-  }
-
+  const dt_iop_rotatepixels_data_t *d = piece->data;
+  darkroom_geom_unrotate_coords(points, points_count, d->m,
+                                 d->rx, d->ry, scale);
   return TRUE;
 }
 

@@ -1545,6 +1545,20 @@ void darkroom_geom_blit_rows(const float *in_buf, float *out_buf,
                               size_t out_width,
                               size_t border_x, size_t border_y);
 
+/* Apply 2×2 rotation matrix + translation to every coordinate pair.
+ * pi = (x - rx*scale, y - ry*scale); o = M * pi.
+ * m is [m00,m01,m10,m11] (row-major).
+ * Matches distort_transform in src/iop/rotatepixels.c:138. */
+void darkroom_geom_rotate_coords(float *pts, size_t points_count,
+                                  const float *m,
+                                  float rx, float ry, float scale);
+
+/* Inverse rotation: o = M^T * x + (rx*scale, ry*scale).
+ * Matches distort_backtransform in src/iop/rotatepixels.c:162. */
+void darkroom_geom_unrotate_coords(float *pts, size_t points_count,
+                                    const float *m,
+                                    float rx, float ry, float scale);
+
 /*
  * CLAHE (Contrast-Limited Adaptive Histogram Equalisation).
  * Two-pass algorithm: builds a per-pixel luminance map = (max(RGB)+min(RGB))/2,

@@ -176,6 +176,72 @@ pub unsafe extern "C" fn darkroom_geom_blit_rows(
     }
 }
 
+// ── 2×2 matrix × 2D coordinate ───────────────────────────────────────────────
+
+/// Apply a 2×2 rotation matrix + translation to every coordinate pair.
+///
+/// For each point i:
+///   pi = (x - rx*scale, y - ry*scale)
+///   o  = M * pi
+/// where M = [m[0], m[1]; m[2], m[3]] (row-major 2×2).
+///
+/// Matches `transform()` called from `distort_transform` in
+/// src/iop/rotatepixels.c:138.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_geom_rotate_coords(
+    pts: *mut f32,
+    points_count: usize,
+    m: *const f32,  // 4 floats: [m00, m01, m10, m11]
+    rx: f32,
+    ry: f32,
+    scale: f32,
+) {
+    if points_count == 0 { return; }
+    let buf = std::slice::from_raw_parts_mut(pts, points_count * 2);
+    let mat = std::slice::from_raw_parts(m, 4);
+    let mut i = 0;
+    while i < points_count * 2 {
+        let pix = buf[i]     - rx * scale;
+        let piy = buf[i + 1] - ry * scale;
+        buf[i]     = pix * mat[0] + piy * mat[1];
+        buf[i + 1] = pix * mat[2] + piy * mat[3];
+        i += 2;
+    }
+}
+
+/// Inverse rotation: apply the transposed matrix then add translation.
+///
+/// For each point i:
+///   rt = [m[0], -m[1], -m[2], m[3]]  (transpose of rotation)
+///   o  = rt * x
+///   o += (rx*scale, ry*scale)
+///
+/// Matches `backtransform()` called from `distort_backtransform` in
+/// src/iop/rotatepixels.c:162.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_geom_unrotate_coords(
+    pts: *mut f32,
+    points_count: usize,
+    m: *const f32,
+    rx: f32,
+    ry: f32,
+    scale: f32,
+) {
+    if points_count == 0 { return; }
+    let buf = std::slice::from_raw_parts_mut(pts, points_count * 2);
+    let mat = std::slice::from_raw_parts(m, 4);
+    // transposed rotation matrix: rt = [m[0], -m[1], -m[2], m[3]]
+    let rt = [mat[0], -mat[1], -mat[2], mat[3]];
+    let mut i = 0;
+    while i < points_count * 2 {
+        let x = buf[i];
+        let y = buf[i + 1];
+        buf[i]     = x * rt[0] + y * rt[1] + rx * scale;
+        buf[i + 1] = x * rt[2] + y * rt[3] + ry * scale;
+        i += 2;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +297,30 @@ mod tests {
         }
         assert!((pts[0] - orig[0]).abs() < 1e-5, "x={} orig={}", pts[0], orig[0]);
         assert!((pts[1] - orig[1]).abs() < 1e-5, "y={} orig={}", pts[1], orig[1]);
+    }
+
+    #[test]
+    fn rotate_coords_applies_matrix_and_translation() {
+        // Identity matrix, no translation: output = input
+        let mut pts = vec![3.0_f32, 4.0];
+        let m = [1.0_f32, 0.0, 0.0, 1.0]; // identity
+        unsafe { darkroom_geom_rotate_coords(pts.as_mut_ptr(), 1, m.as_ptr(), 0.0, 0.0, 1.0); }
+        assert!((pts[0] - 3.0).abs() < 1e-6);
+        assert!((pts[1] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unrotate_is_inverse_of_rotate() {
+        // 90° rotation matrix: [[0,-1],[1,0]], translation (1,2)
+        let m = [0.0_f32, -1.0, 1.0, 0.0];
+        let orig = vec![3.0_f32, 4.0];
+        let mut pts = orig.clone();
+        unsafe {
+            darkroom_geom_rotate_coords(pts.as_mut_ptr(), 1, m.as_ptr(), 1.0, 2.0, 1.0);
+            darkroom_geom_unrotate_coords(pts.as_mut_ptr(), 1, m.as_ptr(), 1.0, 2.0, 1.0);
+        }
+        assert!((pts[0] - orig[0]).abs() < 1e-5, "x={}", pts[0]);
+        assert!((pts[1] - orig[1]).abs() < 1e-5, "y={}", pts[1]);
     }
 
     #[test]
