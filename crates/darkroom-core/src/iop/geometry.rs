@@ -31,6 +31,27 @@ geom_iop_stub!(Borders,       "borders");
 geom_iop_stub!(Enlargecanvas, "enlargecanvas");
 geom_iop_stub!(Rotatepixels,  "rotatepixels");
 geom_iop_stub!(Scalepixels,   "scalepixels");
+// IOPs whose process() delegates entirely to shared C utilities (DWT, bilateral,
+// NLM, equaliser filter, clamp-and-scale) — no OMP loops remain to migrate in
+// the IOP file itself. Registered as stubs to track coverage.
+geom_iop_stub!(Equalizer,     "equalizer");
+geom_iop_stub!(Finalscale,    "finalscale");
+geom_iop_stub!(Nlmeans,       "nlmeans");
+geom_iop_stub!(Bilat,         "bilat");
+geom_iop_stub!(Spots,         "spots");
+// IOPs with remaining OMP loops blocked on infrastructure not yet in Rust
+// (color-space transforms, interpolation, bilateral grid, NLM, keystone, etc.)
+geom_iop_stub!(Demosaic,            "demosaic");
+geom_iop_stub!(Ashift,              "ashift");
+geom_iop_stub!(Clipping,            "clipping");
+geom_iop_stub!(Colorreconstruction, "colorreconstruction");
+geom_iop_stub!(Colorharmonizer,     "colorharmonizer");
+geom_iop_stub!(Colorbalancergb,     "colorbalancergb");
+geom_iop_stub!(Liquify,             "liquify");
+geom_iop_stub!(Denoiseprofile,      "denoiseprofile");
+geom_iop_stub!(Retouch,             "retouch");
+geom_iop_stub!(Sharpen,             "sharpen");
+geom_iop_stub!(Rawoverexposed,      "rawoverexposed");
 
 // ── Coordinate-shift ─────────────────────────────────────────────────────────
 
