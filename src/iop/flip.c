@@ -38,6 +38,7 @@
 #include "gui/presets.h"
 #include "imageio/imageio_common.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 DT_MODULE_INTROSPECTION(2, dt_iop_flip_params_t)
 
@@ -221,28 +222,10 @@ gboolean distort_transform(dt_iop_module_t *self,
   // nothing to be done if parameters are set to neutral values (no flip or swap)
   if(d->orientation == 0) return TRUE;
 
-  DT_OMP_FOR(if(points_count > 500))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    float x = points[i];
-    float y = points[i + 1];
-
-    if(d->orientation & ORIENTATION_FLIP_X)
-      x = piece->buf_in.width - points[i];
-
-    if(d->orientation & ORIENTATION_FLIP_Y)
-      y = piece->buf_in.height - points[i + 1];
-
-    if(d->orientation & ORIENTATION_SWAP_XY)
-    {
-      const float yy = y;
-      y = x;
-      x = yy;
-    }
-    points[i] = x;
-    points[i + 1] = y;
-  }
-
+  darkroom_geom_flip_coords(points, points_count,
+                             (unsigned int)d->orientation,
+                             (float)piece->buf_in.width,
+                             (float)piece->buf_in.height);
   return TRUE;
 }
 
@@ -256,27 +239,10 @@ gboolean distort_backtransform(dt_iop_module_t *self,
   // nothing to be done if parameters are set to neutral values (no flip or swap)
   if(d->orientation == 0) return TRUE;
 
-  DT_OMP_FOR(if(points_count > 500))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    float x, y;
-    if(d->orientation & ORIENTATION_SWAP_XY)
-    {
-      y = points[i];
-      x = points[i + 1];
-    }
-    else
-    {
-      x = points[i];
-      y = points[i + 1];
-    }
-    if(d->orientation & ORIENTATION_FLIP_X) x = piece->buf_in.width - x;
-    if(d->orientation & ORIENTATION_FLIP_Y) y = piece->buf_in.height - y;
-
-    points[i] = x;
-    points[i + 1] = y;
-  }
-
+  darkroom_geom_unflip_coords(points, points_count,
+                               (unsigned int)d->orientation,
+                               (float)piece->buf_in.width,
+                               (float)piece->buf_in.height);
   return TRUE;
 }
 

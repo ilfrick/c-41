@@ -71,6 +71,7 @@ pub mod gamma;
 pub mod blurs;
 pub mod filmicrgb;
 pub mod cacorrect;
+pub mod geometry;
 
 use crate::{params::IopParams, roi::RoiIn, Result};
 

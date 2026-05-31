@@ -34,6 +34,7 @@
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 #include <gdk/gdkkeysyms.h>
 #include <gtk/gtk.h>
@@ -360,13 +361,8 @@ gboolean distort_transform(dt_iop_module_t *self,
 
   float *const pts = DT_IS_ALIGNED(points);
 
-  DT_OMP_FOR(if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    pts[i] += border_size_l;
-    pts[i + 1] += border_size_t;
-  }
-
+  darkroom_geom_shift_coords(pts, points_count,
+                             (float)border_size_l, (float)border_size_t);
   return TRUE;
 }
 
@@ -386,13 +382,8 @@ gboolean distort_backtransform(dt_iop_module_t *self,
   if(border_size_l == 0 && border_size_t == 0) return TRUE;
 
   float *const pts = DT_IS_ALIGNED(points);
-  DT_OMP_FOR(if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    pts[i] -= border_size_l;
-    pts[i + 1] -= border_size_t;
-  }
-
+  darkroom_geom_unshift_coords(pts, points_count,
+                               (float)border_size_l, (float)border_size_t);
   return TRUE;
 }
 
@@ -417,13 +408,10 @@ void distort_mask(dt_iop_module_t *self,
   dt_iop_image_fill(out, 0.0f, roi_out->width, roi_out->height, 1);
 
   // blit image inside border and fill the output with previous processed out
-  DT_OMP_FOR()
-  for(int j = 0; j < roi_in->height; j++)
-  {
-    float *outb = out + (size_t)(j + border_in_y) * roi_out->width + border_in_x;
-    const float *inb = in + (size_t)j * roi_in->width;
-    memcpy(outb, inb, sizeof(float) * roi_in->width);
-  }
+  darkroom_geom_blit_rows(in, out,
+                          (size_t)roi_in->width, (size_t)roi_in->height,
+                          (size_t)roi_out->width,
+                          (size_t)border_in_x, (size_t)border_in_y);
 }
 
 void modify_roi_out(dt_iop_module_t *self,

@@ -1514,6 +1514,37 @@ void darkroom_cacorrect_writeout(const float *corrected, float *output,
                                   int roi_out_x, int roi_out_y,
                                   float scaler);
 
+/* Geometry helpers — shared across crop, flip, borders, enlargecanvas.
+ * All operate on a flat [x0,y0,x1,y1,...] coordinate buffer. */
+
+/* Add (dx,dy) to every coordinate pair. Matches distort_transform in
+ * crop.c, borders.c, enlargecanvas.c. */
+void darkroom_geom_shift_coords(float *pts, size_t points_count,
+                                 float dx, float dy);
+
+/* Subtract (dx,dy) from every coordinate pair (backtransform). */
+void darkroom_geom_unshift_coords(float *pts, size_t points_count,
+                                   float dx, float dy);
+
+/* Apply dt_image_orientation_t flip/transpose. Matches distort_transform
+ * in flip.c. orientation bits: FLIP_Y=1, FLIP_X=2, SWAP_XY=4. */
+void darkroom_geom_flip_coords(float *pts, size_t points_count,
+                                unsigned int orientation,
+                                float img_width, float img_height);
+
+/* Inverse of flip_coords (backtransform). Matches distort_backtransform
+ * in flip.c. */
+void darkroom_geom_unflip_coords(float *pts, size_t points_count,
+                                  unsigned int orientation,
+                                  float img_width, float img_height);
+
+/* Row-by-row memcpy blit with border offset. Matches distort_mask
+ * DT_OMP_FOR in borders.c:420 and enlargecanvas.c:324. */
+void darkroom_geom_blit_rows(const float *in_buf, float *out_buf,
+                              size_t in_width, size_t in_height,
+                              size_t out_width,
+                              size_t border_x, size_t border_y);
+
 /*
  * CLAHE (Contrast-Limited Adaptive Histogram Equalisation).
  * Two-pass algorithm: builds a per-pixel luminance map = (max(RGB)+min(RGB))/2,

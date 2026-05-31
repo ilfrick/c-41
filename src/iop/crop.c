@@ -33,6 +33,7 @@
 #include "gui/guides.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 #include <assert.h>
 #include <gdk/gdkkeysyms.h>
@@ -472,13 +473,7 @@ gboolean distort_transform(dt_iop_module_t *self,
 
   float *const pts = DT_IS_ALIGNED(points);
 
-  DT_OMP_FOR(if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    pts[i] -= crop_left;
-    pts[i + 1] -= crop_top;
-  }
-
+  darkroom_geom_unshift_coords(pts, points_count, crop_left, crop_top);
   return TRUE;
 }
 
@@ -494,13 +489,7 @@ gboolean distort_backtransform(dt_iop_module_t *self,
 
   float *const pts = DT_IS_ALIGNED(points);
 
-  DT_OMP_FOR(if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    pts[i] += crop_left;
-    pts[i + 1] += crop_top;
-  }
-
+  darkroom_geom_shift_coords(pts, points_count, crop_left, crop_top);
   return TRUE;
 }
 
