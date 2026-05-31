@@ -1481,6 +1481,39 @@ void darkroom_filmicrgb_restore_ratios(float *ratios_buf,
                                         const float *norms_buf,
                                         size_t npixels);
 
+/* Cacorrect IOP — copy non-green Bayer channel to half-res buffer.
+ * oldraw[row*h_width + col/2] = in[row*full_width + col]
+ * Matches DT_OMP_FOR at src/iop/cacorrect.c:327. */
+void darkroom_cacorrect_save_oldraw(const float *in_buf, float *oldraw_buf,
+                                     size_t full_width, size_t height,
+                                     size_t h_width, unsigned int filters);
+
+/* Cacorrect IOP — compute per-pixel R/B correction factors.
+ * nongreen[(row/2)*h_width + col/2] = clamp(oldraw/in, 0.5, 2.0)
+ * Matches DT_OMP_FOR at src/iop/cacorrect.c:1125. */
+void darkroom_cacorrect_compute_factors(const float *in_buf,
+                                         const float *oldraw_buf,
+                                         float *red_buf, float *blue_buf,
+                                         size_t full_width, size_t height,
+                                         size_t h_width, unsigned int filters);
+
+/* Cacorrect IOP — apply blurred correction factors to the output buffer.
+ * out[row*w + col] *= nongreen[row/2*h_width + col/2]  for interior pixels.
+ * Matches DT_OMP_FOR at src/iop/cacorrect.c:1172. */
+void darkroom_cacorrect_apply_factors(float *out_buf,
+                                       const float *red_buf, const float *blue_buf,
+                                       size_t full_width, size_t height,
+                                       size_t h_width, unsigned int filters);
+
+/* Cacorrect IOP — write corrected buffer to roi_out with scale factor.
+ * output[ox] = corrected[irow*in_width + icol] * scaler  (bounds-guarded).
+ * Matches DT_OMP_FOR(collapse(2)) at src/iop/cacorrect.c:1190. */
+void darkroom_cacorrect_writeout(const float *corrected, float *output,
+                                  size_t out_width, size_t out_height,
+                                  size_t in_width,  size_t in_height,
+                                  int roi_out_x, int roi_out_y,
+                                  float scaler);
+
 /*
  * CLAHE (Contrast-Limited Adaptive Histogram Equalisation).
  * Two-pass algorithm: builds a per-pixel luminance map = (max(RGB)+min(RGB))/2,

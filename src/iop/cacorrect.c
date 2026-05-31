@@ -26,6 +26,7 @@
 #include "common/imagebuf.h"
 #include "common/gaussian.h"
 #include "develop/imageop.h"
+#include "rust_ffi/darkroom_core.h"
 #include "develop/imageop_gui.h"
 #include "develop/imageop_math.h"
 #include "gui/accelerators.h"
@@ -324,14 +325,8 @@ void process(dt_iop_module_t *self,
       goto writeout;
     }
     // copy raw values before ca correction
-    DT_OMP_FOR()
-    for(size_t row = 0; row < height; row++)
-    {
-      for(size_t col = (FC(row, 0, filters) & 1); col < width; col += 2)
-      {
-        oldraw[row * h_width + col / 2] = in[row * width + col];
-      }
-    }
+    darkroom_cacorrect_save_oldraw(in, oldraw, (size_t)width, (size_t)height,
+                                   (size_t)h_width, filters);
   }
 
   double fitparams[2][2][16];
@@ -1122,19 +1117,9 @@ DT_OMP_PRAGMA(barrier)
     // to avoid or at least reduce the colour shift caused by raw ca correction we compute the per pixel difference factors
     // of red and blue channel and apply a gaussian blur to them.
     // Then we apply the resulting factors per pixel on the result of raw ca correction
-    DT_OMP_FOR()
-    for(int row = 0; row < height; row++)
-    {
-      const int firstCol = FC(row, 0, filters) & 1;
-      const int color    = FC(row, firstCol, filters);
-      float *nongreen    = (color == 0) ? redfactor : bluefactor;
-      for(int col = firstCol; col < width; col += 2)
-      {
-        const size_t index = (size_t)row * width + col;
-        const size_t oindex = (size_t)row * h_width + col / 2;
-        nongreen[(row / 2) * h_width + col / 2] = CLAMPF(oldraw[oindex] / in[index], 0.5f, 2.0f);
-      }
-    }
+    darkroom_cacorrect_compute_factors(in, oldraw, redfactor, bluefactor,
+                                       (size_t)width, (size_t)height,
+                                       (size_t)h_width, filters);
 
     if(height % 2)
     {
@@ -1169,39 +1154,19 @@ DT_OMP_PRAGMA(barrier)
       dt_gaussian_blur(red, redfactor, redfactor);
       dt_gaussian_blur(blue, bluefactor, bluefactor);
 
-      DT_OMP_FOR()
-      for(size_t row = 2; row < height - 2; row++)
-      {
-        const int firstCol = FC(row, 0, filters) & 1;
-        const int color = FC(row, firstCol, filters);
-        float *nongreen = (color == 0) ? redfactor : bluefactor;
-        for(size_t col = firstCol; col < width - 2; col += 2)
-        {
-          const float correction = nongreen[row / 2 * h_width + col / 2];
-          out[row * width + col] *= correction;
-        }
-      }
+      darkroom_cacorrect_apply_factors(out, redfactor, bluefactor,
+                                       (size_t)width, (size_t)height,
+                                       (size_t)h_width, filters);
     }
     if(red)  dt_gaussian_free(red);
     if(blue) dt_gaussian_free(blue);
   }
 
   writeout:
-  DT_OMP_FOR(collapse(2))
-  for(size_t row = 0; row < roi_out->height; row++)
-  {
-    for(size_t col = 0; col < roi_out->width; col++)
-    {
-      const size_t ox = row * roi_out->width + col;
-      const size_t irow = row + roi_out->y;
-      const size_t icol = col + roi_out->x;
-      const size_t ix = irow * roi_in->width + icol;
-      if((irow < roi_in->height) && (icol < roi_in->width))
-      {
-        output[ox] = out[ix] * scaler;
-      }
-    }
-  }
+  darkroom_cacorrect_writeout(out, output,
+                               (size_t)roi_out->width, (size_t)roi_out->height,
+                               (size_t)roi_in->width,  (size_t)roi_in->height,
+                               roi_out->x, roi_out->y, scaler);
 
   dt_free_align(blockwt);
   dt_free_align(out);

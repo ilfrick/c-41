@@ -70,6 +70,7 @@ pub mod useless;
 pub mod gamma;
 pub mod blurs;
 pub mod filmicrgb;
+pub mod cacorrect;
 
 use crate::{params::IopParams, roi::RoiIn, Result};
 
