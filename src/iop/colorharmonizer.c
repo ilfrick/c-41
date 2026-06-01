@@ -25,6 +25,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/chromatic_adaptation.h"
 #include "develop/imageop.h"
+#include "rust_ffi/darkroom_core.h"
 #include "develop/imageop_gui.h"
 #include "gui/color_picker_proxy.h"
 #include "gui/gtk.h"
@@ -339,47 +340,15 @@ void process(dt_iop_module_t *self,
 
   if(p->smoothing <= 0.0f)
   {
-    // Fused single pass: forward conversion → correction → inverse conversion.
-    // No intermediate buffer needed; each pixel is touched exactly once.
-    DT_OMP_FOR()
-    for(int j = 0; j < roi_out->height; j++)
-    {
-      const float *in  = ((const float *)ivoid) + (size_t)ch * roi_in->width * j;
-      float       *out = ((float *)ovoid)        + (size_t)ch * roi_out->width * j;
-
-      for(int i = 0; i < roi_out->width; i++, in += ch, out += ch)
-      {
-        const dt_aligned_pixel_t px_rgb = { fmaxf(in[0], 0.0f), fmaxf(in[1], 0.0f),
-                                            fmaxf(in[2], 0.0f), 0.0f };
-        dt_aligned_pixel_t px_JCH;
-        dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, px_JCH, work_profile->matrix_in_transposed, L_white);
-
-        const float hue    = (px_JCH[2] + M_PI_F) / DT_2PI_F;
-        const float chroma = px_JCH[1];
-
-        int   winning_idx = 0;
-        float max_weight  = 0.0f;
-        const float hue_shift = get_weighted_hue_shift(hue, nodes, num_nodes, pull_width,
-                                                       &winning_idx, &max_weight);
-        const float sat_delta = (p->node_saturation[winning_idx] - 1.0f) * max_weight;
-
-        // Smooth hyperbolic ramp: approaches 0 for neutral colors, ~1 for saturated colors.
-        const float chroma_weight = chroma / (chroma + cutoff + 1e-5f);
-
-        px_JCH[2] = wrap_hue(hue + hue_shift * pull_strength * chroma_weight) * DT_2PI_F - M_PI_F;
-        px_JCH[1] = fmaxf(chroma * (1.0f + sat_delta * chroma_weight), 0.0f);
-
-        dt_aligned_pixel_t px_xyY, px_xyz_d65, px_xyz;
-        dt_UCS_JCH_to_xyY(px_JCH, L_white, px_xyY);
-        dt_xyY_to_XYZ(px_xyY, px_xyz_d65);
-        XYZ_D65_to_D50(px_xyz_d65, px_xyz);
-
-        dt_aligned_pixel_t px_rgb_out;
-        dt_apply_transposed_color_matrix(px_xyz, work_profile->matrix_out_transposed, px_rgb_out);
-        for_each_channel(c) out[c] = px_rgb_out[c];
-        out[3] = in[3];
-      }
-    }
+    // Fused single pass (Rust FFI)
+    const size_t npx = (size_t)roi_out->width * roi_out->height;
+    darkroom_colorharmonizer_fused(
+        (const float *)ivoid, (float *)ovoid, npx, (size_t)ch,
+        (const float *)work_profile->matrix_in_transposed,
+        (const float *)work_profile->matrix_out_transposed,
+        L_white,
+        nodes, num_nodes, pull_width, pull_strength, cutoff,
+        p->node_saturation);
   }
   else
   {
@@ -395,35 +364,11 @@ void process(dt_iop_module_t *self,
       return;
     }
 
-    // Pass 1: forward RGB → JCH (cached) + compute per-pixel corrections.
-    DT_OMP_FOR()
-    for(int j = 0; j < roi_out->height; j++)
-    {
-      const float *in  = ((const float *)ivoid) + (size_t)ch * roi_in->width * j;
-      const size_t row = (size_t)j * roi_out->width;
-
-      for(int i = 0; i < roi_out->width; i++, in += ch)
-      {
-        const dt_aligned_pixel_t px_rgb = { fmaxf(in[0], 0.0f), fmaxf(in[1], 0.0f),
-                                            fmaxf(in[2], 0.0f), 0.0f };
-        dt_aligned_pixel_t px_JCH;
-        dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, px_JCH, work_profile->matrix_in_transposed, L_white);
-
-        const float hue = (px_JCH[2] + M_PI_F) / DT_2PI_F;
-
-        const size_t k = row + i;
-        jch_cache[k * 3]     = px_JCH[0];  // J
-        jch_cache[k * 3 + 1] = px_JCH[1];  // chroma
-        jch_cache[k * 3 + 2] = hue;        // normalized hue [0,1)
-
-        int   winning_idx = 0;
-        float max_weight  = 0.0f;
-        const float hue_shift = get_weighted_hue_shift(hue, nodes, num_nodes, pull_width,
-                                                       &winning_idx, &max_weight);
-        corrections[k * 2]     = hue_shift;
-        corrections[k * 2 + 1] = (p->node_saturation[winning_idx] - 1.0f) * max_weight;
-      }
-    }
+    // Pass 1: RGB → JCH cache + corrections (Rust FFI)
+    darkroom_colorharmonizer_cache_pass(
+        (const float *)ivoid, jch_cache, corrections, npx, (size_t)ch,
+        (const float *)work_profile->matrix_in_transposed, L_white,
+        nodes, num_nodes, pull_width, p->node_saturation);
 
     // Gaussian blur: smooth corrections spatially to soften zone-boundary transitions.
     // sigma scales with the preview↔full-res ratio so the blur radius stays consistent
@@ -433,40 +378,12 @@ void process(dt_iop_module_t *self,
                         * fmaxf(1.0f, pull_width);
     dt_gaussian_mean_blur(corrections, roi_out->width, roi_out->height, 2, sigma);
 
-    // Pass 2: apply blurred corrections using cached JCH (inverse only).
-    DT_OMP_FOR()
-    for(int j = 0; j < roi_out->height; j++)
-    {
-      const float *in  = ((const float *)ivoid) + (size_t)ch * roi_in->width  * j;
-      float       *out = ((float *)ovoid)        + (size_t)ch * roi_out->width * j;
-      const size_t row = (size_t)j * roi_out->width;
-
-      for(int i = 0; i < roi_out->width; i++, in += ch, out += ch)
-      {
-        const size_t k     = row + i;
-        const float J      = jch_cache[k * 3];
-        const float chroma = jch_cache[k * 3 + 1];
-        const float hue    = jch_cache[k * 3 + 2];
-
-        const float chroma_weight = chroma / (chroma + cutoff + 1e-5f);
-
-        const float new_hue = wrap_hue(hue + corrections[k * 2] * pull_strength * chroma_weight);
-        dt_aligned_pixel_t px_JCH = { J,
-                                      fmaxf(chroma * (1.0f + corrections[k * 2 + 1] * chroma_weight), 0.0f),
-                                      new_hue * DT_2PI_F - M_PI_F,
-                                      0.0f };
-
-        dt_aligned_pixel_t px_xyY, px_xyz_d65, px_xyz;
-        dt_UCS_JCH_to_xyY(px_JCH, L_white, px_xyY);
-        dt_xyY_to_XYZ(px_xyY, px_xyz_d65);
-        XYZ_D65_to_D50(px_xyz_d65, px_xyz);
-
-        dt_aligned_pixel_t px_rgb_out;
-        dt_apply_transposed_color_matrix(px_xyz, work_profile->matrix_out_transposed, px_rgb_out);
-        for_each_channel(c) out[c] = px_rgb_out[c];
-        out[3] = in[3];
-      }
-    }
+    // Pass 2: apply blurred corrections (Rust FFI)
+    darkroom_colorharmonizer_apply_pass(
+        (const float *)ivoid, (float *)ovoid,
+        jch_cache, corrections, npx, (size_t)ch,
+        (const float *)work_profile->matrix_out_transposed,
+        L_white, cutoff, pull_strength);
 
     dt_free_align(jch_cache);
     dt_free_align(corrections);

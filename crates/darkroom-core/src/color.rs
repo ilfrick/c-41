@@ -186,6 +186,248 @@ pub fn rgb_norm(r: f32, g: f32, b: f32, mode: i32) -> f32 {
     }
 }
 
+// ── dt UCS 2.2 color space ────────────────────────────────────────────────────
+// Mirrors src/common/colorspaces_inline_conversions.h starting at line 1270.
+// This color model is used by colorequal, colorbalancergb, colorharmonizer.
+
+const DT_UCS_L_STAR_RANGE:       f32 = 2.098883786377;
+const DT_UCS_L_STAR_UPPER_LIMIT: f32 = 2.09885;
+
+/// D65 white point chromaticity fallback (from colorspaces.h D65xyY).
+pub const D65_X: f32 = 0.31271;
+pub const D65_Y: f32 = 0.32902;
+
+/// D50 white point chromaticity fallback (from colorspaces.h D50xyY).
+pub const D50_X: f32 = 0.34567;
+pub const D50_Y: f32 = 0.35850;
+
+/// `Y_to_dt_UCS_L_star(Y)` — convert absolute luminance to dt UCS lightness.
+/// Matches Y_to_dt_UCS_L_star() in colorspaces_inline_conversions.h:1274.
+#[inline(always)]
+pub fn y_to_dt_ucs_l_star(y: f32) -> f32 {
+    let y_hat = y.powf(0.631651345306265);
+    DT_UCS_L_STAR_RANGE * y_hat / (y_hat + 1.12426773749357)
+}
+
+/// Inverse of `y_to_dt_ucs_l_star`.
+/// Matches dt_UCS_L_star_to_Y() in colorspaces_inline_conversions.h:1280.
+#[inline(always)]
+pub fn dt_ucs_l_star_to_y(l_star: f32) -> f32 {
+    ((1.12426773749357 * l_star / (DT_UCS_L_STAR_RANGE - l_star)).max(0.0)).powf(1.5831518565279648)
+}
+
+/// Convert xyY to dt UCS UV_star_prime[2].
+/// Matches xyY_to_dt_UCS_UV() in colorspaces_inline_conversions.h:1286.
+#[inline(always)]
+pub fn xyy_to_dt_ucs_uv(xyy: &[f32; 4]) -> [f32; 2] {
+    const X_FACTORS: [f32; 3] = [-0.783941002840055,  0.745273540913283,  0.318707282433486];
+    const Y_FACTORS: [f32; 3] = [ 0.277512987809202, -0.205375866083878,  2.16743692732158];
+    const OFFSETS:   [f32; 3] = [ 0.153836578598858, -0.165478376301988,  0.291320554395942];
+
+    let mut uvd = [0.0_f32; 3];
+    for c in 0..3 {
+        uvd[c] = X_FACTORS[c] * xyy[0] + Y_FACTORS[c] * xyy[1] + OFFSETS[c];
+    }
+
+    let div = if uvd[2] >= 0.0 { uvd[2].max(f32::MIN_POSITIVE) }
+              else { uvd[2].min(-f32::MIN_POSITIVE) };
+    uvd[0] /= div;
+    uvd[1] /= div;
+
+    let factors     = [1.39656225667, 1.4513954287];
+    let half_values = [1.49217352929, 1.52488637914];
+    let mut uv_star = [0.0_f32; 2];
+    for c in 0..2 {
+        uv_star[c] = factors[c] * uvd[c] / (uvd[c].abs() + half_values[c]);
+    }
+
+    // 2D matrix product
+    [
+        -1.124983854323892 * uv_star[0] - 0.980483721769325 * uv_star[1],
+         1.86323315098672  * uv_star[0] + 1.971853092390862 * uv_star[1],
+    ]
+}
+
+/// Convert (L_star, L_white, UV_star_prime) to JCH.
+/// Matches dt_UCS_LUV_to_JCH() in colorspaces_inline_conversions.h:1314.
+#[inline(always)]
+pub fn dt_ucs_luv_to_jch(l_star: f32, l_white: f32, uv: &[f32; 2]) -> [f32; 4] {
+    let m2 = uv[0] * uv[0] + uv[1] * uv[1];
+    let j  = l_star / l_white;
+    let c  = 15.932993652962535 * l_star.powf(0.6523997524738018)
+           * m2.powf(0.6007557017508491) / l_white;
+    let h  = uv[1].atan2(uv[0]);
+    [j, c, h, 0.0]
+}
+
+/// Convert xyY (normalized D65 CIE 2°) to dt UCS JCH.
+/// Matches xyY_to_dt_UCS_JCH() in colorspaces_inline_conversions.h:1325.
+#[inline(always)]
+pub fn xyy_to_dt_ucs_jch(xyy: &[f32; 4], l_white: f32) -> [f32; 4] {
+    let uv = xyy_to_dt_ucs_uv(xyy);
+    dt_ucs_luv_to_jch(y_to_dt_ucs_l_star(xyy[2]), l_white, &uv)
+}
+
+/// Convert dt UCS JCH back to xyY.
+/// Matches dt_UCS_JCH_to_xyY() in colorspaces_inline_conversions.h:1343.
+#[inline(always)]
+pub fn dt_ucs_jch_to_xyy(jch: &[f32; 4], l_white: f32) -> [f32; 4] {
+    let l_star = (jch[0] * l_white).clamp(0.0, DT_UCS_L_STAR_UPPER_LIMIT);
+    let m = if l_star != 0.0 {
+        (jch[1] * l_white / (15.932993652962535 * l_star.powf(0.6523997524738018)))
+            .max(0.0)
+            .powf(0.8322850678616855)
+    } else {
+        0.0
+    };
+    let u_star_prime = m * jch[2].cos();
+    let v_star_prime = m * jch[2].sin();
+
+    // inverse 2D matrix
+    let uv_star = [
+        -5.037522385190711 * u_star_prime - 2.504856328185843 * v_star_prime,
+         4.760029407436461 * u_star_prime + 2.874012963239247 * v_star_prime,
+    ];
+
+    let factors     = [1.39656225667, 1.4513954287];
+    let half_values = [1.49217352929, 1.52488637914];
+    let mut uv = [0.0_f32; 2];
+    for c in 0..2 {
+        uv[c] = -half_values[c] * uv_star[c] / (uv_star[c].abs() - factors[c]);
+    }
+
+    const U_FACTORS: [f32; 3] = [ 0.167171472114775, -0.150959086409163,  0.940254742367256];
+    const V_FACTORS: [f32; 3] = [ 0.141299802443708, -0.155185060382272,  1.000000000000000];
+    const OFFSETS2:  [f32; 3] = [-0.00801531300850582, -0.00843312433578007, -0.0256325967652889];
+
+    let mut xyd = [0.0_f32; 3];
+    for c in 0..3 {
+        xyd[c] = U_FACTORS[c] * uv[0] + V_FACTORS[c] * uv[1] + OFFSETS2[c];
+    }
+    let div = if xyd[2] >= 0.0 { xyd[2].max(f32::MIN_POSITIVE) }
+              else { xyd[2].min(-f32::MIN_POSITIVE) };
+
+    [xyd[0] / div, xyd[1] / div, dt_ucs_l_star_to_y(l_star), 0.0]
+}
+
+/// JCH → HSB (Hue/Saturation/Brightness).
+/// Matches dt_UCS_JCH_to_HSB() in colorspaces_inline_conversions.h:1389.
+#[inline(always)]
+pub fn dt_ucs_jch_to_hsb(jch: &[f32; 4]) -> [f32; 4] {
+    let b = jch[0] * (jch[1].powf(1.33654221029386) + 1.0);
+    let s = if b > 0.0 { jch[1] / b } else { 0.0 };
+    [jch[2], s, b, jch[3]]
+}
+
+/// HSB → JCH.
+/// Matches dt_UCS_HSB_to_JCH() in colorspaces_inline_conversions.h:1397.
+#[inline(always)]
+pub fn dt_ucs_hsb_to_jch(hsb: &[f32; 4]) -> [f32; 4] {
+    let c = hsb[1] * hsb[2];
+    let j = hsb[2] / (c.powf(1.33654221029386) + 1.0);
+    [j, c, hsb[0], hsb[3]]
+}
+
+/// XYZ D65 → xyY with D65 white-point fallback on zero-sum.
+/// Matches dt_D65_XYZ_to_xyY() in colorspaces_inline_conversions.h:246.
+#[inline(always)]
+pub fn d65_xyz_to_xyy(xyz: &[f32; 4]) -> [f32; 4] {
+    let x = xyz[0].max(0.0);
+    let y = xyz[1].max(0.0);
+    let z = xyz[2].max(0.0);
+    let sum = x + y + z;
+    if sum > 0.0 {
+        [x / sum, y / sum, y, 0.0]
+    } else {
+        [D65_X, D65_Y, 0.0, 0.0]
+    }
+}
+
+/// xyY → XYZ (Bruce Lindbloom formula).
+/// Matches dt_xyY_to_XYZ() in colorspaces_inline_conversions.h:272.
+#[inline(always)]
+pub fn xyy_to_xyz(xyy: &[f32; 4]) -> [f32; 4] {
+    if xyy[1] == 0.0 {
+        [0.0, 0.0, 0.0, 0.0]
+    } else {
+        let big_y = xyy[2];
+        [
+            big_y * xyy[0] / xyy[1],
+            big_y,
+            big_y * (1.0 - xyy[0] - xyy[1]) / xyy[1],
+            0.0,
+        ]
+    }
+}
+
+// ── Matrix operations + chromatic adaptation ─────────────────────────────────
+
+/// Apply a transposed 4×4 colour matrix (stored row-major with padding).
+///
+/// out[r] = M[0][r]*in[0] + M[1][r]*in[1] + M[2][r]*in[2]
+///
+/// `matrix` is `[[f32; 4]; 4]` (C `dt_colormatrix_t`), only the first 3
+/// rows and first 3 columns are used. Matches `dt_apply_transposed_color_matrix()`
+/// in colorspaces_inline_conversions.h:121.
+#[inline(always)]
+pub fn apply_transposed_color_matrix(inp: &[f32; 4], m: &[[f32; 4]; 4]) -> [f32; 4] {
+    let mut out = [0.0_f32; 4];
+    for r in 0..4 {
+        out[r] = m[0][r] * inp[0] + m[1][r] * inp[1] + m[2][r] * inp[2];
+    }
+    out
+}
+
+// CAT16 D50↔D65 transposed matrices (from chromatic_adaptation.h).
+pub const XYZ_D50_TO_D65_CAT16_TRANS: [[f32; 4]; 4] = [
+    [ 9.89466254e-01, -5.40518733e-03, -4.03920992e-04, 0.0],
+    [-4.00304626e-02,  1.00666069e+00,  1.50768030e-02, 0.0],
+    [ 4.40530317e-02, -1.75551955e-03,  1.30210211e+00, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+pub const XYZ_D65_TO_D50_CAT16_TRANS: [[f32; 4]; 4] = [
+    [ 1.01085433e+00,  5.42814201e-03,  2.50722468e-04, 0.0],
+    [ 4.07086103e-02,  9.93581926e-01, -1.14918759e-02, 0.0],
+    [-3.41445825e-02,  1.15592039e-03,  7.67964947e-01, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// XYZ D50 → XYZ D65 (CAT16). Matches XYZ_D50_to_D65() in chromatic_adaptation.h:406.
+#[inline(always)]
+pub fn xyz_d50_to_d65(xyz: &[f32; 4]) -> [f32; 4] {
+    apply_transposed_color_matrix(xyz, &XYZ_D50_TO_D65_CAT16_TRANS)
+}
+
+/// XYZ D65 → XYZ D50 (CAT16). Matches XYZ_D65_to_D50() in chromatic_adaptation.h:412.
+#[inline(always)]
+pub fn xyz_d65_to_d50(xyz: &[f32; 4]) -> [f32; 4] {
+    apply_transposed_color_matrix(xyz, &XYZ_D65_TO_D50_CAT16_TRANS)
+}
+
+/// Convert pipeline RGB to dt UCS JCH using a pre-transposed working-space→XYZ
+/// D50 matrix.  Matches `dt_ioppr_rgb_matrix_to_dt_UCS_JCH()` in iop_profile.h:410.
+///
+/// The matrix is `work_profile->matrix_in_transposed` (a 4×4 array of [f32;4]).
+/// `l_white` = `Y_to_dt_UCS_L_star(1.0f)`.
+#[inline(always)]
+pub fn rgb_to_dt_ucs_jch(rgb: &[f32; 4], matrix_in_transposed: &[[f32; 4]; 4], l_white: f32) -> [f32; 4] {
+    let xyz_d50  = apply_transposed_color_matrix(rgb, matrix_in_transposed);
+    let xyz_d65  = xyz_d50_to_d65(&xyz_d50);
+    let xyy      = d65_xyz_to_xyy(&xyz_d65);
+    xyy_to_dt_ucs_jch(&xyy, l_white)
+}
+
+/// Convert dt UCS JCH back to pipeline RGB.
+/// Inverse of `rgb_to_dt_ucs_jch`: JCH → xyY → XYZ D65 → XYZ D50 → RGB.
+#[inline(always)]
+pub fn dt_ucs_jch_to_rgb(jch: &[f32; 4], matrix_out_transposed: &[[f32; 4]; 4], l_white: f32) -> [f32; 4] {
+    let xyy     = dt_ucs_jch_to_xyy(jch, l_white);
+    let xyz_d65 = xyy_to_xyz(&xyy);
+    let xyz_d50 = xyz_d65_to_d50(&xyz_d65);
+    apply_transposed_color_matrix(&xyz_d50, matrix_out_transposed)
+}
+
 // ── eval_exp (unbounded LUT extrapolation) ────────────────────────────────────
 
 /// coeff[1] * (x * coeff[0])^coeff[2] — darktable's eval_exp for LUT tails.
@@ -263,6 +505,89 @@ pub fn get_rgb_matrix_luminance(
         rgb
     };
     matrix_in[1][0] * r[0] + matrix_in[1][1] * r[1] + matrix_in[1][2] * r[2]
+}
+
+#[cfg(test)]
+mod ucs_tests {
+    use super::*;
+
+    const L_WHITE: f32 = 2.098883786377; // Y_to_dt_UCS_L_star(1.0)
+
+    #[test]
+    fn l_star_round_trips() {
+        for y in [0.01, 0.1, 0.5, 1.0, 2.0_f32] {
+            let l = y_to_dt_ucs_l_star(y);
+            let y2 = dt_ucs_l_star_to_y(l);
+            assert!((y2 - y).abs() < 1e-5, "y={y} → l={l} → y2={y2}");
+        }
+    }
+
+    #[test]
+    fn xyy_ucs_jch_round_trips() {
+        // Mid-grey D65 (x=0.31, y=0.33, Y=0.5)
+        let xyy: [f32; 4] = [0.31271, 0.32902, 0.5, 0.0];
+        let jch = xyy_to_dt_ucs_jch(&xyy, L_WHITE);
+        let xyy2 = dt_ucs_jch_to_xyy(&jch, L_WHITE);
+        for c in 0..3 {
+            assert!((xyy2[c] - xyy[c]).abs() < 1e-4, "c={c}: {}->{}", xyy[c], xyy2[c]);
+        }
+    }
+
+    #[test]
+    fn jch_hsb_round_trips() {
+        let jch: [f32; 4] = [0.5, 0.3, 1.0, 0.0];
+        let hsb = dt_ucs_jch_to_hsb(&jch);
+        let jch2 = dt_ucs_hsb_to_jch(&hsb);
+        for c in 0..3 {
+            assert!((jch2[c] - jch[c]).abs() < 1e-5, "c={c}: {}->{}", jch[c], jch2[c]);
+        }
+    }
+
+    #[test]
+    fn apply_transposed_matrix_identity() {
+        // Identity 4×4 matrix → output = input
+        let m: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let inp = [0.3, 0.5, 0.7, 0.0];
+        let out = apply_transposed_color_matrix(&inp, &m);
+        for c in 0..3 { assert!((out[c] - inp[c]).abs() < 1e-6); }
+    }
+
+    #[test]
+    fn d50_d65_round_trip() {
+        let xyz = [0.2, 0.4, 0.3, 0.0_f32];
+        let d65 = xyz_d50_to_d65(&xyz);
+        let d50 = xyz_d65_to_d50(&d65);
+        for c in 0..3 { assert!((d50[c] - xyz[c]).abs() < 1e-5, "c={c}"); }
+    }
+
+    #[test]
+    fn rgb_ucs_jch_pipeline_produces_finite_values() {
+        // Use sRGB D65 matrix (identity-ish) — just verify no NaN/inf
+        let m: [[f32; 4]; 4] = [
+            [0.4124564, 0.2126729, 0.0193339, 0.0],
+            [0.3575761, 0.7151522, 0.1191920, 0.0],
+            [0.1804375, 0.0721750, 0.9503041, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let rgb = [0.5_f32, 0.3, 0.8, 0.0];
+        let jch = rgb_to_dt_ucs_jch(&rgb, &m, L_WHITE);
+        for c in 0..3 { assert!(jch[c].is_finite(), "c={c}: {}", jch[c]); }
+    }
+
+    #[test]
+    fn xyy_to_xyz_and_back() {
+        let xyy: [f32; 4] = [0.3, 0.4, 0.5, 0.0];
+        let xyz = xyy_to_xyz(&xyy);
+        let sum = xyz[0] + xyz[1] + xyz[2];
+        assert!((xyz[0] / sum - 0.3).abs() < 1e-5);
+        assert!((xyz[1] / sum - 0.4).abs() < 1e-5);
+        assert!((xyz[1] - 0.5).abs() < 1e-5);
+    }
 }
 
 #[cfg(test)]

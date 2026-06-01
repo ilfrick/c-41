@@ -72,6 +72,7 @@ pub mod blurs;
 pub mod filmicrgb;
 pub mod cacorrect;
 pub mod geometry;
+pub mod colorharmonizer;
 
 use crate::{params::IopParams, roi::RoiIn, Result};
 

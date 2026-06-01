@@ -1509,6 +1509,35 @@ void darkroom_filmicrgb_inpaint_noise(const float *in_buf,
                                        size_t width,
                                        size_t height);
 
+/*
+ * Colorharmonizer IOP — fused single-pass (smoothing <= 0).
+ * matrix_in/out_transposed are flat 16-float (4x4) working-space matrices.
+ * nodes/node_saturation are num_nodes floats; both may be NULL if num_nodes=0.
+ */
+void darkroom_colorharmonizer_fused(
+    const float *in_buf, float *out_buf, size_t npixels, size_t ch,
+    const float *matrix_in_transposed, const float *matrix_out_transposed,
+    float l_white,
+    const float *nodes, int num_nodes,
+    float pull_width, float pull_strength, float cutoff,
+    const float *node_saturation);
+
+/* Colorharmonizer — pass 1 of the smoothing path: RGB → JCH cache + corrections. */
+void darkroom_colorharmonizer_cache_pass(
+    const float *in_buf, float *jch_cache, float *corrections,
+    size_t npixels, size_t ch,
+    const float *matrix_in_transposed, float l_white,
+    const float *nodes, int num_nodes, float pull_width,
+    const float *node_saturation);
+
+/* Colorharmonizer — pass 2 of the smoothing path: apply corrections. */
+void darkroom_colorharmonizer_apply_pass(
+    const float *in_buf, float *out_buf,
+    const float *jch_cache, const float *corrections,
+    size_t npixels, size_t ch,
+    const float *matrix_out_transposed,
+    float l_white, float cutoff, float pull_strength);
+
 /* Cacorrect IOP — copy non-green Bayer channel to half-res buffer.
  * oldraw[row*h_width + col/2] = in[row*full_width + col]
  * Matches DT_OMP_FOR at src/iop/cacorrect.c:327. */
