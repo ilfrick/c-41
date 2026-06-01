@@ -1150,6 +1150,19 @@ void darkroom_diffuse_build_mask(const float *in_buf,
                                  float threshold);
 
 /*
+ * Diffuse IOP — inpaint mask initialisation with deterministic noise.
+ * Masked pixels: inpainted[k+c] = abs(gaussian_noise(orig[k+c], orig[k+c]))
+ *   using per-pixel xoshiro128+ state seeded from pixel position.
+ * Unmasked pixels: inpainted[k..k+4] = original[k..k+4].
+ * Matches inpaint_mask() in src/iop/diffuse.c:1302.
+ */
+void darkroom_diffuse_inpaint_mask(float *inpainted_buf,
+                                   const float *original_buf,
+                                   const unsigned char *mask_buf,
+                                   size_t width,
+                                   size_t height);
+
+/*
  * Colortransfer IOP — L-histogram-matching pass.
  *
  * Per pixel:

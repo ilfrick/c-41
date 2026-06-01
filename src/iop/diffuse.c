@@ -1305,32 +1305,8 @@ static inline void inpaint_mask(float *const restrict inpainted,
                                 const size_t width,
                                 const size_t height)
 {
-  // init the reconstruction with noise inside the masked areas
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width * 4; k += 4)
-  {
-    if(mask[k / 4])
-    {
-      const uint32_t i = k / width;
-      const uint32_t j = k - i;
-      uint32_t DT_ALIGNED_ARRAY state[4]
-          = { splitmix32(j + 1), splitmix32((uint64_t)(j + 1) * (i + 3)),
-              splitmix32(1337), splitmix32(666) };
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-
-      for_four_channels(c, aligned(inpainted, original, state:64))
-        inpainted[k + c] = fabsf(gaussian_noise(original[k + c],
-                                                original[k + c], i % 2 || j % 2, state));
-    }
-    else
-    {
-      for_four_channels(c, aligned(original, inpainted:64))
-        inpainted[k + c] = original[k + c];
-    }
-  }
+  // init the reconstruction with noise inside the masked areas (Rust FFI)
+  darkroom_diffuse_inpaint_mask(inpainted, original, mask, width, height);
 }
 
 void process(dt_iop_module_t *self,
