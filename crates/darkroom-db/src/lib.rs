@@ -5,6 +5,7 @@
 
 pub mod collection;
 pub mod film;
+pub mod history;
 pub mod image;
 pub mod metadata;
 pub mod tags;
