@@ -5,6 +5,7 @@
 
 pub mod collection;
 pub mod image;
+pub mod metadata;
 pub mod tags;
 pub mod ffi;
 
