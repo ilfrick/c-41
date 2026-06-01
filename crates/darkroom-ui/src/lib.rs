@@ -1,9 +1,8 @@
 //! GTK4 + libadwaita UI shell for Darkroom.
 //!
-//! Phase 3-ui-1: boots the application and presents a three-column layout
-//! (left panel | lighttable GridView | right panel). The lighttable uses
-//! a GtkGridView with a StringList model as a placeholder until the DB
-//! thumbnail pipeline is connected.
+//! Phase 3-ui-2: three-column layout with a real GtkGridView lighttable
+//! populated from darkroom-db (demo in-memory data until a real DB path
+//! is passed through).
 
 use adw::prelude::*;
 use adw::Application;
@@ -14,9 +13,9 @@ pub mod dialogs;
 pub mod lighttable;
 pub mod panels;
 
-pub const APP_ID: &str = "org.darkroom.Darkroom";
-pub const DEFAULT_WIDTH:  i32 = 1280;
-pub const DEFAULT_HEIGHT: i32 = 800;
+pub const APP_ID:         &str = "org.darkroom.Darkroom";
+pub const DEFAULT_WIDTH:   i32 = 1280;
+pub const DEFAULT_HEIGHT:  i32 = 800;
 
 /// Boot the GTK4 application. Blocks until the main window is closed.
 pub fn run() -> Result<glib::ExitCode> {
@@ -35,39 +34,32 @@ fn build_main_window(app: &Application) {
         .default_height(DEFAULT_HEIGHT)
         .build();
 
-    // ── Three-column layout: left panel | lighttable | right panel ──────────
+    // ── Build the lighttable and load demo / real DB data ──────────────────
+    let (lt_page, lt_model) = lighttable::lighttable_page();
+
+    // Populate from the library DB (empty string → in-memory demo data)
+    let db_path = std::env::var("DARKROOM_LIBRARY_DB").unwrap_or_default();
+    lighttable::lighttable_load_from_db(&lt_model, &db_path);
+
+    // Extract the ScrolledWindow from the NavigationPage so it fills the HBox
+    let scroll = lt_page.child().unwrap();
+    scroll.set_hexpand(true);
+
+    // ── Three-column layout ────────────────────────────────────────────────
     let hbox = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
-
-    // Left panel (collections / film rolls)
-    let left = panels::left_panel();
-    hbox.append(&left);
-
-    // Separator
+    hbox.append(&panels::left_panel());
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
-
-    // Lighttable — NavigationPage wraps the GridView
-    let lt_page = lighttable::lighttable_page();
-    // Unwrap the inner child (ScrolledWindow) from the NavigationPage
-    // and put it directly in the HBox so it expands to fill.
-    let scroll = lt_page.child().unwrap();
-    scroll.set_hexpand(true);
     hbox.append(&scroll);
-
-    // Separator
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
+    hbox.append(&panels::right_panel());
 
-    // Right panel (metadata / history)
-    let right = panels::right_panel();
-    hbox.append(&right);
-
-    // ── Header bar with view switcher ────────────────────────────────────────
+    // ── Header bar ─────────────────────────────────────────────────────────
     let header = adw::HeaderBar::new();
-    let title = adw::WindowTitle::new("Darkroom", "Lighttable");
+    let title  = adw::WindowTitle::new("Darkroom", "Lighttable");
     header.set_title_widget(Some(&title));
 
-    // ── Toolbar view: header + content ───────────────────────────────────────
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&hbox));
