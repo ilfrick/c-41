@@ -1,42 +1,29 @@
 //! GTK4 + libadwaita UI shell for Darkroom.
 //!
-//! The legacy C/GTK3 UI lives under src/views, src/libs, src/gui. This crate
-//! is the eventual replacement. The current state is a minimal entry point
-//! (an empty main window) so the rest of the toolchain — workspace build,
-//! container packaging, integration with darkroom-core — can be validated
-//! end-to-end. Real views (lighttable, darkroom, slideshow, …) are added
-//! incrementally as their dependencies in darkroom-core stabilise.
+//! Phase 3-ui-1: boots the application and presents a three-column layout
+//! (left panel | lighttable GridView | right panel). The lighttable uses
+//! a GtkGridView with a StringList model as a placeholder until the DB
+//! thumbnail pipeline is connected.
 
 use adw::prelude::*;
 use adw::Application;
 use anyhow::Result;
 use gtk4::ApplicationWindow;
 
-/// Application identifier used by GIO for desktop integration (single-instance
-/// lookup, file associations, settings backend, …). Keep stable across builds
-/// — changing it orphans saved window state and per-app GSettings.
-pub const APP_ID: &str = "org.darkroom.Darkroom";
+pub mod dialogs;
+pub mod lighttable;
+pub mod panels;
 
-/// Default window dimensions. The C UI persists last-known dimensions in
-/// `ui_last/gui_w` / `ui_last/gui_h`; we'll wire that through once the
-/// darkroom-core conf access lands in Rust.
+pub const APP_ID: &str = "org.darkroom.Darkroom";
 pub const DEFAULT_WIDTH:  i32 = 1280;
 pub const DEFAULT_HEIGHT: i32 = 800;
 
 /// Boot the GTK4 application. Blocks until the main window is closed.
-///
-/// Returns the libadwaita / GLib exit code so the binary can propagate it as
-/// its process exit status (matches the C `main()`'s gtk_main() contract).
 pub fn run() -> Result<glib::ExitCode> {
-    // libadwaita's Application is a thin wrapper around gtk4::Application that
-    // also initialises the Adwaita stylesheet provider — needed for the
-    // colour scheme tracking and switch widgets we rely on.
     let app = Application::builder()
         .application_id(APP_ID)
         .build();
-
     app.connect_activate(build_main_window);
-
     Ok(app.run())
 }
 
@@ -48,15 +35,43 @@ fn build_main_window(app: &Application) {
         .default_height(DEFAULT_HEIGHT)
         .build();
 
-    // Placeholder: a centred label until the lighttable view is ported.
-    // The real darkroom UI swaps this out for an AdwViewStack rooted at the
-    // current dt_view_t (lighttable / darkroom / slideshow / …).
-    let label = gtk4::Label::builder()
-        .label("Darkroom — Rust + GTK4 shell (work in progress)")
-        .halign(gtk4::Align::Center)
-        .valign(gtk4::Align::Center)
+    // ── Three-column layout: left panel | lighttable | right panel ──────────
+    let hbox = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
         .build();
-    window.set_child(Some(&label));
 
+    // Left panel (collections / film rolls)
+    let left = panels::left_panel();
+    hbox.append(&left);
+
+    // Separator
+    hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
+
+    // Lighttable — NavigationPage wraps the GridView
+    let lt_page = lighttable::lighttable_page();
+    // Unwrap the inner child (ScrolledWindow) from the NavigationPage
+    // and put it directly in the HBox so it expands to fill.
+    let scroll = lt_page.child().unwrap();
+    scroll.set_hexpand(true);
+    hbox.append(&scroll);
+
+    // Separator
+    hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
+
+    // Right panel (metadata / history)
+    let right = panels::right_panel();
+    hbox.append(&right);
+
+    // ── Header bar with view switcher ────────────────────────────────────────
+    let header = adw::HeaderBar::new();
+    let title = adw::WindowTitle::new("Darkroom", "Lighttable");
+    header.set_title_widget(Some(&title));
+
+    // ── Toolbar view: header + content ───────────────────────────────────────
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&hbox));
+
+    window.set_child(Some(&toolbar_view));
     window.present();
 }
