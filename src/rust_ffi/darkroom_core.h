@@ -1494,6 +1494,21 @@ void darkroom_filmicrgb_restore_ratios(float *ratios_buf,
                                         const float *norms_buf,
                                         size_t npixels);
 
+/*
+ * Filmicrgb IOP — inpaint_noise(): add statistical noise to highlights to
+ * seed the wavelet reconstruction. Uses per-pixel deterministic xoshiro128+.
+ * noise_distribution: 0=uniform, 1=gaussian, 2=poissonian.
+ * Matches inpaint_noise() in src/iop/filmicrgb.c:1062.
+ */
+void darkroom_filmicrgb_inpaint_noise(const float *in_buf,
+                                       const float *mask_buf,
+                                       float *inpainted,
+                                       float noise_level,
+                                       float threshold,
+                                       unsigned int noise_distribution,
+                                       size_t width,
+                                       size_t height);
+
 /* Cacorrect IOP — copy non-green Bayer channel to half-res buffer.
  * oldraw[row*h_width + col/2] = in[row*full_width + col]
  * Matches DT_OMP_FOR at src/iop/cacorrect.c:327. */

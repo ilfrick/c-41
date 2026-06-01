@@ -1064,44 +1064,11 @@ inline static void inpaint_noise(const float *const in, const float *const mask,
                                  const dt_noise_distribution_t noise_distribution,
                                  const size_t width, const size_t height)
 {
-  // add statistical noise in highlights to fill-in texture
-  // this creates "particules" in highlights, that will help the implicit partial derivative equation
-  // solver used in wavelets reconstruction to generate texture
-
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < height; i++)
-    for(size_t j = 0; j < width; j++)
-    {
-      // Init random number generator
-      uint32_t DT_ALIGNED_ARRAY state[4]
-        = { splitmix32(j + 1), splitmix32((j + 1) * (i + 3)), splitmix32(1337), splitmix32(666) };
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-
-      // get the mask value in [0 ; 1]
-      const size_t idx = i * width + j;
-      const size_t index = idx * 4;
-      const float weight = mask[idx];
-      const float *const restrict pix_in = DT_IS_ALIGNED_PIXEL(in + index);
-      dt_aligned_pixel_t noise = { 0.f };
-      dt_aligned_pixel_t sigma = { 0.f };
-      const int DT_ALIGNED_ARRAY flip[4] = { TRUE, FALSE, TRUE, FALSE };
-
-      for_each_channel(c,aligned(pix_in))
-        sigma[c] = pix_in[c] * noise_level / threshold;
-
-      // create statistical noise
-      dt_noise_generator_simd(noise_distribution, pix_in, sigma, flip, state, noise);
-
-      // add noise to input
-      dt_aligned_pixel_t pix_out;
-      for_each_channel(c,aligned(pix_in,noise,pix_out))
-        pix_out[c] = MAX(pix_in[c] * (1.0f - weight) + weight * noise[c], 0.0f);
-      copy_pixel_nontemporal(inpainted + index, pix_out);
-    }
-  dt_omploop_sfence();  // ensure that nontemporal write complete before we attempt to read the output
+  // add statistical noise in highlights (Rust FFI)
+  darkroom_filmicrgb_inpaint_noise(in, mask, inpainted,
+                                    noise_level, threshold,
+                                    (unsigned int)noise_distribution,
+                                    width, height);
 }
 
 inline static void wavelets_reconstruct_RGB(const float *const restrict HF, const float *const restrict LF,

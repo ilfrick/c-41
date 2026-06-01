@@ -123,6 +123,94 @@ pub fn dt_noise_generator(
     }
 }
 
+/// 4-channel uniform noise.
+/// Matches uniform_noise_simd() in noise_generator.h:139.
+/// Only fills channels 0..3 (channel 3 stays as mu[3] with 0-sigma).
+#[inline(always)]
+pub fn uniform_noise_4ch(mu: &[f32; 4], sigma: &[f32; 4], state: &mut [u32; 4]) -> [f32; 4] {
+    let mut out = *mu;
+    for c in 0..3 {
+        let n = xoshiro128plus(state);
+        out[c] = mu[c] + 2.0 * (n - 0.5) * sigma[c];
+    }
+    out
+}
+
+/// 4-channel Gaussian noise (Box-Muller, per-channel flip).
+/// `flip[c]` selects cos vs sin branch.
+/// Matches gaussian_noise_simd() in noise_generator.h:157.
+#[inline(always)]
+pub fn gaussian_noise_4ch(
+    mu: &[f32; 4],
+    sigma: &[f32; 4],
+    flip: &[bool; 4],
+    state: &mut [u32; 4],
+) -> [f32; 4] {
+    use std::f32::consts::TAU;
+    let mut u1 = [0.0_f32; 4];
+    let mut u2 = [0.0_f32; 4];
+    for c in 0..3 { u1[c] = xoshiro128plus(state).max(f32::MIN_POSITIVE); }
+    for c in 0..3 { u2[c] = xoshiro128plus(state); }
+    let mut out = [0.0_f32; 4];
+    for c in 0..4 {
+        let n = if flip[c] {
+            (-2.0 * u1[c].ln()).sqrt() * (TAU * u2[c]).cos()
+        } else {
+            (-2.0 * u1[c].ln()).sqrt() * (TAU * u2[c]).sin()
+        };
+        out[c] = n * sigma[c] + mu[c];
+    }
+    out
+}
+
+/// 4-channel Poissonian noise (Gaussian + Anscombe transform).
+/// Matches poisson_noise_simd() in noise_generator.h:196.
+#[inline(always)]
+pub fn poisson_noise_4ch(
+    mu: &[f32; 4],
+    sigma: &[f32; 4],
+    flip: &[bool; 4],
+    state: &mut [u32; 4],
+) -> [f32; 4] {
+    use std::f32::consts::TAU;
+    let mut u1 = [0.0_f32; 4];
+    let mut u2 = [0.0_f32; 4];
+    for c in 0..3 {
+        u1[c] = xoshiro128plus(state).max(f32::MIN_POSITIVE);
+        u2[c] = xoshiro128plus(state);
+    }
+    let mut out = [0.0_f32; 4];
+    for c in 0..4 {
+        let n = if flip[c] {
+            (-2.0 * u1[c].ln()).sqrt() * (TAU * u2[c]).cos()
+        } else {
+            (-2.0 * u1[c].ln()).sqrt() * (TAU * u2[c]).sin()
+        };
+        let r = n * sigma[c] + 2.0 * (mu[c] + 3.0 / 8.0).max(0.0).sqrt();
+        out[c] = (r * r - sigma[c] * sigma[c]) / 4.0 - 3.0 / 8.0;
+    }
+    out
+}
+
+/// 4-channel noise generator dispatcher.
+/// `distribution`: 0=uniform, 1=gaussian, 2=poissonian.
+/// `flip`: [true, false, true, false] as used in filmicrgb.
+/// Matches dt_noise_generator_simd() in noise_generator.h:237.
+#[inline(always)]
+pub fn dt_noise_generator_4ch(
+    distribution: u32,
+    mu: &[f32; 4],
+    param: &[f32; 4],
+    flip: &[bool; 4],
+    state: &mut [u32; 4],
+) -> [f32; 4] {
+    match distribution {
+        1 => gaussian_noise_4ch(mu, param, flip, state),
+        2 => poisson_noise_4ch(mu, param, flip, state),
+        _ => uniform_noise_4ch(mu, param, state),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

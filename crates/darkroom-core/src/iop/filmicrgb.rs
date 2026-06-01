@@ -101,6 +101,70 @@ pub unsafe extern "C" fn darkroom_filmicrgb_restore_ratios(
     }
 }
 
+/// Add statistical noise to highlights to seed the wavelet reconstruction.
+///
+/// For each pixel (i, j):
+///   seed xoshiro128+ from (i, j) → 4 warm-up rounds
+///   sigma[c] = pix_in[c] * noise_level / threshold
+///   noise = dt_noise_generator_simd(dist, pix_in, sigma, flip=[T,F,T,F])
+///   pix_out[c] = max(pix_in[c]*(1-weight) + weight*noise[c], 0)
+///
+/// `noise_distribution`: 0 = uniform, 1 = gaussian, 2 = poissonian.
+/// Matches `inpaint_noise()` in src/iop/filmicrgb.c:1062.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_filmicrgb_inpaint_noise(
+    in_buf:     *const f32,
+    mask_buf:   *const f32,
+    inpainted:  *mut f32,
+    noise_level: f32,
+    threshold:   f32,
+    noise_distribution: u32,
+    width:  usize,
+    height: usize,
+) {
+    let npx = width * height;
+    if npx == 0 { return; }
+    let inp  = std::slice::from_raw_parts(in_buf,   npx * 4);
+    let mask = std::slice::from_raw_parts(mask_buf, npx);
+    let out  = std::slice::from_raw_parts_mut(inpainted, npx * 4);
+
+    const FLIP: [bool; 4] = [true, false, true, false];
+
+    for i in 0..height {
+        for j in 0..width {
+            let mut state = [
+                crate::math::splitmix32((j + 1) as u64),
+                crate::math::splitmix32(((j + 1) * (i + 3)) as u64),
+                crate::math::splitmix32(1337),
+                crate::math::splitmix32(666),
+            ];
+            // 4 warm-up rounds
+            for _ in 0..4 { crate::math::xoshiro128plus(&mut state); }
+
+            let idx   = i * width + j;
+            let index = idx * 4;
+            let weight = mask[idx];
+            let mu: [f32; 4] = [inp[index], inp[index+1], inp[index+2], inp[index+3]];
+
+            let thr = threshold.max(1e-6); // avoid division by zero
+            let sigma: [f32; 4] = [
+                mu[0] * noise_level / thr,
+                mu[1] * noise_level / thr,
+                mu[2] * noise_level / thr,
+                mu[3] * noise_level / thr,
+            ];
+
+            let noise = crate::math::dt_noise_generator_4ch(
+                noise_distribution, &mu, &sigma, &FLIP, &mut state,
+            );
+
+            for c in 0..4 {
+                out[index + c] = (mu[c] * (1.0 - weight) + weight * noise[c]).max(0.0);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +205,53 @@ mod tests {
         let mut out = vec![-1.0_f32; 12];
         unsafe { darkroom_filmicrgb_display_mask(mask.as_ptr(), out.as_mut_ptr(), 3); }
         for v in &out { assert!((v - 0.42).abs() < 1e-6); }
+    }
+
+    #[test]
+    fn inpaint_noise_zero_weight_passes_through_rgb() {
+        // weight=0 → out[c] = max(inp[c] * 1 + 0 * noise[c], 0) for c in 0..3.
+        // Channel 3 (alpha) is left as max(NaN,0)=0 in both C and Rust since
+        // gaussian_noise_simd fills u1/u2 for channels 0..2 only, making u1[3]=0
+        // → log(0)=-∞ → noise[3]=inf → 0*inf=NaN → max(NaN,0)=0.
+        let inp  = vec![0.3_f32, 0.5, 0.7, 1.0];
+        let mask = vec![0.0_f32; 1];
+        let mut out = vec![-1.0_f32; 4];
+        unsafe {
+            darkroom_filmicrgb_inpaint_noise(
+                inp.as_ptr(), mask.as_ptr(), out.as_mut_ptr(),
+                0.1, 0.9, 1, 1, 1,
+            );
+        }
+        // Only check RGB channels; alpha behaviour matches C (becomes 0 via NaN path)
+        for c in 0..3 { assert!((out[c] - inp[c]).abs() < 1e-5, "c={c}: out={}", out[c]); }
+    }
+
+    #[test]
+    fn inpaint_noise_output_is_nonneg() {
+        // Gaussian noise * some weight; abs ensures non-negative output
+        let inp  = vec![0.5_f32, 0.5, 0.5, 1.0];
+        let mask = vec![1.0_f32];
+        let mut out = vec![-1.0_f32; 4];
+        unsafe {
+            darkroom_filmicrgb_inpaint_noise(
+                inp.as_ptr(), mask.as_ptr(), out.as_mut_ptr(),
+                0.5, 0.5, 1, 1, 1,
+            );
+        }
+        for c in 0..4 { assert!(out[c] >= 0.0, "c={c}: out={}", out[c]); }
+    }
+
+    #[test]
+    fn inpaint_noise_is_deterministic() {
+        let inp  = vec![0.4_f32, 0.6, 0.2, 1.0];
+        let mask = vec![0.8_f32];
+        let mut o1 = vec![0.0_f32; 4];
+        let mut o2 = vec![0.0_f32; 4];
+        unsafe {
+            darkroom_filmicrgb_inpaint_noise(inp.as_ptr(), mask.as_ptr(), o1.as_mut_ptr(), 0.3, 0.7, 1, 1, 1);
+            darkroom_filmicrgb_inpaint_noise(inp.as_ptr(), mask.as_ptr(), o2.as_mut_ptr(), 0.3, 0.7, 1, 1, 1);
+        }
+        assert_eq!(o1, o2);
     }
 
     #[test]
