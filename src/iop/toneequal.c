@@ -1376,15 +1376,7 @@ static inline void compute_log_histogram_and_stats(const float *const restrict l
   memset(temp_hist, 0, sizeof(int) * TEMP_SAMPLES);
 
   // Split exposure in bins
-  DT_OMP_FOR_SIMD(reduction(+:temp_hist[:TEMP_SAMPLES]))
-  for(size_t k = 0; k < num_elem; k++)
-  {
-    // extended histogram bins between [-10; +6] EV remapped between [0 ; 2 * UI_SAMPLES]
-    const int index =
-      CLAMP((int)(((log2f(luminance[k]) + 10.0f) / 16.0f) * (float)TEMP_SAMPLES),
-            0, TEMP_SAMPLES - 1);
-    temp_hist[index] += 1;
-  }
+  darkroom_toneequal_build_log_histogram(luminance, num_elem, temp_hist, TEMP_SAMPLES);
 
   const int first = (int)((float)num_elem * 0.05f);
   const int last = (int)((float)num_elem * (1.0f - 0.95f));

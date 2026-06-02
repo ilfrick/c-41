@@ -270,3 +270,31 @@ mod tests {
         assert!(out[0] > 0.0 && out[0] < 0.5, "intensity={}", out[0]);
     }
 }
+
+/// Build a log-exposure histogram from a luminance buffer.
+///
+/// Each luminance value is mapped to an EV bin in [-10, +6]:
+///   index = CLAMP((log2(lum) + 10) / 16 * temp_samples, 0, temp_samples-1)
+/// hist[index] += 1
+///
+/// `temp_samples` = 2 * UI_SAMPLES = 512 in production. `hist` must be
+/// zeroed by the caller and have at least `temp_samples` entries.
+/// Matches DT_OMP_FOR_SIMD(reduction) in src/iop/toneequal.c:1379.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_toneequal_build_log_histogram(
+    luminance: *const f32,
+    num_elem: usize,
+    hist: *mut i32,
+    temp_samples: usize,
+) {
+    if num_elem == 0 || temp_samples == 0 { return; }
+    let lum = std::slice::from_raw_parts(luminance, num_elem);
+    let h   = std::slice::from_raw_parts_mut(hist, temp_samples);
+    let ts  = temp_samples as f32;
+    for k in 0..num_elem {
+        let ev = lum[k].log2();
+        let idx = (((ev + 10.0) / 16.0) * ts) as i64;
+        let idx = idx.clamp(0, (temp_samples - 1) as i64) as usize;
+        h[idx] += 1;
+    }
+}

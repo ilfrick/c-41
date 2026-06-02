@@ -1517,6 +1517,10 @@ void darkroom_toneequal_mask_display(const float *in_buf,
                                      size_t in_height,
                                      size_t offset_x,
                                      size_t offset_y);
+void darkroom_toneequal_build_log_histogram(const float *luminance,
+                                            size_t num_elem,
+                                            int *hist,
+                                            size_t temp_samples);
 
 /*
  * Useless IOP — checkerboard dimming example module.
