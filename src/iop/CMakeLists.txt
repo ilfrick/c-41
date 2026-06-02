@@ -38,6 +38,9 @@ macro (add_iop _lib _src)
   # to "", no compilation will happen. this is needed for proper IDE support.
   add_library(${_lib} MODULE ${_output} ${OPT_SRC} ${_input})
   target_link_libraries(${_lib} lib_darktable)
+  if(TARGET darkroom_core)
+    target_link_libraries(${_lib} darkroom_core)
+  endif()
 
   if (WIN32)
     _detach_debuginfo (${_lib} ${CMAKE_INSTALL_LIBDIR}/darktable/plugins)
