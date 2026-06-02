@@ -1359,6 +1359,37 @@ void darkroom_colorequal_apply_prefilter(float *uv_buf,
                                          const float *satweights,
                                          size_t satsize);
 
+/* colorequal.c:698 — build guide×corrections correlation cross-products */
+void darkroom_colorequal_init_correlations(
+    const float *uv_buf, const float *corrections_buf,
+    const float *b_corrections, float *corr_buf, size_t pixels);
+
+/* colorequal.c:727 — subtract averages from correlations */
+void darkroom_colorequal_finish_correlations(
+    const float *uv_buf, const float *corrections_buf,
+    const float *b_corrections, float *corr_buf, size_t pixels);
+
+/* colorequal.c:755 — compute guided-filter regression params from correlations */
+void darkroom_colorequal_compute_guided_params(
+    const float *uv_buf, const float *covariance_buf, const float *correlations,
+    const float *corrections_buf, const float *b_corrections,
+    float *a_buf, float *b_buf, size_t pixels, float eps);
+
+/* colorequal.c:823 — apply guided filter with sigmoid weighting to corrections */
+void darkroom_colorequal_apply_guided_filter(
+    const float *uv_buf, const float *saturation, const float *gradients,
+    const float *a_buf, const float *b_buf,
+    float *corrections, float *b_corrections,
+    size_t npixels, float sat_shift, float bright_shift,
+    const float *satweights, size_t satsize);
+
+/* colorequal.c:944 — STEP 1: RGB → dt UCS UV + saturation + L*.
+ * input_matrix is flat 16-float (4×4) non-transposed:
+ *   XYZ_D50_to_D65_CAT16 × work_profile->matrix_in */
+void darkroom_colorequal_rgb_to_ucs_uv(
+    const float *in_buf, float *uv_buf, float *saturation, float *lscharr,
+    size_t npixels, size_t ch, const float *input_matrix);
+
 /*
  * Toneequal IOP — LUT-based correction apply.
  * For each pixel: correction = lut[round((clamp(log2(lum), min_ev, max_ev) - min_ev) * lut_res)]

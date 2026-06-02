@@ -695,19 +695,7 @@ static void _guide_with_chromaticity(float *const restrict UV,
     return;
   }
 
-  DT_OMP_FOR_SIMD(aligned(ds_UV, ds_corrections, ds_b_corrections, correlations: 64))
-  for(size_t k = 0; k < ds_pixels; k++)
-  {
-    // corr(sat, U)
-    correlations[4 * k + 0] = ds_UV[2 * k + 0] * ds_corrections[2 * k + 1];
-    // corr(sat, V)
-    correlations[4 * k + 1] = ds_UV[2 * k + 1] * ds_corrections[2 * k + 1];
-
-    // corr(bright, U)
-    correlations[4 * k + 2] = ds_UV[2 * k + 0] * ds_b_corrections[k];
-    // corr(bright, V)
-    correlations[4 * k + 3] = ds_UV[2 * k + 1] * ds_b_corrections[k];
-  }
+  darkroom_colorequal_init_correlations(ds_UV, ds_corrections, ds_b_corrections, correlations, ds_pixels);
 
   // Compute the local averages of everything over the window size We
   // use a gaussian blur as a weighted local average because it's a
@@ -724,15 +712,7 @@ static void _guide_with_chromaticity(float *const restrict UV,
   _finish_covariance(ds_pixels, ds_UV, covariance);
 
   // Finish the guide * guided correlation computation
-  DT_OMP_FOR_SIMD(aligned(ds_UV, ds_corrections, correlations: 64))
-  for(size_t k = 0; k < ds_pixels; k++)
-  {
-    correlations[4 * k + 0] -= ds_UV[2 * k + 0] * ds_corrections[2 * k + 1];
-    correlations[4 * k + 1] -= ds_UV[2 * k + 1] * ds_corrections[2 * k + 1];
-
-    correlations[4 * k + 2] -= ds_UV[2 * k + 0] * ds_b_corrections[k];
-    correlations[4 * k + 3] -= ds_UV[2 * k + 1] * ds_b_corrections[k];
-  }
+  darkroom_colorequal_finish_correlations(ds_UV, ds_corrections, ds_b_corrections, correlations, ds_pixels);
 
   // Compute a and b the params of the guided filters
   float *const restrict ds_a = dt_alloc_align_float(4 * ds_pixels);
@@ -752,37 +732,9 @@ static void _guide_with_chromaticity(float *const restrict UV,
     return;
   }
 
-  DT_OMP_FOR_SIMD(aligned(ds_UV, covariance, correlations, ds_corrections, ds_b_corrections, ds_a, ds_b: 64))
-  for(size_t k = 0; k < ds_pixels; k++)
-  {
-    // Extract the 2×2 covariance matrix sigma = cov(U, V) at current pixel
-    // and add the covariance threshold : sigma' = sigma + epsilon * Identity
-    const dt_aligned_pixel_t Sigma
-        = { covariance[4 * k + 0] + eps,
-            covariance[4 * k + 1],
-            covariance[4 * k + 2],
-            covariance[4 * k + 3] + eps };
-
-    // Invert the 2×2 sigma matrix algebraically
-    // see https://www.mathcentre.ac.uk/resources/uploaded/sigma-matrices7-2009-1.pdf
-    const float det = Sigma[0] * Sigma[3] - Sigma[1] * Sigma[2];
-    // Note : epsilon prevents determinant == 0 so the invert exists all the time
-    if(fabsf(det) > 4.f * FLT_EPSILON)
-    {
-      const dt_aligned_pixel_t sigma_inv = { Sigma[3] / det, -Sigma[1] / det, -Sigma[2] / det, Sigma[0] / det };
-      ds_a[4 * k + 0] = (correlations[4 * k + 0] * sigma_inv[0] + correlations[4 * k + 1] * sigma_inv[1]);
-      ds_a[4 * k + 1] = (correlations[4 * k + 0] * sigma_inv[2] + correlations[4 * k + 1] * sigma_inv[3]);
-      ds_a[4 * k + 2] = (correlations[4 * k + 2] * sigma_inv[0] + correlations[4 * k + 3] * sigma_inv[1]);
-      ds_a[4 * k + 3] = (correlations[4 * k + 2] * sigma_inv[2] + correlations[4 * k + 3] * sigma_inv[3]);
-    }
-    else
-    {
-      ds_a[4 * k + 0] = ds_a[4 * k + 1] = ds_a[4 * k + 2] = ds_a[4 * k + 3] = 0.f;
-    }
-    // b = avg(chan) - dot_product(a_chan * avg(UV))
-    ds_b[2 * k + 0] = ds_corrections[2 * k + 1] - ds_a[4 * k + 0] * ds_UV[2 * k + 0]  - ds_a[4 * k + 1] * ds_UV[2 * k + 1];
-    ds_b[2 * k + 1] = ds_b_corrections[k]       - ds_a[4 * k + 2] * ds_UV[2 * k + 0]  - ds_a[4 * k + 3] * ds_UV[2 * k + 1];
-  }
+  darkroom_colorequal_compute_guided_params(
+      ds_UV, covariance, correlations, ds_corrections, ds_b_corrections,
+      ds_a, ds_b, ds_pixels, eps);
 
   if(resized)
   {
@@ -819,18 +771,10 @@ static void _guide_with_chromaticity(float *const restrict UV,
     }
   }
 
-  // Apply the guided filter
-  DT_OMP_FOR_SIMD(aligned(a, b, corrections, saturation, gradients, UV: 64))
-  for(size_t k = 0; k < pixels; k++)
-  {
-    // For each correction factor, we re-express it as a[0] * U + a[1] * V + b
-    const float uv[2] = { UV[2 * k + 0], UV[2 * k + 1] };
-    const float cv[2] = { a[4 * k + 0] * uv[0] + a[4 * k + 1] * uv[1] + b[2 * k + 0],
-                          a[4 * k + 2] * uv[0] + a[4 * k + 3] * uv[1] + b[2 * k + 1] };
-    corrections[2 * k + 1] = 1.0f + (cv[0] - 1.0f) * _get_satweight(saturation[k] - sat_shift);
-    const float gradient_weight = 1.0f - CLIP(gradients[k]);
-    b_corrections[k] = cv[1] * gradient_weight * _get_satweight(saturation[k] - bright_shift);
-  }
+  // Apply the guided filter (Rust FFI)
+  darkroom_colorequal_apply_guided_filter(
+      UV, saturation, gradients, a, b, corrections, b_corrections,
+      pixels, sat_shift, bright_shift, satweights, (size_t)SATSIZE);
   dt_free_align(a);
   dt_free_align(b);
 }
@@ -940,29 +884,10 @@ void process(dt_iop_module_t *self,
   _prepare_process(roi_in->scale / piece->iscale, d,
     &white, &sat_shift, &max_brightness_shift, &corr_max_brightness_shift, &bright_shift, &gradient_amp, &hue_sigma, &par_sigma, &sat_sigma, &scharr_sigma);
 
-  // STEP 1: convert image from RGB to darktable UCS LUV and calc saturation
-  DT_OMP_FOR()
-  for(size_t k = 0; k < npixels; k++)
-  {
-    const float *const restrict pix_in = DT_IS_ALIGNED_PIXEL(in + k * 4);
-    float *const restrict uv = UV + k * 2;
-
-    // Convert to XYZ D65
-    dt_aligned_pixel_t XYZ_D65 = { 0.0f, 0.0f, 0.0f, 0.0f };
-    dot_product(pix_in, input_matrix, XYZ_D65);
-    // Convert to dt UCS 22 UV and store UV
-    dt_aligned_pixel_t xyY = { 0.0f, 0.0f, 0.0f, 0.0f };
-    dt_D65_XYZ_to_xyY(XYZ_D65, xyY);
-
-    // calc saturation from input data
-    const float dmin = min3f(pix_in);
-    const float dmax = max3f(pix_in);
-    const float delta = dmax - dmin;
-    saturation[k] = (dmax > NORM_MIN && delta > NORM_MIN) ? delta / dmax : 0.0f;
-
-    xyY_to_dt_UCS_UV(xyY, uv);
-    Lscharr[k] = Y_to_dt_UCS_L_star(xyY[2]);
-  }
+  // STEP 1: convert image from RGB to darktable UCS LUV and calc saturation (Rust FFI)
+  darkroom_colorequal_rgb_to_ucs_uv(in, UV, saturation, Lscharr,
+                                     npixels, (size_t)piece->colors,
+                                     (const float *)input_matrix);
 
   dt_gaussian_mean_blur(saturation, width, height, 1, sat_sigma);
 

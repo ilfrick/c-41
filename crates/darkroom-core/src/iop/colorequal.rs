@@ -1,4 +1,4 @@
-use crate::{params::IopParams, roi::RoiIn, Result};
+use crate::{color, params::IopParams, roi::RoiIn, Result};
 use super::{ClBuffer, IopProcess};
 
 pub struct Colorequal;
@@ -189,6 +189,231 @@ pub unsafe extern "C" fn darkroom_colorequal_apply_prefilter(
         let w = get_satweight(sat[k] - sat_shift, sw, satsize);
         uv[2 * k]     = u + w * (u_corr - u);
         uv[2 * k + 1] = v + w * (v_corr - v);
+    }
+}
+
+// ── _guide_with_chromaticity helpers ─────────────────────────────────────────
+
+/// Build the guide×corrections correlation matrix.
+///
+///   corr[k*4+0] = UV[k*2+0] * corrections[k*2+1]   corr(U, sat)
+///   corr[k*4+1] = UV[k*2+1] * corrections[k*2+1]   corr(V, sat)
+///   corr[k*4+2] = UV[k*2+0] * b_corrections[k]      corr(U, bright)
+///   corr[k*4+3] = UV[k*2+1] * b_corrections[k]      corr(V, bright)
+///
+/// Matches the DT_OMP_FOR_SIMD at src/iop/colorequal.c:698.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorequal_init_correlations(
+    uv_buf:           *const f32,
+    corrections_buf:  *const f32,
+    b_corrections:    *const f32,
+    corr_buf:         *mut f32,
+    pixels: usize,
+) {
+    if pixels == 0 { return; }
+    let uv   = std::slice::from_raw_parts(uv_buf,          pixels * 2);
+    let corr_in = std::slice::from_raw_parts(corrections_buf, pixels * 2);
+    let bcorr   = std::slice::from_raw_parts(b_corrections,   pixels);
+    let corr    = std::slice::from_raw_parts_mut(corr_buf,    pixels * 4);
+    for k in 0..pixels {
+        let u  = uv[2 * k];
+        let v  = uv[2 * k + 1];
+        let cs = corr_in[2 * k + 1];
+        let cb = bcorr[k];
+        corr[4 * k]     = u * cs;
+        corr[4 * k + 1] = v * cs;
+        corr[4 * k + 2] = u * cb;
+        corr[4 * k + 3] = v * cb;
+    }
+}
+
+/// Finish the correlations by subtracting avg(UV) × avg(corrections).
+///
+/// Matches the DT_OMP_FOR_SIMD at src/iop/colorequal.c:727.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorequal_finish_correlations(
+    uv_buf:           *const f32,
+    corrections_buf:  *const f32,
+    b_corrections:    *const f32,
+    corr_buf:         *mut f32,
+    pixels: usize,
+) {
+    if pixels == 0 { return; }
+    let uv      = std::slice::from_raw_parts(uv_buf,          pixels * 2);
+    let corr_in = std::slice::from_raw_parts(corrections_buf, pixels * 2);
+    let bcorr   = std::slice::from_raw_parts(b_corrections,   pixels);
+    let corr    = std::slice::from_raw_parts_mut(corr_buf,    pixels * 4);
+    for k in 0..pixels {
+        let u  = uv[2 * k];
+        let v  = uv[2 * k + 1];
+        let cs = corr_in[2 * k + 1];
+        let cb = bcorr[k];
+        corr[4 * k]     -= u * cs;
+        corr[4 * k + 1] -= v * cs;
+        corr[4 * k + 2] -= u * cb;
+        corr[4 * k + 3] -= v * cb;
+    }
+}
+
+/// Compute guided-filter regression params (a, b) from covariance + correlations.
+///
+/// Same 2×2 matrix inversion as `darkroom_colorequal_prepare_prefilter` but:
+///   - numerator is `correlations` (not `covariance`)
+///   - `b[k*2+0] = corrections[k*2+1] - a·UV`
+///   - `b[k*2+1] = b_corrections[k]  - a·UV`
+///
+/// Matches the DT_OMP_FOR_SIMD at src/iop/colorequal.c:755.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorequal_compute_guided_params(
+    uv_buf:          *const f32,
+    covariance_buf:  *const f32,
+    correlations:    *const f32,
+    corrections_buf: *const f32,
+    b_corrections:   *const f32,
+    a_buf: *mut f32,
+    b_buf: *mut f32,
+    pixels: usize,
+    eps: f32,
+) {
+    if pixels == 0 { return; }
+    let uv    = std::slice::from_raw_parts(uv_buf,          pixels * 2);
+    let cov   = std::slice::from_raw_parts(covariance_buf,  pixels * 4);
+    let cor   = std::slice::from_raw_parts(correlations,    pixels * 4);
+    let corr  = std::slice::from_raw_parts(corrections_buf, pixels * 2);
+    let bcorr = std::slice::from_raw_parts(b_corrections,   pixels);
+    let a     = std::slice::from_raw_parts_mut(a_buf, pixels * 4);
+    let b     = std::slice::from_raw_parts_mut(b_buf, pixels * 2);
+
+    for k in 0..pixels {
+        let sigma = [
+            cov[4 * k]     + eps,
+            cov[4 * k + 1],
+            cov[4 * k + 2],
+            cov[4 * k + 3] + eps,
+        ];
+        let det = sigma[0] * sigma[3] - sigma[1] * sigma[2];
+        if det.abs() > 4.0 * f32::EPSILON {
+            let si = [sigma[3]/det, -sigma[1]/det, -sigma[2]/det, sigma[0]/det];
+            a[4*k]   = cor[4*k]*si[0] + cor[4*k+1]*si[1];
+            a[4*k+1] = cor[4*k]*si[2] + cor[4*k+1]*si[3];
+            a[4*k+2] = cor[4*k+2]*si[0] + cor[4*k+3]*si[1];
+            a[4*k+3] = cor[4*k+2]*si[2] + cor[4*k+3]*si[3];
+        } else {
+            a[4*k] = 0.0; a[4*k+1] = 0.0; a[4*k+2] = 0.0; a[4*k+3] = 0.0;
+        }
+        let u = uv[2*k]; let v = uv[2*k+1];
+        b[2*k]   = corr[2*k+1]  - a[4*k]*u - a[4*k+1]*v;
+        b[2*k+1] = bcorr[k]     - a[4*k+2]*u - a[4*k+3]*v;
+    }
+}
+
+/// Apply the guided-filter to corrections using the sigmoid saturation weighting.
+///
+/// For each pixel k:
+///   cv[0] = a[k*4+0]*U + a[k*4+1]*V + b[k*2+0]
+///   cv[1] = a[k*4+2]*U + a[k*4+3]*V + b[k*2+1]
+///   corrections[k*2+1] = 1 + (cv[0]-1) * get_satweight(sat[k] - sat_shift)
+///   gradient_weight    = 1 - CLIP(gradients[k])
+///   b_corrections[k]   = cv[1] * gradient_weight * get_satweight(sat[k] - bright_shift)
+///
+/// Matches the DT_OMP_FOR_SIMD at src/iop/colorequal.c:823.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorequal_apply_guided_filter(
+    uv_buf:       *const f32,
+    saturation:   *const f32,
+    gradients:    *const f32,
+    a_buf:        *const f32,
+    b_buf:        *const f32,
+    corrections:  *mut f32,
+    b_corrections: *mut f32,
+    npixels: usize,
+    sat_shift: f32,
+    bright_shift: f32,
+    satweights: *const f32,
+    satsize: usize,
+) {
+    if npixels == 0 || satsize == 0 { return; }
+    let uv   = std::slice::from_raw_parts(uv_buf,     npixels * 2);
+    let sat  = std::slice::from_raw_parts(saturation, npixels);
+    let grad = std::slice::from_raw_parts(gradients,  npixels);
+    let a    = std::slice::from_raw_parts(a_buf,      npixels * 4);
+    let b    = std::slice::from_raw_parts(b_buf,      npixels * 2);
+    let corr = std::slice::from_raw_parts_mut(corrections,   npixels * 2);
+    let bcorr = std::slice::from_raw_parts_mut(b_corrections, npixels);
+    let sw   = std::slice::from_raw_parts(satweights, 2 * satsize + 1);
+
+    for k in 0..npixels {
+        let u = uv[2*k]; let v = uv[2*k+1];
+        let cv0 = a[4*k]*u + a[4*k+1]*v + b[2*k];
+        let cv1 = a[4*k+2]*u + a[4*k+3]*v + b[2*k+1];
+        let w_sat  = get_satweight(sat[k] - sat_shift,   sw, satsize);
+        let w_bri  = get_satweight(sat[k] - bright_shift, sw, satsize);
+        let gradient_weight = (1.0 - grad[k]).clamp(0.0, 1.0);
+        corr[2*k+1]  = 1.0 + (cv0 - 1.0) * w_sat;
+        bcorr[k]     = cv1 * gradient_weight * w_bri;
+    }
+}
+
+// ── Step 1: RGB → dt UCS UV ───────────────────────────────────────────────────
+
+const NORM_MIN: f32 = 1.52587890625e-05; // 2^-16, from common/math.h
+
+/// STEP 1 of colorequal process(): convert RGB to dt UCS UV + saturation + L*.
+///
+/// For each pixel k:
+///   XYZ_D65 = dot_product(pix_in, input_matrix)   (non-transposed)
+///   xyY     = d65_xyz_to_xyy(XYZ_D65)
+///   sat[k]  = delta / dmax  (0 if dmax or delta < NORM_MIN)
+///   UV[k*2..] = xyY_to_dt_UCS_UV(xyY)
+///   Lscharr[k] = Y_to_dt_UCS_L_star(xyY[2])
+///
+/// `input_matrix` is a flat 16-float row-major 4×4 matrix:
+///   input_matrix = XYZ_D50_to_D65_CAT16 × work_profile->matrix_in
+///
+/// Matches the DT_OMP_FOR at src/iop/colorequal.c:944.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorequal_rgb_to_ucs_uv(
+    in_buf:       *const f32,
+    uv_buf:       *mut f32,
+    saturation:   *mut f32,
+    lscharr:      *mut f32,
+    npixels: usize,
+    ch: usize,
+    input_matrix: *const f32,   // flat 16-float (4×4)
+) {
+    if npixels == 0 || ch == 0 { return; }
+    let inp = std::slice::from_raw_parts(in_buf, npixels * ch);
+    let uv  = std::slice::from_raw_parts_mut(uv_buf,    npixels * 2);
+    let sat = std::slice::from_raw_parts_mut(saturation, npixels);
+    let ls  = std::slice::from_raw_parts_mut(lscharr,    npixels);
+
+    let m_slice = std::slice::from_raw_parts(input_matrix, 16);
+    let mut m = [[0.0_f32; 4]; 4];
+    for r in 0..4 { for c in 0..4 { m[r][c] = m_slice[r * 4 + c]; } }
+
+    for k in 0..npixels {
+        let b = k * ch;
+        let pix = [inp[b], inp[b+1], inp[b+2], inp[b+3].max(0.0)];
+
+        // dot_product: out[i] = M[i] · pix (row-major, non-transposed)
+        let xyz_d65 = color::dot_product(&pix, &m);
+
+        // XYZ D65 → xyY with D65 white-point fallback
+        let xyy = color::d65_xyz_to_xyy(&xyz_d65);
+
+        // Saturation from input RGB
+        let dmax = pix[0].max(pix[1]).max(pix[2]);
+        let dmin = pix[0].min(pix[1]).min(pix[2]);
+        let delta = dmax - dmin;
+        sat[k] = if dmax > NORM_MIN && delta > NORM_MIN { delta / dmax } else { 0.0 };
+
+        // UV in dt UCS space
+        let uv_pair = color::xyy_to_dt_ucs_uv(&xyy);
+        uv[2*k]   = uv_pair[0];
+        uv[2*k+1] = uv_pair[1];
+
+        // L* for later JCH conversion
+        ls[k] = color::y_to_dt_ucs_l_star(xyy[2]);
     }
 }
 

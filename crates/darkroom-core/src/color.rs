@@ -362,6 +362,20 @@ pub fn xyy_to_xyz(xyy: &[f32; 4]) -> [f32; 4] {
 
 // ── Matrix operations + chromatic adaptation ─────────────────────────────────
 
+/// Standard (non-transposed) row-major 3×4 matrix product.
+///
+/// `out[i] = M[i] · in`  (i in 0..3)
+///
+/// Matches `dot_product()` in src/common/math.h:279.
+#[inline(always)]
+pub fn dot_product(inp: &[f32; 4], m: &[[f32; 4]; 4]) -> [f32; 4] {
+    let mut out = [0.0_f32; 4];
+    for i in 0..4 {
+        out[i] = m[i][0]*inp[0] + m[i][1]*inp[1] + m[i][2]*inp[2] + m[i][3]*inp[3];
+    }
+    out
+}
+
 /// Apply a transposed 4×4 colour matrix (stored row-major with padding).
 ///
 /// out[r] = M[0][r]*in[0] + M[1][r]*in[1] + M[2][r]*in[2]
