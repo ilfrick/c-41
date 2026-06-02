@@ -1460,7 +1460,7 @@ void darkroom_colorequal_rgb_to_ucs_uv(
     const float *in_buf, float *uv_buf, float *saturation, float *lscharr,
     size_t npixels, size_t ch, const float *input_matrix);
 
-/* colorequal.c:974 -- STEP 3: L*/UV -> JCH -> HSB + hue/sat/brightness corrections.
+/* colorequal.c:974 -- STEP 3: Lab-UV -> JCH -> HSB + hue/sat/brightness corrections.
  * lut_hue/saturation/brightness are each LUT_ELEM=512 floats. */
 void darkroom_colorequal_compute_hsb_corrections(
     const float *uv_buf, float *lscharr, const float *saturation,
