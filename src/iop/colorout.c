@@ -296,20 +296,6 @@ static float lerp_lut(const float *const lut, const float v)
 }
 #endif
 
-// call only if sure that v<1.0
-static float _lerp_lut(const float *const lut, const float v)
-{
-  const float z = MAX(v,0.0f);  // clip away negatives
-  const float ft = z * (LUT_SAMPLES - 1);
-  // because v<1.0, ft must be less than (LUT_SAMPLES-1), so truncating
-  // will set t <= (LUT_SAMPLES-2) and thus we don't need to clamp it
-  // to avoid an array overrun
-  const int t = (int)ft;
-  const float f = ft - t;
-  const float l1 = lut[t];
-  const float l2 = lut[t + 1];
-  return l1 * (1.0f - f) + l2 * f;
-}
 
 #ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,

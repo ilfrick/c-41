@@ -502,16 +502,6 @@ static void _mul2temp(dt_iop_module_t *self,
   _XYZ_to_temperature(_mul2xyz(self, p), TempK, tint);
 }
 
-DT_OMP_DECLARE_SIMD(aligned(inp,outp))
-static inline void scaled_copy_4wide(float *const outp,
-                                     const float *const inp,
-                                     const float *const coeffs)
-{
-  // this needs to be in a separate function to make GCC8 vectorize it
-  // at -O2 as well as -O3
-  for_four_channels(c, aligned(inp, coeffs, outp))
-    outp[c] = inp[c] * coeffs[c];
-}
 
 static inline void _publish_chroma(dt_dev_pixelpipe_iop_t *piece)
 {
