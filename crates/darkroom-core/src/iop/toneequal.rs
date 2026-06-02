@@ -298,3 +298,39 @@ pub unsafe extern "C" fn darkroom_toneequal_build_log_histogram(
         h[idx] += 1;
     }
 }
+
+// Fixed node positions for PIXEL_CHAN=8 Gaussian RBF, uniformly spaced over [-8, 0] EV.
+const CENTERS_OPS: [f32; 8] = [
+    -56.0 / 7.0, -48.0 / 7.0, -40.0 / 7.0, -32.0 / 7.0,
+    -24.0 / 7.0, -16.0 / 7.0,  -8.0 / 7.0,   0.0 / 7.0,
+];
+// Fixed evaluation points for CHANNELS=9 UI parameters.
+const CENTERS_PARAMS: [f32; 9] = [-8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0];
+
+#[inline(always)]
+fn pixel_correction_rs(exposure: f32, factors: &[f32; 8], gauss_denom: f32) -> f32 {
+    let expo = exposure.clamp(-8.0, 0.0);
+    let result: f32 = CENTERS_OPS.iter().zip(factors.iter())
+        .map(|(&c, &f)| (-(expo - c).powi(2) / gauss_denom).exp() * f)
+        .sum();
+    result.clamp(0.25, 4.0)
+}
+
+/// Compute correction factors for CHANNELS=9 UI parameters from PIXEL_CHAN=8 RBF weights.
+///
+/// out[i] = clamp(sum_j(gaussian(centers_params[i] - centers_ops[j]) * factors[j]), 0.25, 4)
+///
+/// Matches the DT_OMP_FOR_SIMD at src/iop/toneequal.c:1254.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_toneequal_compute_channels_factors(
+    factors: *const f32,
+    out: *mut f32,
+    sigma: f32,
+) {
+    let f: &[f32; 8] = &*(factors as *const [f32; 8]);
+    let o = std::slice::from_raw_parts_mut(out, 9);
+    let gauss_denom = 2.0 * sigma * sigma;
+    for (i, &cp) in CENTERS_PARAMS.iter().enumerate() {
+        o[i] = pixel_correction_rs(cp, f, gauss_denom);
+    }
+}

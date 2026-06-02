@@ -1542,6 +1542,9 @@ void darkroom_toneequal_build_log_histogram(const float *luminance,
                                             size_t num_elem,
                                             int *hist,
                                             size_t temp_samples);
+void darkroom_toneequal_compute_channels_factors(const float *factors,
+                                                  float *out,
+                                                  float sigma);
 
 /*
  * Useless IOP -- checkerboard dimming example module.

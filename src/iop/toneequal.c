@@ -1250,14 +1250,7 @@ static gboolean compute_channels_factors(const float factors[PIXEL_CHAN],
   // user parameters channels aka the y coordinates of the
   // approximation for x = { CHANNELS }
   assert(PIXEL_CHAN == 8);
-
-  DT_OMP_FOR_SIMD(aligned(factors, out, centers_params:64) firstprivate(centers_params))
-  for(int i = 0; i < CHANNELS; ++i)
-  {
-    // Compute the new channels factors; pixel_correction clamps the factors, so we don't
-    // need to check for validity here
-    out[i] = pixel_correction(centers_params[i], factors, sigma);
-  }
+  darkroom_toneequal_compute_channels_factors(factors, out, sigma);
   return TRUE;
 }
 
