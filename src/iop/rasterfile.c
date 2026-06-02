@@ -242,36 +242,9 @@ static float *_read_rasterfile(char *filename,
     }
 
     if(png.bit_depth < 16)
-    {
-      const float normalizer = 1.0f / 255.0f;
-      DT_OMP_FOR()
-      for(size_t k = 0; k < (size_t)width * height; k++)
-      {
-        const size_t base = 3 * k;
-        float val = 0.0f;
-        if(mode & DT_RASTERFILE_MODE_RED)   val = MAX(val, buf[base] * normalizer);
-        if(mode & DT_RASTERFILE_MODE_GREEN) val = MAX(val, buf[base + 1] * normalizer);
-        if(mode & DT_RASTERFILE_MODE_BLUE)  val = MAX(val, buf[base + 2] * normalizer);
-        mask[k] = CLIP(val);
-      }
-    }
+      darkroom_rasterfile_mask_from_u8(buf, mask, (size_t)width * height, (uint32_t)mode);
     else
-    {
-      const float normalizer = 1.0f / 65535.0f;
-      DT_OMP_FOR()
-      for(size_t k = 0; k < (size_t)width * height; k++)
-      {
-        const size_t base = 6 * k;
-        const float red = (buf[base] * 256.0f + buf[base + 1]) * normalizer;
-        const float green = (buf[base + 2] * 256.0f + buf[base + 3]) * normalizer;
-        const float blue = (buf[base + 4] * 256.0f + buf[base + 5]) * normalizer;
-        float val = 0.0f;
-        if(mode & DT_RASTERFILE_MODE_RED)   val = MAX(val, red);
-        if(mode & DT_RASTERFILE_MODE_GREEN) val = MAX(val, green);
-        if(mode & DT_RASTERFILE_MODE_BLUE)  val = MAX(val, blue);
-        mask[k] = CLIP(val);
-      }
-    }
+      darkroom_rasterfile_mask_from_u16be(buf, mask, (size_t)width * height, (uint32_t)mode);
 
     dt_free_align(buf);
     *swidth = width;
@@ -293,15 +266,7 @@ static float *_read_rasterfile(char *filename,
     return NULL;
   }
 
-  DT_OMP_FOR()
-  for(size_t k = 0; k < (size_t)width * height; k++)
-  {
-    float val = 0.0f;
-    if(mode & DT_RASTERFILE_MODE_RED)   val = MAX(val, image[k*3]);
-    if(mode & DT_RASTERFILE_MODE_GREEN) val = MAX(val, image[k*3+1]);
-    if(mode & DT_RASTERFILE_MODE_BLUE)  val = MAX(val, image[k*3+2]);
-    mask[k] = CLIP(val);
-  }
+  darkroom_rasterfile_mask_from_pfm(image, mask, (size_t)width * height, (uint32_t)mode);
 
   *swidth = width;
   *sheight = height;

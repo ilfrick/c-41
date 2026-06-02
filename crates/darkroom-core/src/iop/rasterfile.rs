@@ -129,3 +129,72 @@ mod tests {
         assert!((out[2] - 0.3).abs() < 1e-5);
     }
 }
+
+const MODE_RED: u32   = 1;
+const MODE_GREEN: u32 = 2;
+const MODE_BLUE: u32  = 4;
+
+#[inline(always)]
+fn channel_max(r: f32, g: f32, b: f32, mode: u32) -> f32 {
+    let mut val = 0.0_f32;
+    if mode & MODE_RED   != 0 { val = val.max(r); }
+    if mode & MODE_GREEN != 0 { val = val.max(g); }
+    if mode & MODE_BLUE  != 0 { val = val.max(b); }
+    val.clamp(0.0, 1.0)
+}
+
+/// Build a mask from an 8-bit RGB PNG buffer: mask[k] = CLIP(max(selected)/255).
+/// Matches DT_OMP_FOR in src/iop/rasterfile.c:247.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_rasterfile_mask_from_u8(
+    buf: *const u8,
+    mask: *mut f32,
+    npixels: usize,
+    mode: u32,
+) {
+    let inp = std::slice::from_raw_parts(buf, npixels * 3);
+    let out = std::slice::from_raw_parts_mut(mask, npixels);
+    const N: f32 = 1.0 / 255.0;
+    for k in 0..npixels {
+        let r = inp[k * 3]     as f32 * N;
+        let g = inp[k * 3 + 1] as f32 * N;
+        let b = inp[k * 3 + 2] as f32 * N;
+        out[k] = channel_max(r, g, b, mode);
+    }
+}
+
+/// Build a mask from a 16-bit big-endian RGB PNG buffer (2 bytes/channel).
+/// Matches DT_OMP_FOR in src/iop/rasterfile.c:261.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_rasterfile_mask_from_u16be(
+    buf: *const u8,
+    mask: *mut f32,
+    npixels: usize,
+    mode: u32,
+) {
+    let inp = std::slice::from_raw_parts(buf, npixels * 6);
+    let out = std::slice::from_raw_parts_mut(mask, npixels);
+    const N: f32 = 1.0 / 65535.0;
+    for k in 0..npixels {
+        let r = (inp[k * 6]     as f32 * 256.0 + inp[k * 6 + 1] as f32) * N;
+        let g = (inp[k * 6 + 2] as f32 * 256.0 + inp[k * 6 + 3] as f32) * N;
+        let b = (inp[k * 6 + 4] as f32 * 256.0 + inp[k * 6 + 5] as f32) * N;
+        out[k] = channel_max(r, g, b, mode);
+    }
+}
+
+/// Build a mask from a float RGB (PFM) buffer: mask[k] = CLIP(max(selected)).
+/// Matches DT_OMP_FOR in src/iop/rasterfile.c:296.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_rasterfile_mask_from_pfm(
+    image: *const f32,
+    mask: *mut f32,
+    npixels: usize,
+    mode: u32,
+) {
+    let inp = std::slice::from_raw_parts(image, npixels * 3);
+    let out = std::slice::from_raw_parts_mut(mask, npixels);
+    for k in 0..npixels {
+        out[k] = channel_max(inp[k * 3], inp[k * 3 + 1], inp[k * 3 + 2], mode);
+    }
+}

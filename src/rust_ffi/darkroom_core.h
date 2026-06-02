@@ -1188,6 +1188,12 @@ void darkroom_rasterfile_visual_single(float *out_buf,
 void darkroom_rasterfile_visual_rgba(float *out_buf,
                                      const float *mask,
                                      size_t npixels);
+void darkroom_rasterfile_mask_from_u8(const unsigned char *buf, float *mask,
+                                      size_t npixels, unsigned int mode);
+void darkroom_rasterfile_mask_from_u16be(const unsigned char *buf, float *mask,
+                                         size_t npixels, unsigned int mode);
+void darkroom_rasterfile_mask_from_pfm(const float *image, float *mask,
+                                       size_t npixels, unsigned int mode);
 
 /*
  * Diffuse IOP — per-pixel mask builder.
