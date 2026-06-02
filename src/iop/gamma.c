@@ -109,9 +109,6 @@ static void _channel_display_monochrome(const float *const restrict in,
                                         const size_t buffsize,
                                         const float alpha)
 {
-  // yellow; "unused" element enables vectorization
-  const dt_aligned_pixel_t mask_color = { 1.0f, 1.0f, 0.0f };
-
   darkroom_gamma_display_monochrome(in, out, buffsize, alpha);
 }
 
