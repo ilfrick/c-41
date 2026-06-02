@@ -258,9 +258,9 @@ pub unsafe extern "C" fn darkroom_colorout_cmatrix_tonecurve(
         let xyz = lab_to_xyz(&input[k * 4..]);
         let mut rgb = [0.0f32; 4];
         for r in 0..3usize {
-            rgb[r] = cm[0 * 4 + r] * xyz[0]
-                   + cm[1 * 4 + r] * xyz[1]
-                   + cm[2 * 4 + r] * xyz[2];
+            rgb[r] = cm[r]         * xyz[0]
+                   + cm[4 + r]     * xyz[1]
+                   + cm[8 + r]     * xyz[2];
         }
         for c in 0..3usize {
             let lut_c = &lut_s[c * LUT_SAMPLES..(c + 1) * LUT_SAMPLES];

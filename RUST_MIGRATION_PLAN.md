@@ -7,7 +7,7 @@ application runnable throughout.
 
 ---
 
-## Current status -- 2026-06-02
+## Current status -- 2026-06-03
 
 ### Phase 0 -- Infrastructure complete
 
@@ -19,8 +19,8 @@ application runnable throughout.
 | Unit tests passing | **356** |
 | IOP `.rs` files | 93 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+46` (hazeremoval ambient-light reduction) |
-| CI status | `Rust` workflow green; `Fork CI` green (UTF-8 fix applied) |
+| Last patch | `Phase 2z+51` (toneequal GUI curve LUT builder) |
+| CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
 The migration has reached the hard boundary: every remaining `DT_OMP_FOR` loop
@@ -29,7 +29,7 @@ bilateral grid, NLM, perspective matrices) not yet in Rust. Those IOPs have
 stub `IopProcess` impls registered; their loops will be ported once the
 blocking infrastructure lands.
 
-#### Fully migrated IOPs (all OMP loops -> Rust, 0 remain in C)
+#### Fully migrated IOPs (all active OMP loops -> Rust, 0 remain in C)
 
 `agx`, `atrous`, `basicadj`, `bloom`, `cacorrect`, `cacorrectrgb`,
 `censorize`, `channelmixer`, `clahe`, `colorbalance`, `colorchecker`,
@@ -39,9 +39,11 @@ blocking infrastructure lands.
 `grain`, `hazeremoval`, `highpass`, `hotpixels` (all 3 variants),
 `invert`, `levels`, `lowlight`, `lowpass`, `lut3d`, `monochrome`,
 `negadoctor`, `overexposed` (all 4 modes), `overlay`, `primaries`,
-`profile_gamma`, `rasterfile`, `rawdenoise`, `relight`, `rgbcurve`,
-`rgblevels`, `shadhi`, `sigmoid`, `soften`, `splittoning`,
-`temperature`, `useless`, `velvia`, `vibrance`, `vignette`, `watermark`.
+`profile_gamma`, `rasterfile`, `rawdenoise`, `rawprepare`,
+`relight`, `rgbcurve`, `rgblevels`, `shadhi`, `sigmoid`, `soften`,
+`splittoning`, `temperature`, `toneequal` (main process loop is
+`#else`-guarded dead code since `DT_TONEEQ_USE_LUT=TRUE`),
+`useless`, `velvia`, `vibrance`, `vignette`, `watermark`.
 
 Geometric distort loops fully migrated in `geometry.rs`:
 `borders`, `crop`, `enlargecanvas`, `flip`, `rotatepixels` (distort only).
@@ -54,15 +56,13 @@ Commit-params LUT builders migrated:
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
 | `colorequal` | 1 | GUI background renderer (intentionally deferred) |
-| `toneequal` | 3 | GUI LUT builder + full RBF process loop |
 | `highlights` | 4 | `interpolate_color_xtrans` / `interpolate_color` inpaint |
 | `diffuse` | 1 | anisotropic PDE solver (very complex) |
 | `filmicrgb` | 12 | `RGB_to_Ych`, gamut mapping, Filmlight color space, `work_profile` |
 | `gamma` | 5 | `dt_Lab_to_XYZ`, `dt_HSL_2_RGB`, `dt_JzAzBz_*` |
-| `channelmixerrgb` | 3 | B-spline local avg + RBF illuminant detection |
+| `channelmixerrgb` | 2 | B-spline local avg reduction (illuminant detection) |
 | `colortransfer` | 2 | k-means with atomic accumulators |
-| `colorout` | 2 | ICC matrix path + LCMS `cmsDoTransform` |
-| `rawprepare` | 1 | gainmap bilinear interpolation |
+| `colorout` | 1 | LCMS `cmsDoTransform` |
 | `blurs` | 12 | Gaussian IIR, FFT, box-filter builders |
 | `rotatepixels` | 1 | `dt_interpolation_compute_pixel4c` |
 | `scalepixels` | 2 | `dt_interpolation_*` |
