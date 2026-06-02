@@ -222,8 +222,6 @@ static void _mask_display(const float *const restrict in,
                           const size_t buffsize,
                           const float alpha)
 {
-  // yellow, "unused" element aids vectorization
-  const dt_aligned_pixel_t mask_color = { 1.0f, 1.0f, 0.0f };
   const float mix = CLIP(dt_conf_get_float("darkroom/ui/develop_mask_mix"));
   darkroom_gamma_mask_display(in, out, buffsize, alpha, mix);
 }
