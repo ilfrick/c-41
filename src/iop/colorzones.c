@@ -435,41 +435,15 @@ void process_display(dt_iop_module_t *self,
   dt_iop_colorzones_gui_data_t *g = self->gui_data;
 
   const int ch = piece->colors;
-  const float normalize_C = 1.f / (128.0f * M_SQRT2_F);
-
   const dt_iop_colorzones_channel_t display_channel = g->channel;
 
   dt_iop_image_copy_by_size(ovoid, ivoid, roi_out->width, roi_out->height, ch);
 
-  DT_OMP_FOR()
-  for(size_t k = 0; k < (size_t)roi_out->width * roi_out->height; k++)
-  {
-    float *in = (float *)ivoid + ch * k;
-    float *out = (float *)ovoid + ch * k;
-
-    dt_aligned_pixel_t LCh;
-
-    dt_Lab_2_LCH(in, LCh);
-
-    float select = 0.0f;
-    switch(d->channel)
-    {
-      case DT_IOP_COLORZONES_L:
-        select = LCh[0] * 0.01f;
-        break;
-      case DT_IOP_COLORZONES_C:
-        select = LCh[1] * normalize_C;
-        break;
-      case DT_IOP_COLORZONES_h:
-      default:
-        select = LCh[2];
-        break;
-    }
-    select = CLAMP(select, 0.f, 1.f);
-
-    out[3] = fabsf(lookup(d->lut[display_channel], select) - .5f) * 4.f;
-    out[3] = CLAMP(out[3], 0.f, 1.f);
-  }
+  darkroom_colorzones_display(
+      (const float *)ivoid, (float *)ovoid,
+      (size_t)roi_out->width * roi_out->height,
+      (int)display_channel,
+      d->lut[display_channel]);
 
   piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK;
   piece->pipe->bypass_blendif = TRUE;

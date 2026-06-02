@@ -330,6 +330,11 @@ void darkroom_colorzones_process(const float *in_buf,
                                  const float *lut_l,
                                  const float *lut_a,
                                  const float *lut_b);
+void darkroom_colorzones_display(const float *in_buf,
+                                 float *out_buf,
+                                 size_t npixels,
+                                 int channel,
+                                 const float *lut);
 
 /*
  * Vignette IOP — radial brightness/saturation falloff with optional dithering.

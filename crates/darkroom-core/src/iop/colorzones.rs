@@ -182,3 +182,52 @@ mod tests {
         assert_eq!(out[3], 0.42);
     }
 }
+
+#[inline(always)]
+fn lab_2_lch(lab: &[f32]) -> [f32; 3] {
+    let h_raw = lab[2].atan2(lab[1]);
+    let h = if h_raw > 0.0 {
+        h_raw / std::f32::consts::TAU
+    } else {
+        1.0 - h_raw.abs() / std::f32::consts::TAU
+    };
+    [lab[0], lab[1].hypot(lab[2]), h]
+}
+
+/// Mask-display pass for colorzones process_display().
+///
+/// For each pixel: Lab → LCh, select L/C/h, look up the display-channel LUT,
+/// write mask alpha into out[3]. Input and output are RGBA (4 floats/pixel).
+/// The caller copies ivoid → ovoid first; this function only writes alpha.
+///
+/// `channel`: 0=L, 1=C, 2=h (DT_IOP_COLORZONES_{L,C,h} enum values).
+/// `lut`: pointer to `d->lut[display_channel]` — exactly 65536 floats.
+///
+/// Matches the DT_OMP_FOR in src/iop/colorzones.c:444.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorzones_display(
+    in_buf: *const f32,
+    out_buf: *mut f32,
+    npixels: usize,
+    channel: i32,
+    lut: *const f32,
+) {
+    if npixels == 0 { return; }
+    let input  = std::slice::from_raw_parts(in_buf,  npixels * 4);
+    let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+    let lut_s = std::slice::from_raw_parts(lut, DT_IOP_COLORZONES_LUT_RES);
+    const NORM_C: f32 = 1.0 / (128.0 * std::f32::consts::SQRT_2);
+
+    for k in 0..npixels {
+        let px = &input[k * 4..k * 4 + 4];
+        let lch = lab_2_lch(px);
+        let select = match channel {
+            0 => lch[0] * 0.01,
+            1 => lch[1] * NORM_C,
+            _ => lch[2],
+        };
+        let select = select.clamp(0.0, 1.0);
+        let alpha = (lut_lookup(lut_s, select) - 0.5).abs() * 4.0;
+        output[k * 4 + 3] = alpha.clamp(0.0, 1.0);
+    }
+}
