@@ -100,9 +100,13 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          cmake --build build --verbose 2>&1 | tee /tmp/build-out.txt || {
-            echo "::error::Build failed — showing last 150 lines"
-            tail -150 /tmp/build-out.txt
+          cmake --build build 2>&1 | tee /tmp/build-out.txt || {
+            # Extract the first error line and put it in an annotation
+            ERR=$(grep -m1 "error:" /tmp/build-out.txt || tail -5 /tmp/build-out.txt | head -1)
+            echo "::error::$ERR"
+            # Also upload the full tail as a second annotation
+            TAIL=$(tail -80 /tmp/build-out.txt | tr '\n' '|')
+            echo "::error::BUILD LOG TAIL: $TAIL"
             exit 1
           }
 
