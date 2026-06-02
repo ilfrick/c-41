@@ -508,6 +508,12 @@ static inline float get_gamma(const float x, const float gamma)
   return powf(x, gamma);
 }
 
+static inline float get_contrast(const float x, const float contrast, const float middle_grey,
+                                 const float inv_middle_grey)
+{
+  return powf(x * inv_middle_grey, contrast) * middle_grey;
+}
+
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in,
