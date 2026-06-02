@@ -741,36 +741,9 @@ static inline void _auto_detect_WB(const float *const restrict in,
       Edge-Based Color Constancy, Joost van de Weijer, Theo Gevers, Arjan Gijsenij
       https://hal.inria.fr/inria-00548686/document
     */
-    const float D50[2] = { D50xyY.x, D50xyY.y };
-// Convert RGB to xy
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < height; i++)
-    for(size_t j = 0; j < width; j++)
-    {
-      const size_t index = (i * width + j) * ch;
-      dt_aligned_pixel_t RGB;
-      dt_aligned_pixel_t XYZ;
-
-      // Clip negatives
-      for_each_channel(c,aligned(in))
-        RGB[c] = fmaxf(in[index + c], 0.0f);
-
-      // Convert to XYZ
-      dot_product(RGB, RGB_to_XYZ, XYZ);
-
-      // Convert to xyY
-      const float sum = fmaxf(XYZ[0] + XYZ[1] + XYZ[2], NORM_MIN);
-      XYZ[0] /= sum;   // x
-      XYZ[2] = XYZ[1]; // Y
-      XYZ[1] /= sum;   // y
-
-      // Shift the chromaticity plane so the D50 point (target) becomes the origin
-      const float norm = dt_fast_hypotf(D50[0], D50[1]);
-
-      temp[index    ] = (XYZ[0] - D50[0]) / norm;
-      temp[index + 1] = (XYZ[1] - D50[1]) / norm;
-      temp[index + 2] =  XYZ[2];
-    }
+    darkroom_channelmixerrgb_rgb_to_xyY(in, temp, width, height, ch,
+                                        (const float *)RGB_to_XYZ,
+                                        D50xyY.x, D50xyY.y);
 
   float elements = 0.f;
   dt_aligned_pixel_t xyY = { 0.f };

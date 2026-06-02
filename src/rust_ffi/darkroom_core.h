@@ -827,6 +827,14 @@ void darkroom_channelmixerrgb_loop_switch(const float *in_buf,
                                           int apply_grey,
                                           int kind,
                                           int version);
+void darkroom_channelmixerrgb_rgb_to_xyY(const float *in_buf,
+                                          float *temp,
+                                          size_t width,
+                                          size_t height,
+                                          size_t ch,
+                                          const float *rgb_to_xyz,
+                                          float d50_x,
+                                          float d50_y);
 
 /*
  * colorout tone-curve application -- in-place per-channel LUT + exp extrapolation.

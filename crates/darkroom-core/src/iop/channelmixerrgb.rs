@@ -499,3 +499,53 @@ mod tests {
         assert!((out[3] - 0.777).abs() < 1e-5, "alpha={}", out[3]);
     }
 }
+
+/// Convert an RGBA input image to D50-origin xyY chromaticity in `temp`.
+///
+/// For each pixel (i,j):
+///   1. clip negatives
+///   2. XYZ[r] = sum_c(rgb_to_xyz[r*4+c] * RGB[c])   row-major 3x4 matrix
+///   3. chromaticity: sum = max(X+Y+Z, NORM_MIN); x = X/sum; y = Y/sum
+///   4. norm = hypot(d50_x, d50_y)
+///   5. temp[base+0] = (x - d50_x) / norm
+///      temp[base+1] = (y - d50_y) / norm
+///      temp[base+2] = Y
+///
+/// rgb_to_xyz: 12 floats, row-major (3 rows x 4 cols).
+/// Matches the DT_OMP_FOR(collapse(2)) in src/iop/channelmixerrgb.c:746.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_channelmixerrgb_rgb_to_xyY(
+    in_buf: *const f32,
+    temp: *mut f32,
+    width: usize,
+    height: usize,
+    ch: usize,
+    rgb_to_xyz: *const f32,
+    d50_x: f32,
+    d50_y: f32,
+) {
+    if width == 0 || height == 0 { return; }
+    let input  = std::slice::from_raw_parts(in_buf, width * height * ch);
+    let output = std::slice::from_raw_parts_mut(temp, width * height * ch);
+    let m = std::slice::from_raw_parts(rgb_to_xyz, 12); // row-major 3x4
+    let norm_d50 = d50_x.hypot(d50_y);
+
+    for k in 0..width * height {
+        let base = k * ch;
+        let r = input[base    ].max(0.0);
+        let g = input[base + 1].max(0.0);
+        let b = input[base + 2].max(0.0);
+
+        let x_xyz = m[0] * r + m[1] * g + m[2] * b + m[3] * 0.0;
+        let y_xyz = m[4] * r + m[5] * g + m[6] * b + m[7] * 0.0;
+        let z_xyz = m[8] * r + m[9] * g + m[10] * b + m[11] * 0.0;
+
+        let sum = (x_xyz + y_xyz + z_xyz).max(NORM_MIN);
+        let x_chr = x_xyz / sum;
+        let y_chr = y_xyz / sum;
+
+        output[base]     = (x_chr - d50_x) / norm_d50;
+        output[base + 1] = (y_chr - d50_y) / norm_d50;
+        output[base + 2] = y_xyz;
+    }
+}
