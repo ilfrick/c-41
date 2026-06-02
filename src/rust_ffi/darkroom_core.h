@@ -127,6 +127,8 @@ void darkroom_colisa_process(const float *in_buf,
                              const float *ltable,
                              const float *lunbounded_coeffs,
                              float saturation);
+void darkroom_colisa_build_contrast_lut(float *ctable, float contrast);
+void darkroom_colisa_build_brightness_lut(float *ltable, float gamma);
 
 /*
  * Split-toning IOP — shadow/highlight colorization via HSL.
@@ -239,6 +241,7 @@ void darkroom_profile_gamma_process(const float *in_buf,
                                     float shadows_range,
                                     const float *table,
                                     const float *unbounded_coeffs);
+void darkroom_profile_gamma_build_lut(float *table, float gamma, float linear);
 
 /*
  * Graduated ND filter IOP — exponential density gradient.
@@ -510,6 +513,8 @@ void darkroom_lowpass_process(const float *in_buf,
                               float saturation,
                               float lab_min_ab,
                               float lab_max_ab);
+void darkroom_lowpass_build_contrast_lut(float *ctable, float contrast);
+void darkroom_lowpass_build_brightness_lut(float *ltable, float gamma);
 
 /*
  * Color Balance IOP pixel loop (LEGACY / LGG / SOP modes).

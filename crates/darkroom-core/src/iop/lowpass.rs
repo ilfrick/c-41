@@ -132,3 +132,47 @@ mod tests {
         assert!(out[2] >= -128.0);
     }
 }
+
+/// Build the contrast LUT (65536 entries) for lowpass commit_params.
+///
+/// Two variants depending on contrast:
+///   ≤ 1.0: ctable[k] = contrast * (100*k/0x10000 - 50) + 50  (linear)
+///   > 1.0: sigmoid variant (same formula as colisa)
+///
+/// Matches the DT_OMP_FOR loops at src/iop/lowpass.c:477.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_lowpass_build_contrast_lut(
+    ctable: *mut f32,
+    contrast: f32,
+) {
+    let lut = std::slice::from_raw_parts_mut(ctable, 0x10000);
+    const N: f32 = 0x10000 as f32;
+    if contrast <= 1.0 {
+        for k in 0..0x10000usize {
+            lut[k] = contrast * (100.0 * k as f32 / N - 50.0) + 50.0;
+        }
+    } else {
+        let boost = 5.0_f32;
+        let cm1sq = boost * (contrast.abs() - 1.0).powi(2);
+        let cscale = (1.0 + cm1sq).sqrt() * contrast.signum();
+        for k in 0..0x10000usize {
+            let kx2m1 = 2.0 * k as f32 / N - 1.0;
+            lut[k] = 50.0 * (cscale * kx2m1 / (1.0 + cm1sq * kx2m1 * kx2m1).sqrt() + 1.0);
+        }
+    }
+}
+
+/// Build the brightness LUT (65536 entries) for lowpass commit_params.
+/// ltable[k] = 100 * (k/0x10000)^gamma
+/// Matches src/iop/lowpass.c:498.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_lowpass_build_brightness_lut(
+    ltable: *mut f32,
+    gamma: f32,
+) {
+    let lut = std::slice::from_raw_parts_mut(ltable, 0x10000);
+    const N: f32 = 0x10000 as f32;
+    for k in 0..0x10000usize {
+        lut[k] = 100.0 * (k as f32 / N).powf(gamma);
+    }
+}

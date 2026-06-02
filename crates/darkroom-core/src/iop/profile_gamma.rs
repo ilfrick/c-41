@@ -137,3 +137,49 @@ mod tests {
         // alpha not written
     }
 }
+
+/// Build the tone curve LUT (65536 entries) for profile_gamma commit_params.
+///
+/// Three variants, all dispatched internally:
+///   gamma == 1.0          → linear passthrough  table[k] = k/0x10000
+///   linear == 0.0         → pure power curve    table[k] = (k/0x10000)^gamma
+///   otherwise             → linear segment + power curve (sRGB-like)
+///
+/// Matches the three DT_OMP_FOR loops in src/iop/profile_gamma.c:438-472.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_profile_gamma_build_lut(
+    table: *mut f32,
+    gamma: f32,
+    linear: f32,
+) {
+    let lut = std::slice::from_raw_parts_mut(table, 0x10000);
+    const N: f32 = 0x10000 as f32;
+
+    if (gamma - 1.0).abs() < f32::EPSILON {
+        for k in 0..0x10000usize {
+            lut[k] = k as f32 / N;
+        }
+    } else if linear == 0.0 {
+        for k in 0..0x10000usize {
+            lut[k] = (k as f32 / N).powf(gamma);
+        }
+    } else {
+        let (a, b, c, g) = if linear < 1.0 {
+            let g = gamma * (1.0 - linear) / (1.0 - gamma * linear);
+            let a = 1.0 / (1.0 + linear * (g - 1.0));
+            let b = linear * (g - 1.0) * a;
+            let c = (a * linear + b).powf(g) / linear;
+            (a, b, c, g)
+        } else {
+            (0.0_f32, 0.0_f32, 1.0_f32, 0.0_f32)
+        };
+        let linear_end = (N * linear) as usize;
+        for k in 0..0x10000usize {
+            lut[k] = if k < linear_end {
+                c * k as f32 / N
+            } else {
+                (a * k as f32 / N + b).powf(g)
+            };
+        }
+    }
+}

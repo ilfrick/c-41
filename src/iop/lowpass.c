@@ -461,26 +461,7 @@ void commit_params(dt_iop_module_t *self,
 
 
   // generate precomputed contrast curve
-  if(fabs(d->contrast) <= 1.0f)
-  {
-    // linear curve for contrast up to +/- 1
-    for(int k = 0; k < 0x10000; k++) d->ctable[k] = d->contrast * (100.0f * k / 0x10000 - 50.0f) + 50.0f;
-  }
-  else
-  {
-    // sigmoidal curve for contrast above +/-1 1
-    // going from (0,0) to (1,100) or (0,100) to (1,0), respectively
-    const float boost = 5.0f;
-    const float contrastm1sq = boost * (fabs(d->contrast) - 1.0f) * (fabs(d->contrast) - 1.0f);
-    const float contrastscale = copysign(sqrtf(1.0f + contrastm1sq), d->contrast);
-    float *const ctable = d->ctable;
-    DT_OMP_FOR()
-    for(size_t k = 0; k < 0x10000; k++)
-    {
-      const float kx2m1 = 2.0f * (float)k / 0x10000 - 1.0f;
-      ctable[k] = 50.0f * (contrastscale * kx2m1 / sqrtf(1.0f + contrastm1sq * kx2m1 * kx2m1) + 1.0f);
-    }
-  }
+  darkroom_lowpass_build_contrast_lut(d->ctable, d->contrast);
 
   // now the extrapolation stuff for the contrast curve:
   const float xc[4] = { 0.7f, 0.8f, 0.9f, 1.0f };
@@ -494,12 +475,7 @@ void commit_params(dt_iop_module_t *self,
   // generate precomputed brightness curve
   const float gamma = (d->brightness >= 0.0f) ? 1.0f / (1.0f + d->brightness) : (1.0f - d->brightness);
 
-  float *const ltable = d->ltable;
-  DT_OMP_FOR()
-  for(size_t k = 0; k < 0x10000; k++)
-  {
-    ltable[k] = 100.0f * powf((float)k / 0x10000, gamma);
-  }
+  darkroom_lowpass_build_brightness_lut(d->ltable, gamma);
 
   // now the extrapolation stuff for the brightness curve:
   const float xl[4] = { 0.7f, 0.8f, 0.9f, 1.0f };

@@ -432,45 +432,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   d->linear = p->linear;
   d->gamma = p->gamma;
 
-  float a, b, c, g;
-  if(gamma == 1.0)
-  {
-    DT_OMP_FOR()
-    for(int k = 0; k < 0x10000; k++) d->table[k] = 1.0 * k / 0x10000;
-  }
-  else
-  {
-    if(linear == 0.0)
-    {
-      DT_OMP_FOR()
-      for(int k = 0; k < 0x10000; k++) d->table[k] = powf(1.00 * k / 0x10000, gamma);
-    }
-    else
-    {
-      if(linear < 1.0)
-      {
-        g = gamma * (1.0 - linear) / (1.0 - gamma * linear);
-        a = 1.0 / (1.0 + linear * (g - 1));
-        b = linear * (g - 1) * a;
-        c = powf(a * linear + b, g) / linear;
-      }
-      else
-      {
-        a = b = g = 0.0;
-        c = 1.0;
-      }
-      DT_OMP_FOR()
-      for(int k = 0; k < 0x10000; k++)
-      {
-        float tmp;
-        if(k < 0x10000 * linear)
-          tmp = c * k / 0x10000;
-        else
-          tmp = powf(a * k / 0x10000 + b, g);
-        d->table[k] = tmp;
-      }
-    }
-  }
+  darkroom_profile_gamma_build_lut(d->table, gamma, linear);
 
   // now the extrapolation stuff:
   const float x[4] = { 0.7f, 0.8f, 0.9f, 1.0f };

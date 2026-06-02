@@ -168,3 +168,41 @@ mod tests {
         assert!(output[2].abs() < 1e-7);
     }
 }
+
+/// Build the contrast LUT (65536 entries) for colisa commit_params.
+/// ≤ 1.0: linear; > 1.0: sigmoid (boost=20). Matches colisa.c:180.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colisa_build_contrast_lut(
+    ctable: *mut f32,
+    contrast: f32,
+) {
+    let lut = std::slice::from_raw_parts_mut(ctable, 0x10000);
+    const N: f32 = 0x10000 as f32;
+    if contrast <= 1.0 {
+        for k in 0..0x10000usize {
+            lut[k] = contrast * (100.0 * k as f32 / N - 50.0) + 50.0;
+        }
+    } else {
+        let boost = 20.0_f32;
+        let cm1sq = boost * (contrast - 1.0).powi(2);
+        let cscale = (1.0 + cm1sq).sqrt();
+        for k in 0..0x10000usize {
+            let kx2m1 = 2.0 * k as f32 / N - 1.0;
+            lut[k] = 50.0 * (cscale * kx2m1 / (1.0 + cm1sq * kx2m1 * kx2m1).sqrt() + 1.0);
+        }
+    }
+}
+
+/// Build the brightness LUT (65536 entries) for colisa commit_params.
+/// ltable[k] = 100 * (k/0x10000)^gamma. Matches colisa.c:209.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colisa_build_brightness_lut(
+    ltable: *mut f32,
+    gamma: f32,
+) {
+    let lut = std::slice::from_raw_parts_mut(ltable, 0x10000);
+    const N: f32 = 0x10000 as f32;
+    for k in 0..0x10000usize {
+        lut[k] = 100.0 * (k as f32 / N).powf(gamma);
+    }
+}

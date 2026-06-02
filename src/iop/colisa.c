@@ -174,25 +174,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   d->saturation = p->saturation + 1.0f; // rescale from [-1;+1] to [0;+2] (zero meaning no saturation -> b&w)
 
   // generate precomputed contrast curve
-  if(d->contrast <= 1.0f)
-  {
-// linear curve for d->contrast below 1
-    DT_OMP_FOR()
-    for(int k = 0; k < 0x10000; k++) d->ctable[k] = d->contrast * (100.0f * k / 0x10000 - 50.0f) + 50.0f;
-  }
-  else
-  {
-    // sigmoidal curve for d->contrast above 1
-    const float boost = 20.0f;
-    const float contrastm1sq = boost * (d->contrast - 1.0f) * (d->contrast - 1.0f);
-    const float contrastscale = sqrtf(1.0f + contrastm1sq);
-    DT_OMP_FOR()
-    for(int k = 0; k < 0x10000; k++)
-    {
-      float kx2m1 = 2.0f * (float)k / 0x10000 - 1.0f;
-      d->ctable[k] = 50.0f * (contrastscale * kx2m1 / sqrtf(1.0f + contrastm1sq * kx2m1 * kx2m1) + 1.0f);
-    }
-  }
+  darkroom_colisa_build_contrast_lut(d->ctable, d->contrast);
 
   // now the extrapolation stuff for the contrast curve:
   const float xc[4] = { 0.7f, 0.8f, 0.9f, 1.0f };
@@ -206,11 +188,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   // generate precomputed brightness curve
   const float gamma = (d->brightness >= 0.0f) ? 1.0f / (1.0f + d->brightness) : (1.0f - d->brightness);
 
-  DT_OMP_FOR()
-  for(int k = 0; k < 0x10000; k++)
-  {
-    d->ltable[k] = 100.0f * powf((float)k / 0x10000, gamma);
-  }
+  darkroom_colisa_build_brightness_lut(d->ltable, gamma);
 
   // now the extrapolation stuff for the brightness curve:
   const float xl[4] = { 0.7f, 0.8f, 0.9f, 1.0f };
