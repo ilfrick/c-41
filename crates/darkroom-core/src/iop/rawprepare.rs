@@ -266,3 +266,76 @@ pub unsafe extern "C" fn darkroom_rawprepare_distort_backtransform(
         buf[i + 1] += dy;
     }
 }
+
+/// Apply per-pixel Bayer-channel gain maps (bilinear interpolation) to a
+/// single-channel raw output buffer.
+///
+/// For each output pixel (i, j):
+///   channel = (((j + roi_y + top) & 1) << 1) | ((i + roi_x + left) & 1)   [_BL]
+///   map_x   = clamp(((roi_x+csx+i)*im_to_rel_x - map_origin_h)*rel_to_map_x, 0, map_w)
+///   map_y   = clamp(((roi_y+csy+j)*im_to_rel_y - map_origin_v)*rel_to_map_y, 0, map_h)
+///   gain    = bilinear(maps[channel], map_x, map_y)
+///   out[j*width+i] *= gain
+///
+/// `maps` must point to an array of 4 `const float *` pointers, each pointing
+/// to a `map_w * map_h` float array.
+///
+/// Matches the DT_OMP_FOR in src/iop/rawprepare.c:379.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_rawprepare_apply_gainmaps(
+    out: *mut f32,
+    out_width: i32,
+    out_height: i32,
+    roi_x: i32,
+    roi_y: i32,
+    csx: i32,
+    csy: i32,
+    top: i32,
+    left: i32,
+    im_to_rel_x: f32,
+    im_to_rel_y: f32,
+    rel_to_map_x: f32,
+    rel_to_map_y: f32,
+    map_origin_h: f32,
+    map_origin_v: f32,
+    map_w: u32,
+    map_h: u32,
+    maps: *const *const f32,
+) {
+    if out_width <= 0 || out_height <= 0 { return; }
+    let w = out_width as usize;
+    let h = out_height as usize;
+    let mw = map_w as usize;
+    let mh = map_h as usize;
+    let output = std::slice::from_raw_parts_mut(out, w * h);
+    let map_ptrs = std::slice::from_raw_parts(maps, 4);
+    let map_data: [&[f32]; 4] = [
+        std::slice::from_raw_parts(map_ptrs[0], mw * mh),
+        std::slice::from_raw_parts(map_ptrs[1], mw * mh),
+        std::slice::from_raw_parts(map_ptrs[2], mw * mh),
+        std::slice::from_raw_parts(map_ptrs[3], mw * mh),
+    ];
+
+    for j in 0..h {
+        let y_raw = ((roi_y + csy + j as i32) as f32 * im_to_rel_y - map_origin_v) * rel_to_map_y;
+        let y_map = y_raw.clamp(0.0, map_h as f32);
+        let y_i0 = (y_map as usize).min(mh - 1);
+        let y_i1 = (y_i0 + 1).min(mh - 1);
+        let y_frac = y_map - y_i0 as f32;
+
+        for i in 0..w {
+            let ch = ((((j as i32 + roi_y + top) & 1) << 1) | ((i as i32 + roi_x + left) & 1)) as usize;
+            let x_raw = ((roi_x + csx + i as i32) as f32 * im_to_rel_x - map_origin_h) * rel_to_map_x;
+            let x_map = x_raw.clamp(0.0, map_w as f32);
+            let x_i0 = (x_map as usize).min(mw - 1);
+            let x_i1 = (x_i0 + 1).min(mw - 1);
+            let x_frac = x_map - x_i0 as f32;
+
+            let row0 = &map_data[ch][y_i0 * mw..];
+            let row1 = &map_data[ch][y_i1 * mw..];
+            let gain_top    = (1.0 - x_frac) * row0[x_i0] + x_frac * row0[x_i1];
+            let gain_bottom = (1.0 - x_frac) * row1[x_i0] + x_frac * row1[x_i1];
+            output[j * w + i] *= (1.0 - y_frac) * gain_top + y_frac * gain_bottom;
+        }
+    }
+}

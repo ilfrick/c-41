@@ -1816,6 +1816,16 @@ void darkroom_rawprepare_distort_transform(float *points, size_t points_count,
                                            float dx, float dy);
 void darkroom_rawprepare_distort_backtransform(float *points, size_t points_count,
                                                float dx, float dy);
+void darkroom_rawprepare_apply_gainmaps(float *out,
+                                        int out_width, int out_height,
+                                        int roi_x, int roi_y,
+                                        int csx, int csy,
+                                        int top, int left,
+                                        float im_to_rel_x, float im_to_rel_y,
+                                        float rel_to_map_x, float rel_to_map_y,
+                                        float map_origin_h, float map_origin_v,
+                                        unsigned int map_w, unsigned int map_h,
+                                        const float *const *maps);
 
 /*
  * Highlights IOP -- sRAW (RGB) clipping-mask builder.
