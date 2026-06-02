@@ -935,6 +935,39 @@ void darkroom_censorize_pixelate(const float *in_buf,
                                  size_t height,
                                  size_t pixel_radius);
 
+/* Censorize IOP — add per-pixel Gaussian noise.
+ * norm = out[pix+1]; eps = gaussian_noise(norm, noise*norm, flip) / norm
+ * out[c] = max(out[c]*eps, 0) for c in 0..3.
+ * Matches make_noise() in src/iop/censorize.c:107. */
+void darkroom_censorize_make_noise(float *output, float noise,
+                                    size_t width, size_t height);
+
+/* invert.c:253 — invert X-Trans mosaic: out = clamp(film[FCxtrans]-in, 0,1) */
+void darkroom_invert_xtrans(const float *in_buf, float *out_buf,
+                             size_t width, size_t height,
+                             const unsigned char *xtrans,
+                             int roi_x, int roi_y,
+                             const float *film_rgb);
+
+/* invert.c:304 — invert Bayer mosaic: out = clamp(film[FC]-in, 0,1) */
+void darkroom_invert_bayer(const float *in_buf, float *out_buf,
+                            size_t width, size_t height,
+                            unsigned int filters,
+                            int roi_x, int roi_y,
+                            const float *film_rgb);
+
+/* temperature.c:552 — white-balance X-Trans: out = in * coeffs[FCNxtrans] */
+void darkroom_temperature_xtrans(const float *in_buf, float *out_buf,
+                                  size_t width, size_t height,
+                                  const unsigned char *xtrans,
+                                  const float *coeffs);
+
+/* temperature.c:590 — white-balance Bayer: out = in * coeffs[FC] */
+void darkroom_temperature_bayer(const float *in_buf, float *out_buf,
+                                 size_t width, size_t height,
+                                 unsigned int filters,
+                                 const float *coeffs);
+
 /*
  * Overexposed IOP — per-channel "any RGB" clipping preview.
  * For each pixel k:

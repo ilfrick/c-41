@@ -109,30 +109,7 @@ static inline void make_noise(float *const output,
                               const size_t width,
                               const size_t height)
 {
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < height; i++)
-    for(size_t j = 0; j < width; j++)
-    {
-      // Init random number generator
-      uint32_t DT_ALIGNED_ARRAY state[4] = { splitmix32(j + 1),
-                                             splitmix32((j + 1) * (i + 3)),
-                                             splitmix32(1337),
-                                             splitmix32(666) };
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-      xoshiro128plus(state);
-
-      const size_t index = (i * width + j) * 4;
-      float *const restrict pix_out = DT_IS_ALIGNED_PIXEL(output + index);
-      const float norm = pix_out[1];
-
-      // create statistical noise
-      const float epsilon = gaussian_noise(norm, noise * norm, i % 2 || j % 2, state) / norm;
-
-      // add noise to output
-      for(size_t c = 0; c < 3; c++) pix_out[c] = fmaxf(pix_out[c] * epsilon, 0.f);
-    }
+  darkroom_censorize_make_noise(output, noise, width, height);
 }
 
 

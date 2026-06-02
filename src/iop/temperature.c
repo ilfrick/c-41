@@ -548,79 +548,14 @@ void process(dt_iop_module_t *self,
   const int height = roi_out->height;
 
   if(filters == 9u)
-  { // xtrans float mosaiced
-    DT_OMP_FOR()
-    for(int j = 0; j < height; j++)
-    {
-      const float DT_ALIGNED_PIXEL coeffs[3][4] =
-      {
-        { d_coeffs[FCNxtrans(j, 0, xtrans)],
-          d_coeffs[FCNxtrans(j, 1, xtrans)],
-          d_coeffs[FCNxtrans(j, 2, xtrans)],
-          d_coeffs[FCNxtrans(j, 3, xtrans)] },
-        { d_coeffs[FCNxtrans(j, 4, xtrans)],
-          d_coeffs[FCNxtrans(j, 5, xtrans)],
-          d_coeffs[FCNxtrans(j, 6, xtrans)],
-          d_coeffs[FCNxtrans(j, 7, xtrans)] },
-        { d_coeffs[FCNxtrans(j, 8, xtrans)],
-          d_coeffs[FCNxtrans(j, 9, xtrans)],
-          d_coeffs[FCNxtrans(j, 10, xtrans)],
-          d_coeffs[FCNxtrans(j, 11, xtrans)] },
-      };
-      // process sensels four at a time (note that attempting to
-      //ensure alignment for this main loop actually slowed things
-      //down marginally)
-      int i = 0;
-      for(int coeff = 0; i + 4 < width; i += 4, coeff = (coeff+1)%3)
-      {
-        const size_t p = (size_t)j * width + i;
-        for_four_channels(c) // in and out are NOT aligned when width is not a multiple of 4
-          out[p+c] = in[p+c] * coeffs[coeff][c];
-      }
-      // process the leftover sensels
-      for(; i < width; i++)
-      {
-        const size_t p = (size_t)j * width + i;
-        out[p] = in[p] * d_coeffs[FCNxtrans(j, i, xtrans)];
-      }
-    }
+  { // xtrans float mosaiced (Rust FFI)
+    darkroom_temperature_xtrans(in, out, (size_t)width, (size_t)height,
+                                (const unsigned char *)xtrans, d_coeffs);
   }
   else if(filters)
-  { // bayer float mosaiced
-    DT_OMP_FOR()
-    for(int j = 0; j < height; j++)
-    {
-      int i = 0;
-
-      const int alignment = 3 & (4 - ((j*width) & 3));
-
-      // process the unaligned sensels at the start of the row (when
-      // width is not a multiple of 4)
-      for(; i < alignment; i++)
-      {
-        const size_t p = (size_t)j * width + i;
-        out[p] = in[p] * d_coeffs[FC(j, i, filters)];
-      }
-      const dt_aligned_pixel_t coeffs =
-        { d_coeffs[FC(j, i, filters)],
-          d_coeffs[FC(j, i + 1,filters)],
-          d_coeffs[FC(j, i + 2, filters)],
-          d_coeffs[FC(j, i + 3, filters)] };
-
-      // process sensels four at a time
-      for(; i < width - 4; i += 4)
-      {
-        const size_t p = (size_t)j * width + i;
-        scaled_copy_4wide(out + p,in + p, coeffs);
-      }
-
-      // process the leftover sensels
-      for(; i < width; i++)
-      {
-        const size_t p = (size_t)j * width + i;
-        out[p] = in[p] * d_coeffs[FC(j, i, filters)];
-      }
-    }
+  { // bayer float mosaiced (Rust FFI)
+    darkroom_temperature_bayer(in, out, (size_t)width, (size_t)height,
+                               filters, d_coeffs);
   }
   else
   { // non-mosaiced

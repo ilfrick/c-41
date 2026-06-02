@@ -1,4 +1,4 @@
-use crate::{params::IopParams, roi::RoiIn, Result};
+use crate::{math, params::IopParams, roi::RoiIn, Result};
 use super::{ClBuffer, IopProcess};
 
 pub struct Censorize;
@@ -75,6 +75,50 @@ pub unsafe extern "C" fn darkroom_censorize_pixelate(
                         output[pidx + c] = rgb[c];
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Add per-pixel Gaussian noise to a pixelated/blurred RGBA buffer.
+///
+/// For each pixel (i, j):
+///   seed xoshiro128+ from (j+1, (j+1)*(i+3), 1337, 666) → 4 warm-up
+///   norm  = output[pix + 1]   (second channel = G in RGB)
+///   eps   = gaussian_noise(norm, noise*norm, (i%2 || j%2)) / norm
+///   out[c] = max(out[c] * eps, 0)  for c in 0..3
+///
+/// Matches `make_noise()` in src/iop/censorize.c:107.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_censorize_make_noise(
+    output: *mut f32,
+    noise: f32,
+    width: usize,
+    height: usize,
+) {
+    if width == 0 || height == 0 { return; }
+    let out = std::slice::from_raw_parts_mut(output, width * height * 4);
+
+    for i in 0..height {
+        for j in 0..width {
+            let mut state = [
+                math::splitmix32((j + 1) as u64),
+                math::splitmix32(((j + 1) * (i + 3)) as u64),
+                math::splitmix32(1337),
+                math::splitmix32(666),
+            ];
+            for _ in 0..4 { math::xoshiro128plus(&mut state); }
+
+            let idx = (i * width + j) * 4;
+            let norm = out[idx + 1];
+            let flip = (i % 2 != 0) || (j % 2 != 0);
+            let eps  = if norm.abs() > 1e-10 {
+                math::gaussian_noise(norm, noise * norm, flip, &mut state) / norm
+            } else {
+                0.0
+            };
+            for c in 0..3 {
+                out[idx + c] = (out[idx + c] * eps).max(0.0);
             }
         }
     }

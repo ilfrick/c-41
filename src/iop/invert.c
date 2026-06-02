@@ -249,89 +249,17 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   const size_t width = roi_out->width;
 
   if(filters == 9u)
-  { // xtrans float mosaiced
-    DT_OMP_FOR()
-    for(size_t j = 0; j < height; j++)
-    {
-      const size_t p = j * width;
-      size_t i = 0;
-      int alignment = ((4 - (j * width & (4 - 1))) & (4 - 1));
-
-      // process unaligned pixels at start of row
-      for(; i < alignment && i < width; i++)
-        out[p+i] = CLAMP(film_rgb_f[FCxtrans(j, i, roi_out, xtrans)] - in[p+i], 0.0f, 1.0f);
-
-      // set up the filter colors for the current row of the image
-      const dt_aligned_pixel_t film[3] = {
-        { film_rgb_f[FCxtrans(j, i + 0, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 1, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 2, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 3, roi_out, xtrans)] },
-        { film_rgb_f[FCxtrans(j, i + 4, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 5, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 6, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 7, roi_out, xtrans)] },
-        { film_rgb_f[FCxtrans(j, i + 8, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 9, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 10, roi_out, xtrans)],
-          film_rgb_f[FCxtrans(j, i + 11, roi_out, xtrans)] }
-      };
-
-      // process aligned pixels four at a time
-      for(size_t f = 0; i < width - (4 - 1); f = (f+1)%3, i += 4)
-      {
-        dt_aligned_pixel_t v;
-        for_each_channel(c)
-          v[c] = CLAMP(film[f][c] - in[p+i+c], 0.0f, 1.0f);
-        copy_pixel_nontemporal(out + p + i, v);
-      }
-
-      // process the remaining pixels
-      for(; i < width; i++)
-        out[p+i] = CLAMP(film_rgb_f[FCxtrans(j, i, roi_out, xtrans)] - in[p+i], 0.0f, 1.0f);
-
-    }
-
+  { // xtrans float mosaiced (Rust FFI)
+    darkroom_invert_xtrans(in, out, width, height,
+                           (const unsigned char *)xtrans,
+                           roi_out->x, roi_out->y, film_rgb_f);
     for(int k = 0; k < 4; k++)
       piece->pipe->dsc.processed_maximum[k] = 1.0f;
   }
   else if(filters)
-  { // bayer float mosaiced
-
-    const size_t x = roi_out->x;
-    const size_t y = roi_out->y;
-
-    DT_OMP_FOR()
-    for(int j = 0; j < height; j++)
-    {
-      const size_t p = (size_t)j * width;
-      size_t i = 0;
-      int alignment = ((4 - (j * width & (4 - 1))) & (4 - 1));
-
-      // process unaligned pixels
-      for(; i < alignment && i < width; i++)
-        out[p+i] = CLAMP(film_rgb_f[FC(j + y, i + x, filters)] - in[p+i], 0.0f, 1.0f);
-
-      // set up the filter mask for the current row of the image
-      const dt_aligned_pixel_t film = { film_rgb_f[FC(j + y, x + i, filters)],
-                                        film_rgb_f[FC(j + y, x + i + 1, filters)],
-                                        film_rgb_f[FC(j + y, x + i + 2, filters)],
-                                        film_rgb_f[FC(j + y, x + i + 3, filters)] };
-
-      // process aligned pixels four at a time
-      for(; i < width - (4 - 1); i += 4)
-      {
-        dt_aligned_pixel_t inv;
-        for_four_channels(c, aligned(in))
-          inv[c] = CLAMP(film[c] - in[p+i+c], 0.0f, 1.0f);
-        copy_pixel_nontemporal(out + p + i, inv);
-      }
-
-      // process the remaining pixels
-      for(; i < roi_out->width; i++)
-        out[p+i] = CLAMP(film_rgb_f[FC(j + y, i + x, filters)] - in[p+i], 0.0f, 1.0f);
-    }
-
+  { // bayer float mosaiced (Rust FFI)
+    darkroom_invert_bayer(in, out, width, height, filters,
+                          roi_out->x, roi_out->y, film_rgb_f);
     for(int k = 0; k < 4; k++)
       piece->pipe->dsc.processed_maximum[k] = 1.0f;
   }
