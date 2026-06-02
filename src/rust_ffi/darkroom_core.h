@@ -878,6 +878,8 @@ void darkroom_filmic_process(const float *in_buf,
                              int preserve_color,
                              const float *table,
                              const float *grad_2);
+void darkroom_filmic_average_luts(float *table, const float *table_temp, size_t len);
+void darkroom_filmic_build_grad2_lut(float *grad2, float center, float sigma);
 
 /*
  * Basecurve IOP — legacy (no preserve-colors) per-channel tone curve via integer-truncation LUT.

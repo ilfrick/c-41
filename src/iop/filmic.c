@@ -1065,8 +1065,7 @@ void compute_curve_lut(dt_iop_filmic_params_t *p, float *table, float *table_tem
     dt_draw_curve_destroy(curve);
 
     // Average both LUT
-    DT_OMP_FOR()
-    for(int k = 0; k < res; k++) table[k] = (table[k] + table_temp[k]) / 2.0f;
+    darkroom_filmic_average_luts(table, table_temp, res);
   }
 
 }
@@ -1122,19 +1121,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   const float saturation = d->saturation / 100.0f;
   const float sigma = saturation * saturation * latitude * latitude;
 
-  DT_OMP_FOR()
-  for(int k = 0; k < 65536; k++)
-  {
-    const float x = ((float)k) / 65536.0f;
-    if(sigma != 0.0f)
-    {
-      d->grad_2[k] = expf(-0.5f * (center - x) * (center - x) / sigma);
-    }
-    else
-    {
-      d->grad_2[k] = 0.0f;
-    }
-  }
+  darkroom_filmic_build_grad2_lut(d->grad_2, center, sigma);
 
 }
 

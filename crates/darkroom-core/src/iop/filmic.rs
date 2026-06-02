@@ -230,3 +230,41 @@ mod tests {
         }
     }
 }
+
+/// Average two equally-sized LUT tables element-wise: `table[k] = (table[k] + table_temp[k]) / 2`.
+///
+/// Used in `compute_curve_lut` when blending two spline LUTs.
+/// Matches the DT_OMP_FOR in src/iop/filmic.c:1068.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_filmic_average_luts(
+    table: *mut f32,
+    table_temp: *const f32,
+    len: usize,
+) {
+    let t  = std::slice::from_raw_parts_mut(table, len);
+    let tt = std::slice::from_raw_parts(table_temp, len);
+    for k in 0..len {
+        t[k] = (t[k] + tt[k]) * 0.5;
+    }
+}
+
+/// Build the desaturation window LUT (`grad_2`, 65536 entries).
+///
+/// grad_2[k] = exp(-0.5 * (center - k/65536)² / sigma)  if sigma != 0, else 0.
+/// Matches the DT_OMP_FOR in src/iop/filmic.c:1125.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_filmic_build_grad2_lut(
+    grad2: *mut f32,
+    center: f32,
+    sigma: f32,
+) {
+    let lut = std::slice::from_raw_parts_mut(grad2, 65536);
+    if sigma == 0.0 {
+        for v in lut.iter_mut() { *v = 0.0; }
+    } else {
+        for k in 0..65536usize {
+            let x = k as f32 / 65536.0;
+            lut[k] = (-0.5 * (center - x) * (center - x) / sigma).exp();
+        }
+    }
+}
