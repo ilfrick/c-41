@@ -101,18 +101,6 @@ const char **description(dt_iop_module_t *self)
 
 
 DT_OMP_DECLARE_SIMD()
-static void transform(const dt_dev_pixelpipe_iop_t *const piece,
-                      const float scale,
-                      const float *const x,
-                      float *o)
-{
-  const dt_iop_rotatepixels_data_t *d = piece->data;
-
-  const float pi[2] = { x[0] - d->rx * scale, x[1] - d->ry * scale };
-
-  mul_mat_vec_2(d->m, pi, o);
-}
-
 
 DT_OMP_DECLARE_SIMD()
 static void backtransform(const dt_dev_pixelpipe_iop_t *const piece,

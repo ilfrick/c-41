@@ -155,68 +155,6 @@ dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
   return IOP_CS_RGB;
 }
 
-// Compute a hue shift toward the nearest harmony node, scaled by Gaussian proximity.
-//
-// We use the nearest-node's angular difference (diff_winning) multiplied by
-// the peak Gaussian weight (max_w). This ensures:
-//   - A pixel already at a node gets zero shift (diff_winning = 0).
-//   - A pixel far from all nodes gets near-zero shift (max_w ≈ 0).
-//   - The correction magnitude tapers smoothly as the pixel moves away from its node.
-//
-//   Narrow zone (< 1): Gaussian drops off quickly → only hues very close to a
-//                       node are attracted; distant hues are barely shifted.
-//   Default zone (1):  Gaussian tapers to ~14 % at the midpoint between nodes.
-//   Wide zone   (> 1): Gaussian stays high across the full hue circle → broad,
-//                       global correction; all hues are pulled noticeably.
-static inline float get_weighted_hue_shift(const float px_hue,
-                                           const float *nodes,
-                                           const int num_nodes,
-                                           const float pull_width_factor,
-                                           int *out_winning_idx,
-                                           float *out_max_weight)
-{
-  if(num_nodes <= 0)
-  {
-    if(out_winning_idx) *out_winning_idx = 0;
-    if(out_max_weight) *out_max_weight = 0.0f;
-    return 0.0f;
-  }
-  const float sigma = pull_width_factor * 0.5f / (float)num_nodes;
-  const float inv_2sigma2 = 1.0f / (2.0f * sigma * sigma);
-
-  float max_w       = 0.0f;
-  int   winning_idx = 0;
-  float diff_winning = 0.0f;
-
-  for(int i = 0; i < num_nodes; i++)
-  {
-    float d = fabsf(px_hue - nodes[i]);
-    if(d > 0.5f) d = 1.0f - d;
-
-    const float w = expf(-d * d * inv_2sigma2);
-    float diff = nodes[i] - px_hue;
-    if(diff > 0.5f)       diff -= 1.0f;
-    else if(diff < -0.5f) diff += 1.0f;
-
-    if(w > max_w)
-    {
-      max_w       = w;
-      winning_idx = i;
-      diff_winning = diff;
-    }
-  }
-
-  if(out_winning_idx) *out_winning_idx = winning_idx;
-  if(out_max_weight)  *out_max_weight  = max_w;
-  return diff_winning * max_w;
-}
-
-static inline float wrap_hue(float h)
-{
-  h = fmodf(h, 1.0f);
-  if (h < 0.0f) h += 1.0f;
-  return h;
-}
 
 // Compute harmony node positions in UCS hue space [0,1).
 // For predefined rules the geometry comes from dt_color_harmony_get_sector_angles()
