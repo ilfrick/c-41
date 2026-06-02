@@ -641,6 +641,12 @@ void darkroom_monochrome_blend(const float *in_buf,
  *   bl  = logf(max(eps, data->drago.bias)) / logf(0.5f)
  *   eps = 0.0001f  (constant)
  */
+/* Globaltonemap IOP — max luminance scan: max(initial, in[k*ch]*0.01).
+ * Matches the DT_OMP_FOR(reduction(max:lwmax)) at globaltonemap.c:221. */
+float darkroom_globaltonemap_luma_max(const float *in_buf,
+                                       size_t npixels, size_t ch,
+                                       float initial);
+
 void darkroom_globaltonemap_reinhard(const float *in_buf,
                                      float *out_buf,
                                      size_t npixels,

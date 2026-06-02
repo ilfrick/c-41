@@ -217,13 +217,8 @@ static inline void process_drago(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *
   // in all other cases we calculate lwmax here
   if(tmp_lwmax == -FLT_MAX)
   {
-    lwmax = eps;
-    DT_OMP_FOR(reduction(max : lwmax))
-    for(size_t k = 0; k < (size_t)roi_out->width * roi_out->height; k++)
-    {
-      const float *inp = in + ch * k;
-      lwmax = fmaxf(lwmax, (inp[0] * 0.01f));
-    }
+    const size_t npixels = (size_t)roi_out->width * roi_out->height;
+    lwmax = darkroom_globaltonemap_luma_max(in, npixels, (size_t)ch, eps);
   }
   else
   {
