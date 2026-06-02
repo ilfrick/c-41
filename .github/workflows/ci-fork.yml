@@ -99,13 +99,12 @@ jobs:
 
       - name: Build
         run: |
-          cmake --build build --parallel $(nproc) 2>&1 | tee /tmp/build-out.txt; \
-          STATUS=${PIPESTATUS[0]}; \
-          if [ $STATUS -ne 0 ]; then \
-            echo "=== BUILD FAILED — last 100 lines ===" && \
-            tail -100 /tmp/build-out.txt; \
-            exit $STATUS; \
-          fi
+          set -o pipefail
+          cmake --build build --verbose 2>&1 | tee /tmp/build-out.txt || {
+            echo "::error::Build failed — showing last 150 lines"
+            tail -150 /tmp/build-out.txt
+            exit 1
+          }
 
       - name: Smoke test the binary
         run: |
