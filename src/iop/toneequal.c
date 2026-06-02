@@ -1201,9 +1201,7 @@ static void compute_correction_lut(float* restrict lut,
                                    const float sigma,
                                    const float *const restrict factors)
 {
-  const float gauss_denom = gaussian_denom(sigma);
   assert(PIXEL_CHAN == 8);
-
   darkroom_toneequal_build_lut(lut, factors, centers_ops,
                                (size_t)PIXEL_CHAN, (size_t)LUT_RESOLUTION,
                                sigma, DT_TONEEQ_MIN_EV);
