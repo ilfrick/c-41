@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * Color-contrast IOP — affine transform on Lab a/b channels.
+ * Color-contrast IOP -- affine transform on Lab a/b channels.
  *
  * Replaces the two OMP loops in src/iop/colorcontrast.c::process().
  * unbound != 0: no clamping; unbound == 0: a/b clamped to [-128, 128].
@@ -31,7 +31,7 @@ void darkroom_colorcontrast_process(const float *in_buf,
                                     int unbound);
 
 /*
- * Vibrance IOP — saturation-weighted chroma boost.
+ * Vibrance IOP -- saturation-weighted chroma boost.
  *
  * Replaces the OMP loop in src/iop/vibrance.c::process().
  * amount must be pre-scaled by 0.01 (done in C commit_params).
@@ -42,7 +42,7 @@ void darkroom_vibrance_process(const float *in_buf,
                                float amount);
 
 /*
- * Levels IOP — black/white-point + gamma correction via LUT.
+ * Levels IOP -- black/white-point + gamma correction via LUT.
  *
  * Replaces the OMP loop in src/iop/levels.c::process().
  * lut points to dt_iop_levels_data_t.lut (65536 floats).
@@ -57,7 +57,7 @@ void darkroom_levels_process(const float *in_buf,
                              const float *lut);
 
 /*
- * Color-correction IOP — luminance-dependent Lab a/b scaling with saturation.
+ * Color-correction IOP -- luminance-dependent Lab a/b scaling with saturation.
  *
  * Replaces the OMP loop in src/iop/colorcorrection.c::process().
  * out.a = saturation * (in.a + in.L * a_scale + a_base)
@@ -73,10 +73,10 @@ void darkroom_colorcorrection_process(const float *in_buf,
                                       float saturation);
 
 /*
- * Relight IOP — gaussian-weighted L-channel boost in Lab colorspace.
+ * Relight IOP -- gaussian-weighted L-channel boost in Lab colorspace.
  *
  * Replaces the OMP loop in src/iop/relight.c::process().
- * GAUSS(a=1, b, c, x) = expf(-(x-b)^2 / c^2)  [no 2× in denominator]
+ * GAUSS(a=1, b, c, x) = expf(-(x-b)^2 / c^2)  [no 2x in denominator]
  */
 void darkroom_relight_process(const float *in_buf,
                               float *out_buf,
@@ -86,7 +86,7 @@ void darkroom_relight_process(const float *in_buf,
                               float width);
 
 /*
- * Colorize IOP — replace a/b with fixed Lab color, blend L from input.
+ * Colorize IOP -- replace a/b with fixed Lab color, blend L from input.
  *
  * Replaces the OMP loop in src/iop/colorize.c::process().
  * Alpha is always written as 0 (matching C copy_pixel({0,a,b,0})).
@@ -100,7 +100,7 @@ void darkroom_colorize_process(const float *in_buf,
                                float mix);
 
 /*
- * Velvia IOP — film-emulation saturation boost in RGB colorspace.
+ * Velvia IOP -- film-emulation saturation boost in RGB colorspace.
  *
  * Replaces the OMP loop in src/iop/velvia.c::process().
  * strength must be pre-scaled by 0.01 (data->strength / 100.0f).
@@ -113,7 +113,7 @@ void darkroom_velvia_process(const float *in_buf,
                              float bias);
 
 /*
- * Colisa IOP — contrast/brightness (LUT) + saturation in Lab colorspace.
+ * Colisa IOP -- contrast/brightness (LUT) + saturation in Lab colorspace.
  *
  * Replaces the OMP loop in src/iop/colisa.c::process().
  * ctable/ltable point to dt_iop_colisa_data_t.ctable/ltable (65536 floats each).
@@ -131,7 +131,7 @@ void darkroom_colisa_build_contrast_lut(float *ctable, float contrast);
 void darkroom_colisa_build_brightness_lut(float *ltable, float gamma);
 
 /*
- * Split-toning IOP — shadow/highlight colorization via HSL.
+ * Split-toning IOP -- shadow/highlight colorization via HSL.
  *
  * Replaces the OMP loop in src/iop/splittoning.c::process().
  * compress must be pre-scaled: (data->compress / 110.0f) / 2.0f
@@ -147,7 +147,7 @@ void darkroom_splittoning_process(const float *in_buf,
                                   float compress);
 
 /*
- * Negadoctor IOP — film negative scan inversion.
+ * Negadoctor IOP -- film negative scan inversion.
  *
  * Replaces the OMP loop in src/iop/negadoctor.c::process().
  * dmin, wb_high, offset each point to 4 floats (dt_aligned_pixel_t).
@@ -166,10 +166,10 @@ void darkroom_negadoctor_process(const float *in_buf,
                                  float exposure);
 
 /*
- * Channel-mixer IOP — linear RGB and HSL channel remapping.
+ * Channel-mixer IOP -- linear RGB and HSL channel remapping.
  *
  * Replaces the process_rgb/gray/hsl_v1/hsl_v2 loops in channelmixer.c::process().
- * hsl_matrix and rgb_matrix each point to 9 floats (3×3, row-major).
+ * hsl_matrix and rgb_matrix each point to 9 floats (3x3, row-major).
  * operation_mode: 0=RGB, 1=GRAY, 2=HSL_V1, 3=HSL_V2.
  */
 void darkroom_channelmixer_process(const float *in_buf,
@@ -180,7 +180,7 @@ void darkroom_channelmixer_process(const float *in_buf,
                                    int operation_mode);
 
 /*
- * Lowlight IOP — scotopic vision simulation in Lab colorspace.
+ * Lowlight IOP -- scotopic vision simulation in Lab colorspace.
  *
  * Replaces the OMP loop in src/iop/lowlight.c::process().
  * lut points to d->lut (DT_IOP_LOWLIGHT_LUT_RES = 65536 floats).
@@ -192,7 +192,7 @@ void darkroom_lowlight_process(const float *in_buf,
                                const float *lut);
 
 /*
- * Tone-curve IOP — 3-channel Lab LUT with four autoscale modes.
+ * Tone-curve IOP -- 3-channel Lab LUT with four autoscale modes.
  *
  * Replaces the OMP loop in src/iop/tonecurve.c::process().
  * table_l/a/b each point to d->table[ch_L/a/b] (65536 floats each).
@@ -213,11 +213,11 @@ void darkroom_tonecurve_process(const float *in_buf,
                                 int preserve_colors);
 
 /*
- * Primaries IOP — linear RGB color matrix adjustment.
+ * Primaries IOP -- linear RGB color matrix adjustment.
  *
  * Replaces the OMP loop in src/iop/primaries.c::process().
  * matrix points to dt_colormatrix_t (float[4][4] = 16 floats, row-major).
- * dt_apply_transposed_color_matrix: out[r] = Σ matrix[c][r] * in[c] for c=0..2
+ * dt_apply_transposed_color_matrix: out[r] = sum matrix[c][r] * in[c] for c=0..2
  */
 void darkroom_primaries_process(const float *in_buf,
                                 float *out_buf,
@@ -225,7 +225,7 @@ void darkroom_primaries_process(const float *in_buf,
                                 const float *matrix);
 
 /*
- * Profile-gamma IOP — logarithmic or gamma LUT tone mapping.
+ * Profile-gamma IOP -- logarithmic or gamma LUT tone mapping.
  *
  * Replaces the OMP loops in src/iop/profile_gamma.c::process().
  * mode: 0=LOG (all ch*npixels elements), 1=GAMMA (channels 0..2 only).
@@ -244,7 +244,7 @@ void darkroom_profile_gamma_process(const float *in_buf,
 void darkroom_profile_gamma_build_lut(float *table, float gamma, float linear);
 
 /*
- * Graduated ND filter IOP — exponential density gradient.
+ * Graduated ND filter IOP -- exponential density gradient.
  *
  * Replaces the OMP loops in src/iop/graduatednd.c::process().
  * Geometry scalars must be pre-computed by C caller (see source for formulas).
@@ -265,10 +265,10 @@ void darkroom_graduatednd_process(const float *in_buf,
                                   const float *color1);
 
 /*
- * Grain IOP — photographic film grain via simplex noise on L channel.
+ * Grain IOP -- photographic film grain via simplex noise on L channel.
  *
  * Replaces the OMP loop in src/iop/grain.c::process() (non-filter path only).
- * grain_lut: 128×128 floats from data->grain_lut; if NULL, built from midtones_bias.
+ * grain_lut: 128x128 floats from data->grain_lut; if NULL, built from midtones_bias.
  * strength = data->strength / 100.0f
  * zoom = (1.0 + 8*data->scale/100) / 800.0
  * wd = fminf(piece->buf_in.width, piece->buf_in.height)
@@ -290,7 +290,7 @@ void darkroom_grain_process(const float *in_buf,
                             const float *grain_lut);
 
 /*
- * RGB-curve IOP — per-channel or linked LUT tone mapping.
+ * RGB-curve IOP -- per-channel or linked LUT tone mapping.
  *
  * Replaces the OMP loop in src/iop/rgbcurve.c::process().
  * autoscale: 0 = AUTOMATIC_RGB (linked, R curve applied to all channels)
@@ -315,12 +315,12 @@ void darkroom_rgbcurve_process(const float *in_buf,
                                int preserve_colors);
 
 /*
- * Color-zones IOP — luminance/chroma/hue equalizer in LCH space.
+ * Color-zones IOP -- luminance/chroma/hue equalizer in LCH space.
  *
  * Replaces process_v1/process_v3 in src/iop/colorzones.c.
  * mode: 0 = smooth/v3 (DT_IOP_COLORZONES_MODE_SMOOTH), non-zero = flat/v1.
  * channel: 0 = L, 1 = C, 2 = h (drives LUT selection index).
- * lut_l/a/b: each DT_IOP_COLORZONES_LUT_RES (65536) floats — d->lut[0..2].
+ * lut_l/a/b: each DT_IOP_COLORZONES_LUT_RES (65536) floats -- d->lut[0..2].
  */
 void darkroom_colorzones_process(const float *in_buf,
                                  float *out_buf,
@@ -337,7 +337,7 @@ void darkroom_colorzones_display(const float *in_buf,
                                  const float *lut);
 
 /*
- * Vignette IOP — radial brightness/saturation falloff with optional dithering.
+ * Vignette IOP -- radial brightness/saturation falloff with optional dithering.
  *
  * Replaces the OMP loop in src/iop/vignette.c::process().
  * All geometry scalars must be pre-computed by the C caller.
@@ -362,7 +362,7 @@ void darkroom_vignette_process(const float *in_buf,
                                int unbound);
 
 /*
- * Sigmoid IOP — RGB-ratio path: luma-based tone curve + hyperbolic gamut compression.
+ * Sigmoid IOP -- RGB-ratio path: luma-based tone curve + hyperbolic gamut compression.
  *
  * Replaces process_loglogistic_rgb_ratio in src/iop/sigmoid.c.
  * white_target / black_target = module_data->white_target / black_target.
@@ -379,7 +379,7 @@ void darkroom_sigmoid_rgb_ratio_process(const float *in_buf,
                                         float skew_power);
 
 /*
- * Sigmoid IOP — per-channel path: per-channel tone curve + hue preservation.
+ * Sigmoid IOP -- per-channel path: per-channel tone curve + hue preservation.
  *
  * Replaces process_loglogistic_per_channel in src/iop/sigmoid.c.
  * pipe_to_base / base_to_rendering / rendering_to_pipe: each 16 floats
@@ -399,7 +399,7 @@ void darkroom_sigmoid_per_channel_process(const float *in_buf,
                                           const float *rendering_to_pipe);
 
 /*
- * RGB-levels IOP — per-channel or luma-linked black/white-point + gamma correction.
+ * RGB-levels IOP -- per-channel or luma-linked black/white-point + gamma correction.
  *
  * Replaces the two DT_OMP_FOR loops in src/iop/rgblevels.c::process().
  * mode: 0 = independent channels (INDEPENDENT or preserve_colors==NONE)
@@ -502,10 +502,10 @@ void darkroom_exposure_process(const float *in_buf,
  * Replaces the DT_OMP_FOR loop in src/iop/lowpass.c::process() (after the blur).
  * out_buf must already contain the gaussian/bilateral blurred Lab image.
  *
- * ctable/ltable: float[0x10000] LUTs for contrast/brightness (L in [0..100] → new L)
+ * ctable/ltable: float[0x10000] LUTs for contrast/brightness (L in [0..100] -> new L)
  * cunbounded/lunbounded: float[3] extrapolation coeffs (dt_iop_eval_exp) for L >= 100
  * saturation: d->saturation (multiplier on a/b channels)
- * lab_min_ab/lab_max_ab: ±128 normally, ±FLT_MAX when unbound=1
+ * lab_min_ab/lab_max_ab: +/-128 normally, +/-FLT_MAX when unbound=1
  * Alpha is copied from in_buf (original pre-blur pixel).
  */
 void darkroom_lowpass_process(const float *in_buf,
@@ -532,7 +532,7 @@ void darkroom_lowpass_build_brightness_lut(float *ltable, float gamma);
  * gain[4]:   pre-computed gain vector
  * grey = d->grey / 100.0f
  * saturation = d->saturation; saturation_out = d->saturation_out
- * contrast_power[4]: { 1/d->contrast, ... } — all four elements equal
+ * contrast_power[4]: { 1/d->contrast, ... } -- all four elements equal
  * (grey/saturation/saturation_out/contrast_power are ignored in LEGACY mode)
  */
 void darkroom_colorbalance_process(const float *in_buf,
@@ -551,7 +551,7 @@ void darkroom_colorbalance_process(const float *in_buf,
  * Soften IOP initial pixel loop.
  *
  * Replaces the DT_OMP_FOR loop in src/iop/soften.c::process() (before dt_box_mean).
- * Converts each pixel RGB→HSL, scales saturation and lightness, writes back RGB.
+ * Converts each pixel RGB->HSL, scales saturation and lightness, writes back RGB.
  *
  * brightness = 1.0f / exp2f(-d->brightness)
  * saturation = d->saturation / 100.0f
@@ -594,7 +594,7 @@ void darkroom_shadhi_process(const float *in_buf,
                              int unbound_mask);
 
 /*
- * Highpass IOP — invert+pack and blend, split around dt_box_mean blur.
+ * Highpass IOP -- invert+pack and blend, split around dt_box_mean blur.
  *
  * Pass 1: darkroom_highpass_invert
  *   Writes out[k] = 100 - clamp(in[4*k], 0, 100) into a packed 1-channel buffer.
@@ -616,15 +616,15 @@ void darkroom_highpass_blend(const float *in_buf,
                              float contrast_scale);
 
 /*
- * Monochrome IOP — two-pass Lab desaturation with bilateral-filtered blend.
+ * Monochrome IOP -- two-pass Lab desaturation with bilateral-filtered blend.
  *
  * Pass 1 (before bilateral blur):
- *   darkroom_monochrome_colorfilter — L_out = 100 * exp(-clamp(dist^2/sigma2, 0,1))
+ *   darkroom_monochrome_colorfilter -- L_out = 100 * exp(-clamp(dist^2/sigma2, 0,1))
  *   where dist^2 = (a_in - a)^2 + (b_in - b)^2; sets a_out=b_out=0.
  *   sigma2 = 2 * (d->size * 128)^2
  *
  * Pass 2 (after bilateral blur of out):
- *   darkroom_monochrome_blend — blends bilateral result with original L.
+ *   darkroom_monochrome_blend -- blends bilateral result with original L.
  *   highlights = d->highlights (0..1).
  */
 void darkroom_monochrome_colorfilter(const float *in_buf,
@@ -640,7 +640,7 @@ void darkroom_monochrome_blend(const float *in_buf,
                                float highlights);
 
 /*
- * Global Tonemap IOP — Reinhard / filmic (Hable) / Drago per-pixel operators.
+ * Global Tonemap IOP -- Reinhard / filmic (Hable) / Drago per-pixel operators.
  *
  * Each function replaces the DT_OMP_FOR loop inside process_reinhard/filmic/drago().
  * ch = piece->colors (stride, normally 4).  Only L (ch*k+0) is tone-mapped;
@@ -651,7 +651,7 @@ void darkroom_monochrome_blend(const float *in_buf,
  *   bl  = logf(max(eps, data->drago.bias)) / logf(0.5f)
  *   eps = 0.0001f  (constant)
  */
-/* Globaltonemap IOP — max luminance scan: max(initial, in[k*ch]*0.01).
+/* Globaltonemap IOP -- max luminance scan: max(initial, in[k*ch]*0.01).
  * Matches the DT_OMP_FOR(reduction(max:lwmax)) at globaltonemap.c:221. */
 float darkroom_globaltonemap_luma_max(const float *in_buf,
                                        size_t npixels, size_t ch,
@@ -677,7 +677,7 @@ void darkroom_globaltonemap_drago(const float *in_buf,
                                   float eps);
 
 /*
- * Bloom IOP — threshold gather + screen-blend, split around dt_box_mean blur.
+ * Bloom IOP -- threshold gather + screen-blend, split around dt_box_mean blur.
  *
  * Pass 1: darkroom_bloom_gather fills a packed 1-channel buffer (npixels floats)
  *   with scaled L values above threshold; zeros elsewhere.
@@ -697,7 +697,7 @@ void darkroom_bloom_blend(const float *in_buf,
                           size_t npixels);
 
 /*
- * Invert IOP — non-mosaiced (4-channel RGBA) path only.
+ * Invert IOP -- non-mosaiced (4-channel RGBA) path only.
  *
  * Replaces the non-raw DT_OMP_FOR loop in src/iop/invert.c::process().
  * color points to 4 floats: { d->color[0], d->color[1], d->color[2], 1.0f }.
@@ -710,12 +710,12 @@ void darkroom_invert_process(const float *in_buf,
                              const float *color);
 
 /*
- * Dither IOP — posterize path only.
+ * Dither IOP -- posterize path only.
  *
  * Replaces the DT_OMP_FOR loop in _process_posterize() in src/iop/dither.c.
  * f = levels - 1  (pre-computed by caller).
  * rf = 1.0f / f   (pre-computed by caller).
- * _quantize(x) = rf * ceilf(x*f - 0.5) — rounds up only when frac > 0.5.
+ * _quantize(x) = rf * ceilf(x*f - 0.5) -- rounds up only when frac > 0.5.
  * All 4 channels including alpha are quantized identically.
  */
 void darkroom_dither_posterize(const float *in_buf,
@@ -725,7 +725,7 @@ void darkroom_dither_posterize(const float *in_buf,
                                float rf);
 
 /*
- * AgX IOP — full per-pixel tone mapping pipeline.
+ * AgX IOP -- full per-pixel tone mapping pipeline.
  *
  * Replaces the DT_OMP_FOR loop in src/iop/agx.c::process().
  * pipe_to_base / base_to_rendering / rendering_to_pipe / rendering_to_xyz:
@@ -745,7 +745,7 @@ void darkroom_agx_process(const float *in_buf,
 
 /* Non-mosaiced white-balance multiply.
  * Replaces the DT_OMP_FOR else-branch in temperature.c::process().
- * coeffs[4] = d->coeffs — one scalar multiplier per RGBA channel.
+ * coeffs[4] = d->coeffs -- one scalar multiplier per RGBA channel.
  */
 void darkroom_temperature_process_rgb(const float *in_buf,
                                       float *out_buf,
@@ -763,9 +763,9 @@ void darkroom_watermark_blend(const float *in_buf,
                               const unsigned char *watermark,
                               float opacity);
 
-/* 3D-LUT interpolation — trilinear, tetrahedral, and pyramid variants.
+/* 3D-LUT interpolation -- trilinear, tetrahedral, and pyramid variants.
  * Replace DT_OMP_FOR loops in _correct_pixel_* in lut3d.c.
- * clut: 3 × level³ floats (RGB per grid point, no alpha padding).
+ * clut: 3 x level^3 floats (RGB per grid point, no alpha padding).
  * Output alpha is always 0.
  */
 void darkroom_lut3d_trilinear(const float *in_buf, float *out_buf,
@@ -783,7 +783,7 @@ void darkroom_lut3d_pyramid(const float *in_buf, float *out_buf,
  */
 void darkroom_add_buffers(float *out_buf, const float *add_buf, size_t n);
 
-/* Camera-RGB → Lab via 4×4 colour matrix (cam→XYZ) + D50 XYZ→Lab.
+/* Camera-RGB -> Lab via 4x4 colour matrix (cam->XYZ) + D50 XYZ->Lab.
  * Replaces the per-pixel loop in _cmatrix_fastpath_simple() in colorin.c.
  * corr:    4 white-balance correction coefficients.
  * cmatrix: 16 floats, dt_colormatrix_t row-major (float[4][4]).
@@ -796,7 +796,7 @@ void darkroom_colorin_cmatrix_fastpath_simple(const float *in_buf,
                                               const float *cmatrix);
 
 /*
- * ChannelMixerRGB IOP — per-pixel chromatic adaptation + mix + luma/chroma.
+ * ChannelMixerRGB IOP -- per-pixel chromatic adaptation + mix + luma/chroma.
  *
  * Replaces the DT_OMP_FOR pixel loop inside _loop_switch() in channelmixerrgb.c.
  * The C caller pre-computes RGB_to_LMS and MIX_to_XYZ from kind, then transposes
@@ -829,13 +829,13 @@ void darkroom_channelmixerrgb_loop_switch(const float *in_buf,
                                           int version);
 
 /*
- * colorout tone-curve application — in-place per-channel LUT + exp extrapolation.
+ * colorout tone-curve application -- in-place per-channel LUT + exp extrapolation.
  *
  * Replaces both DT_OMP_FOR loops in process_fastpath_apply_tonecurves() in colorout.c.
- * lut:              3 × LUT_SAMPLES (65536) floats, row-major (channel c at c*65536).
- * unbounded_coeffs: 3 × 3 floats, row-major (channel c at c*3).
- *   eval_exp(c, v) = coeff[1] * pow(v * coeff[0], coeff[2])  — matches dt_iop_eval_exp.
- * lut_active:       3 ints; non-zero → apply LUT+exp for that channel.
+ * lut:              3 x LUT_SAMPLES (65536) floats, row-major (channel c at c*65536).
+ * unbounded_coeffs: 3 x 3 floats, row-major (channel c at c*3).
+ *   eval_exp(c, v) = coeff[1] * pow(v * coeff[0], coeff[2])  -- matches dt_iop_eval_exp.
+ * lut_active:       3 ints; non-zero -> apply LUT+exp for that channel.
  */
 void darkroom_colorout_apply_tonecurves(float *buf,
                                         size_t npixels,
@@ -843,9 +843,9 @@ void darkroom_colorout_apply_tonecurves(float *buf,
                                         const float *unbounded_coeffs,
                                         const int *lut_active);
 
-/* colorout Lab→XYZ→RGB using pre-transposed 3×4 colormatrix.
+/* colorout Lab->XYZ->RGB using pre-transposed 3x4 colormatrix.
  * Replaces DT_OMP_FOR in _transform_cmatrix_linear() in colorout.c.
- * cmatrix: 12 floats, row-major (3 rows × 4), output of transpose_3xSSE().
+ * cmatrix: 12 floats, row-major (3 rows x 4), output of transpose_3xSSE().
  * Output alpha is always 0.
  */
 void darkroom_colorout_cmatrix_linear(const float *in_buf,
@@ -882,11 +882,11 @@ void darkroom_filmic_average_luts(float *table, const float *table_temp, size_t 
 void darkroom_filmic_build_grad2_lut(float *grad2, float center, float sigma);
 
 /*
- * Basecurve IOP — legacy (no preserve-colors) per-channel tone curve via integer-truncation LUT.
+ * Basecurve IOP -- legacy (no preserve-colors) per-channel tone curve via integer-truncation LUT.
  *
  * Matches apply_legacy_curve() in src/iop/basecurve.c.
- * table:            65536 floats — single shared LUT for all RGB channels.
- * unbounded_coeffs: 3 floats — [c0, c1, c2] for eval_exp extrapolation (f >= 1.0).
+ * table:            65536 floats -- single shared LUT for all RGB channels.
+ * unbounded_coeffs: 3 floats -- [c0, c1, c2] for eval_exp extrapolation (f >= 1.0).
  * mul:              pre-scalar applied to every channel value before lookup.
  */
 void darkroom_basecurve_apply_legacy_curve(const float *in_buf,
@@ -897,7 +897,7 @@ void darkroom_basecurve_apply_legacy_curve(const float *in_buf,
                                            const float *unbounded_coeffs);
 
 /*
- * Basecurve IOP — exposure-fusion feature map written into alpha channel in-place.
+ * Basecurve IOP -- exposure-fusion feature map written into alpha channel in-place.
  *
  * Matches compute_features() in src/iop/basecurve.c.
  * Writes sat * well_exposedness into buf[k*4+3] for every pixel k.
@@ -906,7 +906,7 @@ void darkroom_basecurve_compute_features(float *buf,
                                          size_t npixels);
 
 /*
- * Hazeremoval IOP — per-pixel dark channel.
+ * Hazeremoval IOP -- per-pixel dark channel.
  * Writes min(R,G,B) of each RGBA input pixel into a gray scalar output.
  * Matches the inner loop of _dark_channel() in src/iop/hazeremoval.c.
  */
@@ -915,7 +915,7 @@ void darkroom_hazeremoval_dark_channel(const float *in_buf,
                                        size_t npixels);
 
 /*
- * Hazeremoval IOP — per-pixel transition map.
+ * Hazeremoval IOP -- per-pixel transition map.
  * out[i] = 1 - min(min(R*a0_inv[0], G*a0_inv[1]), B*a0_inv[2]) * strength
  * Matches the inner loop of _transition_map() in src/iop/hazeremoval.c.
  * a0_inv is a 3-float array of reciprocal ambient-light values.
@@ -927,7 +927,7 @@ void darkroom_hazeremoval_transition_map(const float *in_buf,
                                          float strength);
 
 /*
- * Hazeremoval IOP — final dehaze.
+ * Hazeremoval IOP -- final dehaze.
  *   t = max(trans_map[i], t_min)
  *   out[4i + c] = (in[4i + c] - a0[c]) / t + a0[c]   for c in 0..4
  * Matches the final loop in `process()` (hazeremoval.c).
@@ -948,7 +948,7 @@ void darkroom_hazeremoval_ambient_light(const float *dark_channel,
                                         size_t *count_out);
 
 /*
- * Censorize IOP — pixelate (mosaic) effect.
+ * Censorize IOP -- pixelate (mosaic) effect.
  * Divides the RGBA image into 2*pixel_radius sized blocks; for each block,
  * averages five sample points and fills every pixel of the block with that
  * average colour. No-op if pixel_radius == 0.
@@ -960,45 +960,45 @@ void darkroom_censorize_pixelate(const float *in_buf,
                                  size_t height,
                                  size_t pixel_radius);
 
-/* Censorize IOP — add per-pixel Gaussian noise.
+/* Censorize IOP -- add per-pixel Gaussian noise.
  * norm = out[pix+1]; eps = gaussian_noise(norm, noise*norm, flip) / norm
  * out[c] = max(out[c]*eps, 0) for c in 0..3.
  * Matches make_noise() in src/iop/censorize.c:107. */
 void darkroom_censorize_make_noise(float *output, float noise,
                                     size_t width, size_t height);
 
-/* invert.c:253 — invert X-Trans mosaic: out = clamp(film[FCxtrans]-in, 0,1) */
+/* invert.c:253 -- invert X-Trans mosaic: out = clamp(film[FCxtrans]-in, 0,1) */
 void darkroom_invert_xtrans(const float *in_buf, float *out_buf,
                              size_t width, size_t height,
                              const unsigned char *xtrans,
                              int roi_x, int roi_y,
                              const float *film_rgb);
 
-/* invert.c:304 — invert Bayer mosaic: out = clamp(film[FC]-in, 0,1) */
+/* invert.c:304 -- invert Bayer mosaic: out = clamp(film[FC]-in, 0,1) */
 void darkroom_invert_bayer(const float *in_buf, float *out_buf,
                             size_t width, size_t height,
                             unsigned int filters,
                             int roi_x, int roi_y,
                             const float *film_rgb);
 
-/* temperature.c:552 — white-balance X-Trans: out = in * coeffs[FCNxtrans] */
+/* temperature.c:552 -- white-balance X-Trans: out = in * coeffs[FCNxtrans] */
 void darkroom_temperature_xtrans(const float *in_buf, float *out_buf,
                                   size_t width, size_t height,
                                   const unsigned char *xtrans,
                                   const float *coeffs);
 
-/* temperature.c:590 — white-balance Bayer: out = in * coeffs[FC] */
+/* temperature.c:590 -- white-balance Bayer: out = in * coeffs[FC] */
 void darkroom_temperature_bayer(const float *in_buf, float *out_buf,
                                  size_t width, size_t height,
                                  unsigned int filters,
                                  const float *coeffs);
 
 /*
- * Overexposed IOP — per-channel "any RGB" clipping preview.
+ * Overexposed IOP -- per-channel "any RGB" clipping preview.
  * For each pixel k:
- *   if any of R,G,B in img_tmp >= upper      → out[k] = upper_color
- *   else if R,G,B all <= lower               → out[k] = lower_color
- *   else                                     → out[k] = in[k]
+ *   if any of R,G,B in img_tmp >= upper      -> out[k] = upper_color
+ *   else if R,G,B all <= lower               -> out[k] = lower_color
+ *   else                                     -> out[k] = in[k]
  * upper_color and lower_color are 4-float RGBA arrays.
  * Matches the DT_CLIPPING_PREVIEW_ANYRGB branch in src/iop/overexposed.c.
  */
@@ -1012,7 +1012,7 @@ void darkroom_overexposed_anyrgb(const float *in_buf,
                                  const float *lower_color);
 
 /*
- * Overexposed IOP — work-profile-luminance clipping preview.
+ * Overexposed IOP -- work-profile-luminance clipping preview.
  * Same upper/lower decision tree as ANYRGB, but the test is run on the
  * matrix-derived Y value (with optional TRC linearisation when the
  * working profile is non-linear). Mirrors dt_ioppr_get_rgb_matrix_luminance
@@ -1038,7 +1038,7 @@ void darkroom_overexposed_luminance(const float *in_buf,
                                     int nonlinear_lut);
 
 /*
- * Overexposed IOP — gamut clipping preview (luminance + per-channel
+ * Overexposed IOP -- gamut clipping preview (luminance + per-channel
  * saturation test). Same signature as the LUMINANCE variant.
  * Matches the DT_CLIPPING_PREVIEW_GAMUT branch in src/iop/overexposed.c.
  */
@@ -1059,7 +1059,7 @@ void darkroom_overexposed_gamut(const float *in_buf,
                                 int nonlinear_lut);
 
 /*
- * Overexposed IOP — saturation-only preview. Same signature as the
+ * Overexposed IOP -- saturation-only preview. Same signature as the
  * LUMINANCE variant. Tests the saturation+RGB clipping only when
  * luminance is inside (lower, upper); otherwise the input is passed
  * through.
@@ -1082,12 +1082,12 @@ void darkroom_overexposed_saturation(const float *in_buf,
                                      int nonlinear_lut);
 
 /*
- * Hotpixels IOP — Bayer-sensor hot-pixel correction.
+ * Hotpixels IOP -- Bayer-sensor hot-pixel correction.
  * For each interior pixel above threshold, examines the four same-colour
- * Bayer neighbours (offsets ±2, ±2*width). If at least `min_neighbours`
+ * Bayer neighbours (offsets +/-2, +/-2*width). If at least `min_neighbours`
  * of them satisfy `pixel*multiplier > neighbour`, replaces the pixel
  * with the maximum of those neighbours. When `mark_fixed` is true,
- * stamps the original value at column offsets ±2..±10 (step 2) for the
+ * stamps the original value at column offsets +/-2..+/-10 (step 2) for the
  * UI debug overlay. Returns the count of pixels replaced.
  * Matches _process_bayer() in src/iop/hotpixels.c.
  */
@@ -1101,7 +1101,7 @@ int darkroom_hotpixels_bayer(const float *in_buf,
                              int mark_fixed);
 
 /*
- * Hotpixels IOP — multi-plane monochrome hot-pixel correction.
+ * Hotpixels IOP -- multi-plane monochrome hot-pixel correction.
  * Same shape as the Bayer variant but neighbour offsets are +/-planes and
  * +/-planes*width (so we examine adjacent pixels of the same channel
  * rather than skipping a Bayer cell). When fixed, every plane of the
@@ -1120,7 +1120,7 @@ int darkroom_hotpixels_monochrome(const float *in_buf,
                                   int mark_fixed);
 
 /*
- * Hotpixels IOP — X-Trans variant.
+ * Hotpixels IOP -- X-Trans variant.
  * For each (row, col) in 2..h-2 x 2..w-2, examines the 4 pre-computed same-
  * colour neighbours in the 6x6 X-Trans CFA. `xtrans` is a flat 36-byte 6x6
  * pattern. The mark_fixed overlay stamps same-row pixels at column offsets
@@ -1139,7 +1139,7 @@ int darkroom_hotpixels_xtrans(const float *in_buf,
                               int mark_fixed);
 
 /*
- * Defringe IOP — per-pixel edge-chroma map + optional global average sum.
+ * Defringe IOP -- per-pixel edge-chroma map + optional global average sum.
  *   edge = (in.a - out.a)^2 + (in.b - out.b)^2
  *   out.alpha = edge
  *   sum += edge   (only when use_global_average != 0)
@@ -1154,7 +1154,7 @@ float darkroom_defringe_edge_chroma_pass(const float *in_buf,
                                          int use_global_average);
 
 /*
- * Colorchecker IOP — thin-plate-spline colour correction.
+ * Colorchecker IOP -- thin-plate-spline colour correction.
  * Per pixel:
  *   res[c] = patches[N][c]                            (intercept)
  *          + polynomial_<c> dot input_Lab             (affine fall-off)
@@ -1176,7 +1176,7 @@ void darkroom_colorchecker_process(const float *in_buf,
                                    const float *polynomial_b);
 
 /*
- * Rasterfile IOP — single-plane visualisation overlay.
+ * Rasterfile IOP -- single-plane visualisation overlay.
  *   out[k] = 0.2 * clamp(sqrt(out[k]), 0, 0.5) + (mask[k] if mask else 0.0)
  * `out_buf` is read-modified. `mask` may be NULL.
  * Matches the `ch == 1` branch of process() in src/iop/rasterfile.c.
@@ -1186,7 +1186,7 @@ void darkroom_rasterfile_visual_single(float *out_buf,
                                        size_t npixels);
 
 /*
- * Rasterfile IOP — RGBA visualisation overlay (grey-collapse).
+ * Rasterfile IOP -- RGBA visualisation overlay (grey-collapse).
  * For each pixel:
  *   val = 0.2 * clamp(sqrt(0.33*(R+G+B)), 0, 0.5) + mask[k]
  *   R, G, B := val      (alpha untouched)
@@ -1203,7 +1203,7 @@ void darkroom_rasterfile_mask_from_pfm(const float *image, float *mask,
                                        size_t npixels, unsigned int mode);
 
 /*
- * Diffuse IOP — per-pixel mask builder.
+ * Diffuse IOP -- per-pixel mask builder.
  *   mask[k] = (in[4k] > threshold || in[4k+1] > threshold || in[4k+2] > threshold)
  * Matches build_mask() in src/iop/diffuse.c. Used by the inpaint /
  * reconstruction pre-pass.
@@ -1214,7 +1214,7 @@ void darkroom_diffuse_build_mask(const float *in_buf,
                                  float threshold);
 
 /*
- * Diffuse IOP — inpaint mask initialisation with deterministic noise.
+ * Diffuse IOP -- inpaint mask initialisation with deterministic noise.
  * Masked pixels: inpainted[k+c] = abs(gaussian_noise(orig[k+c], orig[k+c]))
  *   using per-pixel xoshiro128+ state seeded from pixel position.
  * Unmasked pixels: inpainted[k..k+4] = original[k..k+4].
@@ -1227,7 +1227,7 @@ void darkroom_diffuse_inpaint_mask(float *inpainted_buf,
                                    size_t height);
 
 /*
- * Colortransfer IOP — L-histogram-matching pass.
+ * Colortransfer IOP -- L-histogram-matching pass.
  *
  * Per pixel:
  *   src_bin    = clamp(HISTN * in_L / 100, 0, HISTN - 1)
@@ -1252,7 +1252,7 @@ void darkroom_colortransfer_apply_l_histogram(const float *in_buf,
                                               size_t histn);
 
 /*
- * Cacorrectrgb IOP — per-pixel manifold normalisation.
+ * Cacorrectrgb IOP -- per-pixel manifold normalisation.
  * For each pixel k (with confidence weight stored in the alpha channel):
  *   weighth = max(higher[k*4+3], 1e-2)
  *   weightl = max(lower[k*4+3],  1e-2)
@@ -1260,8 +1260,8 @@ void darkroom_colortransfer_apply_l_histogram(const float *in_buf,
  *   for the two non-guide channels c:
  *     higher[k*4+c] = exp2(higher[k*4+c] / weighth) * higher[k*4+guide]
  *     lower[k*4+c]  = exp2(lower[k*4+c]  / weightl) * lower[k*4+guide]
- *   if weighth < 0.05: smooth blend higher → blurred_in by (1 - w)
- *   if weightl < 0.05: smooth blend lower  → blurred_in by (1 - w)
+ *   if weighth < 0.05: smooth blend higher -> blurred_in by (1 - w)
+ *   if weightl < 0.05: smooth blend lower  -> blurred_in by (1 - w)
  * `guide` is the guide channel index (0=R, 1=G, 2=B); values >= 3 are a
  * wiring bug and the function returns without touching the buffers.
  * Matches normalize_manifolds() in src/iop/cacorrectrgb.c.
@@ -1331,7 +1331,7 @@ void darkroom_cacorrectrgb_blend_artifacts(
     float safety);
 
 /*
- * Rawdenoise IOP — Bayer collect: gather one Bayer channel into a
+ * Rawdenoise IOP -- Bayer collect: gather one Bayer channel into a
  * half-size monochrome buffer applying the sqrt variance-stabilising
  * transform. `c` selects the channel (0=R, 1=G1, 2=G2, 3=B).
  * `halfwidth` must equal (width - ((c&2)>>1) + 1) / 2 (the C formula).
@@ -1342,7 +1342,7 @@ void darkroom_rawdenoise_bayer_collect(
     size_t width, size_t height, size_t halfwidth, unsigned int c);
 
 /*
- * Rawdenoise IOP — Bayer scatter: distribute denoised Bayer channel back,
+ * Rawdenoise IOP -- Bayer scatter: distribute denoised Bayer channel back,
  * squaring to invert the sqrt transform.
  * Same halfwidth constraint as bayer_collect.
  * Matches the second DT_OMP_FOR in wavelet_denoise() (rawdenoise.c:237).
@@ -1352,7 +1352,7 @@ void darkroom_rawdenoise_bayer_scatter(
     size_t width, size_t height, size_t halfwidth, unsigned int c);
 
 /*
- * Rawdenoise IOP — X-Trans collect: nearest-neighbour scatter of one CFA
+ * Rawdenoise IOP -- X-Trans collect: nearest-neighbour scatter of one CFA
  * channel (c: 0=R,1=G,2=B) into a full-size buffer with vstransform.
  * `xtrans` is a flat 36-byte 6x6 CFA pattern.
  * The caller must pre-fill row 0 and row height-1 with 0.5 before calling.
@@ -1364,7 +1364,7 @@ void darkroom_rawdenoise_xtrans_collect(
     const unsigned char *xtrans, unsigned int c);
 
 /*
- * Rawdenoise IOP — X-Trans scatter: write denoised CFA channel back,
+ * Rawdenoise IOP -- X-Trans scatter: write denoised CFA channel back,
  * squaring to invert vstransform.
  * Matches the DT_OMP_FOR in wavelet_denoise_xtrans() (:454).
  */
@@ -1374,7 +1374,7 @@ void darkroom_rawdenoise_xtrans_scatter(
     const unsigned char *xtrans, unsigned int c);
 
 /*
- * Colormapping IOP — find the min/max of the a and b Lab channels.
+ * Colormapping IOP -- find the min/max of the a and b Lab channels.
  * Returns via four out-pointers. Sentinels (FLT_MAX / -FLT_MAX) are written
  * when npixels == 0. Matches the reduction loop in kmeans() (colormapping.c:298).
  */
@@ -1383,7 +1383,7 @@ void darkroom_colormapping_ab_range(const float *col, size_t npixels,
                                     float *out_b_min, float *out_b_max);
 
 /*
- * Colormapping IOP — compute the blended L-delta for every pixel.
+ * Colormapping IOP -- compute the blended L-delta for every pixel.
  * out[k*4] = clamp(0.5 * ((L*(1-eq) + source_ihist[target_hist[bin]]*eq) - L) + 50, 0, 100)
  * `target_hist` and `source_ihist` are both of length `histn`.
  * Matches the DT_OMP_FOR loop in process() (colormapping.c:492).
@@ -1395,13 +1395,13 @@ void darkroom_colormapping_l_delta(const float *in_buf, float *out_buf,
                                    size_t histn,
                                    float equalization);
 
-/* Colorequal IOP — initialise per-pixel UV covariance (U*U, U*V, V*V). */
+/* Colorequal IOP -- initialise per-pixel UV covariance (U*U, U*V, V*V). */
 void darkroom_colorequal_init_covariance(const float *uv_buf, float *cov_buf,
                                          size_t pixels);
-/* Colorequal IOP — finalise covariance by subtracting avg(x)*avg(y). */
+/* Colorequal IOP -- finalise covariance by subtracting avg(x)*avg(y). */
 void darkroom_colorequal_finish_covariance(const float *uv_buf, float *cov_buf,
                                            size_t pixels);
-/* Colorequal IOP — compute guided-filter regression coefficients (a, b). */
+/* Colorequal IOP -- compute guided-filter regression coefficients (a, b). */
 void darkroom_colorequal_prepare_prefilter(const float *uv_buf,
                                            const float *cov_buf,
                                            float *a_buf,
@@ -1409,8 +1409,8 @@ void darkroom_colorequal_prepare_prefilter(const float *uv_buf,
                                            size_t pixels,
                                            float eps);
 /*
- * Colorequal IOP — apply guided-filter regression with sigmoid blending.
- * w = get_satweight(sat[k] - sat_shift) — linear interpolation in the
+ * Colorequal IOP -- apply guided-filter regression with sigmoid blending.
+ * w = get_satweight(sat[k] - sat_shift) -- linear interpolation in the
  * precomputed logistic table (length 2*satsize+1); caller passes the
  * live C static array produced by _init_satweights(contrast).
  */
@@ -1423,23 +1423,23 @@ void darkroom_colorequal_apply_prefilter(float *uv_buf,
                                          const float *satweights,
                                          size_t satsize);
 
-/* colorequal.c:698 — build guide×corrections correlation cross-products */
+/* colorequal.c:698 -- build guidexcorrections correlation cross-products */
 void darkroom_colorequal_init_correlations(
     const float *uv_buf, const float *corrections_buf,
     const float *b_corrections, float *corr_buf, size_t pixels);
 
-/* colorequal.c:727 — subtract averages from correlations */
+/* colorequal.c:727 -- subtract averages from correlations */
 void darkroom_colorequal_finish_correlations(
     const float *uv_buf, const float *corrections_buf,
     const float *b_corrections, float *corr_buf, size_t pixels);
 
-/* colorequal.c:755 — compute guided-filter regression params from correlations */
+/* colorequal.c:755 -- compute guided-filter regression params from correlations */
 void darkroom_colorequal_compute_guided_params(
     const float *uv_buf, const float *covariance_buf, const float *correlations,
     const float *corrections_buf, const float *b_corrections,
     float *a_buf, float *b_buf, size_t pixels, float eps);
 
-/* colorequal.c:823 — apply guided filter with sigmoid weighting to corrections */
+/* colorequal.c:823 -- apply guided filter with sigmoid weighting to corrections */
 void darkroom_colorequal_apply_guided_filter(
     const float *uv_buf, const float *saturation, const float *gradients,
     const float *a_buf, const float *b_buf,
@@ -1447,14 +1447,14 @@ void darkroom_colorequal_apply_guided_filter(
     size_t npixels, float sat_shift, float bright_shift,
     const float *satweights, size_t satsize);
 
-/* colorequal.c:944 — STEP 1: RGB → dt UCS UV + saturation + L*.
- * input_matrix is flat 16-float (4×4) non-transposed:
- *   XYZ_D50_to_D65_CAT16 × work_profile->matrix_in */
+/* colorequal.c:944 -- STEP 1: RGB -> dt UCS UV + saturation + L*.
+ * input_matrix is flat 16-float (4x4) non-transposed:
+ *   XYZ_D50_to_D65_CAT16 x work_profile->matrix_in */
 void darkroom_colorequal_rgb_to_ucs_uv(
     const float *in_buf, float *uv_buf, float *saturation, float *lscharr,
     size_t npixels, size_t ch, const float *input_matrix);
 
-/* colorequal.c:974 — STEP 3: L*/UV → JCH → HSB + hue/sat/brightness corrections.
+/* colorequal.c:974 -- STEP 3: L*/UV -> JCH -> HSB + hue/sat/brightness corrections.
  * lut_hue/saturation/brightness are each LUT_ELEM=512 floats. */
 void darkroom_colorequal_compute_hsb_corrections(
     const float *uv_buf, float *lscharr, const float *saturation,
@@ -1463,14 +1463,14 @@ void darkroom_colorequal_compute_hsb_corrections(
     float white, float gradient_amp, int use_filter,
     const float *lut_hue, const float *lut_saturation, const float *lut_brightness);
 
-/* colorequal.c:1035 — STEP 5: apply corrections + convert HSB → RGB.
- * gamut_lut is LUT_ELEM=512 floats; output_matrix is flat 16-float (4×4). */
+/* colorequal.c:1035 -- STEP 5: apply corrections + convert HSB -> RGB.
+ * gamut_lut is LUT_ELEM=512 floats; output_matrix is flat 16-float (4x4). */
 void darkroom_colorequal_apply_corrections(
     float *pix_out_buf, const float *corrections, const float *b_corrections,
     size_t npixels, float white,
     const float *gamut_lut, const float *output_matrix);
 
-/* colorequal.c:930 — mask-display visualization overlay.
+/* colorequal.c:930 -- mask-display visualization overlay.
  * mode: 0=BRIGHTNESS, 1=SATURATION, 2=BRIGHTNESS_GRAD, 3=SATURATION_GRAD, 4=HUE */
 void darkroom_colorequal_mask_display(
     float *pix_out_buf, const float *corrections, const float *b_corrections,
@@ -1480,7 +1480,7 @@ void darkroom_colorequal_mask_display(
     const float *satweights, size_t satsize);
 
 /*
- * Toneequal IOP — LUT-based correction apply.
+ * Toneequal IOP -- LUT-based correction apply.
  * For each pixel: correction = lut[round((clamp(log2(lum), min_ev, max_ev) - min_ev) * lut_res)]
  * All 4 channels multiplied by correction. lut_len = pixel_chan * lut_resolution + 1.
  * Matches apply_toneequalizer() DT_OMP_FOR (toneequal.c:789).
@@ -1496,8 +1496,8 @@ void darkroom_toneequal_apply_lut(const float *in_buf,
                                    float lut_resolution);
 
 /*
- * Toneequal IOP — build the correction LUT from Gaussian RBF.
- * lut[j] = clamp(Σ_i exp(-(j/res+min_ev - centers[i])² / (2σ²)) * factors[i], 0.25, 4)
+ * Toneequal IOP -- build the correction LUT from Gaussian RBF.
+ * lut[j] = clamp(sum_i exp(-(j/res+min_ev - centers[i])^2 / (2sigma^2)) * factors[i], 0.25, 4)
  * Matches build_correction_lut() DT_OMP_FOR (toneequal.c:1231).
  */
 void darkroom_toneequal_build_lut(float *lut,
@@ -1509,7 +1509,7 @@ void darkroom_toneequal_build_lut(float *lut,
                                    float min_ev);
 
 /*
- * Toneequal IOP — luminance mask display overlay.
+ * Toneequal IOP -- luminance mask display overlay.
  * intensity = sqrt(clamp((lum - 1/256) / (1 - 1/256), 0, 1))
  * All 4 out channels written to intensity; alpha overwritten from in.
  * in_height is the full input-buffer height (needed for safe bounds).
@@ -1530,7 +1530,7 @@ void darkroom_toneequal_build_log_histogram(const float *luminance,
                                             size_t temp_samples);
 
 /*
- * Useless IOP — checkerboard dimming example module.
+ * Useless IOP -- checkerboard dimming example module.
  * For each pixel: if ((wi/checker_scale + wj/checker_scale) & 1):
  *   out[c] = in[c] * (1 - factor); mask[k] = 1.0 (if mask non-NULL)
  * else: out[c] = in[c]   (passthrough)
@@ -1549,18 +1549,18 @@ void darkroom_useless_process(const float *in_buf,
                                int checker_scale,
                                float factor);
 
-/* Gamma IOP — copy float RGBA to uint8 BGR (no sRGB gamma, just clamp/round).
+/* Gamma IOP -- copy float RGBA to uint8 BGR (no sRGB gamma, just clamp/round).
  * buffsize = width*height*4 (f32 element count = u8 byte count for 4-ch RGBA).
  * Matches _copy_output() in src/iop/gamma.c:269. */
 void darkroom_gamma_copy_output(const float *in_buf, unsigned char *out_buf,
                                  size_t buffsize);
 
-/* Gamma IOP — monochrome channel display with sRGB gamma + yellow mask overlay.
+/* Gamma IOP -- monochrome channel display with sRGB gamma + yellow mask overlay.
  * Uses in[j+1] (second channel) as grey value. */
 void darkroom_gamma_display_monochrome(const float *in_buf, unsigned char *out_buf,
                                         size_t buffsize, float alpha);
 
-/* Gamma IOP — false-colour single-channel display.
+/* Gamma IOP -- false-colour single-channel display.
  * mode 0=R, 1=G, 2=B, 3=saturation.
  * Applies sRGB gamma + yellow MASK_COLOR blend. */
 void darkroom_gamma_display_false_color_simple(const float *in_buf,
@@ -1569,19 +1569,19 @@ void darkroom_gamma_display_false_color_simple(const float *in_buf,
                                                float alpha,
                                                unsigned int mode);
 
-/* Gamma IOP — luminance mask overlay with configurable grey mix.
+/* Gamma IOP -- luminance mask overlay with configurable grey mix.
  * mix = dt_conf_get_float("darkroom/ui/develop_mask_mix").
  * interpolatef(mix, in[j+3], luma) = mix*(alpha - luma) + luma. */
 void darkroom_gamma_mask_display(const float *in_buf, unsigned char *out_buf,
                                   size_t buffsize, float alpha, float mix);
 
-/* Blurs IOP — restore alpha channel after Gaussian blur overwrites it.
+/* Blurs IOP -- restore alpha channel after Gaussian blur overwrites it.
  * out[k*4+3] = in[k*4+3] for k in 0..npixels.
  * Matches src/iop/blurs.c:601. */
 void darkroom_blurs_alpha_restore(const float *in_buf, float *out_buf,
                                    size_t npixels);
 
-/* Blurs IOP — sparse spatial convolution for lens/motion blur paths.
+/* Blurs IOP -- sparse spatial convolution for lens/motion blur paths.
  * Uses precomputed (offsets, values) for interior pixels and full `kernel`
  * with clamping for edge pixels. `offsets` is in f32-element units from the
  * centre pixel pointer (maps to ptrdiff_t in C). `kernel` is (2*radius+1)^2
@@ -1596,7 +1596,7 @@ void darkroom_blurs_sparse_convolve(const float *in_buf, float *out_buf,
                                      size_t n_nonzero,
                                      const float *kernel);
 
-/* Filmicrgb IOP — build highlight reconstruction mask.
+/* Filmicrgb IOP -- build highlight reconstruction mask.
  * weight = clamp(1/(1+2^(-pix_max*normalize+feathering)), 0, 1)
  * Returns count of pixels where argument < 4 (non-negligible transition).
  * Matches reconstruct_highlights_build_mask() in filmicrgb.c:1050. */
@@ -1606,12 +1606,12 @@ int darkroom_filmicrgb_build_reconstruction_mask(const float *in_buf,
                                                   float normalize,
                                                   float feathering);
 
-/* Filmicrgb IOP — broadcast scalar mask to all 4 output channels.
+/* Filmicrgb IOP -- broadcast scalar mask to all 4 output channels.
  * Matches display_mask() in filmicrgb.c:2012. */
 void darkroom_filmicrgb_display_mask(const float *mask_buf, float *out_buf,
                                       size_t npixels);
 
-/* Filmicrgb IOP — restore pixels from ratio/norm decomposition.
+/* Filmicrgb IOP -- restore pixels from ratio/norm decomposition.
  * ratios[k*4+c] = clamp(ratios[k*4+c], 0, 1) * norms[k]
  * Matches restore_ratios() in filmicrgb.c:2051. */
 void darkroom_filmicrgb_restore_ratios(float *ratios_buf,
@@ -1619,7 +1619,7 @@ void darkroom_filmicrgb_restore_ratios(float *ratios_buf,
                                         size_t npixels);
 
 /*
- * Filmicrgb IOP — inpaint_noise(): add statistical noise to highlights to
+ * Filmicrgb IOP -- inpaint_noise(): add statistical noise to highlights to
  * seed the wavelet reconstruction. Uses per-pixel deterministic xoshiro128+.
  * noise_distribution: 0=uniform, 1=gaussian, 2=poissonian.
  * Matches inpaint_noise() in src/iop/filmicrgb.c:1062.
@@ -1634,7 +1634,7 @@ void darkroom_filmicrgb_inpaint_noise(const float *in_buf,
                                        size_t height);
 
 /*
- * Colorharmonizer IOP — fused single-pass (smoothing <= 0).
+ * Colorharmonizer IOP -- fused single-pass (smoothing <= 0).
  * matrix_in/out_transposed are flat 16-float (4x4) working-space matrices.
  * nodes/node_saturation are num_nodes floats; both may be NULL if num_nodes=0.
  */
@@ -1646,7 +1646,7 @@ void darkroom_colorharmonizer_fused(
     float pull_width, float pull_strength, float cutoff,
     const float *node_saturation);
 
-/* Colorharmonizer — pass 1 of the smoothing path: RGB → JCH cache + corrections. */
+/* Colorharmonizer -- pass 1 of the smoothing path: RGB -> JCH cache + corrections. */
 void darkroom_colorharmonizer_cache_pass(
     const float *in_buf, float *jch_cache, float *corrections,
     size_t npixels, size_t ch,
@@ -1654,7 +1654,7 @@ void darkroom_colorharmonizer_cache_pass(
     const float *nodes, int num_nodes, float pull_width,
     const float *node_saturation);
 
-/* Colorharmonizer — pass 2 of the smoothing path: apply corrections. */
+/* Colorharmonizer -- pass 2 of the smoothing path: apply corrections. */
 void darkroom_colorharmonizer_apply_pass(
     const float *in_buf, float *out_buf,
     const float *jch_cache, const float *corrections,
@@ -1662,14 +1662,14 @@ void darkroom_colorharmonizer_apply_pass(
     const float *matrix_out_transposed,
     float l_white, float cutoff, float pull_strength);
 
-/* Cacorrect IOP — copy non-green Bayer channel to half-res buffer.
+/* Cacorrect IOP -- copy non-green Bayer channel to half-res buffer.
  * oldraw[row*h_width + col/2] = in[row*full_width + col]
  * Matches DT_OMP_FOR at src/iop/cacorrect.c:327. */
 void darkroom_cacorrect_save_oldraw(const float *in_buf, float *oldraw_buf,
                                      size_t full_width, size_t height,
                                      size_t h_width, unsigned int filters);
 
-/* Cacorrect IOP — compute per-pixel R/B correction factors.
+/* Cacorrect IOP -- compute per-pixel R/B correction factors.
  * nongreen[(row/2)*h_width + col/2] = clamp(oldraw/in, 0.5, 2.0)
  * Matches DT_OMP_FOR at src/iop/cacorrect.c:1125. */
 void darkroom_cacorrect_compute_factors(const float *in_buf,
@@ -1678,7 +1678,7 @@ void darkroom_cacorrect_compute_factors(const float *in_buf,
                                          size_t full_width, size_t height,
                                          size_t h_width, unsigned int filters);
 
-/* Cacorrect IOP — apply blurred correction factors to the output buffer.
+/* Cacorrect IOP -- apply blurred correction factors to the output buffer.
  * out[row*w + col] *= nongreen[row/2*h_width + col/2]  for interior pixels.
  * Matches DT_OMP_FOR at src/iop/cacorrect.c:1172. */
 void darkroom_cacorrect_apply_factors(float *out_buf,
@@ -1686,7 +1686,7 @@ void darkroom_cacorrect_apply_factors(float *out_buf,
                                        size_t full_width, size_t height,
                                        size_t h_width, unsigned int filters);
 
-/* Cacorrect IOP — write corrected buffer to roi_out with scale factor.
+/* Cacorrect IOP -- write corrected buffer to roi_out with scale factor.
  * output[ox] = corrected[irow*in_width + icol] * scaler  (bounds-guarded).
  * Matches DT_OMP_FOR(collapse(2)) at src/iop/cacorrect.c:1190. */
 void darkroom_cacorrect_writeout(const float *corrected, float *output,
@@ -1695,7 +1695,7 @@ void darkroom_cacorrect_writeout(const float *corrected, float *output,
                                   int roi_out_x, int roi_out_y,
                                   float scaler);
 
-/* Geometry helpers — shared across crop, flip, borders, enlargecanvas.
+/* Geometry helpers -- shared across crop, flip, borders, enlargecanvas.
  * All operate on a flat [x0,y0,x1,y1,...] coordinate buffer. */
 
 /* Add (dx,dy) to every coordinate pair. Matches distort_transform in
@@ -1726,7 +1726,7 @@ void darkroom_geom_blit_rows(const float *in_buf, float *out_buf,
                               size_t out_width,
                               size_t border_x, size_t border_y);
 
-/* Apply 2×2 rotation matrix + translation to every coordinate pair.
+/* Apply 2x2 rotation matrix + translation to every coordinate pair.
  * pi = (x - rx*scale, y - ry*scale); o = M * pi.
  * m is [m00,m01,m10,m11] (row-major).
  * Matches distort_transform in src/iop/rotatepixels.c:138. */
@@ -1758,7 +1758,7 @@ void darkroom_clahe_process(const float *in_buf,
                             float slope);
 
 /*
- * Rawprepare IOP — uint16 Bayer/X-Trans mosaic linearisation.
+ * Rawprepare IOP -- uint16 Bayer/X-Trans mosaic linearisation.
  *   out[j*w + i] = (in[(j+csy)*in_w + (i+csx)] - sub[id]) / div[id]
  * where `id = ((j+y0)&1)<<1 | ((i+x0)&1)`. `sub`/`div` are 4-float arrays.
  * Matches the TYPE_UINT16 branch of process() in src/iop/rawprepare.c.
@@ -1776,7 +1776,7 @@ void darkroom_rawprepare_mosaic_u16(const unsigned short *in_buf,
                                     const float *div_);
 
 /*
- * Rawprepare IOP — float Bayer/X-Trans mosaic linearisation.
+ * Rawprepare IOP -- float Bayer/X-Trans mosaic linearisation.
  * Same as the uint16 variant but reads f32. Matches the TYPE_FLOAT branch.
  */
 void darkroom_rawprepare_mosaic_f32(const float *in_buf,
@@ -1792,7 +1792,7 @@ void darkroom_rawprepare_mosaic_f32(const float *in_buf,
                                     const float *div_);
 
 /*
- * Rawprepare IOP — pre-downsampled RGBA buffer: per-channel black/scale.
+ * Rawprepare IOP -- pre-downsampled RGBA buffer: per-channel black/scale.
  *   out[k*ch + c] = (in[k_in*ch + c] - sub[c]) / div[c]
  * Matches the no-mosaic else-branch of process() in src/iop/rawprepare.c.
  */
@@ -1812,7 +1812,7 @@ void darkroom_rawprepare_distort_backtransform(float *points, size_t points_coun
                                                float dx, float dy);
 
 /*
- * Highlights IOP — sRAW (RGB) clipping-mask builder.
+ * Highlights IOP -- sRAW (RGB) clipping-mask builder.
  *   refs[c] = max(0.5, 0.95 * clips[c])
  *   tmp[k]  = max_over_c((in[4k+c] - refs[c]) / refs[c]),  floored at 0.
  * `clips` is 4 floats; only the first 3 (RGB) are read.
@@ -1826,7 +1826,7 @@ void darkroom_highlights_mask_sraw(const float *in_buf,
                                    const float *clips);
 
 /*
- * Highlights IOP — Bayer / X-Trans mosaic clipping-mask builder.
+ * Highlights IOP -- Bayer / X-Trans mosaic clipping-mask builder.
  * For each pixel:
  *   c = fcol(row + irow_offset, col + icol_offset, filters, xtrans)
  *   tmp[k] = max(0, (in[k] - refs[c]) / refs[c])
@@ -1845,7 +1845,7 @@ void darkroom_highlights_mask_mosaic(const float *in_buf,
                                      int icol_offset);
 
 /*
- * Highlights IOP — CLIP mode, sRAW path.
+ * Highlights IOP -- CLIP mode, sRAW path.
  * out[k] = fminf(clip, in[k]) for every float in the buffer.
  * NaN propagation matches the C fminf semantics exactly.
  * Matches the `ch == 4` branch of process_clip() in src/iop/highlights.c.
@@ -1856,7 +1856,7 @@ void darkroom_highlights_clip_sraw(const float *in_buf,
                                    float clip);
 
 /*
- * Highlights IOP — visualise mode, sRAW path.
+ * Highlights IOP -- visualise mode, sRAW path.
  * For every pixel k and c in 0..3:
  *   out[k+c] = (in[k+c] < clips[c]) ? 0.2 * in[k+c] : 1.0
  *   out[k+3] = 0.0
@@ -1869,7 +1869,7 @@ void darkroom_highlights_visualize_sraw(const float *in_buf,
                                         const float *clips);
 
 /*
- * Highlights IOP — visualise mode, mosaic path.
+ * Highlights IOP -- visualise mode, mosaic path.
  * For every output (row, col):
  *   irow = row + irow_offset
  *   icol = col + icol_offset
