@@ -404,35 +404,10 @@ static void _transform_cmatrix_tonecurve(const dt_iop_colorout_data_t *const d,
 {
   dt_colormatrix_t cmatrix;
   transpose_3xSSE(d->cmatrix, cmatrix);
-  dt_aligned_pixel_t cmatrix_0, cmatrix_1, cmatrix_2;
-  copy_pixel(cmatrix_0,cmatrix[0]);
-  copy_pixel(cmatrix_1,cmatrix[1]);
-  copy_pixel(cmatrix_2,cmatrix[2]);
-  const float *const lut = &d->lut[0][0];
-  const float *coeffs = &d->unbounded_coeffs[0][0];
-  DT_OMP_FOR()
-  for(size_t k = 0; k < npixels; k++)
-  {
-    dt_aligned_pixel_t rgb; // using an aligned temporary variable lets the compiler optimize away interm. writes
-    dt_Lab_to_linearRGB(in + 4*k, cmatrix_0, cmatrix_1, cmatrix_2, rgb);
-    if(lut[0] >= 0.0f)
-    {
-      rgb[0] = (rgb[0] < 1.0f) ? _lerp_lut(lut, rgb[0])
-        : dt_iop_eval_exp(coeffs, rgb[0]);
-    }
-    if(lut[LUT_SAMPLES] >= 0.0f)
-    {
-      rgb[1] = (rgb[1] < 1.0f) ? _lerp_lut(lut+LUT_SAMPLES, rgb[1])
-        : dt_iop_eval_exp(coeffs+3, rgb[1]);
-    }
-    if(lut[2*LUT_SAMPLES] >= 0.0f)
-    {
-      rgb[2] = (rgb[2] < 1.0f) ? _lerp_lut(lut+2*LUT_SAMPLES, rgb[2])
-        : dt_iop_eval_exp(coeffs+6, rgb[2]);
-    }
-    copy_pixel_nontemporal(out + 4*k, rgb);
-  }
-  dt_omploop_sfence();
+  darkroom_colorout_cmatrix_tonecurve(in, out, npixels,
+                                      (const float *)cmatrix,
+                                      &d->lut[0][0],
+                                      &d->unbounded_coeffs[0][0]);
 }
 
 static int _transform_cmatrix(const dt_iop_colorout_data_t *const d,

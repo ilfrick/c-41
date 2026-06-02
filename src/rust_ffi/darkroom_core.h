@@ -852,6 +852,12 @@ void darkroom_colorout_cmatrix_linear(const float *in_buf,
                                       float *out_buf,
                                       size_t npixels,
                                       const float *cmatrix);
+void darkroom_colorout_cmatrix_tonecurve(const float *in_buf,
+                                         float *out_buf,
+                                         size_t npixels,
+                                         const float *cmatrix,
+                                         const float *lut,
+                                         const float *unbounded_coeffs);
 
 /*
  * Filmic IOP pixel loop (Lab-space filmic tone-mapping).

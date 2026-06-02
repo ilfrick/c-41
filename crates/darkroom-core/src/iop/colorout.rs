@@ -226,3 +226,55 @@ mod tests {
         assert_eq!(out[3], 0.0); // alpha always zeroed
     }
 }
+
+/// Fused Lab->linearRGB (via pre-transposed cmatrix) + per-channel tone curve.
+///
+/// For each pixel:
+///   1. Lab -> XYZ (D50) via CIE formula
+///   2. rgb[r] = sum_c(cmatrix_row_c[r] * XYZ[c])   (transposed matrix multiply)
+///   3. For each channel c: if lut[c*LUT_SAMPLES] >= 0, apply LUT+exp extrapolation
+///
+/// cmatrix:          12 floats (3 rows x 4 cols, row-major); same layout as cmatrix_linear
+/// lut:              3 x LUT_SAMPLES floats; channel active iff lut[c*LUT_SAMPLES] >= 0
+/// unbounded_coeffs: 9 floats (3 sets of 3); eval_exp(c*3, v) = coeff[1]*pow(v*coeff[0], coeff[2])
+///
+/// Matches _transform_cmatrix_tonecurve() DT_OMP_FOR in src/iop/colorout.c:413.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorout_cmatrix_tonecurve(
+    in_buf: *const f32,
+    out_buf: *mut f32,
+    npixels: usize,
+    cmatrix: *const f32,
+    lut: *const f32,
+    unbounded_coeffs: *const f32,
+) {
+    let input   = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let output  = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+    let cm      = std::slice::from_raw_parts(cmatrix, 12);
+    let lut_s   = std::slice::from_raw_parts(lut, 3 * LUT_SAMPLES);
+    let coeffs  = std::slice::from_raw_parts(unbounded_coeffs, 9);
+
+    for k in 0..npixels {
+        let xyz = lab_to_xyz(&input[k * 4..]);
+        let mut rgb = [0.0f32; 4];
+        for r in 0..3usize {
+            rgb[r] = cm[0 * 4 + r] * xyz[0]
+                   + cm[1 * 4 + r] * xyz[1]
+                   + cm[2 * 4 + r] * xyz[2];
+        }
+        for c in 0..3usize {
+            let lut_c = &lut_s[c * LUT_SAMPLES..(c + 1) * LUT_SAMPLES];
+            if lut_c[0] >= 0.0 {
+                rgb[c] = if rgb[c] < 1.0 {
+                    lerp_lut(lut_c, rgb[c])
+                } else {
+                    eval_exp(&coeffs[c * 3..(c + 1) * 3], rgb[c])
+                };
+            }
+        }
+        output[k * 4]     = rgb[0];
+        output[k * 4 + 1] = rgb[1];
+        output[k * 4 + 2] = rgb[2];
+        output[k * 4 + 3] = input[k * 4 + 3];
+    }
+}
