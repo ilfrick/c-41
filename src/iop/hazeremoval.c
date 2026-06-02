@@ -505,20 +505,10 @@ static float _ambient_light(const const_rgb_image img,
   // estimate the diffusive ambient light
   dt_aligned_pixel_t A0 = { 0.0f, 0.0f, 0.0f, 0.0f };
   size_t N_bright_hazy = 0;
-  const float *const restrict data = dark_ch.data;
-  const float *const restrict in_data = img.data;
-  DT_OMP_FOR(reduction(+ : A0[0:4]) reduction(+ : N_bright_hazy))
-  for(size_t i = 0; i < size; i++)
-  {
-    const float *pixel_in = in_data + 4*i;
-    if((data[i] >= crit_haze_level)
-       && (pixel_in[0] + pixel_in[1] + pixel_in[2] >= crit_brightness))
-    {
-      for_each_channel(c,aligned(pixel_in))
-        A0[c] += pixel_in[c];
-      N_bright_hazy++;
-    }
-  }
+  darkroom_hazeremoval_ambient_light(
+      dark_ch.data, img.data, size,
+      crit_haze_level, crit_brightness,
+      A0, &N_bright_hazy);
   if(N_bright_hazy > 0)
   {
     for_each_channel(c)

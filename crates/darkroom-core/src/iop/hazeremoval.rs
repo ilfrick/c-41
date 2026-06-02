@@ -194,3 +194,42 @@ mod tests {
         }
     }
 }
+
+/// Estimate ambient light A0 by summing RGBA over bright-hazy pixels.
+///
+/// Accumulates rgba into a0_out (4 floats, caller-zeroed) and increments
+/// *count_out for each pixel where dark_channel[i] >= crit_haze_level AND
+/// sum(R+G+B) >= crit_brightness. Caller divides by count if count > 0.
+///
+/// Matches DT_OMP_FOR reduction in src/iop/hazeremoval.c:510.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_hazeremoval_ambient_light(
+    dark_channel: *const f32,
+    in_rgba: *const f32,
+    size: usize,
+    crit_haze_level: f32,
+    crit_brightness: f32,
+    a0_out: *mut f32,
+    count_out: *mut usize,
+) {
+    if size == 0 { return; }
+    let data = std::slice::from_raw_parts(dark_channel, size);
+    let inp  = std::slice::from_raw_parts(in_rgba, size * 4);
+    let a0   = std::slice::from_raw_parts_mut(a0_out, 4);
+    a0.fill(0.0);
+    *count_out = 0;
+    for i in 0..size {
+        if data[i] >= crit_haze_level {
+            let r = inp[i * 4];
+            let g = inp[i * 4 + 1];
+            let b = inp[i * 4 + 2];
+            if r + g + b >= crit_brightness {
+                a0[0] += r;
+                a0[1] += g;
+                a0[2] += b;
+                a0[3] += inp[i * 4 + 3];
+                *count_out += 1;
+            }
+        }
+    }
+}

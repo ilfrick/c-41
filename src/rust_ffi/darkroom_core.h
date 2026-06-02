@@ -939,6 +939,13 @@ void darkroom_hazeremoval_dehaze(const float *in_buf,
                                  size_t npixels,
                                  const float *a0,
                                  float t_min);
+void darkroom_hazeremoval_ambient_light(const float *dark_channel,
+                                        const float *in_rgba,
+                                        size_t size,
+                                        float crit_haze_level,
+                                        float crit_brightness,
+                                        float *a0_out,
+                                        size_t *count_out);
 
 /*
  * Censorize IOP — pixelate (mosaic) effect.
