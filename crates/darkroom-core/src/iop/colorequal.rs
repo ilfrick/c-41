@@ -192,6 +192,274 @@ pub unsafe extern "C" fn darkroom_colorequal_apply_prefilter(
     }
 }
 
+// ── Gamut LUT helpers (from darktable_ucs_22_helpers.h) ──────────────────────
+
+const LUT_ELEM: usize = 512;
+
+/// Linear interpolation in a hue-ring LUT.
+/// `hue` is in [-π, π]. Matches `lookup_gamut()` in darktable_ucs_22_helpers.h:132.
+#[inline(always)]
+pub fn lookup_gamut(lut: &[f32; LUT_ELEM], hue: f32) -> f32 {
+    use std::f32::consts::PI;
+    let x_test = LUT_ELEM as f32 * (hue + PI) / (2.0 * PI);
+    let x_prev = x_test.floor();
+    let xi  = (x_prev as i32) & (LUT_ELEM as i32 - 1);
+    let xii = (x_prev as i32 + 1) & (LUT_ELEM as i32 - 1);
+    let y_prev = lut[xi as usize];
+    if xi != xii {
+        y_prev + (x_test - x_prev) * (lut[xii as usize] - y_prev)
+    } else {
+        y_prev
+    }
+}
+
+/// Soft-clip HSB saturation inside the gamut boundary.
+/// Matches `gamut_map_HSB()` in darktable_ucs_22_helpers.h:167.
+#[inline(always)]
+pub fn gamut_map_hsb(hsb: &mut [f32; 4], gamut_lut: &[f32; LUT_ELEM], l_white: f32) {
+    let jch = color::dt_ucs_hsb_to_jch(hsb);
+    let max_colorfulness = lookup_gamut(gamut_lut, jch[2]);
+    let max_chroma = 15.932993652962535
+        * (jch[0] * l_white).powf(0.6523997524738018)
+        * max_colorfulness.powf(0.6007557017508491)
+        / l_white;
+    let jch_boundary = [jch[0], max_chroma, jch[2], 0.0];
+    let hsb_boundary = color::dt_ucs_jch_to_hsb(&jch_boundary);
+    // soft_clip(x, 0.8*upper, upper)
+    let upper = hsb_boundary[1];
+    let soft  = 0.8 * upper;
+    let norm  = upper - soft;
+    hsb[1] = if hsb[1] > soft && norm > 0.0 {
+        soft + (1.0 - (-(hsb[1] - soft) / norm).exp()) * norm
+    } else {
+        hsb[1]
+    };
+}
+
+/// Scharr gradient magnitude at pixel `p` (stride `w`).
+/// Matches `scharr_gradient()` in common/math.h:405.
+#[inline(always)]
+pub fn scharr_gradient(p: &[f32], w: usize, idx: usize) -> f32 {
+    let gx = (47.0 / 255.0) * (p[idx-w-1] - p[idx-w+1] + p[idx+w-1] - p[idx+w+1])
+           + (162.0 / 255.0) * (p[idx-1] - p[idx+1]);
+    let gy = (47.0 / 255.0) * (p[idx-w-1] - p[idx+w-1] + p[idx-w+1] - p[idx+w+1])
+           + (162.0 / 255.0) * (p[idx-w] - p[idx+w]);
+    (gx * gx + gy * gy).sqrt()
+}
+
+// ── Step 3: finish conversion to HSB + compute corrections ───────────────────
+
+/// dt UCS HSB → XYZ D65 (quick path via JCH → xyY → XYZ).
+#[inline(always)]
+pub fn dt_ucs_hsb_to_xyz(hsb: &[f32; 4], l_white: f32) -> [f32; 4] {
+    let jch = color::dt_ucs_hsb_to_jch(hsb);
+    let xyy = color::dt_ucs_jch_to_xyy(&jch, l_white);
+    color::xyy_to_xyz(&xyy)
+}
+
+/// STEP 3: convert L*/UV → JCH → HSB and compute hue/sat/brightness corrections.
+///
+/// For each pixel k:
+///   JCH = dt_UCS_LUV_to_JCH(Lscharr[k], white, UV[k])
+///   pix_out[k] = dt_UCS_JCH_to_HSB(JCH)
+///   if use_filter:
+///     Lscharr[k] = gradient_amp * sqrf(max(0, scharr(saturation, width) - 0.02))
+///   if JCH[1] > NORM_MIN:
+///     corrections[k*2+0] = LUT_hue[hue]
+///     corrections[k*2+1] = LUT_saturation[hue]
+///     b_corrections[k]   = sat * (LUT_brightness[hue] - 1)
+///   else: corrections = {0, 1}, b_corrections = 0
+///
+/// `lut_hue`, `lut_saturation`, `lut_brightness` are each 512-float arrays.
+/// `saturation` is shared with the Scharr gradient: index [kk] is clamped to [1, h-2].
+/// Matches the DT_OMP_FOR at src/iop/colorequal.c:974.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorequal_compute_hsb_corrections(
+    uv_buf:       *const f32,
+    lscharr:      *mut f32,
+    saturation:   *const f32,
+    pix_out_buf:  *mut f32,
+    corrections:  *mut f32,
+    b_corrections: *mut f32,
+    npixels: usize,
+    width: usize,
+    height: usize,
+    white: f32,
+    gradient_amp: f32,
+    use_filter: i32,
+    lut_hue:        *const f32,
+    lut_saturation: *const f32,
+    lut_brightness: *const f32,
+) {
+    if npixels == 0 { return; }
+    const NORM_MIN: f32 = 1.52587890625e-05;
+    let uv    = std::slice::from_raw_parts(uv_buf, npixels * 2);
+    let ls    = std::slice::from_raw_parts_mut(lscharr, npixels);
+    let sat   = std::slice::from_raw_parts(saturation, npixels);
+    let pout  = std::slice::from_raw_parts_mut(pix_out_buf, npixels * 4);
+    let corr  = std::slice::from_raw_parts_mut(corrections, npixels * 2);
+    let bcorr = std::slice::from_raw_parts_mut(b_corrections, npixels);
+    let lh = std::slice::from_raw_parts(lut_hue,        LUT_ELEM);
+    let ls2 = std::slice::from_raw_parts(lut_saturation, LUT_ELEM);
+    let lb = std::slice::from_raw_parts(lut_brightness,  LUT_ELEM);
+
+    // Cast the LUT slices to fixed-size arrays for lookup_gamut
+    let lh_arr: &[f32; LUT_ELEM] = lh.try_into().expect("LUT_HUE size");
+    let ls_arr: &[f32; LUT_ELEM] = ls2.try_into().expect("LUT_SAT size");
+    let lb_arr: &[f32; LUT_ELEM] = lb.try_into().expect("LUT_BRI size");
+
+    for k in 0..npixels {
+        let row = k / width;
+        let col = k - row * width;
+        let uv_pair = [uv[2*k], uv[2*k+1], 0.0, 0.0];
+        let jch = color::dt_ucs_luv_to_jch(ls[k], white, &[uv_pair[0], uv_pair[1]]);
+        let mut hsb = color::dt_ucs_jch_to_hsb(&jch);
+        pout[k*4]   = hsb[0];
+        pout[k*4+1] = hsb[1];
+        pout[k*4+2] = hsb[2];
+        // alpha was already set by Step 1
+
+        if use_filter != 0 {
+            let vrow = row.clamp(1, height.saturating_sub(2));
+            let vcol = col.clamp(1, width.saturating_sub(2));
+            let kk   = vrow * width + vcol;
+            let g = scharr_gradient(sat, width, kk);
+            ls[k] = gradient_amp * (0.0_f32.max(g - 0.02)).powi(2);
+        }
+
+        if jch[1] > NORM_MIN {
+            let hue_rad = pout[k*4]; // HSB[0] = hue in radians
+            corr[2*k]   = lookup_gamut(lh_arr, hue_rad);
+            corr[2*k+1] = lookup_gamut(ls_arr, hue_rad);
+            bcorr[k]    = hsb[1] * (lookup_gamut(lb_arr, hue_rad) - 1.0);
+        } else {
+            corr[2*k]   = 0.0;
+            corr[2*k+1] = 1.0;
+            bcorr[k]    = 0.0;
+        }
+        let _ = hsb; // suppress move warning
+    }
+}
+
+/// STEP 5: apply corrections and convert back to RGB.
+///
+/// For each pixel k:
+///   pix_out[k] += corrections[k*2+0]   (hue offset)
+///   pix_out[k*4+1] = max(0, sat * (1 + SAT_EFFECT * (corrections[k*2+1] - 1)))
+///   pix_out[k*4+2] = max(0, bri * (1 + BRIGHT_EFFECT * b_corrections[k]))
+///   gamut_map_HSB(pix_out)
+///   XYZ_D65 = dt_UCS_HSB_to_XYZ(pix_out, white)
+///   pix_out = dot_product(XYZ_D65, output_matrix)
+///
+/// Matches the DT_OMP_FOR at src/iop/colorequal.c:1035.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorequal_apply_corrections(
+    pix_out_buf:  *mut f32,
+    corrections:  *const f32,
+    b_corrections: *const f32,
+    npixels: usize,
+    white: f32,
+    gamut_lut: *const f32,   // LUT_ELEM floats
+    output_matrix: *const f32, // flat 16-float (4×4)
+) {
+    if npixels == 0 { return; }
+    const SAT_EFFECT:   f32 = 2.0;
+    const BRIGHT_EFFECT: f32 = 8.0;
+    let pout  = std::slice::from_raw_parts_mut(pix_out_buf, npixels * 4);
+    let corr  = std::slice::from_raw_parts(corrections,   npixels * 2);
+    let bcorr = std::slice::from_raw_parts(b_corrections, npixels);
+    let glut  = std::slice::from_raw_parts(gamut_lut, LUT_ELEM);
+    let glut_arr: &[f32; LUT_ELEM] = glut.try_into().expect("gamut LUT size");
+
+    let m_sl = std::slice::from_raw_parts(output_matrix, 16);
+    let mut m_out = [[0.0_f32; 4]; 4];
+    for r in 0..4 { for c in 0..4 { m_out[r][c] = m_sl[r*4+c]; } }
+
+    for k in 0..npixels {
+        let b = k * 4;
+        pout[b]   += corr[2*k];   // hue offset
+        pout[b+1]  = (pout[b+1] * (1.0 + SAT_EFFECT * (corr[2*k+1] - 1.0))).max(0.0);
+        pout[b+2]  = (pout[b+2] * (1.0 + BRIGHT_EFFECT * bcorr[k])).max(0.0);
+
+        // gamut_map_HSB
+        let mut hsb = [pout[b], pout[b+1], pout[b+2], pout[b+3]];
+        gamut_map_hsb(&mut hsb, glut_arr, white);
+        pout[b]   = hsb[0]; pout[b+1] = hsb[1]; pout[b+2] = hsb[2];
+
+        // HSB → XYZ D65
+        let xyz_d65 = dt_ucs_hsb_to_xyz(&hsb, white);
+
+        // XYZ D65 → pipe RGB (dot_product: out[i] = M[i] · xyz)
+        let rgb = color::dot_product(&xyz_d65, &m_out);
+        pout[b]   = rgb[0]; pout[b+1] = rgb[1]; pout[b+2] = rgb[2];
+        // alpha preserved in pout[b+3]
+    }
+}
+
+/// Mask-display visualization: convert HSB brightness + correction into grey overlay.
+///
+/// For each pixel k:
+///   val = sqrt(pix_out[k*4+2] * white)
+///   corr based on mode:
+///     0=BRIGHTNESS:      BRIGHT_EFFECT * b_corrections[k]
+///     1=SATURATION:      SAT_EFFECT * (corrections[k*2+1] - 1)
+///     2=BRIGHTNESS_GRAD: _get_satweight(saturation[k]-bright_shift) - 0.5
+///     3=SATURATION_GRAD: _get_satweight(saturation[k]-sat_shift)    - 0.5
+///     4=HUE (default):   0.2 * corrections[k*2+0]
+///   neg = corr < 0
+///   corr = |corr| < 0.002 ? 0 : |corr|
+///   pix_out[0] = max(0, neg ? val-corr : val)
+///   pix_out[1] = max(0, val-corr)
+///   pix_out[2] = max(0, neg ? val : val-corr)
+///   if mode==BRIGHTNESS && Lscharr[k]>0.1: pix_out={0, Lscharr[k], 0}
+///
+/// Matches the DT_OMP_FOR at src/iop/colorequal.c:930.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorequal_mask_display(
+    pix_out_buf:  *mut f32,
+    corrections:  *const f32,
+    b_corrections: *const f32,
+    saturation:   *const f32,
+    lscharr:      *const f32,
+    npixels: usize,
+    mode: i32,
+    white: f32,
+    sat_shift: f32,
+    bright_shift: f32,
+    satweights: *const f32,
+    satsize: usize,
+) {
+    if npixels == 0 || satsize == 0 { return; }
+    const SAT_EFFECT:   f32 = 2.0;
+    const BRIGHT_EFFECT: f32 = 8.0;
+    let pout  = std::slice::from_raw_parts_mut(pix_out_buf, npixels * 4);
+    let corr  = std::slice::from_raw_parts(corrections,   npixels * 2);
+    let bcorr = std::slice::from_raw_parts(b_corrections, npixels);
+    let sat   = std::slice::from_raw_parts(saturation,    npixels);
+    let ls    = std::slice::from_raw_parts(lscharr,       npixels);
+    let sw    = std::slice::from_raw_parts(satweights, 2 * satsize + 1);
+
+    for k in 0..npixels {
+        let b   = k * 4;
+        let val = (pout[b + 2] * white).sqrt();
+        let c   = match mode {
+            0 => BRIGHT_EFFECT * bcorr[k],
+            1 => SAT_EFFECT * (corr[2*k+1] - 1.0),
+            2 => get_satweight(sat[k] - bright_shift, sw, satsize) - 0.5,
+            3 => get_satweight(sat[k] - sat_shift,    sw, satsize) - 0.5,
+            _ => 0.2 * corr[2*k],  // HUE
+        };
+        let neg  = c < 0.0;
+        let c    = if c.abs() < 2e-3 { 0.0 } else { c.abs() };
+        pout[b]   = if neg { (val - c).max(0.0) } else { val.max(0.0) };
+        pout[b+1] = (val - c).max(0.0);
+        pout[b+2] = if neg { val.max(0.0) } else { (val - c).max(0.0) };
+        if mode == 0 && ls[k] > 0.1 {
+            pout[b] = 0.0; pout[b+2] = 0.0; pout[b+1] = ls[k];
+        }
+    }
+}
+
 // ── _guide_with_chromaticity helpers ─────────────────────────────────────────
 
 /// Build the guide×corrections correlation matrix.

@@ -895,54 +895,16 @@ void process(dt_iop_module_t *self,
   if(d->use_filter && !run_fast)
     _prefilter_chromaticity(UV, saturation, width, height, hue_sigma, d->chroma_feathering, sat_shift);
 
-  // STEP 3 : carry-on with conversion from LUV to HSB
-  DT_OMP_FOR()
-  for(int row = 0; row < height; row++)
-  {
-    for(int col = 0; col < width; col++)
-    {
-      const size_t k = (size_t)row * width + col;
+  // STEP 3: L*/UV → JCH → HSB + corrections (Rust FFI)
+  // Copy alpha channel first (Rust loop only touches RGB + correction buffers)
+  for(size_t k = 0; k < npixels; k++)
+    out[k * 4 + 3] = in[k * 4 + 3];
 
-      const float *const restrict pix_in = DT_IS_ALIGNED_PIXEL(in + k * 4);
-      float *const restrict pix_out = DT_IS_ALIGNED_PIXEL(out + k * 4);
-      float *const restrict corrections_out = corrections + k * 2;
-
-      const float *const restrict uv = UV + k * 2;
-
-      // Finish the conversion to dt UCS JCH then HSB
-      dt_aligned_pixel_t JCH = { 0.0f, 0.0f, 0.0f, 0.0f };
-      dt_UCS_LUV_to_JCH(Lscharr[k], white, uv, JCH);
-      dt_UCS_JCH_to_HSB(JCH, pix_out);
-
-      // As tmp[k] is not used any longer as L(uminance) we re-use it for the saturation gradient
-      if(d->use_filter)
-      {
-        const int vrow = MIN(height - 2, MAX(1, row));
-        const int vcol = MIN(width - 2, MAX(1, col));
-        const size_t kk = vrow * width + vcol;
-        Lscharr[k] = gradient_amp * sqrf(MAX(0.0f, scharr_gradient(&saturation[kk], width) - 0.02f));
-      }
-
-      // Get the boosts - if chroma = 0, we have a neutral grey so set everything to 0
-      if(JCH[1] > NORM_MIN)
-      {
-        const float hue = pix_out[0];
-        const float sat = pix_out[1];
-        corrections_out[0] = lookup_gamut(d->LUT_hue, hue);
-        corrections_out[1] = lookup_gamut(d->LUT_saturation, hue);
-        b_corrections[k] = sat * (lookup_gamut(d->LUT_brightness, hue) - 1.0f);
-      }
-      else
-      {
-        corrections_out[0] = 0.0f;
-        corrections_out[1] = 1.0f;
-        b_corrections[k] = 0.0f;
-      }
-
-      // Copy alpha
-      pix_out[3] = pix_in[3];
-    }
-  }
+  darkroom_colorequal_compute_hsb_corrections(
+      UV, Lscharr, saturation, out, corrections, b_corrections,
+      npixels, (size_t)width, (size_t)height,
+      white, gradient_amp, d->use_filter ? 1 : 0,
+      d->LUT_hue, d->LUT_saturation, d->LUT_brightness);
 
   if(d->use_filter && !run_fast)
   {
@@ -956,74 +918,19 @@ void process(dt_iop_module_t *self,
 
   if(mask_mode == 0)
   {
-    // STEP 5: apply the corrections and convert back to RGB
-    DT_OMP_FOR()
-    for(size_t k = 0; k < npixels; k++)
-    {
-      const float *const restrict corrections_out = corrections + k * 2;
-      float *const restrict pix_out = DT_IS_ALIGNED_PIXEL(out + k * 4);
-
-      // Apply the corrections
-      pix_out[0] += corrections_out[0]; // WARNING: hue is an offset
-      // pix_out[1] (saturation) and pix_out[2] (brightness) are gains
-      pix_out[1] = MAX(0.0f, pix_out[1] * (1.0f + SAT_EFFECT * (corrections_out[1] - 1.0f)));
-      pix_out[2] = MAX(0.0f, pix_out[2] * (1.0f + BRIGHT_EFFECT * b_corrections[k]));
-
-      // Sanitize gamut
-      gamut_map_HSB(pix_out, d->gamut_LUT, white);
-
-      // Convert back to XYZ D65
-      dt_aligned_pixel_t XYZ_D65 = { 0.f };
-      dt_UCS_HSB_to_XYZ(pix_out, white, XYZ_D65);
-
-      // And back to pipe RGB through XYZ D50
-      dot_product(XYZ_D65, output_matrix, pix_out);
-    }
+    // STEP 5: apply corrections + convert back to RGB (Rust FFI)
+    darkroom_colorequal_apply_corrections(
+        out, corrections, b_corrections, npixels, white,
+        d->gamut_LUT, (const float *)output_matrix);
   }
   else
   {
     piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
     const int mode = mask_mode - 1;
-    DT_OMP_FOR()
-    for(size_t k = 0; k < npixels; k++)
-    {
-      float *const restrict pix_out = DT_IS_ALIGNED_PIXEL(out + k * 4);
-      const float *const restrict corrections_out = corrections + k * 2;
-
-      const float val = sqrtf(pix_out[2] * white);
-      float corr = 0.0f;
-      switch(mode)
-      {
-        case BRIGHTNESS:
-          corr = BRIGHT_EFFECT * b_corrections[k];
-          break;
-        case SATURATION:
-          corr = SAT_EFFECT * (corrections_out[1] - 1.0f);
-          break;
-        case BRIGHTNESS_GRAD:
-          corr = _get_satweight(saturation[k] - bright_shift) - 0.5f;
-          break;
-        case SATURATION_GRAD:
-          corr = _get_satweight(saturation[k] - sat_shift) - 0.5f;
-          break;
-
-        default:  // HUE
-          corr = 0.2f * corrections_out[0];
-      }
-
-      const gboolean neg = corr < 0.0f;
-      corr = fabsf(corr);
-      corr = corr < 2e-3 ? 0.0f : corr;
-      pix_out[0] = MAX(0.0f, neg ? val - corr : val);
-      pix_out[1] = MAX(0.0f, val - corr);
-      pix_out[2] = MAX(0.0f, neg ? val : val - corr);
-
-      if(mode == BRIGHTNESS && Lscharr[k] > 0.1f)
-      {
-        pix_out[0] = pix_out[2] = 0.0f;
-        pix_out[1] = Lscharr[k];
-      }
-    }
+    darkroom_colorequal_mask_display(
+        out, corrections, b_corrections, saturation, Lscharr,
+        npixels, mode, white, sat_shift, bright_shift,
+        satweights, (size_t)SATSIZE);
 
     if((mode == BRIGHTNESS_GRAD) || (mode == SATURATION_GRAD))
     {

@@ -1390,6 +1390,31 @@ void darkroom_colorequal_rgb_to_ucs_uv(
     const float *in_buf, float *uv_buf, float *saturation, float *lscharr,
     size_t npixels, size_t ch, const float *input_matrix);
 
+/* colorequal.c:974 — STEP 3: L*/UV → JCH → HSB + hue/sat/brightness corrections.
+ * lut_hue/saturation/brightness are each LUT_ELEM=512 floats. */
+void darkroom_colorequal_compute_hsb_corrections(
+    const float *uv_buf, float *lscharr, const float *saturation,
+    float *pix_out_buf, float *corrections, float *b_corrections,
+    size_t npixels, size_t width, size_t height,
+    float white, float gradient_amp, int use_filter,
+    const float *lut_hue, const float *lut_saturation, const float *lut_brightness);
+
+/* colorequal.c:1035 — STEP 5: apply corrections + convert HSB → RGB.
+ * gamut_lut is LUT_ELEM=512 floats; output_matrix is flat 16-float (4×4). */
+void darkroom_colorequal_apply_corrections(
+    float *pix_out_buf, const float *corrections, const float *b_corrections,
+    size_t npixels, float white,
+    const float *gamut_lut, const float *output_matrix);
+
+/* colorequal.c:930 — mask-display visualization overlay.
+ * mode: 0=BRIGHTNESS, 1=SATURATION, 2=BRIGHTNESS_GRAD, 3=SATURATION_GRAD, 4=HUE */
+void darkroom_colorequal_mask_display(
+    float *pix_out_buf, const float *corrections, const float *b_corrections,
+    const float *saturation, const float *lscharr,
+    size_t npixels, int mode, float white,
+    float sat_shift, float bright_shift,
+    const float *satweights, size_t satsize);
+
 /*
  * Toneequal IOP — LUT-based correction apply.
  * For each pixel: correction = lut[round((clamp(log2(lum), min_ev, max_ev) - min_ev) * lut_res)]
