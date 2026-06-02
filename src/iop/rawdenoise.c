@@ -278,11 +278,6 @@ static void wavelet_denoise(const float *const restrict in, float *const restric
   dt_free_align(fimg);
 }
 
-static inline float vstransform(const float value)
-{
-  return sqrtf(fmaxf(0.0f, value));
-}
-
 static void wavelet_denoise_xtrans(const float *const restrict in,
                                    float *const restrict out,
                                    const dt_iop_roi_t *const restrict roi,

@@ -744,11 +744,6 @@ int scrolled(
   return 0;
 }
 
-static inline float _compute_density(const float dens, const float length)
-{
-  return exp2f(dens * CLIP(0.5f + length));
-}
-
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const ivoid,

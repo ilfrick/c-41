@@ -508,24 +508,6 @@ static inline float get_gamma(const float x, const float gamma)
   return powf(x, gamma);
 }
 
-static inline float get_lut_gamma(const float x, const float gamma, const float *const lut)
-{
-  return (x > 1.f) ? get_gamma(x, gamma) : lut[CLAMP((int)(x * 0x10000ul), 0, 0xffff)];
-}
-
-static inline float get_contrast(const float x, const float contrast, const float middle_grey,
-                                 const float inv_middle_grey)
-{
-  return powf(x * inv_middle_grey, contrast) * middle_grey;
-}
-
-static inline float get_lut_contrast(const float x, const float contrast, const float middle_grey,
-                                     const float inv_middle_grey, const float *const lut)
-{
-  return (x > 1.f) ? get_contrast(x, contrast, middle_grey, inv_middle_grey)
-                   : lut[CLAMP((int)(x * 0x10000ul), 0, 0xffff)];
-}
-
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in,
@@ -845,35 +827,7 @@ static void _get_sum_and_average(const uint32_t *const histogram, const int hist
   *_avg = avg;
 }
 
-static inline float hlcurve(const float level, const float hlcomp, const float hlrange)
-{
-  if(hlcomp > 0.0f)
-  {
-    float val = level + (hlrange - 1.f);
 
-    // to avoid division by zero
-    if(val == 0.0f)
-    {
-      val = 0.000001f;
-    }
-
-    float Y = val / hlrange;
-    Y *= hlcomp;
-
-    // to avoid log(<=0)
-    if(Y <= -1.0f)
-    {
-      Y = -.999999f;
-    }
-
-    float R = hlrange / (val * hlcomp);
-    return log1pf(Y) * R;
-  }
-  else
-  {
-    return 1.f;
-  }
-}
 
 static void _get_auto_exp(const uint32_t *const histogram, const unsigned int hist_size, const int histcompr,
                           const float defgain, const float clip, const float midgray, float *_expcomp,
