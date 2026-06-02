@@ -1789,6 +1789,10 @@ void darkroom_rawprepare_rgba(const float *in_buf,
                               const float *sub,
                               const float *div_,
                               size_t ch);
+void darkroom_rawprepare_distort_transform(float *points, size_t points_count,
+                                           float dx, float dy);
+void darkroom_rawprepare_distort_backtransform(float *points, size_t points_count,
+                                               float dx, float dy);
 
 /*
  * Highlights IOP — sRAW (RGB) clipping-mask builder.

@@ -216,12 +216,7 @@ gboolean distort_transform(dt_iop_module_t *self,
   const float x = (float)d->left * scale;
   const float y = (float)d->top * scale;
 
-  DT_OMP_FOR_SIMD(aligned(points:64) if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    points[i] -= x;
-    points[i + 1] -= y;
-  }
+  darkroom_rawprepare_distort_transform(points, points_count, x, y);
 
   return TRUE;
 }
@@ -241,12 +236,7 @@ gboolean distort_backtransform(dt_iop_module_t *self,
   const float x = (float)d->left * scale;
   const float y = (float)d->top * scale;
 
-  DT_OMP_FOR_SIMD(aligned(points:64) if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    points[i] += x;
-    points[i + 1] += y;
-  }
+  darkroom_rawprepare_distort_backtransform(points, points_count, x, y);
 
   return TRUE;
 }

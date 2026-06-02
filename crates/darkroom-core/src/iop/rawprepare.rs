@@ -231,3 +231,38 @@ mod tests {
         assert!((out[3] - 1.25).abs() < 1e-6); // (4-1.5)/2
     }
 }
+
+/// Shift an interleaved (x,y) coordinate array by (-dx, -dy): forward distort.
+///
+/// points layout: [x0, y0, x1, y1, ...] — points_count pairs.
+/// Matches DT_OMP_FOR_SIMD in src/iop/rawprepare.c:219.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_rawprepare_distort_transform(
+    points: *mut f32,
+    points_count: usize,
+    dx: f32,
+    dy: f32,
+) {
+    let buf = std::slice::from_raw_parts_mut(points, points_count * 2);
+    for i in (0..points_count * 2).step_by(2) {
+        buf[i]     -= dx;
+        buf[i + 1] -= dy;
+    }
+}
+
+/// Shift an interleaved (x,y) coordinate array by (+dx, +dy): back-transform.
+///
+/// Matches DT_OMP_FOR_SIMD in src/iop/rawprepare.c:244.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_rawprepare_distort_backtransform(
+    points: *mut f32,
+    points_count: usize,
+    dx: f32,
+    dy: f32,
+) {
+    let buf = std::slice::from_raw_parts_mut(points, points_count * 2);
+    for i in (0..points_count * 2).step_by(2) {
+        buf[i]     += dx;
+        buf[i + 1] += dy;
+    }
+}
