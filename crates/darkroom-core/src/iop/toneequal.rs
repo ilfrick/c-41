@@ -316,6 +316,31 @@ fn pixel_correction_rs(exposure: f32, factors: &[f32; 8], gauss_denom: f32) -> f
     result.clamp(0.25, 4.0)
 }
 
+/// Build the GUI display curve LUT (UI_SAMPLES=256 entries).
+///
+/// LUT[k] = offset - log2(pixel_correction(x_k, factors, sigma)) / scaling
+/// where x_k = 8*(k/(UI_SAMPLES-1)) - 8   maps k to [-8, 0] EV.
+///
+/// Matches the DT_OMP_FOR_SIMD at src/iop/toneequal.c:1454.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_toneequal_build_gui_lut(
+    lut: *mut f32,
+    factors: *const f32,
+    sigma: f32,
+    offset: f32,
+    scaling: f32,
+) {
+    const UI_SAMPLES: usize = 256;
+    let out = std::slice::from_raw_parts_mut(lut, UI_SAMPLES);
+    let f: &[f32; 8] = &*(factors as *const [f32; 8]);
+    let gauss_denom = 2.0 * sigma * sigma;
+    for k in 0..UI_SAMPLES {
+        let x = 8.0 * (k as f32 / (UI_SAMPLES - 1) as f32) - 8.0;
+        let pc = pixel_correction_rs(x, f, gauss_denom);
+        out[k] = offset - pc.log2() / scaling;
+    }
+}
+
 /// Compute correction factors for CHANNELS=9 UI parameters from PIXEL_CHAN=8 RBF weights.
 ///
 /// out[i] = clamp(sum_j(gaussian(centers_params[i] - centers_ops[j]) * factors[j]), 0.25, 4)

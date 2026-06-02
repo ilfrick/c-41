@@ -1447,18 +1447,7 @@ static inline void compute_lut_correction(dt_iop_toneequalizer_gui_data_t *g,
 
   if(g == NULL) return;
 
-  float *const restrict LUT = g->gui_lut;
-  const float *const restrict factors = g->factors;
-  const float sigma = g->sigma;
-
-  DT_OMP_FOR_SIMD(aligned(LUT, factors:64))
-  for(int k = 0; k < UI_SAMPLES; k++)
-  {
-    // build the inset graph curve LUT
-    // the x range is [-14;+2] EV
-    const float x = (8.0f * (((float)k) / ((float)(UI_SAMPLES - 1)))) - 8.0f;
-    LUT[k] = offset - log2f(pixel_correction(x, factors, sigma)) / scaling;
-  }
+  darkroom_toneequal_build_gui_lut(g->gui_lut, g->factors, g->sigma, offset, scaling);
 }
 
 
