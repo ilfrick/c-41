@@ -13,8 +13,8 @@ pub const THUMB_SIZE: i32 = 160;
 /// The shared model: each string is the absolute path to an image file.
 pub type LighttableModel = gtk4::StringList;
 
-/// Build the lighttable widget. Returns (NavigationPage, shared StringList).
-pub fn lighttable_page() -> (adw::NavigationPage, LighttableModel) {
+/// Build the lighttable widget. Returns (NavigationPage, shared model, selection).
+pub fn lighttable_page() -> (adw::NavigationPage, LighttableModel, SingleSelection) {
     let model     = gtk4::StringList::new(&[]);
     let selection = SingleSelection::new(Some(model.clone()));
     let factory   = SignalListItemFactory::new();
@@ -133,7 +133,7 @@ pub fn lighttable_page() -> (adw::NavigationPage, LighttableModel) {
         .child(&scroll)
         .build();
 
-    (page, model)
+    (page, model, selection)
 }
 
 /// Reload the lighttable from the database at `db_path`.
@@ -171,6 +171,59 @@ pub fn lighttable_load_from_db(model: &LighttableModel, db_path: &str) {
 
     if model.n_items() == 0 {
         model.append("(No images — import a folder to begin)");
+    }
+}
+
+/// Reload the lighttable filtered to a single film-roll folder.
+///
+/// Pass `None` to show all images (same as `lighttable_load_from_db`).
+pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder: Option<&str>) {
+    while model.n_items() > 0 {
+        model.remove(0);
+    }
+
+    let conn = if db_path.is_empty() {
+        open_demo_db()
+    } else {
+        rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
+    };
+
+    let (sql, params): (&str, Vec<String>) = match folder {
+        Some(f) => (
+            "SELECT f.folder || '/' || i.filename \
+             FROM main.images i \
+             JOIN main.film_rolls f ON f.id = i.film_id \
+             WHERE f.folder = ?1 \
+             ORDER BY i.filename LIMIT 2000",
+            vec![f.to_string()],
+        ),
+        None => (
+            "SELECT f.folder || '/' || i.filename \
+             FROM main.images i \
+             JOIN main.film_rolls f ON f.id = i.film_id \
+             ORDER BY f.folder, i.filename LIMIT 2000",
+            vec![],
+        ),
+    };
+
+    if let Ok(mut stmt) = conn.prepare(sql) {
+        let rows: Vec<String> = match folder {
+            Some(_) => stmt
+                .query_map([params[0].as_str()], |r| r.get::<_, String>(0))
+                .map(|it| it.flatten().collect())
+                .unwrap_or_default(),
+            None => stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map(|it| it.flatten().collect())
+                .unwrap_or_default(),
+        };
+        for path in rows {
+            model.append(&path);
+        }
+    }
+
+    if model.n_items() == 0 {
+        model.append("(No images in this collection)");
     }
 }
 

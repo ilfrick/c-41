@@ -1,7 +1,7 @@
 //! GTK4 + libadwaita UI shell for Darkroom.
 //!
-//! Phase 3-ui-4: adw::NavigationView with lighttable root page; double-
-//! clicking an image pushes a darkroom editing page onto the stack.
+//! Phase 3-ui-6: collection filtering (left panel) + live metadata
+//! inspector (right panel) connected to SingleSelection changes.
 
 use adw::prelude::*;
 use adw::Application;
@@ -18,7 +18,6 @@ pub const APP_ID:        &str = "org.darkroom.Darkroom";
 pub const DEFAULT_WIDTH:  i32 = 1280;
 pub const DEFAULT_HEIGHT: i32 = 800;
 
-/// Boot the GTK4 application. Blocks until the main window is closed.
 pub fn run() -> Result<glib::ExitCode> {
     let app = Application::builder()
         .application_id(APP_ID)
@@ -37,22 +36,44 @@ fn build_main_window(app: &Application) {
 
     let db_path = std::env::var("DARKROOM_LIBRARY_DB").unwrap_or_default();
 
-    // ── Lighttable page ────────────────────────────────────────────────────
-    let (lt_grid, lt_model) = lighttable::lighttable_page();
+    // ── Lighttable: grid + model + selection ───────────────────────────────
+    let (lt_grid, lt_model, lt_selection) = lighttable::lighttable_page();
     lighttable::lighttable_load_from_db(&lt_model, &db_path);
 
-    // Three-column layout inside the lighttable NavigationPage
+    // ── Panels ─────────────────────────────────────────────────────────────
+    let left  = panels::left_panel(&db_path, &lt_model);
+    let right = panels::MetadataPanel::new();
+
+    // Update metadata when selection changes
+    {
+        let meta_panel = right.clone();
+        let db = db_path.clone();
+        let model = lt_model.clone();
+        lt_selection.connect_selection_changed(move |sel, _, _| {
+            let pos = sel.selected();
+            if let Some(path) = model.item(pos)
+                .and_downcast::<gtk4::StringObject>()
+                .map(|o| o.string().to_string())
+            {
+                if path.contains('/') {
+                    meta_panel.update(&path, &db);
+                }
+            }
+        });
+    }
+
+    // ── Lighttable page layout ─────────────────────────────────────────────
     let scroll = lt_grid.child().unwrap();
     scroll.set_hexpand(true);
 
     let hbox = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
-    hbox.append(&panels::left_panel(&db_path));
+    hbox.append(&left);
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     hbox.append(&scroll);
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
-    hbox.append(&panels::right_panel());
+    hbox.append(&right.widget);
 
     let lt_header = adw::HeaderBar::new();
     lt_header.set_title_widget(Some(&adw::WindowTitle::new("Darkroom", "Lighttable")));
@@ -67,14 +88,11 @@ fn build_main_window(app: &Application) {
         .child(&lt_toolbar)
         .build();
 
-    // ── Navigation view (stack) ────────────────────────────────────────────
+    // ── Navigation view ────────────────────────────────────────────────────
     let nav = adw::NavigationView::new();
     nav.push(&lt_page);
 
-    // ── Wire up double-click → push darkroom page ──────────────────────────
-    // The GridView emits "activate" when an item is double-clicked or Enter
-    // is pressed. We need a reference to the GridView to connect signals.
-    // Re-extract it: scroll → viewport → GridView.
+    // Double-click → push darkroom page
     {
         let scroll_ref = scroll.downcast_ref::<gtk4::ScrolledWindow>().unwrap();
         if let Some(grid) = scroll_ref.child().and_downcast::<gtk4::GridView>() {
@@ -84,8 +102,7 @@ fn build_main_window(app: &Application) {
                     .map(|o| o.string().to_string())
                 {
                     if path.contains('/') {
-                        let page = darkroom::darkroom_page(&path);
-                        nav.push(&page);
+                        nav.push(&darkroom::darkroom_page(&path));
                     }
                 }
             }));
