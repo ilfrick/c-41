@@ -90,6 +90,20 @@ fn build_main_window(app: &Application) {
     let lt_header = adw::HeaderBar::new();
     lt_header.set_title_widget(Some(&adw::WindowTitle::new("Darkroom", "Lighttable")));
 
+    // Search bar
+    {
+        let search = gtk4::SearchEntry::builder()
+            .placeholder_text("Search images…")
+            .width_request(200)
+            .build();
+        let db = db_path.clone();
+        search.connect_search_changed(clone!(@weak lt_model => move |s| {
+            let query = s.text().to_string();
+            lighttable::lighttable_filter_by_name(&lt_model, &db, &query);
+        }));
+        lt_header.pack_start(&search);
+    }
+
     // Import button
     {
         let btn = gtk4::Button::builder()

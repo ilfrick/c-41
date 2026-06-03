@@ -7,6 +7,7 @@
 use adw::prelude::*;
 use glib::clone;
 use crate::lighttable::{LighttableModel, lighttable_load_by_folder};
+use darkroom_db;
 
 // ── Left panel (collections) ──────────────────────────────────────────────
 
@@ -141,19 +142,22 @@ fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {
     rolls
 }
 
-// ── Right panel (metadata) ────────────────────────────────────────────────
+// ── Right panel (metadata + tags) ────────────────────────────────────────
 
 /// Metadata inspector widget with an `update` method.
 ///
-/// All label references are GTK GObject ref-counts so `MetadataPanel` is
-/// cheaply cloneable -- just clone it to share with a selection callback.
+/// All GTK fields are GObject ref-counts so `MetadataPanel` is Clone.
 #[derive(Clone)]
 pub struct MetadataPanel {
-    pub widget: gtk4::Box,
+    pub widget:   gtk4::Box,
     filename_lbl: gtk4::Label,
     folder_lbl:   gtk4::Label,
     dims_lbl:     gtk4::Label,
     size_lbl:     gtk4::Label,
+    tags_flow:    gtk4::FlowBox,
+    tag_entry:    gtk4::Entry,
+    /// Shared (path, db_path) for the add-tag handler
+    ctx: std::rc::Rc<std::cell::RefCell<(String, String)>>,
 }
 
 impl MetadataPanel {
@@ -164,6 +168,7 @@ impl MetadataPanel {
             .width_request(210)
             .build();
 
+        // ── Header ────────────────────────────────────────────────────────
         let header = gtk4::Label::builder()
             .label("Metadata")
             .halign(gtk4::Align::Start)
@@ -174,87 +179,175 @@ impl MetadataPanel {
         panel.append(&header);
         panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-        let grid = gtk4::Grid::builder()
-            .row_spacing(4)
-            .column_spacing(8)
-            .margin_start(12).margin_end(12)
-            .margin_top(10)
-            .build();
-
+        // ── Info grid ─────────────────────────────────────────────────────
         let mk_key = |text: &str| {
             let l = gtk4::Label::builder().label(text).halign(gtk4::Align::End).build();
             l.add_css_class("dim-label");
             l
         };
-        let mk_val = || {
-            gtk4::Label::builder()
-                .halign(gtk4::Align::Start)
-                .hexpand(true)
-                .max_width_chars(20)
-                .ellipsize(gtk4::pango::EllipsizeMode::Middle)
-                .build()
-        };
+        let mk_val = || gtk4::Label::builder()
+            .halign(gtk4::Align::Start).hexpand(true)
+            .max_width_chars(20).ellipsize(gtk4::pango::EllipsizeMode::Middle)
+            .build();
 
         let filename_lbl = mk_val();
         let folder_lbl   = mk_val();
         let dims_lbl     = mk_val();
         let size_lbl     = mk_val();
 
-        let rows: [(&str, &gtk4::Label); 4] = [
-            ("File",   &filename_lbl),
-            ("Folder", &folder_lbl),
-            ("Size",   &dims_lbl),
-            ("Disk",   &size_lbl),
-        ];
-        for (i, (key, val)) in rows.iter().enumerate() {
+        let grid = gtk4::Grid::builder()
+            .row_spacing(4).column_spacing(8)
+            .margin_start(12).margin_end(12).margin_top(10)
+            .build();
+        for (i, (key, val)) in [
+            ("File", &filename_lbl), ("Folder", &folder_lbl),
+            ("Size", &dims_lbl),    ("Disk",   &size_lbl),
+        ].iter().enumerate() {
             grid.attach(&mk_key(key), 0, i as i32, 1, 1);
             grid.attach(*val, 1, i as i32, 1, 1);
         }
+        panel.append(&grid);
 
+        // ── Tags section ──────────────────────────────────────────────────
+        let tags_header = gtk4::Label::builder()
+            .label("Tags")
+            .halign(gtk4::Align::Start)
+            .margin_top(12).margin_bottom(4)
+            .margin_start(12).margin_end(12)
+            .build();
+        tags_header.add_css_class("heading");
+        panel.append(&tags_header);
+
+        let tags_flow = gtk4::FlowBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .homogeneous(false)
+            .max_children_per_line(10)
+            .margin_start(10).margin_end(10).margin_bottom(6)
+            .build();
+        panel.append(&tags_flow);
+
+        // Add-tag entry
+        let tag_entry = gtk4::Entry::builder()
+            .placeholder_text("Add tag…")
+            .margin_start(10).margin_end(10).margin_bottom(8)
+            .build();
+        panel.append(&tag_entry);
+
+        // ── Placeholder ───────────────────────────────────────────────────
         let placeholder = gtk4::Label::builder()
             .label("Select an image\nto view metadata")
-            .halign(gtk4::Align::Center)
-            .valign(gtk4::Align::Center)
-            .vexpand(true)
-            .justify(gtk4::Justification::Center)
+            .halign(gtk4::Align::Center).valign(gtk4::Align::Center)
+            .vexpand(true).justify(gtk4::Justification::Center)
             .build();
         placeholder.add_css_class("dim-label");
-
-        panel.append(&grid);
         panel.append(&placeholder);
 
-        Self { widget: panel, filename_lbl, folder_lbl, dims_lbl, size_lbl }
+        let ctx = std::rc::Rc::new(std::cell::RefCell::new((String::new(), String::new())));
+
+        // Wire add-tag on Enter key
+        {
+            let ctx2      = ctx.clone();
+            let flow_ref  = tags_flow.clone();
+            tag_entry.connect_activate(move |entry| {
+                let tag_name = entry.text().trim().to_string();
+                if tag_name.is_empty() { return; }
+                let (ref path, ref db) = *ctx2.borrow();
+                if !db.is_empty() {
+                    add_tag_to_image(path, db, &tag_name);
+                    rebuild_tags_flow(&flow_ref, path, db);
+                }
+                entry.set_text("");
+            });
+        }
+
+        Self { widget: panel, filename_lbl, folder_lbl, dims_lbl, size_lbl,
+               tags_flow, tag_entry, ctx }
     }
 
-    /// Update the panel with metadata for the image at `full_path`.
+    /// Refresh the panel for the image at `full_path`.
     pub fn update(&self, full_path: &str, db_path: &str) {
         use std::path::Path;
-
-        let p = Path::new(full_path);
+        let p        = Path::new(full_path);
         let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or(full_path);
         let folder   = p.parent().and_then(|d| d.to_str()).unwrap_or("");
 
         self.filename_lbl.set_label(filename);
-        self.folder_lbl.set_label(
-            folder.rsplit('/').next().unwrap_or(folder)
-        );
+        self.folder_lbl.set_label(folder.rsplit('/').next().unwrap_or(folder));
 
-        // Dimensions from DB
         let dims = query_dims(full_path, db_path)
-            .map(|(w, h)| format!("{w} × {h}"))
-            .unwrap_or_else(|| "—".to_string());
+            .map(|(w, h)| format!("{w} \u{00d7} {h}"))
+            .unwrap_or_else(|| "\u{2014}".into());
         self.dims_lbl.set_label(&dims);
 
-        // File size on disk
         let disk = std::fs::metadata(full_path)
             .map(|m| format_bytes(m.len()))
-            .unwrap_or_else(|_| "—".to_string());
+            .unwrap_or_else(|_| "\u{2014}".into());
         self.size_lbl.set_label(&disk);
+
+        // Store context for the tag-entry handler
+        *self.ctx.borrow_mut() = (full_path.to_string(), db_path.to_string());
+
+        // Rebuild tag chips
+        rebuild_tags_flow(&self.tags_flow, full_path, db_path);
+        self.tag_entry.set_text("");
     }
 }
 
 impl Default for MetadataPanel {
     fn default() -> Self { Self::new() }
+}
+
+// ── Tag helpers ───────────────────────────────────────────────────────────
+
+fn rebuild_tags_flow(flow: &gtk4::FlowBox, full_path: &str, db_path: &str) {
+    // Clear existing chips
+    while let Some(child) = flow.first_child() {
+        flow.remove(&child);
+    }
+
+    let tags = load_tags(full_path, db_path);
+    if tags.is_empty() {
+        let lbl = gtk4::Label::builder().label("(none)").build();
+        lbl.add_css_class("dim-label");
+        flow.insert(&lbl, -1);
+        return;
+    }
+
+    for tag in tags {
+        let chip = gtk4::Label::builder()
+            .label(&tag)
+            .margin_start(4).margin_end(4)
+            .margin_top(2).margin_bottom(2)
+            .build();
+        chip.add_css_class("tag");
+        flow.insert(&chip, -1);
+    }
+}
+
+fn load_tags(full_path: &str, db_path: &str) -> Vec<String> {
+    if db_path.is_empty() { return Vec::new(); }
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let imgid = match darkroom_db::image::image_get_id_by_path(&conn, full_path) {
+        Ok(Some(id)) => id,
+        _ => return Vec::new(),
+    };
+    darkroom_db::tags::tag_get_attached(&conn, imgid)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| darkroom_db::tags::tag_get_name(&conn, id).ok().flatten())
+        .collect()
+}
+
+fn add_tag_to_image(full_path: &str, db_path: &str, tag_name: &str) {
+    let Ok(conn) = rusqlite::Connection::open(db_path) else { return };
+    let Ok(Some(imgid)) = darkroom_db::image::image_get_id_by_path(&conn, full_path) else { return };
+    // Create tag if it doesn't exist, then attach it
+    if let Ok(Some(tag_id)) = darkroom_db::tags::tag_new(&conn, tag_name) {
+        let _ = darkroom_db::tags::tag_attach(&conn, tag_id, imgid);
+    }
 }
 
 fn query_dims(full_path: &str, db_path: &str) -> Option<(i64, i64)> {

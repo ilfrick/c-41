@@ -113,6 +113,31 @@ pub fn image_count_all(conn: &Connection) -> rusqlite::Result<i32> {
     conn.query_row("SELECT COUNT(*) FROM main.images", [], |row| row.get(0))
 }
 
+/// Look up image id by full path (folder/filename split).
+pub fn image_get_id_by_path(
+    conn: &Connection,
+    full_path: &str,
+) -> rusqlite::Result<Option<dt_imgid_t>> {
+    use std::path::Path;
+    let p        = Path::new(full_path);
+    let filename = match p.file_name().and_then(|n| n.to_str()) {
+        Some(f) => f,
+        None    => return Ok(None),
+    };
+    let folder = match p.parent().and_then(|d| d.to_str()) {
+        Some(d) => d,
+        None    => return Ok(None),
+    };
+    conn.query_row(
+        "SELECT i.id FROM main.images i \
+         JOIN main.film_rolls f ON f.id = i.film_id \
+         WHERE f.folder = ?1 AND i.filename = ?2",
+        params![folder, filename],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 /// Insert a new image record. Returns the new image id.
 /// Skips insertion if an image with the same film_id and filename already exists.
 pub fn image_insert(

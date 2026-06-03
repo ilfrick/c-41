@@ -299,6 +299,42 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
     }
 }
 
+/// Filter the lighttable to images whose filename contains `query` (case-insensitive).
+/// Pass an empty query to show all images (same as load_from_db).
+pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: &str) {
+    if query.is_empty() {
+        lighttable_load_by_folder(model, db_path, None);
+        return;
+    }
+    while model.n_items() > 0 {
+        model.remove(0);
+    }
+    let conn = if db_path.is_empty() {
+        open_demo_db()
+    } else {
+        rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
+    };
+    let pattern = format!("%{query}%");
+    let rows: Vec<String> = conn
+        .prepare(
+            "SELECT f.folder || '/' || i.filename \
+             FROM main.images i JOIN main.film_rolls f ON f.id = i.film_id \
+             WHERE i.filename LIKE ?1 \
+             ORDER BY f.folder, i.filename LIMIT 2000",
+        )
+        .and_then(|mut s| {
+            s.query_map([pattern.as_str()], |r| r.get::<_, String>(0))
+                .map(|it| it.flatten().collect())
+        })
+        .unwrap_or_default();
+    for path in rows {
+        model.append(&path);
+    }
+    if model.n_items() == 0 {
+        model.append("(No results)");
+    }
+}
+
 fn open_demo_db() -> rusqlite::Connection {
     use rusqlite::Connection;
     let conn = Connection::open_in_memory().expect("in-memory db");
