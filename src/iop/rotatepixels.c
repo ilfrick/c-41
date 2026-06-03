@@ -245,8 +245,6 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
              const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
   const int ch = piece->colors;
-  const int ch_width = ch * roi_in->width;
-
   const float scale = roi_in->scale / piece->iscale;
 
   assert(ch == 4);

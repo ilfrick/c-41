@@ -158,7 +158,6 @@ void distort_mask(dt_iop_module_t *self,
   const dt_interpolation_t *iter = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
   const int iw = roi_in->width;
   const int ih = roi_in->height;
-  const size_t ow = roi_out->width;
 
   // Compute scale factors locally from the actual roi_in/roi_out to ensure
   // consistency, rather than relying on d->x_scale/d->y_scale which may have
@@ -217,8 +216,6 @@ void modify_roi_in(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const d
 void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid, void *const ovoid,
              const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  const int ch = piece->colors;
-  const int ch_width = ch * roi_in->width;
   const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
 
   // Compute scale factors locally from the actual roi_in/roi_out to ensure
