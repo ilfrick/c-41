@@ -1649,6 +1649,28 @@ void darkroom_blurs_alpha_restore(const float *in_buf, float *out_buf,
                                    size_t npixels);
 void darkroom_blurs_bspline_2d(const float *in_buf, float *out_buf,
                                 size_t width, size_t height);
+
+/* Denoiseprofile IOP -- 6 Anscombe/power-law VST loops. */
+void darkroom_denoise_precondition(const float *in_buf, float *out_buf,
+                                    size_t npixels,
+                                    const float *a, const float *b);
+void darkroom_denoise_backtransform(float *buf, size_t npixels,
+                                     const float *a, const float *b);
+void darkroom_denoise_precondition_v2(const float *in_buf, float *out_buf,
+                                       size_t npixels,
+                                       float a, const float *p, float b,
+                                       const float *wb);
+void darkroom_denoise_backtransform_v2(float *buf, size_t npixels,
+                                        float a, const float *p, float b,
+                                        float bias, const float *wb);
+void darkroom_denoise_precondition_yuv(const float *in_buf, float *out_buf,
+                                        size_t npixels,
+                                        float a, const float *p, float b,
+                                        const float *to_yuv);
+void darkroom_denoise_backtransform_yuv(float *buf, size_t npixels,
+                                         float a, const float *p, float b,
+                                         float bias, const float *wb,
+                                         const float *to_rgb);
 void darkroom_blurs_init_kernel(float *buf, size_t n);
 void darkroom_blurs_gauss_kernel(float *buf, size_t width, size_t height);
 void darkroom_blurs_lens_kernel(float *buf, size_t width, size_t height,

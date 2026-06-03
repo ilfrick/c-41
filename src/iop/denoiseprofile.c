@@ -34,6 +34,7 @@
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 #include <gtk/gtk.h>
 #include <math.h>
@@ -914,22 +915,7 @@ static inline void precondition(const float *const in,
                                 const dt_aligned_pixel_t a,
                                 const dt_aligned_pixel_t b)
 {
-  const dt_aligned_pixel_t sigma2_plus_3_8
-      = { (b[0] / a[0]) * (b[0] / a[0]) + 3.f / 8.f,
-          (b[1] / a[1]) * (b[1] / a[1]) + 3.f / 8.f,
-          (b[2] / a[2]) * (b[2] / a[2]) + 3.f / 8.f,
-          0.0f };
-  const size_t npixels = (size_t)wd * ht;
-
-  DT_OMP_FOR()
-  for(size_t j = 0; j < 4U * npixels; j += 4)
-  {
-    for_each_channel(c,aligned(in,buf,a,sigma2_plus_3_8))
-    {
-      const float d = fmaxf(0.0f, in[j+c] / a[c] + sigma2_plus_3_8[c]);
-      buf[j+c] = 2.0f * sqrtf(d);
-    }
-  }
+  darkroom_denoise_precondition(in, buf, (size_t)wd * ht, a, b);
 }
 
 static inline void backtransform(float *const buf,
@@ -938,31 +924,7 @@ static inline void backtransform(float *const buf,
                                  const dt_aligned_pixel_t a,
                                  const dt_aligned_pixel_t b)
 {
-  const dt_aligned_pixel_t sigma2_plus_1_8
-      = { (b[0] / a[0]) * (b[0] / a[0]) + 1.f / 8.f,
-          (b[1] / a[1]) * (b[1] / a[1]) + 1.f / 8.f,
-          (b[2] / a[2]) * (b[2] / a[2]) + 1.f / 8.f,
-          0.0f };
-  const size_t npixels = (size_t)wd * ht;
-  const float sqrt_3_2 = sqrtf(3.0f / 2.0f);
-
-  DT_OMP_FOR()
-  for(size_t j = 0; j < 4U * npixels; j += 4)
-  {
-    for_each_channel(c,aligned(buf,sigma2_plus_1_8))
-    {
-      const float x = buf[j+c], x2 = x * x;
-      // closed form approximation to unbiased inverse (input range
-      // was 0..200 for fit, not 0..1)
-      buf[j+c] = (x < 0.5f)
-        ? 0.0f
-        : a[c] * (1.f / 4.f * x2 + 1.f / 4.f * sqrt_3_2 / x - 11.f / 8.f / x2
-                  + 5.f / 8.f * sqrt_3_2 / (x * x2) - sigma2_plus_1_8[c]);
-      // asymptotic form:
-      // buf[j+c] = fmaxf(0.0f, 1./4.*x*x - 1./8. - sigma2[c]);
-      // buf[j+c] *= a[c];
-    }
-  }
+  darkroom_denoise_backtransform(buf, (size_t)wd * ht, a, b);
 }
 
 // the "v2" variance stabilizing transform is an extension of the generalized
@@ -997,29 +959,7 @@ static inline void precondition_v2(const float *const in,
                                    const float b,
                                    const dt_aligned_pixel_t wb)
 {
-  const size_t npixels = (size_t)wd * ht;
-  const dt_aligned_pixel_t expon = { -p[0] / 2 + 1, -p[1] / 2 + 1, -p[2] / 2 + 1, 1.0f };
-  const dt_aligned_pixel_t denom = { (-p[0] + 2) * sqrtf(a), (-p[1] + 2) * sqrtf(a),
-                                     (-p[2] + 2) * sqrtf(a), 1.0f };
-
-  DT_OMP_FOR()
-  for(size_t j = 0; j < 4U * npixels; j += 4)
-  {
-    dt_aligned_pixel_t scaled;
-    for_each_channel(c,aligned(in,wb))
-      scaled[c] = MAX(in[j+c] / wb[c] + b, 0.0f);
-    dt_aligned_pixel_t precond;
-#ifdef VECTORIZE_POWF
-    dt_vector_powf(scaled, expon, precond);
-#else
-    for_each_channel(c,aligned(scaled,expon))
-      precond[c] = powf(scaled[c], expon[c]);
-#endif
-    for_each_channel(c,aligned(denom))
-      precond[c] = 2.0f * precond[c] / denom[c];
-    copy_pixel_nontemporal(buf + j, precond);
-  }
-  dt_omploop_sfence(); // ensure that nontemporal writes complete before we read the output
+  darkroom_denoise_precondition_v2(in, buf, (size_t)wd * ht, a, p, b, wb);
 }
 
 // this backtransform aims at being a low bias backtransform
@@ -1090,36 +1030,7 @@ static inline void backtransform_v2(float *const buf,
                                     const float bias,
                                     const dt_aligned_pixel_t wb)
 {
-  const size_t npixels = (size_t)wd * ht;
-  const dt_aligned_pixel_t expon = { 1.0f / (1.0f - p[0] / 2.0f),
-                                     1.0f / (1.0f - p[1] / 2.0f),
-                                     1.0f / (1.0f - p[2] / 2.0f),
-                                     1.0f };
-
-  const dt_aligned_pixel_t denom = { 4.0f / (sqrtf(a) * (2.0f - p[0])),
-                                     4.0f / (sqrtf(a) * (2.0f - p[1])),
-                                     4.0f / (sqrtf(a) * (2.0f - p[2])),
-                                     1.0f };
-  DT_OMP_FOR()
-  for(size_t j = 0; j < 4U * npixels; j += 4)
-  {
-    dt_aligned_pixel_t z1;
-    for_each_channel(c,aligned(buf,wb))
-    {
-      const float x = MAX(buf[j+c], 0.0f);
-      const float delta = x * x + bias;
-      z1[c] = (x + sqrtf(MAX(delta, 0.0f))) / denom[c];
-    }
-    dt_aligned_pixel_t back;
-#ifdef VECTORIZE_POWF
-    dt_vector_powf(z1, expon, back);
-#else
-    for_each_channel(c)
-      back[c] = powf(z1[c], expon[c]);
-#endif
-    for_each_channel(c,aligned(buf))
-      buf[j+c] = wb[c] * (back[c] - b);
-  }
+  darkroom_denoise_backtransform_v2(buf, (size_t)wd * ht, a, p, b, bias, wb);
 }
 
 static inline void precondition_Y0U0V0(const float *const in,
@@ -1131,31 +1042,8 @@ static inline void precondition_Y0U0V0(const float *const in,
                                        const float b,
                                        const dt_colormatrix_t toY0U0V0_trans)
 {
-  const dt_aligned_pixel_t expon = { -p[0] / 2 + 1, -p[1] / 2 + 1, -p[2] / 2 + 1, 1.0f };
-  const dt_aligned_pixel_t scale = { 2.0f / ((-p[0] + 2) * sqrtf(a)),
-                                     2.0f / ((-p[1] + 2) * sqrtf(a)),
-                                     2.0f / ((-p[2] + 2) * sqrtf(a)),
-                                     1.0f };
-  DT_OMP_FOR()
-  for(size_t j = 0; j < (size_t)4 * ht * wd; j += 4)
-  {
-    dt_aligned_pixel_t tmp; // "unused" fourth element enables vectorization
-#ifdef VECTORIZE_POWF
-    dt_aligned_pixel_t clamped;
-    for_each_channel(c,aligned(in))
-      clamped[c] = MAX(in[j+c] + b, 0.0f);
-    dt_vector_powf(clamped, expon, tmp);
-    for_each_channel(c,aligned(scale))
-      tmp[c] *= scale[c];
-#else
-    for_each_channel(c,aligned(in))
-      tmp[c] = powf(MAX(in[j+c] + b, 0.0f), expon[c]) * scale[c];
-#endif
-    dt_aligned_pixel_t yuv;
-    dt_apply_transposed_color_matrix(tmp, toY0U0V0_trans, yuv);
-    copy_pixel_nontemporal(buf + j, yuv);
-  }
-  dt_omploop_sfence(); // ensure that nontemporal writes complete before we read the output
+  darkroom_denoise_precondition_yuv(in, buf, (size_t)wd * ht, a, p, b,
+                                     (const float *)toY0U0V0_trans);
 }
 
 static inline void backtransform_Y0U0V0(float *const buf,
@@ -1168,38 +1056,8 @@ static inline void backtransform_Y0U0V0(float *const buf,
                                         const dt_aligned_pixel_t wb,
                                         const dt_colormatrix_t toRGB_trans)
 {
-  const dt_aligned_pixel_t bias_wb = { bias * wb[0], bias * wb[1], bias * wb[2], 0.0f };
-
-  const dt_aligned_pixel_t expon = {  1.0f / (1.0f - p[0] / 2.0f),
-                                      1.0f / (1.0f - p[1] / 2.0f),
-                                      1.0f / (1.0f - p[2] / 2.0f),
-                                      1.0f };
-
-  const dt_aligned_pixel_t scale = { (sqrtf(a) * (2.0f - p[0])) / 4.0f,
-                                     (sqrtf(a) * (2.0f - p[1])) / 4.0f,
-                                     (sqrtf(a) * (2.0f - p[2])) / 4.0f,
-                                     1.0f };
-  DT_OMP_FOR()
-  for(size_t j = 0; j < (size_t)4 * ht * wd; j += 4)
-  {
-    dt_aligned_pixel_t rgb = { 0.0f }; // "unused" fourth element enables vectorization
-    dt_apply_transposed_color_matrix(buf + j, toRGB_trans, rgb);
-    dt_aligned_pixel_t z1;
-    for_each_channel(c,aligned(buf))
-    {
-      const float x = MAX(rgb[c], 0.0f);
-      const float delta = x * x + bias_wb[c];
-      z1[c] = (x + sqrtf(MAX(delta, 0.0f))) * scale[c];
-    }
-#ifdef VECTORIZE_POWF
-    dt_vector_powf(z1, expon, z1);
-#else
-    for_each_channel(c,aligned(expon))
-      z1[c] = powf(z1[c], expon[c]);
-#endif
-    for_each_channel(c,aligned(buf))
-      buf[j+c] = z1[c] - b;
-  }
+  darkroom_denoise_backtransform_yuv(buf, (size_t)wd * ht, a, p, b, bias, wb,
+                                     (const float *)toRGB_trans);
 }
 
 // =====================================================================================
