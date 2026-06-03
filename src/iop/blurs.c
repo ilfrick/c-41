@@ -180,9 +180,7 @@ static inline void _init_kernel(float *const restrict buffer,
                                 const size_t width,
                                 const size_t height)
 {
-  // init an empty kernel with zeros
-  DT_OMP_FOR_SIMD(aligned(buffer:64))
-  for(size_t k = 0; k < height * width; k++) buffer[k] = 0.f;
+  darkroom_blurs_init_kernel(buffer, height * width);
 }
 
 
@@ -204,24 +202,7 @@ static inline void _create_lens_kernel(float *const restrict buffer,
   const float eps = 1.f / (float)width;
   const float radius = (float)(width - 1) / 2.f - 1;
 
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < height; i++)
-    for(size_t j = 0; j < width; j++)
-    {
-      // get normalized kernel coordinates in [-1 ; 1]
-      const float x = (float)(i - 1) / radius - 1;
-      const float y = (float)(j - 1) / radius - 1;
-
-      // get current radial distance from kernel center
-      const float r = dt_fast_hypotf(x, y);
-
-      // get the radial distance at current angle of the shape envelope
-      const float M = cosf((2.f * asinf(k) + M_PI_F * m) / (2.f * n))
-                      / cosf((2.f * asinf(k * cosf(n * (atan2f(y, x) + rotation))) + M_PI_F * m) / (2.f * n));
-
-      // write 1 if we are inside the envelope of the shape, else 0
-      buffer[i * width + j] = (M >= r + eps);
-    }
+  darkroom_blurs_lens_kernel(buffer, width, height, n, m, k, rotation);
 }
 
 static inline void _create_motion_kernel(float *const restrict buffer,
@@ -249,40 +230,8 @@ static inline void _create_motion_kernel(float *const restrict buffer,
   const float M[2][2] = { { cosf(corr_angle), -sinf(corr_angle) },
                           { sinf(corr_angle), cosf(corr_angle) } };
 
-  DT_OMP_FOR_SIMD(aligned(buffer:64))
-  for(size_t i = 0; i < 8 * width; i++)
-  {
-    // Note : for better smoothness of the polynomial discretization,
-    // we oversample 8 times, meaning we evaluate the polynomial
-    // every eighth of pixel
-
-    // get normalized kernel coordinates in [-1 ; 1]
-    const float x = (float)(i / 8.f - 1) / radius - 1;
-    //const float y = (j - 1) / radius - 1; // not used here
-
-    // build the motion path : 2nd order polynomial
-    const float X = x - offset;
-    const float y = X * X * A + X * B + C;
-
-    // rotate the motion path around the kernel center
-    const float rot_x = x * M[0][0] + y * M[0][1];
-    const float rot_y = x * M[1][0] + y * M[1][1];
-
-    // convert back to kernel absolute coordinates ± eps
-    const int y_f[2] = { roundf((rot_y + 1) * radius - eps),
-                         roundf((rot_y + 1) * radius + eps) };
-    const int x_f[2] = { roundf((rot_x + 1) * radius - eps),
-                         roundf((rot_x + 1) * radius + eps) };
-
-    // write 1 if we are inside the envelope of the shape, else 0
-    // leave 1px padding on each border of the kernel for the anti-aliasing
-    for(int l = 0; l < 2; l++)
-      for(int m = 0; m < 2; m++)
-      {
-        if(x_f[l] > 0 && x_f[l] < width - 1 && y_f[m] > 0 && y_f[m] < width - 1)
-          buffer[y_f[m] * width + x_f[l]] = 1.f;
-      }
-  }
+  const float rot_flat[4] = { M[0][0], M[0][1], M[1][0], M[1][1] };
+  darkroom_blurs_motion_kernel(buffer, width, A, offset, rot_flat, radius, eps);
 }
 
 
@@ -294,18 +243,7 @@ static inline void _create_gauss_kernel(float *const restrict buffer,
   // 2 × 1D convolutions.
   const float radius = (width - 1) / 2.f - 1;
 
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < height; i++)
-    for(size_t j = 0; j < width; j++)
-    {
-      // get normalized kernel coordinates in [-1 ; 1]
-      const float x = (float)(i - 1) / radius - 1;
-      const float y = (float)(j - 1) / radius - 1;
-
-      // get current square radial distance from kernel center
-      const float r_2 = x * x + y * y;
-      buffer[i * width + j] = expf(-4.f * r_2);
-    }
+  darkroom_blurs_gauss_kernel(buffer, width, height);
 }
 
 static inline void _build_gui_kernel(unsigned char *const buffer,
@@ -341,12 +279,7 @@ static inline void _build_gui_kernel(unsigned char *const buffer,
     _create_gauss_kernel(kernel_2, width, height);
   }
 
-  // Convert to Gtk/Cairo RGBA 8×4 bits
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width; k++)
-  {
-    buffer[k * 4] = buffer[k * 4 + 1] = buffer[k * 4 + 2] = buffer[k * 4 + 3] = roundf(255.f * kernel_2[k]);
-  }
+  darkroom_blurs_gui_rgba(kernel_2, buffer, height * width);
 cleanup:
   dt_free_align(kernel_1);
   dt_free_align(kernel_2);
@@ -355,25 +288,13 @@ cleanup:
 
 static inline float _compute_norm(const float *const buffer, const size_t width, const size_t height)
 {
-  float norm = 0.f;
-
-  DT_OMP_FOR_SIMD(aligned(buffer:64) reduction(+:norm))
-  for(size_t i = 0; i < width * height; i++)
-  {
-    norm += buffer[i];
-  }
-
-  return norm;
+  return darkroom_blurs_compute_norm(buffer, width * height);
 }
 
 
 static inline void _normalize(float *const buffer, const size_t width, const size_t height, const float norm)
 {
-  DT_OMP_FOR_SIMD(aligned(buffer:64))
-  for(size_t i = 0; i < width * height; i++)
-  {
-    buffer[i] /= norm;
-  }
+  darkroom_blurs_normalize(buffer, width * height, norm);
 }
 
 
@@ -450,38 +371,12 @@ static void process_fft(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *pi
     goto cleanup;
   }
 
-  // Write the image in the padded buffer
-  DT_OMP_FOR_SIMD(aligned(in, padded_in:64))
-  for(size_t i = 0; i < roi_in->height; i++)
-    for(size_t j = 0; j < roi_in->width; j++)
-    {
-      const size_t index_in = (i * roi_in->width + j) * 4;
-      const size_t index_out = (i * padded_width + j) * 4;
-      for_four_channels(c, aligned(in, padded_in : 64)) padded_in[index_out + c] = in[index_in + c];
-    }
-
-  // Write the padding if needed
+  darkroom_blurs_pad_image(in, padded_in, roi_in->height, roi_in->width, padded_width);
   if(padded_width > roi_in->width)
-  {
-  DT_OMP_FOR_SIMD(aligned(in, padded_in:64))
-  for(size_t i = 0; i < roi_in->height; i++)
-    {
-      const size_t index_in = (i * (roi_in->width - 1)) * 4;
-      const size_t index_out = (i * (padded_width - 1)) * 4;
-      for_four_channels(c, aligned(in, padded_in : 64)) padded_in[index_out + c] = in[index_in + c];
-    }
-  }
-
+    darkroom_blurs_pad_right_edge(in, padded_in, roi_in->height, roi_in->width, padded_width);
   if(padded_height > roi_in->height)
-  {
-  DT_OMP_FOR_SIMD(aligned(in, padded_in:64))
-  for(size_t j = 0; j < roi_in->width; j++)
-    {
-      const size_t index_in = ((roi_in->height - 1) * roi_in->width + j) * 4;
-      const size_t index_out = ((padded_height - 1) * padded_width + j) * 4;
-      for_four_channels(c, aligned(in, padded_in : 64)) padded_in[index_out + c] = in[index_in + c];
-    }
-  }
+    darkroom_blurs_pad_bottom_edge(in, padded_in, roi_in->height, roi_in->width,
+                                    padded_width, padded_height);
 
   // Init the blur kernel
   const size_t radius = MAX(roundf(p->radius / scale), 1);
@@ -494,25 +389,9 @@ static void process_fft(struct dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *pi
   float *const restrict padded_kernel = dt_alloc_align_float(padded_width * padded_height);
   const size_t offset_i = (padded_height - 1) / 2 - (kernel_width - 1) / 2;
   const size_t offset_j = (padded_width - 1) / 2 - (kernel_width - 1) / 2;
-  const size_t i_reach = offset_i + kernel_width;
-  const size_t j_reach = offset_j + kernel_width;
 
-  DT_OMP_FOR_SIMD(aligned(kernel, padded_kernel:64))
-  for(size_t i = 0; i < padded_width; i++)
-    for(size_t j = 0; j < padded_width; j++)
-    {
-      const size_t padded_idx = (i * padded_width) + j;
-
-      if(i >= offset_i && i < i_reach && j >= offset_j && j < j_reach)
-      {
-        const size_t i_kern = i - offset_i;
-        const size_t j_kern = j - offset_j;
-        const size_t kern_idx = i_kern * kernel_width + j_kern;
-        padded_kernel[padded_idx] = kernel[kern_idx];
-      }
-      else
-        padded_kernel[padded_idx] = 0.f;
-    }
+  darkroom_blurs_pad_kernel(kernel, padded_kernel, kernel_width, padded_width,
+                             offset_i, offset_j);
 
   // Init the FFT transforms
   int threads = fftw_init_threads();

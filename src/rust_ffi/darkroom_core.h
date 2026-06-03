@@ -1616,6 +1616,27 @@ void darkroom_gamma_mask_display(const float *in_buf, unsigned char *out_buf,
  * Matches src/iop/blurs.c:601. */
 void darkroom_blurs_alpha_restore(const float *in_buf, float *out_buf,
                                    size_t npixels);
+void darkroom_blurs_init_kernel(float *buf, size_t n);
+void darkroom_blurs_gauss_kernel(float *buf, size_t width, size_t height);
+void darkroom_blurs_lens_kernel(float *buf, size_t width, size_t height,
+                                 float n, float m, float k, float rotation);
+void darkroom_blurs_motion_kernel(float *buf, size_t width,
+                                   float a, float offset,
+                                   const float *rot_m,
+                                   float radius, float eps);
+void darkroom_blurs_gui_rgba(const float *kernel, unsigned char *rgba, size_t n);
+float darkroom_blurs_compute_norm(const float *buf, size_t n);
+void darkroom_blurs_normalize(float *buf, size_t n, float norm);
+void darkroom_blurs_pad_image(const float *in, float *padded,
+                               size_t in_height, size_t in_width, size_t padded_width);
+void darkroom_blurs_pad_right_edge(const float *in, float *padded,
+                                    size_t in_height, size_t in_width, size_t padded_width);
+void darkroom_blurs_pad_bottom_edge(const float *in, float *padded,
+                                     size_t in_height, size_t in_width,
+                                     size_t padded_width, size_t padded_height);
+void darkroom_blurs_pad_kernel(const float *kernel, float *padded_kernel,
+                                size_t kernel_width, size_t padded_width,
+                                size_t offset_i, size_t offset_j);
 
 /* Blurs IOP -- sparse spatial convolution for lens/motion blur paths.
  * Uses precomputed (offsets, values) for interior pixels and full `kernel`

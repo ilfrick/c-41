@@ -203,3 +203,193 @@ mod tests {
         }
     }
 }
+
+// ── Kernel builders (Phase 2z+57) ────────────────────────────────────────
+
+/// Zero-initialise a float kernel buffer. Matches blurs.c::_init_kernel DT_OMP_FOR_SIMD.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_init_kernel(buf: *mut f32, n: usize) {
+    std::slice::from_raw_parts_mut(buf, n).fill(0.0);
+}
+
+/// 2D Gaussian kernel: buf[i,j] = exp(-4*(x²+y²)) for (x,y) in [-1,1]².
+/// Matches blurs.c::_create_gauss_kernel DT_OMP_FOR(collapse(2)).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_gauss_kernel(
+    buf: *mut f32, width: usize, height: usize,
+) {
+    let b = std::slice::from_raw_parts_mut(buf, width * height);
+    let radius = (width - 1) as f32 / 2.0 - 1.0;
+    for i in 0..height {
+        for j in 0..width {
+            let x = (i as f32 - 1.0) / radius - 1.0;
+            let y = (j as f32 - 1.0) / radius - 1.0;
+            b[i * width + j] = (-4.0 * (x*x + y*y)).exp();
+        }
+    }
+}
+
+/// Lens diaphragm kernel: 1.0 inside envelope, 0.0 outside.
+/// n=blades, m=concavity, k=roundness, rotation in radians.
+/// Matches blurs.c::_create_lens_kernel DT_OMP_FOR(collapse(2)).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_lens_kernel(
+    buf: *mut f32, width: usize, height: usize,
+    n: f32, m: f32, k: f32, rotation: f32,
+) {
+    let b = std::slice::from_raw_parts_mut(buf, width * height);
+    let eps = 1.0 / width as f32;
+    let radius = (width - 1) as f32 / 2.0 - 1.0;
+    for i in 0..height {
+        for j in 0..width {
+            let x = (i as f32 - 1.0) / radius - 1.0;
+            let y = (j as f32 - 1.0) / radius - 1.0;
+            let r = x.hypot(y);
+            let angle = y.atan2(x);
+            let num   = ((2.0 * k.asin() + std::f32::consts::PI * m) / (2.0 * n)).cos();
+            let denom = ((2.0 * (k * (n * (angle + rotation)).cos()).asin()
+                          + std::f32::consts::PI * m) / (2.0 * n))
+                .cos()
+                .max(1e-9);
+            let big_m = num / denom;
+            b[i * width + j] = if big_m >= r + eps { 1.0 } else { 0.0 };
+        }
+    }
+}
+
+/// Motion blur kernel: paints the polynomial arc into buf.
+/// a=curvature/2, offset=user offset param; rot_m is the 2×2 rotation matrix.
+/// Internally computes B=1, C = -a*offset^2 + offset, then for each i:
+///   x = (i/8 - 1)/radius - 1; X = x - offset; y = X^2*a + X + C
+/// Matches blurs.c::_create_motion_kernel DT_OMP_FOR_SIMD.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_motion_kernel(
+    buf: *mut f32, width: usize,
+    a: f32, offset: f32,
+    rot_m: *const f32,   // 4 floats: [M00, M01, M10, M11]
+    radius: f32, eps: f32,
+) {
+    let b = std::slice::from_raw_parts_mut(buf, width * width);
+    let m = std::slice::from_raw_parts(rot_m, 4);
+    let c = -a * offset * offset + offset; // C = -A*offset^2 + B*offset, B=1
+    let w = width as i32;
+    for i in 0..8 * width {
+        let x  = (i as f32 / 8.0 - 1.0) / radius - 1.0;
+        let bx = x - offset;                        // X = x - offset
+        let y  = bx * bx * a + bx + c;             // y = X^2*A + X*B + C
+        let rx = x * m[0] + y * m[1];
+        let ry = x * m[2] + y * m[3];
+        let yf = [((ry + 1.0) * radius - eps).round() as i32,
+                  ((ry + 1.0) * radius + eps).round() as i32];
+        let xf = [((rx + 1.0) * radius - eps).round() as i32,
+                  ((rx + 1.0) * radius + eps).round() as i32];
+        for &xi in &xf {
+            for &yi in &yf {
+                if xi > 0 && xi < w-1 && yi > 0 && yi < w-1 {
+                    b[yi as usize * width + xi as usize] = 1.0;
+                }
+            }
+        }
+    }
+}
+
+/// Convert float kernel to RGBA u8 display buffer (for GUI).
+/// rgba[k*4+0..3] = round(255*kernel[k]) for all channels.
+/// Matches blurs.c:345 DT_OMP_FOR.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_gui_rgba(
+    kernel: *const f32, rgba: *mut u8, n: usize,
+) {
+    let k = std::slice::from_raw_parts(kernel, n);
+    let r = std::slice::from_raw_parts_mut(rgba, n * 4);
+    for i in 0..n {
+        let v = (255.0 * k[i]).round() as u8;
+        r[i*4] = v; r[i*4+1] = v; r[i*4+2] = v; r[i*4+3] = v;
+    }
+}
+
+/// Sum of all elements in a float buffer. Matches blurs.c::_compute_norm.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_compute_norm(buf: *const f32, n: usize) -> f32 {
+    std::slice::from_raw_parts(buf, n).iter().sum()
+}
+
+/// Divide each element by norm in-place. Matches blurs.c::_normalize.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_normalize(buf: *mut f32, n: usize, norm: f32) {
+    let b = std::slice::from_raw_parts_mut(buf, n);
+    if norm.abs() > 1e-10 { b.iter_mut().for_each(|v| *v /= norm); }
+}
+
+/// Copy RGBA image rows into the padded buffer (interior pixels).
+/// Matches blurs.c:454 DT_OMP_FOR_SIMD.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_pad_image(
+    in_buf: *const f32, padded: *mut f32,
+    in_height: usize, in_width: usize, padded_width: usize,
+) {
+    let inp  = std::slice::from_raw_parts(in_buf, in_width * in_height * 4);
+    let outp = std::slice::from_raw_parts_mut(padded, padded_width * in_height * 4);
+    for i in 0..in_height {
+        for j in 0..in_width {
+            for c in 0..4 {
+                outp[(i * padded_width + j) * 4 + c] = inp[(i * in_width + j) * 4 + c];
+            }
+        }
+    }
+}
+
+/// Fill right-edge column of padded buffer from last input column.
+/// Matches blurs.c:466 DT_OMP_FOR_SIMD.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_pad_right_edge(
+    in_buf: *const f32, padded: *mut f32,
+    in_height: usize, in_width: usize, padded_width: usize,
+) {
+    let inp  = std::slice::from_raw_parts(in_buf, in_width * in_height * 4);
+    let outp = std::slice::from_raw_parts_mut(padded, padded_width * in_height * 4);
+    for i in 0..in_height {
+        let si = (i * (in_width - 1)) * 4;
+        let di = (i * (padded_width - 1)) * 4;
+        for c in 0..4 { outp[di + c] = inp[si + c]; }
+    }
+}
+
+/// Fill bottom-edge row of padded buffer from last input row.
+/// Matches blurs.c:477 DT_OMP_FOR_SIMD.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_pad_bottom_edge(
+    in_buf: *const f32, padded: *mut f32,
+    in_height: usize, in_width: usize,
+    padded_width: usize, _padded_height: usize,
+) {
+    let inp  = std::slice::from_raw_parts(in_buf, in_width * in_height * 4);
+    let outp = std::slice::from_raw_parts_mut(padded, padded_width * (in_height + 1) * 4);
+    for j in 0..in_width {
+        let si = ((in_height - 1) * in_width + j) * 4;
+        let di = ((_padded_height - 1) * padded_width + j) * 4;
+        for c in 0..4 { outp[di + c] = inp[si + c]; }
+    }
+}
+
+/// Place a kernel in the centre of a zero-padded kernel buffer.
+/// Matches blurs.c:500 DT_OMP_FOR_SIMD.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_pad_kernel(
+    kernel: *const f32, padded_kernel: *mut f32,
+    kernel_width: usize, padded_width: usize,
+    offset_i: usize, offset_j: usize,
+) {
+    let k  = std::slice::from_raw_parts(kernel, kernel_width * kernel_width);
+    let pk = std::slice::from_raw_parts_mut(padded_kernel, padded_width * padded_width);
+    pk.fill(0.0);
+    let i_reach = offset_i + kernel_width;
+    let j_reach = offset_j + kernel_width;
+    for i in 0..padded_width {
+        for j in 0..padded_width {
+            if i >= offset_i && i < i_reach && j >= offset_j && j < j_reach {
+                pk[i * padded_width + j] = k[(i - offset_i) * kernel_width + (j - offset_j)];
+            }
+        }
+    }
+}
