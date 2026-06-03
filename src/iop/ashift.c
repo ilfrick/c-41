@@ -35,6 +35,7 @@
 #include "gui/draw.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 #include "gui/guides.h"
 
 #include <assert.h>
@@ -1103,39 +1104,13 @@ void distort_mask(dt_iop_module_t *self,
   const float cx = roi_out->scale * fullwidth * data->cl;
   const float cy = roi_out->scale * fullheight * data->ct;
 
-  DT_OMP_FOR(shared(ihomograph))
-  // go over all pixels of output image
-  for(int j = 0; j < roi_out->height; j++)
-  {
-    float *const restrict _out = out + (size_t)j * roi_out->width;
-    for(int i = 0; i < roi_out->width; i++)
-    {
-      float DT_ALIGNED_PIXEL pin[3], DT_ALIGNED_PIXEL pout[3];
-
-      // convert output pixel coordinates to original image coordinates
-      pout[0] = roi_out->x + i + cx;
-      pout[1] = roi_out->y + j + cy;
-      pout[0] /= roi_out->scale;
-      pout[1] /= roi_out->scale;
-      pout[2] = 1.0f;
-
-      // apply homograph
-      mat3mulv(pin, (float *)ihomograph, pout);
-
-      // convert to input pixel coordinates
-      pin[0] /= pin[2];
-      pin[1] /= pin[2];
-      pin[0] *= roi_in->scale;
-      pin[1] *= roi_in->scale;
-      pin[0] -= roi_in->x;
-      pin[1] -= roi_in->y;
-
-      // get output values by interpolation from input image
-      _out[i] = CLIP(dt_interpolation_compute_sample(interpolation, in,
-                                                     pin[0], pin[1],
-                                                     roi_in->width, roi_in->height, 1, roi_in->width));
-    }
-  }
+  darkroom_ashift_distort_mask(in, out,
+      roi_out->width, roi_out->height,
+      (float)roi_out->x, (float)roi_out->y, roi_out->scale,
+      roi_in->width, roi_in->height,
+      (float)roi_in->x, (float)roi_in->y, roi_in->scale,
+      cx, cy, (const float *)ihomograph,
+      (unsigned int)interpolation->id);
 }
 
 void modify_roi_out(dt_iop_module_t *self,
@@ -3444,7 +3419,6 @@ void process(dt_iop_module_t *self,
   dt_iop_ashift_gui_data_t *g = self->gui_data;
 
   const int ch = piece->colors;
-  const int ch_width = ch * roi_in->width;
 
   // only for preview pipe: collect input buffer data and do some other evaluations
   if(g && self->dev->gui_attached && dt_pipe_is_preview(piece->pipe))
@@ -3532,39 +3506,13 @@ void process(dt_iop_module_t *self,
   const float cx = roi_out->scale * fullwidth * data->cl;
   const float cy = roi_out->scale * fullheight * data->ct;
 
-  DT_OMP_FOR(shared(ihomograph))
-  // go over all pixels of output image
-  for(int j = 0; j < roi_out->height; j++)
-  {
-    float *const restrict out = ((float *)ovoid) + (size_t)ch * j * roi_out->width;
-    for(int i = 0; i < roi_out->width; i++)
-    {
-      float pin[3], pout[3];
-
-      // convert output pixel coordinates to original image coordinates
-      pout[0] = roi_out->x + i + cx;
-      pout[1] = roi_out->y + j + cy;
-      pout[0] /= roi_out->scale;
-      pout[1] /= roi_out->scale;
-      pout[2] = 1.0f;
-
-      // apply homograph
-      mat3mulv(pin, (float *)ihomograph, pout);
-
-      // convert to input pixel coordinates
-      pin[0] /= pin[2];
-      pin[1] /= pin[2];
-      pin[0] *= roi_in->scale;
-      pin[1] *= roi_in->scale;
-      pin[0] -= roi_in->x;
-      pin[1] -= roi_in->y;
-
-      // get output values by interpolation from input image
-      dt_interpolation_compute_pixel4c(interpolation, (float *)ivoid, out + ch*i,
-                                       pin[0], pin[1], roi_in->width,
-                                       roi_in->height, ch_width);
-    }
-  }
+  darkroom_ashift_process((const float *)ivoid, (float *)ovoid,
+      roi_out->width, roi_out->height,
+      (float)roi_out->x, (float)roi_out->y, roi_out->scale,
+      roi_in->width, roi_in->height,
+      (float)roi_in->x, (float)roi_in->y, roi_in->scale,
+      cx, cy, (const float *)ihomograph,
+      (unsigned int)interpolation->id);
 }
 
 #ifdef HAVE_OPENCL

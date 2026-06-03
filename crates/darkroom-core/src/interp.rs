@@ -242,6 +242,118 @@ pub unsafe extern "C" fn darkroom_scalepixels_distort_mask(
     }
 }
 
+// ── Homographic projection helper ────────────────────────────────────────
+
+/// Apply a 3×3 homography matrix (row-major) to a 2D point + perspective divide.
+/// Returns (x, y) in input-image space, or None if pin[2] ≈ 0.
+#[inline(always)]
+fn homographic_project(
+    out_x: f32, out_y: f32,
+    roi_out_scale: f32,
+    roi_in_scale: f32,
+    roi_in_x: f32, roi_in_y: f32,
+    cx: f32, cy: f32,
+    h: &[f32; 9],
+) -> Option<(f32, f32)> {
+    let px = (out_x + cx) / roi_out_scale;
+    let py = (out_y + cy) / roi_out_scale;
+    // mat3mulv: pin = h * [px, py, 1]
+    let pin0 = h[0]*px + h[1]*py + h[2];
+    let pin1 = h[3]*px + h[4]*py + h[5];
+    let pin2 = h[6]*px + h[7]*py + h[8];
+    if pin2.abs() < 1e-9 { return None; }
+    let x = pin0 / pin2 * roi_in_scale - roi_in_x;
+    let y = pin1 / pin2 * roi_in_scale - roi_in_y;
+    Some((x, y))
+}
+
+/// Ashift distort_mask: 1-channel homographic resampling with CLIP [0,1].
+/// Matches the DT_OMP_FOR(shared(ihomograph)) in ashift.c:1106.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_ashift_distort_mask(
+    in_buf:         *const f32,
+    out_buf:        *mut f32,
+    out_width:      i32,
+    out_height:     i32,
+    roi_out_x:      f32,
+    roi_out_y:      f32,
+    roi_out_scale:  f32,
+    in_width:       i32,
+    in_height:      i32,
+    roi_in_x:       f32,
+    roi_in_y:       f32,
+    roi_in_scale:   f32,
+    cx:             f32,
+    cy:             f32,
+    ihomograph:     *const f32,   // 9 floats, row-major
+    interp_type:    u32,
+) {
+    if out_width <= 0 || out_height <= 0 { return; }
+    let inp  = std::slice::from_raw_parts(in_buf, (in_width * in_height) as usize);
+    let outp = std::slice::from_raw_parts_mut(out_buf, (out_width * out_height) as usize);
+    let h: &[f32; 9] = &*(ihomograph as *const [f32; 9]);
+
+    for j in 0..out_height as usize {
+        for i in 0..out_width as usize {
+            let coord = homographic_project(
+                roi_out_x + i as f32, roi_out_y + j as f32,
+                roi_out_scale, roi_in_scale, roi_in_x, roi_in_y, cx, cy, h,
+            );
+            outp[j * out_width as usize + i] = match coord {
+                Some((x, y)) => compute_sample_1c(
+                    inp, x, y, in_width, in_height, in_width, interp_type,
+                ).clamp(0.0, 1.0),
+                None => 0.0,
+            };
+        }
+    }
+}
+
+/// Ashift process: 4-channel RGBA homographic resampling.
+/// Matches the DT_OMP_FOR(shared(ihomograph)) in ashift.c:3535.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_ashift_process(
+    in_buf:         *const f32,
+    out_buf:        *mut f32,
+    out_width:      i32,
+    out_height:     i32,
+    roi_out_x:      f32,
+    roi_out_y:      f32,
+    roi_out_scale:  f32,
+    in_width:       i32,
+    in_height:      i32,
+    roi_in_x:       f32,
+    roi_in_y:       f32,
+    roi_in_scale:   f32,
+    cx:             f32,
+    cy:             f32,
+    ihomograph:     *const f32,
+    interp_type:    u32,
+) {
+    if out_width <= 0 || out_height <= 0 { return; }
+    let inp  = std::slice::from_raw_parts(in_buf, (in_width * in_height * 4) as usize);
+    let outp = std::slice::from_raw_parts_mut(out_buf, (out_width * out_height * 4) as usize);
+    let h: &[f32; 9] = &*(ihomograph as *const [f32; 9]);
+    let ls = in_width * 4;
+
+    for j in 0..out_height as usize {
+        for i in 0..out_width as usize {
+            let b = (j * out_width as usize + i) * 4;
+            let coord = homographic_project(
+                roi_out_x + i as f32, roi_out_y + j as f32,
+                roi_out_scale, roi_in_scale, roi_in_x, roi_in_y, cx, cy, h,
+            );
+            match coord {
+                Some((x, y)) if x >= 0.0 && y >= 0.0 && x < in_width as f32 && y < in_height as f32 => {
+                    let px = compute_pixel4c(inp, x, y, in_width, in_height, ls, interp_type);
+                    outp[b] = px[0]; outp[b+1] = px[1]; outp[b+2] = px[2]; outp[b+3] = px[3];
+                }
+                _ => { outp[b] = 0.0; outp[b+1] = 0.0; outp[b+2] = 0.0; outp[b+3] = 0.0; }
+            }
+        }
+    }
+}
+
 /// FFI wrapper for `compute_pixel4c`.
 ///
 /// `interp_type`: 0=bilinear, 1=bicubic, 2=lanczos2, 3=lanczos3

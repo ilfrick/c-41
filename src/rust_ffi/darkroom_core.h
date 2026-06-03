@@ -1764,6 +1764,25 @@ void darkroom_interpolate_pixel4c(const float *in_buf, float *out,
  * samples the input with the given interpolator, zeroes out-of-bounds pixels.
  * m: 4-float 2x2 rotation matrix (d->m).
  * interp_type: same encoding as darkroom_interpolate_pixel4c. */
+/* Homographic (perspective correction) resampling.
+ * ihomograph: 9-float row-major 3x3 inverse homography matrix.
+ * cx/cy: clipping offsets (roi_out->scale * fullwidth * data->cl, etc.).
+ * Matches ashift.c distort_mask (1-ch, CLIP) and process (4-ch) loops. */
+void darkroom_ashift_distort_mask(const float *in_buf, float *out_buf,
+                                   int out_width, int out_height,
+                                   float roi_out_x, float roi_out_y, float roi_out_scale,
+                                   int in_width, int in_height,
+                                   float roi_in_x, float roi_in_y, float roi_in_scale,
+                                   float cx, float cy,
+                                   const float *ihomograph, unsigned int interp_type);
+void darkroom_ashift_process(const float *in_buf, float *out_buf,
+                              int out_width, int out_height,
+                              float roi_out_x, float roi_out_y, float roi_out_scale,
+                              int in_width, int in_height,
+                              float roi_in_x, float roi_in_y, float roi_in_scale,
+                              float cx, float cy,
+                              const float *ihomograph, unsigned int interp_type);
+
 void darkroom_scalepixels_process(const float *in_buf, float *out_buf,
                                    int out_width, int out_height,
                                    int in_width, int in_height,
