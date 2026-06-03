@@ -9,8 +9,12 @@ use anyhow::Result;
 /// Show the export dialog for a list of image paths.
 ///
 /// Presents format and quality choices, then calls `darkroom-cli` for each
-/// selected image. Output goes to an `exports/` sub-folder next to the source.
-pub fn show_export_dialog(parent: &gtk4::Window, paths: Vec<String>) {
+/// selected image. `toast_fn` is called with a summary string on completion.
+pub fn show_export_dialog(
+    parent: &gtk4::Window,
+    paths: Vec<String>,
+    toast_fn: impl Fn(String) + 'static,
+) {
     if paths.is_empty() {
         return;
     }
@@ -40,19 +44,23 @@ pub fn show_export_dialog(parent: &gtk4::Window, paths: Vec<String>) {
     dialog.add_response("export", "Export");
     dialog.set_response_appearance("export", adw::ResponseAppearance::Suggested);
 
+    let toast_fn = std::rc::Rc::new(toast_fn);
     dialog.connect_response(Some("export"), move |_, _| {
         let fmt = match format_row.selected() {
             0 => "jpeg",
             1 => "tiff",
             _ => "png",
         };
-        let quality  = quality_row.value() as u32;
+        let quality   = quality_row.value() as u32;
         let out_paths = paths.clone();
         let fmt_str   = fmt.to_string();
+        let n         = out_paths.len();
+        let tf        = toast_fn.clone();
 
         glib::spawn_future_local(async move {
-            if let Err(e) = export_images_async(out_paths, fmt_str, quality).await {
-                eprintln!("Export error: {e}");
+            match export_images_async(out_paths, fmt_str, quality).await {
+                Ok(())  => tf(format!("Exported {n} image(s)")),
+                Err(e)  => tf(format!("Export failed: {e}")),
             }
         });
     });
@@ -108,13 +116,15 @@ pub fn show_import_dialog(
     parent: &gtk4::Window,
     db_path: String,
     on_done: impl Fn() + 'static,
+    toast_fn: impl Fn(String) + 'static,
 ) {
     let chooser = gtk4::FileDialog::builder()
         .title("Import Folder")
         .build();
 
     let db = db_path.clone();
-    let on_done = std::rc::Rc::new(on_done);
+    let on_done  = std::rc::Rc::new(on_done);
+    let toast_fn = std::rc::Rc::new(toast_fn);
     chooser.select_folder(Some(parent), gtk4::gio::Cancellable::NONE, move |result| {
         let folder = match result {
             Ok(f) => f,
@@ -124,17 +134,21 @@ pub fn show_import_dialog(
             Some(p) => p,
             None    => return,
         };
-        let folder_str = folder_path.to_string_lossy().to_string();
-        let db2        = db.clone();
-        let on_done    = on_done.clone();
+        let folder_str  = folder_path.to_string_lossy().to_string();
+        let folder_name = folder_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("folder")
+            .to_string();
+        let db2      = db.clone();
+        let on_done  = on_done.clone();
+        let toast_fn = toast_fn.clone();
 
         glib::spawn_future_local(async move {
             let count = gio::spawn_blocking(move || {
                 import_folder_sync(&folder_str, &db2)
             }).await.ok().flatten().unwrap_or(0);
 
-            println!("Imported {count} images from {folder_path:?}");
-            // Reload lighttable after import completes
+            toast_fn(format!("Imported {count} images from \"{folder_name}\""));
             on_done();
         });
     });

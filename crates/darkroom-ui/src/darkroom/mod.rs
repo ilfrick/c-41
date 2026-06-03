@@ -67,7 +67,11 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
     let path_for_export = file_path.to_string();
     export_btn.connect_clicked(move |btn| {
         if let Some(root) = btn.root().and_downcast::<gtk4::Window>() {
-            dialogs::show_export_dialog(root.upcast_ref::<gtk4::Window>(), vec![path_for_export.clone()]);
+            dialogs::show_export_dialog(
+                root.upcast_ref::<gtk4::Window>(),
+                vec![path_for_export.clone()],
+                |msg| eprintln!("{msg}"), // darkroom view has no toast overlay yet
+            );
         }
     });
     header.pack_end(&export_btn);

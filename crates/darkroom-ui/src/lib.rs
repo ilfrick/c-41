@@ -1,7 +1,6 @@
 //! GTK4 + libadwaita UI shell for Darkroom.
 //!
-//! Phase 3-ui-6: collection filtering (left panel) + live metadata
-//! inspector (right panel) connected to SingleSelection changes.
+//! Phase 3-ui-8: adw::ToastOverlay + star ratings in lighttable cells.
 
 use adw::prelude::*;
 use adw::Application;
@@ -36,27 +35,36 @@ fn build_main_window(app: &Application) {
 
     let db_path = std::env::var("DARKROOM_LIBRARY_DB").unwrap_or_default();
 
-    // ── Lighttable: grid + model + selection ───────────────────────────────
-    let (lt_grid, lt_model, lt_selection) = lighttable::lighttable_page();
+    // ── Toast overlay (wraps everything for in-app notifications) ──────────
+    let toast_overlay = adw::ToastOverlay::new();
+    let make_toast = {
+        let to = toast_overlay.clone();
+        move |msg: String| {
+            to.add_toast(adw::Toast::new(&msg));
+        }
+    };
+
+    // ── Lighttable ─────────────────────────────────────────────────────────
+    let (lt_grid, lt_model, lt_selection) =
+        lighttable::lighttable_page(db_path.clone());
     lighttable::lighttable_load_from_db(&lt_model, &db_path);
 
     // ── Panels ─────────────────────────────────────────────────────────────
     let left  = panels::left_panel(&db_path, &lt_model);
     let right = panels::MetadataPanel::new();
 
-    // Update metadata when selection changes
+    // Selection → metadata
     {
-        let meta_panel = right.clone();
-        let db = db_path.clone();
-        let model = lt_model.clone();
+        let meta = right.clone();
+        let db   = db_path.clone();
+        let mdl  = lt_model.clone();
         lt_selection.connect_selection_changed(move |sel, _, _| {
-            let pos = sel.selected();
-            if let Some(path) = model.item(pos)
+            if let Some(path) = mdl.item(sel.selected())
                 .and_downcast::<gtk4::StringObject>()
                 .map(|o| o.string().to_string())
             {
                 if path.contains('/') {
-                    meta_panel.update(&path, &db);
+                    meta.update(&path, &db);
                 }
             }
         });
@@ -75,30 +83,57 @@ fn build_main_window(app: &Application) {
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     hbox.append(&right.widget);
 
+    // ── Header bar ─────────────────────────────────────────────────────────
     let lt_header = adw::HeaderBar::new();
     lt_header.set_title_widget(Some(&adw::WindowTitle::new("Darkroom", "Lighttable")));
 
     // Import button
-    let import_btn = gtk4::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("Import folder (Ctrl+I)")
-        .build();
     {
-        let db = db_path.clone();
-        import_btn.connect_clicked(clone!(@weak window, @weak lt_model => move |_| {
-            let db_inner = db.clone();
+        let btn = gtk4::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Import folder")
+            .build();
+        let db         = db_path.clone();
+        let toast_fn   = make_toast.clone();
+        btn.connect_clicked(clone!(@weak window, @weak lt_model => move |_| {
+            let db_inner    = db.clone();
+            let toast_inner = toast_fn.clone();
             dialogs::show_import_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
                 clone!(@weak lt_model, @strong db_inner => move || {
-                    crate::lighttable::lighttable_load_from_db(
-                        &lt_model, &db_inner,
-                    );
+                    lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
+                toast_inner,
             );
         }));
+        lt_header.pack_start(&btn);
     }
-    lt_header.pack_start(&import_btn);
+
+    // Export selected button
+    {
+        let btn = gtk4::Button::builder()
+            .icon_name("document-send-symbolic")
+            .tooltip_text("Export selected")
+            .build();
+        let toast_fn = make_toast.clone();
+        btn.connect_clicked(clone!(@weak lt_model, @weak lt_selection, @weak window => move |_| {
+            let pos = lt_selection.selected();
+            let paths: Vec<String> = if let Some(path) = lt_model.item(pos)
+                .and_downcast::<gtk4::StringObject>()
+                .map(|o| o.string().to_string())
+                .filter(|p| p.contains('/'))
+            {
+                vec![path]
+            } else { vec![] };
+            dialogs::show_export_dialog(
+                window.upcast_ref::<gtk4::Window>(),
+                paths,
+                toast_fn.clone(),
+            );
+        }));
+        lt_header.pack_end(&btn);
+    }
 
     let lt_toolbar = adw::ToolbarView::new();
     lt_toolbar.add_top_bar(&lt_header);
@@ -114,7 +149,7 @@ fn build_main_window(app: &Application) {
     let nav = adw::NavigationView::new();
     nav.push(&lt_page);
 
-    // Double-click → push darkroom page
+    // Double-click → darkroom page
     {
         let scroll_ref = scroll.downcast_ref::<gtk4::ScrolledWindow>().unwrap();
         if let Some(grid) = scroll_ref.child().and_downcast::<gtk4::GridView>() {
@@ -122,15 +157,16 @@ fn build_main_window(app: &Application) {
                 if let Some(path) = lt_model.item(pos)
                     .and_downcast::<gtk4::StringObject>()
                     .map(|o| o.string().to_string())
+                    .filter(|p| p.contains('/'))
                 {
-                    if path.contains('/') {
-                        nav.push(&darkroom::darkroom_page(&path));
-                    }
+                    nav.push(&darkroom::darkroom_page(&path));
                 }
             }));
         }
     }
 
-    window.set_child(Some(&nav));
+    // ── Wire toast overlay + present ───────────────────────────────────────
+    toast_overlay.set_child(Some(&nav));
+    window.set_child(Some(&toast_overlay));
     window.present();
 }
