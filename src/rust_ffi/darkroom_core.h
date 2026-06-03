@@ -1668,6 +1668,42 @@ void darkroom_denoise_precondition_yuv(const float *in_buf, float *out_buf,
                                         float a, const float *p, float b,
                                         const float *to_yuv);
 /* Liquify IOP -- 6 DT_OMP_FOR loops (float complex stored as [re,im] f32 pairs). */
+/* Clipping IOP -- 4 DT_OMP_FOR loops (keystone + affine transforms + pixel warps). */
+void darkroom_clipping_distort_transform(float *points, size_t n,
+    int k_apply, const float *k_space,
+    float ma, float mb, float md, float me, float mg, float mh,
+    float kxa, float kya, float tx, float ty,
+    const float *inv_m, float k_h, float k_v, int flip,
+    float enlarge_x, float enlarge_y, float cix, float ciy, float factor);
+void darkroom_clipping_distort_backtransform(float *points, size_t n,
+    int k_apply, const float *k_space,
+    float ma, float mb, float md, float me, float mg, float mh,
+    float kxa, float kya, float tx, float ty,
+    const float *m, float k_h, float k_v, int flip,
+    float enlarge_x, float enlarge_y, float cix, float ciy, float factor);
+void darkroom_clipping_distort_mask(const float *in_buf, float *out_buf,
+    float roi_out_x, float roi_out_y, float roi_out_scale,
+    int roi_out_w, int roi_out_h,
+    float roi_in_x, float roi_in_y, float roi_in_scale,
+    int roi_in_w, int roi_in_h,
+    int k_apply, const float *k_space,
+    float ma, float mb, float md, float me, float mg, float mh,
+    float kxa, float kya, float tx, float ty,
+    const float *m, float k_h, float k_v, int flip,
+    float enlarge_x, float enlarge_y, float cix, float ciy,
+    unsigned int interp_type);
+void darkroom_clipping_process(const float *in_buf, float *out_buf,
+    float roi_out_x, float roi_out_y, float roi_out_scale,
+    int roi_out_w, int roi_out_h,
+    float roi_in_x, float roi_in_y, float roi_in_scale,
+    int roi_in_w, int roi_in_h,
+    int k_apply, const float *k_space,
+    float ma, float mb, float md, float me, float mg, float mh,
+    float kxa, float kya, float tx, float ty,
+    const float *m, float k_h, float k_v, int flip,
+    float enlarge_x, float enlarge_y, float cix, float ciy,
+    int ch, unsigned int interp_type);
+
 void darkroom_liquify_apply_stamp(float *center, size_t global_width,
                                    size_t iradius,
                                    const float *lookup_table, size_t table_size,

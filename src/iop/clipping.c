@@ -33,6 +33,7 @@
 #include "gui/guides.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 #include <assert.h>
 #include <gdk/gdkkeysyms.h>
@@ -500,34 +501,10 @@ gboolean distort_transform(dt_iop_module_t *self,
   if(d->k_apply == 1)
     keystone_get_matrix(k_space, kxa, kxb, kxc, kxd, kya, kyb, kyc, kyd, &ma, &mb, &md, &me, &mg, &mh);
 
-  DT_OMP_FOR(if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    float pi[2], po[2];
-    pi[0] = points[i];
-    pi[1] = points[i + 1];
-
-    if(d->k_apply == 1) keystone_transform(pi, k_space, ma, mb, md, me, mg, mh, kxa, kya);
-
-    pi[0] -= d->tx / factor;
-    pi[1] -= d->ty / factor;
-    // transform this point using matrix m
-    transform(pi, po, d->inv_m, d->k_h, d->k_v);
-
-    if(d->flip)
-    {
-      po[1] += d->tx / factor;
-      po[0] += d->ty / factor;
-    }
-    else
-    {
-      po[0] += d->tx / factor;
-      po[1] += d->ty / factor;
-    }
-
-    points[i] = po[0] - (d->cix - d->enlarge_x) / factor;
-    points[i + 1] = po[1] - (d->ciy - d->enlarge_y) / factor;
-  }
+  darkroom_clipping_distort_transform(points, points_count,
+      d->k_apply, (const float *)k_space, ma,mb,md,me,mg,mh, kxa,kya,
+      d->tx, d->ty, d->inv_m, d->k_h, d->k_v, d->flip ? 1 : 0,
+      d->enlarge_x, d->enlarge_y, d->cix, d->ciy, factor);
 
   // revert side-effects of the previous call to modify_roi_out
   // TODO: this is just a quick hack. we need a major revamp of this module!
@@ -568,34 +545,10 @@ gboolean distort_backtransform(dt_iop_module_t *self,
   if(d->k_apply == 1)
     keystone_get_matrix(k_space, kxa, kxb, kxc, kxd, kya, kyb, kyc, kyd, &ma, &mb, &md, &me, &mg, &mh);
 
-  DT_OMP_FOR_SIMD(if(points_count > 100) aligned(points:64) aligned(k_space:16))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    float pi[2], po[2];
-    pi[0] = -(d->enlarge_x - d->cix) / factor + points[i];
-    pi[1] = -(d->enlarge_y - d->ciy) / factor + points[i + 1];
-
-    // transform this point using matrix m
-    if(d->flip)
-    {
-      pi[1] -= d->tx / factor;
-      pi[0] -= d->ty / factor;
-    }
-    else
-    {
-      pi[0] -= d->tx / factor;
-      pi[1] -= d->ty / factor;
-    }
-
-    backtransform(pi, po, d->m, d->k_h, d->k_v);
-
-    po[0] += d->tx / factor;
-    po[1] += d->ty / factor;
-    if(d->k_apply == 1) keystone_backtransform(po, k_space, ma, mb, md, me, mg, mh, kxa, kya);
-
-    points[i] = po[0];
-    points[i + 1] = po[1];
-  }
+  darkroom_clipping_distort_backtransform(points, points_count,
+      d->k_apply, (const float *)k_space, ma,mb,md,me,mg,mh, kxa,kya,
+      d->tx, d->ty, d->m, d->k_h, d->k_v, d->flip ? 1 : 0,
+      d->enlarge_x, d->enlarge_y, d->cix, d->ciy, factor);
 
   // revert side-effects of the previous call to modify_roi_out
   // TODO: this is just a quick hack. we need a major revamp of this module!
@@ -637,46 +590,15 @@ void distort_mask(dt_iop_module_t *self,
     if(d->k_apply == 1)
       keystone_get_matrix(k_space, kxa, kxb, kxc, kxd, kya, kyb, kyc, kyd, &ma, &mb, &md, &me, &mg, &mh);
 
-    DT_OMP_FOR(dt_omp_sharedconst(k_space))
-    // (slow) point-by-point transformation.
-    // TODO: optimize with scanlines and linear steps between?
-    for(int j = 0; j < roi_out->height; j++)
-    {
-      float *_out = out + (size_t)j * roi_out->width;
-      for(int i = 0; i < roi_out->width; i++)
-      {
-        float pi[2] = { 0.0f }, po[2] = { 0.0f };
-
-        pi[0] = roi_out->x - roi_out->scale * d->enlarge_x + roi_out->scale * d->cix + i + 0.5f;
-        pi[1] = roi_out->y - roi_out->scale * d->enlarge_y + roi_out->scale * d->ciy + j + 0.5f;
-
-        // transform this point using matrix m
-        if(d->flip)
-        {
-          pi[1] -= d->tx * roi_out->scale;
-          pi[0] -= d->ty * roi_out->scale;
-        }
-        else
-        {
-          pi[0] -= d->tx * roi_out->scale;
-          pi[1] -= d->ty * roi_out->scale;
-        }
-        pi[0] /= roi_out->scale;
-        pi[1] /= roi_out->scale;
-        backtransform(pi, po, d->m, d->k_h, d->k_v);
-        po[0] *= roi_in->scale;
-        po[1] *= roi_in->scale;
-        po[0] += d->tx * roi_in->scale;
-        po[1] += d->ty * roi_in->scale;
-        if(d->k_apply == 1) keystone_backtransform(po, k_space, ma, mb, md, me, mg, mh, kxa, kya);
-        po[0] -= roi_in->x + 0.5f;
-        po[1] -= roi_in->y + 0.5f;
-
-        _out[i] = CLIP(dt_interpolation_compute_sample(interpolation, in,
-                                                       po[0], po[1],
-                                                       roi_in->width, roi_in->height, 1, roi_in->width));
-      }
-    }
+    darkroom_clipping_distort_mask(in, out,
+        (float)roi_out->x, (float)roi_out->y, roi_out->scale,
+        roi_out->width, roi_out->height,
+        (float)roi_in->x, (float)roi_in->y, roi_in->scale,
+        roi_in->width, roi_in->height,
+        d->k_apply, (const float *)k_space, ma,mb,md,me,mg,mh, kxa,kya,
+        d->tx, d->ty, d->m, d->k_h, d->k_v, d->flip ? 1 : 0,
+        d->enlarge_x, d->enlarge_y, d->cix, d->ciy,
+        (unsigned int)interpolation->id);
   }
 }
 
@@ -1025,45 +947,15 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
     if(d->k_apply == 1)
       keystone_get_matrix(k_space, kxa, kxb, kxc, kxd, kya, kyb, kyc, kyd, &ma, &mb, &md, &me, &mg, &mh);
 
-    DT_OMP_FOR(dt_omp_sharedconst(k_space))
-    // (slow) point-by-point transformation.
-    // TODO: optimize with scanlines and linear steps between?
-    for(int j = 0; j < roi_out->height; j++)
-    {
-      float *out = ((float *)ovoid) + (size_t)ch * j * roi_out->width;
-      for(int i = 0; i < roi_out->width; i++)
-      {
-        float pi[2], po[2];
-
-        pi[0] = roi_out->x - roi_out->scale * d->enlarge_x + roi_out->scale * d->cix + i + 0.5f;
-        pi[1] = roi_out->y - roi_out->scale * d->enlarge_y + roi_out->scale * d->ciy + j + 0.5f;
-
-        // transform this point using matrix m
-        if(d->flip)
-        {
-          pi[1] -= d->tx * roi_out->scale;
-          pi[0] -= d->ty * roi_out->scale;
-        }
-        else
-        {
-          pi[0] -= d->tx * roi_out->scale;
-          pi[1] -= d->ty * roi_out->scale;
-        }
-        pi[0] /= roi_out->scale;
-        pi[1] /= roi_out->scale;
-        backtransform(pi, po, d->m, d->k_h, d->k_v);
-        po[0] *= roi_in->scale;
-        po[1] *= roi_in->scale;
-        po[0] += d->tx * roi_in->scale;
-        po[1] += d->ty * roi_in->scale;
-        if(d->k_apply == 1) keystone_backtransform(po, k_space, ma, mb, md, me, mg, mh, kxa, kya);
-        po[0] -= roi_in->x + 0.5f;
-        po[1] -= roi_in->y + 0.5f;
-
-        dt_interpolation_compute_pixel4c(interpolation, (float *)ivoid, out + ch*i, po[0], po[1], roi_in->width,
-                                         roi_in->height, ch_width);
-      }
-    }
+    darkroom_clipping_process((const float *)ivoid, (float *)ovoid,
+        (float)roi_out->x, (float)roi_out->y, roi_out->scale,
+        roi_out->width, roi_out->height,
+        (float)roi_in->x, (float)roi_in->y, roi_in->scale,
+        roi_in->width, roi_in->height,
+        d->k_apply, (const float *)k_space, ma,mb,md,me,mg,mh, kxa,kya,
+        d->tx, d->ty, d->m, d->k_h, d->k_v, d->flip ? 1 : 0,
+        d->enlarge_x, d->enlarge_y, d->cix, d->ciy,
+        ch, (unsigned int)interpolation->id);
   }
 }
 

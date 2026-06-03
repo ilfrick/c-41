@@ -5,6 +5,7 @@
 
 pub mod agx;
 pub mod ashift;
+pub mod clipping;
 pub mod denoiseprofile;
 pub mod liquify;
 pub mod retouch;
