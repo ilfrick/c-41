@@ -114,6 +114,7 @@ pub fn show_import_dialog(
         .build();
 
     let db = db_path.clone();
+    let on_done = std::rc::Rc::new(on_done);
     chooser.select_folder(Some(parent), gtk4::gio::Cancellable::NONE, move |result| {
         let folder = match result {
             Ok(f) => f,
@@ -125,23 +126,17 @@ pub fn show_import_dialog(
         };
         let folder_str = folder_path.to_string_lossy().to_string();
         let db2        = db.clone();
+        let on_done    = on_done.clone();
 
         glib::spawn_future_local(async move {
             let count = gio::spawn_blocking(move || {
                 import_folder_sync(&folder_str, &db2)
             }).await.ok().flatten().unwrap_or(0);
 
-            // Show completion toast via a simple println (UI toast in Phase 3-ui-8)
             println!("Imported {count} images from {folder_path:?}");
+            // Reload lighttable after import completes
+            on_done();
         });
-    });
-
-    // After async import, call the reload callback
-    // We hook it here via a separate closure once the import spawned above finishes.
-    // For now, schedule reload on a short timer since GTK has no built-in future chaining.
-    let on_done = std::rc::Rc::new(on_done);
-    glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
-        on_done();
     });
 }
 
