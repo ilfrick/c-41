@@ -198,10 +198,6 @@ static inline void _create_lens_kernel(float *const restrict buffer,
   //   see https://math.stackexchange.com/a/4160104/498090
   // buffer sizes need to be odd
 
-  // Spatial coordinates rounding error
-  const float eps = 1.f / (float)width;
-  const float radius = (float)(width - 1) / 2.f - 1;
-
   darkroom_blurs_lens_kernel(buffer, width, height, n, m, k, rotation);
 }
 
@@ -212,13 +208,7 @@ static inline void _create_motion_kernel(float *const restrict buffer,
                                          const float curvature,
                                          const float offset)
 {
-  // Compute the polynomial params from user params
   const float A = curvature / 2.f;
-  const float B = 1.f;
-  const float C = -A * offset * offset + B * offset;
-  // Note : C ensures the polynomial arc always goes through the central pixel
-  // so we don't shift pixels. This is meant to allow seamless connection
-  // with unmasked areas when using masked blur.
 
   // Spatial coordinates rounding error
   const float eps = 1.f / (float)width;
@@ -239,10 +229,6 @@ static inline void _create_gauss_kernel(float *const restrict buffer,
                                         const size_t width, 
                                         const size_t height)
 {
-  // This is not optimized. Gauss kernel is separable and can be turned into
-  // 2 × 1D convolutions.
-  const float radius = (width - 1) / 2.f - 1;
-
   darkroom_blurs_gauss_kernel(buffer, width, height);
 }
 
