@@ -5,6 +5,7 @@
 
 pub mod agx;
 pub mod ashift;
+pub mod retouch;
 pub mod basicadj;
 pub mod bloom;
 pub mod globaltonemap;

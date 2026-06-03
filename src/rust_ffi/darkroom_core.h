@@ -933,6 +933,37 @@ void darkroom_basecurve_add_layers(float *comb_k, const float *out_buf,
 void darkroom_basecurve_copy_output(const float *comb0, const float *in_buf,
                                      float *out_buf, size_t npixels);
 
+/* Retouch IOP helpers -- 5 portable DT_OMP_FOR loops. */
+void darkroom_retouch_copy_rows(const float *in_buf, float *out_buf,
+                                 int y_to, int xoffs, int yoffs,
+                                 int in_width, int out_width, int ch,
+                                 size_t rowsize);
+void darkroom_retouch_build_mask(const float *mask, float *mask_tmp,
+                                  int roi_mask_x, int roi_mask_y,
+                                  int roi_mask_w, int roi_mask_h,
+                                  int roi_ms_x, int roi_ms_y,
+                                  int roi_ms_w, int roi_ms_h,
+                                  int x_to, int y_to, float scale);
+void darkroom_retouch_copy_masked(const float *src, float *dest,
+                                   int dest_roi_x, int dest_roi_y, int dest_roi_w,
+                                   size_t dest_npixels,
+                                   const float *mask,
+                                   int mask_roi_x, int mask_roi_y,
+                                   int mask_w, int mask_h, float opacity);
+void darkroom_retouch_copy_mask_to_alpha(float *img,
+                                          int roi_img_x, int roi_img_y, int roi_img_w,
+                                          size_t img_npixels, int ch,
+                                          const float *mask,
+                                          int mask_roi_x, int mask_roi_y,
+                                          int mask_w, int mask_h, float opacity);
+void darkroom_retouch_fill(float *dest,
+                            int roi_in_x, int roi_in_y, int roi_in_w,
+                            size_t dest_npixels,
+                            const float *mask,
+                            int mask_roi_x, int mask_roi_y,
+                            int mask_w, int mask_h, float opacity,
+                            const float *fill_color);
+
 /*
  * Hazeremoval IOP -- per-pixel dark channel.
  * Writes min(R,G,B) of each RGBA input pixel into a gray scalar output.

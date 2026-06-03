@@ -31,6 +31,7 @@
 #include "develop/masks.h"
 #include "develop/tiling.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 #include "dtgtk/drawingarea.h"
 #include "gui/accelerators.h"
 #include "gui/color_picker_proxy.h"
@@ -3247,16 +3248,8 @@ static void rt_copy_in_to_out(const float *const in,
   const int yoffs = roi_out->y - roi_in->y - dy;
   const int y_to = MIN(roi_out->height, roi_in->height);
 
-  DT_OMP_FOR()
-  for(int y = 0; y < y_to; y++)
-  {
-    const size_t iindex = ((size_t)(y + yoffs) * roi_in->width + xoffs) * ch;
-    const size_t oindex = (size_t)y * roi_out->width * ch;
-    float *in1 = (float *)in + iindex;
-    float *out1 = (float *)out + oindex;
-
-    memcpy(out1, in1, rowsize);
-  }
+  darkroom_retouch_copy_rows(in, out, y_to, xoffs, yoffs,
+      roi_in->width, roi_out->width, ch, rowsize);
 }
 
 // Return TRUE in case of an error
@@ -3297,25 +3290,10 @@ static gboolean rt_build_scaled_mask(float *const mask,
   }
   dt_iop_image_fill(mask_tmp, 0.0f, roi_mask_scaled->width, roi_mask_scaled->height, 1);
 
-  DT_OMP_FOR()
-  for(int yy = roi_mask_scaled->y; yy < y_to; yy++)
-  {
-    const int mask_index = ((int)(yy / roi_in->scale)) - roi_mask->y;
-    if(mask_index < 0 || mask_index >= roi_mask->height) continue;
-
-    const int mask_scaled_index = (yy - roi_mask_scaled->y) * roi_mask_scaled->width;
-
-    const float *m = mask + mask_index * roi_mask->width;
-    float *ms = mask_tmp + mask_scaled_index;
-
-    for(int xx = roi_mask_scaled->x; xx < x_to; xx++, ms++)
-    {
-      const int mx = ((int)(xx / roi_in->scale)) - roi_mask->x;
-      if(mx < 0 || mx >= roi_mask->width) continue;
-
-      *ms = m[mx];
-    }
-  }
+  darkroom_retouch_build_mask(mask, mask_tmp,
+      roi_mask->x, roi_mask->y, roi_mask->width, roi_mask->height,
+      roi_mask_scaled->x, roi_mask_scaled->y, roi_mask_scaled->width, roi_mask_scaled->height,
+      x_to, y_to, roi_in->scale);
 
 cleanup:
   *mask_scaled = mask_tmp;
@@ -3330,30 +3308,13 @@ static void rt_copy_image_masked(float *const img_src,
                                  dt_iop_roi_t *const roi_mask_scaled,
                                  const float opacity)
 {
-  DT_OMP_FOR()
-  for(int yy = 0; yy < roi_mask_scaled->height; yy++)
-  {
-    const int mask_index = yy * roi_mask_scaled->width;
-    const int src_index = 4 * mask_index;
-    const int dest_index
-      = 4 * (((yy + roi_mask_scaled->y - roi_dest->y)
-              * roi_dest->width) + (roi_mask_scaled->x - roi_dest->x));
-
-    const float *s = img_src + src_index;
-    const float *m = mask_scaled + mask_index;
-    float *d = img_dest + dest_index;
-
-    for(int xx = 0; xx < roi_mask_scaled->width; xx++)
-    {
-      const float f = m[xx] * opacity;
-      const float f1 = (1.0f - f);
-
-      for_each_channel(c,aligned(s,d))
-      {
-        d[4*xx + c] = d[4*xx + c] * f1 + s[4*xx + c] * f;
-      }
-    }
-  }
+  darkroom_retouch_copy_masked(img_src, img_dest,
+      roi_dest->x, roi_dest->y, roi_dest->width,
+      (size_t)roi_dest->width * roi_dest->height,
+      mask_scaled,
+      roi_mask_scaled->x, roi_mask_scaled->y,
+      roi_mask_scaled->width, roi_mask_scaled->height,
+      opacity);
 }
 
 static void rt_copy_mask_to_alpha(float *const img,
@@ -3363,23 +3324,13 @@ static void rt_copy_mask_to_alpha(float *const img,
                                   dt_iop_roi_t *const roi_mask_scaled,
                                   const float opacity)
 {
-  DT_OMP_FOR()
-  for(int yy = 0; yy < roi_mask_scaled->height; yy++)
-  {
-    const int mask_index = yy * roi_mask_scaled->width;
-    const int dest_index
-        = (((yy + roi_mask_scaled->y - roi_img->y) * roi_img->width)
-           + (roi_mask_scaled->x - roi_img->x)) * ch;
-
-    float *d = img + dest_index;
-    const float *m = mask_scaled + mask_index;
-
-    for(int xx = 0; xx < roi_mask_scaled->width; xx++, d += ch, m++)
-    {
-      const float f = (*m) * opacity;
-      if(f > d[3]) d[3] = f;
-    }
-  }
+  darkroom_retouch_copy_mask_to_alpha(img,
+      roi_img->x, roi_img->y, roi_img->width,
+      (size_t)roi_img->width * roi_img->height,
+      ch, mask_scaled,
+      roi_mask_scaled->x, roi_mask_scaled->y,
+      roi_mask_scaled->width, roi_mask_scaled->height,
+      opacity);
 }
 
 static void _retouch_fill(float *const in,
@@ -3389,25 +3340,13 @@ static void _retouch_fill(float *const in,
                           const float opacity,
                           const float *const fill_color)
 {
-  DT_OMP_FOR()
-  for(int yy = 0; yy < roi_mask_scaled->height; yy++)
-  {
-    const int mask_index = yy * roi_mask_scaled->width;
-    const int dest_index
-        = (((yy + roi_mask_scaled->y - roi_in->y) * roi_in->width)
-           + (roi_mask_scaled->x - roi_in->x)) * 4;
-
-    float *d = in + dest_index;
-    const float *m = mask_scaled + mask_index;
-
-    for(int xx = 0; xx < roi_mask_scaled->width; xx++)
-    {
-      const float f = m[xx] * opacity;
-
-      for_each_channel(c,aligned(d,fill_color))
-        d[4*xx + c] = d[4*xx + c] * (1.0f - f) + fill_color[c] * f;
-    }
-  }
+  darkroom_retouch_fill(in,
+      roi_in->x, roi_in->y, roi_in->width,
+      (size_t)roi_in->width * roi_in->height,
+      mask_scaled,
+      roi_mask_scaled->x, roi_mask_scaled->y,
+      roi_mask_scaled->width, roi_mask_scaled->height,
+      opacity, fill_color);
 }
 
 static void _retouch_clone(float *const in,
