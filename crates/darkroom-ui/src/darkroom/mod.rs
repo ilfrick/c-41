@@ -6,6 +6,7 @@
 
 use adw::prelude::*;
 use glib::clone;
+use crate::dialogs;
 
 /// Build a NavigationPage for editing a single image at `file_path`.
 ///
@@ -53,10 +54,23 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     content.append(&modules_panel);
 
-    // ── Header bar ─────────────────────────────────────────────────────────
+    // ── Header bar with Export button ─────────────────────────────────────
     let header = adw::HeaderBar::new();
     let title_widget = adw::WindowTitle::new(&filename, "Darkroom");
     header.set_title_widget(Some(&title_widget));
+
+    let export_btn = gtk4::Button::builder()
+        .label("Export")
+        .tooltip_text("Export this image")
+        .build();
+    export_btn.add_css_class("suggested-action");
+    let path_for_export = file_path.to_string();
+    export_btn.connect_clicked(move |btn| {
+        if let Some(root) = btn.root().and_downcast::<gtk4::Window>() {
+            dialogs::show_export_dialog(root.upcast_ref::<gtk4::Window>(), vec![path_for_export.clone()]);
+        }
+    });
+    header.pack_end(&export_btn);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
