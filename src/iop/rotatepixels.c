@@ -244,10 +244,7 @@ void modify_roi_in(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const d
 void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid, void *const ovoid,
              const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  const int ch = piece->colors;
   const float scale = roi_in->scale / piece->iscale;
-
-  assert(ch == 4);
 
   const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
   const dt_iop_rotatepixels_data_t *d = piece->data;
