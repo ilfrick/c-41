@@ -149,30 +149,7 @@ inline static void _blur_2D_Bspline(const float *const restrict in,
                                     const size_t width,
                                     const size_t height)
 {
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < height; i++)
-  {
-    for(size_t j = 0; j < width; j++)
-    {
-      const size_t index = (i * width + j);
-      float acc = 0.f;
-
-      for(size_t ii = 0; ii < FSIZE; ++ii)
-        for(size_t jj = 0; jj < FSIZE; ++jj)
-        {
-          const size_t row = CLAMP((int)i + (int)(ii - (FSIZE - 1) / 2), (int)0, (int)height - 1);
-          const size_t col = CLAMP((int)j + (int)(jj - (FSIZE - 1) / 2), (int)0, (int)width - 1);
-          const size_t k_index = (row * width + col);
-
-          static const float DT_ALIGNED_ARRAY filter[FSIZE]
-              = { 1.0f / 16.0f, 4.0f / 16.0f, 6.0f / 16.0f, 4.0f / 16.0f, 1.0f / 16.0f };
-
-          acc += filter[ii] * filter[jj] * in[k_index];
-        }
-
-      out[index] = acc;
-    }
-  }
+  darkroom_blurs_bspline_2d(in, out, width, height);
 }
 
 

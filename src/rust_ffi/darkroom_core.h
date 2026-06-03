@@ -1647,6 +1647,8 @@ void darkroom_gamma_mask_display(const float *in_buf, unsigned char *out_buf,
  * Matches src/iop/blurs.c:601. */
 void darkroom_blurs_alpha_restore(const float *in_buf, float *out_buf,
                                    size_t npixels);
+void darkroom_blurs_bspline_2d(const float *in_buf, float *out_buf,
+                                size_t width, size_t height);
 void darkroom_blurs_init_kernel(float *buf, size_t n);
 void darkroom_blurs_gauss_kernel(float *buf, size_t width, size_t height);
 void darkroom_blurs_lens_kernel(float *buf, size_t width, size_t height,

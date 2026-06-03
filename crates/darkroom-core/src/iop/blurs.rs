@@ -204,6 +204,36 @@ mod tests {
     }
 }
 
+/// 2D B-spline (5-tap per axis) single-channel convolution with clamp-to-edge.
+/// filter = [1/16, 4/16, 6/16, 4/16, 1/16] applied non-separably.
+/// Matches _blur_2D_Bspline DT_OMP_FOR(collapse(2)) at blurs.c:152.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blurs_bspline_2d(
+    in_buf:  *const f32,
+    out_buf: *mut f32,
+    width:   usize,
+    height:  usize,
+) {
+    const FILTER: [f32; 5] = [1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.0];
+    let inp = std::slice::from_raw_parts(in_buf, width * height);
+    let out = std::slice::from_raw_parts_mut(out_buf, width * height);
+    let hi = height as i32;
+    let wi = width as i32;
+    for i in 0..height {
+        for j in 0..width {
+            let mut acc = 0.0f32;
+            for ii in 0usize..5 {
+                let row = (i as i32 + ii as i32 - 2).clamp(0, hi - 1) as usize;
+                for jj in 0usize..5 {
+                    let col = (j as i32 + jj as i32 - 2).clamp(0, wi - 1) as usize;
+                    acc += FILTER[ii] * FILTER[jj] * inp[row * width + col];
+                }
+            }
+            out[i * width + j] = acc;
+        }
+    }
+}
+
 // ── Kernel builders (Phase 2z+57) ────────────────────────────────────────
 
 /// Zero-initialise a float kernel buffer. Matches blurs.c::_init_kernel DT_OMP_FOR_SIMD.
