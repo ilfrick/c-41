@@ -7,7 +7,7 @@ application runnable throughout.
 
 ---
 
-## Current status -- 2026-06-03
+## Current status -- 2026-06-04
 
 ### Phase 0 -- Infrastructure complete
 
@@ -19,7 +19,7 @@ application runnable throughout.
 | Unit tests passing | **356** |
 | IOP `.rs` files | 93 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+51` (toneequal GUI curve LUT builder) |
+| Last patch | `Phase 2z+62` (clipping.c fully migrated) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -32,12 +32,13 @@ blocking infrastructure lands.
 #### Fully migrated IOPs (all active OMP loops -> Rust, 0 remain in C)
 
 `agx`, `atrous`, `basicadj`, `bloom`, `cacorrect`, `cacorrectrgb`,
-`censorize`, `channelmixer`, `clahe`, `colorbalance`, `colorchecker`,
-`colorcontrast`, `colorcorrection`, `colorize`, `colormapping`,
-`colorzones`, `defringe`, `dither`, `exposure`,
+`censorize`, `channelmixer`, `clahe`, `clipping`,
+`colorbalance`, `colorchecker`, `colorcontrast`, `colorcorrection`,
+`colorize`, `colormapping`, `colorzones`, `defringe`, `denoiseprofile`,
+`dither`, `exposure`,
 `filmic`, `filmicrgb` (utility loops), `globaltonemap`, `graduatednd`,
 `grain`, `hazeremoval`, `highpass`, `hotpixels` (all 3 variants),
-`invert`, `levels`, `lowlight`, `lowpass`, `lut3d`, `monochrome`,
+`invert`, `levels`, `liquify`, `lowlight`, `lowpass`, `lut3d`, `monochrome`,
 `negadoctor`, `overexposed` (all 4 modes), `overlay`, `primaries`,
 `profile_gamma`, `rasterfile`, `rawdenoise`, `rawprepare`,
 `relight`, `rgbcurve`, `rgblevels`, `shadhi`, `sigmoid`, `soften`,
@@ -56,16 +57,17 @@ Commit-params LUT builders migrated:
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
 | `colorequal` | 1 | GUI background renderer (intentionally deferred) |
-| `highlights` | 4 | `interpolate_color_xtrans` / `interpolate_color` inpaint |
+| `highlights` | 4 | `interpolate_color_xtrans` / `interpolate_color` CFA inpaint |
 | `diffuse` | 1 | anisotropic PDE solver (very complex) |
-| `filmicrgb` | 12 | `RGB_to_Ych`, gamut mapping, Filmlight color space, `work_profile` |
+| `filmicrgb` | 12 | `RGB_to_Ych`, Filmlight color space, `work_profile` |
 | `gamma` | 5 | `dt_Lab_to_XYZ`, `dt_HSL_2_RGB`, `dt_JzAzBz_*` |
 | `channelmixerrgb` | 2 | B-spline local avg reduction (illuminant detection) |
 | `colortransfer` | 2 | k-means with atomic accumulators |
 | `colorout` | 1 | LCMS `cmsDoTransform` |
-| `blurs` | 12 | Gaussian IIR, FFT, box-filter builders |
-| `rotatepixels` | 1 | `dt_interpolation_compute_pixel4c` |
-| `scalepixels` | 2 | `dt_interpolation_*` |
+| `retouch` | 4 | `dt_linearRGB_to_XYZ` / `dt_XYZ_to_Lab` ICC paths |
+| `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
+| `colorin` | 5 | ICC matrix + LCMS |
+| `ashift` | 2 | `dt_Rec709_to_XYZ_D50` + `dt_XYZ_to_Lab` |
 
 #### Stubs only -- fully blocked
 
