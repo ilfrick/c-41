@@ -29,6 +29,7 @@
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 #include <assert.h>
 #include <cairo.h>
 #include <complex.h>
@@ -953,53 +954,10 @@ static void apply_round_stamp(const dt_liquify_warp_t *const restrict warp,
   // circle in quadrants and doing only the inside we have to calculate
   // hypotf only for PI / 16 = 0.196 of the stamp area.
   // We don't do octants to avoid false sharing of cache lines between threads.
-  DT_OMP_FOR(dt_omp_sharedconst(LOOKUP_OVERSAMPLE))
-  for(size_t y = 0; y <= iradius; y++)
-  {
-    const float complex y_i = y * I;
-    const float y2 = y*y;
-    for(size_t x = 0; x <= iradius; x++)
-    {
-      // faster than hypotf(), and we know we won't have overflow or denormals
-      const float dist = sqrtf((float)x*x + y2);
-      const size_t idist = round(dist * LOOKUP_OVERSAMPLE);
-      if(idist >= table_size)
-        // idist will only grow bigger in this row
-        break;
-
-      // pointers into the 4 quadrants of the circle
-      // quadrant count is ccw from positive x-axis
-      float complex *const q1 = center - y * global_width + x;
-      float complex *const q2 = center - y * global_width - x;
-      float complex *const q3 = center + y * global_width - x;
-      float complex *const q4 = center + y * global_width + x;
-
-      if(warp->type == DT_LIQUIFY_WARP_TYPE_LINEAR)
-      {
-        const float complex w_strength = -strength * lookup_table[idist];
-        *q1 += w_strength;
-        if(x!=0)
-          *q2 += w_strength;
-        if(x!=0&&y!=0)
-          *q3 += w_strength;
-        if(y!=0)
-          *q4 += w_strength;
-      }
-      else
-      {
-        // DT_LIQUIFY_WARP_TYPE_RADIAL_GROW or _SHRINK
-        // abs_strength is negative for _SHRINK
-        const float abs_lookup = abs_strength * lookup_table[idist] / iradius;
-        *q1 -= abs_lookup * (x - y_i);
-        if(x!=0)
-          *q2 += abs_lookup * (x + y_i);
-        if(x!=0&&y!=0)
-          *q3 += abs_lookup * (x - y_i);
-        if(y!=0)
-          *q4 -= abs_lookup * (x + y_i);
-      }
-    }
-  }
+  darkroom_liquify_apply_stamp((float *)center, global_width, iradius,
+      lookup_table, table_size, LOOKUP_OVERSAMPLE,
+      (warp->type == DT_LIQUIFY_WARP_TYPE_LINEAR) ? 0 : 1,
+      -crealf(strength), -cimagf(strength), abs_strength);
 
   dt_free_align((void*) lookup_table);
 }
@@ -1021,42 +979,13 @@ static void _apply_global_distortion_map(dt_iop_module_t *self,
                                          const cairo_rectangle_int_t *extent)
 {
   const int ch = piece->colors;
-  const int ch_width = ch * roi_in->width;
   const dt_interpolation_t *const interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
 
-  const size_t min_y = MAX(roi_out->y, extent->y);
-  const size_t max_y = MIN(roi_out->y + roi_out->height, extent->y + extent->height);
-
-  DT_OMP_FOR()
-  for(size_t y = min_y; y < max_y; y++)
-  {
-    const size_t min_x = MAX(roi_out->x, extent->x);
-    const size_t max_x = MIN(roi_out->x + roi_out->width, extent->x + extent->width);
-    const float complex *row = map + (y - extent->y) * extent->width + (min_x - extent->x);
-    float* out_sample = out + ch * ((y - roi_out->y) * roi_out->width - roi_out->x);
-    for(size_t x = min_x; x < max_x; x++)
-    {
-      if(*row != 0) // point actually warped?
-      {
-        if(ch == 1) // handle masks
-          out_sample[x] = CLIP(dt_interpolation_compute_sample(interpolation, in,
-                                                               x + crealf(*row) - roi_in->x, y + cimagf(*row) - roi_in->y,
-                                                               roi_in->width, roi_in->height, 1, ch_width));
-        else
-          dt_interpolation_compute_pixel4c(
-            interpolation,
-            in,
-            out_sample + ch*x,
-            x + crealf(*row) - roi_in->x,
-            y + cimagf(*row) - roi_in->y,
-            roi_in->width,
-            roi_in->height,
-            ch_width);
-
-      }
-      ++row;
-    }
-  }
+  darkroom_liquify_apply_map(in, out,
+      roi_in->x, roi_in->y, roi_in->width, roi_in->height,
+      roi_out->x, roi_out->y, roi_out->width, roi_out->height,
+      extent->x, extent->y, extent->width, extent->height,
+      (const float *)map, ch, (unsigned int)interpolation->id);
 }
 
 // calculate the map extent.
@@ -1126,22 +1055,8 @@ static float complex *create_global_distortion_map(const cairo_rectangle_int_t *
     // copy map into imap(inverted map).
     // imap [ n + dx(map[n]) , n + dy(map[n]) ] = -map[n]
 
-    DT_OMP_FOR()
-    for(int y = 0; y <  map_extent->height; y++)
-    {
-      const float complex *const row = map + y * map_extent->width;
-      for(int x = 0; x < map_extent->width; x++)
-      {
-        const float complex d = row[x];
-        // compute new position (nx,ny) given the displacement d
-        const int nx = x + (int)crealf(d);
-        const int ny = y + (int)cimagf(d);
-
-        // if the point falls into the extent, set it
-        if(nx>0 && nx<map_extent->width && ny>0 && ny<map_extent->height)
-          imap[nx + ny * map_extent->width] = -d;
-      }
-    }
+    darkroom_liquify_invert_map((const float *)map, (float *)imap,
+        map_extent->width, map_extent->height);
 
     dt_free_align((void *) map);
 
@@ -1150,23 +1065,8 @@ static float complex *create_global_distortion_map(const cairo_rectangle_int_t *
     // distortion mask is only used to compute a final displacement of
     // points.
 
-    DT_OMP_FOR()
-    for(int y = 0; y <  map_extent->height; y++)
-    {
-      float complex *const row = imap + y * map_extent->width;
-      float complex last[2] = { 0, 0 };
-      for(int x = 0; x < map_extent->width / 2 + 1; x++)
-      {
-        float complex *cl = row + x;
-        float complex *cr = row + map_extent->width - x;
-        if(x!=0)
-        {
-          if(*cl == 0) *cl = last[0];
-          if(*cr == 0) *cr = last[1];
-        }
-        last[0] = *cl; last[1] = *cr;
-      }
-    }
+    darkroom_liquify_fill_gaps((float *)imap,
+        map_extent->width, map_extent->height);
 
     map = imap;
   }
@@ -1255,16 +1155,8 @@ static gboolean _distort_xtransform(const dt_iop_module_t *self,
   // compute the extent of all points (all computations are done in RAW coordinate)
   float xmin = FLT_MAX, xmax = FLT_MIN, ymin = FLT_MAX, ymax = FLT_MIN;
 
-  DT_OMP_FOR(if(points_count > 100) reduction(min:xmin, ymin) reduction(max:xmax, ymax))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    const float x = points[i] * scale;
-    const float y = points[i + 1] * scale;
-    xmin = fmin(xmin, x);
-    xmax = fmax(xmax, x);
-    ymin = fmin(ymin, y);
-    ymax = fmax(ymax, y);
-  }
+  darkroom_liquify_bounding_box(points, points_count, scale,
+      &xmin, &xmax, &ymin, &ymax);
 
   cairo_rectangle_int_t extent = { .x = (int)(xmin - .5),
                                    .y = (int)(ymin - .5),
@@ -1288,33 +1180,9 @@ static gboolean _distort_xtransform(const dt_iop_module_t *self,
 
     if(map == NULL) return FALSE;
 
-    const int map_size =  extent.width * extent.height;
-    const int x_last = extent.x + extent.width;
-    const int y_last = extent.y + extent.height;
-
-    // apply distortion to all points (this is a simple displacement
-    // given by a vector at this same point in the map)
-    DT_OMP_FOR(if(points_count > 100))
-    for(size_t i = 0; i < points_count; i++)
-    {
-      float *px = &points[i*2];
-      float *py = &points[i*2+1];
-      const float x = *px * scale;
-      const float y = *py * scale;
-      const int map_offset = ((int)(x - 0.5) - extent.x) + ((int)(y - 0.5) - extent.y) * extent.width;
-
-      if(x >= extent.x
-         && x < x_last
-         && y >= extent.y
-         && y < y_last
-         && map_offset >= 0
-         && map_offset < map_size)
-      {
-        const float complex dist = map[map_offset] / scale;
-        *px += crealf(dist);
-        *py += cimagf(dist);
-      }
-    }
+    const int map_size = extent.width * extent.height;
+    darkroom_liquify_apply_distortion(points, points_count, scale,
+        (const float *)map, extent.x, extent.y, extent.width, map_size);
 
     dt_free_align((void *) map);
   }

@@ -6,6 +6,7 @@
 pub mod agx;
 pub mod ashift;
 pub mod denoiseprofile;
+pub mod liquify;
 pub mod retouch;
 pub mod basicadj;
 pub mod bloom;

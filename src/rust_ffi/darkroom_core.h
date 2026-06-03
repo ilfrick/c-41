@@ -1667,6 +1667,33 @@ void darkroom_denoise_precondition_yuv(const float *in_buf, float *out_buf,
                                         size_t npixels,
                                         float a, const float *p, float b,
                                         const float *to_yuv);
+/* Liquify IOP -- 6 DT_OMP_FOR loops (float complex stored as [re,im] f32 pairs). */
+void darkroom_liquify_apply_stamp(float *center, size_t global_width,
+                                   size_t iradius,
+                                   const float *lookup_table, size_t table_size,
+                                   size_t oversample, int warp_type,
+                                   float strength_re, float strength_im,
+                                   float abs_strength);
+void darkroom_liquify_apply_map(const float *in_buf, float *out_buf,
+                                 int roi_in_x, int roi_in_y,
+                                 int roi_in_w, int roi_in_h,
+                                 int roi_out_x, int roi_out_y,
+                                 int roi_out_w, int roi_out_h,
+                                 int extent_x, int extent_y,
+                                 int extent_w, int extent_h,
+                                 const float *map, int ch,
+                                 unsigned int interp_type);
+void darkroom_liquify_invert_map(const float *map, float *imap,
+                                  int width, int height);
+void darkroom_liquify_fill_gaps(float *imap, int width, int height);
+void darkroom_liquify_bounding_box(const float *points, size_t n, float scale,
+                                    float *xmin, float *xmax,
+                                    float *ymin, float *ymax);
+void darkroom_liquify_apply_distortion(float *points, size_t n, float scale,
+                                        const float *map,
+                                        int extent_x, int extent_y,
+                                        int extent_w, int map_size);
+
 void darkroom_denoise_backtransform_yuv(float *buf, size_t npixels,
                                          float a, const float *p, float b,
                                          float bias, const float *wb,
