@@ -1313,14 +1313,7 @@ static gboolean detail_enhance(const float *const in,
   // we need to convert from RGB to Lab first;
   // as colors don't matter we are safe to assume data to be sRGB
 
-  // convert RGB input to Lab, use output buffer for intermediate storage
-  DT_OMP_FOR()
-  for(size_t index = 0; index < 4*npixels; index += 4)
-  {
-    dt_aligned_pixel_t XYZ;
-    dt_Rec709_to_XYZ_D50(in + index, XYZ);  // convert linear sRBG to XYZ
-    dt_XYZ_to_Lab(XYZ, out + index);
-  }
+  darkroom_color_rgb_to_lab(in, out, npixels);
 
   // bilateral grid detail enhancement
   dt_bilateral_t *b = dt_bilateral_init(width, height, sigma_s, sigma_r);
@@ -1335,14 +1328,7 @@ static gboolean detail_enhance(const float *const in,
   else
     success = FALSE;
 
-  // convert resulting Lab to RGB output
-  DT_OMP_FOR()
-  for(size_t index = 0; index < 4*npixels; index += 4)
-  {
-    dt_aligned_pixel_t XYZ;
-    dt_Lab_to_XYZ(out + index, XYZ);
-    dt_XYZ_to_linearRGB(XYZ, out + index);
-  }
+  darkroom_color_lab_to_rgb(out, npixels);
 
   return success;
 }

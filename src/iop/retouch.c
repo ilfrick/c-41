@@ -3051,13 +3051,7 @@ static void image_rgb2lab(float *img_src,
 {
   const size_t npixels = (size_t)width * height;
 
-  DT_OMP_FOR()
-  for(size_t i = 0; i < npixels; i++)
-  {
-    dt_aligned_pixel_t XYZ;
-    dt_linearRGB_to_XYZ(img_src + 4*i, XYZ);
-    dt_XYZ_to_Lab(XYZ, img_src + 4*i);
-  }
+  darkroom_color_rgb_to_lab(img_src, img_src, npixels);
 }
 
 static void image_lab2rgb(float *img_src,
@@ -3066,13 +3060,7 @@ static void image_lab2rgb(float *img_src,
 {
   const size_t npixels = (size_t)width * height;
 
-  DT_OMP_FOR()
-  for(size_t i = 0; i < npixels; i++)
-  {
-    dt_aligned_pixel_t XYZ;
-    dt_Lab_to_XYZ(img_src + 4*i, XYZ);
-    dt_XYZ_to_linearRGB(XYZ, img_src + 4*i);
-  }
+  darkroom_color_lab_to_rgb(img_src, npixels);
 }
 
 static void rt_process_stats(dt_iop_module_t *self,

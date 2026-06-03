@@ -933,6 +933,12 @@ void darkroom_basecurve_add_layers(float *comb_k, const float *out_buf,
 void darkroom_basecurve_copy_output(const float *comb0, const float *in_buf,
                                      float *out_buf, size_t npixels);
 
+/* Generic sRGB/Lab batch converters (no work_profile required).
+ * Matches dt_Rec709_to_XYZ_D50 + dt_XYZ_to_Lab (forward)
+ * and dt_Lab_to_XYZ + dt_XYZ_to_linearRGB (inverse). */
+void darkroom_color_rgb_to_lab(const float *in_buf, float *out_buf, size_t npixels);
+void darkroom_color_lab_to_rgb(float *buf, size_t npixels);
+
 /* Retouch IOP helpers -- 5 portable DT_OMP_FOR loops. */
 void darkroom_retouch_copy_rows(const float *in_buf, float *out_buf,
                                  int y_to, int xoffs, int yoffs,

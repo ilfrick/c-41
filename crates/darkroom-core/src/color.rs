@@ -107,6 +107,74 @@ pub fn xyz_to_lab(xyz: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+// ── sRGB (D50) ↔ XYZ ─────────────────────────────────────────────────────────
+//
+// Matrices from src/common/colorspaces_inline_conversions.h:505-513.
+// Applied via dt_apply_transposed_color_matrix convention:
+//   out[r] = sum_c(matrix[c][r] * in[c])
+
+const SRGB_TO_XYZ_T: [[f32; 3]; 3] = [
+    [0.4360747, 0.2225045, 0.0139322],  // row 0 = R coefficients for XYZ[0..2]
+    [0.3850649, 0.7168786, 0.0971045],  // row 1 = G coefficients
+    [0.1430804, 0.0606169, 0.7141733],  // row 2 = B coefficients
+];
+
+const XYZ_TO_SRGB_T: [[f32; 3]; 3] = [
+    [ 3.1338561, -0.9787684,  0.0719453],
+    [-1.6168667,  1.9161415, -0.2289914],
+    [-0.4906146,  0.0334540,  1.4052427],
+];
+
+/// Linear sRGB → XYZ D50 (matches dt_linearRGB_to_XYZ / dt_Rec709_to_XYZ_D50).
+pub fn srgb_to_xyz_d50(rgb: [f32; 4]) -> [f32; 4] {
+    let xyz: [f32; 3] = std::array::from_fn(|r|
+        SRGB_TO_XYZ_T[0][r]*rgb[0] + SRGB_TO_XYZ_T[1][r]*rgb[1] + SRGB_TO_XYZ_T[2][r]*rgb[2]
+    );
+    [xyz[0], xyz[1], xyz[2], rgb[3]]
+}
+
+/// XYZ D50 → linear sRGB (matches dt_XYZ_to_linearRGB / dt_XYZ_to_Rec709_D50).
+pub fn xyz_d50_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
+    let rgb: [f32; 3] = std::array::from_fn(|r|
+        XYZ_TO_SRGB_T[0][r]*xyz[0] + XYZ_TO_SRGB_T[1][r]*xyz[1] + XYZ_TO_SRGB_T[2][r]*xyz[2]
+    );
+    [rgb[0], rgb[1], rgb[2], xyz[3]]
+}
+
+/// Batch linear sRGB → Lab. Matches dt_Rec709_to_XYZ_D50 + dt_XYZ_to_Lab per pixel.
+/// Used by ashift.c:1317 and retouch.c:3053.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_color_rgb_to_lab(
+    in_buf:  *const f32,
+    out_buf: *mut f32,
+    npixels: usize,
+) {
+    let inp = std::slice::from_raw_parts(in_buf,  npixels * 4);
+    let out = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+    for k in 0..npixels {
+        let rgb = [inp[k*4], inp[k*4+1], inp[k*4+2], inp[k*4+3]];
+        let xyz = srgb_to_xyz_d50(rgb);
+        let lab = xyz_to_lab(xyz);
+        out[k*4] = lab[0]; out[k*4+1] = lab[1]; out[k*4+2] = lab[2]; out[k*4+3] = lab[3];
+    }
+}
+
+/// Batch Lab → linear sRGB in-place. Matches dt_Lab_to_XYZ + dt_XYZ_to_linearRGB per pixel.
+/// Used by ashift.c:1339 and retouch.c:3068.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_color_lab_to_rgb(
+    buf:     *mut f32,
+    npixels: usize,
+) {
+    let b = std::slice::from_raw_parts_mut(buf, npixels * 4);
+    for k in 0..npixels {
+        let lab = [b[k*4], b[k*4+1], b[k*4+2], b[k*4+3]];
+        let xyz = lab_to_xyz(lab);
+        let rgb = xyz_d50_to_srgb(xyz);
+        b[k*4] = rgb[0]; b[k*4+1] = rgb[1]; b[k*4+2] = rgb[2]; b[k*4+3] = rgb[3];
+    }
+}
+
 // ── Lab ↔ ProPhoto RGB ────────────────────────────────────────────────────────
 
 // Transposed matrices from colorspaces_inline_conversions.h:439-462.
