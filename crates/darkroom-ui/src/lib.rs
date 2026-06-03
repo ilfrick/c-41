@@ -49,7 +49,7 @@ fn build_main_window(app: &Application) {
     let hbox = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
-    hbox.append(&panels::left_panel());
+    hbox.append(&panels::left_panel(&db_path));
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     hbox.append(&scroll);
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
