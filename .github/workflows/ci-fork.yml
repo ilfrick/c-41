@@ -98,15 +98,7 @@ jobs:
             -DBINARY_PACKAGE_BUILD=ON
 
       - name: Build
-        run: |
-          set -o pipefail
-          cmake --build build --parallel $(nproc) 2>&1 | tee /tmp/b.txt || {
-            ERR=$(grep -m1 " error:" /tmp/b.txt)
-            TAIL=$(tail -20 /tmp/b.txt | tr '\n' '|')
-            echo "::error::$ERR"
-            echo "::error::TAIL: $TAIL"
-            exit 1
-          }
+        run: cmake --build build --parallel $(nproc)
 
       - name: Smoke test the binary
         run: |
