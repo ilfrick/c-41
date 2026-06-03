@@ -1023,16 +1023,8 @@ gboolean distort_transform(dt_iop_module_t *self,
 
   float *const pts = DT_IS_ALIGNED(points);
 
-  DT_OMP_FOR(if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    const float DT_ALIGNED_PIXEL pi[3] = { pts[i], pts[i + 1], 1.0f };
-    float DT_ALIGNED_PIXEL po[3];
-    mat3mulv(po, (float *)homograph, pi);
-    pts[i] = po[0] / po[2] - cx;
-    pts[i + 1] = po[1] / po[2] - cy;
-  }
-
+  darkroom_ashift_transform_coords(pts, points_count,
+      (const float *)homograph, cx, cy);
   return TRUE;
 }
 
@@ -1061,16 +1053,8 @@ gboolean distort_backtransform(dt_iop_module_t *self,
 
   float *const pts = DT_IS_ALIGNED(points);
 
-  DT_OMP_FOR(if(points_count > 100))
-  for(size_t i = 0; i < points_count * 2; i += 2)
-  {
-    const float DT_ALIGNED_PIXEL pi[3] = { pts[i] + cx, pts[i + 1] + cy, 1.0f };
-    float DT_ALIGNED_PIXEL po[3];
-    mat3mulv(po, (float *)ihomograph, pi);
-    pts[i] = po[0] / po[2];
-    pts[i + 1] = po[1] / po[2];
-  }
-
+  darkroom_ashift_backtransform_coords(pts, points_count,
+      (const float *)ihomograph, cx, cy);
   return TRUE;
 }
 
@@ -1268,13 +1252,7 @@ static void rgb2grey256(const float *const in,
 {
   const size_t npixels = (size_t)width * height;
 
-  DT_OMP_FOR()
-  for(size_t index = 0; index < npixels; index++)
-  {
-    out[index] = (0.3f * in[4*index+0]
-                  + 0.59f * in[4*index+1]
-                  + 0.11f * in[4*index+2]) * 256.0;
-  }
+  darkroom_ashift_rgb_to_gray(in, out, npixels);
 }
 
 // sobel edge enhancement in one direction
@@ -1283,65 +1261,9 @@ static void edge_enhance_1d(const double *in, double *out,
                             const int height,
                             const dt_iop_ashift_enhance_t dir)
 {
-  // Sobel kernels for both directions
-  const double hkernel[3][3] = { { 1.0, 0.0, -1.0 },
-                                 { 2.0, 0.0, -2.0 },
-                                 { 1.0, 0.0, -1.0 } };
-
-  const double vkernel[3][3] = { { 1.0, 2.0, 1.0 },
-                                 { 0.0, 0.0, 0.0 },
-                                 { -1.0, -2.0, -1.0 } };
-  const int kwidth = 3;
-  const int khwidth = kwidth / 2;
-
-  // select kernel
-  const double *kernel = (dir == ASHIFT_ENHANCE_HORIZONTAL)
-    ? (const double *)hkernel
-    : (const double *)vkernel;
-
-  DT_OMP_FOR()
-  // loop over image pixels and perform sobel convolution
-  for(int j = khwidth; j < height - khwidth; j++)
-  {
-    const double *inp = in + (size_t)j * width + khwidth;
-    double *outp = out + (size_t)j * width + khwidth;
-    for(int i = khwidth; i < width - khwidth; i++, inp++, outp++)
-    {
-      double sum = 0.0f;
-      for(int jj = 0; jj < kwidth; jj++)
-      {
-        const int k = jj * kwidth;
-        const int l = (jj - khwidth) * width;
-        for(int ii = 0; ii < kwidth; ii++)
-        {
-          sum += inp[l + ii - khwidth] * kernel[k + ii];
-        }
-      }
-      *outp = sum;
-    }
-  }
-
-  DT_OMP_FOR()
-  // border fill in output buffer, so we don't get pseudo lines at image frame
-  for(int j = 0; j < height; j++)
-    for(int i = 0; i < width; i++)
-    {
-      double val = out[(size_t)j * width + i];
-
-      if(j < khwidth)
-        val = out[(size_t)(khwidth - j) * width + i];
-      else if(j >= height - khwidth)
-        val = out[(size_t)(j - khwidth) * width + i];
-      else if(i < khwidth)
-        val = out[(size_t)j * width + (khwidth - i)];
-      else if(i >= width - khwidth)
-        val = out[(size_t)j * width + (i - khwidth)];
-
-      out[(size_t)j * width + i] = val;
-
-      // jump over center of image
-      if(i == khwidth && j >= khwidth && j < height - khwidth) i = width - khwidth;
-    }
+  darkroom_ashift_sobel_1d(in, out, width, height,
+      dir == ASHIFT_ENHANCE_HORIZONTAL ? 0 : 1);
+  darkroom_ashift_sobel_border(out, width, height);
 }
 
 // edge enhancement in both directions
@@ -1363,12 +1285,7 @@ static gboolean edge_enhance(const double *in,
   edge_enhance_1d(in, Gx, width, height, ASHIFT_ENHANCE_HORIZONTAL);
   edge_enhance_1d(in, Gy, width, height, ASHIFT_ENHANCE_VERTICAL);
 
-// calculate absolute values
-  DT_OMP_FOR()
-  for(size_t k = 0; k < (size_t)width * height; k++)
-  {
-    out[k] = sqrt(Gx[k] * Gx[k] + Gy[k] * Gy[k]);
-  }
+  darkroom_ashift_gradient_magnitude(Gx, Gy, out, (size_t)width * height);
 
   free(Gx);
   free(Gy);
@@ -1438,12 +1355,7 @@ static void gamma_correct(const float *const in,
                           const int height)
 {
   const size_t npixels = (size_t)width * height;
-  DT_OMP_FOR()
-  for(size_t index = 0; index < 4 * npixels; index += 4)
-  {
-    for_three_channels(c)
-      out[index+c] = powf(in[index+c], LSD_GAMMA);
-  }
+  darkroom_ashift_gamma_correct(in, out, npixels);
 }
 
 // do actual line_detection based on LSD algorithm and return results according

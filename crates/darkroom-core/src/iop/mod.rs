@@ -4,6 +4,7 @@
 //! implementing `IopProcess`. Migration order follows RUST_MIGRATION_PLAN.md.
 
 pub mod agx;
+pub mod ashift;
 pub mod basicadj;
 pub mod bloom;
 pub mod globaltonemap;

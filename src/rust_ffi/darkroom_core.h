@@ -1768,6 +1768,18 @@ void darkroom_interpolate_pixel4c(const float *in_buf, float *out,
  * ihomograph: 9-float row-major 3x3 inverse homography matrix.
  * cx/cy: clipping offsets (roi_out->scale * fullwidth * data->cl, etc.).
  * Matches ashift.c distort_mask (1-ch, CLIP) and process (4-ch) loops. */
+void darkroom_ashift_transform_coords(float *pts, size_t n,
+                                       const float *homograph, float cx, float cy);
+void darkroom_ashift_backtransform_coords(float *pts, size_t n,
+                                           const float *ihomograph, float cx, float cy);
+void darkroom_ashift_rgb_to_gray(const float *in_buf, double *out_buf, size_t npixels);
+void darkroom_ashift_sobel_1d(const double *in_buf, double *out_buf,
+                               int width, int height, int direction);
+void darkroom_ashift_sobel_border(double *buf, int width, int height);
+void darkroom_ashift_gradient_magnitude(const double *gx, const double *gy,
+                                         double *out, size_t n);
+void darkroom_ashift_gamma_correct(const float *in_buf, float *out_buf, size_t npixels);
+
 void darkroom_ashift_distort_mask(const float *in_buf, float *out_buf,
                                    int out_width, int out_height,
                                    float roi_out_x, float roi_out_y, float roi_out_scale,
