@@ -192,3 +192,174 @@ mod tests {
         assert_eq!(buf[2], orig[2]);
     }
 }
+
+// ── Gaussian pyramid (Phase 2z+56) ───────────────────────────────────────
+
+/// Mirror-reflect index outside [0, max] (half-sample boundary convention).
+/// Left: -x;  Right: 2*max+1-x.  Matches basecurve.c gauss_blur borders.
+#[inline(always)]
+fn bc_mirror(x: i32, max: i32) -> usize {
+    if x < 0 { (-x) as usize }
+    else if x > max { (2 * max + 1 - x) as usize }
+    else { x as usize }
+}
+
+/// 5-tap separable Gaussian blur for a 4-channel RGBA image.
+/// Kernel: [1/16, 4/16, 6/16, 4/16, 1/16]. In-place safe.
+/// Matches the two DT_OMP_FOR loops in basecurve.c::gauss_blur().
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_basecurve_gauss_blur(
+    input:  *const f32,
+    output: *mut f32,
+    wd:     usize,
+    ht:     usize,
+) {
+    const W: [f32; 5] = [1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.0];
+    let n   = wd * ht * 4;
+    let inp = std::slice::from_raw_parts(input, n);
+    let out = std::slice::from_raw_parts_mut(output, n);
+    let wdi = wd as i32;
+    let hti = ht as i32;
+
+    // Horizontal pass into temp buffer
+    let mut tmp = vec![0.0f32; n];
+    for j in 0..ht {
+        for i in 0..wd {
+            let b = (j * wd + i) * 4;
+            for c in 0..4 {
+                let mut s = 0.0f32;
+                for ii in -2i32..=2 {
+                    let si = bc_mirror(i as i32 + ii, wdi - 1);
+                    s += inp[(j * wd + si) * 4 + c] * W[(ii + 2) as usize];
+                }
+                tmp[b + c] = s;
+            }
+        }
+    }
+
+    // Vertical pass into output
+    for j in 0..ht {
+        for i in 0..wd {
+            let b = (j * wd + i) * 4;
+            for c in 0..4 {
+                let mut s = 0.0f32;
+                for jj in -2i32..=2 {
+                    let sj = bc_mirror(j as i32 + jj, hti - 1);
+                    s += tmp[(sj * wd + i) * 4 + c] * W[(jj + 2) as usize];
+                }
+                out[b + c] = s;
+            }
+        }
+    }
+}
+
+/// Gaussian pyramid upsampling: fill even pixels from coarse (×4), blur.
+/// Matches gauss_expand() in basecurve.c (DT_OMP_FOR(collapse(2)) + gauss_blur).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_basecurve_gauss_expand(
+    coarse: *const f32,
+    fine:   *mut f32,
+    wd:     usize,
+    ht:     usize,
+) {
+    let cw  = (wd - 1) / 2 + 1;
+    let ch  = (ht - 1) / 2 + 1;
+    let n   = wd * ht * 4;
+    let fin = std::slice::from_raw_parts_mut(fine, n);
+    let crs = std::slice::from_raw_parts(coarse, cw * ch * 4);
+
+    fin.fill(0.0);
+    for j in (0..ht).step_by(2) {
+        for i in (0..wd).step_by(2) {
+            let cb = (j / 2 * cw + i / 2) * 4;
+            let fb = (j * wd + i) * 4;
+            for c in 0..4 { fin[fb + c] = 4.0 * crs[cb + c]; }
+        }
+    }
+    darkroom_basecurve_gauss_blur(fine as *const f32, fine, wd, ht);
+}
+
+/// Weight update: col0_alpha *= 0.1 + ||out_rgb||. Matches basecurve.c:1193.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_basecurve_weight_update(
+    col0:    *mut f32,
+    out_buf: *const f32,
+    npixels: usize,
+) {
+    let col = std::slice::from_raw_parts_mut(col0, npixels * 4);
+    let out = std::slice::from_raw_parts(out_buf, npixels * 4);
+    for k in (0..npixels * 4).step_by(4) {
+        let mag = (out[k]*out[k] + out[k+1]*out[k+1] + out[k+2]*out[k+2]).sqrt();
+        col[k + 3] *= 0.1 + mag;
+    }
+}
+
+/// Blend one pyramid level into comb_k.
+/// is_base!=0: comb[c] += w*col[c];  is_base==0: comb[c] += w*(col[c]-out[c]).
+/// comb[3] += w always. Matches basecurve.c:1229.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_basecurve_pyramid_blend(
+    comb_k:  *mut f32,
+    col_k:   *const f32,
+    out_buf: *const f32,
+    npixels: usize,
+    is_base: i32,
+) {
+    let comb = std::slice::from_raw_parts_mut(comb_k, npixels * 4);
+    let col  = std::slice::from_raw_parts(col_k,  npixels * 4);
+    let out  = std::slice::from_raw_parts(out_buf, npixels * 4);
+    for x in (0..npixels * 4).step_by(4) {
+        let w = col[x + 3];
+        if is_base != 0 {
+            for c in 0..3 { comb[x+c] += w * col[x+c]; }
+        } else {
+            for c in 0..3 { comb[x+c] += w * (col[x+c] - out[x+c]); }
+        }
+        comb[x + 3] += w;
+    }
+}
+
+/// Normalize RGB by alpha: if comb[x+3] > 1e-8, divide comb[x..x+3] by it.
+/// Matches basecurve.c:1265.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_basecurve_normalize_alpha(
+    comb_k:  *mut f32,
+    npixels: usize,
+) {
+    let comb = std::slice::from_raw_parts_mut(comb_k, npixels * 4);
+    for x in (0..npixels * 4).step_by(4) {
+        let a = comb[x + 3];
+        if a > 1e-8 { for c in 0..3 { comb[x+c] /= a; } }
+    }
+}
+
+/// Add expanded coarser level to comb_k RGB. Matches basecurve.c:1273.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_basecurve_add_layers(
+    comb_k:  *mut f32,
+    out_buf: *const f32,
+    npixels: usize,
+) {
+    let comb = std::slice::from_raw_parts_mut(comb_k, npixels * 4);
+    let out  = std::slice::from_raw_parts(out_buf, npixels * 4);
+    for x in (0..npixels * 4).step_by(4) {
+        for c in 0..3 { comb[x+c] += out[x+c]; }
+    }
+}
+
+/// Copy comb0 RGB (clamped ≥ 0) + in alpha to output. Matches basecurve.c:1283.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_basecurve_copy_output(
+    comb0:   *const f32,
+    in_buf:  *const f32,
+    out_buf: *mut f32,
+    npixels: usize,
+) {
+    let comb = std::slice::from_raw_parts(comb0,   npixels * 4);
+    let inp  = std::slice::from_raw_parts(in_buf,  npixels * 4);
+    let out  = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+    for k in (0..npixels * 4).step_by(4) {
+        for c in 0..3 { out[k+c] = comb[k+c].max(0.0); }
+        out[k + 3] = inp[k + 3];
+    }
+}

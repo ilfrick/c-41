@@ -918,6 +918,20 @@ void darkroom_basecurve_apply_legacy_curve(const float *in_buf,
  */
 void darkroom_basecurve_compute_features(float *buf,
                                          size_t npixels);
+void darkroom_basecurve_gauss_blur(const float *input, float *output,
+                                    size_t wd, size_t ht);
+void darkroom_basecurve_gauss_expand(const float *coarse, float *fine,
+                                      size_t wd, size_t ht);
+void darkroom_basecurve_weight_update(float *col0, const float *out_buf,
+                                       size_t npixels);
+void darkroom_basecurve_pyramid_blend(float *comb_k, const float *col_k,
+                                       const float *out_buf, size_t npixels,
+                                       int is_base);
+void darkroom_basecurve_normalize_alpha(float *comb_k, size_t npixels);
+void darkroom_basecurve_add_layers(float *comb_k, const float *out_buf,
+                                    size_t npixels);
+void darkroom_basecurve_copy_output(const float *comb0, const float *in_buf,
+                                     float *out_buf, size_t npixels);
 
 /*
  * Hazeremoval IOP -- per-pixel dark channel.

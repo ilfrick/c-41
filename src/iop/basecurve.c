@@ -36,6 +36,7 @@
 #include "gui/accelerators.h"
 #include "iop/iop_api.h"
 #include "rust_ffi/darkroom_core.h"
+#include "rust_ffi/darkroom_core.h"
 
 #include <regex.h>
 #include <assert.h>
@@ -1026,46 +1027,7 @@ static inline void gauss_blur(
     const size_t wd,
     const size_t ht)
 {
-  const float w[5] = { 1.f / 16.f, 4.f / 16.f, 6.f / 16.f, 4.f / 16.f, 1.f / 16.f };
-  float *tmp = dt_alloc_align_float((size_t)4 * wd * ht);
-  dt_iop_image_fill(tmp, 0.0f, wd, ht, 4);
-  DT_OMP_FOR()
-  for(int j=0;j<ht;j++)
-  { // horizontal pass
-    // left borders
-    for(int i=0;i<2;i++)
-      for(int ii=-2;ii<=2;ii++)
-        for_four_channels(c)
-          tmp[4*(j*wd+i)+c] += input[4*(j*wd+MAX(-i-ii,i+ii))+c] * w[ii+2];
-    // most pixels
-    for(int i=2;i<wd-2;i++)
-      for(int ii=-2;ii<=2;ii++)
-        for_four_channels(c)
-          tmp[4*(j*wd+i)+c] += input[4*(j*wd+i+ii)+c] * w[ii+2];
-    // right borders
-    for(int i=wd-2;i<wd;i++)
-      for(int ii=-2;ii<=2;ii++)
-        for_four_channels(c)
-          tmp[4*(j*wd+i)+c] += input[4*(j*wd+MIN(i+ii, wd-(i+ii-wd+1) ))+c] * w[ii+2];
-  }
-  dt_iop_image_fill(output, 0.0f, wd, ht, 4);
-  DT_OMP_FOR()
-  for(int i=0;i<wd;i++)
-  { // vertical pass
-    for(int j=0;j<2;j++)
-      for(int jj=-2;jj<=2;jj++)
-        for_four_channels(c)
-          output[4*(j*wd+i)+c] += tmp[4*(MAX(-j-jj,j+jj)*wd+i)+c] * w[jj+2];
-    for(int j=2;j<ht-2;j++)
-      for(int jj=-2;jj<=2;jj++)
-        for_four_channels(c)
-          output[4*(j*wd+i)+c] += tmp[4*((j+jj)*wd+i)+c] * w[jj+2];
-    for(int j=ht-2;j<ht;j++)
-      for(int jj=-2;jj<=2;jj++)
-        for_four_channels(c)
-          output[4*(j*wd+i)+c] += tmp[4*(MIN(j+jj, ht-(j+jj-ht+1))*wd+i)+c] * w[jj+2];
-  }
-  dt_free_align(tmp);
+  darkroom_basecurve_gauss_blur(input, output, wd, ht);
 }
 
 static inline void gauss_expand(
@@ -1074,17 +1036,7 @@ static inline void gauss_expand(
     const size_t wd,          // fine res
     const size_t ht)
 {
-  const size_t cw = (wd-1)/2+1;
-  // fill numbers in even pixels, zero odd ones
-  dt_iop_image_fill(fine, 0.0f, wd, ht, 4);
-  DT_OMP_FOR(collapse(2))
-  for(int j=0;j<ht;j+=2)
-    for(int i=0;i<wd;i+=2)
-      for_four_channels(c)
-        fine[4*(j*wd+i)+c] = 4.0f * input[4*(j/2*cw + i/2)+c];
-
-  // convolve with same kernel weights mul by 4:
-  gauss_blur(fine, fine, wd, ht);
+  darkroom_basecurve_gauss_expand(input, fine, wd, ht);
 }
 
 // XXX FIXME: we'll need to pad up the image to get a good boundary condition!
@@ -1190,9 +1142,7 @@ void process_fusion(dt_iop_module_t *self,
     w = wd;
     h = ht;
     gauss_reduce(col[0], col[1], out, w, h);
-    DT_OMP_FOR()
-    for(size_t k = 0; k < 4ul * wd * ht; k += 4)
-      col[0][k + 3] *= .1f + sqrtf(out[k] * out[k] + out[k + 1] * out[k + 1] + out[k + 2] * out[k + 2]);
+    darkroom_basecurve_weight_update(col[0], out, (size_t)wd * ht);
 
 // #define DEBUG_VIS2
 #ifdef DEBUG_VIS2 // transform weights in channels
@@ -1226,26 +1176,8 @@ void process_fusion(dt_iop_module_t *self,
       if(k != num_levels - 1)
         gauss_expand(col[k + 1], out, w, h);
       const size_t npixels = (size_t)w * h;
-      DT_OMP_FOR()
-      for(size_t x = 0; x < 4 * npixels; x += 4)
-      {
-        // blend images into output pyramid
-        if(k == num_levels - 1) // blend gaussian base
-#ifdef DEBUG_VIS2
-          ;
-#else
-        {
-        for(int c = 0; c < 3; c++)
-          comb[k][x + c] += col[k][x + 3] * col[k][x + c];
-        }
-#endif
-        else // laplacian
-        {
-          for(int c = 0; c < 3; c++)
-            comb[k][x + c] += col[k][x + 3] * (col[k][x + c] - out[x + c]);
-        }
-        comb[k][x + 3] += col[k][x + 3];
-      }
+      darkroom_basecurve_pyramid_blend(comb[k], col[k], out, npixels,
+          k == num_levels - 1 ? 1 : 0);
     }
   }
 
@@ -1261,33 +1193,16 @@ void process_fusion(dt_iop_module_t *self,
       h = (h - 1) / 2 + 1;
     }
 
-    // normalise both gaussian base and laplacians:
-    DT_OMP_FOR()
-    for(size_t i = 0; i < (size_t)4 * w * h; i += 4)
-      if(comb[k][i + 3] > 1e-8f)
-        for(int c = 0; c < 3; c++) comb[k][i + c] /= comb[k][i + 3];
+    darkroom_basecurve_normalize_alpha(comb[k], (size_t)w * h);
 
     if(k < num_levels - 1)
     { // reconstruct output image
       gauss_expand(comb[k + 1], out, w, h);
-      DT_OMP_FOR()
-      for(size_t x = 0; x < (size_t)4 * h * w; x += 4)
-        {
-        for(int c = 0; c < 3; c++)
-          comb[k][x + c] += out[x + c];
-        }
+      darkroom_basecurve_add_layers(comb[k], out, (size_t)h * w);
     }
   }
 #endif
-  // copy output buffer
-  DT_OMP_FOR()
-  for(size_t k = 0; k < (size_t)4 * wd * ht; k += 4)
-  {
-    out[k + 0] = fmaxf(comb[0][k + 0], 0.f);
-    out[k + 1] = fmaxf(comb[0][k + 1], 0.f);
-    out[k + 2] = fmaxf(comb[0][k + 2], 0.f);
-    out[k + 3] = in[k + 3]; // pass on 4th channel
-  }
+  darkroom_basecurve_copy_output(comb[0], in, out, (size_t)wd * ht);
 
   // free temp buffers
 cleanup:
