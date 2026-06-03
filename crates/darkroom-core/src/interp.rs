@@ -142,6 +142,106 @@ pub fn compute_pixel4c(
     [pixel[0] * oonorm, pixel[1] * oonorm, pixel[2] * oonorm, pixel[3] * oonorm]
 }
 
+/// Compute one interpolated single-channel sample at fractional (x, y).
+///
+/// `linestride`: floats per image row (= width for single-channel).
+/// Equivalent to dt_interpolation_compute_sample with samplestride=1.
+pub fn compute_sample_1c(
+    in_buf: &[f32],
+    x: f32,
+    y: f32,
+    img_width: i32,
+    img_height: i32,
+    linestride: i32,
+    interp: u32,
+) -> f32 {
+    let hw  = half_width(interp);
+    let ksz = 2 * hw;
+    let mut kh = [0.0f32; 6];
+    let mut kv = [0.0f32; 6];
+    let ix = x.floor() as i32;
+    let iy = y.floor() as i32;
+    let norm_h = make_kernel(&mut kh[..ksz], x - (ix - hw as i32 + 1) as f32, hw, interp);
+    let norm_v = make_kernel(&mut kv[..ksz], y - (iy - hw as i32 + 1) as f32, hw, interp);
+    let oonorm  = 1.0 / (norm_h * norm_v);
+    let start_x = ix - hw as i32 + 1;
+    let start_y = iy - hw as i32 + 1;
+    let max_x   = img_width  - 1;
+    let max_y   = img_height - 1;
+    let mut acc = 0.0f32;
+    for i in 0..ksz {
+        let py   = mirror(start_y + i as i32, max_y) as usize;
+        let mut h = 0.0f32;
+        for j in 0..ksz {
+            let px  = mirror(start_x + j as i32, max_x) as usize;
+            h += kh[j] * in_buf[py * linestride as usize + px];
+        }
+        acc += kv[i] * h;
+    }
+    acc * oonorm
+}
+
+/// 4-channel scale resampling: maps each output pixel (i, j) to (i*x_scale, j*y_scale)
+/// in the input and interpolates. Matches the DT_OMP_FOR in scalepixels.c::process().
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_scalepixels_process(
+    in_buf:      *const f32,
+    out_buf:     *mut f32,
+    out_width:   i32,
+    out_height:  i32,
+    in_width:    i32,
+    in_height:   i32,
+    x_scale:     f32,
+    y_scale:     f32,
+    interp_type: u32,
+) {
+    if out_width <= 0 || out_height <= 0 { return; }
+    let inp  = std::slice::from_raw_parts(in_buf, (in_width * in_height * 4) as usize);
+    let outp = std::slice::from_raw_parts_mut(out_buf, (out_width * out_height * 4) as usize);
+    let ls   = in_width * 4;
+    for j in 0..out_height as usize {
+        for i in 0..out_width as usize {
+            let x = i as f32 * x_scale;
+            let y = j as f32 * y_scale;
+            if x >= 0.0 && y >= 0.0 && x < in_width as f32 && y < in_height as f32 {
+                let px = compute_pixel4c(inp, x, y, in_width, in_height, ls, interp_type);
+                let b  = (j * out_width as usize + i) * 4;
+                outp[b] = px[0]; outp[b+1] = px[1]; outp[b+2] = px[2]; outp[b+3] = px[3];
+            } else {
+                let b = (j * out_width as usize + i) * 4;
+                outp[b] = 0.0; outp[b+1] = 0.0; outp[b+2] = 0.0; outp[b+3] = 0.0;
+            }
+        }
+    }
+}
+
+/// 1-channel scale resampling with CLIP: maps (i,j) -> (i*x_scale, j*y_scale).
+/// Matches the DT_OMP_FOR(collapse(2)) in scalepixels.c::distort_mask().
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_scalepixels_distort_mask(
+    in_buf:      *const f32,
+    out_buf:     *mut f32,
+    out_width:   i32,
+    out_height:  i32,
+    in_width:    i32,
+    in_height:   i32,
+    x_scale:     f32,
+    y_scale:     f32,
+    interp_type: u32,
+) {
+    if out_width <= 0 || out_height <= 0 { return; }
+    let inp  = std::slice::from_raw_parts(in_buf, (in_width * in_height) as usize);
+    let outp = std::slice::from_raw_parts_mut(out_buf, (out_width * out_height) as usize);
+    for row in 0..out_height as usize {
+        for col in 0..out_width as usize {
+            let x = col as f32 * x_scale;
+            let y = row as f32 * y_scale;
+            let v = compute_sample_1c(inp, x, y, in_width, in_height, in_width, interp_type);
+            outp[row * out_width as usize + col] = v.clamp(0.0, 1.0);
+        }
+    }
+}
+
 /// FFI wrapper for `compute_pixel4c`.
 ///
 /// `interp_type`: 0=bilinear, 1=bicubic, 2=lanczos2, 3=lanczos3

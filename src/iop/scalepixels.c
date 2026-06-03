@@ -16,6 +16,7 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "rust_ffi/darkroom_core.h"
 #include "bauhaus/bauhaus.h"
 #include "common/interpolation.h"
 #include "develop/imageop.h"
@@ -165,16 +166,9 @@ void distort_mask(dt_iop_module_t *self,
   const float x_scale = (roi_in->width * 1.0f) / (roi_out->width * 1.0f);
   const float y_scale = (roi_in->height * 1.0f) / (roi_out->height * 1.0f);
 
-  DT_OMP_FOR(collapse(2))
-  for(int row = 0; row < roi_out->height; row++)
-  {
-    for(int col = 0; col < roi_out->width; col++)
-    {
-      const float x = col * x_scale;
-      const float y = row * y_scale;
-      out[ow * row + col] = CLIP(dt_interpolation_compute_sample(iter, in, x, y, iw, ih, 1, iw));
-    }
-  }
+  darkroom_scalepixels_distort_mask(in, out, roi_out->width, roi_out->height,
+                                      iw, ih, x_scale, y_scale,
+                                      (unsigned int)iter->id);
 }
 
 void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop_roi_t *roi_out,
@@ -233,20 +227,11 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   const float x_scale = (roi_in->width * 1.0f) / (roi_out->width * 1.0f);
   const float y_scale = (roi_in->height * 1.0f) / (roi_out->height * 1.0f);
 
-  DT_OMP_FOR()
-  // (slow) point-by-point transformation.
-  // TODO: optimize with scanlines and linear steps between?
-  for(int j = 0; j < roi_out->height; j++)
-  {
-    float *out = ((float *)ovoid) + (size_t)4 * j * roi_out->width;
-    for(int i = 0; i < roi_out->width; i++, out += 4)
-    {
-      const float x = i * x_scale;
-      const float y = j * y_scale;
-      dt_interpolation_compute_pixel4c(interpolation, (float *)ivoid, out, x, y, roi_in->width,
-                                       roi_in->height, ch_width);
-    }
-  }
+  darkroom_scalepixels_process((const float *)ivoid, (float *)ovoid,
+                                roi_out->width, roi_out->height,
+                                roi_in->width, roi_in->height,
+                                x_scale, y_scale,
+                                (unsigned int)interpolation->id);
 }
 
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *params, dt_dev_pixelpipe_t *pipe,

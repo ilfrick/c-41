@@ -1764,6 +1764,17 @@ void darkroom_interpolate_pixel4c(const float *in_buf, float *out,
  * samples the input with the given interpolator, zeroes out-of-bounds pixels.
  * m: 4-float 2x2 rotation matrix (d->m).
  * interp_type: same encoding as darkroom_interpolate_pixel4c. */
+void darkroom_scalepixels_process(const float *in_buf, float *out_buf,
+                                   int out_width, int out_height,
+                                   int in_width, int in_height,
+                                   float x_scale, float y_scale,
+                                   unsigned int interp_type);
+void darkroom_scalepixels_distort_mask(const float *in_buf, float *out_buf,
+                                        int out_width, int out_height,
+                                        int in_width, int in_height,
+                                        float x_scale, float y_scale,
+                                        unsigned int interp_type);
+
 void darkroom_rotatepixels_process(const float *in_buf, float *out_buf,
                                     int out_width, int out_height,
                                     float roi_out_x, float roi_out_y,
