@@ -21,6 +21,9 @@ pub fn run() -> Result<glib::ExitCode> {
     let app = Application::builder()
         .application_id(APP_ID)
         .build();
+    // Register app-level keyboard accelerators
+    app.set_accels_for_action("win.import", &["<Control>i"]);
+    app.set_accels_for_action("win.export-selected", &["<Control>e"]);
     app.connect_activate(build_main_window);
     Ok(app.run())
 }
@@ -163,6 +166,45 @@ fn build_main_window(app: &Application) {
                 }
             }));
         }
+    }
+
+    // ── Window actions for keyboard shortcuts ──────────────────────────────
+    {
+        // win.import — Ctrl+I
+        let db         = db_path.clone();
+        let toast_fn   = make_toast.clone();
+        let import_act = gtk4::gio::SimpleAction::new("import", None);
+        import_act.connect_activate(clone!(@weak window, @weak lt_model => move |_, _| {
+            let db_inner    = db.clone();
+            let toast_inner = toast_fn.clone();
+            dialogs::show_import_dialog(
+                window.upcast_ref::<gtk4::Window>(),
+                db.clone(),
+                clone!(@weak lt_model, @strong db_inner => move || {
+                    lighttable::lighttable_load_from_db(&lt_model, &db_inner);
+                }),
+                toast_inner,
+            );
+        }));
+        window.add_action(&import_act);
+
+        // win.export-selected — Ctrl+E
+        let toast_fn2   = make_toast.clone();
+        let export_act  = gtk4::gio::SimpleAction::new("export-selected", None);
+        export_act.connect_activate(clone!(@weak lt_model, @weak lt_selection, @weak window => move |_, _| {
+            let pos = lt_selection.selected();
+            let paths: Vec<String> = lt_model.item(pos)
+                .and_downcast::<gtk4::StringObject>()
+                .map(|o| o.string().to_string())
+                .filter(|p| p.contains('/'))
+                .into_iter().collect();
+            dialogs::show_export_dialog(
+                window.upcast_ref::<gtk4::Window>(),
+                paths,
+                toast_fn2.clone(),
+            );
+        }));
+        window.add_action(&export_act);
     }
 
     // ── Wire toast overlay + present ───────────────────────────────────────
