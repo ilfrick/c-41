@@ -252,29 +252,16 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   assert(ch == 4);
 
   const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const dt_iop_rotatepixels_data_t *d = piece->data;
 
-  DT_OMP_FOR()
-  // (slow) point-by-point transformation.
-  // TODO: optimize with scanlines and linear steps between?
-  for(int j = 0; j < roi_out->height; j++)
-  {
-    float *out = ((float *)ovoid) + (size_t)ch * j * roi_out->width;
-    for(int i = 0; i < roi_out->width; i++, out += ch)
-    {
-      float pi[2], po[2];
-
-      pi[0] = roi_out->x + i;
-      pi[1] = roi_out->y + j;
-
-      backtransform(piece, scale, pi, po);
-
-      po[0] -= roi_in->x;
-      po[1] -= roi_in->y;
-
-      dt_interpolation_compute_pixel4c(interpolation, (float *)ivoid, out, po[0], po[1], roi_in->width,
-                                       roi_in->height, ch_width);
-    }
-  }
+  darkroom_rotatepixels_process(
+      (const float *)ivoid, (float *)ovoid,
+      roi_out->width, roi_out->height,
+      (float)roi_out->x, (float)roi_out->y,
+      roi_in->width, roi_in->height,
+      (float)roi_in->x, (float)roi_in->y,
+      scale, d->m, d->rx, d->ry,
+      (unsigned int)interpolation->id);
 }
 
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,

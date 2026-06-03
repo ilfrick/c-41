@@ -263,6 +263,77 @@ pub unsafe extern "C" fn darkroom_geom_unrotate_coords(
     }
 }
 
+/// Full rotatepixels process() loop.
+///
+/// For each output pixel (i, j):
+///   pi  = (roi_out_x + i, roi_out_y + j)
+///   po  = M^T * pi + (rx, ry) * scale      (inverse rotation / backtransform)
+///   po -= (roi_in_x, roi_in_y)              (convert to roi-relative coords)
+///   if po in [0, in_w) x [0, in_h): sample in_buf with interpolator
+///   else: zero the output pixel
+///
+/// `m`: 4-float 2x2 rotation matrix (d->m, row-major).
+/// `in_width/in_height`: roi_in dimensions (NOT full image).
+/// `interp_type`: 0=bilinear 1=bicubic 2=lanczos2 3=lanczos3.
+/// Matches the DT_OMP_FOR in src/iop/rotatepixels.c:256.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_rotatepixels_process(
+    in_buf:      *const f32,
+    out_buf:     *mut f32,
+    out_width:   i32,
+    out_height:  i32,
+    roi_out_x:   f32,
+    roi_out_y:   f32,
+    in_width:    i32,
+    in_height:   i32,
+    roi_in_x:    f32,
+    roi_in_y:    f32,
+    scale:       f32,
+    m:           *const f32,
+    rx:          f32,
+    ry:          f32,
+    interp_type: u32,
+) {
+    if out_width <= 0 || out_height <= 0 { return; }
+    let inp  = std::slice::from_raw_parts(in_buf, (in_width * in_height * 4) as usize);
+    let outp = std::slice::from_raw_parts_mut(out_buf, (out_width * out_height * 4) as usize);
+    let mref = std::slice::from_raw_parts(m, 4);
+
+    // Transpose of 2x2 rotation matrix with sign convention from C backtransform():
+    //   rt = {m[0], -m[1], -m[2], m[3]}
+    let rt = [mref[0], -mref[1], -mref[2], mref[3]];
+
+    let ls = in_width * 4; // linestride in floats
+    let iw = in_width  as f32;
+    let ih = in_height as f32;
+
+    for j in 0..out_height as usize {
+        let piy = roi_out_y + j as f32;
+        for i in 0..out_width as usize {
+            let pix = roi_out_x + i as f32;
+
+            let pox = rt[0] * pix + rt[1] * piy + rx * scale - roi_in_x;
+            let poy = rt[2] * pix + rt[3] * piy + ry * scale - roi_in_y;
+
+            let base = (j * out_width as usize + i) * 4;
+            if pox >= 0.0 && poy >= 0.0 && pox < iw && poy < ih {
+                let px = crate::interp::compute_pixel4c(
+                    inp, pox, poy, in_width, in_height, ls, interp_type,
+                );
+                outp[base]     = px[0];
+                outp[base + 1] = px[1];
+                outp[base + 2] = px[2];
+                outp[base + 3] = px[3];
+            } else {
+                outp[base]     = 0.0;
+                outp[base + 1] = 0.0;
+                outp[base + 2] = 0.0;
+                outp[base + 3] = 0.0;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

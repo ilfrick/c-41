@@ -1752,6 +1752,27 @@ void darkroom_geom_blit_rows(const float *in_buf, float *out_buf,
  * pi = (x - rx*scale, y - ry*scale); o = M * pi.
  * m is [m00,m01,m10,m11] (row-major).
  * Matches distort_transform in src/iop/rotatepixels.c:138. */
+/* 2D separable pixel interpolation -- Rust port of dt_interpolation_compute_pixel4c().
+ * interp_type: 0=bilinear, 1=bicubic, 2=lanczos2, 3=lanczos3.
+ * linestride: floats per image row (= width * 4 for RGBA). */
+void darkroom_interpolate_pixel4c(const float *in_buf, float *out,
+                                   float x, float y,
+                                   int img_width, int img_height,
+                                   int linestride, unsigned int interp_type);
+
+/* Full rotatepixels process() loop: back-transforms each output coordinate,
+ * samples the input with the given interpolator, zeroes out-of-bounds pixels.
+ * m: 4-float 2x2 rotation matrix (d->m).
+ * interp_type: same encoding as darkroom_interpolate_pixel4c. */
+void darkroom_rotatepixels_process(const float *in_buf, float *out_buf,
+                                    int out_width, int out_height,
+                                    float roi_out_x, float roi_out_y,
+                                    int in_width, int in_height,
+                                    float roi_in_x, float roi_in_y,
+                                    float scale,
+                                    const float *m, float rx, float ry,
+                                    unsigned int interp_type);
+
 void darkroom_geom_rotate_coords(float *pts, size_t points_count,
                                   const float *m,
                                   float rx, float ry, float scale);
