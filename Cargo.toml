@@ -13,6 +13,7 @@ anyhow       = "1"
 rayon        = "1"
 rusqlite     = { version = "0.31", features = ["bundled"] }
 tracing      = "0.1"
+walkdir      = "2"
 darkroom-sys  = { path = "crates/darkroom-sys" }
 darkroom-core = { path = "crates/darkroom-core" }
 darkroom-db   = { path = "crates/darkroom-db" }

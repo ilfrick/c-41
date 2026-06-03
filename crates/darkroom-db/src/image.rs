@@ -113,6 +113,34 @@ pub fn image_count_all(conn: &Connection) -> rusqlite::Result<i32> {
     conn.query_row("SELECT COUNT(*) FROM main.images", [], |row| row.get(0))
 }
 
+/// Insert a new image record. Returns the new image id.
+/// Skips insertion if an image with the same film_id and filename already exists.
+pub fn image_insert(
+    conn: &Connection,
+    film_id: i32,
+    filename: &str,
+    width: i32,
+    height: i32,
+) -> rusqlite::Result<dt_imgid_t> {
+    // Return existing id if already present
+    let existing: Option<dt_imgid_t> = conn
+        .query_row(
+            "SELECT id FROM main.images WHERE film_id = ?1 AND filename = ?2",
+            params![film_id, filename],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO main.images (film_id, filename, width, height, flags) \
+         VALUES (?1, ?2, ?3, ?4, 0)",
+        params![film_id, filename, width, height],
+    )?;
+    Ok(conn.last_insert_rowid() as dt_imgid_t)
+}
+
 /// Return the film_id for a given image.
 pub fn image_get_film_id(conn: &Connection, imgid: dt_imgid_t) -> rusqlite::Result<Option<i32>> {
     conn.query_row(

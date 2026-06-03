@@ -14,3 +14,4 @@ adw           = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 glib          = "0.20"
 gio           = "0.20"
 rusqlite      = { workspace = true }
+walkdir       = { workspace = true }

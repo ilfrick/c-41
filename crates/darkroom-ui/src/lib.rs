@@ -78,6 +78,28 @@ fn build_main_window(app: &Application) {
     let lt_header = adw::HeaderBar::new();
     lt_header.set_title_widget(Some(&adw::WindowTitle::new("Darkroom", "Lighttable")));
 
+    // Import button
+    let import_btn = gtk4::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Import folder (Ctrl+I)")
+        .build();
+    {
+        let db = db_path.clone();
+        import_btn.connect_clicked(clone!(@weak window, @weak lt_model => move |_| {
+            let db_inner = db.clone();
+            dialogs::show_import_dialog(
+                window.upcast_ref::<gtk4::Window>(),
+                db.clone(),
+                clone!(@weak lt_model, @strong db_inner => move || {
+                    crate::lighttable::lighttable_load_from_db(
+                        &lt_model, &db_inner,
+                    );
+                }),
+            );
+        }));
+    }
+    lt_header.pack_start(&import_btn);
+
     let lt_toolbar = adw::ToolbarView::new();
     lt_toolbar.add_top_bar(&lt_header);
     lt_toolbar.set_content(Some(&hbox));
