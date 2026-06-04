@@ -1647,6 +1647,16 @@ void darkroom_gamma_display_false_color_simple(const float *in_buf,
  * interpolatef(mix, in[j+3], luma) = mix*(alpha - luma) + luma. */
 void darkroom_gamma_mask_display(const float *in_buf, unsigned char *out_buf,
                                   size_t buffsize, float alpha, float mix);
+void darkroom_gamma_display_a_channel(const float *in_buf, unsigned char *out_buf,
+                                       size_t buffsize, float alpha);
+void darkroom_gamma_display_b_channel(const float *in_buf, unsigned char *out_buf,
+                                       size_t buffsize, float alpha);
+void darkroom_gamma_display_lch_h(const float *in_buf, unsigned char *out_buf,
+                                   size_t buffsize, float alpha);
+void darkroom_gamma_display_hsl_h(const float *in_buf, unsigned char *out_buf,
+                                   size_t buffsize, float alpha);
+void darkroom_gamma_display_jz_hz(const float *in_buf, unsigned char *out_buf,
+                                   size_t buffsize, float alpha);
 
 /* Blurs IOP -- restore alpha channel after Gaussian blur overwrites it.
  * out[k*4+3] = in[k*4+3] for k in 0..npixels.

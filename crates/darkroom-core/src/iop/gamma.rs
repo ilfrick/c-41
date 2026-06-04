@@ -242,3 +242,100 @@ mod tests {
         assert_eq!(out[1], out[2]);
     }
 }
+
+// ── Channel display helpers (gamma.c Phase 2z+64) ────────────────────────
+
+#[inline(always)]
+fn write_pixel_bgr(pixel: [f32; 4], out: &mut [u8], offset: usize, alpha: f32) {
+    for c in 0..3usize {
+        let v = srgb_gamma(pixel[c]) * (1.0 - alpha) + MASK_COLOR[c] * alpha;
+        out[offset + 2 - c] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Channel display: synthetic Lab from 'a' channel → XYZ → sRGB (with overlay).
+/// Matches _channel_display_false_color DT_OMP_FOR_SIMD at gamma.c:128.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_gamma_display_a_channel(
+    in_buf: *const f32, out_buf: *mut u8, buffsize: usize, alpha: f32,
+) {
+    let inp = std::slice::from_raw_parts(in_buf, buffsize);
+    let out = std::slice::from_raw_parts_mut(out_buf, buffsize);
+    for j in (0..buffsize).step_by(4) {
+        let value = (inp[j+1]*256.0 - 128.0).clamp(-56.0, 56.0);
+        let lab = [79.0 - value*(11.0/56.0), value, 0.0, 0.0];
+        let xyz  = crate::color::lab_to_xyz(lab);
+        let srgb = crate::color::xyz_d50_to_srgb(xyz);
+        let px   = crate::color::normalize_color(srgb, 0.75);
+        write_pixel_bgr(px, out, j, inp[j+3]*alpha);
+    }
+}
+
+/// Channel display: synthetic Lab from 'b' channel → XYZ → sRGB.
+/// Matches _channel_display_false_color DT_OMP_FOR_SIMD at gamma.c:143.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_gamma_display_b_channel(
+    in_buf: *const f32, out_buf: *mut u8, buffsize: usize, alpha: f32,
+) {
+    let inp = std::slice::from_raw_parts(in_buf, buffsize);
+    let out = std::slice::from_raw_parts_mut(out_buf, buffsize);
+    for j in (0..buffsize).step_by(4) {
+        let value = (inp[j+1]*256.0 - 128.0).clamp(-65.0, 65.0);
+        let lab = [60.0 + value*(2.0/65.0), 0.0, value, 0.0];
+        let xyz  = crate::color::lab_to_xyz(lab);
+        let srgb = crate::color::xyz_d50_to_srgb(xyz);
+        let px   = crate::color::normalize_color(srgb, 0.75);
+        write_pixel_bgr(px, out, j, inp[j+3]*alpha);
+    }
+}
+
+/// Channel display: LCH hue → Lab → XYZ → sRGB.
+/// Matches _channel_display_false_color DT_OMP_FOR_SIMD at gamma.c:171.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_gamma_display_lch_h(
+    in_buf: *const f32, out_buf: *mut u8, buffsize: usize, alpha: f32,
+) {
+    let inp = std::slice::from_raw_parts(in_buf, buffsize);
+    let out = std::slice::from_raw_parts_mut(out_buf, buffsize);
+    for j in (0..buffsize).step_by(4) {
+        let lch  = [65.0f32, 37.0, inp[j+1], 0.0];
+        let lab  = crate::color::lch_to_lab(lch);
+        let xyz  = crate::color::lab_to_xyz(lab);
+        let srgb = crate::color::xyz_d50_to_srgb(xyz);
+        let px   = crate::color::normalize_color(srgb, 0.75);
+        write_pixel_bgr(px, out, j, inp[j+3]*alpha);
+    }
+}
+
+/// Channel display: HSL hue → RGB (normalized).
+/// Matches _channel_display_false_color DT_OMP_FOR at gamma.c:184.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_gamma_display_hsl_h(
+    in_buf: *const f32, out_buf: *mut u8, buffsize: usize, alpha: f32,
+) {
+    let inp = std::slice::from_raw_parts(in_buf, buffsize);
+    let out = std::slice::from_raw_parts_mut(out_buf, buffsize);
+    for j in (0..buffsize).step_by(4) {
+        let (r,g,b,_) = crate::color::hsl2rgb(inp[j+1], 0.5, 0.5);
+        let px = crate::color::normalize_color([r,g,b,0.0], 0.75);
+        write_pixel_bgr(px, out, j, inp[j+3]*alpha);
+    }
+}
+
+/// Channel display: JzCzhz hue → JzAzBz → XYZ D65 → sRGB.
+/// Matches _channel_display_false_color DT_OMP_FOR at gamma.c:195.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_gamma_display_jz_hz(
+    in_buf: *const f32, out_buf: *mut u8, buffsize: usize, alpha: f32,
+) {
+    let inp = std::slice::from_raw_parts(in_buf, buffsize);
+    let out = std::slice::from_raw_parts_mut(out_buf, buffsize);
+    for j in (0..buffsize).step_by(4) {
+        let jzczhz  = [0.011f32, 0.01, inp[j+1], 0.0];
+        let jzazbz  = crate::color::jzczhz_to_jzazbz(jzczhz);
+        let xyz_d65 = crate::color::jzazbz_to_xyz_d65(jzazbz);
+        let srgb    = crate::color::xyz_d65_to_srgb(xyz_d65);
+        let px      = crate::color::normalize_color(srgb, 0.75);
+        write_pixel_bgr(px, out, j, inp[j+3]*alpha);
+    }
+}

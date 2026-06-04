@@ -125,33 +125,10 @@ static void _channel_display_false_color(const float *const restrict in,
   switch(channel & DT_DEV_PIXELPIPE_DISPLAY_ANY & ~DT_DEV_PIXELPIPE_DISPLAY_OUTPUT)
   {
     case DT_DEV_PIXELPIPE_DISPLAY_a:
-      DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        dt_aligned_pixel_t xyz;
-        dt_aligned_pixel_t pixel;
-        // colors with "a" exceeding the range [-56,56] range will
-        // yield colors not representable in sRGB
-        const float value = fminf(fmaxf(in[j + 1] * 256.0f - 128.0f, -56.0f), 56.0f);
-        const dt_aligned_pixel_t lab = { 79.0f - value * (11.0f / 56.0f), value, 0.0f, 0.0f };
-        dt_Lab_to_XYZ(lab, xyz);
-        _XYZ_to_REC_709_normalized(xyz, pixel, 0.75f);
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_a_channel(in, out, buffsize, alpha);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_b:
-      DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        dt_aligned_pixel_t xyz, pixel;
-        // colors with "b" exceeding the range [-65,65] range will
-        // yield colors not representable in sRGB
-        const float value = fminf(fmaxf(in[j + 1] * 256.0f - 128.0f, -65.0f), 65.0f);
-        const dt_aligned_pixel_t lab = { 60.0f + value * (2.0f / 65.0f), 0.0f, value, 0.0f };
-        dt_Lab_to_XYZ(lab, xyz);
-        _XYZ_to_REC_709_normalized(xyz, pixel, 0.75f);
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_b_channel(in, out, buffsize, alpha);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_R:
       darkroom_gamma_display_false_color_simple(in, out, buffsize, alpha, 0);
@@ -168,43 +145,13 @@ static void _channel_display_false_color(const float *const restrict in,
       darkroom_gamma_display_false_color_simple(in, out, buffsize, alpha, 3);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_LCH_h:
-      DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        dt_aligned_pixel_t lch = { 65.0f, 37.0f, in[j + 1], 0.0f };
-        dt_aligned_pixel_t lab, xyz, pixel;
-        dt_LCH_2_Lab(lch, lab);
-        lab[3] = 0.0f;
-        dt_Lab_to_XYZ(lab, xyz);
-        _XYZ_to_REC_709_normalized(xyz, pixel, 0.75f);
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_lch_h(in, out, buffsize, alpha);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_HSL_H:
-      DT_OMP_FOR()
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        dt_aligned_pixel_t hsl = { in[j + 1], 0.5f, 0.5f, 0.0f };
-        dt_aligned_pixel_t pixel;
-        dt_HSL_2_RGB(hsl, pixel);
-        _normalize_color(pixel, 0.75f);
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_hsl_h(in, out, buffsize, alpha);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_hz:
-      DT_OMP_FOR()
-      for(size_t j = 0; j < buffsize; j += 4)
-      {
-        const dt_aligned_pixel_t JzCzhz = { 0.011f, 0.01f, in[j + 1] };
-        dt_aligned_pixel_t JzAzBz;
-        dt_aligned_pixel_t XYZ_D65;
-        dt_aligned_pixel_t pixel;
-        dt_JzCzhz_2_JzAzBz(JzCzhz, JzAzBz);
-        dt_JzAzBz_2_XYZ(JzAzBz, XYZ_D65);
-        dt_XYZ_to_Rec709_D65(XYZ_D65, pixel);
-        _normalize_color(pixel, 0.75f);
-        _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
-      }
+      darkroom_gamma_display_jz_hz(in, out, buffsize, alpha);
       break;
     case DT_DEV_PIXELPIPE_DISPLAY_L:
     case DT_DEV_PIXELPIPE_DISPLAY_GRAY:

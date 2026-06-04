@@ -141,6 +141,76 @@ pub fn xyz_d50_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], xyz[3]]
 }
 
+/// XYZ D65 → linear sRGB (matches dt_XYZ_to_Rec709_D65).
+pub fn xyz_d65_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
+    const M: [[f32; 3]; 3] = [
+        [ 3.2404542, -0.9692660,  0.0556434],
+        [-1.5371385,  1.8760108, -0.2040259],
+        [-0.4985314,  0.0415560,  1.0572252],
+    ];
+    let rgb: [f32; 3] = std::array::from_fn(|r|
+        M[0][r]*xyz[0] + M[1][r]*xyz[1] + M[2][r]*xyz[2]
+    );
+    [rgb[0], rgb[1], rgb[2], xyz[3]]
+}
+
+/// Polar LCh → Cartesian Lab (h is normalized 0..1, same as dt_LCH_2_Lab).
+pub fn lch_to_lab(lch: [f32; 4]) -> [f32; 4] {
+    let h = lch[2] * std::f32::consts::TAU;
+    [lch[0], lch[1] * h.cos(), lch[1] * h.sin(), lch[3]]
+}
+
+/// Polar JzCzhz → Cartesian JzAzBz (matches dt_JzCzhz_2_JzAzBz).
+pub fn jzczhz_to_jzazbz(jzczhz: [f32; 4]) -> [f32; 4] {
+    let h = jzczhz[2] * std::f32::consts::TAU;
+    [jzczhz[0], h.cos()*jzczhz[1], h.sin()*jzczhz[1], jzczhz[3]]
+}
+
+/// JzAzBz → XYZ D65 via ICtCp/PQ inverse (matches dt_JzAzBz_2_XYZ).
+pub fn jzazbz_to_xyz_d65(v: [f32; 4]) -> [f32; 4] {
+    const B: f32 = 1.15; const G: f32 = 0.66;
+    const C1: f32 = 0.8359375; const C2: f32 = 18.8515625; const C3: f32 = 18.6875;
+    const N_INV: f32 = 1.0 / 0.159301758;
+    const P_INV: f32 = 1.0 / 134.034375;
+    const D: f32 = -0.56; const D0: f32 = 1.6295499532821566e-11;
+    const AI: [[f32; 3]; 3] = [
+        [1.0,                 1.0,                  1.0               ],
+        [0.1386050432715393, -0.1386050432715393,  -0.0960192420263190],
+        [0.0580473161561189, -0.0580473161561189,  -0.8118918960560390],
+    ];
+    const MI: [[f32; 3]; 3] = [
+        [ 1.9242264357876067,  0.3503167620949991, -0.0909828109828475],
+        [-1.0047923125953657,  0.7264811939316552, -0.3127282905230739],
+        [ 0.0376514040306180, -0.0653844229480850,  1.5227665613052603],
+    ];
+    let mut iz = v[0] + D0;
+    iz = (iz / (1.0 + D - D * iz)).max(0.0);
+    let iaz = [iz, v[1], v[2]];
+    // iaz → LMS via AI (transposed convention: lms[r] = sum_c AI[c][r]*iaz[c])
+    let mut lms: [f32; 3] = std::array::from_fn(|r|
+        AI[0][r]*iaz[0] + AI[1][r]*iaz[1] + AI[2][r]*iaz[2]
+    );
+    for l in &mut lms { *l = l.max(0.0).powf(P_INV); }
+    for l in &mut lms { *l = (C1 - *l) / (C3 * *l - C2); }
+    for l in &mut lms { *l = (10000.0 * l.max(0.0).powf(N_INV)); }
+    // lms → X'Y'Z via MI
+    let xyz_p: [f32; 3] = std::array::from_fn(|r|
+        MI[0][r]*lms[0] + MI[1][r]*lms[1] + MI[2][r]*lms[2]
+    );
+    let x = (xyz_p[0] + (B-1.0)*xyz_p[2]) / B;
+    let y = (xyz_p[1] + (G-1.0)*x) / G;
+    [x, y, xyz_p[2], v[3]]
+}
+
+/// Normalize an RGB pixel so max(R,G,B) = norm (matches _normalize_color).
+pub fn normalize_color(pixel: [f32; 4], norm: f32) -> [f32; 4] {
+    let m = pixel[0].max(pixel[1]).max(pixel[2]);
+    if m > 0.0 {
+        let f = norm / m;
+        [pixel[0]*f, pixel[1]*f, pixel[2]*f, pixel[3]]
+    } else { pixel }
+}
+
 /// Batch linear sRGB → Lab. Matches dt_Rec709_to_XYZ_D50 + dt_XYZ_to_Lab per pixel.
 /// Used by ashift.c:1317 and retouch.c:3053.
 #[no_mangle]
