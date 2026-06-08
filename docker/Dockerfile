@@ -53,7 +53,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rm -rf /root/.rustup/toolchains/*/share/doc
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-RUN git clone --recurse-submodules --depth 1 -b ${DARKROOM_BRANCH} ${DARKROOM_REPO} /src
+# CACHEBUST invalidates the git-clone layer (and everything after it) whenever
+# the source changes. Without it, `RUN git clone -b master` is cached by command
+# string alone, so Docker keeps a stale checkout even after master advances —
+# the image would be silently rebuilt from old source. CI passes the commit SHA.
+ARG CACHEBUST=unknown
+RUN echo "source revision: ${CACHEBUST}" \
+    && git clone --recurse-submodules --depth 1 -b ${DARKROOM_BRANCH} ${DARKROOM_REPO} /src
 
 WORKDIR /src
 
