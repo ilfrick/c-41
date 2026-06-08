@@ -51,9 +51,11 @@ pub unsafe extern "C" fn darkroom_cacorrectrgb_normalize_manifolds(
     // Hard guard rather than a silent clamp. Production builds reach this
     // function through the C FFI; a mis-wired call passing guide >= 3
     // would otherwise corrupt every pixel without raising a signal. Bail
-    // out cleanly and leave the caller's buffers untouched.
+    // out cleanly and leave the caller's buffers untouched. NB: we must not
+    // panic here — this is an `extern "C"` boundary, so a panic (even a
+    // debug_assert) is a non-unwinding abort rather than something a caller
+    // or test can catch.
     if guide >= 3 {
-        debug_assert!(false, "guide channel must be 0..=2; got {guide}");
         return;
     }
     let guide = guide as usize;
@@ -626,16 +628,12 @@ mod tests {
         let mut hi = vec![5.0_f32, 6.0, 7.0, 8.0];
         let lo_orig = lo.clone();
         let hi_orig = hi.clone();
-        // Wrap in catch_unwind to swallow the debug_assert! panic that fires
-        // in debug builds but not release.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unsafe {
-                darkroom_cacorrectrgb_normalize_manifolds(
-                    inp.as_ptr(), lo.as_mut_ptr(), hi.as_mut_ptr(),
-                    1, 1, 7, // out of range
-                );
-            }
-        }));
+        unsafe {
+            darkroom_cacorrectrgb_normalize_manifolds(
+                inp.as_ptr(), lo.as_mut_ptr(), hi.as_mut_ptr(),
+                1, 1, 7, // out of range
+            );
+        }
         assert_eq!(lo, lo_orig);
         assert_eq!(hi, hi_orig);
     }

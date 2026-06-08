@@ -61,7 +61,14 @@ pub unsafe extern "C" fn darkroom_colorchecker_process(
     let input = std::slice::from_raw_parts(in_buf, npixels * 4);
     let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
 
-    let sources_slice = std::slice::from_raw_parts(sources, num_patches * 4);
+    // `sources` may legitimately be NULL when there are no patches (the loop
+    // below never reads it in that case). `slice::from_raw_parts` is UB on a
+    // null pointer even for length 0, so hand back an empty slice instead.
+    let sources_slice = if num_patches == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(sources, num_patches * 4)
+    };
     let patches_slice = std::slice::from_raw_parts(patches, (num_patches + 1) * 4);
     let pl = std::slice::from_raw_parts(polynomial_l, 3);
     let pa = std::slice::from_raw_parts(polynomial_a, 3);
