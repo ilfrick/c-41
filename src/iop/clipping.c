@@ -926,7 +926,6 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   const dt_iop_clipping_data_t *d = piece->data;
 
   const int ch = 4;
-  const int ch_width = ch * roi_in->width;
 
   // only crop, no rot fast and sharp path:
   if(!d->flags && d->angle == 0.0 && d->all_off && roi_in->width == roi_out->width

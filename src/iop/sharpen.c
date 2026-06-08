@@ -28,6 +28,7 @@
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>

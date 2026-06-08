@@ -119,9 +119,6 @@ static void _channel_display_false_color(const float *const restrict in,
                                          const float alpha,
                                          dt_dev_pixelpipe_display_mask_t channel)
 {
-  // yellow, "unused" element aids vectorization
-  const dt_aligned_pixel_t mask_color = { 1.0f, 1.0f, 0.0f };
-
   switch(channel & DT_DEV_PIXELPIPE_DISPLAY_ANY & ~DT_DEV_PIXELPIPE_DISPLAY_OUTPUT)
   {
     case DT_DEV_PIXELPIPE_DISPLAY_a:
