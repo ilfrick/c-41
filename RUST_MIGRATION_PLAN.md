@@ -41,7 +41,7 @@ blocking infrastructure lands.
 `invert`, `levels`, `liquify`, `lowlight`, `lowpass`, `lut3d`, `monochrome`,
 `negadoctor`, `overexposed` (all 4 modes), `overlay`, `primaries`,
 `profile_gamma`, `rasterfile`, `rawdenoise`, `rawprepare`,
-`relight`, `rgbcurve`, `rgblevels`, `shadhi`, `sigmoid`, `soften`,
+`relight`, `rgbcurve`, `rgblevels`, `shadhi`, `sharpen`, `sigmoid`, `soften`,
 `splittoning`, `temperature`, `toneequal` (main process loop is
 `#else`-guarded dead code since `DT_TONEEQ_USE_LUT=TRUE`),
 `useless`, `velvia`, `vibrance`, `vignette`, `watermark`.
@@ -74,7 +74,7 @@ Commit-params LUT builders migrated:
 `ashift` (11), `basecurve` (9), `clipping` (4), `colorbalancergb` (4),
 `colorin` (5), `colorreconstruction` (3), `denoiseprofile` (6),
 `liquify` (6), `rawoverexposed` (2), `retouch` (9),
-`sharpen` (1), `zonesystem` (4).
+`zonesystem` (4).
 
 These depend on `dt_interpolation_*`, 3D bilateral grid, NLM/wavelet, perspective
 matrices, or per-pixel ICC transforms not yet ported to Rust.
@@ -85,7 +85,7 @@ matrices, or per-pixel ICC transforms not yet ported to Rust.
 |---|---|
 | `dt_interpolation_*` | scalepixels, rotatepixels process(), demosaic |
 | 3D bilateral grid | colorreconstruction |
-| NLM + wavelet | denoiseprofile, nlmeans, sharpen |
+| NLM + wavelet | denoiseprofile, nlmeans |
 | `dt_dev_distort_backtransform_plus` | rawoverexposed |
 | Keystone / perspective 3x3 | clipping, ashift |
 | Filmlight Yrg / `work_profile` callbacks | filmicrgb main loops, basecurve, colorin |

@@ -264,16 +264,6 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
     return;
   }
 
-  float *restrict tmp;	// one row per thread
-  size_t padded_size;
-  if(!dt_iop_alloc_image_buffers(self, roi_in, roi_out,
-                                  1 | DT_IMGSZ_WIDTH | DT_IMGSZ_PERTHREAD, &tmp, &padded_size,
-                                  0))
-  {
-    dt_iop_copy_image_roi(ovoid, ivoid, 4, roi_in, roi_out);
-    return;
-  }
-
   const int wd = 2 * rad + 1;
   const int wd4 = (wd & 3) ? (wd >> 2) + 1 : wd >> 2;
 
@@ -288,82 +278,14 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
     return;
   }
   const float *const restrict in = (float*)ivoid;
+  float *const restrict out = (float*)ovoid;
   const size_t width = roi_out->width;
-  DT_OMP_FOR()
-  for(int j = 0; j < roi_out->height; j++)
-  {
-    // We skip the top and bottom 'rad' rows because the kernel would extend beyond the edge of the image, resulting
-    // in an incomplete summation.
-    if(j < rad || j >= roi_out->height - rad)
-    {
-      // fill in the top/bottom border with unchanged luma values from the input image.
-      const float *const restrict row_in = in + (size_t)4 * j * width;
-      float *const restrict row_out = ((float*)ovoid) + (size_t)4 * j * width;
-      memcpy(row_out, row_in, 4 * sizeof(float) * width);
-      continue;
-    }
-    // Get a thread-local temporary buffer for processing the current row of the image.
-    float *const restrict temp_buf = dt_get_perthread(tmp, padded_size);
-    // vertically blur the pixels of the current row into the temp buffer
-    const size_t start_row = j-rad;
-    const size_t end_row = j+rad;
-    const size_t end_bulk = width & ~(size_t)3;
-    // do the bulk of the row four at a time
-    for(size_t i = 0; i < end_bulk; i += 4)
-    {
-      dt_aligned_pixel_t sum = { 0.0f };
-      for(size_t k = start_row; k <= end_row; k++)
-      {
-        const size_t k_adj = k - start_row;
-        for_four_channels(c,aligned(in))
-          sum[c] += mat[k_adj] * in[4*(k*width+i+c)];
-      }
-      float *const vblurred = temp_buf + i;
-      for_four_channels(c,aligned(vblurred))
-        vblurred[c] = sum[c];
-    }
-    // do the leftover 0-3 pixels of the row
-    for(size_t i = end_bulk; i < width; i++)
-    {
-      float sum = 0.0f;
-      for(size_t k = start_row; k <= end_row; k++)
-      {
-        const size_t k_adj = k - start_row;
-        sum += mat[k_adj] * in[4*(k*width+i)];
-      }
-      temp_buf[i] = sum;
-    }
+  const size_t height = roi_out->height;
 
-    // now horizontally blur the already vertically-blurred pixels from the temp buffer to the final output buffer
-    // we can skip the left-most and right-most pixels for the same reason as we skipped the top and bottom borders.
-    float *const restrict row_out = ((float*)ovoid) + (size_t)4 * j * width;
-    for(int i = 0; i < rad; i++)
-      copy_pixel(row_out + 4*i, in + 4*(j*width+i));  //copy unsharpened border pixel
-    const float threshold = data->threshold;
-    const float amount = data->amount;
-    for(int i = rad; i < roi_out->width - rad; i++)
-    {
-      float sum = 0.0f;
-      for(int k = i-rad; k <= i+rad; k++)
-      {
-        const int k_adj = k - (i-rad);
-        sum += mat[k_adj] * temp_buf[k];
-      }
-      // subtract the blurred pixel's luma from the original input pixel's luma
-      const size_t index = 4 * (j * width + i);
-      const float diff = in[index] - sum;
-      const float absdiff = fabs(diff);
-      const float detail = (absdiff > threshold) ? copysignf(MAX(absdiff - threshold, 0.0f), diff) : 0.0f;
-      row_out[4*i] = in[index] + detail * amount;
-      row_out[4*i + 1] = in[index + 1];
-      row_out[4*i + 2] = in[index + 2];
-    }
-    for(int i = roi_out->width - rad; i < roi_out->width; i++)
-      copy_pixel(row_out + 4*i, in + 4*(j*width+i));  //copy unsharpened border pixel
-  }
+  // Separable Gaussian blur + unsharp mask of the luma channel (Rust FFI).
+  darkroom_sharpen_process(in, out, mat, width, height, rad, data->threshold, data->amount);
 
   dt_free_align(mat);
-  dt_free_align(tmp);
 }
 
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,

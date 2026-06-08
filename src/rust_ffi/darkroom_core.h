@@ -564,6 +564,24 @@ void darkroom_soften_process(const float *in_buf,
                              float saturation);
 
 /*
+ * Sharpen IOP — separable Gaussian blur + unsharp mask.
+ *
+ * Replaces the DT_OMP_FOR row loop in src/iop/sharpen.c::process().
+ * `mat` is the Gaussian kernel built by init_gaussian_kernel(); the first
+ * 2*rad + 1 taps are used. Luma (channel 0) is sharpened; chroma (1, 2) pass
+ * through; alpha (3) is left untouched in the interior and copied on borders.
+ * Caller guarantees rad >= 1 and width/height >= 2*rad + 1.
+ */
+void darkroom_sharpen_process(const float *in_buf,
+                              float *out_buf,
+                              const float *mat,
+                              size_t width,
+                              size_t height,
+                              int rad,
+                              float threshold,
+                              float amount);
+
+/*
  * Shadows/Highlights IOP pixel loop.
  *
  * Replaces the DT_OMP_FOR loop in src/iop/shadhi.c::process().

@@ -23,6 +23,7 @@ pub mod filmic;
 pub mod lowpass;
 pub mod shadhi;
 pub mod soften;
+pub mod sharpen;
 pub mod colisa;
 pub mod colorcontrast;
 pub mod colorcorrection;
