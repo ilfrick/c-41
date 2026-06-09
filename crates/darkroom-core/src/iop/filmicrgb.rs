@@ -428,6 +428,182 @@ pub unsafe extern "C" fn darkroom_filmicrgb_split_v2_v3(
     );
 }
 
+// ── Chroma-preservation path (ratio-preserving norm tone mapping) ─────────────
+
+const INVERSE_SQRT_3: f32 = 0.5773502691896258;
+
+/// `(|R|³+|G|³+|B|³) / max(|R|²+|G|²+|B|², 1e-12)` — matches pixel_rgb_norm_power().
+#[inline(always)]
+fn pixel_rgb_norm_power(p: [f32; 4]) -> f32 {
+    let mut num = 0.0f32;
+    let mut den = 0.0f32;
+    for c in 0..3 {
+        let v = p[c].abs();
+        let sq = v * v;
+        num += sq * v;
+        den += sq;
+    }
+    num / den.max(1e-12)
+}
+
+/// Pixel norm dispatch — matches get_pixel_norm(). Variant values mirror
+/// dt_iop_filmicrgb_methods_type_t (1=max,2=luminance,3=power,4/5=euclidean).
+#[inline(always)]
+fn get_pixel_norm(p: [f32; 4], variant: i32, wp: &Option<WorkProfile>) -> f32 {
+    match variant {
+        1 => p[0].max(p[1]).max(p[2]),
+        3 => pixel_rgb_norm_power(p),
+        4 => (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt(),
+        5 => (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() * INVERSE_SQRT_3,
+        // 2 (LUMINANCE) and the default both use the profile luminance.
+        _ => luminance(p, wp),
+    }
+}
+
+/// Chroma-preserving tone mapping, colour-science v1.
+/// Replaces the DT_OMP_FOR loop in filmic_chroma_v1() (filmicrgb.c).
+///
+/// # Safety
+/// Same buffer/pointer contract as `darkroom_filmicrgb_split_v1`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_filmicrgb_chroma_v1(
+    in_buf: *const f32, out_buf: *mut f32, npixels: usize, variant: i32,
+    has_work_profile: i32, matrix_in: *const f32,
+    lut0: *const f32, lut1: *const f32, lut2: *const f32, unbounded_in: *const f32,
+    lutsize: i32, nonlinearlut: i32,
+    grey: f32, black: f32, dynamic_range: f32,
+    sigma_toe: f32, sigma_shoulder: f32, saturation: f32, output_power: f32,
+    m1: *const f32, m2: *const f32, m3: *const f32, m4: *const f32, m5: *const f32,
+    latitude_min: f32, latitude_max: f32, type0: i32, type1: i32,
+) {
+    let wp = make_work_profile(
+        has_work_profile != 0, matrix_in, lut0, lut1, lut2, unbounded_in,
+        lutsize as usize, nonlinearlut != 0,
+    );
+    let (m1, m2, m3, m4, m5) = (
+        std::slice::from_raw_parts(m1, 4), std::slice::from_raw_parts(m2, 4),
+        std::slice::from_raw_parts(m3, 4), std::slice::from_raw_parts(m4, 4),
+        std::slice::from_raw_parts(m5, 4),
+    );
+    let input = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+
+    for k in 0..npixels {
+        let base = k * 4;
+        let pix_in = [input[base], input[base + 1], input[base + 2], input[base + 3]];
+        let mut norm = get_pixel_norm(pix_in, variant, &wp).max(NORM_MIN);
+
+        let mut ratios = [0.0f32; 4];
+        for c in 0..4 {
+            ratios[c] = pix_in[c] / norm;
+        }
+        let min_ratios = ratios[0].min(ratios[1]).min(ratios[2]);
+        if min_ratios < 0.0 {
+            for r in ratios.iter_mut() {
+                *r -= min_ratios;
+            }
+        }
+
+        norm = log_tonemapping_v1(norm, grey, black, dynamic_range);
+        let desaturation = filmic_desaturate_v1(norm, sigma_toe, sigma_shoulder, saturation);
+
+        for r in ratios.iter_mut() {
+            *r *= norm;
+        }
+        let lum = luminance(ratios, &wp);
+        for r in ratios.iter_mut() {
+            *r = linear_saturation(*r, lum, desaturation) / norm;
+        }
+
+        let s = clamp01(filmic_spline(norm, m1, m2, m3, m4, m5, latitude_min, latitude_max, type0, type1));
+        norm = s.powf(output_power); // scalar libm powf, matching the C chroma path
+        // channel 3 (alpha) is carried through the ratio math, not zeroed, to
+        // match the C `for_each_channel` 4-wide default (alpha is unused downstream).
+        for c in 0..4 {
+            output[base + c] = ratios[c] * norm;
+        }
+    }
+}
+
+/// Chroma-preserving tone mapping, colour-science v2/v3.
+/// Replaces the DT_OMP_FOR loop in filmic_chroma_v2_v3() (filmicrgb.c).
+/// `colorscience_version == 2` selects the v3 re-normalisation branch.
+///
+/// # Safety
+/// Same buffer/pointer contract as `darkroom_filmicrgb_split_v1`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_filmicrgb_chroma_v2_v3(
+    in_buf: *const f32, out_buf: *mut f32, npixels: usize, variant: i32,
+    colorscience_version: i32,
+    has_work_profile: i32, matrix_in: *const f32,
+    lut0: *const f32, lut1: *const f32, lut2: *const f32, unbounded_in: *const f32,
+    lutsize: i32, nonlinearlut: i32,
+    grey: f32, black: f32, dynamic_range: f32,
+    sigma_toe: f32, sigma_shoulder: f32, saturation: f32, output_power: f32,
+    m1: *const f32, m2: *const f32, m3: *const f32, m4: *const f32, m5: *const f32,
+    latitude_min: f32, latitude_max: f32, type0: i32, type1: i32,
+) {
+    let wp = make_work_profile(
+        has_work_profile != 0, matrix_in, lut0, lut1, lut2, unbounded_in,
+        lutsize as usize, nonlinearlut != 0,
+    );
+    let (m1, m2, m3, m4, m5) = (
+        std::slice::from_raw_parts(m1, 4), std::slice::from_raw_parts(m2, 4),
+        std::slice::from_raw_parts(m3, 4), std::slice::from_raw_parts(m4, 4),
+        std::slice::from_raw_parts(m5, 4),
+    );
+    let is_v3 = colorscience_version == 2; // DT_FILMIC_COLORSCIENCE_V3
+    let input = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+
+    for k in 0..npixels {
+        let base = k * 4;
+        let pix_in = [input[base], input[base + 1], input[base + 2], input[base + 3]];
+        let mut norm = get_pixel_norm(pix_in, variant, &wp).max(NORM_MIN);
+
+        let mut ratios = [0.0f32; 4];
+        for c in 0..4 {
+            ratios[c] = pix_in[c] / norm;
+        }
+        let min_ratios = ratios[0].min(ratios[1]).min(ratios[2]);
+        if min_ratios < 0.0 {
+            for r in ratios.iter_mut() {
+                *r -= min_ratios;
+            }
+        }
+
+        norm = log_tonemapping_v2(norm, grey, black, dynamic_range); // == log_tonemapping_v2_1ch
+        let desaturation = filmic_desaturate_v2(norm, sigma_toe, sigma_shoulder, saturation);
+
+        let s = clamp01(filmic_spline(norm, m1, m2, m3, m4, m5, latitude_min, latitude_max, type0, type1));
+        norm = s.powf(output_power);
+
+        for r in ratios.iter_mut() {
+            *r = (*r + (1.0 - *r) * (1.0 - desaturation)).max(0.0);
+        }
+        if is_v3 {
+            norm /= get_pixel_norm(ratios, variant, &wp).max(NORM_MIN);
+        }
+
+        // channel 3 (alpha) carried through the ratio math (not zeroed), matching
+        // the C `for_each_channel` 4-wide default; alpha is unused downstream.
+        let mut pix_out = [0.0f32; 4];
+        for c in 0..4 {
+            pix_out[c] = ratios[c] * norm;
+        }
+        let max_pix = pix_out[0].max(pix_out[1]).max(pix_out[2]);
+        if max_pix > 1.0 {
+            for c in 0..4 {
+                ratios[c] = (ratios[c] + (1.0 - max_pix)).max(0.0);
+                pix_out[c] = clamp01(ratios[c] * norm);
+            }
+        }
+        output[base..base + 4].copy_from_slice(&pix_out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +787,64 @@ mod tests {
         for c in 0..3 {
             assert!(o1[c].is_finite() && (0.0..=1.0).contains(&o1[c]), "v1 c={c} {o1:?}");
             assert!(o2[c].is_finite() && (0.0..=1.0).contains(&o2[c]), "v2 c={c} {o2:?}");
+        }
+    }
+
+    #[test]
+    fn get_pixel_norm_variants() {
+        let p = [0.2f32, 0.5, 0.1, 1.0];
+        let none = None;
+        assert!((get_pixel_norm(p, 1, &none) - 0.5).abs() < 1e-6); // max
+        // power: (.2³+.5³+.1³)/(.2²+.5²+.1²)
+        let num = 0.2f32.powi(3) + 0.5f32.powi(3) + 0.1f32.powi(3);
+        let den = 0.2f32.powi(2) + 0.5f32.powi(2) + 0.1f32.powi(2);
+        assert!((get_pixel_norm(p, 3, &none) - num / den).abs() < 1e-6);
+        // euclidean v1 vs v2 differ by 1/sqrt(3)
+        let e1 = get_pixel_norm(p, 4, &none);
+        let e2 = get_pixel_norm(p, 5, &none);
+        assert!((e2 - e1 * INVERSE_SQRT_3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chroma_v1_grey_pixel_preserves_neutrality() {
+        // grey input -> ratios all 1 -> output channels equal (still neutral).
+        let input = [0.18f32, 0.18, 0.18, 1.0];
+        let mut out = [0f32; 4];
+        let m1 = [0.0, 0.0, 0.0, 0.0];
+        let m2 = [0.0, 0.0, 1.0, 0.0];
+        let z = [0.0f32; 4];
+        unsafe {
+            darkroom_filmicrgb_chroma_v1(
+                input.as_ptr(), out.as_mut_ptr(), 1, 3, // POWER_NORM
+                0, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(), 0, 0, 0.18, -5.0, 8.0, 0.2, 0.2, 1.0, 1.0,
+                m1.as_ptr(), m2.as_ptr(), z.as_ptr(), z.as_ptr(), z.as_ptr(), 0.0, 1.0, 0, 0,
+            );
+        }
+        assert!((out[0] - out[1]).abs() < 1e-5 && (out[1] - out[2]).abs() < 1e-5, "{out:?}");
+        for c in 0..3 {
+            assert!(out[c].is_finite(), "c={c} {out:?}");
+        }
+    }
+
+    #[test]
+    fn chroma_v2_v3_gamut_maps_and_stays_bounded() {
+        // bright saturated input should be gamut-mapped to <= 1 by the penalty.
+        let input = [2.0f32, 0.1, 0.05, 1.0];
+        let mut out = [0f32; 4];
+        let m1 = [0.0, 0.0, 0.0, 0.0];
+        let m2 = [0.0, 0.0, 1.0, 0.0];
+        let z = [0.0f32; 4];
+        unsafe {
+            darkroom_filmicrgb_chroma_v2_v3(
+                input.as_ptr(), out.as_mut_ptr(), 1, 1, 2, // MAX_RGB, colorscience V3
+                0, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(), 0, 0, 0.18, -5.0, 8.0, 0.2, 0.2, 1.0, 1.0,
+                m1.as_ptr(), m2.as_ptr(), z.as_ptr(), z.as_ptr(), z.as_ptr(), 0.0, 1.0, 0, 0,
+            );
+        }
+        for c in 0..3 {
+            assert!(out[c].is_finite() && out[c] <= 1.0 + 1e-6 && out[c] >= 0.0, "c={c} {out:?}");
         }
     }
 }

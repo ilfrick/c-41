@@ -1405,53 +1405,22 @@ static inline void filmic_chroma_v1(const float *const restrict in, float *const
                                     const dt_iop_filmic_rgb_spline_t spline, const int variant, const size_t width,
                                     const size_t height)
 {
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width * 4; k += 4)
-  {
-    const float *const restrict pix_in = in + k;
-
-    dt_aligned_pixel_t ratios = { 0.0f, 0.0f, 0.0f, 0.0f };
-    float norm = MAX(get_pixel_norm(pix_in, variant, work_profile), NORM_MIN);
-
-    // Save the ratios
-    for_each_channel(c,aligned(pix_in))
-      ratios[c] = pix_in[c] / norm;
-
-    // Sanitize the ratios
-    const float min_ratios = MIN(MIN(ratios[0], ratios[1]), ratios[2]);
-    if(min_ratios < 0.0f)
-      for_each_channel(c) ratios[c] -= min_ratios;
-
-    // Log tone-mapping
-    norm = log_tonemapping_v1(norm, data->grey_source, data->black_source, data->dynamic_range);
-
-    // Get the desaturation value based on the log value
-    const float desaturation = filmic_desaturate_v1(norm, data->sigma_toe, data->sigma_shoulder, data->saturation);
-
-    for_each_channel(c) ratios[c] *= norm;
-
-    const float lum = (work_profile) ? dt_ioppr_get_rgb_matrix_luminance(
-                          ratios, work_profile->matrix_in, work_profile->lut_in, work_profile->unbounded_coeffs_in,
-                          work_profile->lutsize, work_profile->nonlinearlut)
-                                     : dt_camera_rgb_luminance(ratios);
-
-    // Desaturate on the non-linear parts of the curve and save ratios
-    for_each_channel(c, aligned(ratios))
-      ratios[c] = linear_saturation(ratios[c], lum, desaturation) / norm;
-
-    // Filmic S curve on the max RGB
-    // Apply the transfer function of the display
-    norm = powf(clamp_simd(filmic_spline(norm, spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
-                                         spline.latitude_min, spline.latitude_max, spline.type)),
-                data->output_power);
-
-    // Re-apply ratios
-    dt_aligned_pixel_t pix_out;
-    for_each_channel(c,aligned(ratios,pix_out))
-      pix_out[c] = ratios[c] * norm;
-    copy_pixel_nontemporal(out + k, pix_out);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  // chroma-preserving tone mapping, colour-science v1 (Rust FFI).
+  const int has_wp = (work_profile != NULL);
+  darkroom_filmicrgb_chroma_v1(
+      in, out, (size_t)width * height, variant,
+      has_wp,
+      has_wp ? (const float *)work_profile->matrix_in : NULL,
+      has_wp ? work_profile->lut_in[0] : NULL,
+      has_wp ? work_profile->lut_in[1] : NULL,
+      has_wp ? work_profile->lut_in[2] : NULL,
+      has_wp ? (const float *)work_profile->unbounded_coeffs_in : NULL,
+      has_wp ? work_profile->lutsize : 0,
+      has_wp ? work_profile->nonlinearlut : 0,
+      data->grey_source, data->black_source, data->dynamic_range,
+      data->sigma_toe, data->sigma_shoulder, data->saturation, data->output_power,
+      spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
+      spline.latitude_min, spline.latitude_max, spline.type[0], spline.type[1]);
 }
 
 
@@ -1465,67 +1434,22 @@ static inline void filmic_chroma_v2_v3(const float *const restrict in,
                                        const size_t height,
                                        const dt_iop_filmicrgb_colorscience_type_t colorscience_version)
 {
-  DT_OMP_FOR()
-  for(size_t k = 0; k < 4 * height * width; k += 4)
-  {
-    const float *const restrict pix_in = in + k;
-    float norm = MAX(get_pixel_norm(pix_in, variant, work_profile), NORM_MIN);
-
-    // Save the ratios
-    dt_aligned_pixel_t ratios = { 0.0f };
-
-    for_each_channel(c,aligned(pix_in))
-      ratios[c] = pix_in[c] / norm;
-
-    // Sanitize the ratios
-    const float min_ratios = MIN(MIN(ratios[0], ratios[1]), ratios[2]);
-    const int sanitize = (min_ratios < 0.0f);
-
-    if(sanitize)
-      for_each_channel(c)
-        ratios[c] -= min_ratios;
-
-    // Log tone-mapping
-    norm = log_tonemapping_v2_1ch(norm, data->grey_source, data->black_source, data->dynamic_range);
-
-    // Get the desaturation value based on the log value
-    const float desaturation = filmic_desaturate_v2(norm, data->sigma_toe, data->sigma_shoulder, data->saturation);
-
-    // Filmic S curve on the max RGB
-    // Apply the transfer function of the display
-    norm = powf(CLIP(filmic_spline(norm, spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
-                                   spline.latitude_min, spline.latitude_max, spline.type)),
-                data->output_power);
-
-    // Re-apply ratios with saturation change
-    for_each_channel(c, aligned(ratios))
-      ratios[c] = MAX(ratios[c] + (1.0f - ratios[c]) * (1.0f - desaturation), 0.0f);
-
-    // color science v3: normalize again after desaturation - the norm might have changed by the desaturation
-    // operation.
-    if(colorscience_version == DT_FILMIC_COLORSCIENCE_V3)
-      norm /= MAX(get_pixel_norm(ratios, variant, work_profile), NORM_MIN);
-
-    dt_aligned_pixel_t pix_out;
-    for_each_channel(c,aligned(pix_out))
-      pix_out[c] = ratios[c] * norm;
-
-    // Gamut mapping
-    const float max_pix = max3f(pix_out);
-    const int penalize = (max_pix > 1.0f);
-
-    // Penalize the ratios by the amount of clipping
-    if(penalize)
-    {
-      for_each_channel(c,aligned(pix_out))
-      {
-        ratios[c] = fmaxf(ratios[c] + (1.0f - max_pix), 0.0f);
-        pix_out[c] = CLIP(ratios[c] * norm);
-      }
-    }
-    copy_pixel_nontemporal(out + k, pix_out);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  // chroma-preserving tone mapping, colour-science v2/v3 (Rust FFI).
+  const int has_wp = (work_profile != NULL);
+  darkroom_filmicrgb_chroma_v2_v3(
+      in, out, (size_t)width * height, variant, (int)colorscience_version,
+      has_wp,
+      has_wp ? (const float *)work_profile->matrix_in : NULL,
+      has_wp ? work_profile->lut_in[0] : NULL,
+      has_wp ? work_profile->lut_in[1] : NULL,
+      has_wp ? work_profile->lut_in[2] : NULL,
+      has_wp ? (const float *)work_profile->unbounded_coeffs_in : NULL,
+      has_wp ? work_profile->lutsize : 0,
+      has_wp ? work_profile->nonlinearlut : 0,
+      data->grey_source, data->black_source, data->dynamic_range,
+      data->sigma_toe, data->sigma_shoulder, data->saturation, data->output_power,
+      spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
+      spline.latitude_min, spline.latitude_max, spline.type[0], spline.type[1]);
 }
 
 
