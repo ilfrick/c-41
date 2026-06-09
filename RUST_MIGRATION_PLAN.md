@@ -19,7 +19,7 @@ application runnable throughout.
 | Unit tests passing | **356** |
 | IOP `.rs` files | 93 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+66` (zonesystem GUI preview loops migrated) |
+| Last patch | `Phase 2z+67` (basecurve apply_curve / preserve-colors migrated) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -31,7 +31,7 @@ blocking infrastructure lands.
 
 #### Fully migrated IOPs (all active OMP loops -> Rust, 0 remain in C)
 
-`agx`, `atrous`, `basicadj`, `bloom`, `cacorrect`, `cacorrectrgb`,
+`agx`, `atrous`, `basecurve`, `basicadj`, `bloom`, `cacorrect`, `cacorrectrgb`,
 `censorize`, `channelmixer`, `clahe`, `clipping`,
 `colorbalance`, `colorchecker`, `colorcontrast`, `colorcorrection`,
 `colorize`, `colormapping`, `colorzones`, `defringe`, `denoiseprofile`,
@@ -71,7 +71,7 @@ Commit-params LUT builders migrated:
 
 #### Stubs only -- fully blocked
 
-`ashift` (11), `basecurve` (9), `clipping` (4), `colorbalancergb` (4),
+`ashift` (11), `clipping` (4), `colorbalancergb` (4),
 `colorin` (5), `colorreconstruction` (3), `denoiseprofile` (6),
 `liquify` (6), `rawoverexposed` (2), `retouch` (9).
 
@@ -87,7 +87,7 @@ matrices, or per-pixel ICC transforms not yet ported to Rust.
 | NLM + wavelet | denoiseprofile, nlmeans |
 | `dt_dev_distort_backtransform_plus` | rawoverexposed |
 | Keystone / perspective 3x3 | clipping, ashift |
-| Filmlight Yrg / `work_profile` callbacks | filmicrgb main loops, basecurve, colorin |
+| Filmlight Yrg / `work_profile` callbacks | filmicrgb main loops, colorin |
 | GUI-only loops | colorbalancergb (2), toneequal GUI LUT |
 
 #### Shared darkroom-core modules

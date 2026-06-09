@@ -74,6 +74,111 @@ pub unsafe extern "C" fn darkroom_basecurve_apply_legacy_curve(
     }
 }
 
+/// Tone curve with colour preservation (the `preserve_colors != NONE` path).
+///
+/// Matches apply_curve() in src/iop/basecurve.c. Per pixel it computes
+/// `lum = mul * dt_rgb_norm(rgb, preserve_colors, work_profile)`, maps it through
+/// the shared curve (`table` for `lum < 1`, else `eval_exp(unbounded_coeffs, lum)`),
+/// and scales all three channels by `mul * curve_lum / lum`. Alpha passes through.
+///
+/// Only the LUMINANCE norm (mode 1) consults the working ICC profile; the other
+/// norms are profile-independent. Work-profile fields are passed flat and may be
+/// NULL when `has_work_profile == 0` (LUMINANCE then falls back to the camera
+/// primaries, matching dt_camera_rgb_luminance):
+///   * `matrix_in`     — 16 floats (`[4][4]`; only the Y row is read)
+///   * `lut0/lut1/lut2` — `lutsize` floats each (only read when `nonlinearlut != 0`)
+///   * `unbounded_in`  — 9 floats (`[3][3]`; per-channel TRC extrapolation)
+///
+/// # Safety
+/// Pointers must be valid for the documented lengths. The work-profile pointers
+/// may be NULL only when `has_work_profile == 0` (and the luts only when
+/// `nonlinearlut == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_basecurve_apply_curve(
+    in_buf: *const f32,
+    out_buf: *mut f32,
+    npixels: usize,
+    mul: f32,
+    preserve_colors: i32,
+    table: *const f32,
+    unbounded_coeffs: *const f32,
+    has_work_profile: i32,
+    matrix_in: *const f32,
+    lut0: *const f32,
+    lut1: *const f32,
+    lut2: *const f32,
+    unbounded_in: *const f32,
+    lutsize: i32,
+    nonlinearlut: i32,
+) {
+    use crate::color;
+    let input = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+    let tbl = std::slice::from_raw_parts(table, LUT_SIZE);
+    let curve_ub = std::slice::from_raw_parts(unbounded_coeffs, 3);
+
+    let has_wp = has_work_profile != 0;
+    let nonlinear = nonlinearlut != 0;
+    let lutsize = lutsize as usize;
+
+    // Hoist work-profile views — constant across all pixels.
+    let matrix = if has_wp {
+        Some(&*(matrix_in as *const [[f32; 4]; 4]))
+    } else {
+        None
+    };
+    let trc = if has_wp && nonlinear {
+        let l0 = std::slice::from_raw_parts(lut0, lutsize);
+        let l1 = std::slice::from_raw_parts(lut1, lutsize);
+        let l2 = std::slice::from_raw_parts(lut2, lutsize);
+        let ub = std::slice::from_raw_parts(unbounded_in, 9);
+        Some(([l0, l1, l2], [&ub[0..3], &ub[3..6], &ub[6..9]]))
+    } else {
+        None
+    };
+
+    for k in 0..npixels {
+        let base = k * 4;
+        let r = input[base];
+        let g = input[base + 1];
+        let b = input[base + 2];
+
+        // dt_rgb_norm: only LUMINANCE (mode 1) depends on the work profile.
+        let norm = if preserve_colors == 1 {
+            match matrix {
+                Some(m) => match trc {
+                    Some((luts, ubc)) => {
+                        color::get_rgb_matrix_luminance([r, g, b, 0.0], m, luts, ubc, lutsize, true)
+                    }
+                    // linear profile: Y-row dot product, no TRC.
+                    None => m[1][0] * r + m[1][1] * g + m[1][2] * b,
+                },
+                // no work profile -> camera primaries (dt_camera_rgb_luminance).
+                None => r * 0.2225045 + g * 0.7168786 + b * 0.0606169,
+            }
+        } else {
+            color::rgb_norm(r, g, b, preserve_colors)
+        };
+
+        let lum = mul * norm;
+        let mut ratio = 1.0f32;
+        if lum > 0.0 {
+            let curve_lum = if lum < 1.0 {
+                // table[CLAMP((int)(lum * 0x10000), 0, 0xffff)]
+                let idx = ((lum * LUT_SIZE as f32) as i32).clamp(0, (LUT_SIZE - 1) as i32) as usize;
+                tbl[idx]
+            } else {
+                eval_exp(curve_ub, lum)
+            };
+            ratio = mul * curve_lum / lum;
+        }
+        output[base] = (ratio * r).max(0.0);
+        output[base + 1] = (ratio * g).max(0.0);
+        output[base + 2] = (ratio * b).max(0.0);
+        output[base + 3] = input[base + 3];
+    }
+}
+
 /// Compute per-pixel exposure-fusion features into the alpha channel in-place.
 ///
 /// Matches compute_features() in src/iop/basecurve.c.
@@ -190,6 +295,79 @@ mod tests {
         assert_eq!(buf[0], orig[0]);
         assert_eq!(buf[1], orig[1]);
         assert_eq!(buf[2], orig[2]);
+    }
+
+    // Identity curve table: table[i] = i / 65536, so curve_lum ≈ lum for lum < 1.
+    fn identity_table() -> Vec<f32> {
+        (0..LUT_SIZE).map(|i| i as f32 / LUT_SIZE as f32).collect()
+    }
+
+    #[test]
+    fn apply_curve_identity_max_norm_is_passthrough() {
+        let table = identity_table();
+        let ub = [1.0f32, 1.0, 1.0];
+        let input = [0.5f32, 0.25, 0.1, 0.9];
+        let mut out = [0f32; 4];
+        unsafe {
+            darkroom_basecurve_apply_curve(
+                input.as_ptr(), out.as_mut_ptr(), 1, 1.0,
+                2, // DT_RGB_NORM_MAX -> norm = 0.5; identity curve -> ratio 1
+                table.as_ptr(), ub.as_ptr(),
+                0, std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(), std::ptr::null(), 0, 0,
+            );
+        }
+        assert!((out[0] - 0.5).abs() < 1e-3, "{out:?}");
+        assert!((out[1] - 0.25).abs() < 1e-3);
+        assert!((out[2] - 0.1).abs() < 1e-3);
+        assert_eq!(out[3], 0.9);
+    }
+
+    #[test]
+    fn apply_curve_luminance_no_profile_uses_camera_primaries() {
+        let table = identity_table();
+        let ub = [1.0f32, 1.0, 1.0];
+        // grey 0.5: camera luminance = 0.5*(0.2225045+0.7168786+0.0606169) = 0.5
+        let input = [0.5f32, 0.5, 0.5, 1.0];
+        let mut out = [0f32; 4];
+        unsafe {
+            darkroom_basecurve_apply_curve(
+                input.as_ptr(), out.as_mut_ptr(), 1, 1.0,
+                1, // DT_RGB_NORM_LUMINANCE, no work profile -> camera primaries
+                table.as_ptr(), ub.as_ptr(),
+                0, std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(), std::ptr::null(), 0, 0,
+            );
+        }
+        for c in 0..3 {
+            assert!((out[c] - 0.5).abs() < 1e-3, "c={c} {out:?}");
+        }
+    }
+
+    #[test]
+    fn apply_curve_luminance_linear_profile_uses_matrix_y_row() {
+        let table = identity_table();
+        let ub = [1.0f32, 1.0, 1.0];
+        // 4x4 matrix; Y row (row 1) = [0.2, 0.7, 0.1]. nonlinearlut = 0 (linear).
+        let matrix: [f32; 16] = [
+            1.0, 0.0, 0.0, 0.0,
+            0.2, 0.7, 0.1, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        let input = [0.5f32, 0.5, 0.5, 1.0]; // lum = 0.5*(0.2+0.7+0.1) = 0.5
+        let mut out = [0f32; 4];
+        unsafe {
+            darkroom_basecurve_apply_curve(
+                input.as_ptr(), out.as_mut_ptr(), 1, 1.0,
+                1, table.as_ptr(), ub.as_ptr(),
+                1, matrix.as_ptr(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(), std::ptr::null(), 0, 0,
+            );
+        }
+        for c in 0..3 {
+            assert!((out[c] - 0.5).abs() < 1e-3, "c={c} {out:?}");
+        }
     }
 }
 

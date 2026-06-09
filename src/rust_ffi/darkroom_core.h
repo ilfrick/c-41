@@ -947,6 +947,33 @@ void darkroom_basecurve_apply_legacy_curve(const float *in_buf,
                                            const float *unbounded_coeffs);
 
 /*
+ * Basecurve IOP -- preserve-colors tone curve (preserve_colors != NONE path).
+ *
+ * Matches apply_curve() in src/iop/basecurve.c. Only the LUMINANCE norm consults
+ * the working ICC profile; its fields are passed flat. When has_work_profile is
+ * 0 the work-profile pointers may be NULL (LUMINANCE falls back to camera
+ * primaries); the luts may be NULL when nonlinearlut is 0.
+ *   matrix_in:     16 floats ([4][4], only the Y row is read)
+ *   lut0/lut1/lut2: lutsize floats each (read only when nonlinearlut != 0)
+ *   unbounded_in:  9 floats ([3][3])
+ */
+void darkroom_basecurve_apply_curve(const float *in_buf,
+                                    float *out_buf,
+                                    size_t npixels,
+                                    float mul,
+                                    int preserve_colors,
+                                    const float *table,
+                                    const float *unbounded_coeffs,
+                                    int has_work_profile,
+                                    const float *matrix_in,
+                                    const float *lut0,
+                                    const float *lut1,
+                                    const float *lut2,
+                                    const float *unbounded_in,
+                                    int lutsize,
+                                    int nonlinearlut);
+
+/*
  * Basecurve IOP -- exposure-fusion feature map written into alpha channel in-place.
  *
  * Matches compute_features() in src/iop/basecurve.c.

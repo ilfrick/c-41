@@ -36,7 +36,6 @@
 #include "gui/accelerators.h"
 #include "iop/iop_api.h"
 #include "rust_ffi/darkroom_core.h"
-#include "rust_ffi/darkroom_core.h"
 
 #include <regex.h>
 #include <assert.h>
@@ -999,26 +998,19 @@ static inline void apply_curve(
     const dt_iop_order_iccprofile_info_t *const work_profile)
 {
   const size_t npixels = (size_t)width * height;
-  DT_OMP_FOR()
-  for(size_t k = 0; k < 4*npixels; k += 4)
-  {
-    float ratio = 1.f;
-    // FIXME: Determine if we can get rid of the conditionals within this function in some way to improve performance.
-    // However, solving this one is much harder than the conditional for legacy vs. current
-    const float lum = mul * dt_rgb_norm(in+k, preserve_colors, work_profile);
-    if(lum > 0.f)
-    {
-      const float curve_lum = (lum < 1.0f)
-        ? table[CLAMP((int)(lum * 0x10000ul), 0, 0xffff)]
-        : dt_iop_eval_exp(unbounded_coeffs, lum);
-      ratio = mul * curve_lum / lum;
-    }
-    for(size_t c = 0; c < 3; c++)
-    {
-      out[k+c] = fmaxf(ratio * in[k+c], 0.f);
-    }
-    out[k+3] = in[k+3];
-  }
+  // preserve-colors tone curve (Rust FFI). Only the LUMINANCE norm needs the
+  // working profile; its fields are passed flat (NULL when there is none).
+  const int has_wp = (work_profile != NULL);
+  darkroom_basecurve_apply_curve(
+      in, out, npixels, mul, preserve_colors, table, unbounded_coeffs,
+      has_wp,
+      has_wp ? (const float *)work_profile->matrix_in : NULL,
+      has_wp ? work_profile->lut_in[0] : NULL,
+      has_wp ? work_profile->lut_in[1] : NULL,
+      has_wp ? work_profile->lut_in[2] : NULL,
+      has_wp ? (const float *)work_profile->unbounded_coeffs_in : NULL,
+      has_wp ? work_profile->lutsize : 0,
+      has_wp ? work_profile->nonlinearlut : 0);
 }
 
 static inline void gauss_blur(
