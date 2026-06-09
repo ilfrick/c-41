@@ -466,6 +466,24 @@ void darkroom_zonesystem_process(const float *in_buf,
                                  size_t size);
 
 /*
+ * Zonesystem GUI zone-map preview helpers.
+ *
+ * Replace the strided-copy and CLAMPS fill DT_OMP_FOR loops in
+ * src/iop/zonesystem.c::process_common_cleanup(). extract_channel pulls the
+ * luma (channel 0) out of an npixels*ch RGBA buffer; build_zonemap quantises a
+ * blurred luma buffer (0..100) into guchar zone indices clamped to [0, size-2].
+ */
+void darkroom_zonesystem_extract_channel(const float *in_buf,
+                                         float *out_buf,
+                                         size_t npixels,
+                                         size_t ch);
+
+void darkroom_zonesystem_build_zonemap(const float *blurred,
+                                       unsigned char *zonemap,
+                                       size_t npixels,
+                                       size_t size);
+
+/*
  * Overlay IOP pixel loop.
  *
  * Replaces the DT_OMP_FOR(collapse(2)) loop in src/iop/overlay.c::process().

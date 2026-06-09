@@ -19,7 +19,7 @@ application runnable throughout.
 | Unit tests passing | **356** |
 | IOP `.rs` files | 93 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+62` (clipping.c fully migrated) |
+| Last patch | `Phase 2z+66` (zonesystem GUI preview loops migrated) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -44,7 +44,7 @@ blocking infrastructure lands.
 `relight`, `rgbcurve`, `rgblevels`, `shadhi`, `sharpen`, `sigmoid`, `soften`,
 `splittoning`, `temperature`, `toneequal` (main process loop is
 `#else`-guarded dead code since `DT_TONEEQ_USE_LUT=TRUE`),
-`useless`, `velvia`, `vibrance`, `vignette`, `watermark`.
+`useless`, `velvia`, `vibrance`, `vignette`, `watermark`, `zonesystem`.
 
 Geometric distort loops fully migrated in `geometry.rs`:
 `borders`, `crop`, `enlargecanvas`, `flip`, `rotatepixels` (distort only).
@@ -73,8 +73,7 @@ Commit-params LUT builders migrated:
 
 `ashift` (11), `basecurve` (9), `clipping` (4), `colorbalancergb` (4),
 `colorin` (5), `colorreconstruction` (3), `denoiseprofile` (6),
-`liquify` (6), `rawoverexposed` (2), `retouch` (9),
-`zonesystem` (4).
+`liquify` (6), `rawoverexposed` (2), `retouch` (9).
 
 These depend on `dt_interpolation_*`, 3D bilateral grid, NLM/wavelet, perspective
 matrices, or per-pixel ICC transforms not yet ported to Rust.
@@ -89,7 +88,7 @@ matrices, or per-pixel ICC transforms not yet ported to Rust.
 | `dt_dev_distort_backtransform_plus` | rawoverexposed |
 | Keystone / perspective 3x3 | clipping, ashift |
 | Filmlight Yrg / `work_profile` callbacks | filmicrgb main loops, basecurve, colorin |
-| GUI-only loops | zonesystem (4), colorbalancergb (2), toneequal GUI LUT |
+| GUI-only loops | colorbalancergb (2), toneequal GUI LUT |
 
 #### Shared darkroom-core modules
 

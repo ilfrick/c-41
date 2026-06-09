@@ -211,36 +211,25 @@ static void process_common_cleanup(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t
 
     if(gauss && tmp)
     {
-      DT_OMP_FOR()
-      for(size_t k = 0; k < (size_t)width * height; k++)
-        tmp[k] = ((float *)ivoid)[ch * k];
+      const size_t npixels = (size_t)width * height;
+      darkroom_zonesystem_extract_channel((const float *)ivoid, tmp, npixels, ch);
 
       dt_gaussian_blur(gauss, tmp, tmp);
 
       /* create zonemap preview for input */
       dt_iop_gui_enter_critical_section(self);
-      DT_OMP_FOR()
-      for(size_t k = 0; k < (size_t)width * height; k++)
-      {
-        g->in_preview_buffer[k] = CLAMPS(tmp[k] * (size - 1) / 100.0f, 0, size - 2);
-      }
+      darkroom_zonesystem_build_zonemap(tmp, g->in_preview_buffer, npixels, (size_t)size);
       dt_iop_gui_leave_critical_section(self);
 
 
-      DT_OMP_FOR()
-      for(size_t k = 0; k < (size_t)width * height; k++)
-        tmp[k] = ((float *)ovoid)[ch * k];
+      darkroom_zonesystem_extract_channel((const float *)ovoid, tmp, npixels, ch);
 
       dt_gaussian_blur(gauss, tmp, tmp);
 
 
       /* create zonemap preview for output */
       dt_iop_gui_enter_critical_section(self);
-      DT_OMP_FOR()
-      for(size_t k = 0; k < (size_t)width * height; k++)
-      {
-        g->out_preview_buffer[k] = CLAMPS(tmp[k] * (size - 1) / 100.0f, 0, size - 2);
-      }
+      darkroom_zonesystem_build_zonemap(tmp, g->out_preview_buffer, npixels, (size_t)size);
       dt_iop_gui_leave_critical_section(self);
     }
 
