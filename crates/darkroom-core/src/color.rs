@@ -314,6 +314,12 @@ pub fn rgb_norm(r: f32, g: f32, b: f32, mode: i32) -> f32 {
             let g2 = g * g;
             let b2 = b * b;
             let den = r2 + g2 + b2;
+            // Intentional divergence from C dt_rgb_norm(): the C POWER branch
+            // divides unconditionally, yielding NaN for an all-zero pixel. We
+            // guard it (return the average, i.e. 0). End-to-end output is
+            // identical because every caller treats the result via `lum > 0`,
+            // which is false for both NaN and 0 → pixel passes through. Do not
+            // "restore" the unguarded division in a later match-C pass.
             if den > 0.0 {
                 (r * r2 + g * g2 + b * b2) / den
             } else {

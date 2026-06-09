@@ -1,4 +1,5 @@
 use crate::{params::IopParams, roi::RoiIn, Result};
+use crate::color::eval_exp; // shared unbounded LUT extrapolation (dt_iop_eval_exp)
 use super::{ClBuffer, IopProcess};
 
 pub struct Basecurve;
@@ -23,12 +24,6 @@ fn lut_lookup(table: &[f32], f: f32) -> f32 {
     table[idx].max(0.0)
 }
 
-/// Unbounded extrapolation: coeff[1] * pow(v * coeff[0], coeff[2]).
-/// Matches dt_iop_eval_exp() in imageop_math.h.
-#[inline(always)]
-fn eval_exp(coeff: &[f32], v: f32) -> f32 {
-    coeff[1] * (v * coeff[0]).powf(coeff[2])
-}
 
 /// Fast exp approximation matching dt_fast_expf() in common/math.h.
 /// Valid for x in [-100, 0]; behaviour outside that range is intentionally imprecise.
