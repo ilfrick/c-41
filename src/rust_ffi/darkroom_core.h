@@ -1888,6 +1888,39 @@ void darkroom_filmicrgb_inpaint_noise(const float *in_buf,
                                        size_t height);
 
 /*
+ * Filmic RGB IOP -- chroma-free "split" tone mapping (colour-science v1 and
+ * v2/v3). Replace the DT_OMP_FOR loops in filmic_split_v1 / filmic_split_v2_v3.
+ *
+ * Only the LUMINANCE step consults the working ICC profile; its fields are
+ * passed flat (NULL when has_work_profile == 0 -> camera-primary fallback; luts
+ * NULL when nonlinearlut == 0). matrix_in is 16 floats ([4][4], Y row used);
+ * unbounded_in is 9 floats ([3][3]); lut0/1/2 are lutsize floats each.
+ * m1..m5 are the spline factor vectors (4 floats; indices 0/1/2 used);
+ * type0/type1 are the toe/shoulder curve types (0=poly4,1=poly3,2=rational).
+ */
+void darkroom_filmicrgb_split_v1(const float *in_buf, float *out_buf, size_t npixels,
+                                 int has_work_profile, const float *matrix_in,
+                                 const float *lut0, const float *lut1, const float *lut2,
+                                 const float *unbounded_in, int lutsize, int nonlinearlut,
+                                 float grey_source, float black_source, float dynamic_range,
+                                 float sigma_toe, float sigma_shoulder, float saturation,
+                                 float output_power,
+                                 const float *m1, const float *m2, const float *m3,
+                                 const float *m4, const float *m5,
+                                 float latitude_min, float latitude_max, int type0, int type1);
+
+void darkroom_filmicrgb_split_v2_v3(const float *in_buf, float *out_buf, size_t npixels,
+                                    int has_work_profile, const float *matrix_in,
+                                    const float *lut0, const float *lut1, const float *lut2,
+                                    const float *unbounded_in, int lutsize, int nonlinearlut,
+                                    float grey_source, float black_source, float dynamic_range,
+                                    float sigma_toe, float sigma_shoulder, float saturation,
+                                    float output_power,
+                                    const float *m1, const float *m2, const float *m3,
+                                    const float *m4, const float *m5,
+                                    float latitude_min, float latitude_max, int type0, int type1);
+
+/*
  * Colorharmonizer IOP -- fused single-pass (smoothing <= 0).
  * matrix_in/out_transposed are flat 16-float (4x4) working-space matrices.
  * nodes/node_saturation are num_nodes floats; both may be NULL if num_nodes=0.

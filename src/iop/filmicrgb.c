@@ -1353,40 +1353,22 @@ static inline void filmic_split_v1(const float *const restrict in,
                                    const size_t width,
                                    const size_t height)
 {
-  const dt_aligned_pixel_t output_power
-    = { data->output_power, data->output_power, data->output_power, data->output_power };
-
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width * 4; k += 4)
-  {
-    const float *const restrict pix_in = in + k;
-    dt_aligned_pixel_t temp;
-
-    // Log tone-mapping
-    for(int c = 0; c < 3; c++)
-      temp[c] = log_tonemapping_v1(MAX(pix_in[c], NORM_MIN), data->grey_source, data->black_source,
-                                   data->dynamic_range);
-
-    // Get the desaturation coeff based on the log value
-    const float lum = (work_profile)
-                          ? dt_ioppr_get_rgb_matrix_luminance(temp, work_profile->matrix_in, work_profile->lut_in,
-                                                              work_profile->unbounded_coeffs_in,
-                                                              work_profile->lutsize, work_profile->nonlinearlut)
-                          : dt_camera_rgb_luminance(temp);
-    const float desaturation = filmic_desaturate_v1(lum, data->sigma_toe, data->sigma_shoulder, data->saturation);
-
-    // Desaturate on the non-linear parts of the curve
-    // Filmic S curve on the max RGB
-    // Apply the transfer function of the display
-    dt_aligned_pixel_t pix_out = { 0.0f, 0.0f, 0.0f, 0.0f };
-    for(int c = 0; c < 3; c++)
-      pix_out[c] = filmic_spline(linear_saturation(temp[c], lum, desaturation), spline.M1, spline.M2, spline.M3,
-                                 spline.M4, spline.M5, spline.latitude_min, spline.latitude_max, spline.type);
-    dt_vector_clip(pix_out);
-    dt_vector_powf(pix_out, output_power, pix_out);
-    copy_pixel_nontemporal(out + k, pix_out);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  // chroma-free tone mapping (Rust FFI). work_profile fields passed flat.
+  const int has_wp = (work_profile != NULL);
+  darkroom_filmicrgb_split_v1(
+      in, out, (size_t)width * height,
+      has_wp,
+      has_wp ? (const float *)work_profile->matrix_in : NULL,
+      has_wp ? work_profile->lut_in[0] : NULL,
+      has_wp ? work_profile->lut_in[1] : NULL,
+      has_wp ? work_profile->lut_in[2] : NULL,
+      has_wp ? (const float *)work_profile->unbounded_coeffs_in : NULL,
+      has_wp ? work_profile->lutsize : 0,
+      has_wp ? work_profile->nonlinearlut : 0,
+      data->grey_source, data->black_source, data->dynamic_range,
+      data->sigma_toe, data->sigma_shoulder, data->saturation, data->output_power,
+      spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
+      spline.latitude_min, spline.latitude_max, spline.type[0], spline.type[1]);
 }
 
 
@@ -1398,43 +1380,22 @@ static inline void filmic_split_v2_v3(const float *const restrict in,
                                       const size_t width,
                                       const size_t height)
 {
-  const dt_aligned_pixel_t output_power
-    = { data->output_power, data->output_power, data->output_power, data->output_power };
-
-  // DO NOT REPLACE THE FOLLOWING BY "DT_OMP_FOR_SIMD" - doing so causes a small but measurable change in results
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width * 4; k += 4)
-  {
-    const float *const restrict pix_in = in + k;
-    dt_aligned_pixel_t temp;
-    for_each_channel(c,aligned(pix_in,temp))
-      temp[c] = MAX(pix_in[c], NORM_MIN);
-
-    // Log tone-mapping
-    log_tonemapping_v2(temp, temp, data->grey_source, data->black_source, data->dynamic_range);
-
-    // Get the desaturation coeff based on the log value
-    const float lum = (work_profile)
-                          ? dt_ioppr_get_rgb_matrix_luminance(temp, work_profile->matrix_in, work_profile->lut_in,
-                                                              work_profile->unbounded_coeffs_in,
-                                                              work_profile->lutsize, work_profile->nonlinearlut)
-                          : dt_camera_rgb_luminance(temp);
-    const float desaturation = filmic_desaturate_v2(lum, data->sigma_toe, data->sigma_shoulder, data->saturation);
-
-    // Desaturate on the non-linear parts of the curve
-    // Filmic S curve on the max RGB
-    // Apply the transfer function of the display
-    dt_aligned_pixel_t pix_out = { 0.0f, 0.0f, 0.0f, 0.0f };
-    for(size_t c = 0; c < 3; c++)
-    {
-      pix_out[c] = filmic_spline(linear_saturation(temp[c], lum, desaturation), spline.M1, spline.M2, spline.M3,
-                                spline.M4, spline.M5, spline.latitude_min, spline.latitude_max, spline.type);
-    }
-    dt_vector_clip(pix_out);
-    dt_vector_powf(pix_out, output_power, pix_out);
-    copy_pixel_nontemporal(out + k, pix_out);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  // chroma-free tone mapping, colour-science v2/v3 (Rust FFI).
+  const int has_wp = (work_profile != NULL);
+  darkroom_filmicrgb_split_v2_v3(
+      in, out, (size_t)width * height,
+      has_wp,
+      has_wp ? (const float *)work_profile->matrix_in : NULL,
+      has_wp ? work_profile->lut_in[0] : NULL,
+      has_wp ? work_profile->lut_in[1] : NULL,
+      has_wp ? work_profile->lut_in[2] : NULL,
+      has_wp ? (const float *)work_profile->unbounded_coeffs_in : NULL,
+      has_wp ? work_profile->lutsize : 0,
+      has_wp ? work_profile->nonlinearlut : 0,
+      data->grey_source, data->black_source, data->dynamic_range,
+      data->sigma_toe, data->sigma_shoulder, data->saturation, data->output_power,
+      spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
+      spline.latitude_min, spline.latitude_max, spline.type[0], spline.type[1]);
 }
 
 
