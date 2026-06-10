@@ -665,11 +665,135 @@ pub fn get_rgb_matrix_luminance(
     matrix_in[1][0] * r[0] + matrix_in[1][1] * r[1] + matrix_in[1][2] * r[2]
 }
 
+// ── Filmlight Yrg / CIE-2006-LMS colour space (src/common/*.h, gamut_mapping.h) ─
+// Used by filmicrgb's colour-science v4 chroma path.
+
+/// Filmlight grading-RGB -> CIE 2006 LMS D65 (transposed), `filmlightRGB_D65_to_LMS_D65_trans`.
+const FILMLIGHT_RGB_TO_LMS_T: [[f32; 4]; 4] = [
+    [0.95, 0.05, 0.00, 0.0],
+    [0.38, 0.62, 0.00, 0.0],
+    [0.00, 0.03, 0.97, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
+/// CIE 2006 LMS D65 -> Filmlight grading-RGB (transposed), `LMS_D65_to_filmlightRGB_D65_trans`.
+const LMS_TO_FILMLIGHT_RGB_T: [[f32; 4]; 4] = [
+    [1.08771930, -0.0877193, 0.00, 0.0],
+    [-0.66666667, 1.66666667, 0.00, 0.0],
+    [0.02061856, -0.05154639, 1.03092784, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
+// Yrg white point (r, g of D50 white through the conversion chain).
+const YRG_WP_R: f32 = 0.21902143;
+const YRG_WP_G: f32 = 0.54371398;
+
+/// CIE 2006 LMS D65 -> normalised Filmlight Yrg luminance/chromaticity.
+/// Matches LMS_to_Yrg().
+#[inline(always)]
+pub fn lms_to_yrg(lms: [f32; 4]) -> [f32; 4] {
+    let y = 0.68990272 * lms[0] + 0.34832189 * lms[1];
+    let a = lms[0] + lms[1] + lms[2];
+    let norm = if a == 0.0 {
+        [0.0; 4]
+    } else {
+        [lms[0] / a, lms[1] / a, lms[2] / a, 0.0]
+    };
+    let rgb = apply_transposed_color_matrix(&norm, &LMS_TO_FILMLIGHT_RGB_T);
+    [y, rgb[0], rgb[1], 0.0]
+}
+
+/// Filmlight Yrg -> CIE 2006 LMS D65. Matches Yrg_to_LMS().
+#[inline(always)]
+pub fn yrg_to_lms(yrg: [f32; 4]) -> [f32; 4] {
+    let y = yrg[0];
+    let r = yrg[1];
+    let g = yrg[2];
+    let b = 1.0 - r - g;
+    let lms = apply_transposed_color_matrix(&[r, g, b, 0.0], &FILMLIGHT_RGB_TO_LMS_T);
+    let denom = 0.68990272 * lms[0] + 0.34832189 * lms[1];
+    let a = if denom == 0.0 { 0.0 } else { y / denom };
+    [lms[0] * a, lms[1] * a, lms[2] * a, 0.0]
+}
+
+/// Filmlight Yrg -> polar Ych. Stores [Y, c, cos_h, sin_h]. Matches Yrg_to_Ych().
+#[inline(always)]
+pub fn yrg_to_ych(yrg: [f32; 4]) -> [f32; 4] {
+    let y = yrg[0];
+    let r = yrg[1] - YRG_WP_R;
+    let g = yrg[2] - YRG_WP_G;
+    let c = (r * r + g * g).sqrt(); // dt_fast_hypotf (matches its __FAST_MATH__ branch; symmetric in r,g)
+    let (cos_h, sin_h) = if c != 0.0 { (r / c, g / c) } else { (1.0, 0.0) };
+    [y, c, cos_h, sin_h]
+}
+
+/// Polar Ych [Y, c, cos_h, sin_h] -> Filmlight Yrg. Matches Ych_to_Yrg().
+#[inline(always)]
+pub fn ych_to_yrg(ych: [f32; 4]) -> [f32; 4] {
+    let y = ych[0];
+    let c = ych[1];
+    let r = c * ych[2] + YRG_WP_R;
+    let g = c * ych[3] + YRG_WP_G;
+    [y, r, g, 0.0]
+}
+
+/// Pipeline RGB -> Filmlight Ych. `matrix_trans` is the RGB->LMS-2006 transposed
+/// matrix (from prepare_RGB_Yrg_matrices). Matches RGB_to_Ych().
+#[inline(always)]
+pub fn rgb_to_ych(rgb: [f32; 4], matrix_trans: &[[f32; 4]; 4]) -> [f32; 4] {
+    let lms = apply_transposed_color_matrix(&rgb, matrix_trans);
+    yrg_to_ych(lms_to_yrg(lms))
+}
+
+/// Filmlight Ych -> pipeline RGB. `matrix_trans` is the LMS-2006->RGB transposed
+/// matrix. Matches Ych_to_RGB().
+#[inline(always)]
+pub fn ych_to_rgb(ych: [f32; 4], matrix_trans: &[[f32; 4]; 4]) -> [f32; 4] {
+    let lms = yrg_to_lms(ych_to_yrg(ych));
+    apply_transposed_color_matrix(&lms, matrix_trans)
+}
+
 #[cfg(test)]
 mod ucs_tests {
     use super::*;
 
     const L_WHITE: f32 = 2.098883786377; // Y_to_dt_UCS_L_star(1.0)
+
+    const IDENTITY_T: [[f32; 4]; 4] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+
+    #[test]
+    fn lms_yrg_round_trips() {
+        let lms = [0.5f32, 0.3, 0.2, 0.0];
+        let back = yrg_to_lms(lms_to_yrg(lms));
+        for c in 0..3 {
+            assert!((back[c] - lms[c]).abs() < 1e-4, "c={c}: {} -> {}", lms[c], back[c]);
+        }
+    }
+
+    #[test]
+    fn yrg_ych_round_trips() {
+        let yrg = [0.45f32, 0.30, 0.55, 0.0];
+        let back = ych_to_yrg(yrg_to_ych(yrg));
+        for c in 0..3 {
+            assert!((back[c] - yrg[c]).abs() < 1e-5, "c={c}: {} -> {}", yrg[c], back[c]);
+        }
+    }
+
+    #[test]
+    fn rgb_ych_round_trips_identity_matrix() {
+        // With identity RGB<->LMS matrices, RGB->Ych->RGB must recover the input.
+        let rgb = [0.5f32, 0.3, 0.2, 0.0];
+        let ych = rgb_to_ych(rgb, &IDENTITY_T);
+        let back = ych_to_rgb(ych, &IDENTITY_T);
+        for c in 0..3 {
+            assert!((back[c] - rgb[c]).abs() < 1e-4, "c={c}: {} -> {}", rgb[c], back[c]);
+        }
+    }
 
     #[test]
     fn l_star_round_trips() {
