@@ -1707,28 +1707,26 @@ static inline void filmic_chroma_v4(const float *const restrict in,
   const float norm_min = exp_tonemapping_v2(0.f, data->grey_source, data->black_source, data->dynamic_range);
   const float norm_max = exp_tonemapping_v2(1.f, data->grey_source, data->black_source, data->dynamic_range);
 
-  DT_OMP_FOR()
-  for(size_t k = 0; k < 4 * height * width; k += 4)
-  {
-    const float *const restrict pix_in = in + k;
-    dt_aligned_pixel_t pix_out;
-    norm_tone_mapping_v4(pix_in, pix_out, variant, work_profile, data, spline,
-                         norm_min, norm_max, display_black, display_white);
-
-    // Save Ych in Kirk/Filmlight Yrg
-    dt_aligned_pixel_t Ych_original = { 0.f };
-    RGB_to_Ych(pix_in, input_matrix_trans, Ych_original);
-
-    // Get final Ych in Kirk/Filmlight Yrg
-    dt_aligned_pixel_t Ych_final = { 0.f };
-    RGB_to_Ych(pix_out, input_matrix_trans, Ych_final);
-
-    gamut_mapping(Ych_final, Ych_original, pix_out, input_matrix_trans, output_matrix, output_matrix_trans,
-                  export_input_matrix_trans, export_output_matrix, export_output_matrix_trans,
-                  display_black, display_white, data->saturation, use_output_profile);
-    copy_pixel_nontemporal(out + k, pix_out);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  // chroma-preserving (norm) tone mapping + gamut mapping, v4 (Rust FFI).
+  const int has_wp = (work_profile != NULL);
+  darkroom_filmicrgb_chroma_v4(
+      in, out, (size_t)width * height, variant,
+      has_wp,
+      has_wp ? (const float *)work_profile->matrix_in : NULL,
+      has_wp ? work_profile->lut_in[0] : NULL,
+      has_wp ? work_profile->lut_in[1] : NULL,
+      has_wp ? work_profile->lut_in[2] : NULL,
+      has_wp ? (const float *)work_profile->unbounded_coeffs_in : NULL,
+      has_wp ? work_profile->lutsize : 0,
+      has_wp ? work_profile->nonlinearlut : 0,
+      data->grey_source, data->black_source, data->dynamic_range,
+      data->output_power, data->saturation,
+      spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
+      spline.latitude_min, spline.latitude_max, spline.type[0], spline.type[1],
+      (const float *)input_matrix_trans, (const float *)output_matrix, (const float *)output_matrix_trans,
+      (const float *)export_input_matrix_trans, (const float *)export_output_matrix,
+      (const float *)export_output_matrix_trans,
+      use_output_profile, norm_min, norm_max, display_black, display_white);
 }
 
 static inline void filmic_split_v4(const float *const restrict in,
@@ -1758,30 +1756,17 @@ static inline void filmic_split_v4(const float *const restrict in,
                                  export_input_matrix_trans, export_output_matrix, export_output_matrix_trans,
                                  work_profile, export_profile);
 
-  DT_OMP_FOR()
-  for(size_t k = 0; k < 4 * height * width; k += 4)
-  {
-    const float *const restrict pix_in = in + k;
-    dt_aligned_pixel_t pix_out;
-
-    RGB_tone_mapping_v4(pix_in, pix_out, data, spline, display_black, display_white);
-
-    // Save Ych in Kirk/Filmlight Yrg
-    dt_aligned_pixel_t Ych_original = { 0.f };
-    RGB_to_Ych(pix_in, input_matrix_trans, Ych_original);
-
-    // Get final Ych in Kirk/Filmlight Yrg
-    dt_aligned_pixel_t Ych_final = { 0.f };
-    RGB_to_Ych(pix_out, input_matrix_trans, Ych_final);
-
-    Ych_final[1] = MIN(Ych_original[1], Ych_final[1]);
-
-    gamut_mapping(Ych_final, Ych_original, pix_out, input_matrix_trans, output_matrix, output_matrix_trans,
-                  export_input_matrix_trans, export_output_matrix, export_output_matrix_trans,
-                  display_black, display_white, data->saturation, use_output_profile);
-    copy_pixel_nontemporal(out + k, pix_out);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  // per-channel ("split") tone mapping + gamut mapping, v4 (Rust FFI).
+  darkroom_filmicrgb_split_v4(
+      in, out, (size_t)width * height,
+      data->grey_source, data->black_source, data->dynamic_range,
+      data->output_power, data->saturation,
+      spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
+      spline.latitude_min, spline.latitude_max, spline.type[0], spline.type[1],
+      (const float *)input_matrix_trans, (const float *)output_matrix, (const float *)output_matrix_trans,
+      (const float *)export_input_matrix_trans, (const float *)export_output_matrix,
+      (const float *)export_output_matrix_trans,
+      use_output_profile, display_black, display_white);
 }
 
 
@@ -1810,39 +1795,26 @@ static inline void filmic_v5(const float *const restrict in, float *const restri
   const float norm_min = exp_tonemapping_v2(0.f, data->grey_source, data->black_source, data->dynamic_range);
   const float norm_max = exp_tonemapping_v2(1.f, data->grey_source, data->black_source, data->dynamic_range);
 
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width * 4; k += 4)
-  {
-    const float *const restrict pix_in = in + k;
-
-    dt_aligned_pixel_t max_rgb = { 0.f };
-    dt_aligned_pixel_t naive_rgb = { 0.f };
-
-    RGB_tone_mapping_v4(pix_in, naive_rgb, data, spline, display_black, display_white);
-    norm_tone_mapping_v4(pix_in, max_rgb, DT_FILMIC_METHOD_MAX_RGB, work_profile, data,
-                         spline, norm_min, norm_max, display_black, display_white);
-
-    // Mix max RGB with naive RGB
-    dt_aligned_pixel_t pix_out;
-    for_each_channel(c, aligned(pix_out, max_rgb, naive_rgb))
-      pix_out[c] = (0.5f - data->saturation) * naive_rgb[c] + (0.5f + data->saturation) * max_rgb[c];
-
-    // Save Ych in Kirk/Filmlight Yrg
-    dt_aligned_pixel_t Ych_original = { 0.f };
-    RGB_to_Ych(pix_in, input_matrix_trans, Ych_original);
-
-    // Get final Ych in Kirk/Filmlight Yrg
-    dt_aligned_pixel_t Ych_final = { 0.f };
-    RGB_to_Ych(pix_out, input_matrix_trans, Ych_final);
-
-    Ych_final[1] = fminf(Ych_original[1], Ych_final[1]);
-
-    gamut_mapping(Ych_final, Ych_original, pix_out, input_matrix_trans, output_matrix, output_matrix_trans,
-                  export_input_matrix_trans, export_output_matrix, export_output_matrix_trans,
-                  display_black, display_white, 0.0f, use_output_profile);
-    copy_pixel_nontemporal(out + k, pix_out);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  // default colour-science v5: naive/max-RGB blend + gamut mapping (Rust FFI).
+  const int has_wp = (work_profile != NULL);
+  darkroom_filmicrgb_v5(
+      in, out, (size_t)width * height,
+      has_wp,
+      has_wp ? (const float *)work_profile->matrix_in : NULL,
+      has_wp ? work_profile->lut_in[0] : NULL,
+      has_wp ? work_profile->lut_in[1] : NULL,
+      has_wp ? work_profile->lut_in[2] : NULL,
+      has_wp ? (const float *)work_profile->unbounded_coeffs_in : NULL,
+      has_wp ? work_profile->lutsize : 0,
+      has_wp ? work_profile->nonlinearlut : 0,
+      data->grey_source, data->black_source, data->dynamic_range,
+      data->output_power, data->saturation,
+      spline.M1, spline.M2, spline.M3, spline.M4, spline.M5,
+      spline.latitude_min, spline.latitude_max, spline.type[0], spline.type[1],
+      (const float *)input_matrix_trans, (const float *)output_matrix, (const float *)output_matrix_trans,
+      (const float *)export_input_matrix_trans, (const float *)export_output_matrix,
+      (const float *)export_output_matrix_trans,
+      use_output_profile, norm_min, norm_max, display_black, display_white);
 }
 
 

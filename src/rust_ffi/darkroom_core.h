@@ -1952,6 +1952,63 @@ void darkroom_filmicrgb_chroma_v2_v3(const float *in_buf, float *out_buf, size_t
                                      float latitude_min, float latitude_max, int type0, int type1);
 
 /*
+ * Filmic RGB IOP -- colour-science v4/v5 gamut-mapped tone mapping. Replace the
+ * DT_OMP_FOR loops in filmic_chroma_v4 / filmic_split_v4 / filmic_v5.
+ *
+ * Work-profile / spline parameters follow the same flat convention as the split
+ * functions above. The six colour matrices (each 16 floats, [4][4]) are prepared
+ * on the C side by filmic_v4_prepare_matrices and passed flat:
+ *   input_matrix_trans         pipeline RGB -> CIE 2006 LMS (transposed)
+ *   output_matrix              CIE 2006 LMS -> pipeline RGB
+ *   output_matrix_trans        CIE 2006 LMS -> pipeline RGB (transposed)
+ *   export_input_matrix_trans  output RGB -> CIE 2006 LMS (transposed)
+ *   export_output_matrix       CIE 2006 LMS -> output RGB
+ *   export_output_matrix_trans CIE 2006 LMS -> output RGB (transposed)
+ * use_output_profile selects the export-profile gamut path. norm_min/norm_max are
+ * exp_tonemapping_v2(0/1). display_black/display_white are the display bounds.
+ */
+void darkroom_filmicrgb_chroma_v4(const float *in_buf, float *out_buf, size_t npixels, int variant,
+                                  int has_work_profile, const float *matrix_in,
+                                  const float *lut0, const float *lut1, const float *lut2,
+                                  const float *unbounded_in, int lutsize, int nonlinearlut,
+                                  float grey, float black, float dynamic_range,
+                                  float output_power, float saturation,
+                                  const float *m1, const float *m2, const float *m3,
+                                  const float *m4, const float *m5,
+                                  float latitude_min, float latitude_max, int type0, int type1,
+                                  const float *input_matrix_trans, const float *output_matrix,
+                                  const float *output_matrix_trans, const float *export_input_matrix_trans,
+                                  const float *export_output_matrix, const float *export_output_matrix_trans,
+                                  int use_output_profile, float norm_min, float norm_max,
+                                  float display_black, float display_white);
+
+void darkroom_filmicrgb_split_v4(const float *in_buf, float *out_buf, size_t npixels,
+                                 float grey, float black, float dynamic_range,
+                                 float output_power, float saturation,
+                                 const float *m1, const float *m2, const float *m3,
+                                 const float *m4, const float *m5,
+                                 float latitude_min, float latitude_max, int type0, int type1,
+                                 const float *input_matrix_trans, const float *output_matrix,
+                                 const float *output_matrix_trans, const float *export_input_matrix_trans,
+                                 const float *export_output_matrix, const float *export_output_matrix_trans,
+                                 int use_output_profile, float display_black, float display_white);
+
+void darkroom_filmicrgb_v5(const float *in_buf, float *out_buf, size_t npixels,
+                           int has_work_profile, const float *matrix_in,
+                           const float *lut0, const float *lut1, const float *lut2,
+                           const float *unbounded_in, int lutsize, int nonlinearlut,
+                           float grey, float black, float dynamic_range,
+                           float output_power, float saturation,
+                           const float *m1, const float *m2, const float *m3,
+                           const float *m4, const float *m5,
+                           float latitude_min, float latitude_max, int type0, int type1,
+                           const float *input_matrix_trans, const float *output_matrix,
+                           const float *output_matrix_trans, const float *export_input_matrix_trans,
+                           const float *export_output_matrix, const float *export_output_matrix_trans,
+                           int use_output_profile, float norm_min, float norm_max,
+                           float display_black, float display_white);
+
+/*
  * Colorharmonizer IOP -- fused single-pass (smoothing <= 0).
  * matrix_in/out_transposed are flat 16-float (4x4) working-space matrices.
  * nodes/node_saturation are num_nodes floats; both may be NULL if num_nodes=0.

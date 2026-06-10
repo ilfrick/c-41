@@ -604,6 +604,380 @@ pub unsafe extern "C" fn darkroom_filmicrgb_chroma_v2_v3(
     }
 }
 
+// ── Colour-science v4/v5 gamut-mapped path (Filmlight Yrg) ────────────────────
+
+/// CLAMP(x, lo, hi) == MAX(lo, MIN(x, hi)). Mirrors the C macro and, unlike
+/// `f32::clamp`, never panics when `lo > hi` (matches darktable's behaviour).
+#[inline(always)]
+fn clamp_lh(x: f32, lo: f32, hi: f32) -> f32 {
+    x.min(hi).max(lo)
+}
+
+/// The six prepared colour matrices `filmic_v4_prepare_matrices` builds on the C
+/// side and passes flat across the FFI. Borrowed views over `[[f32;4];4]`.
+struct V4Matrices<'a> {
+    input_matrix_trans: &'a [[f32; 4]; 4],
+    output_matrix: &'a [[f32; 4]; 4],
+    output_matrix_trans: &'a [[f32; 4]; 4],
+    export_input_matrix_trans: &'a [[f32; 4]; 4],
+    export_output_matrix: &'a [[f32; 4]; 4],
+    export_output_matrix_trans: &'a [[f32; 4]; 4],
+}
+
+/// Massage Ych_final's chroma towards/away from the original chroma per the
+/// saturation control. Mutates `ych_final[1]`. Matches `filmic_desaturate_v4()`
+/// in filmicrgb.c:1456.
+#[inline(always)]
+fn filmic_desaturate_v4(ych_original: [f32; 4], ych_final: &mut [f32; 4], saturation: f32) {
+    // Ych is normalised, so c is a saturation; chroma = c * Y.
+    let chroma_original = ych_original[1] * ych_original[0]; // c2
+    let mut chroma_final = ych_final[1] * ych_final[0]; // c1
+    let delta_chroma = saturation * (chroma_original - chroma_final);
+
+    let filmic_brightens = ych_final[0] > ych_original[0];
+    let filmic_resat = chroma_original < chroma_final;
+    let filmic_desat = chroma_original > chroma_final;
+    let user_resat = saturation > 0.0;
+    let user_desat = saturation < 0.0;
+
+    chroma_final = if filmic_brightens && filmic_resat {
+        (chroma_original + chroma_final) / 2.0
+    } else if (user_resat && filmic_desat) || user_desat {
+        chroma_final + delta_chroma
+    } else {
+        chroma_final
+    };
+
+    ych_final[1] = (chroma_final / ych_final[0]).max(0.0);
+}
+
+/// Bring a possibly-out-of-gamut Ych pixel back into the target RGB gamut by
+/// estimating an in-gamut luminance and clipping chroma, returning the clamped
+/// RGB. Matches `gamut_check_RGB()` in filmicrgb.c:1494.
+#[inline(always)]
+fn gamut_check_rgb(
+    matrix_in_trans: &[[f32; 4]; 4],
+    matrix_out: &[[f32; 4]; 4],
+    matrix_out_trans: &[[f32; 4]; 4],
+    display_black: f32,
+    display_white: f32,
+    ych_in: [f32; 4],
+) -> [f32; 4] {
+    // How much white light to add to bring the brightened pixel back in gamut.
+    let mut rgb_brightened = color::ych_to_rgb(ych_in, matrix_out_trans);
+    let min_pix = rgb_brightened[0].min(rgb_brightened[1]).min(rgb_brightened[2]);
+    let black_offset = (-min_pix).max(0.0);
+    for v in rgb_brightened.iter_mut() {
+        *v += black_offset;
+    }
+    let ych_brightened = color::rgb_to_ych(rgb_brightened, matrix_in_trans);
+
+    let y = clamp_lh(
+        (ych_in[0] + ych_brightened[0]) / 2.0,
+        color::CIE_Y_1931_TO_2006 * display_black,
+        color::CIE_Y_1931_TO_2006 * display_white,
+    );
+
+    let cos_h = ych_in[2];
+    let sin_h = ych_in[3];
+    let new_chroma = ych_in[1].min(color::ych_max_chroma(matrix_out, display_white, y, cos_h, sin_h));
+
+    let ych = [y, new_chroma, cos_h, sin_h];
+    let mut rgb_out = color::ych_to_rgb(ych, matrix_out_trans);
+    for v in rgb_out.iter_mut() {
+        *v = clamp_lh(*v, 0.0, display_white);
+    }
+    rgb_out
+}
+
+/// Force hue to the original, clip luminance, massage chroma, gamut-check in Yrg
+/// and in target RGB. Returns the gamut-mapped pixel. Matches `gamut_mapping()`
+/// in filmicrgb.c:1538.
+#[inline(always)]
+fn gamut_mapping_v4(
+    mut ych_final: [f32; 4],
+    ych_original: [f32; 4],
+    m: &V4Matrices,
+    display_black: f32,
+    display_white: f32,
+    saturation: f32,
+    use_output_profile: bool,
+) -> [f32; 4] {
+    // Force final hue to original
+    ych_final[2] = ych_original[2];
+    ych_final[3] = ych_original[3];
+
+    // Clip luminance
+    ych_final[0] = clamp_lh(
+        ych_final[0],
+        color::CIE_Y_1931_TO_2006 * display_black,
+        color::CIE_Y_1931_TO_2006 * display_white,
+    );
+
+    // Massage chroma, then gamut-clip chroma in Yrg/LMS cone space
+    filmic_desaturate_v4(ych_original, &mut ych_final, saturation);
+    ych_final = color::gamut_check_yrg(ych_final);
+
+    if !use_output_profile {
+        gamut_check_rgb(
+            m.input_matrix_trans, m.output_matrix, m.output_matrix_trans,
+            display_black, display_white, ych_final,
+        )
+    } else {
+        let pix_out = gamut_check_rgb(
+            m.export_input_matrix_trans, m.export_output_matrix, m.export_output_matrix_trans,
+            display_black, display_white, ych_final,
+        );
+        // export RGB -> CIE LMS 2006 D65 -> pipeline RGB D50
+        let lms = color::apply_transposed_color_matrix(&pix_out, m.export_input_matrix_trans);
+        color::apply_transposed_color_matrix(&lms, m.output_matrix_trans)
+    }
+}
+
+/// Spline factor vectors + latitudes + curve types, grouped for the v4 helpers.
+struct Spline<'a> {
+    m1: &'a [f32], m2: &'a [f32], m3: &'a [f32], m4: &'a [f32], m5: &'a [f32],
+    latitude_min: f32, latitude_max: f32, type0: i32, type1: i32,
+}
+
+/// Chroma-preserving (norm) tone mapping for v4/v5. Matches
+/// `norm_tone_mapping_v4()` in filmicrgb.c:1619. The output alpha is unused —
+/// `gamut_mapping_v4` overwrites the whole pixel downstream.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn norm_tone_mapping_v4(
+    pix_in: [f32; 4], variant: i32, wp: &Option<WorkProfile>,
+    grey: f32, black: f32, dynamic_range: f32, output_power: f32,
+    sp: &Spline, norm_min: f32, norm_max: f32, display_black: f32, display_white: f32,
+) -> [f32; 4] {
+    let mut norm = clamp_lh(get_pixel_norm(pix_in, variant, wp), norm_min, norm_max);
+    let ratios = [pix_in[0] / norm, pix_in[1] / norm, pix_in[2] / norm, pix_in[3] / norm];
+
+    norm = log_tonemapping_v2(norm, grey, black, dynamic_range);
+    let s = clamp_lh(
+        filmic_spline(norm, sp.m1, sp.m2, sp.m3, sp.m4, sp.m5,
+                      sp.latitude_min, sp.latitude_max, sp.type0, sp.type1),
+        display_black, display_white,
+    );
+    norm = s.powf(output_power); // scalar libm powf, matching the C norm path
+
+    [ratios[0] * norm, ratios[1] * norm, ratios[2] * norm, ratios[3] * norm]
+}
+
+/// Per-channel ("naive") RGB tone mapping for v4/v5. Matches
+/// `RGB_tone_mapping_v4()` in filmicrgb.c:1658. Alpha is unused downstream.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn rgb_tone_mapping_v4(
+    pix_in: [f32; 4], grey: f32, black: f32, dynamic_range: f32, output_power: f32,
+    sp: &Spline, display_white: f32,
+) -> [f32; 4] {
+    // log_tonemapping_v2 (4-wide, clamped to [0,1] via dt_vector_clip)
+    let mut mapped = [0.0f32; 4];
+    for c in 0..3 {
+        mapped[c] = log_tonemapping_v2(pix_in[c], grey, black, dynamic_range);
+    }
+    // spline on RGB only — matches the C `for(c = 0; c < 3; c++)` loop
+    for c in 0..3 {
+        mapped[c] = filmic_spline(mapped[c], sp.m1, sp.m2, sp.m3, sp.m4, sp.m5,
+                                  sp.latitude_min, sp.latitude_max, sp.type0, sp.type1);
+    }
+    // individual components can always go to zero; luminance is clamped later
+    let mut out = [0.0f32; 4];
+    for c in 0..3 {
+        // dt_vector_pow1 == 2^(log2(x)*p); use the same libm form as the split path
+        out[c] = powf_log2(clamp_lh(mapped[c], 0.0, display_white), output_power);
+    }
+    out
+}
+
+/// Read a flat 16-float FFI pointer as a `&[[f32;4];4]` colour matrix.
+/// # Safety: `p` must point to 16 contiguous floats.
+#[inline(always)]
+unsafe fn mat4(p: *const f32) -> &'static [[f32; 4]; 4] {
+    &*(p as *const [[f32; 4]; 4])
+}
+
+/// Chroma-preserving (norm) tone mapping + gamut mapping, colour-science v4.
+/// Replaces the DT_OMP_FOR loop in filmic_chroma_v4() (filmicrgb.c:1710).
+///
+/// # Safety
+/// Buffers hold `npixels*4` floats; `m1..m5` hold >= 4 floats each; the six
+/// matrix pointers each hold 16 floats; work-profile pointers valid per
+/// `make_work_profile`'s contract.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_filmicrgb_chroma_v4(
+    in_buf: *const f32, out_buf: *mut f32, npixels: usize, variant: i32,
+    has_work_profile: i32, matrix_in: *const f32,
+    lut0: *const f32, lut1: *const f32, lut2: *const f32, unbounded_in: *const f32,
+    lutsize: i32, nonlinearlut: i32,
+    grey: f32, black: f32, dynamic_range: f32, output_power: f32, saturation: f32,
+    m1: *const f32, m2: *const f32, m3: *const f32, m4: *const f32, m5: *const f32,
+    latitude_min: f32, latitude_max: f32, type0: i32, type1: i32,
+    input_matrix_trans: *const f32, output_matrix: *const f32, output_matrix_trans: *const f32,
+    export_input_matrix_trans: *const f32, export_output_matrix: *const f32, export_output_matrix_trans: *const f32,
+    use_output_profile: i32, norm_min: f32, norm_max: f32, display_black: f32, display_white: f32,
+) {
+    let wp = make_work_profile(
+        has_work_profile != 0, matrix_in, lut0, lut1, lut2, unbounded_in,
+        lutsize as usize, nonlinearlut != 0,
+    );
+    let sp = Spline {
+        m1: std::slice::from_raw_parts(m1, 4), m2: std::slice::from_raw_parts(m2, 4),
+        m3: std::slice::from_raw_parts(m3, 4), m4: std::slice::from_raw_parts(m4, 4),
+        m5: std::slice::from_raw_parts(m5, 4),
+        latitude_min, latitude_max, type0, type1,
+    };
+    let mats = V4Matrices {
+        input_matrix_trans: mat4(input_matrix_trans),
+        output_matrix: mat4(output_matrix),
+        output_matrix_trans: mat4(output_matrix_trans),
+        export_input_matrix_trans: mat4(export_input_matrix_trans),
+        export_output_matrix: mat4(export_output_matrix),
+        export_output_matrix_trans: mat4(export_output_matrix_trans),
+    };
+    let use_op = use_output_profile != 0;
+    let input = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+
+    for k in 0..npixels {
+        let base = k * 4;
+        let pix_in = [input[base], input[base + 1], input[base + 2], input[base + 3]];
+        let pix_out = norm_tone_mapping_v4(
+            pix_in, variant, &wp, grey, black, dynamic_range, output_power,
+            &sp, norm_min, norm_max, display_black, display_white,
+        );
+        let ych_original = color::rgb_to_ych(pix_in, mats.input_matrix_trans);
+        let ych_final = color::rgb_to_ych(pix_out, mats.input_matrix_trans);
+        let mapped = gamut_mapping_v4(
+            ych_final, ych_original, &mats, display_black, display_white, saturation, use_op,
+        );
+        output[base..base + 4].copy_from_slice(&mapped);
+    }
+}
+
+/// Per-channel ("split") tone mapping + gamut mapping, colour-science v4.
+/// Replaces the DT_OMP_FOR loop in filmic_split_v4() (filmicrgb.c:1761).
+///
+/// # Safety
+/// Same contract as `darkroom_filmicrgb_chroma_v4`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_filmicrgb_split_v4(
+    in_buf: *const f32, out_buf: *mut f32, npixels: usize,
+    grey: f32, black: f32, dynamic_range: f32, output_power: f32, saturation: f32,
+    m1: *const f32, m2: *const f32, m3: *const f32, m4: *const f32, m5: *const f32,
+    latitude_min: f32, latitude_max: f32, type0: i32, type1: i32,
+    input_matrix_trans: *const f32, output_matrix: *const f32, output_matrix_trans: *const f32,
+    export_input_matrix_trans: *const f32, export_output_matrix: *const f32, export_output_matrix_trans: *const f32,
+    use_output_profile: i32, display_black: f32, display_white: f32,
+) {
+    let sp = Spline {
+        m1: std::slice::from_raw_parts(m1, 4), m2: std::slice::from_raw_parts(m2, 4),
+        m3: std::slice::from_raw_parts(m3, 4), m4: std::slice::from_raw_parts(m4, 4),
+        m5: std::slice::from_raw_parts(m5, 4),
+        latitude_min, latitude_max, type0, type1,
+    };
+    let mats = V4Matrices {
+        input_matrix_trans: mat4(input_matrix_trans),
+        output_matrix: mat4(output_matrix),
+        output_matrix_trans: mat4(output_matrix_trans),
+        export_input_matrix_trans: mat4(export_input_matrix_trans),
+        export_output_matrix: mat4(export_output_matrix),
+        export_output_matrix_trans: mat4(export_output_matrix_trans),
+    };
+    let use_op = use_output_profile != 0;
+    let input = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+
+    for k in 0..npixels {
+        let base = k * 4;
+        let pix_in = [input[base], input[base + 1], input[base + 2], input[base + 3]];
+        let pix_out = rgb_tone_mapping_v4(
+            pix_in, grey, black, dynamic_range, output_power, &sp, display_white,
+        );
+        let ych_original = color::rgb_to_ych(pix_in, mats.input_matrix_trans);
+        let mut ych_final = color::rgb_to_ych(pix_out, mats.input_matrix_trans);
+        ych_final[1] = ych_original[1].min(ych_final[1]);
+        let mapped = gamut_mapping_v4(
+            ych_final, ych_original, &mats, display_black, display_white, saturation, use_op,
+        );
+        output[base..base + 4].copy_from_slice(&mapped);
+    }
+}
+
+/// Default colour-science v5: blend of naive (per-channel) and max-RGB (norm)
+/// tone mapping, then gamut mapping with saturation forced to 0.
+/// Replaces the DT_OMP_FOR loop in filmic_v5() (filmicrgb.c:1813).
+///
+/// # Safety
+/// Same contract as `darkroom_filmicrgb_chroma_v4`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_filmicrgb_v5(
+    in_buf: *const f32, out_buf: *mut f32, npixels: usize,
+    has_work_profile: i32, matrix_in: *const f32,
+    lut0: *const f32, lut1: *const f32, lut2: *const f32, unbounded_in: *const f32,
+    lutsize: i32, nonlinearlut: i32,
+    grey: f32, black: f32, dynamic_range: f32, output_power: f32, saturation: f32,
+    m1: *const f32, m2: *const f32, m3: *const f32, m4: *const f32, m5: *const f32,
+    latitude_min: f32, latitude_max: f32, type0: i32, type1: i32,
+    input_matrix_trans: *const f32, output_matrix: *const f32, output_matrix_trans: *const f32,
+    export_input_matrix_trans: *const f32, export_output_matrix: *const f32, export_output_matrix_trans: *const f32,
+    use_output_profile: i32, norm_min: f32, norm_max: f32, display_black: f32, display_white: f32,
+) {
+    let wp = make_work_profile(
+        has_work_profile != 0, matrix_in, lut0, lut1, lut2, unbounded_in,
+        lutsize as usize, nonlinearlut != 0,
+    );
+    let sp = Spline {
+        m1: std::slice::from_raw_parts(m1, 4), m2: std::slice::from_raw_parts(m2, 4),
+        m3: std::slice::from_raw_parts(m3, 4), m4: std::slice::from_raw_parts(m4, 4),
+        m5: std::slice::from_raw_parts(m5, 4),
+        latitude_min, latitude_max, type0, type1,
+    };
+    let mats = V4Matrices {
+        input_matrix_trans: mat4(input_matrix_trans),
+        output_matrix: mat4(output_matrix),
+        output_matrix_trans: mat4(output_matrix_trans),
+        export_input_matrix_trans: mat4(export_input_matrix_trans),
+        export_output_matrix: mat4(export_output_matrix),
+        export_output_matrix_trans: mat4(export_output_matrix_trans),
+    };
+    let use_op = use_output_profile != 0;
+    let input = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+
+    const METHOD_MAX_RGB: i32 = 1; // DT_FILMIC_METHOD_MAX_RGB
+    for k in 0..npixels {
+        let base = k * 4;
+        let pix_in = [input[base], input[base + 1], input[base + 2], input[base + 3]];
+        let naive_rgb = rgb_tone_mapping_v4(
+            pix_in, grey, black, dynamic_range, output_power, &sp, display_white,
+        );
+        let max_rgb = norm_tone_mapping_v4(
+            pix_in, METHOD_MAX_RGB, &wp, grey, black, dynamic_range, output_power,
+            &sp, norm_min, norm_max, display_black, display_white,
+        );
+        // Mix max RGB with naive RGB. The C `for_each_channel` blend also writes
+        // alpha = (0.5+sat)*pix_in[3]; we leave alpha 0 here because gamut_mapping_v4
+        // overwrites the whole pixel below (its final Ych_to_RGB zeroes channel 3),
+        // so the output alpha is 0 in both the C and Rust paths.
+        let mut pix_out = [0.0f32; 4];
+        for c in 0..3 {
+            pix_out[c] = (0.5 - saturation) * naive_rgb[c] + (0.5 + saturation) * max_rgb[c];
+        }
+        let ych_original = color::rgb_to_ych(pix_in, mats.input_matrix_trans);
+        let mut ych_final = color::rgb_to_ych(pix_out, mats.input_matrix_trans);
+        ych_final[1] = ych_original[1].min(ych_final[1]);
+        let mapped = gamut_mapping_v4(
+            ych_final, ych_original, &mats, display_black, display_white, 0.0, use_op,
+        );
+        output[base..base + 4].copy_from_slice(&mapped);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,5 +1220,107 @@ mod tests {
         for c in 0..3 {
             assert!(out[c].is_finite() && out[c] <= 1.0 + 1e-6 && out[c] >= 0.0, "c={c} {out:?}");
         }
+    }
+
+    // ── v4/v5 gamut-mapped path ───────────────────────────────────────────────
+
+    // Flat 4x4 identity (last row/col padding zero), used as stand-in colour
+    // matrices: RGB == LMS so the Yrg conversions are well-defined. The gamut
+    // path's final clamp guarantees output in [0, display_white] when finite.
+    const IDENTITY_FLAT: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+    ];
+
+    fn linear_spline() -> ([f32; 4], [f32; 4], [f32; 4]) {
+        // M1 = 0, M2 latitude slope = 1, rest zero → identity-ish S-curve.
+        ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0f32; 4])
+    }
+
+    #[test]
+    fn split_v4_runs_finite_and_bounded() {
+        let input = [0.18f32, 0.2, 0.15, 1.0];
+        let mut out = [0f32; 4];
+        let (m1, m2, z) = linear_spline();
+        let id = IDENTITY_FLAT;
+        unsafe {
+            darkroom_filmicrgb_split_v4(
+                input.as_ptr(), out.as_mut_ptr(), 1,
+                0.18, -5.0, 8.0, 1.0, 0.0,
+                m1.as_ptr(), m2.as_ptr(), z.as_ptr(), z.as_ptr(), z.as_ptr(),
+                0.0, 1.0, 0, 0,
+                id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(),
+                0, 0.0, 1.0,
+            );
+        }
+        for c in 0..3 {
+            assert!(out[c].is_finite() && out[c] >= 0.0 && out[c] <= 1.0 + 1e-5, "c={c} {out:?}");
+        }
+    }
+
+    #[test]
+    fn chroma_v4_runs_finite_and_bounded() {
+        // bright saturated input must be gamut-mapped into [0, display_white].
+        let input = [2.0f32, 0.1, 0.05, 1.0];
+        let mut out = [0f32; 4];
+        let (m1, m2, z) = linear_spline();
+        let id = IDENTITY_FLAT;
+        // norm_min/norm_max from exp_tonemapping_v2(0/1): grey*2^(dr*x+black)
+        let grey = 0.18f32; let black = -5.0f32; let dr = 8.0f32;
+        let norm_min = grey * (dr * 0.0 + black).exp2();
+        let norm_max = grey * (dr * 1.0 + black).exp2();
+        unsafe {
+            darkroom_filmicrgb_chroma_v4(
+                input.as_ptr(), out.as_mut_ptr(), 1, 1, // MAX_RGB
+                0, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                0, 0,
+                grey, black, dr, 1.0, 0.0,
+                m1.as_ptr(), m2.as_ptr(), z.as_ptr(), z.as_ptr(), z.as_ptr(),
+                0.0, 1.0, 0, 0,
+                id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(),
+                0, norm_min, norm_max, 0.0, 1.0,
+            );
+        }
+        for c in 0..3 {
+            assert!(out[c].is_finite() && out[c] >= 0.0 && out[c] <= 1.0 + 1e-5, "c={c} {out:?}");
+        }
+    }
+
+    #[test]
+    fn v5_runs_finite_and_bounded() {
+        let input = [0.3f32, 0.5, 0.9, 1.0];
+        let mut out = [0f32; 4];
+        let (m1, m2, z) = linear_spline();
+        let id = IDENTITY_FLAT;
+        let grey = 0.18f32; let black = -5.0f32; let dr = 8.0f32;
+        let norm_min = grey * (dr * 0.0 + black).exp2();
+        let norm_max = grey * (dr * 1.0 + black).exp2();
+        unsafe {
+            darkroom_filmicrgb_v5(
+                input.as_ptr(), out.as_mut_ptr(), 1,
+                0, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                0, 0,
+                grey, black, dr, 1.0, 0.0,
+                m1.as_ptr(), m2.as_ptr(), z.as_ptr(), z.as_ptr(), z.as_ptr(),
+                0.0, 1.0, 0, 0,
+                id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(), id.as_ptr(),
+                0, norm_min, norm_max, 0.0, 1.0,
+            );
+        }
+        for c in 0..3 {
+            assert!(out[c].is_finite() && out[c] >= 0.0 && out[c] <= 1.0 + 1e-5, "c={c} {out:?}");
+        }
+    }
+
+    #[test]
+    fn filmic_desaturate_v4_no_user_sat_keeps_final() {
+        // saturation=0, filmic darkens (final Y < original): chroma_final kept.
+        let original = [0.5f32, 0.4, 1.0, 0.0]; // Y, c, cos, sin
+        let mut final_ych = [0.3f32, 0.2, 1.0, 0.0];
+        filmic_desaturate_v4(original, &mut final_ych, 0.0);
+        // chroma_final unchanged → c stays 0.2
+        assert!((final_ych[1] - 0.2).abs() < 1e-6, "{final_ych:?}");
     }
 }

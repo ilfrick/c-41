@@ -753,6 +753,119 @@ pub fn ych_to_rgb(ych: [f32; 4], matrix_trans: &[[f32; 4]; 4]) -> [f32; 4] {
     apply_transposed_color_matrix(&lms, matrix_trans)
 }
 
+// ── filmicrgb v4 gamut mapping (src/common/gamut_mapping.h + gamut_check_Yrg) ──
+
+/// CIE Y 1931 -> CIE Y 2006 scale (achromatic). Matches the
+/// `CIE_Y_1931_to_CIE_Y_2006` macro in gamut_mapping.h:31.
+pub const CIE_Y_1931_TO_2006: f32 = 1.05785528;
+
+/// Gamut-clip an Ych pixel's chroma at constant hue and luminance so it fits the
+/// Yrg / LMS cone space. Returns the sanitised `[Y, c, cos_h, sin_h]`.
+/// Matches `gamut_check_Yrg()` in colorspaces_inline_conversions.h:1200.
+#[inline(always)]
+pub fn gamut_check_yrg(ych: [f32; 4]) -> [f32; 4] {
+    let yrg = ych_to_yrg(ych);
+    let mut max_c = ych[1];
+    let cos_h = ych[2];
+    let sin_h = ych[3];
+    if yrg[1] < 0.0 {
+        max_c = max_c.min(-YRG_WP_R / cos_h);
+    }
+    if yrg[2] < 0.0 {
+        max_c = max_c.min(-YRG_WP_G / sin_h);
+    }
+    if yrg[1] + yrg[2] > 1.0 {
+        max_c = max_c.min((1.0 - YRG_WP_R - YRG_WP_G) / (cos_h + sin_h));
+    }
+    [ych[0], max_c, cos_h, sin_h]
+}
+
+/// Chroma that brings one RGB component to `target_white`, before the near-white
+/// numerical correction. `coeffs` is a row of the LMS->RGB matrix. Returns
+/// `f32::MAX` when this channel can't limit chroma (matches the C `FLT_MAX`).
+/// Matches `_clip_chroma_white_raw()` in gamut_mapping.h:34.
+#[inline(always)]
+fn clip_chroma_white_raw(coeffs: &[f32; 4], target_white: f32, y: f32, cos_h: f32, sin_h: f32) -> f32 {
+    let denominator_y_coeff = coeffs[0] * (0.979381443298969 * cos_h + 0.391752577319588 * sin_h)
+        + coeffs[1] * (0.0206185567010309 * cos_h + 0.608247422680412 * sin_h)
+        - coeffs[2] * (cos_h + sin_h);
+    let denominator_target_term = target_white * (0.68285981628866 * cos_h + 0.482137060515464 * sin_h);
+
+    // this channel won't limit the chroma
+    if denominator_y_coeff == 0.0 {
+        return f32::MAX;
+    }
+
+    // asymptote of the max-chroma equation; below it the upper bound is meaningless
+    let y_asymptote = denominator_target_term / denominator_y_coeff;
+    if y <= y_asymptote {
+        return f32::MAX;
+    }
+
+    let denominator = y * denominator_y_coeff - denominator_target_term;
+    let numerator = -0.427506877216495
+        * (y * (coeffs[0] + 0.856492345150334 * coeffs[1] + 0.554995960637719 * coeffs[2])
+            - 0.988237752433297 * target_white);
+    numerator / denominator
+}
+
+/// Max chroma to keep one channel <= `target_white`, with the near-max-luminance
+/// linear feather and negative->FLT_MAX guard. Matches `_clip_chroma_white()`
+/// in gamut_mapping.h:64.
+#[inline(always)]
+fn clip_chroma_white(coeffs: &[f32; 4], target_white: f32, y: f32, cos_h: f32, sin_h: f32) -> f32 {
+    let eps = 1e-3;
+    let max_y = CIE_Y_1931_TO_2006 * target_white;
+    let delta_y = (max_y - y).max(0.0);
+    let max_chroma = if delta_y < eps {
+        delta_y / (eps * max_y) * clip_chroma_white_raw(coeffs, target_white, (1.0 - eps) * max_y, cos_h, sin_h)
+    } else {
+        clip_chroma_white_raw(coeffs, target_white, y, cos_h, sin_h)
+    };
+    if max_chroma >= 0.0 { max_chroma } else { f32::MAX }
+}
+
+/// Max chroma to keep one channel >= 0 (target value 0). Matches
+/// `_clip_chroma_black()` in gamut_mapping.h:87.
+#[inline(always)]
+fn clip_chroma_black(coeffs: &[f32; 4], cos_h: f32, sin_h: f32) -> f32 {
+    let denominator = coeffs[0] * (0.979381443298969 * cos_h + 0.391752577319588 * sin_h)
+        + coeffs[1] * (0.0206185567010309 * cos_h + 0.608247422680412 * sin_h)
+        - coeffs[2] * (cos_h + sin_h);
+
+    if denominator == 0.0 {
+        return f32::MAX;
+    }
+    let numerator =
+        -0.427506877216495 * (coeffs[0] + 0.856492345150334 * coeffs[1] + 0.554995960637719 * coeffs[2]);
+    let max_chroma = numerator / denominator;
+    if max_chroma >= 0.0 { max_chroma } else { f32::MAX }
+}
+
+/// Min over R/G/B of the chroma that keeps each channel non-negative.
+/// `matrix_out` rows are the LMS->RGB coeffs. Matches
+/// `Ych_max_chroma_without_negatives()` in gamut_mapping.h:109.
+#[inline(always)]
+pub fn ych_max_chroma_without_negatives(matrix_out: &[[f32; 4]; 4], cos_h: f32, sin_h: f32) -> f32 {
+    let cr = clip_chroma_black(&matrix_out[0], cos_h, sin_h);
+    let cg = clip_chroma_black(&matrix_out[1], cos_h, sin_h);
+    let cb = clip_chroma_black(&matrix_out[2], cos_h, sin_h);
+    cr.min(cg).min(cb)
+}
+
+/// Max in-gamut chroma at the given luminance/hue: the tighter of the white
+/// (over-max) and black (negative) clipping bounds. Matches `Ych_max_chroma()`
+/// in gamut_mapping.h:172.
+#[inline(always)]
+pub fn ych_max_chroma(matrix_out: &[[f32; 4]; 4], target_white: f32, y: f32, cos_h: f32, sin_h: f32) -> f32 {
+    let cr = clip_chroma_white(&matrix_out[0], target_white, y, cos_h, sin_h);
+    let cg = clip_chroma_white(&matrix_out[1], target_white, y, cos_h, sin_h);
+    let cb = clip_chroma_white(&matrix_out[2], target_white, y, cos_h, sin_h);
+    let max_chroma_white = cr.min(cg).min(cb);
+    let max_chroma_black = ych_max_chroma_without_negatives(matrix_out, cos_h, sin_h);
+    max_chroma_black.min(max_chroma_white)
+}
+
 #[cfg(test)]
 mod ucs_tests {
     use super::*;
@@ -923,5 +1036,100 @@ mod profile_tests {
             lut.len(), false,
         );
         assert!((y - 1.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod gamut_tests {
+    use super::*;
+
+    // Representative LMS->RGB output matrix (rows = R, G, B coeffs from LMS),
+    // and an RGB->LMS transposed matrix. Both are also used by the C reference
+    // generator (tools/goldgen) that produced the golden values below.
+    const MATRIX_OUT: [[f32; 4]; 4] = [
+        [1.80, -1.30, 0.35, 0.0],
+        [0.62, 0.40, -0.04, 0.0],
+        [-0.13, 0.20, 1.74, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+    const MT: [[f32; 4]; 4] = [
+        [0.95, 0.38, 0.00, 0.0],
+        [0.05, 0.62, 0.03, 0.0],
+        [0.00, 0.00, 0.97, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+
+    fn close(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol || (a.is_infinite() && b.is_infinite() && a.signum() == b.signum())
+    }
+
+    // Golden vectors: values printed by a self-contained C program that copies
+    // the verbatim functions from colorspaces_inline_conversions.h and
+    // gamut_mapping.h (FLT_MAX == 3.40282347e+38).
+    const FLT_MAX_C: f32 = 3.40282347e+38;
+
+    #[test]
+    fn rgb_to_ych_matches_c_reference() {
+        let cases: [([f32; 4], [f32; 4]); 3] = [
+            ([0.18, 0.20, 0.15, 0.0], [0.191889524, 0.0852646381, -0.965918958, 0.258844584]),
+            ([0.8, 0.1, 0.05, 0.0], [0.655261397, 0.292412996, 0.954872489, -0.297016054]),
+            ([0.4, 0.5, 0.9, 0.0], [0.440335333, 0.201490209, -0.660455108, -0.750865519]),
+        ];
+        for (rgb, expect) in cases {
+            let got = rgb_to_ych(rgb, &MT);
+            for c in 0..4 {
+                assert!(close(got[c], expect[c], 1e-5), "rgb={rgb:?} c={c}: got={} want={}", got[c], expect[c]);
+            }
+        }
+    }
+
+    #[test]
+    fn gamut_check_yrg_matches_c_reference() {
+        // in0 clips chroma (r+g>1); in1/in2 pass through unchanged.
+        let cases: [([f32; 4], [f32; 4]); 3] = [
+            ([0.2, 0.6, 0.9, -0.4], [0.2, 0.474529177, 0.9, -0.4]),
+            ([0.5, 0.3, -0.7, 0.71], [0.5, 0.3, -0.7, 0.71]),
+            ([0.3, 0.05, 0.5, 0.5], [0.3, 0.05, 0.5, 0.5]),
+        ];
+        for (ych, expect) in cases {
+            let got = gamut_check_yrg(ych);
+            for c in 0..4 {
+                assert!(close(got[c], expect[c], 1e-5), "ych={ych:?} c={c}: got={} want={}", got[c], expect[c]);
+            }
+        }
+    }
+
+    #[test]
+    fn clip_chroma_black_matches_c_reference() {
+        // cos_h=0.6, sin_h=0.8. R,G hit the FLT_MAX guard; B is the limiter.
+        let (cos_h, sin_h) = (0.6, 0.8);
+        assert!(close(clip_chroma_black(&MATRIX_OUT[0], cos_h, sin_h), FLT_MAX_C, 1.0));
+        assert!(close(clip_chroma_black(&MATRIX_OUT[1], cos_h, sin_h), FLT_MAX_C, 1.0));
+        assert!(close(clip_chroma_black(&MATRIX_OUT[2], cos_h, sin_h), 0.175473303, 1e-6));
+        assert!(close(ych_max_chroma_without_negatives(&MATRIX_OUT, cos_h, sin_h), 0.175473303, 1e-6));
+    }
+
+    #[test]
+    fn clip_chroma_white_raw_matches_c_reference() {
+        // target_white=1.0, Y=0.5, cos_h=0.6, sin_h=0.8.
+        let (cos_h, sin_h) = (0.6, 0.8);
+        assert!(close(clip_chroma_white_raw(&MATRIX_OUT[0], 1.0, 0.5, cos_h, sin_h), FLT_MAX_C, 1.0));
+        assert!(close(clip_chroma_white_raw(&MATRIX_OUT[1], 1.0, 0.5, cos_h, sin_h), FLT_MAX_C, 1.0));
+        // raw can be negative (only _white clamps it); B = -0.102483056.
+        assert!(close(clip_chroma_white_raw(&MATRIX_OUT[2], 1.0, 0.5, cos_h, sin_h), -0.102483056, 1e-6));
+    }
+
+    #[test]
+    fn clip_chroma_white_eps_branch_matches_c_reference() {
+        // Y just below max_Y triggers the linear-feather branch.
+        let max_y = CIE_Y_1931_TO_2006 * 1.0;
+        let got = clip_chroma_white(&MATRIX_OUT[0], 1.0, max_y - 1e-4, 0.6, 0.8);
+        assert!(close(got, 3.21725286e37, 3.2e32), "got={got}");
+    }
+
+    #[test]
+    fn ych_max_chroma_matches_c_reference() {
+        let got = ych_max_chroma(&MATRIX_OUT, 1.0, 0.5, 0.6, 0.8);
+        assert!(close(got, 0.175473303, 1e-6), "got={got}");
     }
 }
