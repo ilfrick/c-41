@@ -1078,50 +1078,10 @@ inline static void wavelets_reconstruct_RGB(const float *const restrict HF, cons
                                             const float gamma_comp, const float beta, const float beta_comp,
                                             const float delta, const size_t s, const size_t scales)
 {
-  DT_OMP_FOR_SIMD()
-  for(size_t k = 0; k < 4 * height * width; k += 4)
-  {
-    const float alpha = mask[k / 4];
-
-    // cache RGB wavelets scales just to be sure the compiler doesn't reload them
-    const float *const restrict HF_c = DT_IS_ALIGNED_PIXEL(HF + k);
-    const float *const restrict LF_c = DT_IS_ALIGNED_PIXEL(LF + k);
-    const float *const restrict TT_c = DT_IS_ALIGNED_PIXEL(texture + k);
-
-    // synthesize the max of all RGB channels texture as a flat texture term for the whole pixel
-    // this is useful if only 1 or 2 channels are clipped, so we transfer the valid/sharpest texture on the other
-    // channels
-    const float grey_texture = fmaxabsf(fmaxabsf(TT_c[0], TT_c[1]), TT_c[2]);
-
-    // synthesize the max of all interpolated/inpainted RGB channels as a flat details term for the whole pixel
-    // this is smoother than grey_texture and will fill holes smoothly in details layers if grey_texture ~= 0.f
-    const float grey_details = (HF_c[0] + HF_c[1] + HF_c[2]) / 3.f;
-
-    // synthesize both terms with weighting
-    // when beta_comp ~= 1.0, we force the reconstruction to be achromatic, which may help with gamut issues or
-    // magenta highlights.
-    const float grey_HF = beta_comp * (gamma_comp * grey_details + gamma * grey_texture);
-
-    // synthesize the min of all low-frequency RGB channels as a flat
-    // structure term for the whole pixel
-    // when beta_comp ~= 1.0, we force the reconstruction to be
-    // achromatic, which may help with gamut issues or magenta
-    // highlights.
-    const float grey_residual = beta_comp * (LF_c[0] + LF_c[1] + LF_c[2]) / 3.f;
-
-    // synthesize interpolated/inpainted RGB channels color details residuals and weigh them
-    // this brings back some color on top of the grey_residual
-    dt_aligned_pixel_t details;
-    for_each_channel(c, aligned(details, HF_c, TT_c))
-    {
-      details[c] = (gamma_comp * HF_c[c] + gamma * TT_c[c]) * beta + grey_HF;
-    }
-    dt_aligned_pixel_t residual;
-    for_each_channel(c, aligned(LF_c))
-      residual[c] = (s == scales - 1) ? (grey_residual + LF_c[c] * beta) : 0.f;
-    for_each_channel(c,aligned(reconstructed))
-      reconstructed[k + c] += alpha * (delta * details[c] + residual[c]);
-  }
+  // wavelet reconstruction of clipped highlights, RGB variant (Rust FFI).
+  darkroom_filmicrgb_wavelets_reconstruct_rgb(HF, LF, texture, mask, reconstructed,
+                                              (size_t)height * width,
+                                              gamma, gamma_comp, beta, beta_comp, delta, s, scales);
 }
 
 static inline void wavelets_reconstruct_ratios(const float *const restrict HF,
@@ -1151,46 +1111,10 @@ static inline void wavelets_reconstruct_ratios(const float *const restrict HF,
  * Note : ratios close to 1 mean higher spectral purity (more white). Ratios close to 0 mean lower spectral purity
  * (more colorful)
  */
-  DT_OMP_FOR_SIMD()
-  for(size_t k = 0; k < 4 * height * width; k += 4)
-  {
-    const float alpha = mask[k / 4];
-
-    // cache RGB wavelets scales just to be sure the compiler doesn't reload them
-    const float *const restrict HF_c = DT_IS_ALIGNED_PIXEL(HF + k);
-    const float *const restrict LF_c = DT_IS_ALIGNED_PIXEL(LF + k);
-    const float *const restrict TT_c = DT_IS_ALIGNED_PIXEL(texture + k);
-
-    // synthesize the max of all RGB channels texture as a flat texture term for the whole pixel
-    // this is useful if only 1 or 2 channels are clipped, so we transfer the valid/sharpest texture on the other
-    // channels
-    const float grey_texture = fmaxabsf(fmaxabsf(TT_c[0], TT_c[1]), TT_c[2]);
-
-    // synthesize the max of all interpolated/inpainted RGB channels as a flat details term for the whole pixel
-    // this is smoother than grey_texture and will fill holes smoothly in details layers if grey_texture ~= 0.f
-    const float grey_details = (HF_c[0] + HF_c[1] + HF_c[2]) / 3.f;
-
-    // synthesize both terms with weighting
-    // when beta_comp ~= 1.0, we force the reconstruction to be achromatic, which may help with gamut issues or
-    // magenta highlights.
-    const float grey_HF = (gamma_comp * grey_details + gamma * grey_texture);
-
-    dt_aligned_pixel_t details;
-    for_each_channel(c,aligned(reconstructed:64) aligned(HF_c, TT_c, LF_c:16) linear(k:4))
-    {
-      // synthesize interpolated/inpainted RGB channels color details residuals and weigh them
-      // this brings back some color on top of the grey_residual
-      details[c] = 0.5f * ((gamma_comp * HF_c[c] + gamma * TT_c[c]) + grey_HF);
-    }
-    dt_aligned_pixel_t residual;
-    for_each_channel(c, aligned(LF_c))
-    {
-      // reconstruction
-      residual[c] = (s == scales - 1) ? LF_c[c] : 0.f;
-    }
-    for_each_channel(c, aligned(reconstructed, details, residual))
-      reconstructed[k + c] += alpha * (delta * details[c] + residual[c]);
-  }
+  // wavelet reconstruction of clipped highlights, ratios variant (Rust FFI).
+  darkroom_filmicrgb_wavelets_reconstruct_ratios(HF, LF, texture, mask, reconstructed,
+                                                 (size_t)height * width,
+                                                 gamma, gamma_comp, beta, beta_comp, delta, s, scales);
 }
 
 
@@ -1308,12 +1232,8 @@ static inline gboolean reconstruct_highlights(const float *const restrict in,
 
     // Compute wavelets high-frequency scales and save the minimum of texture over the RGB channels in HF
     const size_t pts = roi_out->height * roi_out->width;
-    DT_OMP_FOR_SIMD(aligned(HF, LF, detail : 64))
-    for(size_t k = 0; k < pts; k++)
-    {
-      for_each_channel(c)
-        HF[4*k + c] = detail[4*k + c] - LF[4*k + c];
-    }
+    // high-frequency scale: HF = detail - LF (Rust FFI)
+    darkroom_filmicrgb_wavelet_hf(detail, LF, HF, pts);
 
     // interpolate/blur/inpaint (same thing) the RGB high-frequency to fill holes
     blur_2D_Bspline(HF, HF_RGB, temp, padded_size, roi_out->width, roi_out->height, 1, TRUE); // clip negatives

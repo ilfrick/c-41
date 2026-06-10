@@ -2027,6 +2027,26 @@ void darkroom_filmicrgb_compute_ratios(const float *in_buf, float *norms_buf, fl
                                        const float *unbounded_in, int lutsize, int nonlinearlut);
 
 /*
+ * Filmic RGB IOP -- à-trous wavelet highlight reconstruction.
+ * wavelet_hf: high-frequency scale, HF = detail - LF over npixels*4 floats.
+ * wavelets_reconstruct_{rgb,ratios}: accumulate the reconstructed clipped
+ *   highlights into `reconstructed` (+=). hf/lf/texture/reconstructed are
+ *   npixels*4 floats; mask is npixels floats. s is the current scale, scales
+ *   the total; the residual term is only added at the last scale (s==scales-1).
+ */
+void darkroom_filmicrgb_wavelet_hf(const float *detail, const float *lf, float *hf, size_t npixels);
+
+void darkroom_filmicrgb_wavelets_reconstruct_rgb(const float *hf, const float *lf, const float *texture,
+                                                 const float *mask, float *reconstructed, size_t npixels,
+                                                 float gamma, float gamma_comp, float beta, float beta_comp,
+                                                 float delta, size_t s, size_t scales);
+
+void darkroom_filmicrgb_wavelets_reconstruct_ratios(const float *hf, const float *lf, const float *texture,
+                                                    const float *mask, float *reconstructed, size_t npixels,
+                                                    float gamma, float gamma_comp, float beta, float beta_comp,
+                                                    float delta, size_t s, size_t scales);
+
+/*
  * Colorharmonizer IOP -- fused single-pass (smoothing <= 0).
  * matrix_in/out_transposed are flat 16-float (4x4) working-space matrices.
  * nodes/node_saturation are num_nodes floats; both may be NULL if num_nodes=0.

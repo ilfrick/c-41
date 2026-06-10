@@ -173,6 +173,122 @@ pub unsafe extern "C" fn darkroom_filmicrgb_compute_ratios(
     }
 }
 
+/// max in absolute value, returned with its sign; NaN `b` yields 0.
+/// Matches fmaxabsf() in src/develop/openmp_maths.h:68.
+#[inline(always)]
+fn fmaxabsf(a: f32, b: f32) -> f32 {
+    if a.abs() > b.abs() { a } else if b.is_nan() { 0.0 } else { b }
+}
+
+/// High-frequency wavelet scale: `HF = detail - LF` over all 4 channels.
+/// Replaces the DT_OMP_FOR_SIMD loop in reconstruct_highlights() (filmicrgb.c:1311).
+///
+/// # Safety
+/// All three buffers hold `npixels*4` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_filmicrgb_wavelet_hf(
+    detail: *const f32,
+    lf: *const f32,
+    hf: *mut f32,
+    npixels: usize,
+) {
+    if npixels == 0 { return; }
+    let n = npixels * 4;
+    let detail = std::slice::from_raw_parts(detail, n);
+    let lf = std::slice::from_raw_parts(lf, n);
+    let hf = std::slice::from_raw_parts_mut(hf, n);
+    for k in 0..n {
+        hf[k] = detail[k] - lf[k];
+    }
+}
+
+/// Shared body for the wavelet reconstruction accumulation. `ratios` selects the
+/// chromaticity-favouring variant; otherwise the RGB variant is used.
+#[allow(clippy::too_many_arguments)]
+unsafe fn wavelets_reconstruct_impl(
+    hf: *const f32, lf: *const f32, texture: *const f32, mask: *const f32,
+    reconstructed: *mut f32, npixels: usize,
+    gamma: f32, gamma_comp: f32, beta: f32, beta_comp: f32, delta: f32,
+    s: usize, scales: usize, ratios: bool,
+) {
+    if npixels == 0 { return; }
+    let hf = std::slice::from_raw_parts(hf, npixels * 4);
+    let lf = std::slice::from_raw_parts(lf, npixels * 4);
+    let tt = std::slice::from_raw_parts(texture, npixels * 4);
+    let mask = std::slice::from_raw_parts(mask, npixels);
+    let rec = std::slice::from_raw_parts_mut(reconstructed, npixels * 4);
+    let last = s == scales - 1;
+
+    for k in 0..npixels {
+        let b = k * 4;
+        let alpha = mask[k];
+
+        // flat texture term: max-abs of RGB texture (transfers the sharpest
+        // valid channel when only 1-2 channels are clipped)
+        let grey_texture = fmaxabsf(fmaxabsf(tt[b], tt[b + 1]), tt[b + 2]);
+        // flat details term: mean of the interpolated/inpainted RGB HF
+        let grey_details = (hf[b] + hf[b + 1] + hf[b + 2]) / 3.0;
+
+        if ratios {
+            let grey_hf = gamma_comp * grey_details + gamma * grey_texture;
+            for c in 0..4 {
+                let details = 0.5 * ((gamma_comp * hf[b + c] + gamma * tt[b + c]) + grey_hf);
+                let residual = if last { lf[b + c] } else { 0.0 };
+                rec[b + c] += alpha * (delta * details + residual);
+            }
+        } else {
+            let grey_hf = beta_comp * (gamma_comp * grey_details + gamma * grey_texture);
+            let grey_residual = beta_comp * (lf[b] + lf[b + 1] + lf[b + 2]) / 3.0;
+            for c in 0..4 {
+                let details = (gamma_comp * hf[b + c] + gamma * tt[b + c]) * beta + grey_hf;
+                let residual = if last { grey_residual + lf[b + c] * beta } else { 0.0 };
+                rec[b + c] += alpha * (delta * details + residual);
+            }
+        }
+    }
+}
+
+/// Wavelet reconstruction of clipped highlights, RGB variant (favours recovering
+/// high frequencies). Accumulates into `reconstructed`. Replaces the
+/// DT_OMP_FOR_SIMD loop in wavelets_reconstruct_RGB() (filmicrgb.c:1081).
+///
+/// # Safety
+/// `hf`/`lf`/`texture`/`reconstructed` hold `npixels*4` floats; `mask` holds
+/// `npixels` floats.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_filmicrgb_wavelets_reconstruct_rgb(
+    hf: *const f32, lf: *const f32, texture: *const f32, mask: *const f32,
+    reconstructed: *mut f32, npixels: usize,
+    gamma: f32, gamma_comp: f32, beta: f32, beta_comp: f32, delta: f32,
+    s: usize, scales: usize,
+) {
+    wavelets_reconstruct_impl(
+        hf, lf, texture, mask, reconstructed, npixels,
+        gamma, gamma_comp, beta, beta_comp, delta, s, scales, false,
+    );
+}
+
+/// Wavelet reconstruction of clipped highlights, ratios (chromaticity) variant
+/// (favours smoother, more achromatic low frequencies). Replaces the
+/// DT_OMP_FOR_SIMD loop in wavelets_reconstruct_ratios() (filmicrgb.c:1154).
+///
+/// # Safety
+/// Same buffer contract as `darkroom_filmicrgb_wavelets_reconstruct_rgb`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_filmicrgb_wavelets_reconstruct_ratios(
+    hf: *const f32, lf: *const f32, texture: *const f32, mask: *const f32,
+    reconstructed: *mut f32, npixels: usize,
+    gamma: f32, gamma_comp: f32, beta: f32, beta_comp: f32, delta: f32,
+    s: usize, scales: usize,
+) {
+    wavelets_reconstruct_impl(
+        hf, lf, texture, mask, reconstructed, npixels,
+        gamma, gamma_comp, beta, beta_comp, delta, s, scales, true,
+    );
+}
+
 /// Add statistical noise to highlights to seed the wavelet reconstruction.
 ///
 /// For each pixel (i, j):
@@ -1204,6 +1320,68 @@ mod tests {
         }
         assert_eq!(norms[0], NORM_MIN);
         for c in 0..4 { assert_eq!(ratios[c], 0.0); }
+    }
+
+    #[test]
+    fn fmaxabsf_picks_larger_magnitude_with_sign() {
+        assert_eq!(fmaxabsf(-3.0, 2.0), -3.0); // |−3|>|2|
+        assert_eq!(fmaxabsf(1.0, -4.0), -4.0); // |−4|>|1|
+        assert_eq!(fmaxabsf(2.0, f32::NAN), 0.0); // NaN b → 0
+        assert_eq!(fmaxabsf(f32::NAN, 5.0), 5.0); // |NaN|>|5| false, b not nan → b
+    }
+
+    #[test]
+    fn wavelet_hf_is_detail_minus_lf() {
+        let detail = vec![1.0_f32, 0.5, 0.2, 0.0,  2.0, 1.0, 0.0, 1.0];
+        let lf     = vec![0.3_f32, 0.1, 0.2, 0.0,  0.5, 0.5, 0.0, 0.5];
+        let mut hf = vec![0.0_f32; 8];
+        unsafe { darkroom_filmicrgb_wavelet_hf(detail.as_ptr(), lf.as_ptr(), hf.as_mut_ptr(), 2); }
+        for k in 0..8 { assert!((hf[k] - (detail[k] - lf[k])).abs() < 1e-6, "k={k}"); }
+    }
+
+    #[test]
+    fn wavelets_reconstruct_rgb_accumulates_last_scale() {
+        // last scale (s==scales-1) adds details + residual, scaled by alpha.
+        let hf  = vec![0.1_f32, 0.2, 0.3, 0.0];
+        let lf  = vec![0.4_f32, 0.5, 0.6, 0.0];
+        let tt  = vec![0.05_f32, -0.07, 0.02, 0.0];
+        let mask = vec![0.5_f32];
+        let mut rec = vec![1.0_f32; 4]; // pre-seeded; function accumulates
+        // gamma=0, gamma_comp=1, beta=1, beta_comp=0, delta=1, s=0, scales=1
+        unsafe {
+            darkroom_filmicrgb_wavelets_reconstruct_rgb(
+                hf.as_ptr(), lf.as_ptr(), tt.as_ptr(), mask.as_ptr(), rec.as_mut_ptr(), 1,
+                0.0, 1.0, 1.0, 0.0, 1.0, 0, 1,
+            );
+        }
+        // beta_comp=0 → grey_hf=0, grey_residual=0; beta=1 → details[c]=hf[c],
+        // residual[c]=lf[c]; rec += 0.5*(1*details + residual)
+        for c in 0..3 {
+            let expect = 1.0 + 0.5 * (hf[c] + lf[c]);
+            assert!((rec[c] - expect).abs() < 1e-6, "c={c}: {} vs {}", rec[c], expect);
+        }
+    }
+
+    #[test]
+    fn wavelets_reconstruct_ratios_non_last_scale_has_no_residual() {
+        // non-last scale (s=0, scales=2) → residual = 0; details = 0.5*(hf+grey_hf) with gamma=0.
+        let hf  = vec![0.2_f32, 0.4, 0.6, 0.0];
+        let lf  = vec![0.9_f32, 0.9, 0.9, 0.0];
+        let tt  = vec![0.0_f32; 4];
+        let mask = vec![1.0_f32];
+        let mut rec = vec![0.0_f32; 4];
+        unsafe {
+            darkroom_filmicrgb_wavelets_reconstruct_ratios(
+                hf.as_ptr(), lf.as_ptr(), tt.as_ptr(), mask.as_ptr(), rec.as_mut_ptr(), 1,
+                0.0, 1.0, 1.0, 0.0, 1.0, 0, 2,
+            );
+        }
+        // grey_details = (0.2+0.4+0.6)/3 = 0.4; grey_hf = 1*0.4 = 0.4 (gamma_comp=1)
+        // details[c] = 0.5*((1*hf[c]+0) + 0.4); residual=0; rec += 1*(1*details)
+        for c in 0..3 {
+            let expect = 0.5 * (hf[c] + 0.4);
+            assert!((rec[c] - expect).abs() < 1e-6, "c={c}: {} vs {}", rec[c], expect);
+        }
     }
 
     #[test]
