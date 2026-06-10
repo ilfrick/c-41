@@ -19,7 +19,7 @@ application runnable throughout.
 | Unit tests passing | **356** |
 | IOP `.rs` files | 93 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+69` (filmicrgb chroma-preservation v1/v2/v3 migrated) |
+| Last patch | `Phase 2z+70` (Filmlight Yrg colour space ported; filmicrgb v4 foundation) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -59,7 +59,7 @@ Commit-params LUT builders migrated:
 | `colorequal` | 1 | GUI background renderer (intentionally deferred) |
 | `highlights` | 4 | `interpolate_color_xtrans` / `interpolate_color` CFA inpaint |
 | `diffuse` | 1 | anisotropic PDE solver (very complex) |
-| `filmicrgb` | 8 | `RGB_to_Ych`/Filmlight (v4) + highlights reconstruction; split + chroma v1/v2/v3 done |
+| `filmicrgb` | 8 | split + chroma v1/v2/v3 done; Yrg colour space now in color.rs. Remaining: v4/v5 gamut-mapping loops (filmic_split_v4, filmic_v5, filmic_chroma_v4 — need gamut_mapping() + filmic_v4_prepare_matrices + RGB/norm_tone_mapping_v4 + chroma-clip curves) and ~5 highlights-reconstruction loops (wavelet/diffusion) |
 | `gamma` | 5 | `dt_Lab_to_XYZ`, `dt_HSL_2_RGB`, `dt_JzAzBz_*` |
 | `channelmixerrgb` | 2 | B-spline local avg reduction (illuminant detection) |
 | `colortransfer` | 2 | k-means with atomic accumulators |
