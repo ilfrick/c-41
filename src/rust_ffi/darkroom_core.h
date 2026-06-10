@@ -2009,6 +2009,24 @@ void darkroom_filmicrgb_v5(const float *in_buf, float *out_buf, size_t npixels,
                            float display_black, float display_white);
 
 /*
+ * Filmic RGB IOP -- highlights-reconstruction helpers.
+ * init_reconstruct: multiplied-alpha blend of non/partially-clipped pixels
+ *   (reconstructed = max(in * (1 - mask), 0)); mask is npixels floats.
+ * compute_ratios: per-pixel norm + per-channel ratios; `variant` is the RGB-norm
+ *   method; work-profile fields follow the same flat convention as the split
+ *   functions (only the LUMINANCE variant consults the profile). norms is
+ *   npixels floats; ratios is npixels*4 floats.
+ */
+void darkroom_filmicrgb_init_reconstruct(const float *in_buf, const float *mask_buf,
+                                         float *reconstructed, size_t npixels);
+
+void darkroom_filmicrgb_compute_ratios(const float *in_buf, float *norms_buf, float *ratios_buf,
+                                       size_t npixels, int variant,
+                                       int has_work_profile, const float *matrix_in,
+                                       const float *lut0, const float *lut1, const float *lut2,
+                                       const float *unbounded_in, int lutsize, int nonlinearlut);
+
+/*
  * Colorharmonizer IOP -- fused single-pass (smoothing <= 0).
  * matrix_in/out_transposed are flat 16-float (4x4) working-space matrices.
  * nodes/node_saturation are num_nodes floats; both may be NULL if num_nodes=0.

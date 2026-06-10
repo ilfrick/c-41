@@ -102,6 +102,77 @@ pub unsafe extern "C" fn darkroom_filmicrgb_restore_ratios(
     }
 }
 
+/// Initialise the reconstruction buffer with the non-clipped and partially
+/// clipped pixels via multiplied-alpha blending (`mask` = alpha weight).
+///
+/// For each pixel k and channel c (4-wide):
+///   reconstructed[k*4 + c] = max(in[k*4 + c] * (1 - mask[k]), 0)
+///
+/// Matches `init_reconstruct()` in filmicrgb.c:1197.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_filmicrgb_init_reconstruct(
+    in_buf: *const f32,
+    mask_buf: *const f32,
+    reconstructed: *mut f32,
+    npixels: usize,
+) {
+    if npixels == 0 { return; }
+    let inp  = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let mask = std::slice::from_raw_parts(mask_buf, npixels);
+    let out  = std::slice::from_raw_parts_mut(reconstructed, npixels * 4);
+    for k in 0..npixels {
+        let w = 1.0 - mask[k];
+        for c in 0..4 {
+            out[k * 4 + c] = (inp[k * 4 + c] * w).max(0.0);
+        }
+    }
+}
+
+/// Decompose each pixel into a per-pixel norm and the per-channel ratios.
+///
+/// For each pixel k:
+///   norm     = max(get_pixel_norm(pix, variant, work_profile), NORM_MIN)
+///   norms[k] = norm
+///   ratios[k*4 + c] = pix[c] / norm   (4-wide)
+///
+/// Only the LUMINANCE norm variant consults the working profile; its fields are
+/// passed flat (same convention as the split/chroma functions). Matches
+/// `compute_ratios()` in filmicrgb.c:1830.
+///
+/// # Safety
+/// `in_buf`/`ratios_buf` hold `npixels*4` floats; `norms_buf` holds `npixels`
+/// floats; work-profile pointers valid per `make_work_profile`'s contract.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_filmicrgb_compute_ratios(
+    in_buf: *const f32,
+    norms_buf: *mut f32,
+    ratios_buf: *mut f32,
+    npixels: usize,
+    variant: i32,
+    has_work_profile: i32, matrix_in: *const f32,
+    lut0: *const f32, lut1: *const f32, lut2: *const f32, unbounded_in: *const f32,
+    lutsize: i32, nonlinearlut: i32,
+) {
+    if npixels == 0 { return; }
+    let wp = make_work_profile(
+        has_work_profile != 0, matrix_in, lut0, lut1, lut2, unbounded_in,
+        lutsize as usize, nonlinearlut != 0,
+    );
+    let inp    = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let norms  = std::slice::from_raw_parts_mut(norms_buf, npixels);
+    let ratios = std::slice::from_raw_parts_mut(ratios_buf, npixels * 4);
+    for k in 0..npixels {
+        let base = k * 4;
+        let pix = [inp[base], inp[base + 1], inp[base + 2], inp[base + 3]];
+        let norm = get_pixel_norm(pix, variant, &wp).max(NORM_MIN);
+        norms[k] = norm;
+        for c in 0..4 {
+            ratios[base + c] = pix[c] / norm;
+        }
+    }
+}
+
 /// Add statistical noise to highlights to seed the wavelet reconstruction.
 ///
 /// For each pixel (i, j):
@@ -1079,6 +1150,60 @@ mod tests {
         assert!((ratios[1] - 0.0).abs() < 1e-6); // -0.5 → 0.0 * 2.0
         assert!((ratios[2] - 1.0).abs() < 1e-6); // 0.5 → 0.5 * 2.0
         assert!((ratios[3] - 0.5).abs() < 1e-6); // 0.25 → 0.25 * 2.0
+    }
+
+    #[test]
+    fn init_reconstruct_alpha_blends_and_clamps() {
+        // mask=0.25 → weight 0.75; negative input clamped to 0.
+        let inp  = vec![0.4_f32, -0.2, 0.8, 1.0];
+        let mask = vec![0.25_f32];
+        let mut out = vec![-1.0_f32; 4];
+        unsafe {
+            darkroom_filmicrgb_init_reconstruct(inp.as_ptr(), mask.as_ptr(), out.as_mut_ptr(), 1);
+        }
+        assert!((out[0] - 0.3).abs() < 1e-6);  // 0.4 * 0.75
+        assert!((out[1] - 0.0).abs() < 1e-6);  // -0.2 * 0.75 → max(_, 0)
+        assert!((out[2] - 0.6).abs() < 1e-6);  // 0.8 * 0.75
+        assert!((out[3] - 0.75).abs() < 1e-6); // 1.0 * 0.75
+    }
+
+    #[test]
+    fn compute_ratios_recovers_norm_and_unit_ratios() {
+        // MAX_RGB norm of [0.2,0.5,0.1] is 0.5; ratios scale by 1/0.5.
+        let inp = vec![0.2_f32, 0.5, 0.1, 1.0];
+        let mut norms = vec![0.0_f32; 1];
+        let mut ratios = vec![0.0_f32; 4];
+        unsafe {
+            darkroom_filmicrgb_compute_ratios(
+                inp.as_ptr(), norms.as_mut_ptr(), ratios.as_mut_ptr(), 1, 1, // MAX_RGB
+                0, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                0, 0,
+            );
+        }
+        assert!((norms[0] - 0.5).abs() < 1e-6);
+        assert!((ratios[0] - 0.4).abs() < 1e-6); // 0.2/0.5
+        assert!((ratios[1] - 1.0).abs() < 1e-6); // 0.5/0.5
+        assert!((ratios[2] - 0.2).abs() < 1e-6); // 0.1/0.5
+        // restore_ratios should invert (clamp then * norm): ratio*norm == input (since all in [0,1])
+        unsafe { darkroom_filmicrgb_restore_ratios(ratios.as_mut_ptr(), norms.as_ptr(), 1); }
+        for c in 0..3 { assert!((ratios[c] - inp[c]).abs() < 1e-6, "c={c}"); }
+    }
+
+    #[test]
+    fn compute_ratios_clamps_norm_to_norm_min() {
+        // all-zero pixel → norm clamped to NORM_MIN, ratios finite (0/NORM_MIN = 0).
+        let inp = vec![0.0_f32; 4];
+        let mut norms = vec![0.0_f32; 1];
+        let mut ratios = vec![9.0_f32; 4];
+        unsafe {
+            darkroom_filmicrgb_compute_ratios(
+                inp.as_ptr(), norms.as_mut_ptr(), ratios.as_mut_ptr(), 1, 1,
+                0, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                0, 0,
+            );
+        }
+        assert_eq!(norms[0], NORM_MIN);
+        for c in 0..4 { assert_eq!(ratios[c], 0.0); }
     }
 
     #[test]

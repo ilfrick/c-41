@@ -1200,17 +1200,9 @@ static inline void init_reconstruct(const float *const restrict in,
                                     const size_t width,
                                     const size_t height)
 {
-// init the reconstructed buffer with non-clipped and partially clipped pixels
-// Note : it's a simple multiplied alpha blending where mask = alpha weight
-  DT_OMP_FOR() \
-  for(size_t k = 0; k < height * width; k++)
-  {
-    dt_aligned_pixel_t re;
-    for_each_channel(c,aligned(in,mask,reconstructed))
-      re[c] = MAX(in[4*k + c] * (1.f - mask[k]), 0.0f);
-    copy_pixel_nontemporal(reconstructed + 4*k, re);
-  }
-  dt_omploop_sfence();  // ensure that nontemporal write complete before we attempt to read the output
+  // init the reconstructed buffer with non-clipped and partially clipped pixels:
+  // a simple multiplied-alpha blend where mask = alpha weight (Rust FFI).
+  darkroom_filmicrgb_init_reconstruct(in, mask, reconstructed, (size_t)height * width);
 }
 
 static int get_scales(const dt_iop_roi_t *roi_in, const dt_dev_pixelpipe_iop_t *const piece)
@@ -1835,17 +1827,18 @@ static inline void compute_ratios(const float *const restrict in,
                                   const size_t width,
                                   const size_t height)
 {
-  DT_OMP_FOR()
-  for(size_t k = 0; k < height * width * 4; k += 4)
-  {
-    const float norm = MAX(get_pixel_norm(in + k, variant, work_profile), NORM_MIN);
-    norms[k / 4] = norm;
-    dt_aligned_pixel_t ratio;
-    for_each_channel(c,aligned(ratios,in))
-      ratio[c] = in[k + c] / norm;
-    copy_pixel_nontemporal(ratios + k, ratio);
-  }
-  dt_omploop_sfence();	// ensure that nontemporal writes complete before we attempt to read output
+  // decompose pixels into per-pixel norm + per-channel ratios (Rust FFI).
+  const int has_wp = (work_profile != NULL);
+  darkroom_filmicrgb_compute_ratios(
+      in, norms, ratios, (size_t)height * width, variant,
+      has_wp,
+      has_wp ? (const float *)work_profile->matrix_in : NULL,
+      has_wp ? work_profile->lut_in[0] : NULL,
+      has_wp ? work_profile->lut_in[1] : NULL,
+      has_wp ? work_profile->lut_in[2] : NULL,
+      has_wp ? (const float *)work_profile->unbounded_coeffs_in : NULL,
+      has_wp ? work_profile->lutsize : 0,
+      has_wp ? work_profile->nonlinearlut : 0);
 }
 
 

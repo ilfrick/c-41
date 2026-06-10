@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **391** |
+| Unit tests passing | **394** |
 | IOP `.rs` files | 93 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+71` (filmicrgb colour-science v4/v5 gamut-mapping loops ported to Rust FFI) |
+| Last patch | `Phase 2z+72` (filmicrgb init_reconstruct + compute_ratios ported to Rust FFI) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -59,7 +59,7 @@ Commit-params LUT builders migrated:
 | `colorequal` | 1 | GUI background renderer (intentionally deferred) |
 | `highlights` | 4 | `interpolate_color_xtrans` / `interpolate_color` CFA inpaint |
 | `diffuse` | 1 | anisotropic PDE solver (very complex) |
-| `filmicrgb` | 5 | split + chroma v1/v2/v3 done; Yrg colour space + gamut-mapping foundation (gamut_check_yrg, chroma-clip curves, ych_max_chroma) in color.rs; colour-science v4/v5 gamut-mapping loops (filmic_chroma_v4, filmic_split_v4, filmic_v5) ported to Rust FFI. Remaining: ~5 highlights-reconstruction loops (wavelet/diffusion) + compute_ratios |
+| `filmicrgb` | 3 | split + chroma v1/v2/v3 + v4/v5 gamut-mapping done; Yrg + gamut-mapping foundation in color.rs; highlights init_reconstruct + compute_ratios ported. Remaining 3: wavelets_reconstruct_RGB (~1081), wavelets_reconstruct_ratios (~1154), reconstruct_highlights (~1319) — the wavelet/diffusion path |
 | `gamma` | 5 | `dt_Lab_to_XYZ`, `dt_HSL_2_RGB`, `dt_JzAzBz_*` |
 | `channelmixerrgb` | 2 | B-spline local avg reduction (illuminant detection) |
 | `colortransfer` | 2 | k-means with atomic accumulators |
