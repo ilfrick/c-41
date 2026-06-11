@@ -2393,6 +2393,61 @@ void darkroom_highlights_lch_xtrans(const float *in_buf, float *out_buf,
                                     size_t width_in,
                                     const unsigned char *xtrans, float clip);
 
+/*
+ * Highlights IOP -- opposed reconstruction (src/iop/hlreconstruct/opposed.c).
+ * The mask buffer is the 6*msize char buffer (channels 0..2 = clipped
+ * superpixels, 3..5 = dilated); msize = round4(mwidth)*round4(mheight).
+ * mask_* return non-zero when any superpixel clipped. sums/cnts are
+ * caller-zeroed 4-float accumulators; clips 3 floats; chrominance 3 floats;
+ * correction 4 floats; xtrans 36 bytes. The sraw input/output buffers are
+ * RGBA (4 floats/pixel); the raw ones single-channel. In output_raw, tmpout
+ * may be NULL (reconstruction recomputed on the fly).
+ */
+int darkroom_highlights_opposed_mask_sraw(const float *in_buf, unsigned char *mask_buf,
+                                          size_t width, size_t height,
+                                          size_t mwidth, size_t mheight, size_t msize,
+                                          const float *clips);
+
+void darkroom_highlights_opposed_dilate_sraw(unsigned char *mask_buf,
+                                             size_t mwidth, size_t mheight, size_t msize);
+
+void darkroom_highlights_opposed_chroma_sraw(const float *in_buf, const unsigned char *mask_buf,
+                                             size_t width, size_t height,
+                                             size_t mwidth, size_t mheight, size_t msize,
+                                             const float *clips, float *sums, float *cnts);
+
+void darkroom_highlights_opposed_output_sraw(const float *in_buf, float *out_buf, size_t npixels,
+                                             const float *clips, const float *chrominance);
+
+int darkroom_highlights_opposed_mask_raw(const float *in_buf, unsigned char *mask_buf,
+                                         size_t width, size_t mwidth, size_t mheight, size_t msize,
+                                         unsigned int filters, const unsigned char *xtrans,
+                                         const float *clips);
+
+void darkroom_highlights_opposed_dilate_raw(unsigned char *mask_buf,
+                                            size_t mwidth, size_t mheight, size_t msize);
+
+void darkroom_highlights_opposed_chroma_raw(const float *in_buf, const unsigned char *mask_buf,
+                                            size_t width, size_t height,
+                                            size_t mwidth, size_t mheight, size_t msize,
+                                            unsigned int filters, const unsigned char *xtrans,
+                                            const float *clips, const float *correction,
+                                            float *sums, float *cnts);
+
+void darkroom_highlights_opposed_tmpout_raw(const float *in_buf, float *tmpout,
+                                            size_t width, size_t height,
+                                            unsigned int filters, const unsigned char *xtrans,
+                                            const float *clips, const float *chrominance,
+                                            const float *correction);
+
+void darkroom_highlights_opposed_output_raw(const float *in_buf, const float *tmpout, float *out_buf,
+                                            size_t out_width, size_t out_height,
+                                            int out_x, int out_y,
+                                            size_t in_width, size_t in_height,
+                                            unsigned int filters, const unsigned char *xtrans,
+                                            const float *clips, const float *chrominance,
+                                            const float *correction);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

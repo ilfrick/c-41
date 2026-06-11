@@ -434,6 +434,440 @@ pub unsafe extern "C" fn darkroom_highlights_lch_xtrans(
     }
 }
 
+// ── Opposed highlight reconstruction (src/iop/hlreconstruct/opposed.c) ────────
+
+/// x³ — matches fcube() in src/common/math.h:295.
+#[inline(always)]
+fn fcube(a: f32) -> f32 { a * a * a }
+
+/// Opposing-channel reference for an sRAW RGBA pixel: cube of the mean of the
+/// two other channels' cube roots. Matches _calc_linear_refavg() (opposed.c:49).
+#[inline(always)]
+fn calc_linear_refavg(pix: &[f32], color: usize) -> f32 {
+    let ins = [
+        pix[0].max(0.0).cbrt(),
+        pix[1].max(0.0).cbrt(),
+        pix[2].max(0.0).cbrt(),
+    ];
+    let opp = [
+        0.5 * (ins[1] + ins[2]),
+        0.5 * (ins[0] + ins[2]),
+        0.5 * (ins[0] + ins[1]),
+    ];
+    fcube(opp[color])
+}
+
+/// Raw-mosaic opposing-channel reference: per-colour means over the
+/// (row-1..row+1, col-1..col+1)-ish window (note the C's asymmetric clamping
+/// at the bottom/right edges), cube-rooted with `correction`, then the mean of
+/// the two opposing channels; cubed when `linear`.
+/// Matches _calc_refavg() in src/iop/hlreconstruct/segbased.c:186.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn calc_refavg(
+    input: &[f32], xt: &[[u8; 6]; 6], filters: u32,
+    row: usize, col: usize, width: usize, height: usize,
+    correction: &[f32; 4], linear: bool,
+) -> f32 {
+    let color = raw::fcol(row as i32, col as i32, filters, xt);
+    let mut mean = [0.0_f32; 3];
+    let mut cnt = [0.0_f32; 3];
+
+    let dymin = row.saturating_sub(1);
+    let dxmin = col.saturating_sub(1);
+    let dymax = (height - 1).min(row + 2); // exclusive — mirrors the C `dy < dymax`
+    let dxmax = (width - 1).min(col + 2);
+
+    for dy in dymin..dymax {
+        for dx in dxmin..dxmax {
+            let val = input[dy * width + dx].max(0.0);
+            let c = raw::fcol(dy as i32, dx as i32, filters, xt);
+            mean[c] += val;
+            cnt[c] += 1.0;
+        }
+    }
+    for c in 0..3 {
+        mean[c] = if cnt[c] > 0.0 { ((correction[c] * mean[c]) / cnt[c]).cbrt() } else { 0.0 };
+    }
+    let croot_refavg = [
+        0.5 * (mean[1] + mean[2]),
+        0.5 * (mean[0] + mean[2]),
+        0.5 * (mean[0] + mean[1]),
+    ];
+    if linear { fcube(croot_refavg[color]) } else { croot_refavg[color] }
+}
+
+/// Coarse-map index of a raw photosite: 3x3 superpixels. Matches
+/// _raw_to_cmap() (opposed.c:57), with the row/col **clamped to the map** —
+/// the C version can index one cmap row/col past the end when
+/// width/height ≡ 1 (mod 3) (silent OOB read there; clamped here).
+#[inline(always)]
+fn raw_to_cmap(mwidth: usize, mheight: usize, row: usize, col: usize) -> usize {
+    (row / 3).min(mheight - 1) * mwidth + (col / 3).min(mwidth - 1)
+}
+
+/// 7x7-ish dilation tap pattern around `center`. Matches _mask_dilated()
+/// (opposed.c:62). Caller guarantees ±3 rows/cols around `center` are in
+/// bounds (the loop bounds below do).
+#[inline(always)]
+fn mask_dilated(m: &[u8], center: usize, w1: usize) -> u8 {
+    let at = |off: isize| -> u8 { m[(center as isize + off) as usize] };
+    if at(0) != 0 { return 1; }
+    let w1 = w1 as isize;
+    if at(-w1 - 1) | at(-w1) | at(-w1 + 1) | at(-1) | at(1) | at(w1 - 1) | at(w1) | at(w1 + 1) != 0 {
+        return 1;
+    }
+    let w2 = 2 * w1;
+    let w3 = 3 * w1;
+    let ring = at(-w3 - 2) | at(-w3 - 1) | at(-w3) | at(-w3 + 1) | at(-w3 + 2)
+        | at(-w2 - 3) | at(-w2 - 2) | at(-w2 - 1) | at(-w2) | at(-w2 + 1) | at(-w2 + 2) | at(-w2 + 3)
+        | at(-w1 - 3) | at(-w1 - 2) | at(-w1 + 2) | at(-w1 + 3)
+        | at(-3) | at(-2) | at(2) | at(3)
+        | at(w1 - 3) | at(w1 - 2) | at(w1 + 2) | at(w1 + 3)
+        | at(w2 - 3) | at(w2 - 2) | at(w2 - 1) | at(w2) | at(w2 + 1) | at(w2 + 2) | at(w2 + 3)
+        | at(w3 - 2) | at(w3 - 1) | at(w3) | at(w3 + 1) | at(w3 + 2);
+    if ring != 0 { 1 } else { 0 }
+}
+
+/// Read the 6x6 X-Trans table from a raw byte pointer.
+/// # Safety: `xtrans` points to 36 bytes.
+#[inline(always)]
+unsafe fn read_xtrans(xtrans: *const u8) -> [[u8; 6]; 6] {
+    let b = std::slice::from_raw_parts(xtrans, 36);
+    let mut xt = [[0_u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 { xt[r][c] = b[r * 6 + c]; }
+    }
+    xt
+}
+
+/// sRAW clipped-superpixel mask build. Returns 1 if any superpixel clipped.
+/// Replaces the DT_OMP_FOR(reduction(|:anyclipped)) loop in
+/// _process_linear_opposed() (opposed.c:124). Note: like the C, the clip test
+/// reads channel 0 (`input[idx]`) for all three colour comparisons.
+///
+/// # Safety
+/// `in_buf` holds `width*height*4` floats; `mask_buf` holds `6*msize` bytes
+/// (channels 0..2 written); `clips` holds 3 floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_opposed_mask_sraw(
+    in_buf: *const f32, mask_buf: *mut u8,
+    width: usize, height: usize, mwidth: usize, mheight: usize, msize: usize,
+    clips: *const f32,
+) -> i32 {
+    if width < 2 || height < 2 { return 0; }
+    let input = std::slice::from_raw_parts(in_buf, width * height * 4);
+    let mask = std::slice::from_raw_parts_mut(mask_buf, 6 * msize);
+    let clips = std::slice::from_raw_parts(clips, 3);
+    let mut anyclipped = false;
+
+    for row in 0..height - 1 {
+        for col in 0..width - 1 {
+            let idx = (row * width + col) * 4;
+            let mdx = raw_to_cmap(mwidth, mheight, row, col);
+            for c in 0..3 {
+                if input[idx] >= clips[c] && mask[c * msize + mdx] == 0 {
+                    mask[c * msize + mdx] |= 1;
+                    anyclipped = true;
+                }
+            }
+        }
+    }
+    anyclipped as i32
+}
+
+/// sRAW mask dilation (interior only, rows/cols 3..m-4). Replaces the
+/// DT_OMP_FOR(collapse(2)) loop in _process_linear_opposed() (opposed.c:151).
+///
+/// # Safety
+/// `mask_buf` holds `6*msize` bytes (reads channels 0..2, writes 3..5).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_opposed_dilate_sraw(
+    mask_buf: *mut u8, mwidth: usize, mheight: usize, msize: usize,
+) {
+    if mwidth < 7 || mheight < 7 { return; }
+    let mask = std::slice::from_raw_parts_mut(mask_buf, 6 * msize);
+    for row in 3..mheight - 3 {
+        for col in 3..mwidth - 3 {
+            let mx = row * mwidth + col;
+            mask[3 * msize + mx] = mask_dilated(mask, mx, mwidth);
+            mask[4 * msize + mx] = mask_dilated(mask, msize + mx, mwidth);
+            mask[5 * msize + mx] = mask_dilated(mask, 2 * msize + mx, mwidth);
+        }
+    }
+}
+
+/// sRAW chrominance sums: accumulate (inval - linear refavg) for unclipped
+/// pixels near clipped areas. Replaces the DT_OMP_FOR(reduction(+:sums,cnts))
+/// loop in _process_linear_opposed() (opposed.c:163). `sums`/`cnts` are
+/// caller-zeroed 4-float accumulators.
+///
+/// # Safety
+/// Buffers per `darkroom_highlights_opposed_mask_sraw`; `sums`/`cnts` hold 4
+/// floats each.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_opposed_chroma_sraw(
+    in_buf: *const f32, mask_buf: *const u8,
+    width: usize, height: usize, mwidth: usize, mheight: usize, msize: usize,
+    clips: *const f32, sums: *mut f32, cnts: *mut f32,
+) {
+    if width < 7 || height < 7 { return; }
+    let input = std::slice::from_raw_parts(in_buf, width * height * 4);
+    let mask = std::slice::from_raw_parts(mask_buf, 6 * msize);
+    let clips = std::slice::from_raw_parts(clips, 3);
+    let sums = std::slice::from_raw_parts_mut(sums, 4);
+    let cnts = std::slice::from_raw_parts_mut(cnts, 4);
+
+    for row in 3..height - 3 {
+        for col in 3..width - 3 {
+            let idx = (row * width + col) * 4;
+            let mdx = raw_to_cmap(mwidth, mheight, row, col);
+            for c in 0..3 {
+                let inval = input[idx + c];
+                if inval > 0.2 * clips[c] && inval < clips[c] && mask[(c + 3) * msize + mdx] != 0 {
+                    sums[c] += inval - calc_linear_refavg(&input[idx..idx + 4], c);
+                    cnts[c] += 1.0;
+                }
+            }
+        }
+    }
+}
+
+/// sRAW final output: clipped channels become max(in, refavg + chrominance).
+/// Replaces the DT_OMP_FOR(collapse(2)) loop in _process_linear_opposed()
+/// (opposed.c:201). Only channels 0..2 are written (alpha untouched, as in C).
+///
+/// # Safety
+/// `in_buf`/`out_buf` hold `npixels*4` floats; `clips`/`chrominance` hold >= 3
+/// floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_opposed_output_sraw(
+    in_buf: *const f32, out_buf: *mut f32, npixels: usize,
+    clips: *const f32, chrominance: *const f32,
+) {
+    let input = std::slice::from_raw_parts(in_buf, npixels * 4);
+    let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
+    let clips = std::slice::from_raw_parts(clips, 3);
+    let chrominance = std::slice::from_raw_parts(chrominance, 3);
+
+    for k in 0..npixels {
+        let idx = k * 4;
+        for c in 0..3 {
+            let refv = calc_linear_refavg(&input[idx..idx + 4], c);
+            let inval = input[idx + c].max(0.0);
+            output[idx + c] = if inval >= clips[c] { inval.max(refv + chrominance[c]) } else { inval };
+        }
+    }
+}
+
+/// Raw clipped-superpixel mask build over 3x3 photosite blocks. Returns 1 if
+/// any superpixel clipped. Replaces the DT_OMP_FOR(reduction(|:anyclipped)
+/// collapse(2)) loop in _process_opposed() (opposed.c:267).
+///
+/// # Safety
+/// `in_buf` holds `>= (3*(mheight-1)) * width` floats (single-channel raw);
+/// `mask_buf` holds `6*msize` bytes; `clips` 3 floats; `xtrans` 36 bytes.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_opposed_mask_raw(
+    in_buf: *const f32, mask_buf: *mut u8,
+    width: usize, mwidth: usize, mheight: usize, msize: usize,
+    filters: u32, xtrans: *const u8, clips: *const f32,
+) -> i32 {
+    if mwidth < 1 || mheight < 1 { return 0; }
+    // the raw frame has >= 3*mheight rows (mheight = height/3)
+    let input = std::slice::from_raw_parts(in_buf, 3 * mheight * width);
+    let mask = std::slice::from_raw_parts_mut(mask_buf, 6 * msize);
+    let clips = std::slice::from_raw_parts(clips, 3);
+    let xt = read_xtrans(xtrans);
+    let mut anyclipped = false;
+
+    for mrow in 0..mheight.saturating_sub(1) {
+        for mcol in 0..mwidth.saturating_sub(1) {
+            let mut mbuff = [0_u8; 3];
+            for y in 0..3 {
+                for x in 0..3 {
+                    let r = 3 * mrow + y;
+                    let cidx = 3 * mcol + x;
+                    let idx = r * width + cidx;
+                    let color = raw::fcol(r as i32, cidx as i32, filters, &xt);
+                    if input[idx] >= clips[color] { mbuff[color] += 1; }
+                }
+            }
+            for c in 0..3 {
+                mask[c * msize + mrow * mwidth + mcol] = (mbuff[c] != 0) as u8;
+                anyclipped |= mbuff[c] != 0;
+            }
+        }
+    }
+    anyclipped as i32
+}
+
+/// Raw mask dilation over the whole map; border cells copy the source mask.
+/// Replaces the DT_OMP_FOR(collapse(2)) loop in _process_opposed()
+/// (opposed.c:301). The `safe` test uses signed arithmetic: for maps narrower
+/// than 8 cells every cell takes the copy branch (the C's size_t arithmetic
+/// would wrap and read out of bounds there).
+///
+/// # Safety
+/// `mask_buf` holds `6*msize` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_opposed_dilate_raw(
+    mask_buf: *mut u8, mwidth: usize, mheight: usize, msize: usize,
+) {
+    let mask = std::slice::from_raw_parts_mut(mask_buf, 6 * msize);
+    let (w, h) = (mwidth as isize, mheight as isize);
+    for row in 0..mheight {
+        for col in 0..mwidth {
+            let mx = row * mwidth + col;
+            let safe = col >= 3 && row >= 3 && (col as isize) < w - 4 && (row as isize) < h - 4;
+            if safe {
+                mask[3 * msize + mx] = mask_dilated(mask, mx, mwidth);
+                mask[4 * msize + mx] = mask_dilated(mask, msize + mx, mwidth);
+                mask[5 * msize + mx] = mask_dilated(mask, 2 * msize + mx, mwidth);
+            } else {
+                mask[3 * msize + mx] = mask[mx];
+                mask[4 * msize + mx] = mask[mx + msize];
+                mask[5 * msize + mx] = mask[mx + 2 * msize];
+            }
+        }
+    }
+}
+
+/// Raw chrominance sums via _calc_refavg. Replaces the
+/// DT_OMP_FOR(reduction(+:sums,cnts) collapse(2)) loop in _process_opposed()
+/// (opposed.c:316). `sums`/`cnts` are caller-zeroed 4-float accumulators.
+///
+/// # Safety
+/// `in_buf` holds `width*height` floats; `mask_buf` `6*msize` bytes;
+/// `clips` 3, `correction` 4, `sums`/`cnts` 4 floats; `xtrans` 36 bytes.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_opposed_chroma_raw(
+    in_buf: *const f32, mask_buf: *const u8,
+    width: usize, height: usize, mwidth: usize, mheight: usize, msize: usize,
+    filters: u32, xtrans: *const u8, clips: *const f32, correction: *const f32,
+    sums: *mut f32, cnts: *mut f32,
+) {
+    let input = std::slice::from_raw_parts(in_buf, width * height);
+    let mask = std::slice::from_raw_parts(mask_buf, 6 * msize);
+    let clips = std::slice::from_raw_parts(clips, 3);
+    let corr: &[f32; 4] = &*(correction as *const [f32; 4]);
+    let sums = std::slice::from_raw_parts_mut(sums, 4);
+    let cnts = std::slice::from_raw_parts_mut(cnts, 4);
+    let xt = read_xtrans(xtrans);
+
+    for row in 0..height {
+        for col in 0..width {
+            let idx = row * width + col;
+            let color = raw::fcol(row as i32, col as i32, filters, &xt);
+            let inval = input[idx];
+            if inval < clips[color]
+                && inval > 0.2 * clips[color]
+                && mask[(color + 3) * msize + raw_to_cmap(mwidth, mheight, row, col)] != 0
+            {
+                sums[color] += inval - calc_refavg(input, &xt, filters, row, col, width, height, corr, true);
+                cnts[color] += 1.0;
+            }
+        }
+    }
+}
+
+/// Raw full-frame reconstruction into `tmpout` (the `keep` path). Replaces the
+/// DT_OMP_FOR(collapse(2)) loop in _process_opposed() (opposed.c:361).
+///
+/// # Safety
+/// `in_buf`/`tmpout` hold `width*height` floats; scalars as in chroma_raw.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_opposed_tmpout_raw(
+    in_buf: *const f32, tmpout: *mut f32,
+    width: usize, height: usize,
+    filters: u32, xtrans: *const u8, clips: *const f32,
+    chrominance: *const f32, correction: *const f32,
+) {
+    let input = std::slice::from_raw_parts(in_buf, width * height);
+    let out = std::slice::from_raw_parts_mut(tmpout, width * height);
+    let clips = std::slice::from_raw_parts(clips, 3);
+    let chrominance = std::slice::from_raw_parts(chrominance, 3);
+    let corr: &[f32; 4] = &*(correction as *const [f32; 4]);
+    let xt = read_xtrans(xtrans);
+
+    for row in 0..height {
+        for col in 0..width {
+            let idx = row * width + col;
+            let color = raw::fcol(row as i32, col as i32, filters, &xt);
+            let inval = input[idx];
+            out[idx] = if inval >= clips[color] {
+                let refv = calc_refavg(input, &xt, filters, row, col, width, height, corr, true);
+                inval.max(refv + chrominance[color])
+            } else {
+                inval
+            };
+        }
+    }
+}
+
+/// Raw output crop/reconstruct into the roi_out plane. When `tmpout` is
+/// non-null the reconstruction is taken from it; otherwise it is recomputed
+/// on the fly. Out-of-input positions write 0. Replaces the
+/// DT_OMP_FOR(collapse(2)) loop in _process_opposed() (opposed.c:380).
+///
+/// # Safety
+/// `out_buf` holds `out_width*out_height` floats; `in_buf` (and `tmpout` when
+/// non-null) hold `in_width*in_height` floats; scalars as in chroma_raw.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_opposed_output_raw(
+    in_buf: *const f32, tmpout: *const f32, out_buf: *mut f32,
+    out_width: usize, out_height: usize, out_x: i32, out_y: i32,
+    in_width: usize, in_height: usize,
+    filters: u32, xtrans: *const u8, clips: *const f32,
+    chrominance: *const f32, correction: *const f32,
+) {
+    let input = std::slice::from_raw_parts(in_buf, in_width * in_height);
+    let tmp = if tmpout.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(tmpout, in_width * in_height))
+    };
+    let output = std::slice::from_raw_parts_mut(out_buf, out_width * out_height);
+    let clips = std::slice::from_raw_parts(clips, 3);
+    let chrominance = std::slice::from_raw_parts(chrominance, 3);
+    let corr: &[f32; 4] = &*(correction as *const [f32; 4]);
+    let xt = read_xtrans(xtrans);
+
+    for row in 0..out_height {
+        for col in 0..out_width {
+            let odx = row * out_width + col;
+            // C adds the (possibly negative) roi offsets in size_t and relies
+            // on wrap-around to fail the bounds test; signed math here.
+            let irow = row as i64 + out_y as i64;
+            let icol = col as i64 + out_x as i64;
+            let mut oval = 0.0_f32;
+            if irow >= 0 && (irow as usize) < in_height && icol >= 0 && (icol as usize) < in_width {
+                let (irow, icol) = (irow as usize, icol as usize);
+                let ix = irow * in_width + icol;
+                oval = match tmp {
+                    Some(t) => t[ix],
+                    None => {
+                        let color = raw::fcol(irow as i32, icol as i32, filters, &xt);
+                        let v = input[ix];
+                        if v >= clips[color] {
+                            let refv = calc_refavg(input, &xt, filters, irow, icol, in_width, in_height, corr, true);
+                            v.max(refv + chrominance[color])
+                        } else {
+                            v
+                        }
+                    }
+                };
+            }
+            output[odx] = oval;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +959,107 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn calc_linear_refavg_grey_is_identity() {
+        // equal channels → opposing means equal the channel itself
+        let pix = [0.343_f32, 0.343, 0.343, 0.0];
+        for c in 0..3 {
+            assert!((calc_linear_refavg(&pix, c) - 0.343).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn calc_refavg_uniform_raw_is_identity() {
+        // uniform mosaic: every per-colour mean is v → refavg = v (correction=1)
+        let (w, h) = (8usize, 8usize);
+        let v = 0.62_f32;
+        let input = vec![v; w * h];
+        let corr = [1.0_f32; 4];
+        let xt = [[0u8; 6]; 6]; // unused for bayer
+        let r = calc_refavg(&input, &xt, RGGB, 4, 4, w, h, &corr, true);
+        assert!((r - v).abs() < 1e-5, "r={r}");
+    }
+
+    #[test]
+    fn opposed_sraw_mask_and_output_roundtrip() {
+        // 12x12 RGBA frame, one clipped R pixel in the middle.
+        let (w, h) = (12usize, 12usize);
+        let (mw, mh) = (w / 3, h / 3);
+        let r4 = |x: usize| (x + 3) & !3; // dt_round_size(x, 4)
+        let msize = r4(mw) * r4(mh);
+
+        let clips = [1.0_f32, 1.0, 1.0];
+        let mut input = vec![0.4_f32; w * h * 4];
+        let cidx = (6 * w + 6) * 4;
+        input[cidx] = 2.0; // clipped R at (6,6)
+
+        let mut mask = vec![0_u8; 6 * msize];
+        let any = unsafe {
+            darkroom_highlights_opposed_mask_sraw(
+                input.as_ptr(), mask.as_mut_ptr(), w, h, mw, mh, msize, clips.as_ptr(),
+            )
+        };
+        assert_eq!(any, 1);
+        // (6,6) maps to cmap (2,2); channel 0 — but note C tests input[idx]
+        // (channel 0) against all three clips, so all 3 channels get flagged.
+        assert_eq!(mask[2 * mw + 2], 1);
+
+        // output: unclipped pixels pass through, the clipped one >= original
+        let mut out = vec![0.0_f32; w * h * 4];
+        let chroma = [0.0_f32; 3];
+        unsafe {
+            darkroom_highlights_opposed_output_sraw(
+                input.as_ptr(), out.as_mut_ptr(), w * h, clips.as_ptr(), chroma.as_ptr(),
+            );
+        }
+        assert!((out[4] - 0.4).abs() < 1e-6); // ordinary pixel untouched
+        assert!(out[cidx] >= 2.0 - 1e-6); // clipped stays at least the input
+    }
+
+    #[test]
+    fn opposed_dilate_raw_copies_borders_and_dilates_interior() {
+        let (mw, mh) = (16usize, 16usize);
+        let msize = mw * mh; // already multiples of 4
+        let mut mask = vec![0_u8; 6 * msize];
+        mask[8 * mw + 8] = 1; // single set cell, channel 0
+        mask[0] = 1; // border cell, channel 0
+        unsafe {
+            darkroom_highlights_opposed_dilate_raw(mask.as_mut_ptr(), mw, mh, msize);
+        }
+        // border copies source
+        assert_eq!(mask[3 * msize], 1);
+        // dilation spreads to taps within the pattern (e.g. (8,5) is a -3 tap)
+        assert_eq!(mask[3 * msize + 8 * mw + 5], 1);
+        assert_eq!(mask[3 * msize + 5 * mw + 8], 1); // -3 rows tap
+        assert_eq!(mask[3 * msize + 8 * mw + 8], 1); // itself
+        // far cell untouched
+        assert_eq!(mask[3 * msize + 12 * mw + 14], 0);
+    }
+
+    #[test]
+    fn opposed_raw_output_crops_and_zeroes_outside() {
+        // 8x8 input, 4x4 output at offset (6,6): rows/cols 6..9 — 8,9 out of range → 0
+        let (iw, ih) = (8usize, 8usize);
+        let input: Vec<f32> = (0..iw * ih).map(|k| k as f32 * 0.001).collect();
+        let (ow, oh) = (4usize, 4usize);
+        let mut out = vec![9.0_f32; ow * oh];
+        let clips = [10.0_f32; 3]; // nothing clipped
+        let chroma = [0.0_f32; 3];
+        let corr = [1.0_f32; 4];
+        let xt = [[0u8; 6]; 6];
+        unsafe {
+            darkroom_highlights_opposed_output_raw(
+                input.as_ptr(), std::ptr::null(), out.as_mut_ptr(),
+                ow, oh, 6, 6, iw, ih,
+                RGGB, xt.as_ptr() as *const u8, clips.as_ptr(), chroma.as_ptr(), corr.as_ptr(),
+            );
+        }
+        // (0,0) of out = input(6,6); (2,2) of out = input(8,8) → out of range → 0
+        assert!((out[0] - input[6 * iw + 6]).abs() < 1e-6);
+        assert_eq!(out[2 * ow + 2], 0.0);
+        assert_eq!(out[3 * ow + 3], 0.0);
     }
 
     #[test]

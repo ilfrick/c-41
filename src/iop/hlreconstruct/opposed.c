@@ -120,24 +120,11 @@ static void _process_linear_opposed(dt_iop_module_t *self,
     char *mask = (quality) ? dt_calloc_align_type(char, 6 * msize) : NULL;
     if(mask)
     {
-      gboolean anyclipped = FALSE;
-      DT_OMP_FOR(reduction( | : anyclipped))
-      for(size_t row = 0; row < height -1; row++)
-      {
-        for(size_t col = 0; col < width -1; col++)
-        {
-          const size_t idx = (row * width + col) * 4;
-          const size_t mdx = _raw_to_cmap(mwidth, row, col);
-          for_three_channels(c)
-          {
-            if((input[idx] >= clips[c]) && (mask[c*msize + mdx] == 0))
-            {
-              mask[c * msize + mdx] |= 1;
-              anyclipped |= TRUE;
-            }
-          }
-        }
-      }
+      // clipped-superpixel mask build (Rust FFI). Note: like the original
+      // loop, the clip test reads channel 0 for all three colour comparisons.
+      const gboolean anyclipped
+        = darkroom_highlights_opposed_mask_sraw(input, (unsigned char *)mask,
+                                                width, height, mwidth, mheight, msize, clips);
       /* We want to use the photosites closely around clipped data to be taken into account.
          The mask buffers holds data for each color channel, we dilate the mask buffer slightly
          to get those locations.
@@ -148,35 +135,11 @@ static void _process_linear_opposed(dt_iop_module_t *self,
 
       if(anyclipped)
       {
-        DT_OMP_FOR(collapse(2))
-        for(size_t row = 3; row < mheight - 3; row++)
-        {
-          for(size_t col = 3; col < mwidth - 3; col++)
-          {
-            const size_t mx = row * mwidth + col;
-            mask[3*msize + mx] = _mask_dilated(mask + mx, mwidth);
-            mask[4*msize + mx] = _mask_dilated(mask + msize + mx, mwidth);
-            mask[5*msize + mx] = _mask_dilated(mask + 2*msize + mx, mwidth);
-          }
-        }
-
-        DT_OMP_FOR(reduction(+ : sums, cnts))
-        for(size_t row = 3; row < height - 3; row++)
-        {
-          for(size_t col = 3; col < width - 3; col++)
-          {
-            const size_t idx = (row * width + col) * 4;
-            for_three_channels(c)
-            {
-              const float inval = input[idx+c];
-              if((inval > 0.2f * clips[c]) && (inval < clips[c]) && (mask[(c+3) * msize + _raw_to_cmap(mwidth, row, col)]))
-              {
-                sums[c] += inval - _calc_linear_refavg(&input[idx], c);
-                cnts[c] += 1.0f;
-              }
-            }
-          }
-        }
+        // mask dilation + chrominance sums (Rust FFI)
+        darkroom_highlights_opposed_dilate_sraw((unsigned char *)mask, mwidth, mheight, msize);
+        darkroom_highlights_opposed_chroma_sraw(input, (const unsigned char *)mask,
+                                                width, height, mwidth, mheight, msize,
+                                                clips, sums, cnts);
         for_three_channels(c)
           chrominance[c] = (cnts[c] > 30.0f) ? sums[c] / cnts[c] : 0.0f;
 
@@ -198,20 +161,8 @@ static void _process_linear_opposed(dt_iop_module_t *self,
     }
   }
 
-  DT_OMP_FOR(collapse(2))
-  for(size_t row = 0; row < height; row++)
-  {
-    for(size_t col = 0; col < width; col++)
-    {
-      const size_t idx = (row * width + col) * 4;
-      for_three_channels(c)
-      {
-        const float ref = _calc_linear_refavg(&input[idx], c);
-        const float inval = fmaxf(0.0f, input[idx+c]);
-        output[idx+c] = (inval >= clips[c]) ? fmaxf(inval, ref + chrominance[c]) : inval;
-      }
-    }
-  }
+  // final sRAW output (Rust FFI)
+  darkroom_highlights_opposed_output_sraw(input, output, width * height, clips, chrominance);
 }
 
 static float *_process_opposed(dt_iop_module_t *self,
@@ -263,30 +214,11 @@ static float *_process_opposed(dt_iop_module_t *self,
     char *mask = (quality) ? dt_calloc_align_type(char, 6 * msize) : NULL;
     if(mask)
     {
-      gboolean anyclipped = FALSE;
-      DT_OMP_FOR(reduction( | : anyclipped) collapse(2))
-      for(int mrow = 0; mrow < mheight-1; mrow++)
-      {
-        for(int mcol = 0; mcol < mwidth-1; mcol++)
-        {
-          char mbuff[3] = { 0, 0, 0 };
-          for(int y = 0; y < 3; y++)
-          {
-            for(int x = 0; x < 3; x++)
-            {
-              const size_t idx = (3*mrow + y) * roi_in->width + 3*mcol + x;
-              const int color = fcol(3*mrow+y, 3*mcol+x, filters, xtrans);
-              const gboolean clipped = input[idx] >= clips[color];
-              mbuff[color] += clipped ? 1 : 0;
-            }
-          }
-          for_three_channels(c)
-          {
-            mask[c * msize + mrow * mwidth + mcol] = mbuff[c] ? 1 : 0;
-            anyclipped |= mbuff[c] ? 1 : 0;
-          }
-        }
-      }
+      // clipped-superpixel mask build over 3x3 photosite blocks (Rust FFI)
+      const gboolean anyclipped
+        = darkroom_highlights_opposed_mask_raw(input, (unsigned char *)mask,
+                                               roi_in->width, mwidth, mheight, msize,
+                                               filters, (const unsigned char *)xtrans, clips);
 
       dt_aligned_pixel_t sums = {0.0f, 0.0f, 0.0f, 0.0f};
       dt_aligned_pixel_t cnts = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -298,39 +230,13 @@ static float *_process_opposed(dt_iop_module_t *self,
          to get those locations.
          If there are no clipped locations we keep the chrominance correction at 0 but make it valid
         */
-        DT_OMP_FOR(collapse(2))
-        for(size_t row = 0; row < mheight; row++)
-        {
-          for(size_t col = 0; col < mwidth; col++)
-          {
-            const size_t mx = row * mwidth + col;
-            const gboolean safe = col >= 3 && row >= 3 && col < mwidth - 4 && row < mheight - 4;
-            mask[3*msize + mx] = safe ? _mask_dilated(mask + mx, mwidth)          : mask[mx];
-            mask[4*msize + mx] = safe ? _mask_dilated(mask + msize + mx, mwidth)  : mask[mx + msize];
-            mask[5*msize + mx] = safe ? _mask_dilated(mask + 2*msize + mx, mwidth): mask[mx + 2*msize];
-          }
-        }
-
-        const dt_aligned_pixel_t lo_clips = { 0.2f * clips[0], 0.2f * clips[1], 0.2f * clips[2], 1.0f };
-        /* After having the surrounding mask for each color channel we can calculate the chrominance corrections. */
-        DT_OMP_FOR(reduction(+ : sums, cnts) collapse(2))
-        for(size_t row = 0; row < roi_in->height; row++)
-        {
-          for(size_t col = 0; col < roi_in->width; col++)
-          {
-            const size_t idx = row * roi_in->width + col;
-            const int color = fcol(row, col, filters, xtrans);
-            const float inval = input[idx];
-
-            /* we only use the unclipped photosites very close the true clipped data to calculate the chrominance offset */
-            if((inval < clips[color]) && (inval > lo_clips[color])
-               && (mask[(color+3) * msize + _raw_to_cmap(mwidth, row, col)]))
-            {
-              sums[color] += inval - _calc_refavg(input, xtrans, filters, row, col, roi_in, correction, TRUE);
-              cnts[color] += 1.0f;
-            }
-          }
-        }
+        // mask dilation + chrominance sums via _calc_refavg (Rust FFI)
+        darkroom_highlights_opposed_dilate_raw((unsigned char *)mask, mwidth, mheight, msize);
+        darkroom_highlights_opposed_chroma_raw(input, (const unsigned char *)mask,
+                                               roi_in->width, roi_in->height,
+                                               mwidth, mheight, msize,
+                                               filters, (const unsigned char *)xtrans,
+                                               clips, correction, sums, cnts);
         for_three_channels(c)
           chrominance[c] = (cnts[c] > 100.0f) ? sums[c] / cnts[c] : 0.0f;
       }
@@ -358,53 +264,19 @@ static float *_process_opposed(dt_iop_module_t *self,
   float *tmpout = keep ? dt_alloc_align_float(roi_in->width * roi_in->height) : NULL;
   if(tmpout)
   {
-    DT_OMP_FOR(collapse(2))
-    for(size_t row = 0; row < roi_in->height; row++)
-    {
-      for(size_t col = 0; col < roi_in->width; col++)
-      {
-        const size_t idx = row * roi_in->width + col;
-        const int color = fcol(row, col, filters, xtrans);
-        const float inval = input[idx];
-        if(inval >= clips[color])
-        {
-          const float ref = _calc_refavg(input, xtrans, filters, row, col, roi_in, correction, TRUE);
-          tmpout[idx] = MAX(inval, ref + chrominance[color]);
-        }
-        else
-          tmpout[idx] = inval;
-      }
-    }
+    // full-frame reconstruction for the keep path (Rust FFI)
+    darkroom_highlights_opposed_tmpout_raw(input, tmpout, roi_in->width, roi_in->height,
+                                           filters, (const unsigned char *)xtrans,
+                                           clips, chrominance, correction);
   }
 
-  DT_OMP_FOR(collapse(2))
-  for(size_t row = 0; row < roi_out->height; row++)
-  {
-    for(size_t col = 0; col < roi_out->width; col++)
-    {
-      const size_t odx = row * roi_out->width + col;
-      const size_t irow = row + roi_out->y;
-      const size_t icol = col + roi_out->x;
-      const size_t ix = irow * roi_in->width + icol;
-      float oval = 0.0f;
-      if((irow < roi_in->height) && (icol < roi_in->width))
-      {
-        if(tmpout)
-          oval = tmpout[ix];
-        else
-        {
-          const int color = fcol(irow, icol, filters, xtrans);
-          oval = input[ix];
-          if(oval >= clips[color])
-          {
-            const float ref = _calc_refavg(input, xtrans, filters, irow, icol, roi_in, correction, TRUE);
-            oval = MAX(oval, ref + chrominance[color]);
-          }
-        }
-      }
-      output[odx] = oval;
-    }
-  }
+  // crop/reconstruct into the roi_out plane (Rust FFI)
+  darkroom_highlights_opposed_output_raw(input, tmpout, output,
+                                         roi_out->width, roi_out->height,
+                                         roi_out->x, roi_out->y,
+                                         roi_in->width, roi_in->height,
+                                         filters, (const unsigned char *)xtrans,
+                                         clips, chrominance, correction);
   return tmpout;
 }
 
