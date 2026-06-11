@@ -2377,6 +2377,22 @@ void darkroom_highlights_visualize_mosaic(const float *in_buf,
                                           int irow_offset,
                                           int icol_offset);
 
+/*
+ * Highlights IOP -- LCH reconstruction (src/iop/hlreconstruct/lch.c).
+ * Bayer: in/out are single-channel width*height planes (both indexed with
+ *   roi_out->width, matching the C). filters is the Bayer mask.
+ * X-Trans: out is width_out*height_out; in rows are strided by width_in
+ *   (roi_in->width >= width_out); xtrans is the 6x6 CFA byte table.
+ */
+void darkroom_highlights_lch_bayer(const float *in_buf, float *out_buf,
+                                   size_t width, size_t height,
+                                   unsigned int filters, float clip);
+
+void darkroom_highlights_lch_xtrans(const float *in_buf, float *out_buf,
+                                    size_t width_out, size_t height_out,
+                                    size_t width_in,
+                                    const unsigned char *xtrans, float clip);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

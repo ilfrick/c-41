@@ -236,9 +236,309 @@ pub unsafe extern "C" fn darkroom_highlights_visualize_mosaic(
     }
 }
 
+// ── LCH highlight reconstruction (src/iop/hlreconstruct/lch.c) ───────────────
+
+// sqrt(3) and 2*sqrt(3); the C macros are long-double literals — rounded here
+// to the nearest f32 (sub-ulp differences are invisible in reconstruction).
+const SQRT3: f32 = 1.732_050_8;
+const SQRT12: f32 = 3.464_101_6; // 2*SQRT3
+
+/// LCH backtransform: rebuild RGB from luminance L and rescaled C/H.
+/// `(C,H)` is scaled by `sqrt((Co²+Ho²)/(C²+H²))` when well-defined, pulling
+/// the unclipped chroma/hue magnitude onto the full-range L.
+#[inline(always)]
+fn lch_backtransform(l: f32, mut c: f32, mut h: f32, co: f32, ho: f32, distinct: bool) -> [f32; 3] {
+    if distinct {
+        let ratio = ((co * co + ho * ho) / (c * c + h * h)).sqrt();
+        c *= ratio;
+        h *= ratio;
+    }
+    // R = L - H/6 + C/sqrt(12); G = L - H/6 - C/sqrt(12); B = L + H/3
+    [l - h / 6.0 + c / SQRT12, l - h / 6.0 - c / SQRT12, l + h / 3.0]
+}
+
+/// LCH highlight reconstruction for Bayer sensors.
+/// Replaces the DT_OMP_FOR(collapse(2)) loop in process_lch_bayer()
+/// (src/iop/hlreconstruct/lch.c:41). `in`/`out` are single-channel planes of
+/// `width * height` floats (the C indexes both with roi_out->width).
+///
+/// # Safety
+/// `in_buf` and `out_buf` hold `width * height` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_lch_bayer(
+    in_buf: *const f32,
+    out_buf: *mut f32,
+    width: usize,
+    height: usize,
+    filters: u32,
+    clip: f32,
+) {
+    if width == 0 || height == 0 { return; }
+    let n = width * height;
+    let input = std::slice::from_raw_parts(in_buf, n);
+    let output = std::slice::from_raw_parts_mut(out_buf, n);
+
+    for j in 0..height {
+        for i in 0..width {
+            let idx = j * width + i;
+            if i == width - 1 || j == height - 1 {
+                // fast path for border
+                output[idx] = clip.min(input[idx]);
+                continue;
+            }
+
+            // sample 1 bayer block (2x2), giving 2 green values
+            let mut clipped = false;
+            let (mut r, mut gmin, mut gmax, mut b) = (0.0_f32, f32::MAX, f32::MIN, 0.0_f32);
+            for jj in 0..=1usize {
+                for ii in 0..=1usize {
+                    let val = input[idx + jj * width + ii];
+                    clipped = clipped || val > clip;
+                    match raw::fc_bayer((j + jj) as i32, (i + ii) as i32, filters) {
+                        0 => r = val,
+                        1 => { gmin = gmin.min(val); gmax = gmax.max(val); }
+                        2 => b = val,
+                        _ => {}
+                    }
+                }
+            }
+
+            if clipped {
+                let ro = r.min(clip);
+                let go = gmin.min(clip);
+                let bo = b.min(clip);
+
+                let l = (r + gmax + b) / 3.0;
+                let c = SQRT3 * (r - gmax);
+                let h = 2.0 * b - gmax - r;
+                let co = SQRT3 * (ro - go);
+                let ho = 2.0 * bo - go - ro;
+
+                let rgb = lch_backtransform(l, c, h, co, ho, r != gmax && gmax != b);
+                output[idx] = rgb[raw::fc_bayer(j as i32, i as i32, filters)];
+            } else {
+                output[idx] = input[idx];
+            }
+        }
+    }
+}
+
+/// LCH highlight reconstruction for X-Trans sensors.
+/// Replaces the DT_OMP_FOR loop in process_lch_xtrans()
+/// (src/iop/hlreconstruct/lch.c:142). `out` is a `width_out * height_out`
+/// plane; `in` rows are strided by `width_in` (roi_in->width >= width_out).
+///
+/// # Safety
+/// `out_buf` holds `width_out * height_out` floats; `in_buf` holds at least
+/// `height_out` rows of `width_in` floats (rows j-2..j+2 are sampled inside
+/// the border guard, and j±1 by the clipping ring buffer).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_lch_xtrans(
+    in_buf: *const f32,
+    out_buf: *mut f32,
+    width_out: usize,
+    height_out: usize,
+    width_in: usize,
+    xtrans: *const u8, // 6*6 = 36 bytes
+    clip: f32,
+) {
+    if width_out == 0 || height_out == 0 { return; }
+    let input = std::slice::from_raw_parts(in_buf, height_out * width_in);
+    let output = std::slice::from_raw_parts_mut(out_buf, height_out * width_out);
+
+    let xt_bytes = std::slice::from_raw_parts(xtrans, 36);
+    let mut xt = [[0_u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 { xt[r][c] = xt_bytes[r * 6 + c]; }
+    }
+
+    let riw = width_in as isize;
+    // int-style bounds (C uses int arithmetic; usize would underflow when the
+    // ROI is narrower than 3 pixels)
+    let (w, h) = (width_out as isize, height_out as isize);
+    for j in 0..height_out {
+        let ji = j as isize;
+        // bit vector used as ring buffer to remember clipping of current and
+        // last two columns, checking current pixel and its vertical neighbours
+        let mut cl: u32 = 0;
+        for i in 0..width_out {
+            let ii_ = i as isize;
+            let base = (j * width_in + i) as isize;
+            let at = |off: isize| -> f32 { input[(base + off) as usize] };
+
+            // update clipping ring buffer
+            cl = (cl << 1) & 6;
+            if ji >= 2 && ji <= h - 3 {
+                cl |= (at(-riw) > clip || at(0) > clip || at(riw) > clip) as u32;
+            }
+
+            let oidx = j * width_out + i;
+            if ii_ < 2 || ii_ > w - 3 || ji < 2 || ji > h - 3 {
+                // fast path for border
+                output[oidx] = clip.min(at(0));
+                continue;
+            }
+
+            // if the current pixel is clipped, always reconstruct
+            let mut clipped = at(0) > clip;
+            if !clipped && cl != 0 {
+                // Slow case: reconstruct only if every 3x3 block touching the
+                // pixel contains a clipped value (avoids zippering at edges of
+                // clipped regions — the X-Trans pattern is prone to it).
+                clipped = true;
+                for offset_j in -2..=0isize {
+                    for offset_i in -2..=0isize {
+                        if clipped {
+                            clipped = false;
+                            for jj in offset_j..=offset_j + 2 {
+                                for ii in offset_i..=offset_i + 2 {
+                                    clipped = clipped || at(jj * riw + ii) > clip;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if clipped {
+                let mut mean = [0.0_f32; 3];
+                let mut rgb_max = [f32::MIN; 3];
+                let mut cnt = [0_i32; 3];
+                for jj in -1..=1isize {
+                    for ii in -1..=1isize {
+                        let val = at(jj * riw + ii);
+                        let c = raw::fc_xtrans(j as i32 + jj as i32, i as i32 + ii as i32, &xt);
+                        mean[c] += val;
+                        cnt[c] += 1;
+                        rgb_max[c] = rgb_max[c].max(val);
+                    }
+                }
+
+                let ro = (mean[0] / cnt[0] as f32).min(clip);
+                let go = (mean[1] / cnt[1] as f32).min(clip);
+                let bo = (mean[2] / cnt[2] as f32).min(clip);
+
+                let (r, g, b) = (rgb_max[0], rgb_max[1], rgb_max[2]);
+                let l = (r + g + b) / 3.0;
+                let c = SQRT3 * (r - g);
+                let h = 2.0 * b - g - r;
+                let co = SQRT3 * (ro - go);
+                let ho = 2.0 * bo - go - ro;
+
+                let rgb = lch_backtransform(l, c, h, co, ho, r != g && g != b);
+                output[oidx] = rgb[raw::fc_xtrans(j as i32, i as i32, &xt)];
+            } else {
+                output[oidx] = at(0);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RGGB Bayer mask (see raw.rs tests).
+    const RGGB: u32 = 0x94949494;
+
+    // Genuine Fuji X-Trans CFA (R=0,G=1,B=2). Unlike an arbitrary 6x6 table,
+    // every 3x3 window contains all three colours — process_lch_xtrans relies
+    // on that (cnt[c] > 0) exactly like the C original.
+    const XTRANS: [[u8; 6]; 6] = [
+        [1, 2, 1, 1, 0, 1], [0, 1, 0, 2, 1, 2],
+        [1, 2, 1, 1, 0, 1], [1, 0, 1, 1, 2, 1],
+        [2, 1, 2, 0, 1, 0], [1, 0, 1, 1, 2, 1],
+    ];
+
+    #[test]
+    fn lch_bayer_unclipped_passes_through() {
+        let (w, h) = (4usize, 4usize);
+        let inp: Vec<f32> = (0..w * h).map(|k| 0.1 + 0.01 * k as f32).collect();
+        let mut out = vec![-1.0_f32; w * h];
+        unsafe {
+            darkroom_highlights_lch_bayer(inp.as_ptr(), out.as_mut_ptr(), w, h, RGGB, 1.0);
+        }
+        assert_eq!(out, inp); // nothing clipped; borders min(clip, in) = in
+    }
+
+    #[test]
+    fn lch_bayer_border_clamps_to_clip() {
+        let (w, h) = (4usize, 4usize);
+        let mut inp = vec![0.5_f32; w * h];
+        inp[w * h - 1] = 5.0; // bottom-right border pixel above clip
+        let mut out = vec![0.0_f32; w * h];
+        unsafe {
+            darkroom_highlights_lch_bayer(inp.as_ptr(), out.as_mut_ptr(), w, h, RGGB, 1.0);
+        }
+        assert_eq!(out[w * h - 1], 1.0);
+    }
+
+    #[test]
+    fn lch_bayer_reconstructs_clipped_r_pixel() {
+        // RGGB 2x2 block at (0,0): R=2.0 (clipped), G=G=0.5, B=0.5.
+        // Gmax == B → no ratio rescale. L=1, H=-1.5, C=1.5*sqrt3;
+        // out = L - H/6 + C/sqrt12 = 1 + 0.25 + 0.75 = 2.0.
+        let (w, h) = (4usize, 4usize);
+        let mut inp = vec![0.5_f32; w * h];
+        inp[0] = 2.0;
+        let mut out = vec![0.0_f32; w * h];
+        unsafe {
+            darkroom_highlights_lch_bayer(inp.as_ptr(), out.as_mut_ptr(), w, h, RGGB, 1.0);
+        }
+        assert!((out[0] - 2.0).abs() < 1e-5, "out[0]={}", out[0]);
+        // neighbour (1,1) sees the clipped block too (its 2x2 spans rows 1-2) → untouched value
+        assert!((out[w + 2] - 0.5).abs() < 1e-6); // far pixel unaffected
+    }
+
+    #[test]
+    fn lch_xtrans_unclipped_passes_through() {
+        let (w, h) = (8usize, 8usize);
+        let inp: Vec<f32> = (0..w * h).map(|k| 0.1 + 0.005 * k as f32).collect();
+        let mut out = vec![-1.0_f32; w * h];
+        unsafe {
+            darkroom_highlights_lch_xtrans(
+                inp.as_ptr(), out.as_mut_ptr(), w, h, w, XTRANS.as_ptr() as *const u8, 1.0,
+            );
+        }
+        assert_eq!(out, inp);
+    }
+
+    #[test]
+    fn lch_xtrans_fully_clipped_field() {
+        // every value 2.0 > clip=1: interior reconstructs to L=2 (R=G=B=2, C=H=0),
+        // borders clamp to clip=1.
+        let (w, h) = (8usize, 8usize);
+        let inp = vec![2.0_f32; w * h];
+        let mut out = vec![0.0_f32; w * h];
+        unsafe {
+            darkroom_highlights_lch_xtrans(
+                inp.as_ptr(), out.as_mut_ptr(), w, h, w, XTRANS.as_ptr() as *const u8, 1.0,
+            );
+        }
+        for j in 0..h {
+            for i in 0..w {
+                let v = out[j * w + i];
+                if i < 2 || i > w - 3 || j < 2 || j > h - 3 {
+                    assert_eq!(v, 1.0, "border ({j},{i})");
+                } else {
+                    assert!((v - 2.0).abs() < 1e-5, "interior ({j},{i})={v}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lch_xtrans_tiny_roi_takes_border_path() {
+        // 2x2 ROI: every pixel is border; must not underflow the int-style guards.
+        let inp = vec![5.0_f32; 4];
+        let mut out = vec![0.0_f32; 4];
+        unsafe {
+            darkroom_highlights_lch_xtrans(
+                inp.as_ptr(), out.as_mut_ptr(), 2, 2, 2, XTRANS.as_ptr() as *const u8, 1.0,
+            );
+        }
+        assert_eq!(out, vec![1.0; 4]);
+    }
 
     #[test]
     fn sraw_mask_zero_for_clean_pixels() {
