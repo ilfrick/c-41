@@ -2448,6 +2448,18 @@ void darkroom_highlights_opposed_output_raw(const float *in_buf, const float *tm
                                             const float *clips, const float *chrominance,
                                             const float *correction);
 
+/*
+ * Segmentation morphology (src/iop/hlreconstruct/segmentation.c).
+ * Dilate/erode the border-inset interior of a width*height uint32 bitmap
+ * with the progressive-radius ring tests (dilate radius 1..8, erode 1..5).
+ * Caller guarantees border >= radius.
+ */
+void darkroom_segmentation_dilate(const uint32_t *img, uint32_t *out,
+                                  size_t width, size_t height, int border, int radius);
+
+void darkroom_segmentation_erode(const uint32_t *img, uint32_t *out,
+                                 size_t width, size_t height, int border, int radius);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

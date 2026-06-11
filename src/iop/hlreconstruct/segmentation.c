@@ -215,15 +215,8 @@ static inline void _dilating(const uint32_t *img,
                              const int border,
                              const int radius)
 {
-  DT_OMP_FOR(collapse(2))
-  for(int row = border; row < height - border; row++)
-  {
-    for(int col = border; col < w1 - border; col++)
-    {
-      const size_t i = (size_t)row*w1 + col;
-      o[i] = _test_dilate(img, i, w1, radius) ? 1 : 0;
-    }
-  }
+  // morphological dilation of the bitmap interior (Rust FFI)
+  darkroom_segmentation_dilate(img, o, w1, height, border, radius);
 }
 
 static inline int _test_erode(const uint32_t *img, const size_t i, const size_t w1, const int radius)
@@ -286,15 +279,8 @@ static inline void _eroding(const uint32_t *img,
                             const int border,
                             const int radius)
 {
-  DT_OMP_FOR(collapse(2))
-  for(int row = border; row < height - border; row++)
-  {
-    for(int col = border; col < w1 - border; col++)
-    {
-      const size_t i = (size_t)row*w1 + col;
-      o[i] = _test_erode(img, i, w1, radius) ? 1 : 0;
-    }
-  }
+  // morphological erosion of the bitmap interior (Rust FFI)
+  darkroom_segmentation_erode(img, o, w1, height, border, radius);
 }
 
 static inline void _intimage_borderfill(uint32_t *d,

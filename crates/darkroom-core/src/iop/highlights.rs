@@ -868,6 +868,224 @@ pub unsafe extern "C" fn darkroom_highlights_opposed_output_raw(
     }
 }
 
+// ── Segmentation morphology (src/iop/hlreconstruct/segmentation.c) ───────────
+
+/// Progressive-radius dilation test (radius 1..8): OR of the ring taps,
+/// returning early once any tap is set or the radius is exhausted.
+/// Matches _test_dilate() (segmentation.c:104). The two asymmetric taps in
+/// ring 8 (`-w5+6` at line 194, `-w7+6` at line 206 where symmetry suggests
+/// `+7`/`+w7+6`) are replicated verbatim from the C.
+fn test_dilate(img: &[u32], i: usize, w1: usize, radius: i32) -> u32 {
+    let at = |off: isize| -> u32 { img[(i as isize + off) as usize] };
+    let w1 = w1 as isize;
+
+    let mut retval = at(-w1 - 1) | at(-w1) | at(-w1 + 1)
+        | at(-1) | at(0) | at(1)
+        | at(w1 - 1) | at(w1) | at(w1 + 1);
+    if retval != 0 || radius < 2 { return retval; }
+
+    let w2 = 2 * w1;
+    retval = at(-w2 - 1) | at(-w2) | at(-w2 + 1)
+        | at(-w1 - 2) | at(-w1 + 2)
+        | at(-2) | at(2)
+        | at(w1 - 2) | at(w1 + 2)
+        | at(w2 - 1) | at(w2) | at(w2 + 1);
+    if retval != 0 || radius < 3 { return retval; }
+
+    let w3 = 3 * w1;
+    retval = at(-w3 - 2) | at(-w3 - 1) | at(-w3) | at(-w3 + 1) | at(-w3 + 2)
+        | at(-w2 - 3) | at(-w2 - 2) | at(-w2 + 2) | at(-w2 + 3)
+        | at(-w1 - 3) | at(-w1 + 3)
+        | at(-3) | at(3)
+        | at(w1 - 3) | at(w1 + 3)
+        | at(w2 - 3) | at(w2 - 2) | at(w2 + 2) | at(w2 + 3)
+        | at(w3 - 2) | at(w3 - 1) | at(w3) | at(w3 + 1) | at(w3 + 2);
+    if retval != 0 || radius < 4 { return retval; }
+
+    let w4 = 4 * w1;
+    retval = at(-w4 - 2) | at(-w4 - 1) | at(-w4) | at(-w4 + 1) | at(-w4 + 2)
+        | at(-w3 - 3) | at(-w3 + 3)
+        | at(-w2 - 4) | at(-w2 + 4)
+        | at(-w1 - 4) | at(-w1 + 4)
+        | at(-4) | at(4)
+        | at(w1 - 4) | at(w1 + 4)
+        | at(w2 - 4) | at(w2 + 4)
+        | at(w3 - 3) | at(w3 + 3)
+        | at(w4 - 2) | at(w4 - 1) | at(w4) | at(w4 + 1) | at(w4 + 2);
+    if retval != 0 || radius < 5 { return retval; }
+
+    let w5 = 5 * w1;
+    retval = at(-w5 - 2) | at(-w5 - 1) | at(-w5) | at(-w5 + 1) | at(-w5 + 2)
+        | at(-w4 - 4) | at(-w4 - 3) | at(-w4 + 3) | at(-w4 + 4)
+        | at(-w3 - 4) | at(-w3 + 4)
+        | at(-w2 - 5) | at(-w2 + 5)
+        | at(-w1 - 5) | at(-w1 + 5)
+        | at(-5) | at(5)
+        | at(w1 - 5) | at(w1 + 5)
+        | at(w2 - 5) | at(w2 + 5)
+        | at(w3 - 4) | at(w3 + 4)
+        | at(w4 - 4) | at(w4 - 3) | at(w4 + 3) | at(w4 + 4)
+        | at(w5 - 2) | at(w5 - 1) | at(w5) | at(w5 + 1) | at(w5 + 2);
+    if retval != 0 || radius < 6 { return retval; }
+
+    let w6 = 6 * w1;
+    retval = at(-w6 - 2) | at(-w6 - 1) | at(-w6) | at(-w6 + 1) | at(-w6 + 2)
+        | at(-w5 - 4) | at(-w5 - 3) | at(-w5 + 3) | at(-w5 + 4)
+        | at(-w4 - 5) | at(-w4 + 5)
+        | at(-w3 - 5) | at(-w3 + 5)
+        | at(-w2 - 6) | at(-w2 + 6)
+        | at(-w1 - 6) | at(-w1 + 6)
+        | at(-6) | at(6)
+        | at(w1 - 6) | at(w1 + 6)
+        | at(w2 - 6) | at(w2 + 6)
+        | at(w3 - 5) | at(w3 + 5)
+        | at(w4 - 5) | at(w4 + 5)
+        | at(w5 - 4) | at(w5 - 3) | at(w5 + 3) | at(w5 + 4)
+        | at(w6 - 2) | at(w6 - 1) | at(w6) | at(w6 + 1) | at(w6 + 2);
+    if retval != 0 || radius < 7 { return retval; }
+
+    let w7 = 7 * w1;
+    retval = at(-w7 - 3) | at(-w7 - 2) | at(-w7 - 1) | at(-w7) | at(-w7 + 1) | at(-w7 + 2) | at(-w7 + 3)
+        | at(-w6 - 4) | at(-w6 - 3) | at(-w6 + 3) | at(-w6 + 4)
+        | at(-w5 - 6) | at(-w5 - 5) | at(-w5 + 5) | at(-w5 + 6)
+        | at(-w4 - 6) | at(-w4 + 6)
+        | at(-w3 - 7) | at(-w3 - 6) | at(-w3 + 6) | at(-w3 + 7)
+        | at(-w2 - 7) | at(-w2 + 7)
+        | at(-w1 - 7) | at(-w1 + 7)
+        | at(-7) | at(7)
+        | at(w1 - 7) | at(w1 + 7)
+        | at(w2 - 7) | at(w2 + 7)
+        | at(w3 - 7) | at(w3 - 6) | at(w3 + 6) | at(w3 + 7)
+        | at(w4 - 6) | at(w4 + 6)
+        | at(w5 - 6) | at(w5 - 5) | at(w5 + 5) | at(w5 + 6)
+        | at(w6 - 4) | at(w6 - 3) | at(w6 + 3) | at(w6 + 4)
+        | at(w7 - 3) | at(w7 - 2) | at(w7 - 1) | at(w7) | at(w7 + 1) | at(w7 + 2) | at(w7 + 3);
+    if retval != 0 || radius < 8 { return retval; }
+
+    let w8 = 8 * w1;
+    at(-w8 - 4) | at(-w8 - 3) | at(-w8 - 2) | at(-w8 - 1) | at(-w8) | at(-w8 + 1) | at(-w8 + 2) | at(-w8 + 3) | at(-w8 + 4)
+        | at(-w7 - 6) | at(-w7 - 5) | at(-w7 - 4) | at(-w7 + 4) | at(-w7 + 5) | at(-w7 + 6)
+        | at(-w6 - 6) | at(-w6 - 5) | at(-w6 + 5) | at(-w6 + 6)
+        | at(-w5 - 7) | at(-w5 + 6) // C quirk: -w5+6, not +7 (segmentation.c:194)
+        | at(-w4 - 8) | at(-w4 - 7) | at(-w4 + 7) | at(-w4 + 8)
+        | at(-w3 - 8) | at(-w3 - 7) | at(-w3 + 7) | at(-w3 + 8)
+        | at(-w2 - 8) | at(-w2 + 8)
+        | at(-w1 - 8) | at(-w1 + 8)
+        | at(-8) | at(8)
+        | at(w1 - 8) | at(w1 + 8)
+        | at(w2 - 8) | at(w2 + 8)
+        | at(w3 - 8) | at(w3 - 7) | at(w3 + 7) | at(w3 + 8)
+        | at(w4 - 8) | at(w4 - 7) | at(w4 + 7) | at(w4 + 8)
+        | at(w5 - 7) | at(w5 + 7)
+        | at(w6 - 6) | at(w6 - 5) | at(w6 + 5) | at(w6 + 6)
+        | at(w7 - 6) | at(w7 - 5) | at(w7 - 4) | at(w7 + 4) | at(w7 + 5) | at(-w7 + 6) // C quirk: -w7+6 (segmentation.c:206)
+        | at(w8 - 4) | at(w8 - 3) | at(w8 - 2) | at(w8 - 1) | at(w8) | at(w8 + 1) | at(w8 + 2) | at(w8 + 3) | at(w8 + 4)
+}
+
+/// Progressive-radius erosion test (radius 1..5): AND of the ring taps,
+/// returning early once any tap is clear or the radius is exhausted.
+/// Matches _test_erode() (segmentation.c:229).
+fn test_erode(img: &[u32], i: usize, w1: usize, radius: i32) -> u32 {
+    let at = |off: isize| -> u32 { img[(i as isize + off) as usize] };
+    let w1 = w1 as isize;
+
+    let mut retval = at(-w1 - 1) & at(-w1) & at(-w1 + 1)
+        & at(-1) & at(0) & at(1)
+        & at(w1 - 1) & at(w1) & at(w1 + 1);
+    if retval == 0 || radius < 2 { return retval; }
+
+    let w2 = 2 * w1;
+    retval = at(-w2 - 1) & at(-w2) & at(-w2 + 1)
+        & at(-w1 - 2) & at(-w1 + 2)
+        & at(-2) & at(2)
+        & at(w1 - 2) & at(w1 + 2)
+        & at(w2 - 1) & at(w2) & at(w2 + 1);
+    if retval == 0 || radius < 3 { return retval; }
+
+    let w3 = 3 * w1;
+    retval = at(-w3 - 2) & at(-w3 - 1) & at(-w3) & at(-w3 + 1) & at(-w3 + 2)
+        & at(-w2 - 3) & at(-w2 - 2) & at(-w2 + 2) & at(-w2 + 3)
+        & at(-w1 - 3) & at(-w1 + 3)
+        & at(-3) & at(3)
+        & at(w1 - 3) & at(w1 + 3)
+        & at(w2 - 3) & at(w2 - 2) & at(w2 + 2) & at(w2 + 3)
+        & at(w3 - 2) & at(w3 - 1) & at(w3) & at(w3 + 1) & at(w3 + 2);
+    if retval == 0 || radius < 4 { return retval; }
+
+    let w4 = 4 * w1;
+    retval = at(-w4 - 2) & at(-w4 - 1) & at(-w4) & at(-w4 + 1) & at(-w4 + 2)
+        & at(-w3 - 3) & at(-w3 + 3)
+        & at(-w2 - 4) & at(-w2 + 4)
+        & at(-w1 - 4) & at(-w1 + 4)
+        & at(-4) & at(4)
+        & at(w1 - 4) & at(w1 + 4)
+        & at(w2 - 4) & at(w2 + 4)
+        & at(w3 - 3) & at(w3 + 3)
+        & at(w4 - 2) & at(w4 - 1) & at(w4) & at(w4 + 1) & at(w4 + 2);
+    if retval == 0 || radius < 5 { return retval; }
+
+    let w5 = 5 * w1;
+    at(-w5 - 2) & at(-w5 - 1) & at(-w5) & at(-w5 + 1) & at(-w5 + 2)
+        & at(-w4 - 4) & at(-w4 - 3) & at(-w4 + 3) & at(-w4 + 4)
+        & at(-w3 - 4) & at(-w3 + 4)
+        & at(-w2 - 5) & at(-w2 + 5)
+        & at(-w1 - 5) & at(-w1 + 5)
+        & at(-5) & at(5)
+        & at(w1 - 5) & at(w1 + 5)
+        & at(w2 - 5) & at(w2 + 5)
+        & at(w3 - 4) & at(w3 + 4)
+        & at(w4 - 4) & at(w4 - 3) & at(w4 + 3) & at(w4 + 4)
+        & at(w5 - 2) & at(w5 - 1) & at(w5) & at(w5 + 1) & at(w5 + 2)
+}
+
+/// Morphological dilation of the segmentation bitmap interior.
+/// Replaces the DT_OMP_FOR(collapse(2)) loop in _dilating()
+/// (segmentation.c:218): o[i] = test_dilate(...) ? 1 : 0 for the
+/// border-inset interior.
+///
+/// # Safety
+/// `img`/`out` hold `width*height` u32s; `border >= radius` per the C caller
+/// contract (ring-r taps reach at most ±r rows/cols around the pixel).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segmentation_dilate(
+    img: *const u32, out: *mut u32,
+    width: usize, height: usize, border: i32, radius: i32,
+) {
+    let input = std::slice::from_raw_parts(img, width * height);
+    let output = std::slice::from_raw_parts_mut(out, width * height);
+    let b = border.max(0) as usize;
+    if 2 * b >= height || 2 * b >= width { return; } // empty interior, like the C int loop
+    for row in b..height - b {
+        for col in b..width - b {
+            let i = row * width + col;
+            output[i] = (test_dilate(input, i, width, radius) != 0) as u32;
+        }
+    }
+}
+
+/// Morphological erosion of the segmentation bitmap interior.
+/// Replaces the DT_OMP_FOR(collapse(2)) loop in _eroding()
+/// (segmentation.c:289).
+///
+/// # Safety
+/// Same contract as `darkroom_segmentation_dilate` (taps reach ±(5*width+5)).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segmentation_erode(
+    img: *const u32, out: *mut u32,
+    width: usize, height: usize, border: i32, radius: i32,
+) {
+    let input = std::slice::from_raw_parts(img, width * height);
+    let output = std::slice::from_raw_parts_mut(out, width * height);
+    let b = border.max(0) as usize;
+    if 2 * b >= height || 2 * b >= width { return; }
+    for row in b..height - b {
+        for col in b..width - b {
+            let i = row * width + col;
+            output[i] = (test_erode(input, i, width, radius) != 0) as u32;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,6 +1278,63 @@ mod tests {
         assert!((out[0] - input[6 * iw + 6]).abs() < 1e-6);
         assert_eq!(out[2 * ow + 2], 0.0);
         assert_eq!(out[3 * ow + 3], 0.0);
+    }
+
+    #[test]
+    fn segmentation_dilate_spreads_single_pixel() {
+        // single set pixel at the centre of a 32x32 map, border 9, radius 3:
+        // every interior pixel within ring distance 3 turns on.
+        let (w, h) = (32usize, 32usize);
+        let mut img = vec![0_u32; w * h];
+        img[16 * w + 16] = 1;
+        let mut out = vec![7_u32; w * h];
+        unsafe {
+            darkroom_segmentation_dilate(img.as_ptr(), out.as_mut_ptr(), w, h, 9, 3);
+        }
+        assert_eq!(out[16 * w + 16], 1); // itself (ring 1 includes centre)
+        assert_eq!(out[16 * w + 13], 1); // -3 col tap (ring 3)
+        assert_eq!(out[13 * w + 16], 1); // -3 row tap
+        assert_eq!(out[16 * w + 12], 0); // distance 4 — beyond radius 3
+        assert_eq!(out[0], 7); // border untouched
+    }
+
+    #[test]
+    fn segmentation_erode_requires_full_neighbourhood() {
+        // all-ones map: erosion keeps interior 1. Poke one hole: pixels whose
+        // ring includes the hole go 0.
+        let (w, h) = (32usize, 32usize);
+        let mut img = vec![1_u32; w * h];
+        let mut out = vec![7_u32; w * h];
+        unsafe {
+            darkroom_segmentation_erode(img.as_ptr(), out.as_mut_ptr(), w, h, 9, 2);
+        }
+        assert_eq!(out[16 * w + 16], 1);
+
+        img[16 * w + 16] = 0; // hole
+        unsafe {
+            darkroom_segmentation_erode(img.as_ptr(), out.as_mut_ptr(), w, h, 9, 2);
+        }
+        assert_eq!(out[16 * w + 16], 0); // centre sees its own hole
+        assert_eq!(out[16 * w + 17], 0); // ring-1 neighbour sees the hole
+        assert_eq!(out[16 * w + 19], 1); // distance 3 — outside radius-2 rings
+    }
+
+    #[test]
+    fn segmentation_dilate_radius8_uses_outer_ring() {
+        // pixel exactly 8 rows above: only reachable at radius 8.
+        let (w, h) = (40usize, 40usize);
+        let mut img = vec![0_u32; w * h];
+        img[12 * w + 20] = 1;
+        let mut out = vec![0_u32; w * h];
+        unsafe {
+            darkroom_segmentation_dilate(img.as_ptr(), out.as_mut_ptr(), w, h, 10, 8);
+        }
+        assert_eq!(out[20 * w + 20], 1); // -w8 tap fires
+        let mut out7 = vec![0_u32; w * h];
+        unsafe {
+            darkroom_segmentation_dilate(img.as_ptr(), out7.as_mut_ptr(), w, h, 10, 7);
+        }
+        assert_eq!(out7[20 * w + 20], 0); // radius 7 can't reach 8 rows
     }
 
     #[test]
