@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **412** |
+| Unit tests passing | **417** |
 | IOP `.rs` files | 93 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+76` (segmentation morphology — hlreconstruct/segmentation.c dilate/erode ported) |
+| Last patch | `Phase 2z+77` (laplacian highlight reconstruction — all 4 hlreconstruct/laplacian.c loops ported) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -57,7 +57,7 @@ Commit-params LUT builders migrated:
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
 | `colorequal` | 1 | GUI background renderer (intentionally deferred) |
-| `highlights` | 4 (+17 in hlreconstruct/) | highlights.c: `interpolate_color_xtrans` / `interpolate_color` CFA inpaint. hlreconstruct/: lch.c + opposed.c + segmentation.c done (0); remaining laplacian.c 4, segbased.c 13 |
+| `highlights` | 4 (+13 in hlreconstruct/) | highlights.c: `interpolate_color_xtrans` / `interpolate_color` CFA inpaint. hlreconstruct/: lch.c + opposed.c + segmentation.c + laplacian.c done (0); remaining segbased.c 13 |
 | `diffuse` | 1 | anisotropic PDE solver (very complex) |
 | `gamma` | 5 | `dt_Lab_to_XYZ`, `dt_HSL_2_RGB`, `dt_JzAzBz_*` |
 | `channelmixerrgb` | 2 | B-spline local avg reduction (illuminant detection) |

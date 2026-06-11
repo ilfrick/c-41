@@ -211,6 +211,23 @@ pub fn dt_noise_generator_4ch(
     }
 }
 
+/// Cache-friendly row interleaving for à-trous wavelet passes: rows are
+/// visited stride-apart so adjacent threads touch adjacent memory.
+/// Matches `dwt_interleave_rows()` in src/common/dwt.h:87.
+#[inline(always)]
+pub fn dwt_interleave_rows(rowid: usize, height: usize, stride: usize) -> usize {
+    if height <= stride {
+        return rowid;
+    }
+    let per_pass = height.div_ceil(stride);
+    let long_passes = height % stride;
+    if long_passes == 0 || rowid < long_passes * per_pass {
+        return (rowid / per_pass) + stride * (rowid % per_pass);
+    }
+    let rowid2 = rowid - long_passes * per_pass;
+    long_passes + (rowid2 / (per_pass - 1)) + stride * (rowid2 % (per_pass - 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

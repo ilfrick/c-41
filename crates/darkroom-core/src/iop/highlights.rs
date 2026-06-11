@@ -1086,6 +1086,397 @@ pub unsafe extern "C" fn darkroom_segmentation_erode(
     }
 }
 
+// ── Laplacian highlight reconstruction (src/iop/hlreconstruct/laplacian.c) ───
+
+const RED: usize = 0;
+const GREEN: usize = 1;
+const BLUE: usize = 2;
+const ALPHA: usize = 3;
+
+// wavelets_scale_t bits
+const FIRST_SCALE: u32 = 1 << 1;
+const LAST_SCALE: u32 = 1 << 2;
+
+/// B_SPLINE_TO_LAPLACIAN from src/common/bspline.h:39.
+const B_SPLINE_TO_LAPLACIAN: f32 = 3.182_727_4;
+
+#[inline(always)]
+fn sqf(x: f32) -> f32 { x * x }
+
+/// Bilinear CFA interpolation + per-channel clipping mask.
+/// Replaces the DT_OMP_FOR loop in _interpolate_and_mask() (laplacian.c:53).
+/// `interpolated`/`clipping_mask` are RGBA planes; channel 3 holds the
+/// Euclidean norm / any-clipped flag respectively.
+///
+/// # Safety
+/// `input` holds `width*height` floats; `interpolated`/`clipping_mask`
+/// hold `width*height*4`; `clips`/`wb` hold 4 floats.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_interpolate_and_mask(
+    input: *const f32, interpolated: *mut f32, clipping_mask: *mut f32,
+    clips: *const f32, wb: *const f32,
+    filters: u32, width: usize, height: usize,
+) {
+    let inp = std::slice::from_raw_parts(input, width * height);
+    let interp = std::slice::from_raw_parts_mut(interpolated, width * height * 4);
+    let cmask = std::slice::from_raw_parts_mut(clipping_mask, width * height * 4);
+    let clips = std::slice::from_raw_parts(clips, 4);
+    let wb = std::slice::from_raw_parts(wb, 4);
+
+    for i in 0..height {
+        for j in 0..width {
+            let c = raw::fc_bayer(i as i32, j as i32, filters);
+            let i_center = i * width;
+            let center = inp[i_center + j];
+
+            let (mut r, mut g, mut b) = (0.0_f32, 0.0_f32, 0.0_f32);
+            let (r_clipped, g_clipped, b_clipped);
+
+            if i == 0 || j == 0 || i == height - 1 || j == width - 1 {
+                // image edges: no demosaic, R = G = B = center
+                r = center; g = center; b = center;
+                let cl = center > clips[c];
+                r_clipped = cl; g_clipped = cl; b_clipped = cl;
+            } else {
+                let i_prev = (i - 1) * width;
+                let i_next = (i + 1) * width;
+                let (j_prev, j_next) = (j - 1, j + 1);
+
+                let north = inp[i_prev + j];
+                let south = inp[i_next + j];
+                let west = inp[i_center + j_prev];
+                let east = inp[i_center + j_next];
+                let north_east = inp[i_prev + j_next];
+                let north_west = inp[i_prev + j_prev];
+                let south_east = inp[i_next + j_next];
+                let south_west = inp[i_next + j_prev];
+
+                if c == GREEN {
+                    g = center;
+                    g_clipped = center > clips[GREEN];
+                } else {
+                    // interpolate inside an X/Y cross
+                    g = (north + south + east + west) / 4.0;
+                    g_clipped = north > clips[GREEN] || south > clips[GREEN]
+                        || east > clips[GREEN] || west > clips[GREEN];
+                }
+
+                let fc = |di: i32, dj: i32| raw::fc_bayer(i as i32 + di, j as i32 + dj, filters);
+                if c == RED {
+                    r = center;
+                    r_clipped = center > clips[RED];
+                } else if fc(-1, 0) == RED && fc(1, 0) == RED {
+                    // red column → interpolate column-wise
+                    r = (north + south) / 2.0;
+                    r_clipped = north > clips[RED] || south > clips[RED];
+                } else if fc(0, -1) == RED && fc(0, 1) == RED {
+                    // red row → interpolate row-wise
+                    r = (west + east) / 2.0;
+                    r_clipped = west > clips[RED] || east > clips[RED];
+                } else {
+                    // blue row → interpolate inside a square
+                    r = (north_west + north_east + south_east + south_west) / 4.0;
+                    r_clipped = north_west > clips[RED] || north_east > clips[RED]
+                        || south_west > clips[RED] || south_east > clips[RED];
+                }
+
+                if c == BLUE {
+                    b = center;
+                    b_clipped = center > clips[BLUE];
+                } else if fc(-1, 0) == BLUE && fc(1, 0) == BLUE {
+                    b = (north + south) / 2.0;
+                    b_clipped = north > clips[BLUE] || south > clips[BLUE];
+                } else if fc(0, -1) == BLUE && fc(0, 1) == BLUE {
+                    b = (west + east) / 2.0;
+                    b_clipped = west > clips[BLUE] || east > clips[BLUE];
+                } else {
+                    b = (north_west + north_east + south_east + south_west) / 4.0;
+                    b_clipped = north_west > clips[BLUE] || north_east > clips[BLUE]
+                        || south_west > clips[BLUE] || south_east > clips[BLUE];
+                }
+            }
+
+            let rgb = [r, g, b, (sqf(r) + sqf(g) + sqf(b)).sqrt()];
+            let any = r_clipped || g_clipped || b_clipped;
+            let clipped = [
+                r_clipped as u32 as f32, g_clipped as u32 as f32, b_clipped as u32 as f32,
+                if any { 1.0 } else { 0.0 },
+            ];
+            let idx = (i * width + j) * 4;
+            for k in 0..4 {
+                interp[idx + k] = (rgb[k] / wb[k]).max(0.0);
+                cmask[idx + k] = clipped[k];
+            }
+        }
+    }
+}
+
+/// Remosaic the reconstructed RGBA plane back to the CFA and alpha-blend with
+/// the original where unclipped. Replaces the DT_OMP_FOR loop in
+/// _remosaic_and_replace() (laplacian.c:189).
+///
+/// # Safety
+/// `input`/`output` hold `width*height` floats; `interpolated`/`clipping_mask`
+/// hold `width*height*4`; `wb` holds 4 floats.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_remosaic_and_replace(
+    input: *const f32, interpolated: *const f32, clipping_mask: *const f32,
+    output: *mut f32, wb: *const f32,
+    filters: u32, width: usize, height: usize,
+) {
+    let inp = std::slice::from_raw_parts(input, width * height);
+    let interp = std::slice::from_raw_parts(interpolated, width * height * 4);
+    let cmask = std::slice::from_raw_parts(clipping_mask, width * height * 4);
+    let out = std::slice::from_raw_parts_mut(output, width * height);
+    let wb = std::slice::from_raw_parts(wb, 4);
+
+    for i in 0..height {
+        for j in 0..width {
+            let c = raw::fc_bayer(i as i32, j as i32, filters);
+            let idx = i * width + j;
+            let index = idx * 4;
+            let opacity = cmask[index + ALPHA].clamp(0.0, 1.0);
+            out[idx] = opacity * (interp[index + c] * wb[c]).max(0.0)
+                + (1.0 - opacity) * inp[idx];
+        }
+    }
+}
+
+/// Gather the 3x3 ring of non-local (mult-strided) RGBA neighbours around
+/// (i, j) into a contiguous array — the shared prologue of guide_laplacians
+/// and heat_PDE_diffusion.
+#[inline(always)]
+fn gather_neighbours(
+    hf: &[f32], i: usize, j: usize, width: usize, height: usize, mult: usize,
+) -> [[f32; 4]; 9] {
+    let i_n = [
+        i.saturating_sub(mult) * width,
+        i * width,
+        (i + mult).min(height - 1) * width,
+    ];
+    let j_n = [j.saturating_sub(mult), j, (j + mult).min(width - 1)];
+    let mut n = [[0.0_f32; 4]; 9];
+    for (ki, &iv) in i_n.iter().enumerate() {
+        for (kj, &jv) in j_n.iter().enumerate() {
+            let base = 4 * (iv + jv);
+            n[3 * ki + kj].copy_from_slice(&hf[base..base + 4]);
+        }
+    }
+    n
+}
+
+/// Chromaticity laplacian guided by the most-detailed channel; one wavelet
+/// scale of the RGB reconstruction. Replaces the DT_OMP_FOR loop in
+/// guide_laplacians() (laplacian.c:218).
+///
+/// # Safety
+/// `high_freq`/`low_freq`/`clipping_mask`/`output` hold `width*height*4`
+/// floats; `mult >= 1`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_guide_laplacians(
+    high_freq: *const f32, low_freq: *const f32, clipping_mask: *const f32,
+    output: *mut f32, width: usize, height: usize,
+    mult: i32, noise_level: f32, salt: i32, scale: u32, radius_sq: f32,
+) {
+    let hf = std::slice::from_raw_parts(high_freq, width * height * 4);
+    let lf = std::slice::from_raw_parts(low_freq, width * height * 4);
+    let cmask = std::slice::from_raw_parts(clipping_mask, width * height * 4);
+    let out = std::slice::from_raw_parts_mut(output, width * height * 4);
+    let mult = mult.max(1) as usize;
+
+    const FLIP: [bool; 4] = [true, false, true, false];
+
+    for row in 0..height {
+        // interleave rows to minimise cache misses (matches the C scheduling;
+        // result is row-order independent)
+        let i = crate::math::dwt_interleave_rows(row, height, mult);
+        for j in 0..width {
+            let idx = i * width + j;
+            let index = idx * 4;
+
+            let alpha = cmask[index + ALPHA];
+            let alpha_comp = 1.0 - cmask[index + ALPHA];
+
+            let mut high_frequency = [hf[index], hf[index + 1], hf[index + 2], hf[index + 3]];
+
+            if alpha > 0.0 {
+                // reconstruct
+                let neigh = gather_neighbours(hf, i, j, width, height, mult);
+
+                let mut means = [0.0_f32; 4];
+                for px in &neigh {
+                    for c in 0..4 { means[c] += px[c] / 9.0; }
+                }
+                let mut variance = [0.0_f32; 4];
+                for px in &neigh {
+                    for c in 0..4 { variance[c] += sqf(px[c] - means[c]) / 9.0; }
+                }
+
+                // channel most likely to contain details = argmax variance
+                let mut guide = ALPHA;
+                let mut guiding_value = 0.0_f32;
+                for c in 0..3 {
+                    if variance[c] > guiding_value {
+                        guiding_value = variance[c];
+                        guide = c;
+                    }
+                }
+
+                let mut covariance = [0.0_f32; 4];
+                for px in &neigh {
+                    for c in 0..4 {
+                        covariance[c] += (px[c] - means[c]) * (px[guide] - means[guide]) / 9.0;
+                    }
+                }
+
+                let scale_multiplier = 1.0 / radius_sq;
+                let alpha_ch = [
+                    cmask[index + RED], cmask[index + GREEN],
+                    cmask[index + BLUE], cmask[index + ALPHA],
+                ];
+
+                // snapshot: the C for_each_channel loop is a 4-lane SIMD
+                // update — all lanes read high_frequency[guide] from the same
+                // pre-update register. A sequential loop without this snapshot
+                // would use a partially-updated value when c > guide.
+                let hf_guide = high_frequency[guide];
+                for c in 0..4 {
+                    let a = (covariance[c] / variance[guide]).max(0.0);
+                    let b = means[c] - a * means[guide];
+                    high_frequency[c] = alpha_ch[c] * scale_multiplier * (a * hf_guide + b)
+                        + (1.0 - alpha_ch[c] * scale_multiplier) * high_frequency[c];
+                }
+            }
+
+            if scale & FIRST_SCALE != 0 {
+                for c in 0..4 { out[index + c] = high_frequency[c]; }
+            } else {
+                for c in 0..4 { out[index + c] += high_frequency[c]; }
+            }
+
+            if scale & LAST_SCALE != 0 {
+                for c in 0..4 { out[index + c] = (out[index + c] + lf[index + c]).max(0.0); }
+            }
+
+            // last step of RGB reconstruct: add noise
+            if scale & LAST_SCALE != 0 && salt != 0 && alpha > 0.0 {
+                let mut state = [
+                    crate::math::splitmix32((j + 1) as u64),
+                    crate::math::splitmix32(((j + 1) * (i + 3)) as u64),
+                    crate::math::splitmix32(1337),
+                    crate::math::splitmix32(666),
+                ];
+                for _ in 0..4 { crate::math::xoshiro128plus(&mut state); }
+
+                let mu = [out[index], out[index + 1], out[index + 2], out[index + 3]];
+                let mut sigma = [0.0_f32; 4];
+                for c in 0..4 { sigma[c] = out[index + c] * noise_level; }
+
+                let noise = crate::math::dt_noise_generator_4ch(2 /*POISSONIAN*/, &mu, &sigma, &FLIP, &mut state);
+                for c in 0..4 {
+                    // noise only brightens the image, since it's clipped
+                    let n = out[index + c] + (noise[c] - out[index + c]).abs();
+                    out[index + c] = (alpha * n + alpha_comp * out[index + c]).max(0.0);
+                }
+            }
+
+            if scale & LAST_SCALE != 0 {
+                // break RGB into ratios + norm for the next reconstruction step
+                let norm = (sqf(out[index + RED]) + sqf(out[index + GREEN]) + sqf(out[index + BLUE]))
+                    .sqrt()
+                    .max(1e-6);
+                for c in 0..4 { out[index + c] /= norm; }
+                out[index + ALPHA] = norm;
+            }
+        }
+    }
+}
+
+/// Anisotropic heat-transfer (PDE) diffusion of the chromaticity ratios; one
+/// wavelet scale. Replaces the DT_OMP_FOR loop in heat_PDE_diffusion()
+/// (laplacian.c:402).
+///
+/// # Safety
+/// Same buffer contract as `darkroom_highlights_guide_laplacians`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_highlights_heat_pde_diffusion(
+    high_freq: *const f32, low_freq: *const f32, clipping_mask: *const f32,
+    output: *mut f32, width: usize, height: usize,
+    mult: i32, scale: u32, first_order_factor: f32,
+) {
+    let hf = std::slice::from_raw_parts(high_freq, width * height * 4);
+    let lf = std::slice::from_raw_parts(low_freq, width * height * 4);
+    let cmask = std::slice::from_raw_parts(clipping_mask, width * height * 4);
+    let out = std::slice::from_raw_parts_mut(output, width * height * 4);
+    let mult = mult.max(1) as usize;
+
+    // laplacian in the direction parallel to the steepest gradient on the norm
+    const KERNEL: [f32; 9] = [0.25, 0.5, 0.25, 0.5, -3.0, 0.5, 0.25, 0.5, 0.25];
+
+    for row in 0..height {
+        let i = crate::math::dwt_interleave_rows(row, height, mult);
+        for j in 0..width {
+            let idx = i * width + j;
+            let index = idx * 4;
+
+            let alpha = [
+                cmask[index + RED], cmask[index + GREEN],
+                cmask[index + BLUE], cmask[index + ALPHA],
+            ];
+            let mut high_frequency = [hf[index], hf[index + 1], hf[index + 2], hf[index + 3]];
+            // don't diffuse the norm: store and restore channel 3
+            let norm_backup = high_frequency[3];
+
+            if alpha[ALPHA] > 0.0 {
+                // reconstruct
+                let neigh = gather_neighbours(hf, i, j, width, height, mult);
+
+                let mut laplacian = [0.0_f32; 4];
+                for (k, px) in neigh.iter().enumerate() {
+                    for c in 0..4 { laplacian[c] += px[c] * KERNEL[k]; }
+                }
+
+                let multipliers = [
+                    1.0 / B_SPLINE_TO_LAPLACIAN, 1.0 / B_SPLINE_TO_LAPLACIAN,
+                    1.0 / B_SPLINE_TO_LAPLACIAN, 0.0,
+                ];
+                for c in 0..4 {
+                    high_frequency[c] +=
+                        alpha[c] * multipliers[c] * (laplacian[c] - first_order_factor * high_frequency[c]);
+                }
+                high_frequency[3] = norm_backup;
+            }
+
+            if scale & FIRST_SCALE != 0 {
+                for c in 0..4 { out[index + c] = high_frequency[c]; }
+            } else {
+                for c in 0..4 { out[index + c] += high_frequency[c]; }
+            }
+
+            if scale & LAST_SCALE != 0 {
+                // add the residual and clamp
+                for c in 0..4 { out[index + c] = (out[index + c] + lf[index + c]).max(0.0); }
+
+                // renormalize ratios
+                if alpha[ALPHA] > 0.0 {
+                    let norm =
+                        (sqf(out[index + RED]) + sqf(out[index + GREEN]) + sqf(out[index + BLUE])).sqrt();
+                    for c in 0..4 {
+                        if c != ALPHA && norm > 1e-4 { out[index + c] /= norm; }
+                    }
+                }
+
+                // reconstruct RGB from ratios and norm — norm stays in channel 3
+                for c in 0..3 { out[index + c] *= out[index + ALPHA]; }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,6 +1726,108 @@ mod tests {
             darkroom_segmentation_dilate(img.as_ptr(), out7.as_mut_ptr(), w, h, 10, 7);
         }
         assert_eq!(out7[20 * w + 20], 0); // radius 7 can't reach 8 rows
+    }
+
+    #[test]
+    fn interpolate_and_mask_grey_field_is_neutral() {
+        // uniform unclipped mosaic, wb=1: every interpolated channel = v,
+        // norm = v*sqrt(3), nothing clipped.
+        let (w, h) = (8usize, 8usize);
+        let v = 0.25_f32;
+        let input = vec![v; w * h];
+        let mut interp = vec![0.0_f32; w * h * 4];
+        let mut cmask = vec![9.0_f32; w * h * 4];
+        let clips = [1.0_f32; 4];
+        let wb = [1.0_f32; 4];
+        unsafe {
+            darkroom_highlights_interpolate_and_mask(
+                input.as_ptr(), interp.as_mut_ptr(), cmask.as_mut_ptr(),
+                clips.as_ptr(), wb.as_ptr(), RGGB, w, h,
+            );
+        }
+        let idx = (3 * w + 3) * 4; // interior pixel
+        for c in 0..3 { assert!((interp[idx + c] - v).abs() < 1e-6, "c={c}"); }
+        assert!((interp[idx + 3] - v * 3.0_f32.sqrt()).abs() < 1e-6);
+        for c in 0..4 { assert_eq!(cmask[idx + c], 0.0); }
+    }
+
+    #[test]
+    fn remosaic_blends_by_mask_opacity() {
+        let (w, h) = (4usize, 4usize);
+        let input = vec![0.2_f32; w * h];
+        let mut interp = vec![0.8_f32; w * h * 4];
+        let mut cmask = vec![0.0_f32; w * h * 4];
+        // pixel (1,1): opacity 0.5
+        cmask[(w + 1) * 4 + 3] = 0.5;
+        interp[(w + 1) * 4 + 2] = 0.6; // its CFA colour at (1,1) RGGB = B(2)
+        let wb = [1.0_f32; 4];
+        let mut out = vec![0.0_f32; w * h];
+        unsafe {
+            darkroom_highlights_remosaic_and_replace(
+                input.as_ptr(), interp.as_ptr(), cmask.as_ptr(), out.as_mut_ptr(),
+                wb.as_ptr(), RGGB, w, h,
+            );
+        }
+        assert!((out[0] - 0.2).abs() < 1e-6); // opacity 0 → original
+        assert!((out[w + 1] - (0.5 * 0.6 + 0.5 * 0.2)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn guide_laplacians_unclipped_first_scale_copies_hf() {
+        // alpha = 0 everywhere → no reconstruction; FIRST_SCALE → out = HF.
+        let (w, h) = (6usize, 6usize);
+        let hf: Vec<f32> = (0..w * h * 4).map(|k| k as f32 * 0.01).collect();
+        let lf = vec![0.0_f32; w * h * 4];
+        let cmask = vec![0.0_f32; w * h * 4];
+        let mut out = vec![-1.0_f32; w * h * 4];
+        unsafe {
+            darkroom_highlights_guide_laplacians(
+                hf.as_ptr(), lf.as_ptr(), cmask.as_ptr(), out.as_mut_ptr(),
+                w, h, 1, 0.0, 0, FIRST_SCALE, 1.0,
+            );
+        }
+        assert_eq!(out, hf);
+    }
+
+    #[test]
+    fn heat_pde_last_scale_rebuilds_rgb_from_ratios() {
+        // FIRST|LAST single-scale, alpha=0: out = max(HF+LF,0) then RGB *= norm.
+        let (w, h) = (4usize, 4usize);
+        let mut hf = vec![0.0_f32; w * h * 4];
+        let mut lf = vec![0.0_f32; w * h * 4];
+        for k in 0..w * h {
+            // ratios (0.6, 0.8, 0.0), norm 2.0 split across HF+LF
+            hf[k * 4] = 0.6;
+            lf[k * 4 + 1] = 0.8;
+            hf[k * 4 + 3] = 1.5;
+            lf[k * 4 + 3] = 0.5;
+        }
+        let cmask = vec![0.0_f32; w * h * 4];
+        let mut out = vec![0.0_f32; w * h * 4];
+        unsafe {
+            darkroom_highlights_heat_pde_diffusion(
+                hf.as_ptr(), lf.as_ptr(), cmask.as_ptr(), out.as_mut_ptr(),
+                w, h, 1, FIRST_SCALE | LAST_SCALE, 0.0,
+            );
+        }
+        // alpha=0 → no renormalize; RGB = ratio * norm, norm kept in ch 3
+        let i = 4 * (w + 1);
+        assert!((out[i] - 0.6 * 2.0).abs() < 1e-6);
+        assert!((out[i + 1] - 0.8 * 2.0).abs() < 1e-6);
+        assert!((out[i + 2] - 0.0).abs() < 1e-6);
+        assert!((out[i + 3] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dwt_interleave_rows_is_a_permutation() {
+        for (h, s) in [(10usize, 4usize), (16, 2), (7, 3), (5, 8)] {
+            let mut seen = vec![false; h];
+            for r in 0..h {
+                let i = crate::math::dwt_interleave_rows(r, h, s);
+                assert!(i < h && !seen[i], "h={h} s={s} r={r} i={i}");
+                seen[i] = true;
+            }
+        }
     }
 
     #[test]

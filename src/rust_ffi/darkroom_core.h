@@ -2460,6 +2460,38 @@ void darkroom_segmentation_dilate(const uint32_t *img, uint32_t *out,
 void darkroom_segmentation_erode(const uint32_t *img, uint32_t *out,
                                  size_t width, size_t height, int border, int radius);
 
+/*
+ * Highlights IOP -- laplacian reconstruction (src/iop/hlreconstruct/laplacian.c).
+ * interpolate_and_mask: bilinear CFA demosaic into an RGBA plane (channel 3 =
+ *   Euclidean norm) + RGBA clipping mask (channel 3 = any-clipped flag).
+ * remosaic_and_replace: back to the CFA, alpha-blended by the mask.
+ * guide_laplacians / heat_pde_diffusion: one wavelet scale of the guided
+ *   linear-fit / anisotropic-PDE reconstruction. `scale` is the
+ *   wavelets_scale_t bitmask; rows are processed dwt-interleaved.
+ * RGBA buffers hold width*height*4 floats; raw planes width*height.
+ */
+void darkroom_highlights_interpolate_and_mask(const float *input, float *interpolated,
+                                              float *clipping_mask,
+                                              const float *clips, const float *wb,
+                                              unsigned int filters, size_t width, size_t height);
+
+void darkroom_highlights_remosaic_and_replace(const float *input, const float *interpolated,
+                                              const float *clipping_mask, float *output,
+                                              const float *wb,
+                                              unsigned int filters, size_t width, size_t height);
+
+void darkroom_highlights_guide_laplacians(const float *high_freq, const float *low_freq,
+                                          const float *clipping_mask, float *output,
+                                          size_t width, size_t height,
+                                          int mult, float noise_level, int salt,
+                                          unsigned int scale, float radius_sq);
+
+void darkroom_highlights_heat_pde_diffusion(const float *high_freq, const float *low_freq,
+                                            const float *clipping_mask, float *output,
+                                            size_t width, size_t height,
+                                            int mult, unsigned int scale,
+                                            float first_order_factor);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
