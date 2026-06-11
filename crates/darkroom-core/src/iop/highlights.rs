@@ -1477,6 +1477,554 @@ pub unsafe extern "C" fn darkroom_highlights_heat_pde_diffusion(
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Segmentation-based reconstruction (src/iop/hlreconstruct/segbased.c).
+// The dt_iop_segmentation_t struct and the flood-fill machinery stay in C;
+// these functions replace the DT_OMP_FOR loops and receive the struct fields
+// (data / val1 / val2 / nr / width / height / border) individually.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Segment-id bit mask, segmentation.c:31.
+const SEG_ID_MASK: u32 = 0x40000;
+/// Outer plane border of the segmentation working planes, segbased.c:89.
+const HL_BORDER: usize = 8;
+
+/// Matches _get_segment_id() (segmentation.c:95): 0 outside the
+/// segmentized region or when the masked id is not a real segment (2..nr-1).
+#[inline(always)]
+fn get_segment_id(data: &[u32], width: usize, height: usize, border: usize, nr: u32, loc: usize) -> u32 {
+    if loc >= width * (height - border) {
+        return 0;
+    }
+    let id = data[loc] & (SEG_ID_MASK - 1);
+    if id > 1 && id < nr { id } else { 0 }
+}
+
+/// Plane index of a raw photosite (3x3 superpixels, HL_BORDER inset).
+/// Matches _raw_to_plane() (segbased.c:414).
+#[inline(always)]
+fn raw_to_plane(pwidth: usize, row: usize, col: usize) -> usize {
+    (HL_BORDER + row / 3) * pwidth + col / 3 + HL_BORDER
+}
+
+/// Seed the gradient plane from the blurred luminance at distance 0..2.
+/// Replaces the DT_OMP_FOR loop in _initial_gradients() (segbased.c:230).
+///
+/// # Safety
+/// `luminance`, `distance` and `gradient` hold `pwidth * pheight` floats;
+/// pwidth/pheight >= 2*(HL_BORDER+2).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_initial_gradients(
+    luminance: *const f32, distance: *const f32, gradient: *mut f32,
+    pwidth: usize, pheight: usize,
+) {
+    let lum = std::slice::from_raw_parts(luminance, pwidth * pheight);
+    let dist = std::slice::from_raw_parts(distance, pwidth * pheight);
+    let grad = std::slice::from_raw_parts_mut(gradient, pwidth * pheight);
+
+    for row in (HL_BORDER + 2)..(pheight - HL_BORDER - 2) {
+        for col in (HL_BORDER + 2)..(pwidth - HL_BORDER - 2) {
+            let v = row * pwidth + col;
+            let mut g = 0.0_f32;
+            if dist[v] > 0.0 && dist[v] < 2.0 {
+                g = 4.0 * crate::math::scharr_gradient(lum, v, pwidth);
+            }
+            grad[v] = g;
+        }
+    }
+}
+
+/// Maximum distance-transform value inside segment `id` over the (caller
+/// clamped) bounding box. Replaces the DT_OMP_FOR(reduction(max)) loop in
+/// _segment_maxdistance() (segbased.c:254).
+///
+/// # Safety
+/// `distance` and `seg_data` hold `seg_width * seg_height` elements;
+/// 0 <= xmin <= xmax <= seg_width, same for y.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_maxdistance(
+    distance: *const f32, seg_data: *const u32,
+    seg_width: usize, seg_height: usize,
+    xmin: i32, xmax: i32, ymin: i32, ymax: i32, id: u32,
+) -> f32 {
+    if xmax <= xmin || ymax <= ymin { return 0.0; }
+    let dist = std::slice::from_raw_parts(distance, seg_width * seg_height);
+    let data = std::slice::from_raw_parts(seg_data, seg_width * seg_height);
+
+    let mut max_distance = 0.0_f32;
+    for row in ymin as usize..ymax as usize {
+        for col in xmin as usize..xmax as usize {
+            let v = row * seg_width + col;
+            if id == data[v] {
+                max_distance = max_distance.max(dist[v]);
+            }
+        }
+    }
+    max_distance
+}
+
+/// One distance ring of the iterative gradient propagation: cells of segment
+/// `id` with distance in [dist, dist+1.5) average the gradients of their 5x5
+/// neighbours one ring closer ([dist-1.5, dist)). Replaces the DT_OMP_FOR
+/// loop in _calc_distance_ring() (segbased.c:299).
+///
+/// # Safety
+/// `gradient`, `distance`, `seg_data` hold `seg_width * seg_height` elements;
+/// the bounds are inset by seg->border >= 2 on every side (the C callers
+/// guarantee this), so the ±2 neighbourhood stays in bounds.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_distance_ring(
+    gradient: *mut f32, distance: *const f32, seg_data: *const u32,
+    seg_width: usize, seg_height: usize,
+    xmin: i32, xmax: i32, ymin: i32, ymax: i32,
+    attenuate: f32, dist: f32, id: u32,
+) {
+    if xmax <= xmin || ymax <= ymin { return; }
+    let grad = std::slice::from_raw_parts_mut(gradient, seg_width * seg_height);
+    let dst = std::slice::from_raw_parts(distance, seg_width * seg_height);
+    let data = std::slice::from_raw_parts(seg_data, seg_width * seg_height);
+
+    for row in ymin as usize..ymax as usize {
+        for col in xmin as usize..xmax as usize {
+            let v = row * seg_width + col;
+            let dv = dst[v];
+            if dv >= dist && dv < dist + 1.5 && id == data[v] {
+                let mut grd = 0.0_f32;
+                let mut cnt = 0.0_f32;
+                for y in -2_isize..3 {
+                    for x in -2_isize..3 {
+                        let p = (v as isize + x + seg_width as isize * y) as usize;
+                        let dd = dst[p];
+                        if dd >= dist - 1.5 && dd < dist {
+                            cnt += 1.0;
+                            grd += grad[p];
+                        }
+                    }
+                }
+                if cnt > 0.0 {
+                    grad[v] = (1.5_f32).min((grd / cnt) * (1.0 + 1.0 / dv.powf(attenuate)));
+                }
+            }
+        }
+    }
+}
+
+/// Copy the segment bounding box of `gradient` into the densely packed `tmp`
+/// buffer for box-blurring. Replaces the first DT_OMP_FOR loop of the
+/// maxdist > 4 branch in _segment_gradients() (segbased.c:354).
+///
+/// # Safety
+/// `gradient` holds `seg_width * ymax` floats at least; `tmp` holds
+/// `(ymax-ymin) * (xmax-xmin)` floats; 0 <= xmin < xmax, 0 <= ymin < ymax.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_box_in(
+    gradient: *const f32, tmp: *mut f32,
+    seg_width: usize, xmin: i32, xmax: i32, ymin: i32, ymax: i32,
+) {
+    if xmax <= xmin || ymax <= ymin { return; }
+    let (xmin, xmax, ymin, ymax) = (xmin as usize, xmax as usize, ymin as usize, ymax as usize);
+    let bw = xmax - xmin;
+    let grad = std::slice::from_raw_parts(gradient, seg_width * ymax);
+    let tmp = std::slice::from_raw_parts_mut(tmp, (ymax - ymin) * bw);
+
+    for row in ymin..ymax {
+        for col in xmin..xmax {
+            tmp[(row - ymin) * bw + (col - xmin)] = grad[row * seg_width + col];
+        }
+    }
+}
+
+/// Copy the blurred box back into `gradient`, only at locations belonging to
+/// segment `id`. Replaces the second DT_OMP_FOR loop of the maxdist > 4
+/// branch in _segment_gradients() (segbased.c:363).
+///
+/// # Safety
+/// Same buffers as darkroom_segbased_box_in, plus `seg_data` of
+/// `seg_width * ymax` elements.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_box_out(
+    gradient: *mut f32, tmp: *const f32, seg_data: *const u32,
+    seg_width: usize, xmin: i32, xmax: i32, ymin: i32, ymax: i32, id: u32,
+) {
+    if xmax <= xmin || ymax <= ymin { return; }
+    let (xmin, xmax, ymin, ymax) = (xmin as usize, xmax as usize, ymin as usize, ymax as usize);
+    let bw = xmax - xmin;
+    let grad = std::slice::from_raw_parts_mut(gradient, seg_width * ymax);
+    let tmp = std::slice::from_raw_parts(tmp, (ymax - ymin) * bw);
+    let data = std::slice::from_raw_parts(seg_data, seg_width * ymax);
+
+    for row in ymin..ymax {
+        for col in xmin..xmax {
+            let v = row * seg_width + col;
+            if id == data[v] {
+                grad[v] = tmp[(row - ymin) * bw + (col - xmin)];
+            }
+        }
+    }
+}
+
+/// Scale the gradients of segment `id` by the recovery strength. Replaces
+/// the final DT_OMP_FOR loop in _segment_gradients() (segbased.c:374).
+///
+/// # Safety
+/// `gradient` and `seg_data` hold `seg_width * ymax` elements at least.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_apply_strength(
+    gradient: *mut f32, seg_data: *const u32,
+    seg_width: usize, xmin: i32, xmax: i32, ymin: i32, ymax: i32,
+    id: u32, strength: f32,
+) {
+    if xmax <= xmin || ymax <= ymin { return; }
+    let grad = std::slice::from_raw_parts_mut(gradient, seg_width * ymax as usize);
+    let data = std::slice::from_raw_parts(seg_data, seg_width * ymax as usize);
+
+    for row in ymin as usize..ymax as usize {
+        for col in xmin as usize..xmax as usize {
+            let v = row * seg_width + col;
+            if id == data[v] {
+                grad[v] *= strength;
+            }
+        }
+    }
+}
+
+/// Replicate the inner border of a single-channel mask outward: rows first
+/// (left/right columns), then columns (top/bottom rows, with the source
+/// column clamped to the interior). Replaces both DT_OMP_FOR loops in
+/// _masks_extend_border() (segbased.c:425/435).
+///
+/// # Safety
+/// `mask` holds `width * height` floats; border < min(width, height)/2.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_masks_extend_border(
+    mask: *mut f32, width: usize, height: usize, border: i32,
+) {
+    if border <= 0 { return; }
+    let border = border as usize;
+    let m = std::slice::from_raw_parts_mut(mask, width * height);
+
+    for row in border..height - border {
+        let idx = row * width;
+        for i in 0..border {
+            m[idx + i] = m[idx + border];
+            m[idx + width - i - 1] = m[idx + width - border - 1];
+        }
+    }
+    for col in 0..width {
+        let src = (width - border - 1).min(col.max(border));
+        let top = m[border * width + src];
+        let bot = m[(height - border - 1) * width + src];
+        for i in 0..border {
+            m[col + i * width] = top;
+            m[col + (height - i - 1) * width] = bot;
+        }
+    }
+}
+
+/// Populate the 3x3-superpixel colour planes, the cube-root opposed-channel
+/// refavg planes and the per-plane clipping seeds from the mosaic. Returns
+/// `anyclipped` (sum of clipped channel counts) and sets `*has_allclipped`
+/// when any superpixel clips in all three planes. Replaces the
+/// DT_OMP_FOR(reduction(|)+reduction(+)) loop in _process_segmentation()
+/// (segbased.c:520).
+///
+/// # Safety
+/// `tmpout` holds `width * height` floats; `planes`/`refavgs` point to 3 and
+/// `seg_datas` to 4 plane pointers of `pwidth * pheight` elements each (all
+/// distinct); `correction`/`cube_coeffs` hold 4 floats; `xtrans` 36 bytes;
+/// `has_allclipped` is a valid int pointer.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_populate_planes(
+    tmpout: *const f32, width: usize, height: usize,
+    filters: u32, xtrans: *const u8,
+    correction: *const f32, cube_coeffs: *const f32, xshifter: i32,
+    planes: *const *mut f32, refavgs: *const *mut f32, seg_datas: *const *mut u32,
+    pwidth: usize, pheight: usize,
+    has_allclipped: *mut i32,
+) -> i32 {
+    let tmp = std::slice::from_raw_parts(tmpout, width * height);
+    let xt = read_xtrans(xtrans);
+    let corr = std::slice::from_raw_parts(correction, 4);
+    let cube = std::slice::from_raw_parts(cube_coeffs, 4);
+    let psize = pwidth * pheight;
+    let planes = std::slice::from_raw_parts(planes, 3);
+    let refavgs = std::slice::from_raw_parts(refavgs, 3);
+    let seg_datas = std::slice::from_raw_parts(seg_datas, 4);
+    let mut plane: Vec<&mut [f32]> =
+        planes.iter().map(|&p| std::slice::from_raw_parts_mut(p, psize)).collect();
+    let mut refavg: Vec<&mut [f32]> =
+        refavgs.iter().map(|&p| std::slice::from_raw_parts_mut(p, psize)).collect();
+    let mut segs: Vec<&mut [u32]> =
+        seg_datas.iter().map(|&p| std::slice::from_raw_parts_mut(p, psize)).collect();
+    let xshifter = xshifter as usize;
+
+    let mut anyclipped = 0_i32;
+    let mut allclipped_any = false;
+
+    for row in 1..height - 1 {
+        for col in 1..width - 1 {
+            // calc all color planes in a 3x3 area. For chroma noise stability in
+            // bayer sensors we make sure to align the box with a green photosite
+            // in centre so we always have a 5:2:2 ratio
+            if col % 3 == xshifter && row % 3 == 1 {
+                let mut mean = [0.0_f32; 3];
+                let mut cnt = [0.0_f32; 3];
+                for dy in row - 1..row + 2 {
+                    for dx in col - 1..col + 2 {
+                        let val = tmp[dy * width + dx];
+                        let c = raw::fcol(dy as i32, dx as i32, filters, &xt);
+                        mean[c] += val;
+                        cnt[c] += 1.0;
+                    }
+                }
+                for c in 0..3 {
+                    mean[c] = if cnt[c] > 0.0 { (corr[c] * mean[c] / cnt[c]).cbrt() } else { 0.0 };
+                }
+                let cube_refavg = [
+                    0.5 * (mean[1] + mean[2]),
+                    0.5 * (mean[0] + mean[2]),
+                    0.5 * (mean[0] + mean[1]),
+                ];
+
+                let o = raw_to_plane(pwidth, row, col);
+                let mut allclipped = 0;
+                for c in 0..3 {
+                    plane[c][o] = mean[c];
+                    refavg[c][o] = cube_refavg[c];
+                    if mean[c] > cube[c] {
+                        allclipped += 1;
+                        segs[c][o] = 1;
+                    }
+                }
+                segs[3][o] = if allclipped == 3 { 1 } else { 0 };
+                allclipped_any |= allclipped == 3;
+                anyclipped += allclipped;
+            }
+        }
+    }
+    *has_allclipped = allclipped_any as i32;
+    anyclipped
+}
+
+/// Inpaint clipped photosites from their segment's candidate: the local
+/// cube-root refavg shifted by (candidate - candidate_reference), cubed back
+/// to linear. Writes both the raw `tmpout` and the colour plane. Replaces
+/// the DT_OMP_FOR loop after _calc_plane_candidates() in
+/// _process_segmentation() (segbased.c:594).
+///
+/// # Safety
+/// `input`/`tmpout` hold `width * height` floats; `planes` points to 3 plane
+/// pointers and `seg_datas`/`seg_val1s`/`seg_val2s` to 3 buffer pointers per
+/// colour (data: pwidth*pheight, val1/val2: >= seg_nrs[c] floats);
+/// `seg_nrs` holds 3 ints; `clips`/`correction` hold 4 floats; `xtrans` 36 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_candidates_apply(
+    input: *const f32, tmpout: *mut f32, width: usize, height: usize,
+    filters: u32, xtrans: *const u8,
+    clips: *const f32, correction: *const f32,
+    planes: *const *mut f32,
+    seg_datas: *const *const u32, seg_val1s: *const *const f32, seg_val2s: *const *const f32,
+    seg_nrs: *const i32,
+    pwidth: usize, pheight: usize, seg_border: i32,
+) {
+    let inp = std::slice::from_raw_parts(input, width * height);
+    let tmp = std::slice::from_raw_parts_mut(tmpout, width * height);
+    let xt = read_xtrans(xtrans);
+    let clips = std::slice::from_raw_parts(clips, 4);
+    let corr_s = std::slice::from_raw_parts(correction, 4);
+    let corr = [corr_s[0], corr_s[1], corr_s[2], corr_s[3]];
+    let psize = pwidth * pheight;
+    let planes = std::slice::from_raw_parts(planes, 3);
+    let mut plane: Vec<&mut [f32]> =
+        planes.iter().map(|&p| std::slice::from_raw_parts_mut(p, psize)).collect();
+    let nrs = std::slice::from_raw_parts(seg_nrs, 3);
+    let datas: Vec<&[u32]> = std::slice::from_raw_parts(seg_datas, 3)
+        .iter().map(|&p| std::slice::from_raw_parts(p, psize)).collect();
+    let val1s: Vec<&[f32]> = std::slice::from_raw_parts(seg_val1s, 3)
+        .iter().enumerate().map(|(c, &p)| std::slice::from_raw_parts(p, nrs[c].max(0) as usize)).collect();
+    let val2s: Vec<&[f32]> = std::slice::from_raw_parts(seg_val2s, 3)
+        .iter().enumerate().map(|(c, &p)| std::slice::from_raw_parts(p, nrs[c].max(0) as usize)).collect();
+    let border = seg_border.max(0) as usize;
+
+    for row in 1..height - 1 {
+        for col in 1..width - 1 {
+            let idx = row * width + col;
+            let inval = inp[idx].max(0.0);
+            let color = raw::fcol(row as i32, col as i32, filters, &xt);
+            if inval > clips[color] {
+                let o = raw_to_plane(pwidth, row, col);
+                let nr = nrs[color] as u32;
+                let pid = get_segment_id(datas[color], pwidth, pheight, border, nr, o);
+                if pid > 1 && pid < nr {
+                    let candidate = val1s[color][pid as usize];
+                    if candidate != 0.0 {
+                        let cand_reference = val2s[color][pid as usize];
+                        let refavg_here =
+                            calc_refavg(inp, &xt, filters, row, col, width, height, &corr, false);
+                        let oval = fcube(refavg_here + candidate - cand_reference);
+                        let v = inval.max(oval);
+                        plane[color][o] = v;
+                        tmp[idx] = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Prepare the recovery working planes: temporary luminance (coeff-weighted
+/// plane mean) and the distance-transform seed (DT_DISTANCE_TRANSFORM_MAX
+/// inside all-clipped superpixels). Replaces the DT_OMP_FOR loop in the
+/// do_recovery||do_masking block of _process_segmentation() (segbased.c:637).
+///
+/// # Safety
+/// `plane0..2`, `tmp`, `distance` and `segall_data` hold `pwidth * pheight`
+/// elements; `icoeffs` holds 3 floats; border < min(pwidth, pheight)/2.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_prepare_lumdist(
+    plane0: *const f32, plane1: *const f32, plane2: *const f32,
+    icoeffs: *const f32, tmp: *mut f32, distance: *mut f32,
+    segall_data: *const u32, pwidth: usize, pheight: usize, border: i32,
+) {
+    const DISTANCE_TRANSFORM_MAX: f32 = 1e20;
+    let psize = pwidth * pheight;
+    let p0 = std::slice::from_raw_parts(plane0, psize);
+    let p1 = std::slice::from_raw_parts(plane1, psize);
+    let p2 = std::slice::from_raw_parts(plane2, psize);
+    let ic = std::slice::from_raw_parts(icoeffs, 3);
+    let tmp = std::slice::from_raw_parts_mut(tmp, psize);
+    let dist = std::slice::from_raw_parts_mut(distance, psize);
+    let data = std::slice::from_raw_parts(segall_data, psize);
+    let border = border.max(0) as usize;
+
+    for row in border..pheight - border {
+        for col in border..pwidth - border {
+            let i = row * pwidth + col;
+            // prepare the temporary luminance for later blurring and also
+            // prefill the distance plane
+            tmp[i] = (p0[i] * ic[0] + p1[i] * ic[1] + p2[i] * ic[2]) / 3.0;
+            dist[i] = if data[i] == 1 { DISTANCE_TRANSFORM_MAX } else { 0.0 };
+        }
+    }
+}
+
+/// Add the recovered gradient back to clipped photosites, sigmoid-attenuated
+/// by the distance transform. Replaces the DT_OMP_FOR loop at the end of the
+/// do_recovery block in _process_segmentation() (segbased.c:684).
+///
+/// # Safety
+/// `input`/`tmpout` hold `width * height` floats; `distance`/`gradient`
+/// hold `pwidth * pheight` floats (pheight implied by raw_to_plane bounds);
+/// `clips` holds 4 floats; `xtrans` 36 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_apply_recovery(
+    input: *const f32, tmpout: *mut f32, width: usize, height: usize,
+    filters: u32, xtrans: *const u8, clips: *const f32,
+    distance: *const f32, gradient: *const f32,
+    pwidth: usize, pheight: usize,
+    strength: f32, dshift: f32,
+) {
+    let inp = std::slice::from_raw_parts(input, width * height);
+    let tmp = std::slice::from_raw_parts_mut(tmpout, width * height);
+    let xt = read_xtrans(xtrans);
+    let clips = std::slice::from_raw_parts(clips, 4);
+    let psize = pwidth * pheight;
+    let dist = std::slice::from_raw_parts(distance, psize);
+    let grad = std::slice::from_raw_parts(gradient, psize);
+
+    for row in 1..height - 1 {
+        for col in 1..width - 1 {
+            let idx = row * width + col;
+            let color = raw::fcol(row as i32, col as i32, filters, &xt);
+            let ival = inp[idx].max(0.0);
+            if ival > clips[color] {
+                let o = raw_to_plane(pwidth, row, col);
+                let effect = strength / (1.0 + (-(dist[o] - dshift)).exp());
+                tmp[idx] += (grad[o] * effect).max(0.0);
+            }
+        }
+    }
+}
+
+/// Final output loop: crop/copy `tmpout` into the output ROI, or — in mask
+/// visualizing modes — the dimmed luminance plus the requested overlay
+/// (combined segments, candidates, or strength-weighted gradient). Replaces
+/// the last DT_OMP_FOR loop in _process_segmentation() (segbased.c:703).
+///
+/// # Safety
+/// `output` holds `out_width * out_height` floats; `tmpout` holds
+/// `in_width * in_height` floats; `luminance`/`gradient` hold
+/// `pwidth * pheight` floats; `seg_datas`/`seg_val1s` point to 3 buffer
+/// pointers (data: pwidth*pheight, val1: >= seg_nrs[c] floats); `seg_nrs`
+/// holds 3 ints; `segall_data` holds pwidth*pheight elements; `xtrans` 36 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_segbased_final_output(
+    output: *mut f32, tmpout: *const f32,
+    luminance: *const f32, gradient: *const f32,
+    out_width: usize, out_height: usize, out_x: i32, out_y: i32,
+    in_width: usize, in_height: usize,
+    filters: u32, xtrans: *const u8,
+    seg_datas: *const *const u32, seg_val1s: *const *const f32, seg_nrs: *const i32,
+    segall_data: *const u32, segall_nr: i32,
+    pwidth: usize, pheight: usize, seg_border: i32,
+    do_masking: i32, vmode: i32, strength: f32,
+) {
+    // dt_highlights_mask_t (src/iop/highlights.c:96)
+    const MASK_COMBINE: i32 = 1;
+    const MASK_CANDIDATING: i32 = 2;
+    const MASK_STRENGTH: i32 = 3;
+
+    let out = std::slice::from_raw_parts_mut(output, out_width * out_height);
+    let tmp = std::slice::from_raw_parts(tmpout, in_width * in_height);
+    let psize = pwidth * pheight;
+    let lum = std::slice::from_raw_parts(luminance, psize);
+    let grad = std::slice::from_raw_parts(gradient, psize);
+    let xt = read_xtrans(xtrans);
+    let nrs = std::slice::from_raw_parts(seg_nrs, 3);
+    let datas: Vec<&[u32]> = std::slice::from_raw_parts(seg_datas, 3)
+        .iter().map(|&p| std::slice::from_raw_parts(p, psize)).collect();
+    let val1s: Vec<&[f32]> = std::slice::from_raw_parts(seg_val1s, 3)
+        .iter().enumerate().map(|(c, &p)| std::slice::from_raw_parts(p, nrs[c].max(0) as usize)).collect();
+    let alldata = std::slice::from_raw_parts(segall_data, psize);
+    let border = seg_border.max(0) as usize;
+    let do_masking = do_masking != 0;
+
+    for row in 0..out_height {
+        for col in 0..out_width {
+            let inrow = row as i32 + out_y;
+            let incol = col as i32 + out_x;
+            let odx = row * out_width + col;
+
+            if inrow >= 0 && (inrow as usize) < in_height && incol >= 0 && (incol as usize) < in_width {
+                let (inrow, incol) = (inrow as usize, incol as usize);
+                let ppos = raw_to_plane(pwidth, inrow, incol);
+                let idx = inrow * in_width + incol;
+
+                out[odx] = if do_masking { (0.2_f32).min(0.2 * lum[ppos]) } else { tmp[idx] };
+                if do_masking && inrow > 0 && incol > 0 && inrow < in_height - 1 && incol < in_width - 1 {
+                    let color = raw::fcol(inrow as i32, incol as i32, filters, &xt);
+                    let pid = get_segment_id(datas[color], pwidth, pheight, border, nrs[color] as u32, ppos);
+
+                    if vmode == MASK_COMBINE && pid != 0 {
+                        out[odx] += if datas[color][ppos] & SEG_ID_MASK != 0 { 1.0 } else { 0.6 };
+                    } else if vmode == MASK_CANDIDATING {
+                        // C: pid && !feqf(val1[pid], 0.0f, 1e-9)
+                        if pid != 0 && val1s[color][pid as usize].abs() >= 1e-9 {
+                            out[odx] += 1.0;
+                        }
+                    } else if vmode == MASK_STRENGTH {
+                        let allid = get_segment_id(alldata, pwidth, pheight, border, segall_nr as u32, ppos);
+                        let allseg = allid > 1 && allid < segall_nr as u32;
+                        out[odx] += if allseg { strength * grad[ppos] } else { 0.0 };
+                    }
+                }
+            } else {
+                out[odx] = 0.0;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2031,5 +2579,290 @@ mod tests {
         assert_eq!(tmp[1], 0.0);
         assert_eq!(tmp[2], 0.0);
         assert!((tmp[3] - (3.0_f32 - 1.9) / 1.9).abs() < 1e-5);
+    }
+
+    // ── segbased.c ports ────────────────────────────────────────────────────
+
+    #[test]
+    fn segbased_initial_gradients_gates_on_distance() {
+        let (pw, ph) = (24usize, 24usize);
+        // luminance ramp by column → scharr magnitude 512/255 everywhere
+        let lum: Vec<f32> = (0..pw * ph).map(|k| (k % pw) as f32).collect();
+        let mut dist = vec![0.0_f32; pw * ph];
+        let v = 12 * pw + 12;
+        dist[v] = 1.0; // in (0, 2) → gradient written
+        dist[v + 1] = 3.0; // >= 2 → stays 0
+        let mut grad = vec![-1.0_f32; pw * ph];
+        unsafe {
+            darkroom_segbased_initial_gradients(lum.as_ptr(), dist.as_ptr(), grad.as_mut_ptr(), pw, ph);
+        }
+        assert!((grad[v] - 4.0 * 512.0 / 255.0).abs() < 1e-5, "grad[v]={}", grad[v]);
+        assert_eq!(grad[v + 1], 0.0);
+        assert_eq!(grad[v + pw], 0.0); // distance 0 → 0
+        assert_eq!(grad[0], -1.0); // border region untouched
+    }
+
+    #[test]
+    fn segbased_maxdistance_respects_id_and_bounds() {
+        let (w, h) = (8usize, 8usize);
+        let mut data = vec![0_u32; w * h];
+        let mut dist = vec![0.0_f32; w * h];
+        data[2 * w + 2] = 5;
+        dist[2 * w + 2] = 7.0;
+        data[3 * w + 3] = 6; // other segment — ignored
+        dist[3 * w + 3] = 9.0;
+        data[7 * w + 7] = 5; // outside the bbox — ignored
+        dist[7 * w + 7] = 11.0;
+        let m = unsafe {
+            darkroom_segbased_maxdistance(dist.as_ptr(), data.as_ptr(), w, h, 1, 5, 1, 5, 5)
+        };
+        assert_eq!(m, 7.0);
+    }
+
+    #[test]
+    fn segbased_distance_ring_averages_inner_ring() {
+        let (w, h) = (12usize, 12usize);
+        let id = 2_u32;
+        let mut data = vec![0_u32; w * h];
+        // background distance 5.0 keeps the rest of the 5x5 window out of the
+        // inner ring [dist-1.5, dist) — note 0.0 would qualify for dist=1.5!
+        let mut dist = vec![5.0_f32; w * h];
+        let mut grad = vec![0.0_f32; w * h];
+        let v = 6 * w + 6;
+        data[v] = id;
+        dist[v] = 2.0; // in [1.5, 3.0) for dist=1.5
+        dist[v - 1] = 1.0; // inner ring: in [0.0, 1.5)
+        grad[v - 1] = 0.5;
+        unsafe {
+            darkroom_segbased_distance_ring(grad.as_mut_ptr(), dist.as_ptr(), data.as_ptr(),
+                                            w, h, 4, 9, 4, 9, 1.0, 1.5, id);
+        }
+        // grd/cnt = 0.5; attenuate=1 → 0.5 * (1 + 1/2.0) = 0.75
+        assert!((grad[v] - 0.75).abs() < 1e-6, "grad[v]={}", grad[v]);
+    }
+
+    #[test]
+    fn segbased_box_roundtrip_and_strength() {
+        let (w, _h) = (10usize, 8usize);
+        let (xmin, xmax, ymin, ymax) = (2_i32, 6, 1, 5);
+        let id = 3_u32;
+        let mut grad: Vec<f32> = (0..w * 8).map(|k| k as f32).collect();
+        let mut data = vec![0_u32; w * 8];
+        data[2 * w + 3] = id;
+        let mut tmp = vec![0.0_f32; 16];
+        unsafe {
+            darkroom_segbased_box_in(grad.as_ptr(), tmp.as_mut_ptr(), w, xmin, xmax, ymin, ymax);
+        }
+        assert_eq!(tmp[0], (1 * w + 2) as f32); // (ymin, xmin)
+        assert_eq!(tmp[15], (4 * w + 5) as f32); // (ymax-1, xmax-1)
+        // perturb tmp, copy back: only the id-cell changes
+        for t in tmp.iter_mut() { *t += 100.0; }
+        let before = grad.clone();
+        unsafe {
+            darkroom_segbased_box_out(grad.as_mut_ptr(), tmp.as_ptr(), data.as_ptr(),
+                                      w, xmin, xmax, ymin, ymax, id);
+        }
+        for (k, (&g, &b)) in grad.iter().zip(before.iter()).enumerate() {
+            if k == 2 * w + 3 {
+                assert_eq!(g, b + 100.0);
+            } else {
+                assert_eq!(g, b);
+            }
+        }
+        unsafe {
+            darkroom_segbased_apply_strength(grad.as_mut_ptr(), data.as_ptr(),
+                                             w, xmin, xmax, ymin, ymax, id, 0.5);
+        }
+        assert_eq!(grad[2 * w + 3], (before[2 * w + 3] + 100.0) * 0.5);
+        assert_eq!(grad[2 * w + 4], before[2 * w + 4]); // not in segment
+    }
+
+    #[test]
+    fn segbased_masks_extend_border_replicates_edges() {
+        let (w, h, b) = (8usize, 8usize, 2_i32);
+        let mut m = vec![0.0_f32; w * h];
+        // interior filled with a recognizable value per row
+        for row in 2..6 {
+            for col in 2..6 { m[row * w + col] = (10 * row + col) as f32; }
+        }
+        unsafe { darkroom_masks_extend_border(m.as_mut_ptr(), w, h, b); }
+        // rows: left/right replicate from col 2 / col 5
+        assert_eq!(m[3 * w], m[3 * w + 2]);
+        assert_eq!(m[3 * w + 1], m[3 * w + 2]);
+        assert_eq!(m[3 * w + 7], m[3 * w + 5]);
+        // cols: top/bottom replicate row 2 / row 5 (col clamped to interior)
+        assert_eq!(m[3], m[2 * w + 3]);
+        assert_eq!(m[w + 3], m[2 * w + 3]);
+        assert_eq!(m[7 * w + 3], m[5 * w + 3]);
+        // corner: clamped to (2,2)
+        assert_eq!(m[0], m[2 * w + 2]);
+    }
+
+    #[test]
+    fn segbased_populate_planes_counts_clipping() {
+        let (w, h) = (12usize, 12usize);
+        let (pw, ph) = (24usize, 24usize);
+        let psize = pw * ph;
+        let tmpout = vec![0.5_f32; w * h];
+        let corr = [1.0_f32; 4];
+        let cube = [0.5_f32; 4]; // cbrt(0.5) ≈ 0.794 > 0.5 → all clipped
+        let mut planes: Vec<Vec<f32>> = (0..3).map(|_| vec![0.0; psize]).collect();
+        let mut refavgs: Vec<Vec<f32>> = (0..3).map(|_| vec![0.0; psize]).collect();
+        let mut segs: Vec<Vec<u32>> = (0..4).map(|_| vec![0; psize]).collect();
+        let pptr: Vec<*mut f32> = planes.iter_mut().map(|p| p.as_mut_ptr()).collect();
+        let rptr: Vec<*mut f32> = refavgs.iter_mut().map(|p| p.as_mut_ptr()).collect();
+        let sptr: Vec<*mut u32> = segs.iter_mut().map(|p| p.as_mut_ptr()).collect();
+        let mut has_all = 0_i32;
+        // RGGB: FC(0,0)=R → xshifter = 2
+        let anyclipped = unsafe {
+            darkroom_segbased_populate_planes(
+                tmpout.as_ptr(), w, h, RGGB, XTRANS.as_ptr() as *const u8,
+                corr.as_ptr(), cube.as_ptr(), 2,
+                pptr.as_ptr(), rptr.as_ptr(), sptr.as_ptr(), pw, ph, &mut has_all,
+            )
+        };
+        // superpixel centres: rows {1,4,7,10} x cols {2,5,8} = 12, all 3 channels clipped
+        assert_eq!(anyclipped, 36);
+        assert_eq!(has_all, 1);
+        let o = raw_to_plane(pw, 1, 2);
+        let expect = 0.5_f32.cbrt();
+        for c in 0..3 {
+            assert!((planes[c][o] - expect).abs() < 1e-6);
+            assert!((refavgs[c][o] - expect).abs() < 1e-6); // opposing means equal for grey
+            assert_eq!(segs[c][o], 1);
+        }
+        assert_eq!(segs[3][o], 1);
+    }
+
+    #[test]
+    fn segbased_candidates_apply_inpaints_from_candidate() {
+        let (w, h) = (12usize, 12usize);
+        let (pw, ph, border) = (24usize, 24usize, 9_i32);
+        let psize = pw * ph;
+        let input = vec![1.0_f32; w * h];
+        let mut tmpout = input.clone();
+        let clips = [0.5_f32, 10.0, 10.0, 10.0]; // only red photosites clip
+        let corr = [1.0_f32; 4];
+        let mut planes: Vec<Vec<f32>> = (0..3).map(|_| vec![0.0; psize]).collect();
+        let pptr: Vec<*mut f32> = planes.iter_mut().map(|p| p.as_mut_ptr()).collect();
+        let mut data = vec![vec![0_u32; psize], vec![0_u32; psize], vec![0_u32; psize]];
+        let nr = [3_i32, 3, 3];
+        // segment id 2 only at the plane cell of photosite (4,4) (red in RGGB)
+        let o = raw_to_plane(pw, 4, 4);
+        data[0][o] = 2;
+        let val1 = [vec![0.0_f32, 0.0, 2.0], vec![0.0; 3], vec![0.0; 3]]; // candidate 2.0
+        let val2 = [vec![0.0_f32; 3], vec![0.0; 3], vec![0.0; 3]]; // reference 0.0
+        let dptr: Vec<*const u32> = data.iter().map(|d| d.as_ptr()).collect();
+        let v1ptr: Vec<*const f32> = val1.iter().map(|v| v.as_ptr()).collect();
+        let v2ptr: Vec<*const f32> = val2.iter().map(|v| v.as_ptr()).collect();
+        unsafe {
+            darkroom_segbased_candidates_apply(
+                input.as_ptr(), tmpout.as_mut_ptr(), w, h, RGGB, XTRANS.as_ptr() as *const u8,
+                clips.as_ptr(), corr.as_ptr(), pptr.as_ptr(),
+                dptr.as_ptr(), v1ptr.as_ptr(), v2ptr.as_ptr(), nr.as_ptr(),
+                pw, ph, border,
+            );
+        }
+        // refavg of an all-1.0 window = 1.0 → oval = (1 + 2 - 0)^3 = 27
+        let idx = 4 * w + 4;
+        assert!((tmpout[idx] - 27.0).abs() < 1e-4, "tmpout={}", tmpout[idx]);
+        assert!((planes[0][o] - 27.0).abs() < 1e-4);
+        // other red photosites clip too but have no segment → untouched
+        assert_eq!(tmpout[4 * w + 6], 1.0);
+    }
+
+    #[test]
+    fn segbased_prepare_lumdist_seeds_distance() {
+        let (pw, ph, b) = (12usize, 12usize, 2_i32);
+        let psize = pw * ph;
+        let p0 = vec![0.3_f32; psize];
+        let p1 = vec![0.6_f32; psize];
+        let p2 = vec![0.9_f32; psize];
+        let ic = [1.0_f32, 2.0, 3.0];
+        let mut tmp = vec![-1.0_f32; psize];
+        let mut dist = vec![-1.0_f32; psize];
+        let mut data = vec![0_u32; psize];
+        let i = 5 * pw + 5;
+        data[i] = 1;
+        unsafe {
+            darkroom_segbased_prepare_lumdist(p0.as_ptr(), p1.as_ptr(), p2.as_ptr(), ic.as_ptr(),
+                                              tmp.as_mut_ptr(), dist.as_mut_ptr(), data.as_ptr(),
+                                              pw, ph, b);
+        }
+        // (0.3*1 + 0.6*2 + 0.9*3)/3 = 1.4
+        assert!((tmp[i] - 1.4).abs() < 1e-6);
+        assert_eq!(dist[i], 1e20);
+        assert_eq!(dist[i + 1], 0.0);
+        assert_eq!(tmp[0], -1.0); // border untouched
+    }
+
+    #[test]
+    fn segbased_apply_recovery_sigmoid_at_dshift() {
+        let (w, h) = (12usize, 12usize);
+        let (pw, ph) = (24usize, 24usize);
+        let psize = pw * ph;
+        let input = vec![1.0_f32; w * h];
+        let mut tmpout = input.clone();
+        let clips = [0.5_f32, 10.0, 10.0, 10.0];
+        let mut dist = vec![0.0_f32; psize];
+        let mut grad = vec![0.0_f32; psize];
+        let o = raw_to_plane(pw, 4, 4);
+        dist[o] = 2.0; // == dshift → sigmoid = 0.5
+        grad[o] = 0.8;
+        unsafe {
+            darkroom_segbased_apply_recovery(input.as_ptr(), tmpout.as_mut_ptr(), w, h,
+                                             RGGB, XTRANS.as_ptr() as *const u8, clips.as_ptr(),
+                                             dist.as_ptr(), grad.as_ptr(), pw, ph, 1.0, 2.0);
+        }
+        let idx = 4 * w + 4;
+        assert!((tmpout[idx] - (1.0 + 0.8 * 0.5)).abs() < 1e-6, "tmpout={}", tmpout[idx]);
+        // unclipped green neighbour untouched
+        assert_eq!(tmpout[4 * w + 5], 1.0);
+    }
+
+    #[test]
+    fn segbased_final_output_copy_and_combine_mask() {
+        let (iw, ih) = (12usize, 12usize);
+        let (ow, oh) = (6usize, 6usize);
+        let (pw, ph, border) = (24usize, 24usize, 9_i32);
+        let psize = pw * ph;
+        let tmpout: Vec<f32> = (0..iw * ih).map(|k| k as f32).collect();
+        let lum = vec![10.0_f32; psize]; // 0.2*10 = 2 → min(0.2, 2) = 0.2
+        let grad = vec![0.0_f32; psize];
+        let mut data = vec![vec![0_u32; psize], vec![0_u32; psize], vec![0_u32; psize]];
+        let alldata = vec![0_u32; psize];
+        let nr = [3_i32, 3, 3];
+        let val1 = [vec![0.0_f32; 3], vec![0.0; 3], vec![0.0; 3]];
+        let o = raw_to_plane(pw, 3, 3);
+        data[2][o] = 2 | SEG_ID_MASK; // (3,3) is blue in RGGB; flagged border bit
+        let dptr: Vec<*const u32> = data.iter().map(|d| d.as_ptr()).collect();
+        let v1ptr: Vec<*const f32> = val1.iter().map(|v| v.as_ptr()).collect();
+        let mut out = vec![-5.0_f32; ow * oh];
+
+        // 1) no masking: plain crop copy with offset (2,2)
+        unsafe {
+            darkroom_segbased_final_output(
+                out.as_mut_ptr(), tmpout.as_ptr(), lum.as_ptr(), grad.as_ptr(),
+                ow, oh, 2, 2, iw, ih, RGGB, XTRANS.as_ptr() as *const u8,
+                dptr.as_ptr(), v1ptr.as_ptr(), nr.as_ptr(), alldata.as_ptr(), 2,
+                pw, ph, border, 0, 0, 1.0,
+            );
+        }
+        assert_eq!(out[0], (2 * iw + 2) as f32);
+        assert_eq!(out[ow + 1], (3 * iw + 3) as f32);
+
+        // 2) COMBINE masking: dim luminance + 1.0 for the flagged segment cell
+        unsafe {
+            darkroom_segbased_final_output(
+                out.as_mut_ptr(), tmpout.as_ptr(), lum.as_ptr(), grad.as_ptr(),
+                ow, oh, 2, 2, iw, ih, RGGB, XTRANS.as_ptr() as *const u8,
+                dptr.as_ptr(), v1ptr.as_ptr(), nr.as_ptr(), alldata.as_ptr(), 2,
+                pw, ph, border, 1, 1, 1.0,
+            );
+        }
+        // (out 1,1) ← in (3,3): 0.2 + 1.0 (DT_SEG_ID_MASK set)
+        assert!((out[ow + 1] - 1.2).abs() < 1e-6, "out={}", out[ow + 1]);
+        // a cell with no segment: just the dimmed luminance
+        assert!((out[0] - 0.2).abs() < 1e-6, "out={}", out[0]);
     }
 }

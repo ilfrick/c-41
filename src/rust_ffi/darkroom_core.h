@@ -2492,6 +2492,91 @@ void darkroom_highlights_heat_pde_diffusion(const float *high_freq, const float 
                                             int mult, unsigned int scale,
                                             float first_order_factor);
 
+/*
+ * Highlights IOP -- segmentation-based reconstruction
+ * (src/iop/hlreconstruct/segbased.c). The dt_iop_segmentation_t struct and
+ * the flood-fill stay in C; struct fields are passed individually.
+ * All planes (luminance/distance/gradient/tmp/colour/refavg/seg data) are
+ * pwidth*pheight elements unless noted; xtrans is the 36-byte CFA table;
+ * clips/correction/cube_coeffs are 4-float vectors; bounding boxes are
+ * caller-clamped half-open [xmin,xmax) x [ymin,ymax) ranges.
+ */
+void darkroom_segbased_initial_gradients(const float *luminance, const float *distance,
+                                         float *gradient, size_t pwidth, size_t pheight);
+
+float darkroom_segbased_maxdistance(const float *distance, const uint32_t *seg_data,
+                                    size_t seg_width, size_t seg_height,
+                                    int xmin, int xmax, int ymin, int ymax, uint32_t id);
+
+void darkroom_segbased_distance_ring(float *gradient, const float *distance,
+                                     const uint32_t *seg_data,
+                                     size_t seg_width, size_t seg_height,
+                                     int xmin, int xmax, int ymin, int ymax,
+                                     float attenuate, float dist, uint32_t id);
+
+/* tmp is a dense (ymax-ymin)*(xmax-xmin) box for dt_box_mean */
+void darkroom_segbased_box_in(const float *gradient, float *tmp, size_t seg_width,
+                              int xmin, int xmax, int ymin, int ymax);
+
+void darkroom_segbased_box_out(float *gradient, const float *tmp, const uint32_t *seg_data,
+                               size_t seg_width, int xmin, int xmax, int ymin, int ymax,
+                               uint32_t id);
+
+void darkroom_segbased_apply_strength(float *gradient, const uint32_t *seg_data,
+                                      size_t seg_width, int xmin, int xmax, int ymin, int ymax,
+                                      uint32_t id, float strength);
+
+void darkroom_masks_extend_border(float *mask, size_t width, size_t height, int border);
+
+/* planes/refavgs: 3 colour-plane pointers; seg_datas: 4 (r,g,b,all).
+ * Returns anyclipped; *has_allclipped set non-zero when a superpixel clips
+ * in all three planes. tmpout is the roi_in->width*height raw plane. */
+int32_t darkroom_segbased_populate_planes(const float *tmpout, size_t width, size_t height,
+                                          unsigned int filters, const unsigned char *xtrans,
+                                          const float *correction, const float *cube_coeffs,
+                                          int xshifter,
+                                          float *const *planes, float *const *refavgs,
+                                          uint32_t *const *seg_datas,
+                                          size_t pwidth, size_t pheight,
+                                          int32_t *has_allclipped);
+
+/* val1/val2 hold seg_nrs[c] floats per colour */
+void darkroom_segbased_candidates_apply(const float *input, float *tmpout,
+                                        size_t width, size_t height,
+                                        unsigned int filters, const unsigned char *xtrans,
+                                        const float *clips, const float *correction,
+                                        float *const *planes,
+                                        const uint32_t *const *seg_datas,
+                                        const float *const *seg_val1s,
+                                        const float *const *seg_val2s,
+                                        const int32_t *seg_nrs,
+                                        size_t pwidth, size_t pheight, int seg_border);
+
+void darkroom_segbased_prepare_lumdist(const float *plane0, const float *plane1,
+                                       const float *plane2, const float *icoeffs,
+                                       float *tmp, float *distance,
+                                       const uint32_t *segall_data,
+                                       size_t pwidth, size_t pheight, int border);
+
+void darkroom_segbased_apply_recovery(const float *input, float *tmpout,
+                                      size_t width, size_t height,
+                                      unsigned int filters, const unsigned char *xtrans,
+                                      const float *clips,
+                                      const float *distance, const float *gradient,
+                                      size_t pwidth, size_t pheight,
+                                      float strength, float dshift);
+
+void darkroom_segbased_final_output(float *output, const float *tmpout,
+                                    const float *luminance, const float *gradient,
+                                    size_t out_width, size_t out_height, int out_x, int out_y,
+                                    size_t in_width, size_t in_height,
+                                    unsigned int filters, const unsigned char *xtrans,
+                                    const uint32_t *const *seg_datas,
+                                    const float *const *seg_val1s, const int32_t *seg_nrs,
+                                    const uint32_t *segall_data, int32_t segall_nr,
+                                    size_t pwidth, size_t pheight, int seg_border,
+                                    int do_masking, int vmode, float strength);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

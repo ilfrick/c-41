@@ -228,9 +228,39 @@ pub fn dwt_interleave_rows(rowid: usize, height: usize, stride: usize) -> usize 
     long_passes + (rowid2 / (per_pass - 1)) + stride * (rowid2 % (per_pass - 1))
 }
 
+/// Scharr gradient magnitude at `buf[v]` in a single-channel plane of row
+/// stride `w`. Matches `scharr_gradient()` in src/common/math.h:405; the
+/// hypot uses sqrt(gx²+gy²) like the `__FAST_MATH__` (release-build) variant
+/// of `dt_fast_hypotf`. Caller guarantees ±1 row/col around `v` in bounds.
+#[inline(always)]
+pub fn scharr_gradient(buf: &[f32], v: usize, w: usize) -> f32 {
+    let p = |off: isize| buf[(v as isize + off) as usize];
+    let w = w as isize;
+    let gx = 47.0 / 255.0 * (p(-w - 1) - p(-w + 1) + p(w - 1) - p(w + 1))
+        + 162.0 / 255.0 * (p(-1) - p(1));
+    let gy = 47.0 / 255.0 * (p(-w - 1) - p(w - 1) + p(-w + 1) - p(w + 1))
+        + 162.0 / 255.0 * (p(-w) - p(w));
+    (gx * gx + gy * gy).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scharr_gradient_flat_field_is_zero() {
+        let buf = vec![0.7_f32; 25];
+        assert_eq!(scharr_gradient(&buf, 12, 5), 0.0);
+    }
+
+    #[test]
+    fn scharr_gradient_horizontal_ramp() {
+        // buf[r][c] = c → gx = -(4*47 + 2*162)/255 = -512/255, gy = 0
+        let w = 5usize;
+        let buf: Vec<f32> = (0..w * w).map(|k| (k % w) as f32).collect();
+        let g = scharr_gradient(&buf, 12, w);
+        assert!((g - 512.0 / 255.0).abs() < 1e-6, "g={g}");
+    }
 
     #[test]
     fn fastlog2_approximates_log2() {
