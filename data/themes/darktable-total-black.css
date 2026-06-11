@@ -1,0 +1,71 @@
+/*
+    This file is part of darktable,
+    Copyright (C) 2026 darktable developers.
+
+    darktable is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    darktable is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/* Total black: pure-black chrome for OLED displays and dim rooms.
+   Note: darkroom_bg_color is intentionally NOT overridden — the canvas
+   around the edited image must stay middle grey for colour judgement. */
+
+@import url("darktable.css");
+@import url("chunk-fonts.css");
+
+/* General */
+@define-color selected_bg_color @grey_20;
+@define-color border_color @grey_05;
+@define-color bg_color @grey_00;                /* pure black chrome */
+@define-color fg_color @grey_70;                /* slightly dimmed text for OLED glare */
+@define-color text_color @grey_05;
+@define-color placeholder_text_color @grey_40;
+@define-color disabled_fg_color @grey_35;
+
+/* Timeline / range band: keep the graph visible on the black strip
+   (range_graph_color derives from timeline_fg_color) */
+@define-color timeline_fg_color @grey_60;
+
+/* Scroll bars */
+@define-color scroll_bar_inactive @grey_25;
+@define-color scroll_bar_active @grey_55;
+@define-color scroll_bar_bg @grey_00;
+
+/* Modules box (plugins) */
+@define-color plugin_bg_color @grey_05;
+@define-color plugin_label_color @grey_55;
+@define-color collapsible_bg_color @grey_10;
+
+/* Buttons and fields */
+@define-color button_bg @grey_10;
+@define-color button_hover_bg @grey_40;
+@define-color field_bg @grey_05;
+@define-color field_active_bg @grey_15;
+@define-color field_selected_bg @grey_30;
+
+/* Tooltips and overlays */
+@define-color tooltip_bg_color @grey_05;
+@define-color really_dark_bg_color @grey_00;
+
+/* Lighttable surround (thumbnail cells keep their own mid-grey background) */
+@define-color lighttable_bg_color @grey_00;
+@define-color lighttable_bg_font_color @grey_65;
+
+/* Graphs (histogram, curves) */
+@define-color graph_bg @grey_05;
+@define-color graph_exterior @grey_00;
+@define-color graph_border @grey_00;
+@define-color graph_grid @grey_10;
+
+/* Bauhaus controls */
+@define-color bauhaus_indicator_border @grey_10;

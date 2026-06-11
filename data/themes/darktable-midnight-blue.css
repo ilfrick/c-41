@@ -1,0 +1,89 @@
+/*
+    This file is part of darktable,
+    Copyright (C) 2026 darktable developers.
+
+    darktable is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    darktable is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/* Midnight blue: a deep blue-tinted dark theme.
+   Note: darkroom_bg_color is intentionally NOT overridden — the canvas
+   around the edited image must stay middle grey for colour judgement.
+   The blue tint is kept on the chrome only, away from the image area. */
+
+@import url("darktable.css");
+@import url("chunk-fonts.css");
+
+/* Midnight palette (cool, low-saturation blues) */
+@define-color night_00 #05080f;
+@define-color night_05 #0a0f1a;
+@define-color night_10 #0f1626;
+@define-color night_15 #141d31;
+@define-color night_20 #19243c;
+@define-color night_25 #1f2c49;
+@define-color night_30 #263554;
+@define-color night_40 #34466b;
+@define-color night_50 #46598a;
+@define-color night_fg #c3cde2;
+@define-color night_fg_dim #8d9cbd;
+
+/* General */
+@define-color selected_bg_color @night_25;
+@define-color border_color @night_05;
+@define-color bg_color @night_10;
+@define-color fg_color @night_fg;
+@define-color text_color @night_05;
+@define-color placeholder_text_color @night_fg_dim;
+@define-color disabled_fg_color @night_40;
+
+/* Timeline / range band: keep the graph visible on the dark-blue strip
+   (range_graph_color derives from timeline_fg_color) */
+@define-color timeline_fg_color @night_fg_dim;
+
+/* Scroll bars */
+@define-color scroll_bar_inactive @night_30;
+@define-color scroll_bar_active @night_50;
+@define-color scroll_bar_bg @night_05;
+
+/* Modules box (plugins) */
+@define-color plugin_bg_color @night_15;
+@define-color plugin_label_color @night_fg_dim;
+@define-color collapsible_bg_color @night_20;
+
+/* Buttons and fields */
+@define-color button_bg @night_20;
+@define-color button_hover_bg @night_50;
+@define-color field_bg @night_10;
+@define-color field_active_bg @night_20;
+@define-color field_selected_bg @night_30;
+
+/* Tooltips and overlays */
+@define-color tooltip_bg_color @night_10;
+@define-color tooltip_fg_color @night_fg_dim;
+@define-color really_dark_bg_color @night_00;
+
+/* Lighttable surround (thumbnail cells keep their own mid-grey background) */
+@define-color lighttable_bg_color @night_15;
+@define-color lighttable_bg_font_color @night_fg_dim;
+
+/* Graphs (histogram, curves) */
+@define-color graph_bg @night_10;
+@define-color graph_exterior @night_05;
+@define-color graph_border @night_00;
+@define-color graph_fg @night_fg;
+@define-color graph_grid @night_05;
+
+/* Bauhaus controls */
+@define-color bauhaus_indicator_border @night_20;
+@define-color bauhaus_fill @night_fg_dim;
+@define-color bauhaus_bg_hover @night_50;
