@@ -376,6 +376,49 @@ pub unsafe extern "C" fn darkroom_demosaic_dual_blend(
     }
 }
 
+/// 3x3 box-average fallback demosaic: every output pixel's channel c is the
+/// mean of the (clamped-to-image) 3x3 neighbourhood's photosites of colour
+/// c, with negative raw values clipped to 0; channels with no contributor
+/// (always alpha) divide by 1 and stay 0. Matches demosaic_box3()
+/// (rcd.c:86).
+///
+/// # Safety
+/// `in_buf` holds `width * height` floats; `out` holds `width * height * 4`;
+/// `xtrans` must point to 36 valid bytes (consulted when filters == 9).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_box3(
+    out: *mut f32, in_buf: *const f32, width: usize, height: usize,
+    filters: u32, xtrans: *const u8,
+) {
+    let inb = std::slice::from_raw_parts(in_buf, width * height);
+    let o = std::slice::from_raw_parts_mut(out, width * height * 4);
+    let xb = std::slice::from_raw_parts(xtrans, 36);
+    let mut xt = [[0_u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 { xt[r][c] = xb[r * 6 + c]; }
+    }
+
+    for row in 0..height as i32 {
+        for col in 0..width as i32 {
+            let mut sum = [0.0_f32; 4];
+            let mut cnt = [0.0_f32; 4];
+            for y in row - 1..row + 2 {
+                for x in col - 1..col + 2 {
+                    if x >= 0 && y >= 0 && x < width as i32 && y < height as i32 {
+                        let color = raw::fcol(y, x, filters, &xt);
+                        sum[color] += inb[y as usize * width + x as usize].max(0.0);
+                        cnt[color] += 1.0;
+                    }
+                }
+            }
+            let op = (row as usize * width + col as usize) * 4;
+            for c in 0..4 {
+                o[op + c] = sum[c] / cnt[c].max(1.0);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +560,39 @@ mod tests {
         assert_eq!(&hd[0..4], &[0.25, 0.25, 0.25, 0.0]);
         // px2: 1.0*(0-2)+2 = 0.0
         assert_eq!(&hd[4..8], &[0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn box3_uniform_field_recovers_all_channels() {
+        // uniform 0.5 raw: every channel's box mean is 0.5 wherever a
+        // contributor exists; alpha (no contributors) stays 0
+        let (w, h) = (6usize, 6usize);
+        let inp = vec![0.5_f32; w * h];
+        let mut out = vec![9.0_f32; w * h * 4];
+        let xt = [0_u8; 36];
+        unsafe {
+            darkroom_demosaic_box3(out.as_mut_ptr(), inp.as_ptr(), w, h, RGGB, xt.as_ptr());
+        }
+        for px in out.chunks_exact(4) {
+            assert_eq!(&px[0..3], &[0.5, 0.5, 0.5]);
+            assert_eq!(px[3], 0.0);
+        }
+    }
+
+    #[test]
+    fn box3_corner_clamps_window() {
+        // 2x2 RGGB image, corner (0,0): window covers all four photosites
+        // exactly once → R=in[0], G=(in[1]+in[2])/2, B=in[3]
+        let inp = [0.1_f32, 0.2, 0.4, 0.8];
+        let mut out = vec![9.0_f32; 16];
+        let xt = [0_u8; 36];
+        unsafe {
+            darkroom_demosaic_box3(out.as_mut_ptr(), inp.as_ptr(), 2, 2, RGGB, xt.as_ptr());
+        }
+        assert!((out[0] - 0.1).abs() < 1e-7);
+        assert!((out[1] - 0.3).abs() < 1e-7);
+        assert!((out[2] - 0.8).abs() < 1e-7);
+        assert_eq!(out[3], 0.0);
     }
 
     #[test]

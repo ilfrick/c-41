@@ -90,29 +90,8 @@ static void demosaic_box3(float *const restrict out,
                           const uint32_t filters,
                           const uint8_t(*const xtrans)[6])
 {
-  DT_OMP_FOR()
-  for(int row = 0; row < height; row++)
-  {
-    for(int col = 0; col < width; col++)
-    {
-      dt_aligned_pixel_t sum = { 0.0f, 0.0f, 0.0f, 0.0f };
-      dt_aligned_pixel_t cnt = { 0.0f, 0.0f, 0.0f, 0.0f };
-      for(int y = row-1; y < row+2; y++)
-      {
-        for(int x = col-1; x < col+2; x++)
-        {
-          if(x >= 0 && y >= 0 && x < width && y < height)
-          {
-            const int color = (filters == 9u) ? FCNxtrans(y, x, xtrans) : FC(y, x, filters);
-            sum[color] += MAX(0.0f, in[(size_t)width*y +x]);
-            cnt[color] += 1.0f;
-          }
-        }
-      }
-      for_each_channel(c)
-        out[((size_t)row * width + col)*4 + c] = sum[c] / MAX(1.0f, cnt[c]);
-    }
-  }
+  darkroom_demosaic_box3(out, in, width, height, filters,
+                         (const unsigned char *)xtrans);
 }
 
 DT_OMP_DECLARE_SIMD(aligned(in, out : 64))

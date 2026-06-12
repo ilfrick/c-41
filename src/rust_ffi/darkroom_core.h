@@ -2664,6 +2664,12 @@ void darkroom_demosaic_dual_mask_to_alpha(float *high_data, const float *mask,
 void darkroom_demosaic_dual_blend(float *high_data, const float *vng_image,
                                   const float *mask, size_t msize);
 
+/* 3x3 box-average fallback demosaic (src/iop/demosaicing/rcd.c
+ * demosaic_box3). out is width*height*4 floats. */
+void darkroom_demosaic_box3(float *out, const float *in_buf,
+                            size_t width, size_t height,
+                            uint32_t filters, const unsigned char *xtrans);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
