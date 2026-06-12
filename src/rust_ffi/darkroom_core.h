@@ -2623,6 +2623,28 @@ void darkroom_rawoverexposed_mark_row(float *out_row, size_t width, size_t ch,
                                       const uint32_t *thresholds,
                                       int mode, const float *solid_color);
 
+/*
+ * Demosaic basics (src/iop/demosaicing/basics.c): green pre-median
+ * filter, RGB colour smoothing (median of R-G / B-G differences,
+ * in-place on a 4-ch buffer), and the local-average / full-average
+ * Bayer green equilibrations. Single-channel buffers are width*height
+ * floats; color_smoothing's buffer is width*height*4.
+ */
+void darkroom_demosaic_pre_median(float *out, const float *in_buf,
+                                  size_t width, size_t height,
+                                  uint32_t filters, int num_passes, float threshold);
+
+void darkroom_demosaic_color_smoothing(float *out, size_t width, size_t height,
+                                       int num_passes);
+
+void darkroom_demosaic_green_eq_lavg(float *out, const float *in_buf,
+                                     size_t width, size_t height,
+                                     uint32_t filters, float thr);
+
+void darkroom_demosaic_green_eq_favg(float *out, const float *in_buf,
+                                     size_t width, size_t height,
+                                     uint32_t filters);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

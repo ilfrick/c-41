@@ -36,6 +36,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "imageio/imageio_rawspeed.h" // for dt_rawspeed_crop_dcraw_filters
 #include "develop/tiling.h"
+#include "rust_ffi/darkroom_core.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
