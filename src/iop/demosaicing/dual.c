@@ -59,9 +59,7 @@ static void dual_demosaic(dt_dev_pixelpipe_iop_t *piece,
 
   if(dual_mask)
   {
-    DT_OMP_FOR_SIMD(aligned(mask : 64))
-    for(size_t idx = 0; idx < msize; idx++)
-      high_data[idx * 4 + 3] = mask[idx];
+    darkroom_demosaic_dual_mask_to_alpha(high_data, mask, msize);
   }
   else
   {
@@ -71,14 +69,7 @@ static void dual_demosaic(dt_dev_pixelpipe_iop_t *piece,
       vng_interpolate(vng_image, raw_data, width, height, filters, xtrans, TRUE);
       color_smoothing(vng_image, width, height, DT_DEMOSAIC_SMOOTH_2);
 
-      DT_OMP_FOR_SIMD(aligned(mask, vng_image : 64))
-      for(size_t idx = 0; idx < msize; idx++)
-      {
-        const size_t oidx = idx * 4;
-        for(int c = 0; c < 3; c++)
-          high_data[oidx + c] = interpolatef(mask[idx], high_data[oidx + c], vng_image[oidx + c]);
-        high_data[oidx + 3] = 0.0f;
-      }
+      darkroom_demosaic_dual_blend(high_data, vng_image, mask, msize);
       dt_free_align(vng_image);
     }
   }

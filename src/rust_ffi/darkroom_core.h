@@ -2655,6 +2655,15 @@ void darkroom_demosaic_passthrough_color(float *out, const float *in_buf,
                                          size_t width, size_t height,
                                          uint32_t filters, const unsigned char *xtrans);
 
+/* Dual demosaic (src/iop/demosaicing/dual.c): copy the detail mask into
+ * the alpha channel, or lerp the high-frequency RGBA image towards the
+ * VNG one by the mask (alpha zeroed). msize = width*height pixels. */
+void darkroom_demosaic_dual_mask_to_alpha(float *high_data, const float *mask,
+                                          size_t msize);
+
+void darkroom_demosaic_dual_blend(float *high_data, const float *vng_image,
+                                  const float *mask, size_t msize);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

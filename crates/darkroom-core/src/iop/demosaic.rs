@@ -336,6 +336,46 @@ pub unsafe extern "C" fn darkroom_demosaic_passthrough_color(
     }
 }
 
+/// Dual-demosaic mask visualization: copy the blend mask into the alpha
+/// channel of the RGBA image. Replaces the first DT_OMP_FOR_SIMD loop in
+/// dual_demosaic() (dual.c:62).
+///
+/// # Safety
+/// `high_data` holds `msize * 4` floats; `mask` holds `msize`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_dual_mask_to_alpha(
+    high_data: *mut f32, mask: *const f32, msize: usize,
+) {
+    let hd = std::slice::from_raw_parts_mut(high_data, msize * 4);
+    let m = std::slice::from_raw_parts(mask, msize);
+    for (px, &mv) in hd.chunks_exact_mut(4).zip(m.iter()) {
+        px[3] = mv;
+    }
+}
+
+/// Dual-demosaic blend: per pixel, lerp the high-frequency demosaic towards
+/// the VNG one by the detail mask — interpolatef(m, high, vng) =
+/// m*(high-vng)+vng (math.h:141) — and zero the alpha. Replaces the second
+/// DT_OMP_FOR_SIMD loop in dual_demosaic() (dual.c:74).
+///
+/// # Safety
+/// `high_data`/`vng_image` hold `msize * 4` floats; `mask` holds `msize`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_dual_blend(
+    high_data: *mut f32, vng_image: *const f32, mask: *const f32, msize: usize,
+) {
+    let hd = std::slice::from_raw_parts_mut(high_data, msize * 4);
+    let vng = std::slice::from_raw_parts(vng_image, msize * 4);
+    let m = std::slice::from_raw_parts(mask, msize);
+    for idx in 0..msize {
+        let o = idx * 4;
+        for c in 0..3 {
+            hd[o + c] = m[idx] * (hd[o + c] - vng[o + c]) + vng[o + c];
+        }
+        hd[o + 3] = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +497,26 @@ mod tests {
         assert_eq!(&out[4..8], &[0.0, 0.2, 0.0, 0.0]); // G site
         assert_eq!(&out[8..12], &[0.0, 0.3, 0.0, 0.0]); // G site
         assert_eq!(&out[12..16], &[0.0, 0.0, 0.4, 0.0]); // B site
+    }
+
+    #[test]
+    fn dual_mask_to_alpha_and_blend() {
+        let mut hd = vec![1.0_f32, 1.0, 1.0, 9.0, /*px2*/ 0.0, 0.0, 0.0, 9.0];
+        let mask = [0.25_f32, 1.0];
+        unsafe {
+            darkroom_demosaic_dual_mask_to_alpha(hd.as_mut_ptr(), mask.as_ptr(), 2);
+        }
+        assert_eq!(hd[3], 0.25);
+        assert_eq!(hd[7], 1.0);
+
+        let vng = vec![0.0_f32, 0.0, 0.0, 5.0, /*px2*/ 2.0, 2.0, 2.0, 5.0];
+        unsafe {
+            darkroom_demosaic_dual_blend(hd.as_mut_ptr(), vng.as_ptr(), mask.as_ptr(), 2);
+        }
+        // px1: 0.25*(1-0)+0 = 0.25; alpha zeroed
+        assert_eq!(&hd[0..4], &[0.25, 0.25, 0.25, 0.0]);
+        // px2: 1.0*(0-2)+2 = 0.0
+        assert_eq!(&hd[4..8], &[0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
