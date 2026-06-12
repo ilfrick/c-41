@@ -69,6 +69,7 @@ pub mod diffuse;
 pub mod colortransfer;
 pub mod cacorrectrgb;
 pub mod rawdenoise;
+pub mod rawoverexposed;
 pub mod colormapping;
 pub mod colorequal;
 pub mod toneequal;

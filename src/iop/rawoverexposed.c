@@ -24,15 +24,16 @@
 #include "control/control.h"      // for dt_control_log
 #include "develop/develop.h"      // for dt_develop_t, dt_develop_t::(anony...
 #include "develop/imageop.h"      // for dt_iop_module_t, dt_iop_roi_t, dt_...
-#include "develop/imageop_math.h" // for FC, FCxtrans
+#include "develop/imageop_math.h"
 #include "develop/pixelpipe.h"    // for dt_dev_pixelpipe_type_t::DT_DEV_PI...
 #include "develop/tiling.h"
+#include "rust_ffi/darkroom_core.h"
 #include "iop/iop_api.h"          // for dt_iop_params_t
 #include <glib/gi18n.h>           // for _
 #include <gtk/gtktypes.h>         // for GtkWidget
 #include <stdint.h>               // for uint16_t, uint8_t, uint32_t
 #include <stdlib.h>               // for size_t, free, NULL, calloc, malloc
-#include <string.h>               // for memcpy
+#include <string.h>
 
 DT_MODULE(1)
 
@@ -155,60 +156,23 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   size_t coordbufsize;
   float *const restrict coordbuf = dt_alloc_perthread_float(2*roi_out->width, &coordbufsize);
 
-  DT_OMP_FOR(firstprivate(dt_iop_rawoverexposed_colors))
   for(int j = 0; j < roi_out->height; j++)
   {
     float *const restrict bufptr = dt_get_perthread(coordbuf, coordbufsize);
 
-    // here are all the pixels of this row
-    for(int i = 0; i < roi_out->width; i++)
-    {
-      bufptr[2 * i] = (float)(roi_out->x + i) / roi_in->scale;
-      bufptr[2 * i + 1] = (float)(roi_out->y + j) / roi_in->scale;
-    }
+    // here are all the pixels of this row (Rust FFI)
+    darkroom_rawoverexposed_fill_coords(bufptr, j, roi_out->width,
+                                        roi_out->x, roi_out->y, roi_in->scale);
 
-    // where did they come from?
+    // where did they come from? (pipeline callback -- stays in C)
     dt_dev_distort_backtransform_plus(self->dev, self->dev->full.pipe, iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL, bufptr, roi_out->width);
 
-    for(int i = 0; i < roi_out->width; i++)
-    {
-      const size_t pout = (size_t)ch * (j * roi_out->width + i);
-
-      // not sure which float -> int to use here
-      const int i_raw = (int)bufptr[2 * i];
-      const int j_raw = (int)bufptr[2 * i + 1];
-
-      if(i_raw < 0 || j_raw < 0 || i_raw >= buf.width || j_raw >= buf.height) continue;
-
-      int c;
-      if(filters == 9u)
-      {
-        c = FCNxtrans(j_raw, i_raw, xtrans);
-      }
-      else // if(filters)
-      {
-        c = FC(j_raw, i_raw, filters);
-      }
-
-      const size_t pin = (size_t)j_raw * buf.width + i_raw;
-      const float in = raw[pin];
-
-      // was the raw pixel clipped?
-      if(in < d->threshold[c]) continue;
-
-      switch(mode)
-      {
-        case DT_DEV_RAWOVEREXPOSED_MODE_MARK_CFA:
-          memcpy(out + pout, dt_iop_rawoverexposed_colors[c], sizeof(float) * 4);
-          break;
-        case DT_DEV_RAWOVEREXPOSED_MODE_MARK_SOLID:
-          memcpy(out + pout, color, sizeof(float) * 4);
-          break;
-        case DT_DEV_RAWOVEREXPOSED_MODE_FALSECOLOR:
-          out[pout + c] = 0.0;
-          break;
-      }
-    }
+    // mark clipped photosites (Rust FFI)
+    darkroom_rawoverexposed_mark_row(out + (size_t)ch * j * roi_out->width,
+                                     roi_out->width, ch, bufptr,
+                                     raw, buf.width, buf.height,
+                                     filters, (const unsigned char *)xtrans,
+                                     d->threshold, mode, color);
   }
 
   dt_free_align(coordbuf);
@@ -276,19 +240,15 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   coordbuf = dt_alloc_aligned(coordbufsize);
   if(coordbuf == NULL) goto error;
 
-  DT_OMP_FOR()
   for(int j = 0; j < height; j++)
   {
     float *bufptr = ((float *)coordbuf) + (size_t)2 * j * width;
 
-    // here are all the pixels of this row
-    for(int i = 0; i < roi_out->width; i++)
-    {
-      bufptr[2 * i] = (float)(roi_out->x + i) / roi_in->scale;
-      bufptr[2 * i + 1] = (float)(roi_out->y + j) / roi_in->scale;
-    }
+    // here are all the pixels of this row (Rust FFI)
+    darkroom_rawoverexposed_fill_coords(bufptr, j, roi_out->width,
+                                        roi_out->x, roi_out->y, roi_in->scale);
 
-    // where did they come from?
+    // where did they come from? (pipeline callback -- stays in C)
     dt_dev_distort_backtransform_plus(self->dev, self->dev->full.pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL, bufptr, roi_out->width);
   }
 

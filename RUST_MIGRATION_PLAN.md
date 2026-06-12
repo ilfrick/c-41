@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **435** |
-| IOP `.rs` files | 93 (one per C IOP) |
+| Unit tests passing | **441** |
+| IOP `.rs` files | 94 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+79` (a1ex colour inpainting — inpaint.c deleted, highlights IOP fully migrated incl. all 6 hlreconstruct/ backends) |
+| Last patch | `Phase 2z+80` (rawoverexposed — row loops split around the C distort callback, marking/coord-fill in Rust) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -41,7 +41,7 @@ blocking infrastructure lands.
 `highpass`, `hotpixels` (all 3 variants),
 `invert`, `levels`, `liquify`, `lowlight`, `lowpass`, `lut3d`, `monochrome`,
 `negadoctor`, `overexposed` (all 4 modes), `overlay`, `primaries`,
-`profile_gamma`, `rasterfile`, `rawdenoise`, `rawprepare`,
+`profile_gamma`, `rasterfile`, `rawdenoise`, `rawoverexposed`, `rawprepare`,
 `relight`, `rgbcurve`, `rgblevels`, `shadhi`, `sharpen`, `sigmoid`, `soften`,
 `splittoning`, `temperature`, `toneequal` (main process loop is
 `#else`-guarded dead code since `DT_TONEEQ_USE_LUT=TRUE`),
@@ -55,39 +55,39 @@ Commit-params LUT builders migrated:
 
 #### Partially migrated (some loops remain, blocked on infrastructure)
 
+Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --include=*.c`):
+
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
-| `colorequal` | 1 | GUI background renderer (intentionally deferred) |
-| `diffuse` | 1 | anisotropic PDE solver (very complex) |
-| `gamma` | 5 | `dt_Lab_to_XYZ`, `dt_HSL_2_RGB`, `dt_JzAzBz_*` |
+| `demosaicing/` | 33 | capture.c 15, basics.c 5, vng.c 4, xtrans/ppg/passthrough/dual 2 each, rcd.c 1 — `dt_interpolation_*` + demosaic algorithms |
+| `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
+| `colorreconstruction` | 3 | 3D bilateral grid |
+| `colorin` | 3 | ICC matrix + LCMS |
 | `channelmixerrgb` | 2 | B-spline local avg reduction (illuminant detection) |
 | `colortransfer` | 2 | k-means with atomic accumulators |
+| `retouch` | 2 | `dt_linearRGB_to_XYZ` / `dt_XYZ_to_Lab` ICC paths |
+| `colorequal` | 1 | GUI background renderer (intentionally deferred) |
 | `colorout` | 1 | LCMS `cmsDoTransform` |
-| `retouch` | 4 | `dt_linearRGB_to_XYZ` / `dt_XYZ_to_Lab` ICC paths |
-| `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
-| `colorin` | 5 | ICC matrix + LCMS |
-| `ashift` | 2 | `dt_Rec709_to_XYZ_D50` + `dt_XYZ_to_Lab` |
+| `diffuse` | 1 | anisotropic PDE solver (very complex) |
+| `toneequal` | 1 | GUI LUT |
 
-#### Stubs only -- fully blocked
-
-`ashift` (11), `clipping` (4), `colorbalancergb` (4),
-`colorin` (5), `colorreconstruction` (3), `denoiseprofile` (6),
-`liquify` (6), `rawoverexposed` (2), `retouch` (9).
-
-These depend on `dt_interpolation_*`, 3D bilateral grid, NLM/wavelet, perspective
-matrices, or per-pixel ICC transforms not yet ported to Rust.
+(`ashift`, `clipping`, `denoiseprofile`, `gamma`, `liquify`, `rawoverexposed`
+previously listed here/as stubs are at 0 loops — fully migrated.)
 
 #### What blocks the remaining loops
 
 | Infrastructure | Unblocked IOPs |
 |---|---|
-| `dt_interpolation_*` | scalepixels, rotatepixels process(), demosaic |
+| `dt_interpolation_*` | demosaicing cluster |
 | 3D bilateral grid | colorreconstruction |
-| NLM + wavelet | denoiseprofile, nlmeans |
-| `dt_dev_distort_backtransform_plus` | rawoverexposed |
-| Keystone / perspective 3x3 | clipping, ashift |
-| Filmlight Yrg / `work_profile` callbacks | filmicrgb main loops, colorin |
-| GUI-only loops | colorbalancergb (2), toneequal GUI LUT |
+| Filmlight Yrg / `work_profile` callbacks | colorbalancergb, colorin |
+| Per-pixel ICC / LCMS | colorin, colorout, retouch |
+| GUI-only loops | colorequal, toneequal GUI LUT |
+
+Pattern note (Phase 2z+80, rawoverexposed): loops interleaved with C
+pipeline callbacks (`dt_dev_distort_backtransform_plus`) are split into
+serial C row loops calling Rust for the work before/after the callback —
+no Rust→C callback plumbing needed.
 
 #### Shared darkroom-core modules
 

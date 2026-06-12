@@ -2604,6 +2604,25 @@ void darkroom_segbased_final_output(float *output, const float *tmpout,
                                     size_t pwidth, size_t pheight, int seg_border,
                                     int do_masking, int vmode, float strength);
 
+/*
+ * Raw-overexposure indicator (src/iop/rawoverexposed.c). fill_coords
+ * writes one row's pre-distortion pixel coordinates (2*width floats);
+ * mark_row paints output pixels whose back-transformed raw photosite
+ * value reaches thresholds[cfa colour] -- mode 0 marks with the CFA
+ * colour, 1 with solid_color (4 floats), 2 zeroes the clipped channel.
+ * The dt_dev_distort_backtransform_plus call between them stays in C.
+ */
+void darkroom_rawoverexposed_fill_coords(float *buf, int row, size_t width,
+                                         int x, int y, float scale);
+
+void darkroom_rawoverexposed_mark_row(float *out_row, size_t width, size_t ch,
+                                      const float *coords,
+                                      const uint16_t *raw_buf,
+                                      size_t raw_width, size_t raw_height,
+                                      unsigned int filters, const unsigned char *xtrans,
+                                      const uint32_t *thresholds,
+                                      int mode, const float *solid_color);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
