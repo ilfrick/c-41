@@ -2025,6 +2025,319 @@ pub unsafe extern "C" fn darkroom_segbased_final_output(
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Colour inpainting (a1ex / magic lantern), src/iop/hlreconstruct/inpaint.c.
+// Four directional passes (0:+x, 1:-x, 2:+y, 3:-y) accumulate per-direction
+// estimates into `out`; pass 3 averages by 4. The row sweeps (passes 0+1) and
+// column sweeps (passes 2+3) each map to one FFI call below.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Colour-transition ratio index lookup: red→blue is ROFF[0][2], blue→red
+/// ROFF[2][0]; negative means invert the ratio. Matches inpaint.c:70.
+const ROFF: [[i32; 3]; 3] = [[0, -1, -2], [1, 0, -3], [2, 3, 0]];
+
+/// Interpolate a clipped pixel from `inb[base+offset_next]`, ideally via the
+/// running colour ratio. Matches interp_pix_xtrans() (inpaint.c:20).
+#[inline(always)]
+fn interp_pix_xtrans(
+    ratio_next: i32, base: isize, offset_next: isize,
+    clip0: f32, clip_next: f32, inb: &[f32], ratios: &[f32; 4],
+) -> f32 {
+    debug_assert!(ratio_next != 0); // identity transitions are never interpolated
+    // it's OK to exceed clipping of current pixel's color based on a
+    // neighbor -- that is the purpose of interpolating highlight colors
+    let clip_val = clip0.max(clip_next);
+    let nv = inb[(base + offset_next) as usize];
+    if nv >= clip_next - 1e-5 {
+        // next pixel is also clipped
+        clip_val
+    } else if ratio_next > 0 {
+        (nv / ratios[ratio_next as usize]).min(clip_val)
+    } else {
+        (nv * ratios[(-ratio_next) as usize]).min(clip_val)
+    }
+}
+
+/// One directional X-Trans inpaint sweep over a row (dim 0) or column
+/// (dim 1). Matches interpolate_color_xtrans() (inpaint.c:48), including the
+/// C's mixed strides: the input cursor starts on a roi_in-width row base but
+/// steps by roi_out-width offsets.
+#[allow(clippy::too_many_arguments)]
+fn interpolate_color_xtrans(
+    inb: &[f32], out: &mut [f32],
+    in_width: usize, out_width: usize, out_height: usize,
+    dim: i32, dir: i32, other: i32,
+    clip: &[f32; 4], xt: &[[u8; 6]; 6], pass: i32,
+) {
+    // record ratios of color transitions 0:unused, 1:RG, 2:RB, and 3:GB
+    let mut ratios = [1.0_f32; 4];
+
+    let mut i: i32 = if dim == 0 { 0 } else { other };
+    let mut j: i32 = if dim == 0 { other } else { 0 };
+    let offs: isize = (if dim != 0 { out_width as isize } else { 1 }) * if dir < 0 { -1 } else { 1 };
+    let offl: isize = offs - if dim != 0 { 1 } else { out_width as isize };
+    let offr: isize = offs + if dim != 0 { 1 } else { out_width as isize };
+    let (beg, end): (i32, i32) = if dir == 1 {
+        (0, if dim == 0 { out_width as i32 } else { out_height as i32 })
+    } else {
+        ((if dim == 0 { out_width as i32 } else { out_height as i32 }) - 1, -1)
+    };
+
+    let (mut op, mut ip): (isize, isize) = if dim == 1 {
+        (i as isize + beg as isize * out_width as isize,
+         i as isize + beg as isize * in_width as isize)
+    } else {
+        (beg as isize + j as isize * out_width as isize,
+         beg as isize + j as isize * in_width as isize)
+    };
+
+    let clip_max = clip[0].max(clip[1]).max(clip[2]); // max3f
+
+    let mut k = beg;
+    while k != end {
+        if dim == 1 { j = k; } else { i = k; }
+
+        let f0 = raw::fc_xtrans(j, i, xt);
+        let f1 = raw::fc_xtrans(if dim != 0 { j + dir } else { j },
+                                if dim != 0 { i } else { i + dir }, xt);
+        let fl = raw::fc_xtrans(if dim != 0 { j + dir } else { j - 1 },
+                                if dim != 0 { i - 1 } else { i + dir }, xt);
+        let fr = raw::fc_xtrans(if dim != 0 { j + dir } else { j + 1 },
+                                if dim != 0 { i + 1 } else { i + dir }, xt);
+        let clip0 = clip[f0];
+        let clip1 = clip[f1];
+        let clipl = clip[fl];
+        let clipr = clip[fr];
+
+        if i == 0 || i == out_width as i32 - 1 || j == 0 || j == out_height as i32 - 1 {
+            if pass == 3 {
+                out[op as usize] = clip_max.min(inb[ip as usize]);
+            }
+        } else {
+            let in0 = inb[ip as usize];
+            let innext = inb[(ip + offs) as usize];
+
+            // ratio to next pixel if this & next are unclamped and not in
+            // a 2x2 green block
+            if f0 != f1 && (in0 < clip0 && in0 > 1e-5) && (innext < clip1 && innext > 1e-5) {
+                let r = ROFF[f0][f1];
+                if r > 0 {
+                    ratios[r as usize] = (3.0 * ratios[r as usize] + innext / in0) / 4.0;
+                } else {
+                    ratios[(-r) as usize] = (3.0 * ratios[(-r) as usize] + in0 / innext) / 4.0;
+                }
+            }
+
+            if in0 >= clip0 - 1e-5 {
+                // interpolate color for clipped pixel
+                let add = if f0 != f1 {
+                    // next pixel is a different color
+                    interp_pix_xtrans(ROFF[f0][f1], ip, offs, clip0, clip1, inb, &ratios)
+                } else if fl != f0 {
+                    // at start of 2x2 green block, look diagonally
+                    interp_pix_xtrans(ROFF[f0][fl], ip, offl, clip0, clipl, inb, &ratios)
+                } else {
+                    interp_pix_xtrans(ROFF[f0][fr], ip, offr, clip0, clipr, inb, &ratios)
+                };
+
+                if pass == 0 {
+                    out[op as usize] = add;
+                } else if pass == 3 {
+                    out[op as usize] = clip_max.min((out[op as usize] + add) / 4.0);
+                } else {
+                    out[op as usize] += add;
+                }
+            } else if pass == 3 {
+                // pixel is not clipped
+                out[op as usize] = in0;
+            }
+        }
+        op += offs;
+        ip += offs;
+        k += dir;
+    }
+}
+
+/// One directional Bayer inpaint sweep over a row (dim 0) or column (dim 1):
+/// single exponential-decay ratio between the alternating colours of the
+/// line. Matches interpolate_color() (inpaint.c:177) — note no clip_max
+/// clamp on pass 3, unlike the X-Trans variant.
+#[allow(clippy::too_many_arguments)]
+fn interpolate_color(
+    inb: &[f32], out: &mut [f32],
+    width: usize, height: usize,
+    dim: i32, dir: i32, other: i32,
+    clip: &[f32; 4], filters: u32, pass: i32,
+) {
+    let mut ratio = 1.0_f32;
+    let mut i: i32 = 0;
+    let mut j: i32 = 0;
+    if dim == 0 { j = other; } else { i = other; }
+    let mut offs: isize = if dim != 0 { width as isize } else { 1 };
+    if dir < 0 { offs = -offs; }
+    let (beg, end): (i32, i32) = match (dim, dir) {
+        (0, 1) => (0, width as i32),
+        (0, -1) => (width as i32 - 1, -1),
+        (1, 1) => (0, height as i32),
+        (1, -1) => (height as i32 - 1, -1),
+        _ => return,
+    };
+
+    let (mut op, mut ip): (isize, isize) = if dim == 1 {
+        let p = i as isize + beg as isize * width as isize;
+        (p, p)
+    } else {
+        let p = beg as isize + j as isize * width as isize;
+        (p, p)
+    };
+
+    let mut k = beg;
+    while k != end {
+        if dim == 1 { j = k; } else { i = k; }
+        let clip0 = clip[raw::fc_bayer(j, i, filters)];
+        let clip1 = clip[raw::fc_bayer(if dim != 0 { j + 1 } else { j },
+                                       if dim != 0 { i } else { i + 1 }, filters)];
+        if i == 0 || i == width as i32 - 1 || j == 0 || j == height as i32 - 1 {
+            if pass == 3 {
+                out[op as usize] = inb[ip as usize];
+            }
+        } else {
+            let in0 = inb[ip as usize];
+            let innext = inb[(ip + offs) as usize];
+
+            if (in0 < clip0 && in0 > 1e-5) && (innext < clip1 && innext > 1e-5) {
+                // update ratio, exponential decay. ratio = in[odd]/in[even]
+                if k & 1 != 0 {
+                    ratio = (3.0 * ratio + in0 / innext) / 4.0;
+                } else {
+                    ratio = (3.0 * ratio + innext / in0) / 4.0;
+                }
+            }
+
+            if in0 >= clip0 - 1e-5 {
+                // in0 is clipped, restore it as innext adjusted by the ratio
+                let add = if innext >= clip1 - 1e-5 {
+                    clip0.max(clip1)
+                } else if k & 1 != 0 {
+                    innext * ratio
+                } else {
+                    innext / ratio
+                };
+
+                if pass == 0 {
+                    out[op as usize] = add;
+                } else if pass == 3 {
+                    out[op as usize] = (out[op as usize] + add) / 4.0;
+                } else {
+                    out[op as usize] += add;
+                }
+            } else if pass == 3 {
+                out[op as usize] = in0;
+            }
+        }
+        op += offs;
+        ip += offs;
+        k += dir;
+    }
+}
+
+/// X-Trans inpaint row sweeps: passes 0 (+x) and 1 (-x) for every row.
+/// Replaces the first DT_OMP_FOR loop of the INPAINT mode in
+/// src/iop/highlights.c.
+///
+/// # Safety
+/// `in_buf` holds `in_width * in_height` floats (in_width >= out_width,
+/// in_height >= out_height — note the INPAINT pipeline path guarantees
+/// roi_in == roi_out because highlights' modify_roi_in only diverges for
+/// the OPPOSED/SEGMENTS modes; the bound checks here would panic across
+/// the FFI boundary if that invariant ever broke); `out_buf` holds
+/// `out_width * out_height`; `clips` 4 floats; `xtrans` 36 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_inpaint_xtrans_rows(
+    in_buf: *const f32, out_buf: *mut f32,
+    in_width: usize, in_height: usize, out_width: usize, out_height: usize,
+    clips: *const f32, xtrans: *const u8,
+) {
+    let inb = std::slice::from_raw_parts(in_buf, in_width * in_height);
+    let out = std::slice::from_raw_parts_mut(out_buf, out_width * out_height);
+    let c = std::slice::from_raw_parts(clips, 4);
+    let clip = [c[0], c[1], c[2], c[3]];
+    let xt = read_xtrans(xtrans);
+
+    for j in 0..out_height as i32 {
+        interpolate_color_xtrans(inb, out, in_width, out_width, out_height, 0, 1, j, &clip, &xt, 0);
+        interpolate_color_xtrans(inb, out, in_width, out_width, out_height, 0, -1, j, &clip, &xt, 1);
+    }
+}
+
+/// X-Trans inpaint column sweeps: passes 2 (+y) and 3 (-y) for every column.
+/// Replaces the second DT_OMP_FOR loop of the INPAINT mode.
+///
+/// # Safety
+/// Same buffers as darkroom_highlights_inpaint_xtrans_rows.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_inpaint_xtrans_cols(
+    in_buf: *const f32, out_buf: *mut f32,
+    in_width: usize, in_height: usize, out_width: usize, out_height: usize,
+    clips: *const f32, xtrans: *const u8,
+) {
+    let inb = std::slice::from_raw_parts(in_buf, in_width * in_height);
+    let out = std::slice::from_raw_parts_mut(out_buf, out_width * out_height);
+    let c = std::slice::from_raw_parts(clips, 4);
+    let clip = [c[0], c[1], c[2], c[3]];
+    let xt = read_xtrans(xtrans);
+
+    for i in 0..out_width as i32 {
+        interpolate_color_xtrans(inb, out, in_width, out_width, out_height, 1, 1, i, &clip, &xt, 2);
+        interpolate_color_xtrans(inb, out, in_width, out_width, out_height, 1, -1, i, &clip, &xt, 3);
+    }
+}
+
+/// Bayer inpaint row sweeps: passes 0 (+x) and 1 (-x) for every row.
+/// Replaces the third DT_OMP_FOR loop of the INPAINT mode. The C indexes
+/// both buffers with roi_out->width, so a single width/height pair is used.
+///
+/// # Safety
+/// `in_buf`/`out_buf` hold `width * height` floats; `clips` 4 floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_inpaint_bayer_rows(
+    in_buf: *const f32, out_buf: *mut f32,
+    width: usize, height: usize,
+    clips: *const f32, filters: u32,
+) {
+    let inb = std::slice::from_raw_parts(in_buf, width * height);
+    let out = std::slice::from_raw_parts_mut(out_buf, width * height);
+    let c = std::slice::from_raw_parts(clips, 4);
+    let clip = [c[0], c[1], c[2], c[3]];
+
+    for j in 0..height as i32 {
+        interpolate_color(inb, out, width, height, 0, 1, j, &clip, filters, 0);
+        interpolate_color(inb, out, width, height, 0, -1, j, &clip, filters, 1);
+    }
+}
+
+/// Bayer inpaint column sweeps: passes 2 (+y) and 3 (-y) for every column.
+/// Replaces the fourth DT_OMP_FOR loop of the INPAINT mode.
+///
+/// # Safety
+/// Same buffers as darkroom_highlights_inpaint_bayer_rows.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_highlights_inpaint_bayer_cols(
+    in_buf: *const f32, out_buf: *mut f32,
+    width: usize, height: usize,
+    clips: *const f32, filters: u32,
+) {
+    let inb = std::slice::from_raw_parts(in_buf, width * height);
+    let out = std::slice::from_raw_parts_mut(out_buf, width * height);
+    let c = std::slice::from_raw_parts(clips, 4);
+    let clip = [c[0], c[1], c[2], c[3]];
+
+    for i in 0..width as i32 {
+        interpolate_color(inb, out, width, height, 1, 1, i, &clip, filters, 2);
+        interpolate_color(inb, out, width, height, 1, -1, i, &clip, filters, 3);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2864,5 +3177,137 @@ mod tests {
         assert!((out[ow + 1] - 1.2).abs() < 1e-6, "out={}", out[ow + 1]);
         // a cell with no segment: just the dimmed luminance
         assert!((out[0] - 0.2).abs() < 1e-6, "out={}", out[0]);
+    }
+
+    // ── inpaint.c ports ─────────────────────────────────────────────────────
+
+    fn run_bayer_inpaint(inp: &[f32], out: &mut [f32], w: usize, h: usize, clips: &[f32; 4]) {
+        unsafe {
+            darkroom_highlights_inpaint_bayer_rows(inp.as_ptr(), out.as_mut_ptr(), w, h,
+                                                   clips.as_ptr(), RGGB);
+            darkroom_highlights_inpaint_bayer_cols(inp.as_ptr(), out.as_mut_ptr(), w, h,
+                                                   clips.as_ptr(), RGGB);
+        }
+    }
+
+    #[test]
+    fn inpaint_bayer_unclipped_passes_through() {
+        let (w, h) = (6usize, 6usize);
+        let inp: Vec<f32> = (0..w * h).map(|k| 0.2 + 0.01 * k as f32).collect();
+        let mut out = vec![-9.0_f32; w * h];
+        run_bayer_inpaint(&inp, &mut out, w, h, &[10.0, 10.0, 10.0, 10.0]);
+        assert_eq!(out, inp); // pass 3 writes in[0] everywhere when unclipped
+    }
+
+    #[test]
+    fn inpaint_bayer_reconstructs_isolated_clipped_red() {
+        // uniform 0.5 field, one clipped red at (2,2): every directional pass
+        // contributes neighbour/ratio = 0.5, pass3 averages back to 0.5.
+        let (w, h) = (6usize, 6usize);
+        let mut inp = vec![0.5_f32; w * h];
+        inp[2 * w + 2] = 2.0;
+        let mut out = vec![-9.0_f32; w * h];
+        run_bayer_inpaint(&inp, &mut out, w, h, &[1.0, 10.0, 10.0, 10.0]);
+        assert!((out[2 * w + 2] - 0.5).abs() < 1e-5, "out={}", out[2 * w + 2]);
+        // everything else passes through
+        for (k, (&o, &i)) in out.iter().zip(inp.iter()).enumerate() {
+            if k != 2 * w + 2 {
+                assert_eq!(o, i, "pixel {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn inpaint_bayer_clipped_pair_clamps_to_clip() {
+        // two adjacent clipped pixels (R and its G neighbour): the horizontal
+        // estimate for each uses max(clip0, clip1) when the neighbour is
+        // also clipped — result stays finite and bounded by the clips.
+        let (w, h) = (6usize, 6usize);
+        let mut inp = vec![0.5_f32; w * h];
+        inp[2 * w + 2] = 2.0; // R clipped (clip 1.0)
+        inp[2 * w + 3] = 2.0; // G clipped (clip 0.8)
+        let mut out = vec![-9.0_f32; w * h];
+        run_bayer_inpaint(&inp, &mut out, w, h, &[1.0, 0.8, 10.0, 0.8]);
+        for &p in &[2 * w + 2, 2 * w + 3] {
+            assert!(out[p].is_finite());
+            assert!(out[p] > 0.0 && out[p] <= 1.0 + 1e-5, "out[{p}]={}", out[p]);
+        }
+    }
+
+    #[test]
+    fn inpaint_xtrans_unclipped_passes_through() {
+        let (w, h) = (12usize, 12usize);
+        let inp: Vec<f32> = (0..w * h).map(|k| 0.2 + 0.002 * k as f32).collect();
+        let mut out = vec![-9.0_f32; w * h];
+        let clips = [10.0_f32; 4];
+        unsafe {
+            darkroom_highlights_inpaint_xtrans_rows(inp.as_ptr(), out.as_mut_ptr(), w, h, w, h,
+                                                    clips.as_ptr(), XTRANS.as_ptr() as *const u8);
+            darkroom_highlights_inpaint_xtrans_cols(inp.as_ptr(), out.as_mut_ptr(), w, h, w, h,
+                                                    clips.as_ptr(), XTRANS.as_ptr() as *const u8);
+        }
+        assert_eq!(out, inp); // interior pass3 = in[0]; borders min(clip_max, in) = in
+    }
+
+    #[test]
+    fn inpaint_xtrans_clipped_pixel_bounded_by_neighbours() {
+        // one clipped photosite in a uniform field reconstructs to the
+        // neighbour level (every pass contributes ~0.5, averaged by 4).
+        let (w, h) = (12usize, 12usize);
+        let mut inp = vec![0.5_f32; w * h];
+        let p = 5 * w + 5;
+        inp[p] = 3.0;
+        let color = raw::fc_xtrans(5, 5, &XTRANS);
+        let mut clips = [10.0_f32; 4];
+        clips[color] = 1.0;
+        let mut out = vec![-9.0_f32; w * h];
+        unsafe {
+            darkroom_highlights_inpaint_xtrans_rows(inp.as_ptr(), out.as_mut_ptr(), w, h, w, h,
+                                                    clips.as_ptr(), XTRANS.as_ptr() as *const u8);
+            darkroom_highlights_inpaint_xtrans_cols(inp.as_ptr(), out.as_mut_ptr(), w, h, w, h,
+                                                    clips.as_ptr(), XTRANS.as_ptr() as *const u8);
+        }
+        assert!((out[p] - 0.5).abs() < 1e-4, "out={}", out[p]);
+        for (k, (&o, &i)) in out.iter().zip(inp.iter()).enumerate() {
+            if k != p {
+                assert_eq!(o, i, "pixel {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn inpaint_xtrans_ratio_recovers_channel_level() {
+        // Per-channel-constant field (R=0.2, G=0.4, B=0.6): the running
+        // colour ratios converge to the true channel ratios (e.g. RG → 0.5),
+        // so a clipped red photosite mid-row must reconstruct to ~0.2 from
+        // its G/B neighbours *through* the ratios — this differentiates the
+        // ROFF sign/inversion and the exponential decay from the trivial
+        // ratio==1 path exercised by the uniform-field tests.
+        let (w, h) = (96usize, 12usize);
+        let levels = [0.2_f32, 0.4, 0.6];
+        let mut inp: Vec<f32> = (0..w * h)
+            .map(|k| levels[raw::fc_xtrans((k / w) as i32, (k % w) as i32, &XTRANS)])
+            .collect();
+        // pick a red photosite near the middle of row 5 (long ratio warm-up
+        // on both sides for the +x and -x passes)
+        let j = 5_i32;
+        let mut pi = 0_i32;
+        for i in 40..56 {
+            if raw::fc_xtrans(j, i, &XTRANS) == 0 { pi = i; break; }
+        }
+        assert_ne!(pi, 0, "no red photosite found in scan range");
+        let p = j as usize * w + pi as usize;
+        inp[p] = 10.0; // clipped (clip_R = 1.0)
+        let clips = [1.0_f32, 10.0, 10.0, 10.0];
+        let mut out = vec![0.0_f32; w * h];
+        unsafe {
+            // rows only: out[p] = pass0 estimate + pass1 estimate ≈ 2 * 0.2
+            darkroom_highlights_inpaint_xtrans_rows(inp.as_ptr(), out.as_mut_ptr(), w, h, w, h,
+                                                    clips.as_ptr(), XTRANS.as_ptr() as *const u8);
+        }
+        // tolerance: the exponential-decay ratios retain ~1% residual from
+        // their 1.0 seed at mid-row; a sign/inversion bug would land at
+        // ~0.8 (no ratio) or ~0.1 (inverted), far outside this band
+        assert!((out[p] - 0.4).abs() < 1e-2, "out[p]={} (want ~0.4)", out[p]);
     }
 }

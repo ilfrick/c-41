@@ -2566,6 +2566,33 @@ void darkroom_segbased_apply_recovery(const float *input, float *tmpout,
                                       size_t pwidth, size_t pheight,
                                       float strength, float dshift);
 
+/*
+ * Highlights IOP -- colour inpainting (src/iop/hlreconstruct/inpaint.c,
+ * a1ex / magic lantern). Each call runs two directional passes for every
+ * row (passes 0:+x, 1:-x) or column (passes 2:+y, 3:-y); pass 3 averages
+ * the four accumulated estimates. The Bayer variant indexes input and
+ * output with the same width (as the C did with roi_out->width); the
+ * X-Trans variant keeps the C's roi_in-width row bases. clips has 4
+ * floats; xtrans is the 36-byte CFA table.
+ */
+void darkroom_highlights_inpaint_xtrans_rows(const float *in_buf, float *out_buf,
+                                             size_t in_width, size_t in_height,
+                                             size_t out_width, size_t out_height,
+                                             const float *clips, const unsigned char *xtrans);
+
+void darkroom_highlights_inpaint_xtrans_cols(const float *in_buf, float *out_buf,
+                                             size_t in_width, size_t in_height,
+                                             size_t out_width, size_t out_height,
+                                             const float *clips, const unsigned char *xtrans);
+
+void darkroom_highlights_inpaint_bayer_rows(const float *in_buf, float *out_buf,
+                                            size_t width, size_t height,
+                                            const float *clips, unsigned int filters);
+
+void darkroom_highlights_inpaint_bayer_cols(const float *in_buf, float *out_buf,
+                                            size_t width, size_t height,
+                                            const float *clips, unsigned int filters);
+
 void darkroom_segbased_final_output(float *output, const float *tmpout,
                                     const float *luminance, const float *gradient,
                                     size_t out_width, size_t out_height, int out_x, int out_y,

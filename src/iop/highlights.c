@@ -321,7 +321,6 @@ static dt_hash_t img_opphash = ULLONG_MAX;
 #include "hlreconstruct/segbased.c"
 #include "hlreconstruct/opposed.c"
 #include "hlreconstruct/laplacian.c"
-#include "hlreconstruct/inpaint.c"
 #include "hlreconstruct/lch.c"
 
 void distort_mask(dt_iop_module_t *self,
@@ -884,35 +883,24 @@ void process(dt_iop_module_t *self,
       if(filters == 9u)
       {
         const uint8_t(*const xtrans)[6] = piece->xtrans;
-        DT_OMP_FOR()
-        for(int j = 0; j < roi_out->height; j++)
-        {
-          interpolate_color_xtrans(ivoid, ovoid, roi_in, roi_out, 0, 1, j, clips, xtrans, 0);
-          interpolate_color_xtrans(ivoid, ovoid, roi_in, roi_out, 0, -1, j, clips, xtrans, 1);
-        }
-        DT_OMP_FOR()
-        for(int i = 0; i < roi_out->width; i++)
-        {
-          interpolate_color_xtrans(ivoid, ovoid, roi_in, roi_out, 1, 1, i, clips, xtrans, 2);
-          interpolate_color_xtrans(ivoid, ovoid, roi_in, roi_out, 1, -1, i, clips, xtrans, 3);
-        }
+        darkroom_highlights_inpaint_xtrans_rows(ivoid, ovoid,
+                                                roi_in->width, roi_in->height,
+                                                roi_out->width, roi_out->height,
+                                                clips, (const unsigned char *)xtrans);
+        darkroom_highlights_inpaint_xtrans_cols(ivoid, ovoid,
+                                                roi_in->width, roi_in->height,
+                                                roi_out->width, roi_out->height,
+                                                clips, (const unsigned char *)xtrans);
       }
       else
       {
-        DT_OMP_FOR()
-        for(int j = 0; j < roi_out->height; j++)
-        {
-          interpolate_color(ivoid, ovoid, roi_out, 0, 1, j, clips, filters, 0);
-          interpolate_color(ivoid, ovoid, roi_out, 0, -1, j, clips, filters, 1);
-        }
-
-// up/down directions
-        DT_OMP_FOR()
-        for(int i = 0; i < roi_out->width; i++)
-        {
-          interpolate_color(ivoid, ovoid, roi_out, 1, 1, i, clips, filters, 2);
-          interpolate_color(ivoid, ovoid, roi_out, 1, -1, i, clips, filters, 3);
-        }
+        darkroom_highlights_inpaint_bayer_rows(ivoid, ovoid,
+                                               roi_out->width, roi_out->height,
+                                               clips, filters);
+        // up/down directions
+        darkroom_highlights_inpaint_bayer_cols(ivoid, ovoid,
+                                               roi_out->width, roi_out->height,
+                                               clips, filters);
       }
       break;
     }
