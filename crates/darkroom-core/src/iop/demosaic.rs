@@ -283,6 +283,59 @@ pub unsafe extern "C" fn darkroom_demosaic_green_eq_favg(
     }
 }
 
+/// Monochrome "demosaic": replicate the single raw channel into RGB and
+/// zero the alpha. Matches passthrough_monochrome() (passthrough.c:20).
+///
+/// # Safety
+/// `in_buf` holds `width * height` floats; `out` holds `width * height * 4`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_passthrough_monochrome(
+    out: *mut f32, in_buf: *const f32, width: usize, height: usize,
+) {
+    let inb = std::slice::from_raw_parts(in_buf, width * height);
+    let o = std::slice::from_raw_parts_mut(out, width * height * 4);
+    for (px, &v) in o.chunks_exact_mut(4).zip(inb.iter()) {
+        px[0] = v;
+        px[1] = v;
+        px[2] = v;
+        px[3] = 0.0;
+    }
+}
+
+/// Debug "demosaic": place each photosite's value in its CFA colour channel,
+/// zeroing the others. Matches passthrough_color() (passthrough.c:39).
+///
+/// # Safety
+/// `in_buf` holds `width * height` floats; `out` holds `width * height * 4`;
+/// `xtrans` must point to 36 valid bytes (copied unconditionally; only
+/// consulted by fcol when filters == 9).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_passthrough_color(
+    out: *mut f32, in_buf: *const f32, width: usize, height: usize,
+    filters: u32, xtrans: *const u8,
+) {
+    let inb = std::slice::from_raw_parts(in_buf, width * height);
+    let o = std::slice::from_raw_parts_mut(out, width * height * 4);
+    let xb = std::slice::from_raw_parts(xtrans, 36);
+    let mut xt = [[0_u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 { xt[r][c] = xb[r * 6 + c]; }
+    }
+
+    for row in 0..height {
+        for col in 0..width {
+            let val = inb[row * width + col];
+            let offset = 4 * (row * width + col);
+            let ch = raw::fcol(row as i32, col as i32, filters, &xt);
+            o[offset] = 0.0;
+            o[offset + 1] = 0.0;
+            o[offset + 2] = 0.0;
+            o[offset + 3] = 0.0;
+            o[offset + ch] = val;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +431,32 @@ mod tests {
         // G2 sites and non-green untouched
         assert_eq!(out[1 * w + 2], 0.6);
         assert_eq!(out[2 * w + 2], 0.1);
+    }
+
+    #[test]
+    fn passthrough_monochrome_replicates_channel() {
+        let inp = [0.1_f32, 0.2, 0.3, 0.4];
+        let mut out = vec![9.0_f32; 16];
+        unsafe {
+            darkroom_demosaic_passthrough_monochrome(out.as_mut_ptr(), inp.as_ptr(), 2, 2);
+        }
+        assert_eq!(&out[0..4], &[0.1, 0.1, 0.1, 0.0]);
+        assert_eq!(&out[12..16], &[0.4, 0.4, 0.4, 0.0]);
+    }
+
+    #[test]
+    fn passthrough_color_places_value_in_cfa_channel() {
+        let inp = [0.1_f32, 0.2, 0.3, 0.4]; // 2x2 RGGB: R G / G B
+        let mut out = vec![9.0_f32; 16];
+        let xt = [0_u8; 36];
+        unsafe {
+            darkroom_demosaic_passthrough_color(out.as_mut_ptr(), inp.as_ptr(), 2, 2,
+                                                RGGB, xt.as_ptr());
+        }
+        assert_eq!(&out[0..4], &[0.1, 0.0, 0.0, 0.0]); // R site
+        assert_eq!(&out[4..8], &[0.0, 0.2, 0.0, 0.0]); // G site
+        assert_eq!(&out[8..12], &[0.0, 0.3, 0.0, 0.0]); // G site
+        assert_eq!(&out[12..16], &[0.0, 0.0, 0.4, 0.0]); // B site
     }
 
     #[test]

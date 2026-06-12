@@ -2645,6 +2645,16 @@ void darkroom_demosaic_green_eq_favg(float *out, const float *in_buf,
                                      size_t width, size_t height,
                                      uint32_t filters);
 
+/* Passthrough "demosaics" (src/iop/demosaicing/passthrough.c): monochrome
+ * replicates the raw channel into RGB (alpha 0); color places each
+ * photosite in its CFA channel. out is width*height*4 floats. */
+void darkroom_demosaic_passthrough_monochrome(float *out, const float *in_buf,
+                                              size_t width, size_t height);
+
+void darkroom_demosaic_passthrough_color(float *out, const float *in_buf,
+                                         size_t width, size_t height,
+                                         uint32_t filters, const unsigned char *xtrans);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
