@@ -883,8 +883,21 @@ pub unsafe extern "C" fn darkroom_demosaic_vng_gradient_row(
 
 const CAPTURE_KERNEL_ALIGN: usize = 32; // capture.c:42
 const CAPTURE_YMIN: f32 = 0.001; // capture.c:45
+const CAPTURE_CFACLIP: f32 = 0.9; // capture.c:46
+const NORM_MIN: f32 = 1.52587890625e-05; // math.h:30 (2^-16)
 // gd->gauss_coeffs is (UCHAR_MAX+1) * CAPTURE_KERNEL_ALIGN floats (capture.c:1096)
 const CAPTURE_KERNELS_LEN: usize = 256 * CAPTURE_KERNEL_ALIGN;
+
+/// CLIP macro (math.h:73): clamp to [0,1], mapping NaN → 0 (not f32::clamp,
+/// which would propagate NaN). `(x>=0) ? (x<=1 ? x : 1) : 0`.
+#[inline(always)]
+fn cs_clip(x: f32) -> f32 {
+    if x >= 0.0 {
+        if x <= 1.0 { x } else { 1.0 }
+    } else {
+        0.0
+    }
+}
 
 /// Capture-sharpen separable-radius convolution value at pixel `i` (the
 /// shared inner of _blur_mul/_blur_div, capture.c:535). `kern` is the
@@ -1006,6 +1019,134 @@ pub unsafe extern "C" fn darkroom_capture_blur_div(
                 let val = capture_blur_val(inb, i, kern, small, bd, col, row, w1, height);
                 o[i] = lum[i] / val.max(CAPTURE_YMIN);
             }
+        }
+    }
+}
+
+/// Capture-sharpen blend-mask preparation (_prepare_blend, capture.c:552):
+/// per pixel write BT.709 luminance into `yold`, then zero `mask` (pre-filled
+/// to 1.0 by the caller) over the 21-px diamond around every clipped/dark
+/// interior pixel, and over the 2-px outer border. `cfa` is single-channel for
+/// Bayer/X-Trans (`filters != 0`) but RGBA for mono; `whites[color]` are the
+/// per-channel clip points. Overlapping mask writes are all 0 ⇒ serial == OMP.
+///
+/// # Safety
+/// `rgb` holds w1*height*4 floats; `mask`/`yold` w1*height; `cfa` w1*height
+/// (filters != 0) or *4 (mono); `whites` 4 floats; `xtrans` 36 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_prepare_blend(
+    cfa: *const f32, rgb: *const f32, filters: u32, xtrans: *const u8,
+    mask: *mut f32, yold: *mut f32, whites: *const f32, w1: i32, height: i32,
+) {
+    let (w, h) = (w1 as usize, height as usize);
+    let n = w * h;
+    let cfas = std::slice::from_raw_parts(cfa, if filters != 0 { n } else { 4 * n });
+    let rgbs = std::slice::from_raw_parts(rgb, 4 * n);
+    let wh = std::slice::from_raw_parts(whites, 4);
+    let m = std::slice::from_raw_parts_mut(mask, n);
+    let yo = std::slice::from_raw_parts_mut(yold, n);
+    let xb = std::slice::from_raw_parts(xtrans, 36);
+    let mut xt = [[0u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 { xt[r][c] = xb[r * 6 + c]; }
+    }
+    // Photometric/digital ITU BT.709 (flum[3] = 0, so dropped from the sum)
+    const FLUM: [f32; 3] = [0.212671, 0.715160, 0.072169];
+    let w2 = 2 * w;
+
+    for row in 0..h {
+        for col in 0..w {
+            let k = row * w + col;
+            let yv = FLUM[0] * rgbs[k * 4] + FLUM[1] * rgbs[k * 4 + 1] + FLUM[2] * rgbs[k * 4 + 2];
+            yo[k] = yv.max(0.0);
+            if row > 1 && col > 1 && row < h - 2 && col < w - 2 {
+                let color = raw::fcol(row as i32, col as i32, filters, &xt);
+                let heat = if filters != 0 {
+                    cfas[k] > wh[color]
+                } else {
+                    cfas[4 * k] > CAPTURE_CFACLIP
+                };
+                if heat || yo[k] < CAPTURE_YMIN {
+                    for off in [
+                        k - w2 - 1, k - w2, k - w2 + 1,
+                        k - w - 2, k - w - 1, k - w, k - w + 1, k - w + 2,
+                        k - 2, k - 1, k, k + 1, k + 2,
+                        k + w - 2, k + w - 1, k + w, k + w + 1, k + w + 2,
+                        k + w2 - 1, k + w2, k + w2 + 1,
+                    ] {
+                        m[off] = 0.0;
+                    }
+                }
+            } else {
+                m[k] = 0.0;
+            }
+        }
+    }
+}
+
+/// Capture-sharpen blend-mask modification (_modify_blend, capture.c:590):
+/// per pixel compute the coefficient of variation of `yold` over a 21-px
+/// neighbourhood (edge coords clamped to [2, dim-3]), map it through a sigmoid
+/// weight, scale `blend[k]` by it (CLIP to [0,1]) and copy `yold` into
+/// `luminance`.
+///
+/// # Safety
+/// `blend`/`yold`/`luminance` hold `width*height` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_modify_blend(
+    blend: *mut f32, yold: *const f32, luminance: *mut f32,
+    dthresh: f32, width: i32, height: i32,
+) {
+    let (w, _h) = (width as usize, height as usize);
+    let n = w * (height as usize);
+    let bl = std::slice::from_raw_parts_mut(blend, n);
+    let yo = std::slice::from_raw_parts(yold, n);
+    let lum = std::slice::from_raw_parts_mut(luminance, n);
+    // Degenerate ROI guard: the neighbourhood reaches ±2 rows/cols around the
+    // CLAMP(.,2,dim-3) centre, so it needs width,height >= 5. For smaller dims
+    // the C read (row-2)*width with row clamped to dim-3 < 2 — a latent OOB
+    // (size_t wrap); clamp it to a no-op (cf. green_eq_lavg). Also keeps
+    // i32 max/min below well-formed (min <= max).
+    if width < 5 || height < 5 {
+        return;
+    }
+    let threshold = 0.6 * (dthresh * dthresh);
+    let tscale = 200.0_f32;
+    let offset = -2.5 + tscale * threshold / 2.0;
+
+    for irow in 0..height {
+        // C CLAMP(irow, 2, height-3) via max-then-min (matches the macro and,
+        // with the guard above, min <= max always).
+        let row = irow.max(2).min(height - 3);
+        for icol in 0..width {
+            let col = icol.max(2).min(width - 3);
+            let k = (irow as usize) * w + icol as usize;
+            let mut sum = 0.0_f32;
+            let mut sum_sq = 0.0_f32;
+            for y in row - 1..row + 2 {
+                for x in col - 2..col + 3 {
+                    let v = yo[(y as usize) * w + x as usize];
+                    sum += v;
+                    sum_sq += v * v;
+                }
+            }
+            for x in col - 1..col + 2 {
+                let a = yo[((row - 2) as usize) * w + x as usize];
+                sum += a;
+                sum_sq += a * a;
+                let b = yo[((row + 2) as usize) * w + x as usize];
+                sum += b;
+                sum_sq += b * b;
+            }
+            // count is always 21
+            let sum_of_squares = (sum_sq - sum * sum / 21.0).max(0.0);
+            let std_deviation = (sum_of_squares / 21.0).sqrt();
+            let mean = (sum / 21.0).max(NORM_MIN);
+            let modified_coef_variation = std_deviation / mean.sqrt();
+            let t = (1.0 + modified_coef_variation).ln();
+            let weight = 1.0 / (1.0 + (offset - tscale * t).exp());
+            bl[k] = cs_clip(bl[k] * 1.01011 * (weight - 0.01));
+            lum[k] = yo[k];
         }
     }
 }
@@ -1503,6 +1644,84 @@ mod tests {
         for i in 0..n {
             assert!((out[i] - 3.0 * inb[i]).abs() < 1e-5, "large[{i}] = {} want {}", out[i], 3.0 * inb[i]);
         }
+    }
+
+    #[test]
+    fn capture_prepare_blend_luma_border_and_clip() {
+        let (w1, h) = (10i32, 10i32);
+        let n = (w1 * h) as usize;
+        // rgb = constant grey 0.5 ⇒ Yold = 0.5*(0.212671+0.715160+0.072169)
+        let mut rgb = vec![0.0_f32; n * 4];
+        for px in rgb.chunks_exact_mut(4) { px[0] = 0.5; px[1] = 0.5; px[2] = 0.5; }
+        let mut cfa = vec![0.5_f32; n]; // below whites ⇒ not clipped
+        let whites = [0.9_f32; 4];
+        let xt = [[0u8; 6]; 6];
+
+        // pass 1: no clipping ⇒ interior mask stays 1.0, 2-px border zeroed
+        let mut mask = vec![1.0_f32; n];
+        let mut yold = vec![0.0_f32; n];
+        unsafe {
+            darkroom_capture_prepare_blend(cfa.as_ptr(), rgb.as_ptr(), RGGB, xt.as_ptr() as *const u8,
+                mask.as_mut_ptr(), yold.as_mut_ptr(), whites.as_ptr(), w1, h);
+        }
+        let want_y = 0.5 * (0.212671 + 0.715160 + 0.072169);
+        assert!((yold[5 * 10 + 5] - want_y).abs() < 1e-6, "Yold = {}", yold[5 * 10 + 5]);
+        assert_eq!(mask[0], 0.0); // border
+        assert_eq!(mask[5 * 10 + 5], 1.0); // interior, unclipped
+
+        // pass 2: one clipped interior pixel zeros its 21-px diamond
+        cfa[5 * 10 + 5] = 0.95; // > whites
+        let mut mask2 = vec![1.0_f32; n];
+        let mut yold2 = vec![0.0_f32; n];
+        unsafe {
+            darkroom_capture_prepare_blend(cfa.as_ptr(), rgb.as_ptr(), RGGB, xt.as_ptr() as *const u8,
+                mask2.as_mut_ptr(), yold2.as_mut_ptr(), whites.as_ptr(), w1, h);
+        }
+        let k = 5 * 10 + 5;
+        let w = 10usize;
+        for off in [k - 2 * w, k - w - 1, k - w, k - w + 1, k - 1, k, k + 1, k + w, k + 2 * w] {
+            assert_eq!(mask2[off], 0.0, "clip neighbour {off} not zeroed");
+        }
+        assert_eq!(mask2[3 * 10 + 3], 1.0); // far interior pixel untouched
+    }
+
+    #[test]
+    fn capture_modify_blend_uniform_field() {
+        // uniform Yold ⇒ std deviation 0 ⇒ coefficient of variation 0 ⇒ a fixed
+        // sigmoid weight; verify blend scaling and luminance copy.
+        let (w1, h) = (8i32, 8i32);
+        let n = (w1 * h) as usize;
+        let v = 0.5_f32;
+        let yold = vec![v; n];
+        let mut blend = vec![1.0_f32; n];
+        let mut lum = vec![-1.0_f32; n];
+        let dthresh = 0.0_f32;
+        unsafe {
+            darkroom_capture_modify_blend(blend.as_mut_ptr(), yold.as_ptr(), lum.as_mut_ptr(), dthresh, w1, h);
+        }
+        let offset = -2.5_f32 + 200.0 * (0.6 * dthresh * dthresh) / 2.0;
+        let weight = 1.0 / (1.0 + (offset - 200.0 * (1.0_f32).ln()).exp());
+        let want_blend = cs_clip(1.0 * 1.01011 * (weight - 0.01));
+        for k in 0..n {
+            assert!((blend[k] - want_blend).abs() < 1e-6, "blend[{k}] = {} want {}", blend[k], want_blend);
+            assert_eq!(lum[k], v);
+        }
+    }
+
+    #[test]
+    fn capture_modify_blend_degenerate_roi_no_panic() {
+        // dims < 5 would clamp the neighbourhood centre below 2 and read a
+        // negative row (latent C OOB); the guard makes it a no-op, no panic.
+        let (w1, h) = (4i32, 4i32);
+        let n = (w1 * h) as usize;
+        let yold = vec![0.5_f32; n];
+        let mut blend = vec![0.7_f32; n];
+        let mut lum = vec![-1.0_f32; n];
+        unsafe {
+            darkroom_capture_modify_blend(blend.as_mut_ptr(), yold.as_ptr(), lum.as_mut_ptr(), 0.0, w1, h);
+        }
+        assert!(blend.iter().all(|&b| b == 0.7)); // untouched
+        assert!(lum.iter().all(|&l| l == -1.0));
     }
 
     #[test]

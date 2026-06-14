@@ -546,35 +546,8 @@ static void _prepare_blend(const float *cfa,
                            const int height)
 {
   dt_iop_image_fill(mask, 1.0f, w1, height, 1);
-  const int w2 = 2 * w1;
-  // Photometric/digital ITU BT.709
-  const dt_aligned_pixel_t flum = { 0.212671f, 0.715160f, 0.072169f, 0.0f };
-  DT_OMP_FOR(collapse(2))
-  for(size_t row = 0; row < height; row++)
-  {
-    for(size_t col = 0; col < w1; col++)
-    {
-      const size_t k = row * w1 + col;
-      dt_aligned_pixel_t yw;
-      for_each_channel(c) yw[c] = flum[c] * rgb[k*4+c];
-      Yold[k] = MAX(0.0f, yw[0] + yw[1] + yw[2]);
-      if(row > 1 && col > 1 && row < height-2 && col < w1-2)
-      {
-        const int color = fcol(row, col, filters, xtrans);
-        const gboolean heat = filters ? cfa[k] > whites[color] : cfa[4*k] > CAPTURE_CFACLIP;
-        if(heat || Yold[k] < CAPTURE_YMIN)
-        {
-          mask[k-w2-1] = mask[k-w2]   = mask[k-w2+1] =
-          mask[k-w1-2] = mask[k-w1-1] = mask[k-w1]   = mask[k-w1+1] = mask[k-w1+2] =
-          mask[k-2]    = mask[k-1]    = mask[k]      = mask[k+1]    = mask[k+2] =
-          mask[k+w1-2] = mask[k+w1-1] = mask[k+w1]   = mask[k+w1+1] = mask[k+w1+2] =
-          mask[k+w2-1] = mask[k+w2]   = mask[k+w2+1] = 0.0f;
-        }
-      }
-      else
-        mask[k] = 0.0f;
-    }
-  }
+  // BT.709 luminance into Yold + clip/dark blend mask -- Rust FFI
+  darkroom_capture_prepare_blend(cfa, rgb, filters, xtrans, mask, Yold, whites, w1, height);
 }
 
 static void _modify_blend(float *blend,
@@ -584,45 +557,8 @@ static void _modify_blend(float *blend,
                           const int width,
                           const int height)
 {
-  const float threshold = 0.6f * sqrf(dthresh);
-  const float tscale = 200.0f;
-  const float offset = -2.5f + tscale * threshold / 2.0f;
-  DT_OMP_FOR()
-  for(int irow = 0; irow < height; irow++)
-  {
-    const int row = CLAMP(irow, 2, height-3);
-    for(int icol = 0; icol < width; icol++)
-    {
-      const int col = CLAMP(icol, 2, width-3);
-      const size_t k = (size_t)irow * width + icol;
-      float sum = 0.0f;
-      float sum_sq = 0.0f;
-      for(int y = row-1; y < row+2; y++)
-      {
-        for(int x = col-2; x < col+3; x++)
-        {
-          sum += Yold[(size_t)y*width + x];
-          sum_sq += sqrf(Yold[(size_t)y*width + x]);
-        }
-      }
-      for(int x = col-1; x < col+2; x++)
-      {
-        sum += Yold[(size_t)(row-2)*width + x];
-        sum_sq += sqrf(Yold[(size_t)(row-2)*width + x]);
-        sum += Yold[(size_t)(row+2)*width + x];
-        sum_sq += sqrf(Yold[(size_t)(row+2)*width + x]);
-      }
-      // we don't have to count locations as it's always 21
-      const float sum_of_squares = MAX(0.0f, sum_sq - sqrf(sum) / 21.0f);
-      const float std_deviation = sqrtf(sum_of_squares / 21.0f);
-      const float mean = MAX(NORM_MIN, sum / 21.0f);
-      const float modified_coef_variation = std_deviation / sqrtf(mean);
-      const float t = logf(1.0f + modified_coef_variation);
-      const float weight = 1.0f / (1.0f + expf(offset - tscale * t));
-      blend[k] = CLIP(blend[k] * 1.01011f * (weight - 0.01f));
-      luminance[k] = Yold[k];
-    }
-  }
+  // local-variance blend modification + luminance copy -- Rust FFI
+  darkroom_capture_modify_blend(blend, Yold, luminance, dthresh, width, height);
 }
 
 static void _capture_radius(dt_iop_module_t *self,

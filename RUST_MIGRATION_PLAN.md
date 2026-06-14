@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **463** |
+| Unit tests passing | **466** |
 | IOP `.rs` files | 95 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+89` (capture.c — _blur_mul/_blur_div Gaussian convolutions) |
+| Last patch | `Phase 2z+90` (capture.c — _prepare_blend / _modify_blend) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -59,7 +59,7 @@ Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --inc
 
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
-| `demosaicing/` | 15 | capture.c 13, xtrans.c 2 — (basics, passthrough, dual, rcd-box3, ppg, vng all done; capture blur_mul/blur_div done) |
+| `demosaicing/` | 13 | capture.c 11, xtrans.c 2 — (basics, passthrough, dual, rcd-box3, ppg, vng done; capture blur + blend-prep/modify done) |
 | `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |

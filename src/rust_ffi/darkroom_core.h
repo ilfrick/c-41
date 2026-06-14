@@ -2727,6 +2727,20 @@ void darkroom_capture_blur_div(const float *in, float *out, const float *luminan
                                const unsigned char *table,
                                int w1, int height, unsigned char idx_small);
 
+/* Capture-sharpen blend-mask prep/modify (capture.c). prepare_blend: write
+ * BT.709 luminance into Yold and zero the (caller-prefilled) mask over
+ * clipped/dark interior pixels' 21-px diamond + the 2-px border. cfa is
+ * single-channel for Bayer/X-Trans, RGBA for mono; whites[color] are clip
+ * points. modify_blend: scale blend by a sigmoid of the local coefficient of
+ * variation of Yold and copy Yold into luminance. */
+void darkroom_capture_prepare_blend(const float *cfa, const float *rgb,
+                                    uint32_t filters, const unsigned char *xtrans,
+                                    float *mask, float *Yold, const float *whites,
+                                    int w1, int height);
+
+void darkroom_capture_modify_blend(float *blend, const float *Yold, float *luminance,
+                                   float dthresh, int width, int height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
