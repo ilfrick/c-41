@@ -2670,6 +2670,20 @@ void darkroom_demosaic_box3(float *out, const float *in_buf,
                             size_t width, size_t height,
                             uint32_t filters, const unsigned char *xtrans);
 
+/* PPG demosaic sweeps (src/iop/demosaicing/ppg.c). green: direction-
+ * selected green interpolation from the (possibly median-filtered)
+ * `input` plane; `in_orig` is the unfiltered raw the C cursor switches
+ * to after the margin+3 ring skip. redblue: in-place R/B interpolation
+ * on the RGBA buffer. margin >= 0; PPG passes a huge sentinel (ring
+ * skip disabled), RCD/LMMSE pass their border widths. */
+void darkroom_demosaic_ppg_green(float *out, const float *input,
+                                 const float *in_orig,
+                                 size_t width, size_t height,
+                                 uint32_t filters, int margin);
+
+void darkroom_demosaic_ppg_redblue(float *out, size_t width, size_t height,
+                                   uint32_t filters, int margin);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

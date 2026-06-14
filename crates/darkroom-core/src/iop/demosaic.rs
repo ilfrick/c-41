@@ -419,6 +419,187 @@ pub unsafe extern "C" fn darkroom_demosaic_box3(
     }
 }
 
+/// PPG green-channel interpolation sweep (first DT_OMP_FOR of
+/// demosaic_ppg, ppg.c:69): for rows/cols 3..-3 (optionally only a
+/// `margin`+3 ring), green at R/B sites is the direction-selected
+/// second-order guess clamped to the neighbour min/max. `input` is the
+/// (possibly pre-median-filtered) raw plane; like the C, the cursor
+/// switches to the *original* raw plane `in_orig` after the ring skip
+/// (a C quirk only reachable when median filtering and a finite margin
+/// combine — never with today's call sites). The C left the other two
+/// colour channels uninitialized here; they are zeroed instead (every
+/// pixel this loop touches has them recomputed by the red/blue sweep).
+///
+/// # Safety
+/// `input`/`in_orig` hold `width * height` floats; `out` holds
+/// `width * height * 4`; margin >= 0 (call sites pass >= 10).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_ppg_green(
+    out: *mut f32, input: *const f32, in_orig: *const f32,
+    width: usize, height: usize, filters: u32, margin: i32,
+) {
+    if width < 7 || height < 7 {
+        return; // C int bounds made the loop a no-op
+    }
+    let o = std::slice::from_raw_parts_mut(out, width * height * 4);
+    let med = std::slice::from_raw_parts(input, width * height);
+    let orig = std::slice::from_raw_parts(in_orig, width * height);
+    let (w, h) = (width as i32, height as i32);
+    let border = margin.saturating_add(3);
+
+    for j in 3..h - 3 {
+        let mut i = 3_i32;
+        let mut bufp = (4 * w * j + 4 * 3) as usize;
+        let mut inp = (w * j + 3) as usize;
+        let mut src = med;
+        // one-shot: for w < 2*border the C's ring skip jumped backwards and
+        // looped forever; real call sites always have w >= 2*border
+        let mut skipped = false;
+        while i < w {
+            if !skipped && i == border && j >= border && j < h - border {
+                skipped = true;
+                i = w - border;
+                bufp = (4 * w * j + 4 * i) as usize;
+                inp = (w * j + i) as usize;
+                src = orig;
+            }
+            if i == w {
+                break;
+            }
+
+            let c = raw::fc_bayer(j, i, filters);
+            let mut color = [0.0_f32; 4];
+            let pc = src[inp];
+            if c == 0 || c == 2 {
+                color[c] = pc;
+                // get stuff (hopefully from cache)
+                let pym = src[inp - width];
+                let pym2 = src[inp - 2 * width];
+                let pym3 = src[inp - 3 * width];
+                let pym_ = src[inp + width];
+                let pym2_ = src[inp + 2 * width];
+                let pym3_ = src[inp + 3 * width];
+                let pxm = src[inp - 1];
+                let pxm2 = src[inp - 2];
+                let pxm3 = src[inp - 3];
+                let pxm_ = src[inp + 1];
+                let pxm2_ = src[inp + 2];
+                let pxm3_ = src[inp + 3];
+
+                let guessx = (pxm + pc + pxm_) * 2.0 - pxm2_ - pxm2;
+                let diffx = ((pxm2 - pc).abs() + (pxm2_ - pc).abs() + (pxm - pxm_).abs()) * 3.0
+                    + ((pxm3_ - pxm_).abs() + (pxm3 - pxm).abs()) * 2.0;
+                let guessy = (pym + pc + pym_) * 2.0 - pym2_ - pym2;
+                let diffy = ((pym2 - pc).abs() + (pym2_ - pc).abs() + (pym - pym_).abs()) * 3.0
+                    + ((pym3_ - pym_).abs() + (pym3 - pym).abs()) * 2.0;
+                if diffx > diffy {
+                    // use guessy
+                    let m = pym.min(pym_);
+                    let mx = pym.max(pym_);
+                    color[1] = (guessy * 0.25).min(mx).max(m);
+                } else {
+                    let m = pxm.min(pxm_);
+                    let mx = pxm.max(pxm_);
+                    color[1] = (guessx * 0.25).min(mx).max(m);
+                }
+            } else {
+                color[1] = pc;
+            }
+            color[3] = 0.0;
+
+            for k in 0..4 {
+                o[bufp + k] = color[k].max(0.0);
+            }
+            bufp += 4;
+            inp += 1;
+            i += 1;
+        }
+    }
+}
+
+/// PPG red/blue interpolation sweep (second DT_OMP_FOR of demosaic_ppg,
+/// ppg.c:138), in-place on the RGBA buffer: green sites get R and B from
+/// the 4-neighbourhood, R sites get B (and vice versa) from the better
+/// diagonal pair. The outermost row/column only re-clamp to >= 0. The C
+/// OMP version raced on neighbouring rows' fresh R/B values (schedule-
+/// dependent); this serial port realizes the deterministic row-major
+/// schedule. An `i >= width` guard replaces the C's latent OOB when
+/// margin == 0 (no call site passes 0).
+///
+/// # Safety
+/// `out` holds `width * height * 4` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_ppg_redblue(
+    out: *mut f32, width: usize, height: usize, filters: u32, margin: i32,
+) {
+    let o = std::slice::from_raw_parts_mut(out, width * height * 4);
+    let (w, h) = (width as i32, height as i32);
+    let w4 = 4 * width;
+
+    for j in 0..h {
+        let mut i = 0_i32;
+        let mut bufp = (4 * w * j) as usize;
+        let mut skipped = false; // one-shot, see ppg_green
+        while i < w {
+            if !skipped && i == margin && j >= margin && j < h - margin {
+                skipped = true;
+                i = w - margin;
+                bufp = (4 * (w * j + i)) as usize;
+            }
+            if i >= w {
+                break;
+            }
+            let mut color = [o[bufp], o[bufp + 1], o[bufp + 2], o[bufp + 3]];
+
+            if j > 0 && i > 0 && i < w - 1 && j < h - 1 {
+                let c = raw::fc_bayer(j, i, filters);
+                if c & 1 != 0 {
+                    // green pixel: red and blue from the 4-neighbourhood
+                    let nt = bufp - w4;
+                    let nb = bufp + w4;
+                    let nl = bufp - 4;
+                    let nr = bufp + 4;
+                    if raw::fc_bayer(j, i + 1, filters) == 0 {
+                        // red neighbour in the same row
+                        color[2] = (o[nt + 2] + o[nb + 2] + 2.0 * color[1] - o[nt + 1] - o[nb + 1]) * 0.5;
+                        color[0] = (o[nl] + o[nr] + 2.0 * color[1] - o[nl + 1] - o[nr + 1]) * 0.5;
+                    } else {
+                        // blue neighbour
+                        color[0] = (o[nt] + o[nb] + 2.0 * color[1] - o[nt + 1] - o[nb + 1]) * 0.5;
+                        color[2] = (o[nl + 2] + o[nr + 2] + 2.0 * color[1] - o[nl + 1] - o[nr + 1]) * 0.5;
+                    }
+                } else {
+                    // diagonal star neighbourhood
+                    let ntl = bufp - 4 - w4;
+                    let ntr = bufp + 4 - w4;
+                    let nbl = bufp - 4 + w4;
+                    let nbr = bufp + 4 + w4;
+                    // src channel: blue for red pixels, red for blue pixels
+                    let s = if c == 0 { 2 } else { 0 };
+                    let diff1 =
+                        (o[ntl + s] - o[nbr + s]).abs() + (o[ntl + 1] - color[1]).abs() + (o[nbr + 1] - color[1]).abs();
+                    let guess1 = o[ntl + s] + o[nbr + s] + 2.0 * color[1] - o[ntl + 1] - o[nbr + 1];
+                    let diff2 =
+                        (o[ntr + s] - o[nbl + s]).abs() + (o[ntr + 1] - color[1]).abs() + (o[nbl + 1] - color[1]).abs();
+                    let guess2 = o[ntr + s] + o[nbl + s] + 2.0 * color[1] - o[ntr + 1] - o[nbl + 1];
+                    color[s] = if diff1 > diff2 {
+                        guess2 * 0.5
+                    } else if diff1 < diff2 {
+                        guess1 * 0.5
+                    } else {
+                        (guess1 + guess2) * 0.25
+                    };
+                }
+            }
+            for k in 0..4 {
+                o[bufp + k] = color[k].max(0.0);
+            }
+            bufp += 4;
+            i += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +774,50 @@ mod tests {
         assert!((out[1] - 0.3).abs() < 1e-7);
         assert!((out[2] - 0.8).abs() < 1e-7);
         assert_eq!(out[3], 0.0);
+    }
+
+    #[test]
+    fn ppg_uniform_field_demosaics_flat() {
+        // uniform raw: green guess = (g+pc+g)*2 - g - g clamped to [g,g] = g;
+        // red/blue interpolation likewise returns the channel value → every
+        // interior pixel ends up (v, v, v, 0)
+        let (w, h) = (12usize, 12usize);
+        let v = 0.5_f32;
+        let inp = vec![v; w * h];
+        let mut out = vec![0.0_f32; w * h * 4];
+        unsafe {
+            // sentinel margin like the PPG call site: ring skip disabled
+            darkroom_demosaic_ppg_green(out.as_mut_ptr(), inp.as_ptr(), inp.as_ptr(),
+                                        w, h, RGGB, 100000);
+            darkroom_demosaic_ppg_redblue(out.as_mut_ptr(), w, h, RGGB, 100000);
+        }
+        // interior of the green sweep ∩ interior of the r/b sweep
+        for j in 3..h - 3 {
+            for i in 3..w - 3 {
+                let p = 4 * (j * w + i);
+                for c in 0..3 {
+                    assert!((out[p + c] - v).abs() < 1e-6, "({j},{i}) c{c} = {}", out[p + c]);
+                }
+                assert_eq!(out[p + 3], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn ppg_green_clamps_to_neighbour_range() {
+        // spike a red site; its green estimate must stay within the
+        // min/max of the chosen direction's direct green neighbours
+        let (w, h) = (12usize, 12usize);
+        let mut inp = vec![0.5_f32; w * h];
+        inp[4 * w + 4] = 8.0; // red site in RGGB
+        let mut out = vec![0.0_f32; w * h * 4];
+        unsafe {
+            darkroom_demosaic_ppg_green(out.as_mut_ptr(), inp.as_ptr(), inp.as_ptr(),
+                                        w, h, RGGB, 100000);
+        }
+        let p = 4 * (4 * w + 4);
+        assert_eq!(out[p], 8.0); // red carried through
+        assert!((out[p + 1] - 0.5).abs() < 1e-6, "green={}", out[p + 1]); // clamped
     }
 
     #[test]

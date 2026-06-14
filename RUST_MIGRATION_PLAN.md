@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **452** |
+| Unit tests passing | **454** |
 | IOP `.rs` files | 95 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+84` (rcd.c demosaic_box3 — 3x3 box fallback demosaic) |
+| Last patch | `Phase 2z+85` (ppg.c — PPG green + red/blue interpolation sweeps) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -59,7 +59,7 @@ Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --inc
 
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
-| `demosaicing/` | 23 | capture.c 15, vng.c 4, xtrans/ppg 2 each — demosaic algorithms (basics, passthrough, dual, rcd-box3 done) |
+| `demosaicing/` | 21 | capture.c 15, vng.c 4, xtrans.c 2 — demosaic algorithms (basics, passthrough, dual, rcd-box3, ppg done) |
 | `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |
