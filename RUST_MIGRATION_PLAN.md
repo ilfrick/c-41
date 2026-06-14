@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **459** |
+| Unit tests passing | **461** |
 | IOP `.rs` files | 95 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+87` (vng.c — VNG finishing pass: green-mix + clipneg) |
+| Last patch | `Phase 2z+88` (vng.c — dcraw VNG gradient kernel; vng.c fully migrated) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -59,7 +59,7 @@ Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --inc
 
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
-| `demosaicing/` | 18 | capture.c 15, vng.c 1 (main gradient algo), xtrans.c 2 — (basics, passthrough, dual, rcd-box3, ppg, vng-lininterpolate, vng-finish done) |
+| `demosaicing/` | 17 | capture.c 15, xtrans.c 2 — (basics, passthrough, dual, rcd-box3, ppg, vng all done; vng.c fully migrated) |
 | `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |

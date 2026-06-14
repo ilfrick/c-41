@@ -2703,6 +2703,16 @@ void darkroom_demosaic_vng_lookup(float *out, const float *in,
  * four channels of every pixel are clipped to >= 0. npixels == width*height. */
 void darkroom_demosaic_vng_finish(float *out, size_t npixels, int mix_greens);
 
+/* VNG gradient interpolation, one image row (vng.c:201). Walks the C-built
+ * per-pixel `code_row` stream (selected by col%pcol), accumulates 8
+ * directional gradients, thresholds, averages qualifying neighbours, and
+ * writes the refined RGBA pixel into `brow2` (the ring-buffer row). Reads
+ * `out` read-only; `code_row` is code[row%prow] (pcol stream pointers). */
+void darkroom_demosaic_vng_gradient_row(const float *out, float *brow2,
+                                        size_t width, size_t height, int row,
+                                        uint32_t filters4, const unsigned char *xtrans,
+                                        int colors, const int *const *code_row, int pcol);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

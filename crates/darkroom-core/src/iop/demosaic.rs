@@ -766,6 +766,121 @@ pub unsafe extern "C" fn darkroom_demosaic_vng_finish(
     }
 }
 
+/// VNG gradient interpolation, one image row — the dcraw threshold-based
+/// variable-number-of-gradients kernel (the `DT_OMP_FOR(private(ip))` col
+/// loop of vng_interpolate, vng.c:201). For each interior column (2..w-2)
+/// it walks the C-built `code_row` stream (selected by col%pcol): a list of
+/// (offset1, offset2, weight, gradient-bits…, -1) terms terminated by
+/// INT_MAX, then 8 (neighbour-offset, chood-colour) pairs. It accumulates 8
+/// directional gradients, thresholds at gmin + gmax*0.5, averages the
+/// qualifying neighbours, and writes the refined RGBA pixel into `brow2`
+/// (the caller's ring-buffer row; the C defers the copy to `out` by two
+/// rows). Reads `out` read-only ⇒ columns are independent, so this serial
+/// sweep equals the original OMP schedule. All stream offsets are signed
+/// (they reach ±2 rows/cols), so index arithmetic is done in `isize`.
+///
+/// # Safety
+/// `out` holds width*height*4 floats; `brow2` holds width*4; `xtrans`
+/// points to 36 bytes; `code_row[0..pcol]` are valid streams built by the C
+/// precalc (INT_MAX-terminated term list + 8*2 chood ints).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_vng_gradient_row(
+    out: *const f32, brow2: *mut f32,
+    width: usize, height: usize, row: i32,
+    filters4: u32, xtrans: *const u8,
+    colors: i32, code_row: *const *const i32, pcol: i32,
+) {
+    let o = std::slice::from_raw_parts(out, width * height * 4);
+    let b2 = std::slice::from_raw_parts_mut(brow2, width * 4);
+    let xb = std::slice::from_raw_parts(xtrans, 36);
+    let mut xt = [[0u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 { xt[r][c] = xb[r * 6 + c]; }
+    }
+    let w = width as i32;
+    let pcolu = pcol as usize;
+
+    for col in 2..w - 2 {
+        let cs = *code_row.add((col as usize) % pcolu); // this pixel's stream
+        let pib = (4 * (row as usize * width + col as usize)) as isize;
+        let mut gval = [0.0_f32; 8];
+
+        // --- gradient accumulation: walk terms until INT_MAX ---
+        let mut p: isize = 0;
+        loop {
+            let g0 = *cs.offset(p);
+            if g0 == i32::MAX {
+                break;
+            }
+            let off2 = *cs.offset(p + 1);
+            let weight = *cs.offset(p + 2) as f32;
+            let diff = (o[(pib + g0 as isize) as usize] - o[(pib + off2 as isize) as usize]).abs()
+                * weight;
+            gval[*cs.offset(p + 3) as usize] += diff;
+            p += 5;
+            let gm1 = *cs.offset(p - 1);
+            if gm1 == -1 {
+                continue;
+            }
+            gval[gm1 as usize] += diff;
+            loop {
+                let gg = *cs.offset(p);
+                p += 1;
+                if gg == -1 {
+                    break;
+                }
+                gval[gg as usize] += diff;
+            }
+        }
+        p += 1; // skip INT_MAX → chood section
+
+        // --- choose a threshold ---
+        let mut gmin = gval[0];
+        let mut gmax = gval[0];
+        for g in 1..8 {
+            if gmin > gval[g] { gmin = gval[g]; }
+            if gmax < gval[g] { gmax = gval[g]; }
+        }
+        let bo = col as usize * 4;
+        if gmax == 0.0 {
+            b2[bo..bo + 4].copy_from_slice(&o[pib as usize..pib as usize + 4]);
+            continue;
+        }
+        let thold = gmin + gmax * 0.5;
+
+        // --- average the qualifying neighbours (chood section) ---
+        let mut sum = [0.0_f32; 4];
+        let color = raw::fcol(row, col, filters4, &xt);
+        let mut num = 0_i32;
+        for g in 0..8 {
+            let c0 = *cs.offset(p) as isize; // neighbour pixel offset
+            let c1 = *cs.offset(p + 1); // chood-colour value (0 = none)
+            p += 2;
+            if gval[g] <= thold {
+                for c in 0..colors as usize {
+                    if c == color && c1 != 0 {
+                        sum[c] += (o[(pib + c as isize) as usize]
+                            + o[(pib + c1 as isize) as usize])
+                            * 0.5;
+                    } else {
+                        sum[c] += o[(pib + c0 + c as isize) as usize];
+                    }
+                }
+                num += 1;
+            }
+        }
+
+        // --- write the refined pixel ---
+        for c in 0..colors as usize {
+            let mut tot = o[(pib + color as isize) as usize];
+            if c != color {
+                tot += (sum[c] - sum[color]) / num as f32;
+            }
+            b2[bo + c] = tot;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1249,66 @@ mod tests {
         assert_eq!(b[0], 0.0); // clipped
         assert_eq!(b[1], 0.2); // green untouched
         assert_eq!(b[3], 0.6); // ch3 untouched (no mix)
+    }
+
+    // One synthetic VNG code stream exercising the multi-gradient inner walk:
+    // a single term whose grad-bitmask covers all 8 gradients, then INT_MAX,
+    // then 8 chood pairs (g0..6 → self offset 0; g7 → offset +4). cs[0]=off1,
+    // cs[1]=off2 (the two pixels differenced into `diff`).
+    fn synthetic_vng_code() -> Vec<i32> {
+        let mut cs = vec![8, -8, 1, 0, 1, 2, 3, 4, 5, 6, 7, -1, i32::MAX];
+        for _ in 0..7 { cs.push(0); cs.push(0); } // g0..6: (self, none)
+        cs.push(4); cs.push(0); // g7: neighbour at +4, no chood colour
+        cs
+    }
+
+    #[test]
+    fn vng_gradient_uniform_field_copies_pixel() {
+        // uniform ⇒ every diff 0 ⇒ all gval 0 ⇒ gmax==0 ⇒ copy pix through
+        let (w, h) = (8usize, 8usize);
+        let v = 0.42_f32;
+        let out = vec![v; w * h * 4];
+        let mut brow2 = vec![-1.0_f32; w * 4];
+        let xt = [[0u8; 6]; 6];
+        let cs = synthetic_vng_code();
+        let code_row = [cs.as_ptr()];
+        unsafe {
+            darkroom_demosaic_vng_gradient_row(out.as_ptr(), brow2.as_mut_ptr(), w, h, 4,
+                RGGB, xt.as_ptr() as *const u8, 4, code_row.as_ptr(), 1);
+        }
+        for col in 2..w - 2 {
+            for c in 0..4 {
+                assert!((brow2[col * 4 + c] - v).abs() < 1e-6, "col {col} c{c} = {}", brow2[col * 4 + c]);
+            }
+        }
+    }
+
+    #[test]
+    fn vng_gradient_averages_qualifying_neighbours() {
+        // Hand-traced: term gives all 8 gradients gval=1.0 (diff=|1-0|*1), so
+        // gmin=gmax=1, thold=1.5, all qualify (num=8). chood: g0..6 add the
+        // pixel itself, g7 adds the +4 neighbour. color=0 at (4,4) for RGGB.
+        let (w, h) = (8usize, 8usize);
+        let mut out = vec![0.0_f32; w * h * 4];
+        let pib = 4 * (4 * w + 4); // 144
+        out[pib + 8] = 1.0; // off1=8 → diff numerator
+        out[pib - 8] = 0.0; // off2=-8
+        out[pib..pib + 4].copy_from_slice(&[0.2, 0.5, 0.1, 0.9]); // pix
+        out[pib + 4..pib + 8].copy_from_slice(&[0.6, 0.0, 0.8, 0.3]); // +4 neighbour
+        let mut brow2 = vec![0.0_f32; w * 4];
+        let xt = [[0u8; 6]; 6];
+        let cs = synthetic_vng_code();
+        let code_row = [cs.as_ptr()];
+        unsafe {
+            darkroom_demosaic_vng_gradient_row(out.as_ptr(), brow2.as_mut_ptr(), w, h, 4,
+                RGGB, xt.as_ptr() as *const u8, 4, code_row.as_ptr(), 1);
+        }
+        // sum[c] = 7*pix[c] + neighbour[c]; out[c]=pix[0]+(sum[c]-sum[0])/8 (c!=0)
+        let expect = [0.2_f32, 0.3875, 0.1375, 0.775];
+        let bo = 4 * 4;
+        for c in 0..4 {
+            assert!((brow2[bo + c] - expect[c]).abs() < 1e-6, "c{c} = {} want {}", brow2[bo + c], expect[c]);
+        }
     }
 
     #[test]

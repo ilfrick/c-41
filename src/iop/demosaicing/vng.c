@@ -198,58 +198,10 @@ static void vng_interpolate(float *out,
 
   for(int row = 2; row < height - 2; row++) /* Do VNG interpolation */
   {
-    DT_OMP_FOR(private(ip))
-    for(int col = 2; col < width - 2; col++)
-    {
-      int g;
-      float gval[8] = { 0.0f };
-      float *pix = out + 4 * (row * width + col);
-      ip = code[row % prow][col % pcol];
-      while((g = ip[0]) != INT_MAX) /* Calculate gradients */
-      {
-        float diff = fabsf(pix[g] - pix[ip[1]]) * ip[2];
-        gval[ip[3]] += diff;
-        ip += 5;
-        if((g = ip[-1]) == -1) continue;
-        gval[g] += diff;
-        while((g = *ip++) != -1)
-          gval[g] += diff;
-      }
-      ip++;
-      float gmin = gval[0], gmax = gval[0]; /* Choose a threshold */
-      for(g = 1; g < 8; g++)
-      {
-        if(gmin > gval[g]) gmin = gval[g];
-        if(gmax < gval[g]) gmax = gval[g];
-      }
-      if(gmax == 0)
-      {
-        memcpy(brow[2][col], pix, sizeof(*out) * 4);
-        continue;
-      }
-      const float thold = gmin + (gmax * 0.5f);
-      dt_aligned_pixel_t sum = { 0.0f };
-      const int color = fcol(row, col, filters4, xtrans);
-      int num = 0;
-      for(g = 0; g < 8; g++, ip += 2) /* Average the neighbors */
-      {
-        if(gval[g] <= thold)
-        {
-          for(int c = 0; c < colors; c++)
-            if(c == color && ip[1])
-              sum[c] += (pix[c] + pix[ip[1]]) * 0.5f;
-            else
-              sum[c] += pix[ip[0] + c];
-          num++;
-        }
-      }
-      for(int c = 0; c < colors; c++) /* Save to buffer */
-      {
-        float tot = pix[color];
-        if(c != color) tot += (sum[c] - sum[color]) / num;
-        brow[2][col][c] = tot;
-      }
-    }
+    // VNG gradient interpolation for this row (writes brow[2]) -- Rust FFI
+    darkroom_demosaic_vng_gradient_row(out, (float *)brow[2], width, height, row,
+                                       filters4, (const unsigned char *)xtrans, colors,
+                                       (const int *const *)code[row % prow], pcol);
     if(row > 3) /* Write buffer to image */
       dt_iop_image_copy(out + 4 * ((row - 2) * width + 2), (float *)(brow[0] + 2), (width - 4)*4);
 
