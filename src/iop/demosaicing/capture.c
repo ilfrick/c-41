@@ -515,75 +515,9 @@ static inline void _blur_mul(const float *const in,
                              const int w1,
                              const int height)
 {
-  const int w2 = 2 * w1;
-  const int w3 = 3 * w1;
-  const int w4 = 4 * w1;
   const uint8_t idx_small = _sigma_to_index(CAPTURE_SMALL);
-
-  DT_OMP_FOR()
-  for(int row = 0; row < height; row++)
-  {
-    for(int col = 0; col < w1; col++)
-    {
-      const size_t i = (size_t)row * w1 + col;
-      if(blend[i] > 0.0f)
-      {
-        const float *kern = kernels + CAPTURE_KERNEL_ALIGN * table[i];
-        const gboolean small = table[i] < idx_small;
-        const int bd = small ? 2 : 4;
-        float val = 0.0f;
-        if(col >= bd && row >= bd && col < w1 - bd && row < height - bd)
-        {
-          const float *d = in + i;
-          if(small)
-          {
-            val =
-              kern[ 5+2] * (d[-w2-1] + d[-w2+1] + d[-w1-2] + d[-w1+2] + d[w1-2] + d[w1+2] + d[w2-1] + d[w2+1]) +
-              kern[   2] * (d[-w2  ] + d[   -2] + d[    2] + d[ w2  ]) +
-              kern[ 5+1] * (d[-w1-1] + d[-w1+1] + d[ w1-1] + d[ w1+1]) +
-              kern[   1] * (d[-w1  ] + d[   -1] + d[    1] + d[ w1  ]) +
-              kern[   0] * (d[0]);
-          }
-          else
-          {
-            val =
-              kern[10+4] * (d[-w4-2] + d[-w4+2] + d[-w2-4] + d[-w2+4] + d[w2-4] + d[w2+4] + d[w4-2] + d[w4+2]) +
-              kern[5 +4] * (d[-w4-1] + d[-w4+1] + d[-w1-4] + d[-w1+4] + d[w1-4] + d[w1+4] + d[w4-1] + d[w4+1]) +
-              kern[4]    * (d[-w4  ] + d[   -4] + d[    4] + d[ w4  ]) +
-              kern[15+3] * (d[-w3-3] + d[-w3+3] + d[ w3-3] + d[ w3+3]) +
-              kern[10+3] * (d[-w3-2] + d[-w3+2] + d[-w2-3] + d[-w2+3] + d[w2-3] + d[w2+3] + d[w3-2] + d[w3+2]) +
-              kern[ 5+3] * (d[-w3-1] + d[-w3+1] + d[-w1-3] + d[-w1+3] + d[w1-3] + d[w1+3] + d[w3-1] + d[w3+1]) +
-              kern[   3] * (d[-w3  ] + d[   -3] + d[    3] + d[ w3  ]) +
-              kern[10+2] * (d[-w2-2] + d[-w2+2] + d[ w2-2] + d[ w2+2]) +
-              kern[ 5+2] * (d[-w2-1] + d[-w2+1] + d[-w1-2] + d[-w1+2] + d[w1-2] + d[w1+2] + d[w2-1] + d[w2+1]) +
-              kern[   2] * (d[-w2  ] + d[   -2] + d[    2] + d[ w2  ]) +
-              kern[ 5+1] * (d[-w1-1] + d[-w1+1] + d[ w1-1] + d[ w1+1]) +
-              kern[   1] * (d[-w1  ] + d[   -1] + d[    1] + d[ w1  ]) +
-              kern[   0] * (d[0]);
-            }
-        }
-        else
-        {
-          for(int ir = -bd; ir <= bd; ir++)
-          {
-            const int irow = row+ir;
-            if(irow >= 0 && irow < height)
-            {
-              for(int ic = -bd; ic <= bd; ic++)
-              {
-                const int icol = col+ic;
-                if(icol >=0 && icol < w1)
-                  val += kern[5 * ABS(ir) + ABS(ic)] * in[(size_t)irow * w1 + icol];
-              }
-            }
-          }
-        }
-        out[i] *= val;
-      }
-      // if blend value is too low we don't have to copy data as we also didn't in _blur_div
-      // and we just keep the original
-    }
-  }
+  // multiply-blur convolution -- Rust FFI
+  darkroom_capture_blur_mul(in, out, blend, kernels, table, w1, height, idx_small);
 }
 
 DT_OMP_DECLARE_SIMD(aligned(in, out, luminance, blend, kernels :64))
@@ -596,73 +530,9 @@ static inline void _blur_div(const float *const in,
                              const int w1,
                              const int height)
 {
-  const int w2 = 2 * w1;
-  const int w3 = 3 * w1;
-  const int w4 = 4 * w1;
   const uint8_t idx_small = _sigma_to_index(CAPTURE_SMALL);
-
-  DT_OMP_FOR()
-  for(int row = 0; row < height; row++)
-  {
-    for(int col = 0; col < w1; col++)
-    {
-      const size_t i = (size_t)row * w1 + col;
-      if(blend[i] > 0.0f)
-      {
-        const float *kern = kernels + CAPTURE_KERNEL_ALIGN * table[i];
-        const gboolean small = table[i] < idx_small;
-        const int bd = small ? 2 : 4;
-        float val = 0.0f;
-        if(col >= bd && row >= bd && col < w1 - bd && row < height - bd)
-        {
-          const float *d = in + i;
-          if(small)
-          {
-            val =
-              kern[ 5+2] * (d[-w2-1] + d[-w2+1] + d[-w1-2] + d[-w1+2] + d[w1-2] + d[w1+2] + d[w2-1] + d[w2+1]) +
-              kern[   2] * (d[-w2  ] + d[   -2] + d[    2] + d[ w2  ]) +
-              kern[ 5+1] * (d[-w1-1] + d[-w1+1] + d[ w1-1] + d[ w1+1]) +
-              kern[   1] * (d[-w1  ] + d[   -1] + d[    1] + d[ w1  ]) +
-              kern[   0] * (d[0]);
-          }
-          else
-          {
-            val =
-              kern[10+4] * (d[-w4-2] + d[-w4+2] + d[-w2-4] + d[-w2+4] + d[w2-4] + d[w2+4] + d[w4-2] + d[w4+2]) +
-              kern[5 +4] * (d[-w4-1] + d[-w4+1] + d[-w1-4] + d[-w1+4] + d[w1-4] + d[w1+4] + d[w4-1] + d[w4+1]) +
-              kern[4]    * (d[-w4  ] + d[   -4] + d[    4] + d[ w4  ]) +
-              kern[15+3] * (d[-w3-3] + d[-w3+3] + d[ w3-3] + d[ w3+3]) +
-              kern[10+3] * (d[-w3-2] + d[-w3+2] + d[-w2-3] + d[-w2+3] + d[w2-3] + d[w2+3] + d[w3-2] + d[w3+2]) +
-              kern[ 5+3] * (d[-w3-1] + d[-w3+1] + d[-w1-3] + d[-w1+3] + d[w1-3] + d[w1+3] + d[w3-1] + d[w3+1]) +
-              kern[   3] * (d[-w3  ] + d[   -3] + d[    3] + d[ w3  ]) +
-              kern[10+2] * (d[-w2-2] + d[-w2+2] + d[ w2-2] + d[ w2+2]) +
-              kern[ 5+2] * (d[-w2-1] + d[-w2+1] + d[-w1-2] + d[-w1+2] + d[w1-2] + d[w1+2] + d[w2-1] + d[w2+1]) +
-              kern[   2] * (d[-w2  ] + d[   -2] + d[    2] + d[ w2  ]) +
-              kern[ 5+1] * (d[-w1-1] + d[-w1+1] + d[ w1-1] + d[ w1+1]) +
-              kern[   1] * (d[-w1  ] + d[   -1] + d[    1] + d[ w1  ]) +
-              kern[   0] * (d[0]);
-            }
-        }
-        else
-        {
-          for(int ir = -bd; ir <= bd; ir++)
-          {
-            const int irow = row+ir;
-            if(irow >= 0 && irow < height)
-            {
-              for(int ic = -bd; ic <= bd; ic++)
-              {
-                const int icol = col+ic;
-                if(icol >=0 && icol < w1)
-                  val += kern[5 * ABS(ir) + ABS(ic)] * in[(size_t)irow * w1 + icol];
-              }
-            }
-          }
-        }
-        out[i] = luminance[i] / MAX(val, CAPTURE_YMIN);
-      }
-    }
-  }
+  // divide-blur convolution -- Rust FFI
+  darkroom_capture_blur_div(in, out, luminance, blend, kernels, table, w1, height, idx_small);
 }
 
 static void _prepare_blend(const float *cfa,

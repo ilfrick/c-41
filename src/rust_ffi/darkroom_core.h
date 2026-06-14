@@ -2713,6 +2713,20 @@ void darkroom_demosaic_vng_gradient_row(const float *out, float *brow2,
                                         uint32_t filters4, const unsigned char *xtrans,
                                         int colors, const int *const *code_row, int pcol);
 
+/* Capture-sharpen radius-selected Gaussian convolutions (capture.c). Where
+ * blend[i] > 0: mul scales out[i] *= conv(in); div sets
+ * out[i] = luminance[i] / max(conv(in), 0.001). `kernels` is the
+ * 256*32-float gauss_coeffs buffer; `table[i]` selects the per-pixel kernel;
+ * idx_small = _sigma_to_index(CAPTURE_SMALL) picks the 2- vs 4-pixel radius. */
+void darkroom_capture_blur_mul(const float *in, float *out, const float *blend,
+                               const float *kernels, const unsigned char *table,
+                               int w1, int height, unsigned char idx_small);
+
+void darkroom_capture_blur_div(const float *in, float *out, const float *luminance,
+                               const float *blend, const float *kernels,
+                               const unsigned char *table,
+                               int w1, int height, unsigned char idx_small);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

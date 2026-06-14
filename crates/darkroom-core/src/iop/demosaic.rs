@@ -881,6 +881,135 @@ pub unsafe extern "C" fn darkroom_demosaic_vng_gradient_row(
     }
 }
 
+const CAPTURE_KERNEL_ALIGN: usize = 32; // capture.c:42
+const CAPTURE_YMIN: f32 = 0.001; // capture.c:45
+// gd->gauss_coeffs is (UCHAR_MAX+1) * CAPTURE_KERNEL_ALIGN floats (capture.c:1096)
+const CAPTURE_KERNELS_LEN: usize = 256 * CAPTURE_KERNEL_ALIGN;
+
+/// Capture-sharpen separable-radius convolution value at pixel `i` (the
+/// shared inner of _blur_mul/_blur_div, capture.c:535). `kern` is the
+/// per-pixel kernel slice; the interior fast path reproduces the C's
+/// hand-unrolled symmetric sums verbatim (operand order preserved); the
+/// border path falls back to the general `kern[5*|ir|+|ic|]` gather.
+#[inline(always)]
+fn capture_blur_val(
+    inb: &[f32], i: usize, kern: &[f32], small: bool, bd: i32,
+    col: i32, row: i32, w1: i32, height: i32,
+) -> f32 {
+    let (w1i, w2, w3, w4) = (w1 as isize, 2 * w1 as isize, 3 * w1 as isize, 4 * w1 as isize);
+    if col >= bd && row >= bd && col < w1 - bd && row < height - bd {
+        let di = i as isize;
+        let g = |off: isize| inb[(di + off) as usize];
+        if small {
+            kern[5 + 2] * (g(-w2 - 1) + g(-w2 + 1) + g(-w1i - 2) + g(-w1i + 2) + g(w1i - 2) + g(w1i + 2) + g(w2 - 1) + g(w2 + 1))
+                + kern[2] * (g(-w2) + g(-2) + g(2) + g(w2))
+                + kern[5 + 1] * (g(-w1i - 1) + g(-w1i + 1) + g(w1i - 1) + g(w1i + 1))
+                + kern[1] * (g(-w1i) + g(-1) + g(1) + g(w1i))
+                + kern[0] * g(0)
+        } else {
+            kern[10 + 4] * (g(-w4 - 2) + g(-w4 + 2) + g(-w2 - 4) + g(-w2 + 4) + g(w2 - 4) + g(w2 + 4) + g(w4 - 2) + g(w4 + 2))
+                + kern[5 + 4] * (g(-w4 - 1) + g(-w4 + 1) + g(-w1i - 4) + g(-w1i + 4) + g(w1i - 4) + g(w1i + 4) + g(w4 - 1) + g(w4 + 1))
+                + kern[4] * (g(-w4) + g(-4) + g(4) + g(w4))
+                + kern[15 + 3] * (g(-w3 - 3) + g(-w3 + 3) + g(w3 - 3) + g(w3 + 3))
+                + kern[10 + 3] * (g(-w3 - 2) + g(-w3 + 2) + g(-w2 - 3) + g(-w2 + 3) + g(w2 - 3) + g(w2 + 3) + g(w3 - 2) + g(w3 + 2))
+                + kern[5 + 3] * (g(-w3 - 1) + g(-w3 + 1) + g(-w1i - 3) + g(-w1i + 3) + g(w1i - 3) + g(w1i + 3) + g(w3 - 1) + g(w3 + 1))
+                + kern[3] * (g(-w3) + g(-3) + g(3) + g(w3))
+                + kern[10 + 2] * (g(-w2 - 2) + g(-w2 + 2) + g(w2 - 2) + g(w2 + 2))
+                + kern[5 + 2] * (g(-w2 - 1) + g(-w2 + 1) + g(-w1i - 2) + g(-w1i + 2) + g(w1i - 2) + g(w1i + 2) + g(w2 - 1) + g(w2 + 1))
+                + kern[2] * (g(-w2) + g(-2) + g(2) + g(w2))
+                + kern[5 + 1] * (g(-w1i - 1) + g(-w1i + 1) + g(w1i - 1) + g(w1i + 1))
+                + kern[1] * (g(-w1i) + g(-1) + g(1) + g(w1i))
+                + kern[0] * g(0)
+        }
+    } else {
+        let mut val = 0.0_f32;
+        for ir in -bd..=bd {
+            let irow = row + ir;
+            if irow >= 0 && irow < height {
+                for ic in -bd..=bd {
+                    let icol = col + ic;
+                    if icol >= 0 && icol < w1 {
+                        val += kern[(5 * ir.abs() + ic.abs()) as usize]
+                            * inb[(irow as isize * w1 as isize + icol as isize) as usize];
+                    }
+                }
+            }
+        }
+        val
+    }
+}
+
+/// Capture-sharpen multiply-blur (_blur_mul, capture.c:523): where blend>0,
+/// multiply `out[i]` by the radius-selected Gaussian convolution of `in`.
+/// `idx_small` is _sigma_to_index(CAPTURE_SMALL) (passed from C); pixels with
+/// table[i] < idx_small use the 2-pixel kernel, others the 4-pixel one.
+///
+/// # Safety
+/// `in_buf`/`out`/`blend` hold `w1*height` floats; `table` `w1*height` bytes;
+/// `kernels` is the 256*32-float gauss_coeffs buffer.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_blur_mul(
+    in_buf: *const f32, out: *mut f32, blend: *const f32,
+    kernels: *const f32, table: *const u8,
+    w1: i32, height: i32, idx_small: u8,
+) {
+    let n = w1 as usize * height as usize;
+    let inb = std::slice::from_raw_parts(in_buf, n);
+    let o = std::slice::from_raw_parts_mut(out, n);
+    let bl = std::slice::from_raw_parts(blend, n);
+    let tab = std::slice::from_raw_parts(table, n);
+    let kerns = std::slice::from_raw_parts(kernels, CAPTURE_KERNELS_LEN);
+
+    for row in 0..height {
+        for col in 0..w1 {
+            let i = (row as usize) * (w1 as usize) + col as usize;
+            if bl[i] > 0.0 {
+                let kb = CAPTURE_KERNEL_ALIGN * tab[i] as usize;
+                let kern = &kerns[kb..kb + CAPTURE_KERNEL_ALIGN];
+                let small = tab[i] < idx_small;
+                let bd = if small { 2 } else { 4 };
+                let val = capture_blur_val(inb, i, kern, small, bd, col, row, w1, height);
+                o[i] *= val;
+            }
+        }
+    }
+}
+
+/// Capture-sharpen divide-blur (_blur_div, capture.c:604): where blend>0,
+/// set `out[i] = luminance[i] / max(val, CAPTURE_YMIN)` with `val` the same
+/// radius-selected convolution as _blur_mul.
+///
+/// # Safety
+/// As _blur_mul, plus `luminance` holds `w1*height` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_blur_div(
+    in_buf: *const f32, out: *mut f32, luminance: *const f32, blend: *const f32,
+    kernels: *const f32, table: *const u8,
+    w1: i32, height: i32, idx_small: u8,
+) {
+    let n = w1 as usize * height as usize;
+    let inb = std::slice::from_raw_parts(in_buf, n);
+    let o = std::slice::from_raw_parts_mut(out, n);
+    let lum = std::slice::from_raw_parts(luminance, n);
+    let bl = std::slice::from_raw_parts(blend, n);
+    let tab = std::slice::from_raw_parts(table, n);
+    let kerns = std::slice::from_raw_parts(kernels, CAPTURE_KERNELS_LEN);
+
+    for row in 0..height {
+        for col in 0..w1 {
+            let i = (row as usize) * (w1 as usize) + col as usize;
+            if bl[i] > 0.0 {
+                let kb = CAPTURE_KERNEL_ALIGN * tab[i] as usize;
+                let kern = &kerns[kb..kb + CAPTURE_KERNEL_ALIGN];
+                let small = tab[i] < idx_small;
+                let bd = if small { 2 } else { 4 };
+                let val = capture_blur_val(inb, i, kern, small, bd, col, row, w1, height);
+                o[i] = lum[i] / val.max(CAPTURE_YMIN);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1308,6 +1437,71 @@ mod tests {
         let bo = 4 * 4;
         for c in 0..4 {
             assert!((brow2[bo + c] - expect[c]).abs() < 1e-6, "c{c} = {} want {}", brow2[bo + c], expect[c]);
+        }
+    }
+
+    #[test]
+    fn capture_blur_mul_div_identity_kernel() {
+        // kernel with only the centre weight (kern[0]=1) ⇒ val == in[i] on
+        // both the interior fast path and the border gather path.
+        let (w1, h) = (8i32, 8i32);
+        let n = (w1 * h) as usize;
+        let inb: Vec<f32> = (0..n).map(|k| 0.1 * k as f32 + 0.5).collect();
+        let mut kernels = vec![0.0_f32; 256 * 32];
+        kernels[0] = 1.0;
+        let mut table = vec![0u8; n];
+        table[5] = 0; // stays < idx_small
+        let mut blend = vec![1.0_f32; n];
+        blend[10] = 0.0; // gated off → untouched
+
+        // _blur_mul: out *= val(=in)
+        let mut out_mul = vec![2.0_f32; n];
+        unsafe {
+            darkroom_capture_blur_mul(inb.as_ptr(), out_mul.as_mut_ptr(), blend.as_ptr(),
+                kernels.as_ptr(), table.as_ptr(), w1, h, 1);
+        }
+        for i in 0..n {
+            let want = if blend[i] > 0.0 { 2.0 * inb[i] } else { 2.0 };
+            assert!((out_mul[i] - want).abs() < 1e-5, "mul[{i}] = {} want {}", out_mul[i], want);
+        }
+
+        // _blur_div: out = lum / max(val(=in), YMIN)
+        let lum: Vec<f32> = (0..n).map(|k| 0.3 * k as f32).collect();
+        let mut out_div = vec![-1.0_f32; n];
+        unsafe {
+            darkroom_capture_blur_div(inb.as_ptr(), out_div.as_mut_ptr(), lum.as_ptr(), blend.as_ptr(),
+                kernels.as_ptr(), table.as_ptr(), w1, h, 1);
+        }
+        for i in 0..n {
+            if blend[i] > 0.0 {
+                let want = lum[i] / inb[i].max(0.001);
+                assert!((out_div[i] - want).abs() < 1e-5, "div[{i}] = {} want {}", out_div[i], want);
+            } else {
+                assert_eq!(out_div[i], -1.0); // untouched
+            }
+        }
+    }
+
+    #[test]
+    fn capture_blur_large_radius_branch() {
+        // Force the bd=4 large-radius path (table[i]=200 >= idx_small=1) and
+        // verify the identity kernel still yields val==in[i] through both the
+        // interior fast path and the wider border gather (needs >=10px to have
+        // interior pixels with bd=4).
+        let (w1, h) = (12i32, 12i32);
+        let n = (w1 * h) as usize;
+        let inb: Vec<f32> = (0..n).map(|k| 0.05 * k as f32 + 0.3).collect();
+        let mut kernels = vec![0.0_f32; 256 * 32];
+        kernels[200 * 32] = 1.0; // centre weight of kernel index 200
+        let table = vec![200u8; n];
+        let blend = vec![1.0_f32; n];
+        let mut out = vec![3.0_f32; n];
+        unsafe {
+            darkroom_capture_blur_mul(inb.as_ptr(), out.as_mut_ptr(), blend.as_ptr(),
+                kernels.as_ptr(), table.as_ptr(), w1, h, 1);
+        }
+        for i in 0..n {
+            assert!((out[i] - 3.0 * inb[i]).abs() < 1e-5, "large[{i}] = {} want {}", out[i], 3.0 * inb[i]);
         }
     }
 
