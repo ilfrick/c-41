@@ -262,16 +262,8 @@ static void vng_interpolate(float *out,
   dt_free_align(buffer);
 
 finish:
-  DT_OMP_FOR()
-  for(size_t i = 0; i < (size_t)width * height * 4; i+=4)
-  {
-    if(mix_greens)
-    {
-      out[i+1] = 0.5f * (out[i+1] + out[i+3]);
-      out[i+3] = 0.0f;
-    }
-    dt_vector_clipneg(&out[i]);
-  }
+  // mix separated greens (Bayer) + clip negatives -- Rust FFI
+  darkroom_demosaic_vng_finish(out, (size_t)width * height, mix_greens);
 }
 
 #ifdef HAVE_OPENCL

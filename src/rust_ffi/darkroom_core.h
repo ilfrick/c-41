@@ -2698,6 +2698,11 @@ void darkroom_demosaic_vng_lookup(float *out, const float *in,
                                   uint32_t filters, int border,
                                   const int *lookup);
 
+/* VNG output finishing pass (vng.c:265). mix_greens averages the two
+ * separated green channels into channel 1 and zeroes channel 3; then all
+ * four channels of every pixel are clipped to >= 0. npixels == width*height. */
+void darkroom_demosaic_vng_finish(float *out, size_t npixels, int mix_greens);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

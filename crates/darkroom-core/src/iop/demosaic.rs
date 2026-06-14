@@ -742,6 +742,30 @@ pub unsafe extern "C" fn darkroom_demosaic_vng_lookup(
     }
 }
 
+/// VNG output finishing pass (the `finish:` DT_OMP_FOR of vng_interpolate,
+/// vng.c:265): when `mix_greens` (Bayer with separated G1/G2), average the
+/// two green channels into channel 1 and zero channel 3; then clip all four
+/// channels of every pixel to >= 0 (dt_vector_clipneg). `npixels` is
+/// width*height (the count of RGBA pixels).
+///
+/// # Safety
+/// `out` holds `npixels * 4` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_vng_finish(
+    out: *mut f32, npixels: usize, mix_greens: i32,
+) {
+    let o = std::slice::from_raw_parts_mut(out, npixels * 4);
+    for px in o.chunks_exact_mut(4) {
+        if mix_greens != 0 {
+            px[1] = 0.5 * (px[1] + px[3]);
+            px[3] = 0.0;
+        }
+        for c in 0..4 {
+            px[c] = px[c].max(0.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,6 +1116,24 @@ mod tests {
         for c in 0..4 {
             assert!(out[p + c] >= 0.0, "channel {c} negative: {}", out[p + c]);
         }
+    }
+
+    #[test]
+    fn vng_finish_mixes_greens_and_clips() {
+        // pixel 0: greens 0.2 & 0.6 → 0.4 mix, ch3 zeroed; negative R clipped.
+        // pixel 1: same data but mix_greens off → greens untouched, only clip.
+        let mut a = vec![-0.5_f32, 0.2, 0.3, 0.6, -0.5, 0.2, 0.3, 0.6];
+        unsafe { darkroom_demosaic_vng_finish(a.as_mut_ptr(), 2, 1); }
+        assert_eq!(a[0], 0.0); // clipped
+        assert!((a[1] - 0.4).abs() < 1e-6, "green mix = {}", a[1]);
+        assert_eq!(a[3], 0.0); // G2 zeroed
+        assert!((a[5] - 0.4).abs() < 1e-6); // second pixel mixed too
+
+        let mut b = vec![-0.5_f32, 0.2, 0.3, 0.6];
+        unsafe { darkroom_demosaic_vng_finish(b.as_mut_ptr(), 1, 0); }
+        assert_eq!(b[0], 0.0); // clipped
+        assert_eq!(b[1], 0.2); // green untouched
+        assert_eq!(b[3], 0.6); // ch3 untouched (no mix)
     }
 
     #[test]
