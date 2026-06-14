@@ -445,6 +445,9 @@ pub unsafe extern "C" fn darkroom_demosaic_ppg_green(
     let med = std::slice::from_raw_parts(input, width * height);
     let orig = std::slice::from_raw_parts(in_orig, width * height);
     let (w, h) = (width as i32, height as i32);
+    // border == margin+3 >= 3 for any sane caller. Only margin == 0 makes the
+    // ring-skip land on column w-3 (the first column the `i < w-3` bound
+    // excludes), which would drop that one interpolation; no call site passes 0.
     let border = margin.saturating_add(3);
 
     for j in 3..h - 3 {
@@ -455,7 +458,9 @@ pub unsafe extern "C" fn darkroom_demosaic_ppg_green(
         // one-shot: for w < 2*border the C's ring skip jumped backwards and
         // looped forever; real call sites always have w >= 2*border
         let mut skipped = false;
-        while i < w {
+        // C bound is `i < width - 3`: the rightmost 3 columns are left to the
+        // border-interpolate pass, not touched by this green sweep.
+        while i < w - 3 {
             if !skipped && i == border && j >= border && j < h - border {
                 skipped = true;
                 i = w - border;
@@ -818,6 +823,31 @@ mod tests {
         let p = 4 * (4 * w + 4);
         assert_eq!(out[p], 8.0); // red carried through
         assert!((out[p + 1] - 0.5).abs() < 1e-6, "green={}", out[p + 1]); // clamped
+    }
+
+    #[test]
+    fn ppg_green_leaves_right_border_untouched() {
+        // C bound is `i < width - 3`: the rightmost 3 columns belong to the
+        // border-interpolate pass and must NOT be written by the green sweep.
+        // Use a non-uniform field so directional interp != any sentinel.
+        let (w, h) = (16usize, 16usize);
+        let inp: Vec<f32> = (0..w * h).map(|k| (k % 7) as f32 * 0.13).collect();
+        const SENTINEL: f32 = -999.0;
+        let mut out = vec![SENTINEL; w * h * 4];
+        unsafe {
+            darkroom_demosaic_ppg_green(out.as_mut_ptr(), inp.as_ptr(), inp.as_ptr(),
+                                        w, h, RGGB, 100000);
+        }
+        for j in 3..h - 3 {
+            for i in w - 3..w {
+                let p = 4 * (j * w + i);
+                assert_eq!(out[p + 1], SENTINEL,
+                           "right-border green ({j},{i}) was overwritten: {}", out[p + 1]);
+            }
+            // and the last interior column it *should* write is w-4
+            assert_ne!(out[4 * (j * w + (w - 4)) + 1], SENTINEL,
+                       "interior green ({j},{}) not written", w - 4);
+        }
     }
 
     #[test]
