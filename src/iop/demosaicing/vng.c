@@ -28,36 +28,8 @@ static void _vng_lininterpolate(float *out,
 {
   const gboolean is_xtrans = filters == 9;
   const int colors = is_xtrans ? 3 : 4;
-  // border interpolate
-  DT_OMP_FOR()
-  for(int row = 0; row < height; row++)
-    for(int col = 0; col < width; col++)
-    {
-      dt_aligned_pixel_t sum = { 0.0f };
-      uint8_t count[4] = { 0 };
-      if(col == 1 && row >= 1 && row < height - 1)
-        col = width - 1;
-      // average all the adjoining pixels inside image by color
-      for(int y = row - 1; y != row + 2; y++)
-        for(int x = col - 1; x != col + 2; x++)
-          if(y >= 0 && x >= 0 && y < height && x < width)
-          {
-            const int f = fcol(y, x, filters, xtrans);
-            sum[f] += fmaxf(0.0f, in[y * width + x]);
-            count[f]++;
-          }
-      const int f = fcol(row, col, filters, xtrans);
-      // for current cell, copy the current sensor's color data,
-      // interpolate the other two colors from surrounding pixels of
-      // their color
-      for(int c = 0; c < colors; c++)
-      {
-        if(c != f && count[c] != 0)
-          out[4 * (row * width + col) + c] = sum[c] / count[c];
-        else
-          out[4 * (row * width + col) + c] = fmaxf(0.0f, in[row * width + col]);
-      }
-    }
+  // border interpolate -- Rust FFI
+  darkroom_demosaic_vng_border(out, in, width, height, filters, (const unsigned char *)xtrans);
 
   // build interpolation lookup table which for a given offset in the sensor
   // lists neighboring pixels from which to interpolate:
@@ -102,34 +74,8 @@ static void _vng_lininterpolate(float *out,
       *ip = f;
     }
 
-  DT_OMP_FOR()
-  for(int row = 1; row < height - 1; row++)
-  {
-    float *buf = out + 4 * width * row + 4;
-    const float *buf_in = in + width * row + 1;
-    for(int col = 1; col < width - 1; col++)
-    {
-      if(col == border && row >= border && row < height - border)
-      {
-        col = width - border;
-        buf = out + (size_t)4 * width * row + 4 * col;
-        buf_in = in + (size_t)width * row + col;
-      }
-      if(col == width) break;
-      dt_aligned_pixel_t sum = { 0.0f };
-      int *ip = &(lookup[row % size][col % size][0]);
-      // for each adjoining pixel not of this pixel's color, sum up its weighted values
-      for(int i = *ip++; i--; ip += 3)
-        sum[ip[2]] += fmaxf(0.0f, buf_in[ip[0]]) * ip[1];
-      // for each interpolated color, load it into the pixel
-      for(int i = colors; --i; ip += 2)
-        buf[*ip] = sum[ip[0]] / ip[1];
-      buf[*ip] = *buf_in;
-      dt_vector_clipneg(buf);
-      buf += 4;
-      buf_in++;
-    }
-  }
+  // threshold-gradient interior interpolation (lookup-driven) -- Rust FFI
+  darkroom_demosaic_vng_lookup(out, in, width, height, filters, border, (const int *)lookup);
 
   free(lookup);
 }

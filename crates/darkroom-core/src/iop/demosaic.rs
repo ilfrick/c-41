@@ -605,6 +605,143 @@ pub unsafe extern "C" fn darkroom_demosaic_ppg_redblue(
     }
 }
 
+/// VNG border colour interpolation: the first DT_OMP_FOR of
+/// _vng_lininterpolate (vng.c:32). For the outer 1-pixel frame (and, for
+/// interior rows, only columns 0 and width-1 — the C `col == 1` jump) each
+/// output channel c is the mean of the clamped 3x3 neighbourhood's
+/// photosites of colour c, falling back to the clamped centre value when c
+/// is the site's own colour or has no contributor. `colors` is 4 for Bayer
+/// (FC can yield 0..3), 3 for X-Trans; the extra Bayer channel always takes
+/// the centre fallback (its count stays 0).
+///
+/// # Safety
+/// `in_buf` holds `width*height` floats; `out` holds `width*height*4`;
+/// `xtrans` points to 36 valid bytes (consulted when filters == 9).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_vng_border(
+    out: *mut f32, in_buf: *const f32, width: usize, height: usize,
+    filters: u32, xtrans: *const u8,
+) {
+    let inb = std::slice::from_raw_parts(in_buf, width * height);
+    let o = std::slice::from_raw_parts_mut(out, width * height * 4);
+    let xb = std::slice::from_raw_parts(xtrans, 36);
+    let mut xt = [[0_u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 { xt[r][c] = xb[r * 6 + c]; }
+    }
+    let (w, h) = (width as i32, height as i32);
+    let colors = if filters == 9 { 3 } else { 4 };
+
+    for row in 0..h {
+        let mut col = 0_i32;
+        while col < w {
+            // interior rows: skip the middle, do only the left/right edge
+            if col == 1 && row >= 1 && row < h - 1 {
+                col = w - 1;
+            }
+            let mut sum = [0.0_f32; 4];
+            let mut count = [0_u32; 4];
+            let mut y = row - 1;
+            while y != row + 2 {
+                let mut x = col - 1;
+                while x != col + 2 {
+                    if y >= 0 && x >= 0 && y < h && x < w {
+                        let f = raw::fcol(y, x, filters, &xt);
+                        sum[f] += inb[(y * w + x) as usize].max(0.0);
+                        count[f] += 1;
+                    }
+                    x += 1;
+                }
+                y += 1;
+            }
+            let f = raw::fcol(row, col, filters, &xt);
+            let centre = inb[(row * w + col) as usize].max(0.0);
+            let base = 4 * (row * w + col) as usize;
+            for c in 0..colors {
+                o[base + c] = if c != f && count[c] != 0 {
+                    sum[c] / count[c] as f32
+                } else {
+                    centre
+                };
+            }
+            col += 1;
+        }
+    }
+}
+
+/// VNG threshold-gradient interior interpolation: the second DT_OMP_FOR of
+/// _vng_lininterpolate (vng.c:105), driven by the C-built `lookup` table
+/// (flat int[16][16][32]; per [row%size][col%size]: [0]=np, then np
+/// (offset, weight, colour) triples, then (colours-1) (colour, weight_sum)
+/// pairs, then the centre colour). Each interior pixel sums weighted
+/// neighbours per colour, divides by the colour's total weight, copies the
+/// centre's own raw value into its channel, then clips all four channels to
+/// >= 0 (dt_vector_clipneg). `border` gates the optional ring skip — VNG
+/// passes 1000000 (disabled) for Bayer, pad_tile for X-Trans.
+///
+/// # Safety
+/// `in_buf` holds `width*height` floats; `out` holds `width*height*4`;
+/// `lookup` points to 16*16*32 valid i32.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_demosaic_vng_lookup(
+    out: *mut f32, in_buf: *const f32, width: usize, height: usize,
+    filters: u32, border: i32, lookup: *const i32,
+) {
+    if width < 3 || height < 3 {
+        return; // C: `row < height - 1` / `col < width - 1` empty
+    }
+    let inb = std::slice::from_raw_parts(in_buf, width * height);
+    let o = std::slice::from_raw_parts_mut(out, width * height * 4);
+    let lut = std::slice::from_raw_parts(lookup, 16 * 16 * 32);
+    let (w, h) = (width as i32, height as i32);
+    let colors = if filters == 9 { 3 } else { 4 };
+    let size = if filters == 9 { 6 } else { 16 };
+
+    for row in 1..h - 1 {
+        let mut col = 1_i32;
+        let mut skipped = false; // one-shot, see ppg_green
+        while col < w - 1 {
+            if !skipped && col == border && row >= border && row < h - border {
+                skipped = true;
+                col = w - border;
+            }
+            if col == w {
+                break; // C guard for border == 0 (no real call site)
+            }
+            let lbase = (((row % size) * 16 + (col % size)) as usize) * 32;
+            let np = lut[lbase] as usize;
+            let inp = (row * w + col) as isize;
+            let mut sum = [0.0_f32; 4];
+            let mut k = lbase + 1;
+            for _ in 0..np {
+                let offset = lut[k] as isize;
+                let weight = lut[k + 1] as f32;
+                let color = lut[k + 2] as usize;
+                sum[color] += inb[(inp + offset) as usize].max(0.0) * weight;
+                k += 3;
+            }
+            let base = 4 * (row * w + col) as usize;
+            // (colors-1) interpolated channels: buf[c] = sum[c] / weight_sum[c].
+            // The Bayer 4th channel (FC only yields 0..2) has weight_sum 0, so
+            // 0/0 = NaN here — squashed to 0 by the final clamp, exactly as the
+            // C does via dt_vector_clipneg (max picks the non-NaN operand).
+            for _ in 0..colors - 1 {
+                let c = lut[k] as usize;
+                let wsum = lut[k + 1] as f32;
+                o[base + c] = sum[c] / wsum;
+                k += 2;
+            }
+            // centre's own colour gets the raw value, then clip all 4 to >= 0
+            let f = lut[k] as usize;
+            o[base + f] = inb[inp as usize];
+            for c in 0..4 {
+                o[base + c] = o[base + c].max(0.0);
+            }
+            col += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +984,113 @@ mod tests {
             // and the last interior column it *should* write is w-4
             assert_ne!(out[4 * (j * w + (w - 4)) + 1], SENTINEL,
                        "interior green ({j},{}) not written", w - 4);
+        }
+    }
+
+    // Faithful re-creation of the C VNG lookup-table builder (vng.c:77-103),
+    // so the Rust consumer is validated against a C-equivalent table.
+    fn build_vng_lookup(width: i32, filters: u32, xt: &[[u8; 6]; 6]) -> Vec<i32> {
+        let colors = if filters == 9 { 3 } else { 4 };
+        let size = if filters == 9 { 6 } else { 16 };
+        let mut lut = vec![0_i32; 16 * 16 * 32];
+        for row in 0..size {
+            for col in 0..size {
+                let lb = ((row * 16 + col) as usize) * 32;
+                let f = raw::fcol(row, col, filters, xt);
+                let mut wsum = [0_i32; 4];
+                let mut k = lb + 1;
+                for y in -1..=1 {
+                    for x in -1..=1 {
+                        let weight = 1_i32 << (((y == 0) as i32) + ((x == 0) as i32));
+                        let color = raw::fcol(row + y, col + x, filters, xt);
+                        if color == f {
+                            continue;
+                        }
+                        lut[k] = width * y + x;
+                        lut[k + 1] = weight;
+                        lut[k + 2] = color as i32;
+                        wsum[color] += weight;
+                        k += 3;
+                    }
+                }
+                lut[lb] = ((k - lb) / 3) as i32;
+                for c in 0..colors {
+                    if c != f {
+                        lut[k] = c as i32;
+                        lut[k + 1] = wsum[c];
+                        k += 2;
+                    }
+                }
+                lut[k] = f as i32;
+            }
+        }
+        lut
+    }
+
+    #[test]
+    fn vng_border_uniform_field_is_flat() {
+        // uniform raw: every neighbour average and the centre fallback equal v,
+        // so each written channel (incl. the Bayer 4th, count==0 → centre) is v
+        let (w, h) = (10usize, 10usize);
+        let v = 0.375_f32;
+        let inp = vec![v; w * h];
+        let mut out = vec![-1.0_f32; w * h * 4];
+        let xt = [[0u8; 6]; 6];
+        unsafe {
+            darkroom_demosaic_vng_border(out.as_mut_ptr(), inp.as_ptr(), w, h, RGGB, xt.as_ptr() as *const u8);
+        }
+        // border frame + the single-pixel left/right edges of interior rows
+        for (j, i) in (0..h).flat_map(|j| (0..w).map(move |i| (j, i)))
+            .filter(|&(j, i)| j == 0 || j == h - 1 || i == 0 || i == w - 1)
+        {
+            let p = 4 * (j * w + i);
+            for c in 0..4 {
+                assert!((out[p + c] - v).abs() < 1e-6, "border ({j},{i}) c{c} = {}", out[p + c]);
+            }
+        }
+    }
+
+    #[test]
+    fn vng_lookup_uniform_field_is_flat() {
+        // sum[c] = v * weight_sum[c] ⇒ buf[c] = v; centre channel = v too
+        let (w, h) = (12usize, 12usize);
+        let v = 0.6_f32;
+        let inp = vec![v; w * h];
+        let mut out = vec![0.0_f32; w * h * 4];
+        let xt = [[0u8; 6]; 6];
+        let lut = build_vng_lookup(w as i32, RGGB, &xt);
+        unsafe {
+            // border = 1000000 like the Bayer VNG call site: ring skip disabled
+            darkroom_demosaic_vng_lookup(out.as_mut_ptr(), inp.as_ptr(), w, h, RGGB, 1000000, lut.as_ptr());
+        }
+        for j in 1..h - 1 {
+            for i in 1..w - 1 {
+                let p = 4 * (j * w + i);
+                for c in 0..3 {
+                    assert!((out[p + c] - v).abs() < 1e-6, "({j},{i}) c{c} = {}", out[p + c]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vng_lookup_negative_centre_clipped() {
+        // a single negative raw site: its own colour channel is the raw value
+        // pre-clip, so it must come out clamped to 0
+        let (w, h) = (12usize, 12usize);
+        let mut inp = vec![0.5_f32; w * h];
+        inp[5 * w + 5] = -3.0; // RGGB: (5,5) is blue
+        let mut out = vec![0.0_f32; w * h * 4];
+        let xt = [[0u8; 6]; 6];
+        let lut = build_vng_lookup(w as i32, RGGB, &xt);
+        unsafe {
+            darkroom_demosaic_vng_lookup(out.as_mut_ptr(), inp.as_ptr(), w, h, RGGB, 1000000, lut.as_ptr());
+        }
+        let f = raw::fc_bayer(5, 5, RGGB); // own-colour channel
+        let p = 4 * (5 * w + 5);
+        assert_eq!(out[p + f], 0.0, "centre own-colour not clipped: {}", out[p + f]);
+        for c in 0..4 {
+            assert!(out[p + c] >= 0.0, "channel {c} negative: {}", out[p + c]);
         }
     }
 

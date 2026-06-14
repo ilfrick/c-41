@@ -2684,6 +2684,20 @@ void darkroom_demosaic_ppg_green(float *out, const float *input,
 void darkroom_demosaic_ppg_redblue(float *out, size_t width, size_t height,
                                    uint32_t filters, int margin);
 
+/* VNG linear interpolation sweeps (src/iop/demosaicing/vng.c,
+ * _vng_lininterpolate). border: 1-pixel-frame colour averaging into the
+ * RGBA buffer. lookup: threshold-gradient interior interpolation driven by
+ * the C-built table (flat int[16][16][32]); `border` gates the ring skip
+ * (VNG passes 1000000 for Bayer, pad_tile for X-Trans). */
+void darkroom_demosaic_vng_border(float *out, const float *in,
+                                  size_t width, size_t height,
+                                  uint32_t filters, const unsigned char *xtrans);
+
+void darkroom_demosaic_vng_lookup(float *out, const float *in,
+                                  size_t width, size_t height,
+                                  uint32_t filters, int border,
+                                  const int *lookup);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
