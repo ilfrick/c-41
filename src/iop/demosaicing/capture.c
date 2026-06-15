@@ -136,62 +136,7 @@ static float _calcRadiusBayer(const float *in,
                               const uint32_t filters)
 {
   const unsigned int fc[2] = {FC(0, 0, filters), FC(1, 0, filters)};
-  float maxRatio = 1.0f;
-  DT_OMP_FOR(reduction(max: maxRatio))
-  for(int row = 4; row < height - 4; ++row)
-  {
-    for(int col = 5 + (fc[row & 1] & 1); col < width - 4; col += 2)
-    {
-      const float *cfa = in + row*width + col;
-      const float val00 = cfa[0];
-      if(val00 > RAWEPS)
-      {
-        const float val1m1 = cfa[width-1];
-        const float val1p1 = cfa[width+1];
-        const float maxVal0 = MAX(val00, val1m1);
-        if(val1m1 > RAWEPS && maxVal0 > lowerLimit)
-        {
-          const float minVal = MIN(val00, val1m1);
-          if(maxVal0 > maxRatio * minVal)
-          {
-            gboolean clipped = FALSE;
-            if(maxVal0 == val00)
-            { // check for influence by clipped green in neighborhood
-              if(MAX(MAX(cfa[-width-1], cfa[-width+1]), val1p1) >= upperLimit)
-                clipped = TRUE;
-            }
-            else
-            { // check for influence by clipped green in neighborhood
-              if(MAX(MAX(MAX(cfa[-2], val00), cfa[2*width-2]), cfa[2*width]) >= upperLimit)
-                clipped = TRUE;
-            }
-            if(!clipped)
-              maxRatio = maxVal0 / minVal;
-          }
-        }
-
-        const float maxVal1 = MAX(val00, val1p1);
-        if(val1p1 > RAWEPS && maxVal1 > lowerLimit)
-        {
-          const float minVal = MIN(val00, val1p1);
-          if(maxVal1 > maxRatio * minVal)
-          {
-            if(maxVal1 == val00)
-            { // check for influence by clipped green in neighborhood
-              if(MAX(MAX(cfa[-width-1], cfa[-width+1]), val1p1) >= upperLimit)
-                continue;
-            }
-            else
-            { // check for influence by clipped green in neighborhood
-              if(MAX(MAX(MAX(val00, cfa[2]), cfa[2*width]), cfa[2*width+2]) >= upperLimit)
-                continue;
-            }
-            maxRatio = maxVal1 / minVal;
-          }
-        }
-      }
-    }
-  }
+  const float maxRatio = darkroom_capture_radius_bayer(in, width, height, fc[0], fc[1]);
   return sqrtf(1.0f / logf(maxRatio));
 }
 
@@ -199,62 +144,7 @@ static float _calcRadiusMono(const float *in,
                              const int width,
                              const int height)
 {
-  float maxRatio = 1.0f;
-  DT_OMP_FOR(reduction(max: maxRatio))
-  for(int row = 4; row < height - 4; ++row)
-  {
-    for(int col = 5; col < width - 4; col += 2)
-    {
-      const float *cfa = in + row*width + col;
-      const float val00 = cfa[0];
-      if(val00 > RAWEPS)
-      {
-        const float val1m1 = cfa[width-1];
-        const float val1p1 = cfa[width+1];
-        const float maxVal0 = MAX(val00, val1m1);
-        if(val1m1 > RAWEPS && maxVal0 > lowerLimit)
-        {
-          const float minVal = MIN(val00, val1m1);
-          if(maxVal0 > maxRatio * minVal)
-          {
-            gboolean clipped = FALSE;
-            if(maxVal0 == val00)
-            {
-              if(MAX(MAX(cfa[-width-1], cfa[-width+1]), val1p1) >= upperLimit)
-                clipped = TRUE;
-            }
-            else
-            {
-              if(MAX(MAX(MAX(cfa[-2], val00), cfa[2*width-2]), cfa[2*width]) >= upperLimit)
-                clipped = TRUE;
-            }
-            if(!clipped)
-              maxRatio = maxVal0 / minVal;
-          }
-        }
-
-        const float maxVal1 = MAX(val00, val1p1);
-        if(val1p1 > RAWEPS && maxVal1 > lowerLimit)
-        {
-          const float minVal = MIN(val00, val1p1);
-          if(maxVal1 > maxRatio * minVal)
-          {
-            if(maxVal1 == val00)
-            { // check for influence by clipped green in neighborhood
-              if(MAX(MAX(cfa[-width-1], cfa[-width+1]), val1p1) >= upperLimit)
-                continue;
-            }
-            else
-            {
-              if(MAX(MAX(MAX(val00, cfa[2]), cfa[2*width]), cfa[2*width+2]) >= upperLimit)
-                continue;
-            }
-            maxRatio = maxVal1 / minVal;
-          }
-        }
-      }
-    }
-  }
+  const float maxRatio = darkroom_capture_radius_bayer(in, width, height, 0, 0);
   return sqrtf(1.0f / logf(maxRatio));
 }
 
@@ -286,106 +176,7 @@ static float _calcRadiusXtrans(const float *in,
     }
   }
 
-  float maxRatio = 1.0f;
-  DT_OMP_FOR(reduction(max: maxRatio))
-  for(int row = starty + 2; row < height - 4; row += 3)
-  {
-    for(int col = startx + 2; col < width - 4; col += 3)
-    {
-      const float *cfa = in + row*width + col;
-      const float valp1p1 = cfa[width+1];
-      const gboolean squareClipped = MAX(MAX(MAX(valp1p1, cfa[width+2]), cfa[2*width+1]), cfa[2*width+2]) >= upperLimit;
-      const float greenSolitary = cfa[0];
-      if(greenSolitary > RAWEPS && MAX(cfa[-width-1], cfa[-width+1]) < upperLimit)
-      {
-        if(greenSolitary < upperLimit)
-        {
-          const float valp1m1 = cfa[width-1];
-          if(valp1m1 > RAWEPS && MAX(MAX(MAX(cfa[width-2], valp1m1), cfa[2*width-2]), cfa[width-1]) < upperLimit)
-          {
-            const float maxVal = MAX(greenSolitary, valp1m1);
-            if(maxVal > lowerLimit)
-            {
-              const float minVal = MIN(greenSolitary, valp1m1);
-              if(maxVal > maxRatio * minVal)
-                maxRatio = maxVal / minVal;
-            }
-          }
-          if(valp1p1 > RAWEPS && !squareClipped)
-          {
-            const float maxVal = MAX(greenSolitary, valp1p1);
-            if(maxVal > lowerLimit)
-            {
-              const float minVal = MIN(greenSolitary, valp1p1);
-              if(maxVal > maxRatio * minVal)
-                maxRatio = maxVal / minVal;
-            }
-          }
-        }
-      }
-
-      if(!squareClipped)
-      {
-        const float valp2p2 = cfa[2*width+2];
-        if(valp2p2 > RAWEPS)
-        {
-          if(valp1p1 > RAWEPS)
-          {
-            const float maxVal = MAX(valp1p1, valp2p2);
-            if(maxVal > lowerLimit)
-            {
-              const float minVal = MIN(valp1p1, valp2p2);
-              if(maxVal > maxRatio * minVal)
-                 maxRatio = maxVal / minVal;
-            }
-          }
-          const float greenSolitaryRight = cfa[3*width+3];
-          if(MAX(MAX(greenSolitaryRight, cfa[4*width+2]), cfa[4*width+4]) < upperLimit)
-          {
-            if(greenSolitaryRight > RAWEPS)
-            {
-              const float maxVal = MAX(greenSolitaryRight, valp2p2);
-              if(maxVal > lowerLimit)
-              {
-                const float minVal = MIN(greenSolitaryRight, valp2p2);
-                if(maxVal > maxRatio * minVal)
-                  maxRatio = maxVal / minVal;
-              }
-            }
-          }
-        }
-        const float valp1p2 = cfa[width+2];
-        const float valp2p1 = cfa[2*width+1];
-        if(valp2p1 > RAWEPS)
-        {
-          if(valp1p2 > RAWEPS)
-          {
-            const float maxVal = MAX(valp1p2, valp2p1);
-            if(maxVal > lowerLimit)
-            {
-              const float minVal = MIN(valp1p2, valp2p1);
-              if(maxVal > maxRatio * minVal)
-                maxRatio = maxVal / minVal;
-            }
-          }
-          const float greenSolitaryLeft = cfa[3*width];
-          if(MAX(MAX(greenSolitaryLeft, cfa[4*width-1]), cfa[4*width+1]) < upperLimit)
-          {
-            if(greenSolitaryLeft > RAWEPS)
-            {
-              const float maxVal = MAX(greenSolitaryLeft, valp2p1);
-              if(maxVal > lowerLimit)
-              {
-                const float minVal = MIN(greenSolitaryLeft, valp2p1);
-                if(maxVal > maxRatio * minVal)
-                  maxRatio = maxVal / minVal;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  const float maxRatio = darkroom_capture_radius_xtrans(in, width, height, startx, starty);
   return sqrtf(1.0f / logf(maxRatio));
 }
 

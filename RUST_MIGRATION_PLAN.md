@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **469** |
+| Unit tests passing | **471** |
 | IOP `.rs` files | 95 (one per C IOP) |
 | Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+92` (capture.c — _cs_precalc_gauss_idx kernel-index map) |
+| Last patch | `Phase 2z+93` (capture.c — _calcRadius Bayer/Mono/Xtrans auto-radius scans) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -59,7 +59,7 @@ Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --inc
 
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
-| `demosaicing/` | 8 | capture.c 6, xtrans.c 2 — (vng done; capture blur + blend + sharpen-output + gauss-idx done; remaining: 3 radius calcs + 3 auto-radius collapse(2)) |
+| `demosaicing/` | 5 | capture.c 3, xtrans.c 2 — (vng done; capture all but _calc_auto_radius's 3 collapse(2) loops done; xtrans Markesteijn + 1 remain) |
 | `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |

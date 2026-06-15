@@ -885,6 +885,13 @@ const CAPTURE_KERNEL_ALIGN: usize = 32; // capture.c:42
 const CAPTURE_YMIN: f32 = 0.001; // capture.c:45
 const CAPTURE_CFACLIP: f32 = 0.9; // capture.c:46
 const NORM_MIN: f32 = 1.52587890625e-05; // math.h:30 (2^-16)
+const RAWEPS: f32 = 0.005; // capture.c:130
+const LOWER_LIMIT: f32 = 0.01; // capture.c:131
+const UPPER_LIMIT: f32 = 0.9; // capture.c:132
+// The radius scans use f32::max/min for the C MAX/MIN macros. These diverge on
+// NaN (f32 ignores NaN; the macro is order-dependent), but the inputs are
+// bounded photometric CFA values, never NaN by construction — accepted, as in
+// the VNG lookup port.
 // gd->gauss_coeffs is (UCHAR_MAX+1) * CAPTURE_KERNEL_ALIGN floats (capture.c:1096)
 const CAPTURE_KERNELS_LEN: usize = 256 * CAPTURE_KERNEL_ALIGN;
 
@@ -1269,6 +1276,162 @@ pub unsafe extern "C" fn darkroom_capture_precalc_gauss_idx(
             t[(row as usize) * w + col as usize] = cs_sigma_to_index(sigma);
         }
     }
+}
+
+/// _calcRadiusBayer / _calcRadiusMono (capture.c:133/198): scan the green
+/// lattice tracking the largest non-clipped green/green ratio. The C uses
+/// `reduction(max: maxRatio)`, whose result is max{qualifying non-clipped
+/// ratios} — order-independent, so this serial sweep matches. Returns the raw
+/// maxRatio (the C wraps it as sqrtf(1/logf(maxRatio))). Mono is this with
+/// fc0=fc1=0 (col start 5; the C bodies are identical).
+///
+/// # Safety
+/// `in_buf` holds `width*height` floats; width/height are the real dims.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_radius_bayer(
+    in_buf: *const f32, width: i32, height: i32, fc0: u32, fc1: u32,
+) -> f32 {
+    let w = width as usize;
+    let inb = std::slice::from_raw_parts(in_buf, w * height as usize);
+    let wi = width as isize;
+    let fc = [fc0, fc1];
+    let mut max_ratio = 1.0_f32;
+    for row in 4..height - 4 {
+        let mut col = 5 + (fc[(row & 1) as usize] & 1) as i32;
+        while col < width - 4 {
+            let base = (row as isize) * wi + col as isize;
+            let g = |off: isize| inb[(base + off) as usize];
+            let val00 = g(0);
+            if val00 > RAWEPS {
+                let val1m1 = g(wi - 1);
+                let val1p1 = g(wi + 1);
+                let max_val0 = val00.max(val1m1);
+                if val1m1 > RAWEPS && max_val0 > LOWER_LIMIT {
+                    let min_val = val00.min(val1m1);
+                    if max_val0 > max_ratio * min_val {
+                        let clipped = if max_val0 == val00 {
+                            g(-wi - 1).max(g(-wi + 1)).max(val1p1) >= UPPER_LIMIT
+                        } else {
+                            g(-2).max(val00).max(g(2 * wi - 2)).max(g(2 * wi)) >= UPPER_LIMIT
+                        };
+                        if !clipped {
+                            max_ratio = max_val0 / min_val;
+                        }
+                    }
+                }
+                let max_val1 = val00.max(val1p1);
+                if val1p1 > RAWEPS && max_val1 > LOWER_LIMIT {
+                    let min_val = val00.min(val1p1);
+                    if max_val1 > max_ratio * min_val {
+                        let clipped = if max_val1 == val00 {
+                            g(-wi - 1).max(g(-wi + 1)).max(val1p1) >= UPPER_LIMIT
+                        } else {
+                            val00.max(g(2)).max(g(2 * wi)).max(g(2 * wi + 2)) >= UPPER_LIMIT
+                        };
+                        if !clipped {
+                            max_ratio = max_val1 / min_val;
+                        }
+                    }
+                }
+            }
+            col += 2;
+        }
+    }
+    max_ratio
+}
+
+/// _calcRadiusXtrans (capture.c:261): the X-Trans analogue, scanning the green
+/// lattice from the caller-supplied start offset (the start search stays in C).
+/// Returns raw maxRatio; order-independent reduction ⇒ serial == OMP.
+///
+/// # Safety
+/// `in_buf` holds `width*height` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_radius_xtrans(
+    in_buf: *const f32, width: i32, height: i32, startx: i32, starty: i32,
+) -> f32 {
+    let w = width as usize;
+    let inb = std::slice::from_raw_parts(in_buf, w * height as usize);
+    let wi = width as isize;
+    let mut max_ratio = 1.0_f32;
+    // gated ratio update (max > lowerLimit, and exceeds the running max)
+    let upd = |a: f32, b: f32, mr: f32| -> Option<f32> {
+        let mv = a.max(b);
+        if mv > LOWER_LIMIT {
+            let mn = a.min(b);
+            if mv > mr * mn {
+                return Some(mv / mn);
+            }
+        }
+        None
+    };
+    let mut row = starty + 2;
+    while row < height - 4 {
+        let mut col = startx + 2;
+        while col < width - 4 {
+            let base = (row as isize) * wi + col as isize;
+            let g = |off: isize| inb[(base + off) as usize];
+            let valp1p1 = g(wi + 1);
+            let square_clipped =
+                valp1p1.max(g(wi + 2)).max(g(2 * wi + 1)).max(g(2 * wi + 2)) >= UPPER_LIMIT;
+            let green_solitary = g(0);
+            if green_solitary > RAWEPS && g(-wi - 1).max(g(-wi + 1)) < UPPER_LIMIT {
+                if green_solitary < UPPER_LIMIT {
+                    let valp1m1 = g(wi - 1);
+                    if valp1m1 > RAWEPS
+                        && g(wi - 2).max(valp1m1).max(g(2 * wi - 2)).max(g(wi - 1)) < UPPER_LIMIT
+                    {
+                        if let Some(r) = upd(green_solitary, valp1m1, max_ratio) {
+                            max_ratio = r;
+                        }
+                    }
+                    if valp1p1 > RAWEPS && !square_clipped {
+                        if let Some(r) = upd(green_solitary, valp1p1, max_ratio) {
+                            max_ratio = r;
+                        }
+                    }
+                }
+            }
+            if !square_clipped {
+                let valp2p2 = g(2 * wi + 2);
+                if valp2p2 > RAWEPS {
+                    if valp1p1 > RAWEPS {
+                        if let Some(r) = upd(valp1p1, valp2p2, max_ratio) {
+                            max_ratio = r;
+                        }
+                    }
+                    let green_solitary_right = g(3 * wi + 3);
+                    if green_solitary_right.max(g(4 * wi + 2)).max(g(4 * wi + 4)) < UPPER_LIMIT
+                        && green_solitary_right > RAWEPS
+                    {
+                        if let Some(r) = upd(green_solitary_right, valp2p2, max_ratio) {
+                            max_ratio = r;
+                        }
+                    }
+                }
+                let valp1p2 = g(wi + 2);
+                let valp2p1 = g(2 * wi + 1);
+                if valp2p1 > RAWEPS {
+                    if valp1p2 > RAWEPS {
+                        if let Some(r) = upd(valp1p2, valp2p1, max_ratio) {
+                            max_ratio = r;
+                        }
+                    }
+                    let green_solitary_left = g(3 * wi);
+                    if green_solitary_left.max(g(4 * wi - 1)).max(g(4 * wi + 1)) < UPPER_LIMIT
+                        && green_solitary_left > RAWEPS
+                    {
+                        if let Some(r) = upd(green_solitary_left, valp2p1, max_ratio) {
+                            max_ratio = r;
+                        }
+                    }
+                }
+            }
+            col += 3;
+        }
+        row += 3;
+    }
+    max_ratio
 }
 
 #[cfg(test)]
@@ -1903,6 +2066,33 @@ mod tests {
                 assert_eq!(table[(row * 4 + col) as usize], want, "({row},{col})");
             }
         }
+    }
+
+    #[test]
+    fn capture_radius_bayer_detects_max_ratio() {
+        let (w, h) = (16i32, 16i32);
+        let n = (w * h) as usize;
+        // uniform green level (>RAWEPS, <upperLimit): every ratio is 1.0, the
+        // gate `maxVal > maxRatio*minVal` never fires ⇒ maxRatio stays 1.0
+        let mut img = vec![0.1_f32; n];
+        let r0 = unsafe { darkroom_capture_radius_bayer(img.as_ptr(), w, h, 0, 0) };
+        assert!((r0 - 1.0).abs() < 1e-6, "uniform = {r0}");
+
+        // a single green pair at scanned centre (6,7) with ratio 3, all
+        // neighbours below upperLimit ⇒ unclipped ⇒ maxRatio = 3.0.
+        // (val00=(6,7)=0.3, val1m1=cfa[width-1]=(7,6)=0.1)
+        img[(6 * w + 7) as usize] = 0.3;
+        let r1 = unsafe { darkroom_capture_radius_bayer(img.as_ptr(), w, h, 0, 0) };
+        assert!((r1 - 3.0).abs() < 1e-6, "ratio = {r1}");
+    }
+
+    #[test]
+    fn capture_radius_xtrans_uniform_is_one() {
+        // uniform field ⇒ no qualifying ratio ⇒ maxRatio 1.0, no panic
+        let (w, h) = (32i32, 32i32);
+        let img = vec![0.1_f32; (w * h) as usize];
+        let r = unsafe { darkroom_capture_radius_xtrans(img.as_ptr(), w, h, 6, 6) };
+        assert!((r - 1.0).abs() < 1e-6, "xtrans uniform = {r}");
     }
 
     #[test]

@@ -2761,6 +2761,15 @@ void darkroom_capture_precalc_gauss_idx(unsigned char *table, int width, int hei
                                         int dx, int dy, int rwidth, int rheight,
                                         float mdim, float isigma, float boost, float centre);
 
+/* Capture-sharpen auto-radius green/green-ratio scans (capture.c). Return the
+ * raw maxRatio (largest non-clipped green/green ratio); the C wraps it as
+ * sqrtf(1/logf(maxRatio)). bayer covers Bayer (fc0/fc1 = FC(0,0)/FC(1,0)) and
+ * mono (fc0=fc1=0); xtrans scans from the caller's precomputed start offset. */
+float darkroom_capture_radius_bayer(const float *in, int width, int height,
+                                    uint32_t fc0, uint32_t fc1);
+float darkroom_capture_radius_xtrans(const float *in, int width, int height,
+                                     int startx, int starty);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
