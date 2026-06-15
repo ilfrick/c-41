@@ -25,8 +25,9 @@ const fn m(label: &'static str, default_on: bool) -> ModuleInfo {
 }
 
 /// The default module catalogue, in pipeline-ish presentation order.
-pub fn module_catalog() -> &'static [ModuleGroup] {
-    &[
+/// Defined as a `static` so the nested slices get `'static` lifetime (a
+/// function body does not promote these const-fn-built arrays).
+static CATALOG: &[ModuleGroup] = &[
         ModuleGroup {
             name: "Base",
             modules: &[
@@ -91,7 +92,10 @@ pub fn module_catalog() -> &'static [ModuleGroup] {
                 m("Watermark", false),
             ],
         },
-    ]
+];
+
+pub fn module_catalog() -> &'static [ModuleGroup] {
+    CATALOG
 }
 
 #[cfg(test)]
