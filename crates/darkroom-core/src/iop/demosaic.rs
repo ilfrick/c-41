@@ -1230,6 +1230,47 @@ pub unsafe extern "C" fn darkroom_capture_apply_sharpen(
     }
 }
 
+/// _sigma_to_index (capture.c:104): CLAMP((int)(sigma/CAPTURE_GAUSS_FRACTION),
+/// 0, 255). The `as i32` truncates toward zero like the C cast (sigma >= 0
+/// here), and saturating-cast + clamp bound extremes to 255.
+#[inline(always)]
+fn cs_sigma_to_index(sigma: f32) -> u8 {
+    const CAPTURE_GAUSS_FRACTION: f32 = 0.01; // capture.c:43
+    ((sigma / CAPTURE_GAUSS_FRACTION) as i32).clamp(0, 255) as u8
+}
+
+/// Capture-sharpen per-pixel kernel-index map (_cs_precalc_gauss_idx,
+/// capture.c:125): for each pixel compute a radial sigma that grows with
+/// distance from the optical centre (boosted) and shrinks toward image edges,
+/// then quantise it via _sigma_to_index. `cboost = 1 + 8*centre²` is derived
+/// here. (hypotf → f32::hypot; any sub-quantum difference is absorbed by the
+/// integer index.)
+///
+/// # Safety
+/// `table` holds `width*height` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_precalc_gauss_idx(
+    table: *mut u8, width: i32, height: i32, dx: i32, dy: i32,
+    rwidth: i32, rheight: i32, mdim: f32, isigma: f32, boost: f32, centre: f32,
+) {
+    let w = width as usize;
+    let t = std::slice::from_raw_parts_mut(table, w * height as usize);
+    let cboost = 1.0 + 8.0 * (centre * centre);
+    for row in 0..height {
+        let frow = (row + dy - rheight) as f32;
+        for col in 0..width {
+            let fcol = (col + dx - rwidth) as f32;
+            let sc = frow.hypot(fcol) / mdim;
+            let s = (sc - 0.5 - centre).max(0.0);
+            let corr = cboost * boost * (s * s);
+            // border taper: MIN(8, MIN(height-row-1, MIN(width-col-1, MIN(col,row))))
+            let edge = 8.min((height - row - 1).min((width - col - 1).min(col.min(row))));
+            let sigma = (isigma + corr) * 0.125 * edge as f32;
+            t[(row as usize) * w + col as usize] = cs_sigma_to_index(sigma);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1843,6 +1884,25 @@ mod tests {
         let mut out2 = vec![0.0_f32; 3 * 4];
         unsafe { darkroom_capture_show_sigma_mask(out2.as_mut_ptr(), gi.as_ptr(), 3); }
         for k in 0..3 { assert!((out2[k * 4 + 3] - gi[k] as f32 / 255.0).abs() < 1e-7); }
+    }
+
+    #[test]
+    fn capture_precalc_gauss_idx_edge_taper() {
+        // boost=0 ⇒ corr=0 ⇒ sigma = isigma*0.125*edge with
+        // edge=min(8,min(h-row-1,min(w-col-1,min(col,row)))). For 4x4,isigma=4:
+        // interior (rows/cols 1..3) edge=1 ⇒ sigma=0.5 ⇒ idx=50; border edge=0.
+        let (w, h) = (4i32, 4i32);
+        let mut table = vec![255u8; (w * h) as usize];
+        unsafe {
+            darkroom_capture_precalc_gauss_idx(table.as_mut_ptr(), w, h, 0, 0, 0, 0,
+                10.0, 4.0, 0.0, 0.0);
+        }
+        for row in 0..4 {
+            for col in 0..4 {
+                let want = if (1..=2).contains(&row) && (1..=2).contains(&col) { 50u8 } else { 0u8 };
+                assert_eq!(table[(row * 4 + col) as usize], want, "({row},{col})");
+            }
+        }
     }
 
     #[test]

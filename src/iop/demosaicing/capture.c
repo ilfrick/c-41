@@ -121,22 +121,9 @@ static unsigned char *_cs_precalc_gauss_idx(dt_iop_module_t *self,
   unsigned char *table = dt_alloc_aligned((size_t)height * width);
   if(!table) return NULL;
 
-  const float cboost = 1.0f + 8.0f * sqrf(centre);
-  DT_OMP_FOR()
-  for(int row = 0; row < height; row++)
-  {
-    const float frow = row + dy - rheight;
-    for(int col = 0; col < width; col++)
-    {
-      const float fcol = col + dx - rwidth;
-      const float sc = hypotf(frow, fcol) / mdim;
-      const float corr = cboost * boost * sqrf(MAX(0.0f, sc - 0.5f - centre));
-
-      // also special care for the image borders
-      const float sigma = (isigma + corr) * 0.125f * (float)MIN(8, MIN(height-row-1, MIN(width-col-1, MIN(col, row))));
-      table[row * width + col] = _sigma_to_index(sigma);
-    }
-  }
+  // radial per-pixel kernel-index map -- Rust FFI
+  darkroom_capture_precalc_gauss_idx(table, width, height, dx, dy, rwidth, rheight,
+                                     mdim, isigma, boost, centre);
   return table;
 }
 

@@ -2753,6 +2753,14 @@ void darkroom_capture_show_sigma_mask(float *out, const unsigned char *gauss_idx
 void darkroom_capture_apply_sharpen(float *out, const float *tmp1, const float *luminance,
                                     const float *blendmask, size_t pixels);
 
+/* Capture-sharpen per-pixel Gaussian kernel-index map (_cs_precalc_gauss_idx,
+ * capture.c:125): fill `table` (width*height bytes) with a radial sigma index
+ * that grows with distance from the optical centre and tapers at image edges.
+ * rwidth/rheight/mdim/dx/dy describe the centre & scale; cboost is derived. */
+void darkroom_capture_precalc_gauss_idx(unsigned char *table, int width, int height,
+                                        int dx, int dy, int rwidth, int rheight,
+                                        float mdim, float isigma, float boost, float centre);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
