@@ -108,11 +108,36 @@ no Rust→C callback plumbing needed.
 `darkroom-db` crate: full CRUD for tags, metadata, film, collection, image, history.
 C FFI trampolines for tags. 61 DB tests passing.
 
-### Phase 3 -- GTK4 UI shell bootstrapped
+### Phase 3 -- GTK4 UI (in progress)
 
-`crates/darkroom-ui` compiles against `gtk4 0.9` + `libadwaita 0.7`.
-`darkroom_ui::run()` boots an `adw::Application` with three-column
-lighttable layout backed by `darkroom-db`.
+`crates/darkroom-ui` (gtk4 0.9 + libadwaita 0.7). `darkroom_ui::run()` boots an
+`adw::Application`. **Done (ui-1..ui-11):**
+- **Lighttable** (functional): DB-backed `GridView` of thumbnails, collections
+  left panel, metadata right panel, name search/filter, star ratings, import &
+  export dialogs, `adw::ToastOverlay` notifications, Ctrl+I / Ctrl+E shortcuts.
+- **Navigation**: `adw::NavigationView` lighttable ⇄ darkroom (double-click).
+- **Darkroom view** (skeleton): image preview (gdk-pixbuf of the file — *not*
+  pipeline output yet), grouped IOP **module panel** sourced from a real module
+  catalog, Export.
+
+**This replaces (eventually):** `src/views/` (7: lighttable, darkroom, map,
+print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
+
+**Roadmap (next milestones):**
+1. *Module stack realism* — module catalog → per-module param widgets, enable
+   toggles wired to history/db, module groups & favourites (mirrors src/libs/
+   modulegroups + the IOP GUIs).
+2. *Live preview* — the load-bearing piece: a Rust pixelpipe driver that runs
+   the migrated `darkroom-core` IOPs and paints processed output into the
+   darkroom view (replaces the pixbuf placeholder). Depends on a Rust pixelpipe
+   orchestrator (currently C).
+3. *Darkroom interactions* — zoom/pan, histogram, color picker, before/after.
+4. *Remaining views/panels* — port src/libs panels (history stack, snapshots,
+   tagging, export) and the other views.
+5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
+
+The UI work is largely independent of the per-IOP loop ports and can proceed in
+parallel; milestone 2 is where the two streams converge.
 
 ---
 
@@ -120,7 +145,7 @@ lighttable layout backed by `darkroom-db`.
 
 ```
 +-------------------------------------------+
-|              GTK4 UI shell (Rust)         |  Phase 3  bootstrapped
+|              GTK4 UI shell (Rust)         |  Phase 3  in progress
 |  lighttable . darkroom . panels . dialogs |
 +-------------------------------------------+
 |           Core services (Rust)            |  Phase 2  complete

@@ -1,6 +1,6 @@
 //! GTK4 + libadwaita UI shell for Darkroom.
 //!
-//! Phase 3-ui-8: adw::ToastOverlay + star ratings in lighttable cells.
+//! Phase 3-ui-11: grouped IOP module catalogue in the darkroom module panel.
 
 use adw::prelude::*;
 use adw::Application;
@@ -8,6 +8,7 @@ use anyhow::Result;
 use gtk4::ApplicationWindow;
 use glib::clone;
 
+pub mod catalog;
 pub mod darkroom;
 pub mod dialogs;
 pub mod lighttable;

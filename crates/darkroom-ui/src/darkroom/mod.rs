@@ -1,8 +1,9 @@
 //! Darkroom editing view — single-image editing with IOP module stack.
 //!
-//! Phase 3-ui-4: skeleton view showing the image at full viewport scale
-//! with a right panel listing the active IOP modules (stubs). Navigation
-//! back to the lighttable is via the NavigationView pop action.
+//! Phase 3-ui-11: skeleton view showing the image at full viewport scale
+//! with a right panel listing the IOP modules grouped by darktable's module
+//! groups (from `crate::catalog`). Navigation back to the lighttable is via
+//! the NavigationView pop action.
 
 use adw::prelude::*;
 use glib::clone;
@@ -86,54 +87,47 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .build()
 }
 
-/// Stub module list panel (to be replaced with real IOP module stack).
-fn build_modules_panel() -> gtk4::Box {
+/// Module-stack panel: the darktable module groups (base/tone/color/correct/
+/// effect) from [`crate::catalog`], each an enable-toggle row. The toggles are
+/// not yet wired to the history stack (a later milestone).
+fn build_modules_panel() -> gtk4::Widget {
     let panel = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
-        .width_request(240)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
         .build();
 
     let header = gtk4::Label::builder()
         .label("Modules")
         .halign(gtk4::Align::Start)
-        .margin_top(12).margin_bottom(6)
-        .margin_start(12).margin_end(12)
         .build();
-    header.add_css_class("heading");
+    header.add_css_class("title-4");
     panel.append(&header);
-    panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-    // Placeholder list of common darktable IOPs
-    let modules = [
-        ("Exposure",         true),
-        ("Color calibration", true),
-        ("Filmic RGB",       true),
-        ("Color balance RGB", true),
-        ("Noise reduction",  false),
-        ("Lens correction",  true),
-        ("Crop",             false),
-    ];
-
-    let list_box = gtk4::ListBox::builder()
-        .selection_mode(gtk4::SelectionMode::None)
-        .build();
-    list_box.add_css_class("boxed-list");
-    list_box.set_margin_start(12);
-    list_box.set_margin_end(12);
-    list_box.set_margin_top(8);
-
-    for (name, enabled) in modules {
-        let row = adw::ActionRow::builder()
-            .title(name)
-            .build();
-        let toggle = gtk4::Switch::builder()
-            .active(enabled)
-            .valign(gtk4::Align::Center)
-            .build();
-        row.add_suffix(&toggle);
-        list_box.append(&row);
+    for group in crate::catalog::module_catalog() {
+        let pg = adw::PreferencesGroup::builder().title(group.name).build();
+        for mi in group.modules {
+            let row = adw::ActionRow::builder().title(mi.label).build();
+            let toggle = gtk4::Switch::builder()
+                .active(mi.default_on)
+                .valign(gtk4::Align::Center)
+                .build();
+            row.add_suffix(&toggle);
+            row.set_activatable_widget(Some(&toggle));
+            pg.add(&row);
+        }
+        panel.append(&pg);
     }
 
-    panel.append(&list_box);
-    panel
+    // Scrollable so the (long) module list never blows out the window height.
+    gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .width_request(280)
+        .child(&panel)
+        .build()
+        .upcast()
 }
