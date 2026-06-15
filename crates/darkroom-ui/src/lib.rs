@@ -1,6 +1,6 @@
 //! GTK4 + libadwaita UI shell for Darkroom.
 //!
-//! Phase 3-ui-11: grouped IOP module catalogue in the darkroom module panel.
+//! Phase 3-ui-12: live exposure preview in the darkroom view via darkroom-core.
 
 use adw::prelude::*;
 use adw::Application;
@@ -13,6 +13,7 @@ pub mod darkroom;
 pub mod dialogs;
 pub mod lighttable;
 pub mod panels;
+pub mod preview;
 
 pub const APP_ID:        &str = "org.darkroom.Darkroom";
 pub const DEFAULT_WIDTH:  i32 = 1280;

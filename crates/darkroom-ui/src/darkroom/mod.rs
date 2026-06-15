@@ -1,13 +1,44 @@
 //! Darkroom editing view — single-image editing with IOP module stack.
 //!
-//! Phase 3-ui-11: skeleton view showing the image at full viewport scale
+//! Phase 3-ui-12: darkroom view with a LIVE exposure (EV) slider that runs the
+//! migrated darkroom-core exposure IOP on the preview; image at full viewport scale
 //! with a right panel listing the IOP modules grouped by darktable's module
 //! groups (from `crate::catalog`). Navigation back to the lighttable is via
 //! the NavigationView pop action.
 
 use adw::prelude::*;
 use glib::clone;
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::dialogs;
+
+/// Decoded preview image kept for live re-processing.
+#[derive(Clone)]
+struct BaseImage {
+    bytes: Vec<u8>,
+    width: i32,
+    height: i32,
+    rowstride: usize,
+    nch: usize,
+}
+
+/// Paint `picture` with the base preview processed at exposure `ev`, running
+/// the migrated `darkroom-core` exposure IOP and uploading a gdk::MemoryTexture.
+fn render_preview(picture: &gtk4::Picture, base: &Rc<RefCell<Option<BaseImage>>>, ev: f32) {
+    if let Some(b) = base.borrow().as_ref() {
+        let processed = crate::preview::apply_exposure(
+            &b.bytes, b.width as usize, b.height as usize, b.rowstride, b.nch, ev,
+        );
+        let fmt = if b.nch == 4 {
+            gtk4::gdk::MemoryFormat::R8g8b8a8
+        } else {
+            gtk4::gdk::MemoryFormat::R8g8b8
+        };
+        let gbytes = glib::Bytes::from_owned(processed);
+        let tex = gtk4::gdk::MemoryTexture::new(b.width, b.height, fmt, &gbytes, b.rowstride);
+        picture.set_paintable(Some(&tex));
+    }
+}
 
 /// Build a NavigationPage for editing a single image at `file_path`.
 ///
@@ -27,31 +58,66 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .content_fit(gtk4::ContentFit::Contain)
         .build();
 
-    // Load the image asynchronously so the page appears immediately
+    // Shared decoded preview, kept for live re-processing by the EV slider.
+    let base: Rc<RefCell<Option<BaseImage>>> = Rc::new(RefCell::new(None));
+
+    // Load + decode the image asynchronously so the page appears immediately.
     let path_for_load = file_path.to_string();
-    glib::spawn_future_local(clone!(@weak picture => async move {
-        let bytes = gio::spawn_blocking(move || std::fs::read(&path_for_load).ok())
+    glib::spawn_future_local(clone!(@weak picture, @strong base => async move {
+        let data = gio::spawn_blocking(move || std::fs::read(&path_for_load).ok())
             .await
             .ok()
             .flatten();
-        if let Some(data) = bytes {
+        if let Some(data) = data {
             let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
             let _ = loader.write(&data);
             let _ = loader.close();
             if let Some(pb) = loader.pixbuf() {
-                picture.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&pb)));
+                *base.borrow_mut() = Some(BaseImage {
+                    bytes: pb.read_pixel_bytes().to_vec(),
+                    width: pb.width(),
+                    height: pb.height(),
+                    rowstride: pb.rowstride() as usize,
+                    nch: pb.n_channels() as usize,
+                });
+                render_preview(&picture, &base, 0.0);
             }
         }
     }));
 
-    // ── IOP module list (right panel stub) ─────────────────────────────────
+    // ── Exposure control (live, via darkroom-core) ─────────────────────────
+    let ev_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, -3.0, 3.0, 0.01);
+    ev_scale.set_value(0.0);
+    ev_scale.set_hexpand(true);
+    ev_scale.set_draw_value(true);
+    ev_scale.set_value_pos(gtk4::PositionType::Right);
+    ev_scale.connect_value_changed(clone!(@weak picture, @strong base => move |s| {
+        render_preview(&picture, &base, s.value() as f32);
+    }));
+    let ev_bar = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(8).margin_end(8).margin_top(4).margin_bottom(4)
+        .build();
+    ev_bar.append(&gtk4::Label::new(Some("Exposure (EV)")));
+    ev_bar.append(&ev_scale);
+
+    let image_area = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .hexpand(true)
+        .build();
+    image_area.append(&picture);
+    image_area.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    image_area.append(&ev_bar);
+
+    // ── IOP module list (right panel) ──────────────────────────────────────
     let modules_panel = build_modules_panel();
 
     // ── Split view: image | modules ────────────────────────────────────────
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
-    content.append(&picture);
+    content.append(&image_area);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     content.append(&modules_panel);
 
