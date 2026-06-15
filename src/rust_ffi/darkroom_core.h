@@ -2779,6 +2779,13 @@ void darkroom_capture_extract_centre_wb(float *input, const float *in,
                                         int dx, int dy, uint32_t filters,
                                         const unsigned char *xtrans, const float *coeff, int wbon);
 
+/* Frank Markesteijn's X-Trans demosaic (xtrans.c, xtrans_markesteijn_interpolate).
+ * Whole-function port: tiled 3-pass interpolation writing the RGBA `out` from
+ * the single-channel CFA `in`. passes is 1 or 3. The trailing
+ * _vng_lininterpolate edge pass stays in C. */
+void darkroom_xtrans_markesteijn(float *out, const float *in, int width, int height,
+                                 const unsigned char *xtrans, int passes, uint32_t filters);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

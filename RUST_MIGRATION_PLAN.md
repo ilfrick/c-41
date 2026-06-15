@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **472** |
+| Unit tests passing | **473** |
 | IOP `.rs` files | 95 (one per C IOP) |
-| Shared modules | `color`, `math`, `raw`, `geometry` |
-| Last patch | `Phase 2z+94` (capture.c — _calc_auto_radius centre extraction; capture.c fully migrated) |
+| Shared modules | `color`, `math`, `raw`, `geometry`, `markesteijn` |
+| Last patch | `Phase 2z+95` (xtrans.c — Markesteijn tiled demosaic, whole-function port) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -59,7 +59,7 @@ Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --inc
 
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
-| `demosaicing/` | 2 | xtrans.c 2 — basics/passthrough/dual/rcd/ppg/vng/capture ALL done; only the X-Trans Markesteijn tiled algo (xtrans.c:102) + 1 remain |
+| `demosaicing/` | 1 | xtrans.c 1 — only the FDC (frequency-domain-chroma, C99 `float complex`) Markesteijn variant remains; everything else (incl. the main Markesteijn tiled algo) done |
 | `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |
