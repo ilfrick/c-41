@@ -72,6 +72,8 @@ pub mod rawdenoise;
 pub mod rawoverexposed;
 pub mod demosaic;
 pub mod markesteijn;
+pub mod fdc_tables;
+pub mod fdc;
 pub mod colormapping;
 pub mod colorequal;
 pub mod toneequal;

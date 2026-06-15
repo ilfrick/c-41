@@ -2786,6 +2786,13 @@ void darkroom_capture_extract_centre_wb(float *input, const float *in,
 void darkroom_xtrans_markesteijn(float *out, const float *in, int width, int height,
                                  const unsigned char *xtrans, int passes, uint32_t filters);
 
+/* Frank Markesteijn's frequency-domain-chroma (FDC) X-Trans demosaic
+ * (xtrans.c, xtrans_fdc_interpolate). Single-pass tiled interpolation with
+ * frequency-domain chroma. hybrid0/hybrid1 are the C hybrid_fdc[2] (computed
+ * C-side from ISO vs the fdc_xover_iso config). Writes the RGBA `out`. */
+void darkroom_xtrans_fdc(float *out, const float *in, int width, int height,
+                         const unsigned char *xtrans, float hybrid0, float hybrid1);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

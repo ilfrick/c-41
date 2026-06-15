@@ -16,10 +16,10 @@ application runnable throughout.
 | Metric | Value |
 |---|---|
 | IOP Rust modules registered | **93 / 93** |
-| Unit tests passing | **473** |
+| Unit tests passing | **474** |
 | IOP `.rs` files | 95 (one per C IOP) |
-| Shared modules | `color`, `math`, `raw`, `geometry`, `markesteijn` |
-| Last patch | `Phase 2z+95` (xtrans.c — Markesteijn tiled demosaic, whole-function port) |
+| Shared modules | `color`, `math`, `raw`, `geometry`, `markesteijn`, `fdc` |
+| Last patch | `Phase 2z+96` (xtrans.c — FDC Markesteijn variant; **demosaicing/ fully migrated, 0 OMP loops**) |
 | CI status | `Rust` workflow green; `Fork CI` green |
 
 **All 93 `src/iop/*.c` files have a corresponding Rust module.**
@@ -53,13 +53,18 @@ Geometric distort loops fully migrated in `geometry.rs`:
 Commit-params LUT builders migrated:
 `colisa`, `lowpass`, `profile_gamma` (contrast/brightness LUT fills).
 
+The entire **`demosaicing/` cluster is fully migrated** (0 OMP loops): basics,
+passthrough, dual, rcd (box3), ppg, vng (all of `_vng_lininterpolate`, the
+dcraw gradient kernel, finishing pass), capture-sharpen (blur, blend,
+sharpen-output, gauss-idx, radius calcs, auto-radius), and both X-Trans
+Markesteijn variants (`markesteijn.rs`, `fdc.rs` + extracted `fdc_tables.rs`).
+
 #### Partially migrated (some loops remain, blocked on infrastructure)
 
 Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --include=*.c`):
 
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
-| `demosaicing/` | 1 | xtrans.c 1 — only the FDC (frequency-domain-chroma, C99 `float complex`) Markesteijn variant remains; everything else (incl. the main Markesteijn tiled algo) done |
 | `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |
