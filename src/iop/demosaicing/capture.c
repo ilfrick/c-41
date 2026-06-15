@@ -224,48 +224,9 @@ static float _calc_auto_radius(float *const in,
   if(!input)
     return 0.5f;
 
-  if(wbon)
-  {
-    if(filters == 9u)
-    {
-      DT_OMP_FOR(collapse(2))
-      for(int row = 0; row < oheight; row++)
-      {
-        for(int col = 0; col < owidth; col++)
-        {
-          const size_t ko = (size_t)row * owidth + col;
-          const size_t ki =  (size_t)(row + dy) * iwidth + col + dx;
-          input[ko] = in[ki] * coeff[FCNxtrans(row, col, xtrans)];
-        }
-      }
-    }
-    else
-    {
-      DT_OMP_FOR(collapse(2))
-      for(int row = 0; row < oheight; row++)
-      {
-        for(int col = 0; col < owidth; col++)
-        {
-          const size_t ko = (size_t)row * owidth + col;
-          const size_t ki =  (size_t)(row + dy) * iwidth + col + dx;
-          input[ko] = in[ki] * coeff[FC(row, col, filters)];
-        }
-      }
-    }
-  }
-  else // monochrome, only take one channel
-  {
-    DT_OMP_FOR(collapse(2))
-    for(int row = 0; row < oheight; row++)
-    {
-      for(int col = 0; col < owidth; col++)
-      {
-        const size_t ko = (size_t)row * owidth + col;
-        const size_t ki =  (size_t)4*((row + dy) * iwidth + col + dx);
-        input[ko] = in[ki];
-      }
-    }
-  }
+  // centre-60% extraction with white balance -- Rust FFI
+  darkroom_capture_extract_centre_wb(input, in, owidth, oheight, iwidth, iheight, dx, dy,
+                                     filters, (const unsigned char *)xtrans, coeff, wbon);
 
   const float radius =
               !filters  ? _calcRadiusMono(input, owidth, oheight)

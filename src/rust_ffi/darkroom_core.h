@@ -2770,6 +2770,15 @@ float darkroom_capture_radius_bayer(const float *in, int width, int height,
 float darkroom_capture_radius_xtrans(const float *in, int width, int height,
                                      int startx, int starty);
 
+/* Capture auto-radius centre-region extraction (_calc_auto_radius, capture.c):
+ * copy the centre-60% CFA into single-channel `input`, white-balancing by
+ * coeff[colour]. wbon X-Trans uses coeff[FCNxtrans], Bayer coeff[FC]; !wbon is
+ * the mono path reading channel 0 of a 4-channel `in`. coeff is 4 floats. */
+void darkroom_capture_extract_centre_wb(float *input, const float *in,
+                                        int owidth, int oheight, int iwidth, int iheight,
+                                        int dx, int dy, uint32_t filters,
+                                        const unsigned char *xtrans, const float *coeff, int wbon);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

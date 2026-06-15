@@ -1434,6 +1434,49 @@ pub unsafe extern "C" fn darkroom_capture_radius_xtrans(
     max_ratio
 }
 
+/// Capture auto-radius centre-region extraction (the three collapse(2) loops
+/// of _calc_auto_radius, capture.c:231/244/258): copy the centre-60% CFA into
+/// a single-channel `input`, white-balancing by `coeff[colour]`. Dispatch
+/// matches the C: `wbon` X-Trans scales by coeff[FCNxtrans], Bayer by coeff[FC];
+/// `!wbon` is the monochrome path reading channel 0 of a 4-channel `in`. Each
+/// output index is distinct ⇒ serial == OMP collapse(2).
+///
+/// # Safety
+/// `input` holds owidth*oheight floats; `in` holds iwidth*iheight floats
+/// (wbon) or *4 (mono); `coeff` 4 floats; `xtrans` 36 bytes (wbon X-Trans).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_extract_centre_wb(
+    input: *mut f32, in_buf: *const f32,
+    owidth: i32, oheight: i32, iwidth: i32, iheight: i32, dx: i32, dy: i32,
+    filters: u32, xtrans: *const u8, coeff: *const f32, wbon: i32,
+) {
+    let (ow, oh, iw) = (owidth as usize, oheight as usize, iwidth as usize);
+    let out = std::slice::from_raw_parts_mut(input, ow * oh);
+    let in_len = iw * iheight as usize * if wbon != 0 { 1 } else { 4 };
+    let inb = std::slice::from_raw_parts(in_buf, in_len);
+    let co = std::slice::from_raw_parts(coeff, 4);
+    let xb = std::slice::from_raw_parts(xtrans, 36);
+    let mut xt = [[0u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 { xt[r][c] = xb[r * 6 + c]; }
+    }
+    let (dxu, dyu) = (dx as usize, dy as usize);
+
+    for row in 0..oh {
+        for col in 0..ow {
+            let ko = row * ow + col;
+            let ki = (row + dyu) * iw + col + dxu;
+            out[ko] = if wbon == 0 {
+                inb[4 * ki] // monochrome: channel 0 of the RGBA buffer
+            } else if filters == 9 {
+                inb[ki] * co[raw::fc_xtrans(row as i32, col as i32, &xt)]
+            } else {
+                inb[ki] * co[raw::fc_bayer(row as i32, col as i32, filters)]
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2093,6 +2136,39 @@ mod tests {
         let img = vec![0.1_f32; (w * h) as usize];
         let r = unsafe { darkroom_capture_radius_xtrans(img.as_ptr(), w, h, 6, 6) };
         assert!((r - 1.0).abs() < 1e-6, "xtrans uniform = {r}");
+    }
+
+    #[test]
+    fn capture_extract_centre_wb_bayer_and_mono() {
+        let xt = [[0u8; 6]; 6];
+        // Bayer (wbon=1): input[ko] = in[ki] * coeff[FC]; dx=dy=0, owidth=iwidth
+        let coeff = [2.0_f32, 3.0, 4.0, 1.0];
+        let inb = vec![1.0_f32; 16];
+        let mut out = vec![0.0_f32; 16];
+        unsafe {
+            darkroom_capture_extract_centre_wb(out.as_mut_ptr(), inb.as_ptr(), 4, 4, 4, 4, 0, 0,
+                RGGB, xt.as_ptr() as *const u8, coeff.as_ptr(), 1);
+        }
+        // RGGB: (0,0)=R→coeff0, (0,1)=G→coeff1, (1,0)=G→coeff1, (1,1)=B→coeff2
+        assert_eq!(out[0], 2.0);
+        assert_eq!(out[1], 3.0);
+        assert_eq!(out[4], 3.0);
+        assert_eq!(out[5], 4.0);
+
+        // Mono (wbon=0): input[ko] = in[4*ki] (channel 0), with dx=dy=1 offset
+        let mono_in: Vec<f32> = (0..4 * 4 * 4).map(|k| k as f32 * 0.1).collect();
+        let mut mout = vec![0.0_f32; 4]; // owidth=oheight=2 from a 4x4 input
+        unsafe {
+            darkroom_capture_extract_centre_wb(mout.as_mut_ptr(), mono_in.as_ptr(), 2, 2, 4, 4, 1, 1,
+                0, xt.as_ptr() as *const u8, coeff.as_ptr(), 0);
+        }
+        // ko=(r,c): ki=(r+1)*4 + c+1; out = in[4*ki] = (4*ki)*0.1
+        for r in 0..2usize {
+            for c in 0..2usize {
+                let ki = (r + 1) * 4 + c + 1;
+                assert!((mout[r * 2 + c] - (4 * ki) as f32 * 0.1).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]
