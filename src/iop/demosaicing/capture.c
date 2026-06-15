@@ -721,22 +721,12 @@ static void _capture_sharpen(dt_iop_module_t *self,
 
   // after the blur, very tiny edges will not get enough strength of sharpening
   // use the maximum of (unblurred,blurred) values.
-  DT_OMP_FOR()
-  for(size_t k = 0; k < pixels; k++)
-  {
-    // difference between the calculated blend from modified_blend, and the blurred value
-    // if the difference is large, the local value was reduced too much as a result of the blurring
-    // use a weighted mean of the unblurred (aka tmp2) and the blurred (aka blendmask)
-    const float diff = tmp2[k] - blendmask[k];
-    const float w_tmp2 = 1.0f / (1.0f + expf(5.0f - 10.0f * diff));
-    blendmask[k] = CLIP(w_tmp2 * tmp2[k] + (1.0f - w_tmp2) * blendmask[k]);
-  }
+  // reconcile unblurred/blurred blend masks -- Rust FFI
+  darkroom_capture_blend_combine(blendmask, tmp2, pixels);
 
   if(show_variance_mask)
   {
-    DT_OMP_FOR()
-    for(size_t k = 0; k < pixels*4; k +=4)
-      out[k+3] = blendmask[k/4];
+    darkroom_capture_show_variance_mask(out, blendmask, pixels);
 
     error = FALSE;
     goto finalize;
@@ -747,9 +737,7 @@ static void _capture_sharpen(dt_iop_module_t *self,
 
   if(show_sigma_mask)
   {
-    DT_OMP_FOR_SIMD()
-    for(size_t k = 0; k < pixels*4; k +=4)
-      out[k+3] = (float)gauss_idx[k/4] / 255.0f;
+    darkroom_capture_show_sigma_mask(out, gauss_idx, pixels);
     error = FALSE;
     goto finalize;
   }
@@ -760,16 +748,8 @@ static void _capture_sharpen(dt_iop_module_t *self,
     _blur_mul(tmp2, tmp1, blendmask, gd->gauss_coeffs, gauss_idx, width, height);
   }
 
-  DT_OMP_FOR_SIMD()
-  for(size_t k = 0; k < pixels; k++)
-  {
-    if(blendmask[k] > 0.0f)
-    {
-      const float luminance_new = interpolatef(CLIP(blendmask[k]), tmp1[k], luminance[k]);
-      const float factor = luminance_new / MAX(luminance[k], CAPTURE_YMIN);
-      for_each_channel(c) out[k*4 + c] *= factor;
-    }
-  }
+  // apply the sharpened luminance ratio to all channels -- Rust FFI
+  darkroom_capture_apply_sharpen(out, tmp1, luminance, blendmask, pixels);
 
   error = FALSE;
 

@@ -2741,6 +2741,18 @@ void darkroom_capture_prepare_blend(const float *cfa, const float *rgb,
 void darkroom_capture_modify_blend(float *blend, const float *Yold, float *luminance,
                                    float dthresh, int width, int height);
 
+/* Capture-sharpen output stage (capture.c, _capture_sharpen). blend_combine:
+ * per-pixel sigmoid blend of the unblurred (tmp2) and blurred (blendmask)
+ * masks, CLIP-ed back into blendmask. show_variance_mask / show_sigma_mask:
+ * debug views writing the mask / normalised kernel index into out's alpha.
+ * apply_sharpen: where blendmask>0, scale all RGBA channels by
+ * interpolatef(CLIP(blendmask), tmp1, luminance) / max(luminance, 0.001). */
+void darkroom_capture_blend_combine(float *blendmask, const float *tmp2, size_t pixels);
+void darkroom_capture_show_variance_mask(float *out, const float *blendmask, size_t pixels);
+void darkroom_capture_show_sigma_mask(float *out, const unsigned char *gauss_idx, size_t pixels);
+void darkroom_capture_apply_sharpen(float *out, const float *tmp1, const float *luminance,
+                                    const float *blendmask, size_t pixels);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

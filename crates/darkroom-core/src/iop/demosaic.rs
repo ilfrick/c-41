@@ -1151,6 +1151,85 @@ pub unsafe extern "C" fn darkroom_capture_modify_blend(
     }
 }
 
+/// Capture-sharpen blend/blur reconciliation (_capture_sharpen, capture.c:724):
+/// per pixel blend the unblurred mask `tmp2` with the blurred `blendmask` by a
+/// sigmoid of their difference, writing the CLIP-ed result back into blendmask.
+///
+/// # Safety
+/// `blendmask`/`tmp2` hold `pixels` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_blend_combine(
+    blendmask: *mut f32, tmp2: *const f32, pixels: usize,
+) {
+    let bm = std::slice::from_raw_parts_mut(blendmask, pixels);
+    let t2 = std::slice::from_raw_parts(tmp2, pixels);
+    for k in 0..pixels {
+        let diff = t2[k] - bm[k];
+        let w_tmp2 = 1.0 / (1.0 + (5.0 - 10.0 * diff).exp());
+        bm[k] = cs_clip(w_tmp2 * t2[k] + (1.0 - w_tmp2) * bm[k]);
+    }
+}
+
+/// Capture-sharpen variance-mask debug view (capture.c:737): copy `blendmask`
+/// into the alpha channel of the RGBA `out`.
+///
+/// # Safety
+/// `out` holds `pixels*4` floats; `blendmask` holds `pixels`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_show_variance_mask(
+    out: *mut f32, blendmask: *const f32, pixels: usize,
+) {
+    let o = std::slice::from_raw_parts_mut(out, pixels * 4);
+    let bm = std::slice::from_raw_parts(blendmask, pixels);
+    for k in 0..pixels {
+        o[k * 4 + 3] = bm[k];
+    }
+}
+
+/// Capture-sharpen sigma-mask debug view (capture.c:750): write the per-pixel
+/// kernel index (normalised to [0,1]) into the alpha channel of `out`.
+///
+/// # Safety
+/// `out` holds `pixels*4` floats; `gauss_idx` holds `pixels` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_show_sigma_mask(
+    out: *mut f32, gauss_idx: *const u8, pixels: usize,
+) {
+    let o = std::slice::from_raw_parts_mut(out, pixels * 4);
+    let gi = std::slice::from_raw_parts(gauss_idx, pixels);
+    for k in 0..pixels {
+        o[k * 4 + 3] = gi[k] as f32 / 255.0;
+    }
+}
+
+/// Capture-sharpen final application (capture.c:763): where blendmask>0, scale
+/// every RGBA channel by luminance_new / max(luminance, YMIN), where
+/// luminance_new = interpolatef(CLIP(blendmask), tmp1, luminance) =
+/// CLIP(bm)*(tmp1-lum)+lum.
+///
+/// # Safety
+/// `out` holds `pixels*4` floats; `tmp1`/`luminance`/`blendmask` hold `pixels`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_capture_apply_sharpen(
+    out: *mut f32, tmp1: *const f32, luminance: *const f32, blendmask: *const f32,
+    pixels: usize,
+) {
+    let o = std::slice::from_raw_parts_mut(out, pixels * 4);
+    let t1 = std::slice::from_raw_parts(tmp1, pixels);
+    let lum = std::slice::from_raw_parts(luminance, pixels);
+    let bm = std::slice::from_raw_parts(blendmask, pixels);
+    for k in 0..pixels {
+        if bm[k] > 0.0 {
+            let m = cs_clip(bm[k]);
+            let luminance_new = m * (t1[k] - lum[k]) + lum[k];
+            let factor = luminance_new / lum[k].max(CAPTURE_YMIN);
+            for c in 0..4 {
+                o[k * 4 + c] *= factor;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,6 +1801,48 @@ mod tests {
         }
         assert!(blend.iter().all(|&b| b == 0.7)); // untouched
         assert!(lum.iter().all(|&l| l == -1.0));
+    }
+
+    #[test]
+    fn capture_blend_combine_and_apply() {
+        // blend_combine: weighted-mean of unblurred(tmp2) and blurred(blendmask)
+        let mut bm = vec![0.2_f32, 0.0, 1.5];
+        let t2 = vec![0.8_f32, 0.0, 0.5];
+        unsafe { darkroom_capture_blend_combine(bm.as_mut_ptr(), t2.as_ptr(), 3); }
+        for k in 0..3 {
+            let diff = t2[k] - [0.2_f32, 0.0, 1.5][k];
+            let w = 1.0 / (1.0 + (5.0 - 10.0 * diff).exp());
+            let want = cs_clip(w * t2[k] + (1.0 - w) * [0.2_f32, 0.0, 1.5][k]);
+            assert!((bm[k] - want).abs() < 1e-6, "combine[{k}] = {} want {}", bm[k], want);
+        }
+
+        // apply_sharpen: bm>0 scales all 4 channels by luminance_new/max(lum,YMIN)
+        let mut out = vec![1.0_f32; 3 * 4];
+        let tmp1 = vec![2.0_f32, 0.5, 3.0];
+        let lum = vec![1.0_f32, 1.0, 0.0]; // last: lum=0 → max(.,YMIN)
+        let bmask = vec![0.5_f32, 0.0, 1.0]; // middle gated off
+        unsafe {
+            darkroom_capture_apply_sharpen(out.as_mut_ptr(), tmp1.as_ptr(), lum.as_ptr(), bmask.as_ptr(), 3);
+        }
+        // k0: m=0.5, ln=0.5*(2-1)+1=1.5, factor=1.5/1=1.5
+        for c in 0..4 { assert!((out[c] - 1.5).abs() < 1e-6); }
+        // k1: bm=0 → untouched
+        for c in 0..4 { assert_eq!(out[4 + c], 1.0); }
+        // k2: m=1, ln=1*(3-0)+0=3, factor=3/max(0,0.001)=3000
+        for c in 0..4 { assert!((out[8 + c] - 3000.0).abs() < 1e-1); }
+    }
+
+    #[test]
+    fn capture_show_masks_write_alpha() {
+        let bm = vec![0.25_f32, 0.5, 0.75];
+        let mut out = vec![0.0_f32; 3 * 4];
+        unsafe { darkroom_capture_show_variance_mask(out.as_mut_ptr(), bm.as_ptr(), 3); }
+        for k in 0..3 { assert_eq!(out[k * 4 + 3], bm[k]); }
+
+        let gi = vec![0u8, 128, 255];
+        let mut out2 = vec![0.0_f32; 3 * 4];
+        unsafe { darkroom_capture_show_sigma_mask(out2.as_mut_ptr(), gi.as_ptr(), 3); }
+        for k in 0..3 { assert!((out2[k * 4 + 3] - gi[k] as f32 / 255.0).abs() < 1e-7); }
     }
 
     #[test]
