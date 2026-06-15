@@ -547,7 +547,7 @@ static void _prepare_blend(const float *cfa,
 {
   dt_iop_image_fill(mask, 1.0f, w1, height, 1);
   // BT.709 luminance into Yold + clip/dark blend mask -- Rust FFI
-  darkroom_capture_prepare_blend(cfa, rgb, filters, xtrans, mask, Yold, whites, w1, height);
+  darkroom_capture_prepare_blend(cfa, rgb, filters, (const unsigned char *)xtrans, mask, Yold, whites, w1, height);
 }
 
 static void _modify_blend(float *blend,
