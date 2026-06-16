@@ -111,19 +111,23 @@ C FFI trampolines for tags. 61 DB tests passing.
 ### Phase 3 -- GTK4 UI (in progress)
 
 `crates/darkroom-ui` (gtk4 0.9 + libadwaita 0.7). `darkroom_ui::run()` boots an
-`adw::Application`. **Done (ui-1..ui-13):**
+`adw::Application`. **Done (ui-1..ui-14):**
 - **Lighttable** (functional): DB-backed `GridView` of thumbnails, collections
   left panel, metadata right panel, name search/filter, star ratings, import &
   export dialogs, `adw::ToastOverlay` notifications, Ctrl+I / Ctrl+E shortcuts.
 - **Navigation**: `adw::NavigationView` lighttable ⇄ darkroom (double-click).
 - **Darkroom view**: grouped IOP **module panel** sourced from a real module
   catalog, Export, and a **live multi-IOP preview pipeline** (`preview.rs`,
-  ui-12/ui-13): a controls bar drives `PreviewParams` (exposure EV + black
-  point → velvia strength), each slider chaining a *migrated `darkroom-core`
-  IOP* (`exposure::process_pixels`, `velvia::process_pixels`) over the decoded
-  8-bit preview and re-uploading a `gdk::MemoryTexture`. This is a stand-in for
-  a real Rust pixelpipe — it processes the 8-bit pixbuf, not raw pipeline
-  output, but exercises the genuine UI↔core seam.
+  ui-12/ui-13): `PreviewParams` drives stages each chaining a *migrated
+  `darkroom-core` IOP* (`exposure::process_pixels`, `velvia::process_pixels`)
+  over the decoded 8-bit preview, re-uploading a `gdk::MemoryTexture`. A
+  stand-in for a real Rust pixelpipe — it processes the 8-bit pixbuf, not raw
+  pipeline output, but exercises the genuine UI↔core seam.
+- **Per-module param widgets (ui-14)**: the preview params now live in their
+  **module rows** in the panel, not a separate bar. Live modules (Exposure,
+  Velvia) render as `adw::ExpanderRow`s whose built-in enable switch gates the
+  pipeline stage (`exposure_on`/`velvia_on`) and whose child sliders drive the
+  params; this converges the module-stack UI with the preview pipeline.
 
 **This replaces (eventually):** `src/views/` (7: lighttable, darkroom, map,
 print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
@@ -131,15 +135,16 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
 **Roadmap (next milestones):**
 1. *Module stack realism* — module catalog → per-module param widgets, enable
    toggles wired to history/db, module groups & favourites (mirrors src/libs/
-   modulegroups + the IOP GUIs).
+   modulegroups + the IOP GUIs). **In progress (ui-14):** Exposure & Velvia are
+   live `ExpanderRow` modules (enable switch + param sliders). Remaining: more
+   live modules, and wiring enable/param state to the history stack + db.
 2. *Live preview* — the load-bearing piece: a Rust pixelpipe driver that runs
    the migrated `darkroom-core` IOPs and paints processed output into the
-   darkroom view. **Bootstrapped (ui-12/ui-13):** `preview.rs::apply_pipeline`
+   darkroom view. **Bootstrapped (ui-12/ui-13/ui-14):** `preview.rs::apply_pipeline`
    chains migrated IOPs (exposure → velvia) over the 8-bit pixbuf, live via the
-   controls bar. Remaining: (a) more IOP stages, (b) move the param widgets out
-   of the bottom bar into their module rows in the right panel (converges with
-   milestone 1), (c) the real raw→scene-referred pixelpipe orchestrator
-   (currently C) so the preview runs on pipeline output, not the 8-bit pixbuf.
+   per-module widgets. Remaining: (a) more IOP stages, (b) the real
+   raw→scene-referred pixelpipe orchestrator (currently C) so the preview runs
+   on pipeline output, not the 8-bit pixbuf.
 3. *Darkroom interactions* — zoom/pan, histogram, color picker, before/after.
 4. *Remaining views/panels* — port src/libs panels (history stack, snapshots,
    tagging, export) and the other views.

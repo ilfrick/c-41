@@ -1,11 +1,14 @@
 //! Darkroom editing view — single-image editing with IOP module stack.
 //!
-//! Phase 3-ui-13: darkroom view with a LIVE multi-IOP preview pipeline. A
-//! controls bar drives `crate::preview::PreviewParams` (exposure EV + black
-//! point, then velvia strength), each slider chaining a migrated darkroom-core
-//! IOP over the preview; the image fills the viewport with a right panel listing
-//! the IOP modules grouped by darktable's module groups (from `crate::catalog`).
-//! Navigation back to the lighttable is via the NavigationView pop action.
+//! Phase 3-ui-14: the live preview params now live in their **module rows** in
+//! the right panel (not a separate controls bar), converging the module-stack
+//! UI with the preview pipeline. Modules backed by a migrated `darkroom-core`
+//! IOP (Exposure, Velvia) render as `adw::ExpanderRow`s whose built-in enable
+//! switch gates the corresponding pipeline stage (`exposure_on` / `velvia_on`)
+//! and whose child sliders drive the stage params; every change re-runs
+//! `crate::preview::apply_pipeline` over the preview. Remaining catalog modules
+//! stay as inert enable-toggle rows. Navigation back to the lighttable is via
+//! the NavigationView pop action.
 
 use adw::prelude::*;
 use glib::clone;
@@ -94,57 +97,14 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         }
     }));
 
-    // ── Live pipeline controls (each slider chains a migrated core IOP) ─────
-    let controls = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(2)
-        .margin_start(8).margin_end(8).margin_top(4).margin_bottom(4)
-        .build();
-
-    // Exposure (EV): scale = 2^ev.
-    let ev_row = labeled_slider("Exposure (EV)", -3.0, 3.0, 0.01, 0.0);
-    ev_row.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
-        params.borrow_mut().ev = s.value() as f32;
-        render_preview(&picture, &base, &params.borrow());
-    }));
-    controls.append(&ev_row.row);
-
-    // Black point: lifted before scaling (out = (in - black) * scale).
-    let black_row = labeled_slider("Black point", 0.0, 0.2, 0.001, 0.0);
-    black_row.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
-        params.borrow_mut().black = s.value() as f32;
-        render_preview(&picture, &base, &params.borrow());
-    }));
-    controls.append(&black_row.row);
-
-    // Velvia strength (0..100); 0 leaves the image untouched.
-    let velvia_row = labeled_slider("Velvia", 0.0, 100.0, 1.0, 0.0);
-    velvia_row.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
-        let v = s.value() as f32;
-        let mut p = params.borrow_mut();
-        p.velvia_strength = v;
-        p.velvia_on = v > 0.0;
-        drop(p);
-        render_preview(&picture, &base, &params.borrow());
-    }));
-    controls.append(&velvia_row.row);
-
-    let image_area = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .hexpand(true)
-        .build();
-    image_area.append(&picture);
-    image_area.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    image_area.append(&controls);
-
-    // ── IOP module list (right panel) ──────────────────────────────────────
-    let modules_panel = build_modules_panel();
+    // ── IOP module list (right panel) — hosts the live param widgets ───────
+    let modules_panel = build_modules_panel(&picture, &base, &params);
 
     // ── Split view: image | modules ────────────────────────────────────────
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
-    content.append(&image_area);
+    content.append(&picture);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     content.append(&modules_panel);
 
@@ -180,7 +140,8 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .build()
 }
 
-/// A labelled horizontal slider row for the controls bar.
+/// A labelled horizontal slider row (used as an `ExpanderRow` child for a
+/// single IOP parameter).
 struct LabeledSlider {
     row: gtk4::Box,
     scale: gtk4::Scale,
@@ -196,11 +157,12 @@ fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> Lab
 
     let lbl = gtk4::Label::new(Some(label));
     lbl.set_xalign(0.0);
-    lbl.set_width_chars(14);
+    lbl.set_width_chars(7);
 
     let row = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
+        .margin_start(12).margin_end(12).margin_top(4).margin_bottom(4)
         .build();
     row.append(&lbl);
     row.append(&scale);
@@ -208,9 +170,15 @@ fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> Lab
 }
 
 /// Module-stack panel: the darktable module groups (base/tone/color/correct/
-/// effect) from [`crate::catalog`], each an enable-toggle row. The toggles are
-/// not yet wired to the history stack (a later milestone).
-fn build_modules_panel() -> gtk4::Widget {
+/// effect) from [`crate::catalog`]. Modules backed by a migrated `darkroom-core`
+/// IOP (Exposure, Velvia) render as expandable rows with a live enable switch
+/// and parameter sliders wired to the preview pipeline; the rest are inert
+/// enable-toggle rows (history-stack wiring is a later milestone).
+fn build_modules_panel(
+    picture: &gtk4::Picture,
+    base: &Rc<RefCell<Option<BaseImage>>>,
+    params: &Rc<RefCell<PreviewParams>>,
+) -> gtk4::Widget {
     let panel = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(12)
@@ -230,14 +198,11 @@ fn build_modules_panel() -> gtk4::Widget {
     for group in crate::catalog::module_catalog() {
         let pg = adw::PreferencesGroup::builder().title(group.name).build();
         for mi in group.modules {
-            let row = adw::ActionRow::builder().title(mi.label).build();
-            let toggle = gtk4::Switch::builder()
-                .active(mi.default_on)
-                .valign(gtk4::Align::Center)
-                .build();
-            row.add_suffix(&toggle);
-            row.set_activatable_widget(Some(&toggle));
-            pg.add(&row);
+            match mi.label {
+                "Exposure" => pg.add(&exposure_module_row(picture, base, params)),
+                "Velvia" => pg.add(&velvia_module_row(picture, base, params)),
+                _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
+            }
         }
         panel.append(&pg);
     }
@@ -246,8 +211,123 @@ fn build_modules_panel() -> gtk4::Widget {
     gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vexpand(true)
-        .width_request(280)
+        .width_request(320)
         .child(&panel)
         .build()
         .upcast()
+}
+
+/// A placeholder module row: title + enable switch not yet wired to anything.
+fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(label).build();
+    let toggle = gtk4::Switch::builder()
+        .active(default_on)
+        .valign(gtk4::Align::Center)
+        .build();
+    row.add_suffix(&toggle);
+    row.set_activatable_widget(Some(&toggle));
+    row
+}
+
+/// Catalog labels that [`build_modules_panel`] dispatches to a *live* preview
+/// module (everything else renders as an inert toggle). The match arms below
+/// use these same literals; `catalog_has_live_modules` guards against a catalog
+/// rename silently dropping a module back to inert. Test-only: it exists purely
+/// as the contract checked by that test.
+#[cfg(test)]
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia"];
+
+// Borrow invariant for the closures below: GTK callbacks run on the main
+// thread and never re-enter while a `params` borrow is held — each closure
+// takes a short-lived `borrow_mut()` (dropped at the statement end) before the
+// `render_preview(..., &params.borrow())` read, so the two never overlap.
+
+/// Exposure module: an expander whose enable switch gates `exposure_on` and
+/// whose EV / black-point sliders drive the exposure stage of the preview.
+fn exposure_module_row(
+    picture: &gtk4::Picture,
+    base: &Rc<RefCell<Option<BaseImage>>>,
+    params: &Rc<RefCell<PreviewParams>>,
+) -> adw::ExpanderRow {
+    let p0 = *params.borrow();
+    let expander = adw::ExpanderRow::builder()
+        .title("Exposure")
+        .subtitle("EV + black point")
+        .show_enable_switch(true)
+        .enable_expansion(p0.exposure_on)
+        .build();
+    expander.connect_enable_expansion_notify(clone!(@weak picture, @strong base, @strong params => move |e| {
+        params.borrow_mut().exposure_on = e.enables_expansion();
+        render_preview(&picture, &base, &params.borrow());
+    }));
+
+    // EV: scale = 2^ev.
+    let ev = labeled_slider("EV", -3.0, 3.0, 0.01, p0.ev as f64);
+    ev.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
+        params.borrow_mut().ev = s.value() as f32;
+        render_preview(&picture, &base, &params.borrow());
+    }));
+    expander.add_row(&ev.row);
+
+    // Black point: lifted before scaling (out = (in - black) * scale).
+    let black = labeled_slider("Black", 0.0, 0.2, 0.001, p0.black as f64);
+    black.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
+        params.borrow_mut().black = s.value() as f32;
+        render_preview(&picture, &base, &params.borrow());
+    }));
+    expander.add_row(&black.row);
+
+    expander
+}
+
+/// Velvia module: an expander whose enable switch gates `velvia_on` and whose
+/// strength slider drives the velvia stage of the preview.
+fn velvia_module_row(
+    picture: &gtk4::Picture,
+    base: &Rc<RefCell<Option<BaseImage>>>,
+    params: &Rc<RefCell<PreviewParams>>,
+) -> adw::ExpanderRow {
+    let p0 = *params.borrow();
+    let expander = adw::ExpanderRow::builder()
+        .title("Velvia")
+        .subtitle("saturation boost")
+        .show_enable_switch(true)
+        .enable_expansion(p0.velvia_on)
+        .build();
+    expander.connect_enable_expansion_notify(clone!(@weak picture, @strong base, @strong params => move |e| {
+        params.borrow_mut().velvia_on = e.enables_expansion();
+        render_preview(&picture, &base, &params.borrow());
+    }));
+
+    // Strength (0..100); the C slider's scale, divided by 100 for the core IOP.
+    let strength = labeled_slider("Strength", 0.0, 100.0, 1.0, p0.velvia_strength as f64);
+    strength.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
+        params.borrow_mut().velvia_strength = s.value() as f32;
+        render_preview(&picture, &base, &params.borrow());
+    }));
+    expander.add_row(&strength.row);
+
+    expander
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every live-module label must still exist verbatim in the catalog, else
+    /// `build_modules_panel`'s string dispatch silently renders it inert.
+    #[test]
+    fn catalog_has_live_modules() {
+        let labels: Vec<&str> = crate::catalog::module_catalog()
+            .iter()
+            .flat_map(|g| g.modules.iter().map(|m| m.label))
+            .collect();
+        for live in LIVE_MODULE_LABELS {
+            assert!(
+                labels.contains(live),
+                "live module {live:?} is no longer in the catalog — update \
+                 LIVE_MODULE_LABELS and the build_modules_panel match arms"
+            );
+        }
+    }
 }
