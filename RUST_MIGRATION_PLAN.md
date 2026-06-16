@@ -145,9 +145,14 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
 **Roadmap (next milestones):**
 1. *Module stack realism* — module catalog → per-module param widgets, enable
    toggles wired to history/db, module groups & favourites (mirrors src/libs/
-   modulegroups + the IOP GUIs). **In progress (ui-14):** Exposure & Velvia are
-   live `ExpanderRow` modules (enable switch + param sliders). Remaining: more
-   live modules, and wiring enable/param state to the history stack + db.
+   modulegroups + the IOP GUIs). **In progress (ui-14/db-wiring):** Exposure,
+   Velvia, Split-toning & Monochrome are live `ExpanderRow` modules; their params
+   **persist to the db** and restore on reopen — `preview::PreviewParams::
+   encode/decode` (versioned blob) stored in a dedicated `main.darkroom_preview`
+   table (`crate::persist`), saved via a debounced autosave + flush on close.
+   `darkroom-db` gained the history write path (`history_add_entry`,
+   `history_get_op_params`) for future real-IOP-history wiring. Remaining: more
+   live modules, module groups & favourites.
 2. *Live preview* — the load-bearing piece: a Rust pixelpipe driver that runs
    the migrated `darkroom-core` IOPs and paints processed output into the
    darkroom view. **Bootstrapped (ui-12/ui-13/ui-14):** `preview.rs::apply_pipeline`

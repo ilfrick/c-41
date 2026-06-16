@@ -13,6 +13,7 @@ pub mod darkroom;
 pub mod dialogs;
 pub mod lighttable;
 pub mod panels;
+pub mod persist;
 pub mod preview;
 
 pub const APP_ID:        &str = "org.darkroom.Darkroom";
@@ -172,13 +173,13 @@ fn build_main_window(app: &Application) {
     {
         let scroll_ref = scroll.downcast_ref::<gtk4::ScrolledWindow>().unwrap();
         if let Some(grid) = scroll_ref.child().and_downcast::<gtk4::GridView>() {
-            grid.connect_activate(clone!(@weak nav, @weak lt_model => move |_, pos| {
+            grid.connect_activate(clone!(@weak nav, @weak lt_model, @strong db_path => move |_, pos| {
                 if let Some(path) = lt_model.item(pos)
                     .and_downcast::<gtk4::StringObject>()
                     .map(|o| o.string().to_string())
                     .filter(|p| p.contains('/'))
                 {
-                    nav.push(&darkroom::darkroom_page(&path));
+                    nav.push(&darkroom::darkroom_page(&path, &db_path));
                 }
             }));
         }

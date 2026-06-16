@@ -48,6 +48,40 @@ struct PreviewCtx {
     hist: Rc<RefCell<Histogram>>,
     /// While set, the preview shows the unprocessed image (before/after toggle).
     bypass: Rc<std::cell::Cell<bool>>,
+    /// Debounced DB autosave of the current params (None when there's no db).
+    autosave: Option<Rc<AutoSave>>,
+}
+
+/// Debounced writer that persists the current params a short time after the last
+/// edit (so slider drags don't write per-tick), with an explicit flush on close.
+struct AutoSave {
+    db_path: String,
+    file_path: String,
+    params: Rc<RefCell<PreviewParams>>,
+    pending: RefCell<Option<glib::SourceId>>,
+}
+
+impl AutoSave {
+    /// (Re)arm the debounce timer; the last edit within the window wins.
+    fn arm(self: &Rc<Self>) {
+        if let Some(id) = self.pending.borrow_mut().take() {
+            id.remove();
+        }
+        let this = self.clone();
+        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+            *this.pending.borrow_mut() = None;
+            crate::persist::save_params(&this.db_path, &this.file_path, &this.params.borrow());
+        });
+        *self.pending.borrow_mut() = Some(id);
+    }
+
+    /// Cancel any pending timer and save immediately (final flush on page close).
+    fn flush(&self) {
+        if let Some(id) = self.pending.borrow_mut().take() {
+            id.remove();
+        }
+        crate::persist::save_params(&self.db_path, &self.file_path, &self.params.borrow());
+    }
 }
 
 /// The params the preview is currently showing: the live params, or their
@@ -90,14 +124,21 @@ fn render_preview(ctx: &PreviewCtx) {
         if let Some(label) = ctx.picker.upgrade() {
             label.set_text(PICKER_PROMPT);
         }
+
+        // Debounced persistence of the (live, not bypassed) params.
+        if let Some(autosave) = &ctx.autosave {
+            autosave.arm();
+        }
     }
 }
 
 /// Build a NavigationPage for editing a single image at `file_path`.
 ///
 /// The page title is set to the filename. The caller pushes this page onto
-/// an `adw::NavigationView` and pops it to return to the lighttable.
-pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
+/// an `adw::NavigationView` and pops it to return to the lighttable. `db_path`
+/// is the catalogue database used to restore the image's saved preview params
+/// on open and persist them when the page is closed (empty string = no db).
+pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     let filename = std::path::Path::new(file_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -127,15 +168,27 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .build();
     picker_label.add_css_class("monospace");
 
-    // Shared live-preview state.
+    // Shared live-preview state. Params are seeded from the DB (saved on a
+    // previous edit) before the panel/preview are built, so the sliders and the
+    // first render reflect the restored values.
+    let params = Rc::new(RefCell::new(crate::persist::load_params(db_path, file_path)));
+    let autosave = (!db_path.is_empty()).then(|| {
+        Rc::new(AutoSave {
+            db_path: db_path.to_string(),
+            file_path: file_path.to_string(),
+            params: params.clone(),
+            pending: RefCell::new(None),
+        })
+    });
     let ctx = PreviewCtx {
         picture: picture.downgrade(),
         hist_area: hist_area.downgrade(),
         picker: picker_label.downgrade(),
         base: Rc::new(RefCell::new(None)),
-        params: Rc::new(RefCell::new(PreviewParams::default())),
+        params,
         hist: Rc::new(RefCell::new([[0u32; 256]; 3])),
         bypass: Rc::new(std::cell::Cell::new(false)),
+        autosave,
     };
 
     // The histogram paints from the shared `hist` buffer (no widget captured,
@@ -289,10 +342,20 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&content));
 
-    adw::NavigationPage::builder()
+    let page = adw::NavigationPage::builder()
         .title(&filename)
         .child(&toolbar_view)
-        .build()
+        .build();
+
+    // Flush any pending autosave when the page is popped back to the lighttable
+    // (the debounce in render_preview covers edits before an abrupt app quit).
+    let save_ctx = ctx.clone();
+    page.connect_hidden(move |_| {
+        if let Some(autosave) = &save_ctx.autosave {
+            autosave.flush();
+        }
+    });
+    page
 }
 
 /// A labelled horizontal slider row (used as an `ExpanderRow` child for a

@@ -110,7 +110,63 @@ impl PreviewParams {
             ..*self
         }
     }
+
+    /// Serialise to a compact, versioned little-endian blob for DB persistence:
+    /// `[version, 4×bool(u8), 13×f32_le]`. Decoded by [`PreviewParams::decode`].
+    /// This is darkroom-ui's own layout (NOT a C IOP `op_params`), stored under a
+    /// synthetic operation name the C reader ignores.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(ENCODED_LEN);
+        v.push(ENCODE_VERSION);
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on] {
+            v.push(b as u8);
+        }
+        for f in [
+            self.black, self.ev,
+            self.velvia_strength, self.velvia_bias,
+            self.split_shadow_hue, self.split_shadow_sat,
+            self.split_highlight_hue, self.split_highlight_sat,
+            self.split_balance, self.split_compress,
+            self.mono_r, self.mono_g, self.mono_b,
+        ] {
+            v.extend_from_slice(&f.to_le_bytes());
+        }
+        v
+    }
+
+    /// Inverse of [`PreviewParams::encode`]. Returns `None` for the wrong version
+    /// byte or wrong length (e.g. a blob written by a future/other schema), so
+    /// the caller falls back to defaults rather than loading garbage.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
+            return None;
+        }
+        let bools = &bytes[1..5];
+        // length is checked above, so exactly 13 f32 chunks follow
+        let f: Vec<f32> = bytes[5..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Some(Self {
+            exposure_on: bools[0] != 0,
+            velvia_on: bools[1] != 0,
+            split_on: bools[2] != 0,
+            mono_on: bools[3] != 0,
+            black: f[0], ev: f[1],
+            velvia_strength: f[2], velvia_bias: f[3],
+            split_shadow_hue: f[4], split_shadow_sat: f[5],
+            split_highlight_hue: f[6], split_highlight_sat: f[7],
+            split_balance: f[8], split_compress: f[9],
+            mono_r: f[10], mono_g: f[11], mono_b: f[12],
+        })
+    }
 }
+
+/// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
+/// to `None` → defaults, rather than mis-parsing).
+const ENCODE_VERSION: u8 = 1;
+/// 1 version byte + 4 bool bytes + 13 little-endian f32.
+const ENCODED_LEN: usize = 1 + 4 + 13 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -501,6 +557,35 @@ mod tests {
     #[test]
     fn histogram_degenerate_input_is_empty() {
         assert_eq!(compute_histogram(&[], 0, 0, 0, 0), [[0u32; 256]; 3]);
+    }
+
+    #[test]
+    fn params_encode_decode_roundtrips() {
+        let p = PreviewParams {
+            exposure_on: true, black: 0.05, ev: -1.25,
+            velvia_on: true, velvia_strength: 42.0, velvia_bias: 0.75,
+            split_on: true, split_shadow_hue: 0.1, split_shadow_sat: 0.6,
+            split_highlight_hue: 0.9, split_highlight_sat: 0.3,
+            split_balance: 0.4, split_compress: 60.0,
+            mono_on: true, mono_r: -0.2, mono_g: 1.5, mono_b: 0.33,
+        };
+        let blob = p.encode();
+        assert_eq!(blob.len(), 1 + 4 + 13 * 4);
+        assert_eq!(PreviewParams::decode(&blob), Some(p));
+        // default round-trips too
+        let d = PreviewParams::default();
+        assert_eq!(PreviewParams::decode(&d.encode()), Some(d));
+    }
+
+    #[test]
+    fn decode_rejects_bad_version_and_length() {
+        let mut blob = PreviewParams::default().encode();
+        // wrong length
+        assert_eq!(PreviewParams::decode(&blob[..blob.len() - 1]), None);
+        assert_eq!(PreviewParams::decode(&[]), None);
+        // wrong version byte
+        blob[0] = 2;
+        assert_eq!(PreviewParams::decode(&blob), None);
     }
 
     #[test]
