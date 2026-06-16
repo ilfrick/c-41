@@ -1,16 +1,18 @@
 //! Darkroom editing view — single-image editing with IOP module stack.
 //!
-//! Phase 3-ui-12: darkroom view with a LIVE exposure (EV) slider that runs the
-//! migrated darkroom-core exposure IOP on the preview; image at full viewport scale
-//! with a right panel listing the IOP modules grouped by darktable's module
-//! groups (from `crate::catalog`). Navigation back to the lighttable is via
-//! the NavigationView pop action.
+//! Phase 3-ui-13: darkroom view with a LIVE multi-IOP preview pipeline. A
+//! controls bar drives `crate::preview::PreviewParams` (exposure EV + black
+//! point, then velvia strength), each slider chaining a migrated darkroom-core
+//! IOP over the preview; the image fills the viewport with a right panel listing
+//! the IOP modules grouped by darktable's module groups (from `crate::catalog`).
+//! Navigation back to the lighttable is via the NavigationView pop action.
 
 use adw::prelude::*;
 use glib::clone;
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::dialogs;
+use crate::preview::PreviewParams;
 
 /// Decoded preview image kept for live re-processing.
 #[derive(Clone)]
@@ -22,12 +24,17 @@ struct BaseImage {
     nch: usize,
 }
 
-/// Paint `picture` with the base preview processed at exposure `ev`, running
-/// the migrated `darkroom-core` exposure IOP and uploading a gdk::MemoryTexture.
-fn render_preview(picture: &gtk4::Picture, base: &Rc<RefCell<Option<BaseImage>>>, ev: f32) {
+/// Paint `picture` with the base preview run through the live `PreviewParams`
+/// pipeline (exposure → velvia, via migrated `darkroom-core` IOPs), uploading
+/// the result as a gdk::MemoryTexture.
+fn render_preview(
+    picture: &gtk4::Picture,
+    base: &Rc<RefCell<Option<BaseImage>>>,
+    params: &PreviewParams,
+) {
     if let Some(b) = base.borrow().as_ref() {
-        let processed = crate::preview::apply_exposure(
-            &b.bytes, b.width as usize, b.height as usize, b.rowstride, b.nch, ev,
+        let processed = crate::preview::apply_pipeline(
+            &b.bytes, b.width as usize, b.height as usize, b.rowstride, b.nch, params,
         );
         let fmt = if b.nch == 4 {
             gtk4::gdk::MemoryFormat::R8g8b8a8
@@ -58,12 +65,14 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .content_fit(gtk4::ContentFit::Contain)
         .build();
 
-    // Shared decoded preview, kept for live re-processing by the EV slider.
+    // Shared decoded preview + live pipeline params, re-read on every slider
+    // change to re-process the preview.
     let base: Rc<RefCell<Option<BaseImage>>> = Rc::new(RefCell::new(None));
+    let params: Rc<RefCell<PreviewParams>> = Rc::new(RefCell::new(PreviewParams::default()));
 
     // Load + decode the image asynchronously so the page appears immediately.
     let path_for_load = file_path.to_string();
-    glib::spawn_future_local(clone!(@weak picture, @strong base => async move {
+    glib::spawn_future_local(clone!(@weak picture, @strong base, @strong params => async move {
         let data = gio::spawn_blocking(move || std::fs::read(&path_for_load).ok())
             .await
             .ok()
@@ -80,27 +89,45 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
                     rowstride: pb.rowstride() as usize,
                     nch: pb.n_channels() as usize,
                 });
-                render_preview(&picture, &base, 0.0);
+                render_preview(&picture, &base, &params.borrow());
             }
         }
     }));
 
-    // ── Exposure control (live, via darkroom-core) ─────────────────────────
-    let ev_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, -3.0, 3.0, 0.01);
-    ev_scale.set_value(0.0);
-    ev_scale.set_hexpand(true);
-    ev_scale.set_draw_value(true);
-    ev_scale.set_value_pos(gtk4::PositionType::Right);
-    ev_scale.connect_value_changed(clone!(@weak picture, @strong base => move |s| {
-        render_preview(&picture, &base, s.value() as f32);
-    }));
-    let ev_bar = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
+    // ── Live pipeline controls (each slider chains a migrated core IOP) ─────
+    let controls = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(2)
         .margin_start(8).margin_end(8).margin_top(4).margin_bottom(4)
         .build();
-    ev_bar.append(&gtk4::Label::new(Some("Exposure (EV)")));
-    ev_bar.append(&ev_scale);
+
+    // Exposure (EV): scale = 2^ev.
+    let ev_row = labeled_slider("Exposure (EV)", -3.0, 3.0, 0.01, 0.0);
+    ev_row.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
+        params.borrow_mut().ev = s.value() as f32;
+        render_preview(&picture, &base, &params.borrow());
+    }));
+    controls.append(&ev_row.row);
+
+    // Black point: lifted before scaling (out = (in - black) * scale).
+    let black_row = labeled_slider("Black point", 0.0, 0.2, 0.001, 0.0);
+    black_row.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
+        params.borrow_mut().black = s.value() as f32;
+        render_preview(&picture, &base, &params.borrow());
+    }));
+    controls.append(&black_row.row);
+
+    // Velvia strength (0..100); 0 leaves the image untouched.
+    let velvia_row = labeled_slider("Velvia", 0.0, 100.0, 1.0, 0.0);
+    velvia_row.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
+        let v = s.value() as f32;
+        let mut p = params.borrow_mut();
+        p.velvia_strength = v;
+        p.velvia_on = v > 0.0;
+        drop(p);
+        render_preview(&picture, &base, &params.borrow());
+    }));
+    controls.append(&velvia_row.row);
 
     let image_area = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -108,7 +135,7 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .build();
     image_area.append(&picture);
     image_area.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    image_area.append(&ev_bar);
+    image_area.append(&controls);
 
     // ── IOP module list (right panel) ──────────────────────────────────────
     let modules_panel = build_modules_panel();
@@ -151,6 +178,33 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .title(&filename)
         .child(&toolbar_view)
         .build()
+}
+
+/// A labelled horizontal slider row for the controls bar.
+struct LabeledSlider {
+    row: gtk4::Box,
+    scale: gtk4::Scale,
+}
+
+/// Build a `[label] [────slider────]` row with a value read-out on the right.
+fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> LabeledSlider {
+    let scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, min, max, step);
+    scale.set_value(value);
+    scale.set_hexpand(true);
+    scale.set_draw_value(true);
+    scale.set_value_pos(gtk4::PositionType::Right);
+
+    let lbl = gtk4::Label::new(Some(label));
+    lbl.set_xalign(0.0);
+    lbl.set_width_chars(14);
+
+    let row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    row.append(&lbl);
+    row.append(&scale);
+    LabeledSlider { row, scale }
 }
 
 /// Module-stack panel: the darktable module groups (base/tone/color/correct/
