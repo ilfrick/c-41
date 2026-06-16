@@ -266,6 +266,7 @@ fn build_modules_panel(ctx: &PreviewCtx) -> gtk4::Widget {
                 "Exposure" => pg.add(&exposure_module_row(ctx)),
                 "Velvia" => pg.add(&velvia_module_row(ctx)),
                 "Split-toning" => pg.add(&splittoning_module_row(ctx)),
+                "Monochrome" => pg.add(&monochrome_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -300,7 +301,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -402,6 +403,22 @@ fn splittoning_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.split_balance = v);
             add_param_slider(e, ctx, "Compress", 0.0, 100.0, 1.0, p0.split_compress as f64,
                 |p, v| p.split_compress = v);
+        })
+}
+
+/// Monochrome module: enable switch gates `mono_on`; R/G/B grayscale mix weights
+/// (channelmixer GRAY mode). Weights may go negative for dramatic B&W contrast.
+fn monochrome_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Monochrome", "B&W channel mixer", p0.mono_on,
+        |p, on| p.mono_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Red", -1.0, 2.0, 0.01, p0.mono_r as f64,
+                |p, v| p.mono_r = v);
+            add_param_slider(e, ctx, "Green", -1.0, 2.0, 0.01, p0.mono_g as f64,
+                |p, v| p.mono_g = v);
+            add_param_slider(e, ctx, "Blue", -1.0, 2.0, 0.01, p0.mono_b as f64,
+                |p, v| p.mono_b = v);
         })
 }
 

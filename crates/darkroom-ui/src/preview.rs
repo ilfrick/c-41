@@ -14,7 +14,7 @@
 //! All run on the colour channels (0..min(3,nch)); any alpha channel and the
 //! rowstride padding are preserved byte-for-byte.
 
-use darkroom_core::iop::{exposure, splittoning, velvia};
+use darkroom_core::iop::{channelmixer, exposure, splittoning, velvia};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `darkroom-core` IOP, in pixelpipe order
@@ -47,6 +47,12 @@ pub struct PreviewParams {
     pub split_balance: f32,
     /// Compress range on the C slider's 0..100 scale (core gets `(c/110)/2`).
     pub split_compress: f32,
+    /// Monochrome (channel-mixer B&W) stage on/off.
+    pub mono_on: bool,
+    /// Grayscale mix weights for R, G, B (channelmixer GRAY mode, row 0).
+    pub mono_r: f32,
+    pub mono_g: f32,
+    pub mono_b: f32,
 }
 
 impl Default for PreviewParams {
@@ -66,6 +72,11 @@ impl Default for PreviewParams {
             split_highlight_sat: 0.5,
             split_balance: 0.5,
             split_compress: 33.0,
+            mono_on: false,
+            // Rec.709 luminance weights — a neutral B&W starting point.
+            mono_r: 0.21,
+            mono_g: 0.72,
+            mono_b: 0.07,
         }
     }
 }
@@ -83,7 +94,8 @@ impl PreviewParams {
         // Split-toning has no value at which it is a strict no-op while enabled
         // (even sat 0 desaturates toned zones toward luminance), so on==off.
         let split_identity = !self.split_on;
-        exp_identity && vel_identity && split_identity
+        let mono_identity = !self.mono_on; // grayscale conversion is never a no-op
+        exp_identity && vel_identity && split_identity && mono_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -94,6 +106,7 @@ impl PreviewParams {
             exposure_on: false,
             velvia_on: false,
             split_on: false,
+            mono_on: false,
             ..*self
         }
     }
@@ -176,6 +189,17 @@ pub fn apply_pipeline(
         let bal = params.split_balance;
         run_rgba_stage(&mut rgb, n, |inp, out| {
             splittoning::process_pixels(inp, out, sh, ss, hh, hs, bal, compress)
+        });
+    }
+
+    // ── monochrome stage (channelmixer GRAY mode; RGBA core loop) ──────────
+    if params.mono_on {
+        // GRAY mode reads only row 0 of rgb_matrix (the R,G,B → gray weights);
+        // the hsl_matrix is unused. operation_mode 1 = OPERATION_MODE_GRAY.
+        let rgb_matrix = [params.mono_r, params.mono_g, params.mono_b, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let hsl_matrix = [0.0f32; 9];
+        run_rgba_stage(&mut rgb, n, |inp, out| {
+            channelmixer::process_pixels(inp, out, &hsl_matrix, &rgb_matrix, 1)
         });
     }
 
@@ -365,6 +389,33 @@ mod tests {
         assert_eq!(b.ev, 2.0);
         let base = vec![60u8, 120, 180];
         assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &b), base);
+    }
+
+    #[test]
+    fn monochrome_produces_equal_rgb_from_weighted_mix() {
+        // weights (0.2,0.7,0.1) on (1.0, 0.502, 0.0):
+        // gray = 0.2 + 0.7*0.502 + 0 = 0.5514 → *255 ≈ 141, R=G=B.
+        let mut p = PreviewParams::default();
+        p.exposure_on = false;
+        p.mono_on = true;
+        p.mono_r = 0.2;
+        p.mono_g = 0.7;
+        p.mono_b = 0.1;
+        assert!(!p.is_identity());
+        let base = vec![255u8, 128, 0];
+        let out = apply_pipeline(&base, 1, 1, 3, 3, &p);
+        assert_eq!(out[0], out[1]);
+        assert_eq!(out[1], out[2]);
+        assert!((out[0] as i32 - 141).abs() <= 1, "gray ~141, got {}", out[0]);
+    }
+
+    #[test]
+    fn monochrome_off_is_identity() {
+        let mut p = PreviewParams::default();
+        p.mono_on = false;
+        assert!(p.is_identity());
+        let base = vec![200u8, 60, 40];
+        assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &p), base);
     }
 
     #[test]

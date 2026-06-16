@@ -122,7 +122,8 @@ C FFI trampolines for tags. 61 DB tests passing.
   `darkroom-core` IOP* over the decoded 8-bit preview, re-uploading a
   `gdk::MemoryTexture`. Stages so far (pixelpipe order): `exposure` (black+EV) →
   `velvia` (strength) → `splittoning` (shadow/highlight hue+sat, balance,
-  compress). RGBA-loop IOPs share a `run_rgba_stage` helper. A stand-in for a
+  compress) → `monochrome` (channelmixer GRAY B&W mix, ui-18). RGBA-loop IOPs
+  share a `run_rgba_stage` helper. A stand-in for a
   real Rust pixelpipe — it processes the 8-bit pixbuf, not raw pipeline output,
   but exercises the genuine UI↔core seam.
 - **Per-module param widgets (ui-14/15)**: the preview params live in their
