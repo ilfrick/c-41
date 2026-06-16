@@ -8,8 +8,9 @@
 //! with `Rc` data) so every callback re-runs `crate::preview::apply_pipeline`,
 //! refreshes the histogram, and repaints. A header before/after toggle shows
 //! the unprocessed image on demand (ui-17); a Reset action restores defaults and
-//! rebuilds the panel (ui-19). Remaining catalog modules stay as inert toggle
-//! rows. Navigation back to the lighttable is via the NavigationView pop action.
+//! rebuilds the panel (ui-19); clicking the image samples the processed pixel
+//! into a colour-picker readout (ui-20). Remaining catalog modules stay as inert
+//! toggle rows. Navigation back to the lighttable is via the NavigationView pop.
 
 use adw::prelude::*;
 use glib::clone;
@@ -17,6 +18,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use crate::dialogs;
 use crate::preview::{Histogram, PreviewParams};
+
+/// Placeholder shown in the colour-picker readout before/after a sample.
+const PICKER_PROMPT: &str = "Pick: click the image to sample a pixel";
 
 /// Decoded preview image kept for live re-processing.
 #[derive(Clone)]
@@ -36,11 +40,25 @@ struct BaseImage {
 struct PreviewCtx {
     picture: glib::WeakRef<gtk4::Picture>,
     hist_area: glib::WeakRef<gtk4::DrawingArea>,
+    /// Colour-picker readout; reset to its prompt on each re-render so a stale
+    /// sample never lingers after an edit changes the displayed pixels.
+    picker: glib::WeakRef<gtk4::Label>,
     base: Rc<RefCell<Option<BaseImage>>>,
     params: Rc<RefCell<PreviewParams>>,
     hist: Rc<RefCell<Histogram>>,
     /// While set, the preview shows the unprocessed image (before/after toggle).
     bypass: Rc<std::cell::Cell<bool>>,
+}
+
+/// The params the preview is currently showing: the live params, or their
+/// bypassed (all-stages-off) form while the before/after toggle is active.
+fn effective_params(ctx: &PreviewCtx) -> PreviewParams {
+    let p = *ctx.params.borrow();
+    if ctx.bypass.get() {
+        p.bypassed()
+    } else {
+        p
+    }
 }
 
 /// Re-run the pipeline over the base preview, refresh the histogram, and repaint
@@ -49,11 +67,7 @@ struct PreviewCtx {
 /// image has decoded or if the page widgets have been dropped.
 fn render_preview(ctx: &PreviewCtx) {
     let Some(picture) = ctx.picture.upgrade() else { return };
-    let params = if ctx.bypass.get() {
-        ctx.params.borrow().bypassed()
-    } else {
-        *ctx.params.borrow()
-    };
+    let params = effective_params(ctx);
     if let Some(b) = ctx.base.borrow().as_ref() {
         let (w, h) = (b.width as usize, b.height as usize);
         let processed = crate::preview::apply_pipeline(&b.bytes, w, h, b.rowstride, b.nch, &params);
@@ -71,6 +85,11 @@ fn render_preview(ctx: &PreviewCtx) {
         let gbytes = glib::Bytes::from_owned(processed);
         let tex = gtk4::gdk::MemoryTexture::new(b.width, b.height, fmt, &gbytes, b.rowstride);
         picture.set_paintable(Some(&tex));
+
+        // The displayed pixels just changed; any prior pick is now stale.
+        if let Some(label) = ctx.picker.upgrade() {
+            label.set_text(PICKER_PROMPT);
+        }
     }
 }
 
@@ -98,10 +117,21 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .hexpand(true)
         .build();
 
+    // ── Colour-picker readout (populated by the click gesture below) ───────
+    let picker_label = gtk4::Label::builder()
+        .label(PICKER_PROMPT)
+        .xalign(0.0)
+        .margin_start(8)
+        .margin_top(2)
+        .margin_bottom(4)
+        .build();
+    picker_label.add_css_class("monospace");
+
     // Shared live-preview state.
     let ctx = PreviewCtx {
         picture: picture.downgrade(),
         hist_area: hist_area.downgrade(),
+        picker: picker_label.downgrade(),
         base: Rc::new(RefCell::new(None)),
         params: Rc::new(RefCell::new(PreviewParams::default())),
         hist: Rc::new(RefCell::new([[0u32; 256]; 3])),
@@ -139,7 +169,40 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         }
     }));
 
-    // ── Left: image over histogram ─────────────────────────────────────────
+    // ── Colour picker: click the image to read the processed pixel ─────────
+    let click = gtk4::GestureClick::new();
+    let pick_ctx = ctx.clone();
+    let pick_pic = picture.downgrade();
+    let pick_label = picker_label.downgrade();
+    click.connect_pressed(move |_, _n, x, y| {
+        let (Some(pic), Some(label)) = (pick_pic.upgrade(), pick_label.upgrade()) else {
+            return;
+        };
+        if let Some(b) = pick_ctx.base.borrow().as_ref() {
+            let (w, h) = (b.width as usize, b.height as usize);
+            match crate::preview::map_widget_to_image(
+                pic.width() as f64, pic.height() as f64, w, h, x, y,
+            ) {
+                Some((px, py)) => {
+                    // Sample what's displayed: re-run the (bypass-aware) pipeline.
+                    let processed = crate::preview::apply_pipeline(
+                        &b.bytes, w, h, b.rowstride, b.nch, &effective_params(&pick_ctx),
+                    );
+                    if let Some((r, g, bl)) =
+                        crate::preview::sample_pixel(&processed, w, h, b.rowstride, b.nch, px, py)
+                    {
+                        label.set_text(&format!(
+                            "Pick ({px},{py}):  R {r}  G {g}  B {bl}   #{r:02X}{g:02X}{bl:02X}"
+                        ));
+                    }
+                }
+                None => label.set_text("Pick: (outside image)"),
+            }
+        }
+    });
+    picture.add_controller(click);
+
+    // ── Left: image over histogram + picker readout ────────────────────────
     let image_area = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .hexpand(true)
@@ -147,6 +210,7 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
     image_area.append(&picture);
     image_area.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     image_area.append(&hist_area);
+    image_area.append(&picker_label);
 
     // ── IOP module list (right panel) — hosts the live param widgets ───────
     let (modules_panel, panel_box) = build_modules_panel(&ctx);

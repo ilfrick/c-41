@@ -277,6 +277,60 @@ pub fn compute_histogram(
     h
 }
 
+/// Map a click at widget-space `(x, y)` to an image pixel `(col, row)` for a
+/// `Picture` using `ContentFit::Contain` (image scaled to fit, preserving aspect,
+/// centred with letterbox/pillarbox bars). Returns `None` when the click lands on
+/// the bars (outside the image) or for degenerate sizes.
+pub fn map_widget_to_image(
+    widget_w: f64,
+    widget_h: f64,
+    img_w: usize,
+    img_h: usize,
+    x: f64,
+    y: f64,
+) -> Option<(usize, usize)> {
+    if img_w == 0 || img_h == 0 || widget_w <= 0.0 || widget_h <= 0.0 {
+        return None;
+    }
+    let (iwf, ihf) = (img_w as f64, img_h as f64);
+    let scale = (widget_w / iwf).min(widget_h / ihf); // Contain: fit the tighter axis
+    let (disp_w, disp_h) = (iwf * scale, ihf * scale);
+    let (off_x, off_y) = ((widget_w - disp_w) / 2.0, (widget_h - disp_h) / 2.0);
+    let ix = (x - off_x) / scale;
+    let iy = (y - off_y) / scale;
+    if ix < 0.0 || iy < 0.0 || ix >= iwf || iy >= ihf {
+        return None;
+    }
+    Some((ix as usize, iy as usize))
+}
+
+/// Read the RGB triplet at image pixel `(x, y)` from an 8-bit interleaved buffer
+/// (alpha ignored). Greyscale (<3 colour channels) replicates its last channel.
+/// Returns `None` if the pixel is out of range or the buffer is too short.
+pub fn sample_pixel(
+    buf: &[u8],
+    width: usize,
+    height: usize,
+    rowstride: usize,
+    nch: usize,
+    x: usize,
+    y: usize,
+) -> Option<(u8, u8, u8)> {
+    if nch == 0 || x >= width || y >= height {
+        return None;
+    }
+    let colour = nch.min(3);
+    let p = y * rowstride + x * nch;
+    if p + colour > buf.len() {
+        return None;
+    }
+    Some((
+        buf[p],
+        buf[p + 1.min(colour - 1)],
+        buf[p + 2.min(colour - 1)],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +501,34 @@ mod tests {
     #[test]
     fn histogram_degenerate_input_is_empty() {
         assert_eq!(compute_histogram(&[], 0, 0, 0, 0), [[0u32; 256]; 3]);
+    }
+
+    #[test]
+    fn widget_to_image_maps_centre_and_letterbox() {
+        // 200x100 widget, 100x100 image → Contain scale 1.0, pillarbox: image
+        // occupies x∈[50,150), full height. Centre of widget → image (50,50).
+        assert_eq!(map_widget_to_image(200.0, 100.0, 100, 100, 100.0, 50.0), Some((50, 50)));
+        // left bar (x=10) is outside the image
+        assert_eq!(map_widget_to_image(200.0, 100.0, 100, 100, 10.0, 50.0), None);
+        // just inside the left image edge (x=50) → col 0
+        assert_eq!(map_widget_to_image(200.0, 100.0, 100, 100, 50.0, 50.0), Some((0, 50)));
+        // a 2x downscale: 100x100 widget, 200x200 image → scale 0.5, no bars
+        assert_eq!(map_widget_to_image(100.0, 100.0, 200, 200, 10.0, 20.0), Some((20, 40)));
+        // degenerate
+        assert_eq!(map_widget_to_image(0.0, 100.0, 100, 100, 1.0, 1.0), None);
+        assert_eq!(map_widget_to_image(100.0, 100.0, 0, 0, 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn sample_pixel_reads_rgb_and_bounds_check() {
+        // 2x1 RGB with row padding
+        let buf = vec![10u8, 20, 30, 40, 50, 60, 0xFF, 0xFF];
+        assert_eq!(sample_pixel(&buf, 2, 1, 8, 3, 0, 0), Some((10, 20, 30)));
+        assert_eq!(sample_pixel(&buf, 2, 1, 8, 3, 1, 0), Some((40, 50, 60)));
+        assert_eq!(sample_pixel(&buf, 2, 1, 8, 3, 2, 0), None); // x out of range
+        // greyscale replicates the single channel
+        let g = vec![77u8, 88];
+        assert_eq!(sample_pixel(&g, 2, 1, 2, 1, 0, 0), Some((77, 77, 77)));
     }
 
     #[test]

@@ -156,8 +156,9 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    raw→scene-referred pixelpipe orchestrator (currently C) so the preview runs
    on pipeline output, not the 8-bit pixbuf.
 3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**),
-   before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), color
-   picker.
+   before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), colour
+   picker (**done, ui-20**: click-to-sample the processed pixel; pure
+   coordinate-mapping + sampling helpers in `preview.rs`).
 4. *Remaining views/panels* — port src/libs panels (history stack, snapshots,
    tagging, export) and the other views.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
