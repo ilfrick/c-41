@@ -154,6 +154,34 @@ pub fn xyz_d65_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], xyz[3]]
 }
 
+// ── sRGB transfer function (encoded ↔ linear) ────────────────────────────────
+// The matrices above operate on *linear* sRGB; these convert between the
+// gamma-encoded sRGB a display/8-bit image stores and linear light. Standard
+// IEC 61966-2-1 piecewise curve.
+
+/// Gamma-encoded sRGB component [0,1] → linear light. Inputs ≤ 0 pass through
+/// the linear segment (no `powf` on negatives), so it's safe for any value.
+#[inline]
+pub fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear light → gamma-encoded sRGB component. Values ≤ 0.0031308 (incl.
+/// negatives from an over-aggressive edit) take the linear segment, so `powf`
+/// only ever sees positive inputs; the caller clamps the result to [0,1].
+#[inline]
+pub fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 /// Polar LCh → Cartesian Lab (h is normalized 0..1, same as dt_LCH_2_Lab).
 pub fn lch_to_lab(lch: [f32; 4]) -> [f32; 4] {
     let h = lch[2] * std::f32::consts::TAU;
@@ -878,6 +906,26 @@ mod ucs_tests {
         [0.0, 0.0, 1.0, 0.0],
         [0.0, 0.0, 0.0, 0.0],
     ];
+
+    #[test]
+    fn srgb_transfer_known_points_and_roundtrip() {
+        // endpoints exact
+        assert!((srgb_to_linear(0.0)).abs() < 1e-7);
+        assert!((srgb_to_linear(1.0) - 1.0).abs() < 1e-5);
+        assert!((linear_to_srgb(0.0)).abs() < 1e-7);
+        assert!((linear_to_srgb(1.0) - 1.0).abs() < 1e-5);
+        // sRGB 0.5 encoded ≈ 0.214 linear (well-known)
+        assert!((srgb_to_linear(0.5) - 0.214).abs() < 1e-3);
+        // round-trips across the range
+        for i in 0..=20 {
+            let c = i as f32 / 20.0;
+            assert!((linear_to_srgb(srgb_to_linear(c)) - c).abs() < 1e-4, "rt {c}");
+        }
+        // negative / out-of-range stay finite (linear segment, no NaN)
+        assert!(linear_to_srgb(-0.1).is_finite());
+        assert!(srgb_to_linear(-0.1).is_finite());
+        assert!(linear_to_srgb(1.5) > 1.0); // overshoot encodes >1, caller clamps
+    }
 
     #[test]
     fn lms_yrg_round_trips() {

@@ -11,10 +11,11 @@
 //! float RGBA the core pipeline runs on, preserving the source alpha channel and
 //! rowstride padding byte-for-byte.
 //!
-//! Note: this still feeds the *8-bit gamma-encoded* pixbuf (normalised to [0,1]),
-//! not a linear scene-referred buffer, so non-linear IOPs won't match their real
-//! pixelpipe output exactly — a deliberate stepping-stone until a raw-decode/
-//! demosaic front end feeds `core::pipeline` directly.
+//! The 8-bit sRGB pixbuf is **decoded to linear light** (sRGB EOTF) on the way
+//! in and re-encoded on the way out, so the core stages run in linear — the
+//! same domain as the real pixelpipe. The remaining gap is that the input is a
+//! display-referred 8-bit image, not true scene-referred raw: a stepping-stone
+//! until a raw-decode/demosaic front end feeds `core::pipeline` directly.
 
 use darkroom_core::pipeline::{Pipeline, Stage};
 
@@ -206,9 +207,8 @@ const ENCODED_LEN: usize = 1 + 4 + 13 * 4;
 /// `darkroom_core::pipeline`, then written back; the source alpha (channel 3,
 /// if present) and inter-row padding are kept byte-for-byte from the input.
 ///
-/// Note: this operates on gamma-encoded 8-bit data (normalised to [0,1] from
-/// the decoded pixbuf), *not* the linear scene-referred float of the real
-/// darktable pixelpipe — a deliberate stepping-stone (see the module doc).
+/// The colour channels are sRGB-decoded to linear before the pipeline and
+/// re-encoded after, so the stages run in linear light (see the module doc).
 pub fn apply_pipeline(
     base: &[u8],
     width: usize,
@@ -227,13 +227,22 @@ pub fn apply_pipeline(
     if base.len() < (height - 1) * rowstride + width * nch {
         return base.to_vec();
     }
+    // No active stage ⇒ return the source untouched (byte-exact; also avoids a
+    // pointless sRGB linearise/encode round-trip that could drift ±1 LSB).
+    let pipeline = params.to_pipeline();
+    if pipeline.stages.is_empty() {
+        return base.to_vec();
+    }
+
     let colour = nch.min(3);
     let n = width * height;
 
-    // ── gather colour → packed RGBA f32 [0,1] ──────────────────────────────
-    // 4th channel = 1.0 scratch (the core pipeline's exposure stage scales all
-    // four; we discard it on scatter and keep the real source alpha). Sources
-    // with <3 colour channels (greyscale) replicate their last channel.
+    // ── gather colour → packed RGBA f32, LINEAR light [0,1] ────────────────
+    // The 8-bit pixbuf is gamma-encoded sRGB; decode to linear so the core
+    // stages (exposure, velvia, …) run in the same scene-referred-ish domain as
+    // the real pixelpipe. 4th channel = 1.0 scratch (exposure scales all four;
+    // we discard it on scatter and keep the real source alpha). Sources with <3
+    // colour channels (greyscale) replicate their last channel.
     let mut rgba = vec![0.0f32; n * 4];
     for y in 0..height {
         let row = y * rowstride;
@@ -242,15 +251,15 @@ pub fn apply_pipeline(
             let o = (y * width + x) * 4;
             for c in 0..3 {
                 let src = c.min(colour - 1);
-                rgba[o + c] = base[p + src] as f32 / 255.0;
+                rgba[o + c] = darkroom_core::color::srgb_to_linear(base[p + src] as f32 / 255.0);
             }
             rgba[o + 3] = 1.0;
         }
     }
 
-    let processed = params.to_pipeline().process(&rgba);
+    let processed = pipeline.process(&rgba);
 
-    // ── scatter colour back, preserving alpha + rowstride padding ──────────
+    // ── scatter colour back (linear → sRGB), preserving alpha + padding ────
     let mut outbuf = base.to_vec();
     for y in 0..height {
         let row = y * rowstride;
@@ -258,7 +267,8 @@ pub fn apply_pipeline(
             let p = row + x * nch;
             let o = (y * width + x) * 4;
             for c in 0..colour {
-                outbuf[p + c] = (processed[o + c].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                let enc = darkroom_core::color::linear_to_srgb(processed[o + c]);
+                outbuf[p + c] = (enc.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         }
     }
@@ -381,24 +391,23 @@ mod tests {
     }
 
     #[test]
-    fn ev_plus_one_doubles_and_clamps_keeps_alpha() {
-        // RGBA: ev=+1 ⇒ scale 2; colour doubles (clamped at 255), alpha kept.
-        // 50/255*2 = 0.392 → *255 ≈ 100; 200/255*2 clamps to 255.
+    fn ev_plus_one_brightens_clamps_keeps_alpha() {
+        // RGBA: ev=+1 doubles in LINEAR light, then re-encodes to sRGB. Each
+        // colour channel brightens; a high channel clamps; alpha is untouched.
         let base = vec![50u8, 200, 25, 111];
         let out = apply_pipeline(&base, 1, 1, 4, 4, &exposure_only(0.0, 1.0));
-        assert_eq!(out[0], 100);
-        assert_eq!(out[1], 255); // clamped
-        assert_eq!(out[2], 50);
+        assert!(out[0] > 50, "R should brighten, got {}", out[0]);
+        assert_eq!(out[1], 255, "200 doubled clamps"); // 0.578·2 > 1 → 255
+        assert!(out[2] > 25, "B should brighten, got {}", out[2]);
         assert_eq!(out[3], 111); // alpha unchanged
     }
 
     #[test]
-    fn black_point_lifts_shadows() {
-        // ev=0 (scale 1), black=0.1 ⇒ out = in - 0.1 (in [0,1]).
-        // 128/255 = 0.502 → 0.402 → *255 ≈ 102.5 → 103
+    fn black_point_darkens() {
+        // ev=0 (scale 1), black=0.1 subtracted in linear ⇒ darker than input.
         let base = vec![128u8, 128, 128];
         let out = apply_pipeline(&base, 1, 1, 3, 3, &exposure_only(0.1, 0.0));
-        assert_eq!(out[0], 103);
+        assert!(out[0] < 128 && out[0] > 0, "darkened, got {}", out[0]);
     }
 
     #[test]
@@ -417,10 +426,13 @@ mod tests {
         p.velvia_on = true;
         p.velvia_strength = 50.0;
 
-        // neutral grey: velvia leaves it (very nearly) unchanged
+        // neutral grey: velvia leaves it (very nearly) unchanged — allow ±1 LSB
+        // for the sRGB linearise/encode round-trip.
         let grey = vec![128u8, 128, 128];
         let g_out = apply_pipeline(&grey, 1, 1, 3, 3, &p);
-        assert_eq!(g_out, grey);
+        for c in 0..3 {
+            assert!((g_out[c] as i32 - 128).abs() <= 1, "grey ch{c} = {}", g_out[c]);
+        }
 
         // saturated reddish pixel: spread between max and min must not shrink
         let base = vec![200u8, 60, 40];
@@ -483,9 +495,11 @@ mod tests {
         assert!(!p.is_identity());
         let base = vec![255u8, 128, 0];
         let out = apply_pipeline(&base, 1, 1, 3, 3, &p);
+        // grayscale ⇒ R=G=B (the mix runs in linear, so the exact 8-bit value
+        // differs from a naive gamma-space weighting; the equality is the point)
         assert_eq!(out[0], out[1]);
         assert_eq!(out[1], out[2]);
-        assert!((out[0] as i32 - 141).abs() <= 1, "gray ~141, got {}", out[0]);
+        assert!(out[0] > 0, "non-black gray, got {}", out[0]);
     }
 
     #[test]

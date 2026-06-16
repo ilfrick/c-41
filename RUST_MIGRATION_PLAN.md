@@ -159,10 +159,13 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    chains migrated IOPs over the 8-bit pixbuf, live via the per-module widgets.
    **Core orchestrator landed (m2-1):** `darkroom_core::pipeline` — an ordered
    `Pipeline` of `Stage`s (exposure/velvia/splittoning/monochrome) over a
-   scene-referred **float RGBA** buffer, ping-pong buffered, with the
-   packed-RGBA length contract asserted. Remaining: (a) darkroom-ui adopts
-   `core::pipeline` (m2-2, replacing the 8-bit seam), (b) ROI/(w,h) signature +
-   geometry-aware IOPs, (c) a raw-decode/demosaic front end as the real input.
+   scene-referred **float RGBA** buffer, ping-pong buffered, length-contract
+   asserted. **darkroom-ui adopted it (m2-2)** via `PreviewParams::to_pipeline`,
+   and the preview now runs in **linear light (m2-3)** — sRGB-decode on input /
+   re-encode on output (`color::srgb_to_linear`/`linear_to_srgb`), so stages run
+   in the real pipeline's domain. Remaining: (a) ROI/(w,h) signature +
+   geometry-aware IOPs, (b) a raw-decode/demosaic front end as the real input
+   (replacing the display-referred 8-bit pixbuf), (c) OpenCL.
 3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**),
    before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), colour
    picker (**done, ui-20**: click-to-sample the processed pixel; pure
