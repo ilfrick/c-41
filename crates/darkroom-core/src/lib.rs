@@ -9,6 +9,7 @@ pub mod interp;
 pub mod iop;
 pub mod math;
 pub mod params;
+pub mod pipeline;
 pub mod raw;
 pub mod roi;
 

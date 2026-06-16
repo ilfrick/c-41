@@ -155,11 +155,14 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    live modules, module groups & favourites.
 2. *Live preview* — the load-bearing piece: a Rust pixelpipe driver that runs
    the migrated `darkroom-core` IOPs and paints processed output into the
-   darkroom view. **Bootstrapped (ui-12/ui-13/ui-14):** `preview.rs::apply_pipeline`
-   chains migrated IOPs (exposure → velvia) over the 8-bit pixbuf, live via the
-   per-module widgets. Remaining: (a) more IOP stages, (b) the real
-   raw→scene-referred pixelpipe orchestrator (currently C) so the preview runs
-   on pipeline output, not the 8-bit pixbuf.
+   darkroom view. **Bootstrapped (ui-12/13/14):** `preview.rs::apply_pipeline`
+   chains migrated IOPs over the 8-bit pixbuf, live via the per-module widgets.
+   **Core orchestrator landed (m2-1):** `darkroom_core::pipeline` — an ordered
+   `Pipeline` of `Stage`s (exposure/velvia/splittoning/monochrome) over a
+   scene-referred **float RGBA** buffer, ping-pong buffered, with the
+   packed-RGBA length contract asserted. Remaining: (a) darkroom-ui adopts
+   `core::pipeline` (m2-2, replacing the 8-bit seam), (b) ROI/(w,h) signature +
+   geometry-aware IOPs, (c) a raw-decode/demosaic front end as the real input.
 3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**),
    before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), colour
    picker (**done, ui-20**: click-to-sample the processed pixel; pure
