@@ -4,21 +4,23 @@
 //! — a stepping-stone toward a full Rust pixelpipe (RUST_MIGRATION_PLAN.md
 //! Phase 3 milestone 2).
 //!
-//! Phase 3-ui-13+ generalises the original single-IOP (exposure) seam into a
-//! small pipeline of stages, each backed by a migrated core IOP that works in
-//! RGB [0,1], in pixelpipe order:
-//!   1. **exposure**    — `out = (in - black) * scale`, `scale = 2^ev`
-//!   2. **velvia**      — saturation-weighted chroma boost
-//!   3. **splittoning** — hue toning of shadows / highlights
+//! Phase 3-m2-2: the stage chaining now lives in `darkroom_core::pipeline`.
+//! [`PreviewParams::to_pipeline`] maps the UI sliders (UI ranges) to a
+//! `Pipeline` of physical-param `Stage`s (exposure → velvia → splittoning →
+//! monochrome); [`apply_pipeline`] just marshals the 8-bit pixbuf to/from the
+//! float RGBA the core pipeline runs on, preserving the source alpha channel and
+//! rowstride padding byte-for-byte.
 //!
-//! All run on the colour channels (0..min(3,nch)); any alpha channel and the
-//! rowstride padding are preserved byte-for-byte.
+//! Note: this still feeds the *8-bit gamma-encoded* pixbuf (normalised to [0,1]),
+//! not a linear scene-referred buffer, so non-linear IOPs won't match their real
+//! pixelpipe output exactly — a deliberate stepping-stone until a raw-decode/
+//! demosaic front end feeds `core::pipeline` directly.
 
-use darkroom_core::iop::{channelmixer, exposure, splittoning, velvia};
+use darkroom_core::pipeline::{Pipeline, Stage};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `darkroom-core` IOP, in pixelpipe order
-/// (exposure then velvia).
+/// (exposure → velvia → splittoning → monochrome; see [`Self::to_pipeline`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreviewParams {
     /// Exposure stage on/off.
@@ -160,6 +162,35 @@ impl PreviewParams {
             mono_r: f[10], mono_g: f[11], mono_b: f[12],
         })
     }
+
+    /// Map the UI params to a `darkroom_core::pipeline::Pipeline`, converting UI
+    /// ranges to the physical params the core stages expect (EV→scale, velvia
+    /// strength /100, split compress (c/110)/2) and including only the enabled
+    /// stages that would actually change the image (so a bypassed/neutral set
+    /// yields an empty, identity pipeline).
+    pub fn to_pipeline(&self) -> Pipeline {
+        let mut p = Pipeline::new();
+        if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
+            p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
+        }
+        if self.velvia_on && self.velvia_strength > 0.0 {
+            p.push(Stage::Velvia { strength: self.velvia_strength / 100.0, bias: self.velvia_bias });
+        }
+        if self.split_on {
+            p.push(Stage::Splittoning {
+                shadow_hue: self.split_shadow_hue,
+                shadow_sat: self.split_shadow_sat,
+                highlight_hue: self.split_highlight_hue,
+                highlight_sat: self.split_highlight_sat,
+                balance: self.split_balance,
+                compress: (self.split_compress / 110.0) / 2.0,
+            });
+        }
+        if self.mono_on {
+            p.push(Stage::Monochrome { r: self.mono_r, g: self.mono_g, b: self.mono_b });
+        }
+        p
+    }
 }
 
 /// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
@@ -170,19 +201,14 @@ const ENCODED_LEN: usize = 1 + 4 + 13 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
-/// are normalised to [0,1], chained through the enabled migrated IOPs and
-/// written back; alpha (channel 3, if present) and inter-row padding are kept
-/// byte-for-byte from the input.
+/// are normalised to [0,1] into a packed RGBA `f32` buffer (4th channel = 1.0,
+/// scratch), run through [`PreviewParams::to_pipeline`] /
+/// `darkroom_core::pipeline`, then written back; the source alpha (channel 3,
+/// if present) and inter-row padding are kept byte-for-byte from the input.
 ///
 /// Note: this operates on gamma-encoded 8-bit data (normalised to [0,1] from
 /// the decoded pixbuf), *not* the linear scene-referred float of the real
-/// darktable pixelpipe. IOPs with non-linear behaviour (velvia, tone curves)
-/// will therefore not match their pixelpipe equivalents exactly — this is a
-/// deliberate stepping-stone (see the module doc), not the final pipeline.
-///
-/// Allocation note: each call allocates a few full-image buffers (gather +
-/// per-stage). Acceptable for the stepping-stone preview; reuse a working
-/// buffer once the real pixelpipe orchestrator lands.
+/// darktable pixelpipe — a deliberate stepping-stone (see the module doc).
 pub fn apply_pipeline(
     base: &[u8],
     width: usize,
@@ -204,96 +230,39 @@ pub fn apply_pipeline(
     let colour = nch.min(3);
     let n = width * height;
 
-    // ── gather colour → packed RGB f32 [0,1] ───────────────────────────────
-    // Sources with fewer than 3 colour channels replicate their last channel
-    // (e.g. greyscale → R=G=B); pixbufs are normally 3 or 4 channels.
-    let mut rgb = vec![0.0f32; n * 3];
+    // ── gather colour → packed RGBA f32 [0,1] ──────────────────────────────
+    // 4th channel = 1.0 scratch (the core pipeline's exposure stage scales all
+    // four; we discard it on scatter and keep the real source alpha). Sources
+    // with <3 colour channels (greyscale) replicate their last channel.
+    let mut rgba = vec![0.0f32; n * 4];
     for y in 0..height {
         let row = y * rowstride;
         for x in 0..width {
             let p = row + x * nch;
-            let o = (y * width + x) * 3;
+            let o = (y * width + x) * 4;
             for c in 0..3 {
                 let src = c.min(colour - 1);
-                rgb[o + c] = base[p + src] as f32 / 255.0;
+                rgba[o + c] = base[p + src] as f32 / 255.0;
             }
+            rgba[o + 3] = 1.0;
         }
     }
 
-    // ── exposure stage (operates element-wise on RGB) ──────────────────────
-    if params.exposure_on && (params.ev != 0.0 || params.black != 0.0) {
-        let scale = 2.0f32.powf(params.ev);
-        let mut out = vec![0.0f32; rgb.len()];
-        exposure::process_pixels(&rgb, &mut out, params.black, scale);
-        rgb = out;
-    }
+    let processed = params.to_pipeline().process(&rgba);
 
-    // ── velvia stage (RGBA core loop; see run_rgba_stage) ──────────────────
-    if params.velvia_on && params.velvia_strength > 0.0 {
-        let (strength, bias) = (params.velvia_strength / 100.0, params.velvia_bias);
-        run_rgba_stage(&mut rgb, n, |inp, out| {
-            velvia::process_pixels(inp, out, strength, bias)
-        });
-    }
-
-    // ── split-toning stage (RGBA core loop) ────────────────────────────────
-    if params.split_on {
-        // The C UI compress slider (0..100) is pre-scaled by commit_params.
-        let compress = (params.split_compress / 110.0) / 2.0;
-        let (sh, ss) = (params.split_shadow_hue, params.split_shadow_sat);
-        let (hh, hs) = (params.split_highlight_hue, params.split_highlight_sat);
-        let bal = params.split_balance;
-        run_rgba_stage(&mut rgb, n, |inp, out| {
-            splittoning::process_pixels(inp, out, sh, ss, hh, hs, bal, compress)
-        });
-    }
-
-    // ── monochrome stage (channelmixer GRAY mode; RGBA core loop) ──────────
-    if params.mono_on {
-        // GRAY mode reads only row 0 of rgb_matrix (the R,G,B → gray weights);
-        // the hsl_matrix is unused. operation_mode 1 = OPERATION_MODE_GRAY.
-        let rgb_matrix = [params.mono_r, params.mono_g, params.mono_b, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let hsl_matrix = [0.0f32; 9];
-        run_rgba_stage(&mut rgb, n, |inp, out| {
-            channelmixer::process_pixels(inp, out, &hsl_matrix, &rgb_matrix, 1)
-        });
-    }
-
-    // ── scatter back, preserving alpha + rowstride padding ─────────────────
+    // ── scatter colour back, preserving alpha + rowstride padding ──────────
     let mut outbuf = base.to_vec();
     for y in 0..height {
         let row = y * rowstride;
         for x in 0..width {
             let p = row + x * nch;
-            let o = (y * width + x) * 3;
+            let o = (y * width + x) * 4;
             for c in 0..colour {
-                outbuf[p + c] = (rgb[o + c].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                outbuf[p + c] = (processed[o + c].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         }
     }
     outbuf
-}
-
-/// Run a 4-channel (RGBA) core IOP over the packed 3-wide RGB buffer in place:
-/// repack to RGBA with alpha = 1.0 (these stages only pass alpha through, so the
-/// value is irrelevant and the result alpha is discarded), run `process`, and
-/// copy the RGB channels back. Used for IOPs whose core loop is
-/// `chunks_exact(4)` (velvia, splittoning).
-fn run_rgba_stage(rgb: &mut [f32], n: usize, process: impl Fn(&[f32], &mut [f32])) {
-    let mut rgba = vec![0.0f32; n * 4];
-    for i in 0..n {
-        rgba[i * 4] = rgb[i * 3];
-        rgba[i * 4 + 1] = rgb[i * 3 + 1];
-        rgba[i * 4 + 2] = rgb[i * 3 + 2];
-        rgba[i * 4 + 3] = 1.0;
-    }
-    let mut out = vec![0.0f32; rgba.len()];
-    process(&rgba, &mut out);
-    for i in 0..n {
-        rgb[i * 3] = out[i * 4];
-        rgb[i * 3 + 1] = out[i * 4 + 1];
-        rgb[i * 3 + 2] = out[i * 4 + 2];
-    }
 }
 
 /// Per-channel (R, G, B) 256-bin histogram of an 8-bit interleaved image.
@@ -557,6 +526,39 @@ mod tests {
     #[test]
     fn histogram_degenerate_input_is_empty() {
         assert_eq!(compute_histogram(&[], 0, 0, 0, 0), [[0u32; 256]; 3]);
+    }
+
+    #[test]
+    fn is_identity_matches_empty_pipeline() {
+        // The two "is this a no-op" sources of truth (is_identity gates whether
+        // the caller re-uploads; to_pipeline gates what runs) must agree, or a
+        // visible edit could be skipped. Check across representative configs.
+        let mut cfgs = vec![PreviewParams::default(), PreviewParams::default().bypassed()];
+        let mut on = PreviewParams::default();
+        on.ev = 0.5;
+        cfgs.push(on);
+        let mut v = PreviewParams::default();
+        v.velvia_on = true;
+        v.velvia_strength = 10.0;
+        cfgs.push(v);
+        let mut s = PreviewParams::default();
+        s.split_on = true;
+        cfgs.push(s);
+        let mut m = PreviewParams::default();
+        m.mono_on = true;
+        cfgs.push(m);
+        // velvia enabled but strength 0 ⇒ still identity (matches to_pipeline gate)
+        let mut v0 = PreviewParams::default();
+        v0.velvia_on = true;
+        v0.velvia_strength = 0.0;
+        cfgs.push(v0);
+        for c in cfgs {
+            assert_eq!(
+                c.is_identity(),
+                c.to_pipeline().stages.is_empty(),
+                "is_identity vs empty-pipeline disagree for {c:?}"
+            );
+        }
     }
 
     #[test]
