@@ -85,6 +85,18 @@ impl PreviewParams {
         let split_identity = !self.split_on;
         exp_identity && vel_identity && split_identity
     }
+
+    /// A copy with every stage disabled — `apply_pipeline` with it returns the
+    /// input unchanged. Used by the darkroom view's before/after toggle to show
+    /// the unprocessed image (and its histogram) without disturbing the params.
+    pub fn bypassed(&self) -> Self {
+        Self {
+            exposure_on: false,
+            velvia_on: false,
+            split_on: false,
+            ..*self
+        }
+    }
 }
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
@@ -337,6 +349,22 @@ mod tests {
         assert!(p.is_identity());
         let base = vec![200u8, 60, 40];
         assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &p), base);
+    }
+
+    #[test]
+    fn bypassed_disables_every_stage_and_returns_input() {
+        let mut p = PreviewParams::default();
+        p.ev = 2.0; // would brighten strongly
+        p.velvia_on = true;
+        p.velvia_strength = 80.0;
+        p.split_on = true;
+        let b = p.bypassed();
+        assert!(b.is_identity());
+        // non-stage params (e.g. velvia_strength) are preserved for restore
+        assert_eq!(b.velvia_strength, 80.0);
+        assert_eq!(b.ev, 2.0);
+        let base = vec![60u8, 120, 180];
+        assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &b), base);
     }
 
     #[test]

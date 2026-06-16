@@ -1,12 +1,13 @@
 //! Darkroom editing view — single-image editing with IOP module stack.
 //!
-//! Phase 3-ui-16: the live preview params live in their **module rows** in the
+//! Phase 3-ui-16/17: the live preview params live in their **module rows** in the
 //! right panel (Exposure / Velvia / Split-toning render as `adw::ExpanderRow`s
 //! whose enable switch gates the pipeline stage and whose sliders drive the
 //! params), and a **live RGB histogram** under the image tracks the processed
 //! output. Shared preview state is bundled in [`PreviewCtx`] (weak widget refs
 //! with `Rc` data) so every callback re-runs `crate::preview::apply_pipeline`,
-//! refreshes the histogram, and repaints. Remaining catalog modules stay as
+//! refreshes the histogram, and repaints. A header before/after toggle shows
+//! the unprocessed image on demand (ui-17). Remaining catalog modules stay as
 //! inert toggle rows. Navigation back to the lighttable is via the
 //! NavigationView pop action.
 
@@ -38,6 +39,8 @@ struct PreviewCtx {
     base: Rc<RefCell<Option<BaseImage>>>,
     params: Rc<RefCell<PreviewParams>>,
     hist: Rc<RefCell<Histogram>>,
+    /// While set, the preview shows the unprocessed image (before/after toggle).
+    bypass: Rc<std::cell::Cell<bool>>,
 }
 
 /// Re-run the pipeline over the base preview, refresh the histogram, and repaint
@@ -46,7 +49,11 @@ struct PreviewCtx {
 /// image has decoded or if the page widgets have been dropped.
 fn render_preview(ctx: &PreviewCtx) {
     let Some(picture) = ctx.picture.upgrade() else { return };
-    let params = *ctx.params.borrow();
+    let params = if ctx.bypass.get() {
+        ctx.params.borrow().bypassed()
+    } else {
+        *ctx.params.borrow()
+    };
     if let Some(b) = ctx.base.borrow().as_ref() {
         let (w, h) = (b.width as usize, b.height as usize);
         let processed = crate::preview::apply_pipeline(&b.bytes, w, h, b.rowstride, b.nch, &params);
@@ -98,6 +105,7 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         base: Rc::new(RefCell::new(None)),
         params: Rc::new(RefCell::new(PreviewParams::default())),
         hist: Rc::new(RefCell::new([[0u32; 256]; 3])),
+        bypass: Rc::new(std::cell::Cell::new(false)),
     };
 
     // The histogram paints from the shared `hist` buffer (no widget captured,
@@ -155,6 +163,21 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
     let header = adw::HeaderBar::new();
     let title_widget = adw::WindowTitle::new(&filename, "Darkroom");
     header.set_title_widget(Some(&title_widget));
+
+    // Before/after: while active, show the unprocessed image + its histogram.
+    let before_after_btn = gtk4::ToggleButton::builder()
+        .icon_name("view-reveal-symbolic")
+        .tooltip_text("Show original (before/after)")
+        .build();
+    // Tooltips aren't reliably exposed as the accessible name for icon-only
+    // buttons, so set it explicitly.
+    before_after_btn.update_property(&[gtk4::accessible::Property::Label("Show original")]);
+    let before_after_ctx = ctx.clone();
+    before_after_btn.connect_toggled(move |b| {
+        before_after_ctx.bypass.set(b.is_active());
+        render_preview(&before_after_ctx);
+    });
+    header.pack_start(&before_after_btn);
 
     let export_btn = gtk4::Button::builder()
         .label("Export")
