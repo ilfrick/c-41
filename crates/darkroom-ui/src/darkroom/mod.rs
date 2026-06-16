@@ -157,7 +157,9 @@ fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> Lab
 
     let lbl = gtk4::Label::new(Some(label));
     lbl.set_xalign(0.0);
-    lbl.set_width_chars(7);
+    // Widest param label is 8 chars ("Compress", "Shad hue"); fixing the column
+    // width keeps every slider track left-aligned across rows.
+    lbl.set_width_chars(8);
 
     let row = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
@@ -201,6 +203,7 @@ fn build_modules_panel(
             match mi.label {
                 "Exposure" => pg.add(&exposure_module_row(picture, base, params)),
                 "Velvia" => pg.add(&velvia_module_row(picture, base, params)),
+                "Split-toning" => pg.add(&splittoning_module_row(picture, base, params)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -235,7 +238,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -306,6 +309,54 @@ fn velvia_module_row(
         render_preview(&picture, &base, &params.borrow());
     }));
     expander.add_row(&strength.row);
+
+    expander
+}
+
+/// Split-toning module: an expander whose enable switch gates `split_on` and
+/// whose shadow/highlight hue+saturation, balance and compress sliders drive
+/// the split-toning stage of the preview.
+fn splittoning_module_row(
+    picture: &gtk4::Picture,
+    base: &Rc<RefCell<Option<BaseImage>>>,
+    params: &Rc<RefCell<PreviewParams>>,
+) -> adw::ExpanderRow {
+    let p0 = *params.borrow();
+    let expander = adw::ExpanderRow::builder()
+        .title("Split-toning")
+        .subtitle("shadow / highlight hues")
+        .show_enable_switch(true)
+        .enable_expansion(p0.split_on)
+        .build();
+    expander.connect_enable_expansion_notify(clone!(@weak picture, @strong base, @strong params => move |e| {
+        params.borrow_mut().split_on = e.enables_expansion();
+        render_preview(&picture, &base, &params.borrow());
+    }));
+
+    // Each slider mutates one field then re-renders. Hue/sat/balance are 0..1;
+    // compress is the C 0..100 slider (pre-scaled in apply_pipeline).
+    let add = |label: &str, max: f64, step: f64, init: f64,
+               set: fn(&mut PreviewParams, f32)| {
+        let row = labeled_slider(label, 0.0, max, step, init);
+        row.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
+            set(&mut params.borrow_mut(), s.value() as f32);
+            render_preview(&picture, &base, &params.borrow());
+        }));
+        expander.add_row(&row.row);
+    };
+
+    add("Shad hue", 1.0, 0.001, p0.split_shadow_hue as f64,
+        |p, v| p.split_shadow_hue = v);
+    add("Shad sat", 1.0, 0.01, p0.split_shadow_sat as f64,
+        |p, v| p.split_shadow_sat = v);
+    add("High hue", 1.0, 0.001, p0.split_highlight_hue as f64,
+        |p, v| p.split_highlight_hue = v);
+    add("High sat", 1.0, 0.01, p0.split_highlight_sat as f64,
+        |p, v| p.split_highlight_sat = v);
+    add("Balance", 1.0, 0.01, p0.split_balance as f64,
+        |p, v| p.split_balance = v);
+    add("Compress", 100.0, 1.0, p0.split_compress as f64,
+        |p, v| p.split_compress = v);
 
     expander
 }

@@ -4,16 +4,17 @@
 //! — a stepping-stone toward a full Rust pixelpipe (RUST_MIGRATION_PLAN.md
 //! Phase 3 milestone 2).
 //!
-//! Phase 3-ui-13 generalises the original single-IOP (exposure) seam into a
+//! Phase 3-ui-13+ generalises the original single-IOP (exposure) seam into a
 //! small pipeline of stages, each backed by a migrated core IOP that works in
-//! RGB [0,1]:
-//!   1. **exposure** — `out = (in - black) * scale`, `scale = 2^ev`
-//!   2. **velvia**   — saturation-weighted chroma boost
+//! RGB [0,1], in pixelpipe order:
+//!   1. **exposure**    — `out = (in - black) * scale`, `scale = 2^ev`
+//!   2. **velvia**      — saturation-weighted chroma boost
+//!   3. **splittoning** — hue toning of shadows / highlights
 //!
-//! Both run on the colour channels (0..min(3,nch)); any alpha channel and the
+//! All run on the colour channels (0..min(3,nch)); any alpha channel and the
 //! rowstride padding are preserved byte-for-byte.
 
-use darkroom_core::iop::{exposure, velvia};
+use darkroom_core::iop::{exposure, splittoning, velvia};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `darkroom-core` IOP, in pixelpipe order
@@ -32,10 +33,25 @@ pub struct PreviewParams {
     pub velvia_strength: f32,
     /// Velvia mid-tones bias, 0..1.
     pub velvia_bias: f32,
+    /// Split-toning stage on/off.
+    pub split_on: bool,
+    /// Shadow hue, 0..1 (normalised, = degrees/360).
+    pub split_shadow_hue: f32,
+    /// Shadow saturation, 0..1.
+    pub split_shadow_sat: f32,
+    /// Highlight hue, 0..1.
+    pub split_highlight_hue: f32,
+    /// Highlight saturation, 0..1.
+    pub split_highlight_sat: f32,
+    /// Centre luminance of the shadow→highlight gradient, 0..1.
+    pub split_balance: f32,
+    /// Compress range on the C slider's 0..100 scale (core gets `(c/110)/2`).
+    pub split_compress: f32,
 }
 
 impl Default for PreviewParams {
     fn default() -> Self {
+        // Mirrors the darktable defaults for each IOP.
         Self {
             exposure_on: true,
             black: 0.0,
@@ -43,6 +59,13 @@ impl Default for PreviewParams {
             velvia_on: false,
             velvia_strength: 25.0,
             velvia_bias: 1.0,
+            split_on: false,
+            split_shadow_hue: 0.0,
+            split_shadow_sat: 0.5,
+            split_highlight_hue: 0.2,
+            split_highlight_sat: 0.5,
+            split_balance: 0.5,
+            split_compress: 33.0,
         }
     }
 }
@@ -57,7 +80,10 @@ impl PreviewParams {
         // from arithmetic, so 0.0 is exactly representable here.
         let exp_identity = !self.exposure_on || (self.ev == 0.0 && self.black == 0.0);
         let vel_identity = !self.velvia_on || self.velvia_strength <= 0.0;
-        exp_identity && vel_identity
+        // Split-toning has no value at which it is a strict no-op while enabled
+        // (even sat 0 desaturates toned zones toward luminance), so on==off.
+        let split_identity = !self.split_on;
+        exp_identity && vel_identity && split_identity
     }
 }
 
@@ -116,27 +142,24 @@ pub fn apply_pipeline(
         rgb = out;
     }
 
-    // ── velvia stage (wants RGBA 4-wide chunks; alpha is copied through) ────
+    // ── velvia stage (RGBA core loop; see run_rgba_stage) ──────────────────
     if params.velvia_on && params.velvia_strength > 0.0 {
-        let mut rgba = vec![0.0f32; n * 4];
-        for i in 0..n {
-            rgba[i * 4] = rgb[i * 3];
-            rgba[i * 4 + 1] = rgb[i * 3 + 1];
-            rgba[i * 4 + 2] = rgb[i * 3 + 2];
-            rgba[i * 4 + 3] = 1.0; // velvia only reads alpha to pass it through
-        }
-        let mut out = vec![0.0f32; rgba.len()];
-        velvia::process_pixels(
-            &rgba,
-            &mut out,
-            params.velvia_strength / 100.0,
-            params.velvia_bias,
-        );
-        for i in 0..n {
-            rgb[i * 3] = out[i * 4];
-            rgb[i * 3 + 1] = out[i * 4 + 1];
-            rgb[i * 3 + 2] = out[i * 4 + 2];
-        }
+        let (strength, bias) = (params.velvia_strength / 100.0, params.velvia_bias);
+        run_rgba_stage(&mut rgb, n, |inp, out| {
+            velvia::process_pixels(inp, out, strength, bias)
+        });
+    }
+
+    // ── split-toning stage (RGBA core loop) ────────────────────────────────
+    if params.split_on {
+        // The C UI compress slider (0..100) is pre-scaled by commit_params.
+        let compress = (params.split_compress / 110.0) / 2.0;
+        let (sh, ss) = (params.split_shadow_hue, params.split_shadow_sat);
+        let (hh, hs) = (params.split_highlight_hue, params.split_highlight_sat);
+        let bal = params.split_balance;
+        run_rgba_stage(&mut rgb, n, |inp, out| {
+            splittoning::process_pixels(inp, out, sh, ss, hh, hs, bal, compress)
+        });
     }
 
     // ── scatter back, preserving alpha + rowstride padding ─────────────────
@@ -152,6 +175,28 @@ pub fn apply_pipeline(
         }
     }
     outbuf
+}
+
+/// Run a 4-channel (RGBA) core IOP over the packed 3-wide RGB buffer in place:
+/// repack to RGBA with alpha = 1.0 (these stages only pass alpha through, so the
+/// value is irrelevant and the result alpha is discarded), run `process`, and
+/// copy the RGB channels back. Used for IOPs whose core loop is
+/// `chunks_exact(4)` (velvia, splittoning).
+fn run_rgba_stage(rgb: &mut [f32], n: usize, process: impl Fn(&[f32], &mut [f32])) {
+    let mut rgba = vec![0.0f32; n * 4];
+    for i in 0..n {
+        rgba[i * 4] = rgb[i * 3];
+        rgba[i * 4 + 1] = rgb[i * 3 + 1];
+        rgba[i * 4 + 2] = rgb[i * 3 + 2];
+        rgba[i * 4 + 3] = 1.0;
+    }
+    let mut out = vec![0.0f32; rgba.len()];
+    process(&rgba, &mut out);
+    for i in 0..n {
+        rgb[i * 3] = out[i * 4];
+        rgb[i * 3 + 1] = out[i * 4 + 1];
+        rgb[i * 3 + 2] = out[i * 4 + 2];
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +295,32 @@ mod tests {
         assert!(p.is_identity());
         let base = vec![200u8, 60, 40];
         assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &p), base);
+    }
+
+    #[test]
+    fn splittoning_off_is_identity() {
+        let mut p = PreviewParams::default();
+        p.split_on = false;
+        p.split_shadow_sat = 1.0;
+        assert!(p.is_identity());
+        let base = vec![200u8, 60, 40];
+        assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &p), base);
+    }
+
+    #[test]
+    fn splittoning_tones_a_dark_pixel_toward_shadow_hue() {
+        // Dark, near-neutral pixel in the shadow zone: a red shadow hue (0.0)
+        // at full saturation must push red above blue.
+        let mut p = PreviewParams::default();
+        p.exposure_on = false; // isolate the split-toning stage
+        p.split_on = true;
+        p.split_shadow_hue = 0.0; // red
+        p.split_shadow_sat = 1.0;
+        p.split_balance = 0.5;
+        p.split_compress = 0.0; // widest toning range
+        assert!(!p.is_identity());
+        let base = vec![30u8, 30, 30];
+        let out = apply_pipeline(&base, 1, 1, 3, 3, &p);
+        assert!(out[0] > out[2], "red {} should exceed blue {}", out[0], out[2]);
     }
 }

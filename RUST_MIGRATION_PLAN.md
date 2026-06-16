@@ -118,16 +118,19 @@ C FFI trampolines for tags. 61 DB tests passing.
 - **Navigation**: `adw::NavigationView` lighttable ⇄ darkroom (double-click).
 - **Darkroom view**: grouped IOP **module panel** sourced from a real module
   catalog, Export, and a **live multi-IOP preview pipeline** (`preview.rs`,
-  ui-12/ui-13): `PreviewParams` drives stages each chaining a *migrated
-  `darkroom-core` IOP* (`exposure::process_pixels`, `velvia::process_pixels`)
-  over the decoded 8-bit preview, re-uploading a `gdk::MemoryTexture`. A
-  stand-in for a real Rust pixelpipe — it processes the 8-bit pixbuf, not raw
-  pipeline output, but exercises the genuine UI↔core seam.
-- **Per-module param widgets (ui-14)**: the preview params now live in their
+  ui-12/13/15): `PreviewParams` drives stages each chaining a *migrated
+  `darkroom-core` IOP* over the decoded 8-bit preview, re-uploading a
+  `gdk::MemoryTexture`. Stages so far (pixelpipe order): `exposure` (black+EV) →
+  `velvia` (strength) → `splittoning` (shadow/highlight hue+sat, balance,
+  compress). RGBA-loop IOPs share a `run_rgba_stage` helper. A stand-in for a
+  real Rust pixelpipe — it processes the 8-bit pixbuf, not raw pipeline output,
+  but exercises the genuine UI↔core seam.
+- **Per-module param widgets (ui-14/15)**: the preview params live in their
   **module rows** in the panel, not a separate bar. Live modules (Exposure,
-  Velvia) render as `adw::ExpanderRow`s whose built-in enable switch gates the
-  pipeline stage (`exposure_on`/`velvia_on`) and whose child sliders drive the
-  params; this converges the module-stack UI with the preview pipeline.
+  Velvia, Split-toning) render as `adw::ExpanderRow`s whose built-in enable
+  switch gates the pipeline stage (`*_on`) and whose child sliders drive the
+  params; this converges the module-stack UI with the preview pipeline. A
+  `catalog_has_live_modules` test guards the label→module dispatch.
 
 **This replaces (eventually):** `src/views/` (7: lighttable, darkroom, map,
 print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
