@@ -52,6 +52,65 @@ pub fn history_list(conn: &Connection, imgid: dt_imgid_t) -> rusqlite::Result<Ve
     Ok(rows)
 }
 
+/// Fields for a new `main.history` row. `op_params` is an opaque BLOB — the
+/// serialised module parameters; its layout (and C-compatibility) is the
+/// caller's concern. A struct (not positional args) keeps the two `i32` fields
+/// (`module_version`, `multi_priority`) from being swapped at call sites.
+pub struct NewHistoryEntry<'a> {
+    pub imgid: dt_imgid_t,
+    pub num: i32,
+    pub operation: &'a str,
+    /// The IOP version (the `module` column). darktable's reader compares this
+    /// to the module's current version and rejects / legacy-converts the row on
+    /// mismatch — a NULL/0 here would invalidate the row on load, so a faithful
+    /// writer must set it (`develop.c` binds `module->version()` here).
+    pub module_version: i32,
+    pub enabled: bool,
+    pub op_params: &'a [u8],
+    pub multi_priority: i32,
+    pub multi_name: &'a str,
+}
+
+/// Append a history entry. Mirrors the `INSERT INTO main.history` in
+/// `dt_dev_write_history_item()` (history.c).
+///
+/// Pure append: the caller owns `num` and MUST keep `(imgid, num)` unique
+/// (e.g. `history_get_max_num + 1`). The table has no UNIQUE constraint, so a
+/// colliding `num` inserts a duplicate row that the C reader mis-loads as two
+/// modules at one step.
+pub fn history_add_entry(conn: &Connection, e: &NewHistoryEntry<'_>) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO main.history \
+            (imgid, num, module, operation, op_params, enabled, multi_priority, multi_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            e.imgid, e.num, e.module_version, e.operation, e.op_params,
+            e.enabled as i32, e.multi_priority, e.multi_name
+        ],
+    )?;
+    Ok(())
+}
+
+/// Return the `op_params` BLOB of the highest-`num` (most recent) entry for the
+/// given operation on an image, or `None` if the operation isn't in the history.
+/// Used to restore a module's last-saved parameters.
+pub fn history_get_op_params(
+    conn: &Connection,
+    imgid: dt_imgid_t,
+    operation: &str,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT op_params FROM main.history \
+         WHERE imgid = ?1 AND operation = ?2 ORDER BY num DESC LIMIT 1",
+        params![imgid, operation],
+        |row| row.get::<_, Option<Vec<u8>>>(0),
+    )
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other),
+    })
+}
+
 /// Delete all history for an image.
 /// Mirrors the core of `dt_history_delete_on_image()` in history.c.
 pub fn history_delete_on_image(conn: &Connection, imgid: dt_imgid_t) -> rusqlite::Result<()> {
@@ -78,10 +137,10 @@ pub fn history_get_max_num(conn: &Connection, imgid: dt_imgid_t) -> rusqlite::Re
     conn.query_row(
         "SELECT MAX(num) FROM main.history WHERE imgid = ?1",
         params![imgid],
-        |row| row.get(0),
+        // `Option` is load-bearing: `MAX(num)` over an empty history returns one
+        // row holding NULL, so reading as `i32` would error/panic.
+        |row| row.get::<_, Option<i32>>(0),
     )
-    .map_err(|e| e)
-    .map(|v: Option<i32>| v)
 }
 
 /// Check if a given operation name exists in the history.
@@ -116,12 +175,15 @@ mod tests {
         let conn = Connection::open_with_flags(
             &format!("file:hist_main{n}?mode=memory&cache=shared"), flags,
         ).unwrap();
+        // Mirror the production main.history shape (database.c:3516), incl.
+        // module + multi_name_hand_edited, so tests exercise the real columns.
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS main.history (
                 imgid INTEGER, num INTEGER, module INTEGER,
-                operation VARCHAR, op_params BLOB, enabled INTEGER,
+                operation VARCHAR(256), op_params BLOB, enabled INTEGER,
                 blendop_params BLOB, blendop_version INTEGER,
-                multi_priority INTEGER, multi_name VARCHAR
+                multi_priority INTEGER, multi_name VARCHAR(256),
+                multi_name_hand_edited INTEGER
             );
         ").unwrap();
         // Seed two history entries for image 1
@@ -199,5 +261,98 @@ mod tests {
     fn module_exists_false_for_absent_op() {
         let db = open_test_db();
         assert!(!history_module_exists(&db, 1, "sharpen").unwrap());
+    }
+
+    /// Build a velvia-ish entry for image 1 with module_version 1.
+    fn entry<'a>(num: i32, op: &'a str, op_params: &'a [u8]) -> NewHistoryEntry<'a> {
+        NewHistoryEntry {
+            imgid: 1,
+            num,
+            operation: op,
+            module_version: 1,
+            enabled: true,
+            op_params,
+            multi_priority: 0,
+            multi_name: "",
+        }
+    }
+
+    #[test]
+    fn add_entry_appends_and_roundtrips_op_params() {
+        let db = open_test_db();
+        let blob = vec![1u8, 2, 3, 4, 250];
+        history_add_entry(&db, &entry(3, "velvia", &blob)).unwrap();
+        assert_eq!(history_count(&db, 1).unwrap(), 4);
+        let got = history_get_op_params(&db, 1, "velvia").unwrap();
+        assert_eq!(got.as_deref(), Some(blob.as_slice()));
+        // the appended entry is listed in num order at the end
+        let entries = history_list(&db, 1).unwrap();
+        assert_eq!(entries.last().unwrap().operation, "velvia");
+        assert!(entries.last().unwrap().enabled);
+    }
+
+    #[test]
+    fn add_entry_writes_module_version_column() {
+        let db = open_test_db();
+        let mut e = entry(3, "velvia", &[1, 2]);
+        e.module_version = 7;
+        history_add_entry(&db, &e).unwrap();
+        let m: i32 = db
+            .query_row(
+                "SELECT module FROM main.history WHERE imgid=1 AND operation='velvia'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(m, 7); // not NULL/0 — would otherwise invalidate the row on C load
+    }
+
+    #[test]
+    fn get_op_params_returns_latest_num() {
+        let db = open_test_db();
+        history_add_entry(&db, &entry(5, "velvia", &[10])).unwrap();
+        history_add_entry(&db, &entry(7, "velvia", &[20])).unwrap(); // newer num
+        history_add_entry(&db, &entry(6, "velvia", &[15])).unwrap(); // older num
+        assert_eq!(
+            history_get_op_params(&db, 1, "velvia").unwrap().as_deref(),
+            Some([20u8].as_slice())
+        );
+    }
+
+    #[test]
+    fn empty_blob_roundtrips_as_some_empty() {
+        let db = open_test_db();
+        history_add_entry(&db, &entry(3, "velvia", &[])).unwrap();
+        assert_eq!(history_get_op_params(&db, 1, "velvia").unwrap(), Some(vec![]));
+    }
+
+    #[test]
+    fn null_op_params_reads_as_none() {
+        // A NULL op_params blob is reported as None — same as no row. That's the
+        // intended conflation for "no params to restore".
+        let db = open_test_db();
+        db.execute(
+            "INSERT INTO main.history (imgid, num, operation, op_params, enabled) \
+             VALUES (1, 9, 'velvia', NULL, 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(history_get_op_params(&db, 1, "velvia").unwrap(), None);
+    }
+
+    #[test]
+    fn duplicate_imgid_num_both_inserted() {
+        // No UNIQUE on (imgid, num): a colliding num yields two rows (documents
+        // that the UI layer must own num uniqueness).
+        let db = open_test_db();
+        history_add_entry(&db, &entry(3, "velvia", &[1])).unwrap();
+        history_add_entry(&db, &entry(3, "sharpen", &[2])).unwrap();
+        assert_eq!(history_count(&db, 1).unwrap(), 5);
+    }
+
+    #[test]
+    fn get_op_params_none_for_absent_op() {
+        let db = open_test_db();
+        assert_eq!(history_get_op_params(&db, 1, "sharpen").unwrap(), None);
     }
 }
