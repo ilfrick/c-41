@@ -7,9 +7,9 @@
 //! output. Shared preview state is bundled in [`PreviewCtx`] (weak widget refs
 //! with `Rc` data) so every callback re-runs `crate::preview::apply_pipeline`,
 //! refreshes the histogram, and repaints. A header before/after toggle shows
-//! the unprocessed image on demand (ui-17). Remaining catalog modules stay as
-//! inert toggle rows. Navigation back to the lighttable is via the
-//! NavigationView pop action.
+//! the unprocessed image on demand (ui-17); a Reset action restores defaults and
+//! rebuilds the panel (ui-19). Remaining catalog modules stay as inert toggle
+//! rows. Navigation back to the lighttable is via the NavigationView pop action.
 
 use adw::prelude::*;
 use glib::clone;
@@ -149,7 +149,7 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
     image_area.append(&hist_area);
 
     // ── IOP module list (right panel) — hosts the live param widgets ───────
-    let modules_panel = build_modules_panel(&ctx);
+    let (modules_panel, panel_box) = build_modules_panel(&ctx);
 
     // ── Split view: image | modules ────────────────────────────────────────
     let content = gtk4::Box::builder()
@@ -178,6 +178,31 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         render_preview(&before_after_ctx);
     });
     header.pack_start(&before_after_btn);
+
+    // Reset: restore default params and rebuild the panel so the sliders follow.
+    let reset_btn = gtk4::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Reset all adjustments")
+        .build();
+    reset_btn.update_property(&[gtk4::accessible::Property::Label("Reset all adjustments")]);
+    let reset_ctx = ctx.clone();
+    let reset_panel = panel_box.downgrade();
+    let reset_ba = before_after_btn.downgrade();
+    reset_btn.connect_clicked(move |_| {
+        *reset_ctx.params.borrow_mut() = PreviewParams::default();
+        reset_ctx.bypass.set(false); // source of truth for bypass
+        if let Some(ba) = reset_ba.upgrade() {
+            ba.set_active(false); // sync the button visual (bypass already cleared)
+        }
+        if let Some(panel) = reset_panel.upgrade() {
+            while let Some(child) = panel.first_child() {
+                panel.remove(&child);
+            }
+            populate_modules(&panel, &reset_ctx);
+        }
+        render_preview(&reset_ctx);
+    });
+    header.pack_start(&reset_btn);
 
     let export_btn = gtk4::Button::builder()
         .label("Export")
@@ -242,7 +267,7 @@ fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> Lab
 /// IOP (Exposure, Velvia) render as expandable rows with a live enable switch
 /// and parameter sliders wired to the preview pipeline; the rest are inert
 /// enable-toggle rows (history-stack wiring is a later milestone).
-fn build_modules_panel(ctx: &PreviewCtx) -> gtk4::Widget {
+fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
     let panel = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(12)
@@ -251,7 +276,28 @@ fn build_modules_panel(ctx: &PreviewCtx) -> gtk4::Widget {
         .margin_start(12)
         .margin_end(12)
         .build();
+    populate_modules(&panel, ctx);
 
+    // Scrollable so the (long) module list never blows out the window height.
+    let scrolled = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .width_request(320)
+        .child(&panel)
+        .build();
+    (scrolled.upcast(), panel)
+}
+
+/// (Re)build the module rows into `panel`, seeding each live module's widgets
+/// from the current `ctx.params`. Called on first build and on Reset (after the
+/// panel is cleared) so the sliders reflect the reset defaults.
+///
+/// Invariant for module builders: set each widget's *initial* value (slider
+/// value, `enable_expansion`) **before** connecting its `value_changed` /
+/// `*_notify` handler. Otherwise this rebuild — run inside the Reset handler —
+/// would fire those handlers per row and re-enter `render_preview` mid-rebuild.
+/// `module_expander`/`add_param_slider` already follow this (build then connect).
+fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     let header = gtk4::Label::builder()
         .label("Modules")
         .halign(gtk4::Align::Start)
@@ -272,15 +318,6 @@ fn build_modules_panel(ctx: &PreviewCtx) -> gtk4::Widget {
         }
         panel.append(&pg);
     }
-
-    // Scrollable so the (long) module list never blows out the window height.
-    gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vexpand(true)
-        .width_request(320)
-        .child(&panel)
-        .build()
-        .upcast()
 }
 
 /// A placeholder module row: title + enable switch not yet wired to anything.
