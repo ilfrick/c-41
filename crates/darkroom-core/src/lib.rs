@@ -11,6 +11,7 @@ pub mod math;
 pub mod params;
 pub mod pipeline;
 pub mod raw;
+pub mod rawimage;
 pub mod roi;
 
 pub use error::Error;

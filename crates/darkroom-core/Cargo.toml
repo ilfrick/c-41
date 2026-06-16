@@ -13,3 +13,6 @@ crate-type = ["cdylib", "rlib"]
 darkroom-sys = { workspace = true }
 anyhow       = { workspace = true }
 rayon        = { workspace = true }
+# Pinned exactly: Cargo.lock is gitignored (CI resolves fresh), and a silent
+# minor bump in the raw decoder must not change how irreplaceable raws decode.
+rawloader    = "=0.37.1"

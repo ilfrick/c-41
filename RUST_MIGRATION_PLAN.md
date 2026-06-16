@@ -163,9 +163,13 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    asserted. **darkroom-ui adopted it (m2-2)** via `PreviewParams::to_pipeline`,
    and the preview now runs in **linear light (m2-3)** — sRGB-decode on input /
    re-encode on output (`color::srgb_to_linear`/`linear_to_srgb`), so stages run
-   in the real pipeline's domain. Remaining: (a) ROI/(w,h) signature +
-   geometry-aware IOPs, (b) a raw-decode/demosaic front end as the real input
-   (replacing the display-referred 8-bit pixbuf), (c) OpenCL.
+   in the real pipeline's domain. **Raw front end started (m2-4a):**
+   `darkroom_core::rawimage` decodes camera raws via the pure-Rust `rawloader`
+   (pinned `=0.37.1`) into a black/white-normalised linear CFA mosaic
+   (`normalize_cfa`); Bayer only (X-Trans 6x6 rejected until its demosaic is
+   wired). Remaining: (a) CFA->RGBA demosaic + white balance to feed `pipeline`;
+   (b) wire the raw path into darkroom-ui (replacing the 8-bit pixbuf for raws);
+   (c) ROI/(w,h) signature + geometry-aware IOPs; (d) OpenCL.
 3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**),
    before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), colour
    picker (**done, ui-20**: click-to-sample the processed pixel; pure
