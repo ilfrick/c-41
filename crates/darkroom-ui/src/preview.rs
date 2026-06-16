@@ -115,6 +115,11 @@ pub fn apply_pipeline(
     if nch == 0 || width == 0 || height == 0 {
         return base.to_vec();
     }
+    // Defensive: a malformed pixbuf (rowstride/len smaller than the geometry
+    // implies) would otherwise panic on indexing user-supplied image data.
+    if base.len() < (height - 1) * rowstride + width * nch {
+        return base.to_vec();
+    }
     let colour = nch.min(3);
     let n = width * height;
 
@@ -197,6 +202,43 @@ fn run_rgba_stage(rgb: &mut [f32], n: usize, process: impl Fn(&[f32], &mut [f32]
         rgb[i * 3 + 1] = out[i * 4 + 1];
         rgb[i * 3 + 2] = out[i * 4 + 2];
     }
+}
+
+/// Per-channel (R, G, B) 256-bin histogram of an 8-bit interleaved image.
+pub type Histogram = [[u32; 256]; 3];
+
+/// Compute the [`Histogram`] of an 8-bit interleaved buffer, honouring
+/// rowstride and channel count; alpha (channel 3) is ignored. Sources with
+/// fewer than 3 colour channels (greyscale) count their last channel into all
+/// three. Intended to run over the *processed* preview so the histogram tracks
+/// the live pipeline output.
+pub fn compute_histogram(
+    buf: &[u8],
+    width: usize,
+    height: usize,
+    rowstride: usize,
+    nch: usize,
+) -> Histogram {
+    let mut h = [[0u32; 256]; 3];
+    if nch == 0 || width == 0 || height == 0 {
+        return h;
+    }
+    // Defensive: short/malformed buffer ⇒ empty histogram rather than a panic.
+    if buf.len() < (height - 1) * rowstride + width * nch {
+        return h;
+    }
+    let colour = nch.min(3);
+    for y in 0..height {
+        let row = y * rowstride;
+        for x in 0..width {
+            let p = row + x * nch;
+            for (c, hc) in h.iter_mut().enumerate() {
+                let src = c.min(colour - 1);
+                hc[buf[p + src] as usize] += 1;
+            }
+        }
+    }
+    h
 }
 
 #[cfg(test)]
@@ -305,6 +347,36 @@ mod tests {
         assert!(p.is_identity());
         let base = vec![200u8, 60, 40];
         assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &p), base);
+    }
+
+    #[test]
+    fn histogram_counts_per_channel_and_respects_rowstride() {
+        // 2x1 RGB, 2 pad bytes at row end: pixels (10,20,30) and (10,40,30).
+        let buf = vec![10u8, 20, 30, 10, 40, 30, 0xFF, 0xFF];
+        let h = compute_histogram(&buf, 2, 1, 8, 3);
+        assert_eq!(h[0][10], 2); // both reds = 10
+        assert_eq!(h[1][20], 1);
+        assert_eq!(h[1][40], 1);
+        assert_eq!(h[2][30], 2); // both blues = 30
+        // total counts per channel == pixel count, padding not counted
+        for c in 0..3 {
+            assert_eq!(h[c].iter().sum::<u32>(), 2);
+        }
+        assert_eq!(h[0][0xFF], 0); // the pad byte must not be counted
+    }
+
+    #[test]
+    fn histogram_degenerate_input_is_empty() {
+        assert_eq!(compute_histogram(&[], 0, 0, 0, 0), [[0u32; 256]; 3]);
+    }
+
+    #[test]
+    fn short_buffer_no_ops_without_panicking() {
+        // Geometry claims 2x2 RGB (needs 12 bytes) but only 3 are supplied.
+        let buf = vec![10u8, 20, 30];
+        assert_eq!(compute_histogram(&buf, 2, 2, 6, 3), [[0u32; 256]; 3]);
+        let p = PreviewParams { ev: 1.0, ..PreviewParams::default() };
+        assert_eq!(apply_pipeline(&buf, 2, 2, 6, 3, &p), buf);
     }
 
     #[test]

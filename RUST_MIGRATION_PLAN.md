@@ -131,6 +131,12 @@ C FFI trampolines for tags. 61 DB tests passing.
   switch gates the pipeline stage (`*_on`) and whose child sliders drive the
   params; this converges the module-stack UI with the preview pipeline. A
   `catalog_has_live_modules` test guards the label→module dispatch.
+- **Live histogram + state refactor (ui-16)**: shared preview state bundled in a
+  `PreviewCtx` (weak widget refs + `Rc` data, no cycles); generic
+  `module_expander`/`add_param_slider` collapse the per-module builders. A
+  `gtk4::DrawingArea` under the image draws a live RGB histogram
+  (`preview::compute_histogram`) of the *processed* output, refreshed each
+  render. Begins **milestone 3** (darkroom interactions).
 
 **This replaces (eventually):** `src/views/` (7: lighttable, darkroom, map,
 print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
@@ -148,7 +154,8 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    per-module widgets. Remaining: (a) more IOP stages, (b) the real
    raw→scene-referred pixelpipe orchestrator (currently C) so the preview runs
    on pipeline output, not the 8-bit pixbuf.
-3. *Darkroom interactions* — zoom/pan, histogram, color picker, before/after.
+3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**), color
+   picker, before/after.
 4. *Remaining views/panels* — port src/libs panels (history stack, snapshots,
    tagging, export) and the other views.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.

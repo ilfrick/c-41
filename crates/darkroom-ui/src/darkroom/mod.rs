@@ -1,21 +1,21 @@
 //! Darkroom editing view — single-image editing with IOP module stack.
 //!
-//! Phase 3-ui-14: the live preview params now live in their **module rows** in
-//! the right panel (not a separate controls bar), converging the module-stack
-//! UI with the preview pipeline. Modules backed by a migrated `darkroom-core`
-//! IOP (Exposure, Velvia) render as `adw::ExpanderRow`s whose built-in enable
-//! switch gates the corresponding pipeline stage (`exposure_on` / `velvia_on`)
-//! and whose child sliders drive the stage params; every change re-runs
-//! `crate::preview::apply_pipeline` over the preview. Remaining catalog modules
-//! stay as inert enable-toggle rows. Navigation back to the lighttable is via
-//! the NavigationView pop action.
+//! Phase 3-ui-16: the live preview params live in their **module rows** in the
+//! right panel (Exposure / Velvia / Split-toning render as `adw::ExpanderRow`s
+//! whose enable switch gates the pipeline stage and whose sliders drive the
+//! params), and a **live RGB histogram** under the image tracks the processed
+//! output. Shared preview state is bundled in [`PreviewCtx`] (weak widget refs
+//! with `Rc` data) so every callback re-runs `crate::preview::apply_pipeline`,
+//! refreshes the histogram, and repaints. Remaining catalog modules stay as
+//! inert toggle rows. Navigation back to the lighttable is via the
+//! NavigationView pop action.
 
 use adw::prelude::*;
 use glib::clone;
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::dialogs;
-use crate::preview::PreviewParams;
+use crate::preview::{Histogram, PreviewParams};
 
 /// Decoded preview image kept for live re-processing.
 #[derive(Clone)]
@@ -27,18 +27,35 @@ struct BaseImage {
     nch: usize,
 }
 
-/// Paint `picture` with the base preview run through the live `PreviewParams`
-/// pipeline (exposure → velvia, via migrated `darkroom-core` IOPs), uploading
-/// the result as a gdk::MemoryTexture.
-fn render_preview(
-    picture: &gtk4::Picture,
-    base: &Rc<RefCell<Option<BaseImage>>>,
-    params: &PreviewParams,
-) {
-    if let Some(b) = base.borrow().as_ref() {
-        let processed = crate::preview::apply_pipeline(
-            &b.bytes, b.width as usize, b.height as usize, b.rowstride, b.nch, params,
-        );
+/// Shared live-preview state, cloned into every widget callback. Widgets are
+/// held as `glib::WeakRef` to avoid widget→closure→widget reference cycles
+/// (the page is dropped on navigation); the `Rc<RefCell<…>>` data is shared
+/// strongly. Cloning is a handful of cheap refcount bumps.
+#[derive(Clone)]
+struct PreviewCtx {
+    picture: glib::WeakRef<gtk4::Picture>,
+    hist_area: glib::WeakRef<gtk4::DrawingArea>,
+    base: Rc<RefCell<Option<BaseImage>>>,
+    params: Rc<RefCell<PreviewParams>>,
+    hist: Rc<RefCell<Histogram>>,
+}
+
+/// Re-run the pipeline over the base preview, refresh the histogram, and repaint
+/// both the image and the histogram. Reads the current params (a `Copy`
+/// snapshot, so no borrow is held across `apply_pipeline`). A no-op until the
+/// image has decoded or if the page widgets have been dropped.
+fn render_preview(ctx: &PreviewCtx) {
+    let Some(picture) = ctx.picture.upgrade() else { return };
+    let params = *ctx.params.borrow();
+    if let Some(b) = ctx.base.borrow().as_ref() {
+        let (w, h) = (b.width as usize, b.height as usize);
+        let processed = crate::preview::apply_pipeline(&b.bytes, w, h, b.rowstride, b.nch, &params);
+
+        *ctx.hist.borrow_mut() = crate::preview::compute_histogram(&processed, w, h, b.rowstride, b.nch);
+        if let Some(area) = ctx.hist_area.upgrade() {
+            area.queue_draw();
+        }
+
         let fmt = if b.nch == 4 {
             gtk4::gdk::MemoryFormat::R8g8b8a8
         } else {
@@ -68,14 +85,31 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
         .content_fit(gtk4::ContentFit::Contain)
         .build();
 
-    // Shared decoded preview + live pipeline params, re-read on every slider
-    // change to re-process the preview.
-    let base: Rc<RefCell<Option<BaseImage>>> = Rc::new(RefCell::new(None));
-    let params: Rc<RefCell<PreviewParams>> = Rc::new(RefCell::new(PreviewParams::default()));
+    // ── Live RGB histogram strip under the image ───────────────────────────
+    let hist_area = gtk4::DrawingArea::builder()
+        .height_request(120)
+        .hexpand(true)
+        .build();
+
+    // Shared live-preview state.
+    let ctx = PreviewCtx {
+        picture: picture.downgrade(),
+        hist_area: hist_area.downgrade(),
+        base: Rc::new(RefCell::new(None)),
+        params: Rc::new(RefCell::new(PreviewParams::default())),
+        hist: Rc::new(RefCell::new([[0u32; 256]; 3])),
+    };
+
+    // The histogram paints from the shared `hist` buffer (no widget captured,
+    // so no cycle with hist_area).
+    let hist_for_draw = ctx.hist.clone();
+    hist_area.set_draw_func(move |_, cr, w, h| {
+        draw_histogram(cr, w, h, &hist_for_draw.borrow());
+    });
 
     // Load + decode the image asynchronously so the page appears immediately.
     let path_for_load = file_path.to_string();
-    glib::spawn_future_local(clone!(@weak picture, @strong base, @strong params => async move {
+    glib::spawn_future_local(clone!(@strong ctx => async move {
         let data = gio::spawn_blocking(move || std::fs::read(&path_for_load).ok())
             .await
             .ok()
@@ -85,26 +119,35 @@ pub fn darkroom_page(file_path: &str) -> adw::NavigationPage {
             let _ = loader.write(&data);
             let _ = loader.close();
             if let Some(pb) = loader.pixbuf() {
-                *base.borrow_mut() = Some(BaseImage {
+                *ctx.base.borrow_mut() = Some(BaseImage {
                     bytes: pb.read_pixel_bytes().to_vec(),
                     width: pb.width(),
                     height: pb.height(),
                     rowstride: pb.rowstride() as usize,
                     nch: pb.n_channels() as usize,
                 });
-                render_preview(&picture, &base, &params.borrow());
+                render_preview(&ctx);
             }
         }
     }));
 
+    // ── Left: image over histogram ─────────────────────────────────────────
+    let image_area = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .hexpand(true)
+        .build();
+    image_area.append(&picture);
+    image_area.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    image_area.append(&hist_area);
+
     // ── IOP module list (right panel) — hosts the live param widgets ───────
-    let modules_panel = build_modules_panel(&picture, &base, &params);
+    let modules_panel = build_modules_panel(&ctx);
 
     // ── Split view: image | modules ────────────────────────────────────────
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
-    content.append(&picture);
+    content.append(&image_area);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     content.append(&modules_panel);
 
@@ -176,11 +219,7 @@ fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> Lab
 /// IOP (Exposure, Velvia) render as expandable rows with a live enable switch
 /// and parameter sliders wired to the preview pipeline; the rest are inert
 /// enable-toggle rows (history-stack wiring is a later milestone).
-fn build_modules_panel(
-    picture: &gtk4::Picture,
-    base: &Rc<RefCell<Option<BaseImage>>>,
-    params: &Rc<RefCell<PreviewParams>>,
-) -> gtk4::Widget {
+fn build_modules_panel(ctx: &PreviewCtx) -> gtk4::Widget {
     let panel = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(12)
@@ -201,9 +240,9 @@ fn build_modules_panel(
         let pg = adw::PreferencesGroup::builder().title(group.name).build();
         for mi in group.modules {
             match mi.label {
-                "Exposure" => pg.add(&exposure_module_row(picture, base, params)),
-                "Velvia" => pg.add(&velvia_module_row(picture, base, params)),
-                "Split-toning" => pg.add(&splittoning_module_row(picture, base, params)),
+                "Exposure" => pg.add(&exposure_module_row(ctx)),
+                "Velvia" => pg.add(&velvia_module_row(ctx)),
+                "Split-toning" => pg.add(&splittoning_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -242,123 +281,135 @@ const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
-// takes a short-lived `borrow_mut()` (dropped at the statement end) before the
-// `render_preview(..., &params.borrow())` read, so the two never overlap.
+// takes a short-lived `borrow_mut()` (dropped at the statement end) before
+// `render_preview(&ctx)` snapshots params, so the two never overlap.
 
-/// Exposure module: an expander whose enable switch gates `exposure_on` and
-/// whose EV / black-point sliders drive the exposure stage of the preview.
-fn exposure_module_row(
-    picture: &gtk4::Picture,
-    base: &Rc<RefCell<Option<BaseImage>>>,
-    params: &Rc<RefCell<PreviewParams>>,
+/// Build a live `ExpanderRow` for one IOP module: title/subtitle, a built-in
+/// enable switch wired to `set_enabled`, and the param sliders added by
+/// `add_params`. `enabled` seeds the switch from the current params.
+fn module_expander(
+    ctx: &PreviewCtx,
+    title: &str,
+    subtitle: &str,
+    enabled: bool,
+    set_enabled: fn(&mut PreviewParams, bool),
+    add_params: impl FnOnce(&adw::ExpanderRow, &PreviewCtx),
 ) -> adw::ExpanderRow {
-    let p0 = *params.borrow();
     let expander = adw::ExpanderRow::builder()
-        .title("Exposure")
-        .subtitle("EV + black point")
+        .title(title)
+        .subtitle(subtitle)
         .show_enable_switch(true)
-        .enable_expansion(p0.exposure_on)
+        .enable_expansion(enabled)
         .build();
-    expander.connect_enable_expansion_notify(clone!(@weak picture, @strong base, @strong params => move |e| {
-        params.borrow_mut().exposure_on = e.enables_expansion();
-        render_preview(&picture, &base, &params.borrow());
-    }));
-
-    // EV: scale = 2^ev.
-    let ev = labeled_slider("EV", -3.0, 3.0, 0.01, p0.ev as f64);
-    ev.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
-        params.borrow_mut().ev = s.value() as f32;
-        render_preview(&picture, &base, &params.borrow());
-    }));
-    expander.add_row(&ev.row);
-
-    // Black point: lifted before scaling (out = (in - black) * scale).
-    let black = labeled_slider("Black", 0.0, 0.2, 0.001, p0.black as f64);
-    black.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
-        params.borrow_mut().black = s.value() as f32;
-        render_preview(&picture, &base, &params.borrow());
-    }));
-    expander.add_row(&black.row);
-
+    let ctx_cl = ctx.clone();
+    expander.connect_enable_expansion_notify(move |e| {
+        set_enabled(&mut ctx_cl.params.borrow_mut(), e.enables_expansion());
+        render_preview(&ctx_cl);
+    });
+    add_params(&expander, ctx);
     expander
 }
 
-/// Velvia module: an expander whose enable switch gates `velvia_on` and whose
-/// strength slider drives the velvia stage of the preview.
-fn velvia_module_row(
-    picture: &gtk4::Picture,
-    base: &Rc<RefCell<Option<BaseImage>>>,
-    params: &Rc<RefCell<PreviewParams>>,
-) -> adw::ExpanderRow {
-    let p0 = *params.borrow();
-    let expander = adw::ExpanderRow::builder()
-        .title("Velvia")
-        .subtitle("saturation boost")
-        .show_enable_switch(true)
-        .enable_expansion(p0.velvia_on)
-        .build();
-    expander.connect_enable_expansion_notify(clone!(@weak picture, @strong base, @strong params => move |e| {
-        params.borrow_mut().velvia_on = e.enables_expansion();
-        render_preview(&picture, &base, &params.borrow());
-    }));
-
-    // Strength (0..100); the C slider's scale, divided by 100 for the core IOP.
-    let strength = labeled_slider("Strength", 0.0, 100.0, 1.0, p0.velvia_strength as f64);
-    strength.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
-        params.borrow_mut().velvia_strength = s.value() as f32;
-        render_preview(&picture, &base, &params.borrow());
-    }));
-    expander.add_row(&strength.row);
-
-    expander
+/// Add one parameter slider to `expander`: `init` seeds it, `set` writes the
+/// value into the shared params, then the preview re-renders. Arg-heavy by
+/// nature (it is a slider builder); the explicit list keeps call sites readable.
+#[allow(clippy::too_many_arguments)]
+fn add_param_slider(
+    expander: &adw::ExpanderRow,
+    ctx: &PreviewCtx,
+    label: &str,
+    min: f64,
+    max: f64,
+    step: f64,
+    init: f64,
+    set: fn(&mut PreviewParams, f32),
+) {
+    let row = labeled_slider(label, min, max, step, init);
+    let ctx_cl = ctx.clone();
+    row.scale.connect_value_changed(move |s| {
+        set(&mut ctx_cl.params.borrow_mut(), s.value() as f32);
+        render_preview(&ctx_cl);
+    });
+    expander.add_row(&row.row);
 }
 
-/// Split-toning module: an expander whose enable switch gates `split_on` and
-/// whose shadow/highlight hue+saturation, balance and compress sliders drive
-/// the split-toning stage of the preview.
-fn splittoning_module_row(
-    picture: &gtk4::Picture,
-    base: &Rc<RefCell<Option<BaseImage>>>,
-    params: &Rc<RefCell<PreviewParams>>,
-) -> adw::ExpanderRow {
-    let p0 = *params.borrow();
-    let expander = adw::ExpanderRow::builder()
-        .title("Split-toning")
-        .subtitle("shadow / highlight hues")
-        .show_enable_switch(true)
-        .enable_expansion(p0.split_on)
-        .build();
-    expander.connect_enable_expansion_notify(clone!(@weak picture, @strong base, @strong params => move |e| {
-        params.borrow_mut().split_on = e.enables_expansion();
-        render_preview(&picture, &base, &params.borrow());
-    }));
+/// Exposure module: enable switch gates `exposure_on`; EV / black-point sliders.
+fn exposure_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Exposure", "EV + black point", p0.exposure_on,
+        |p, on| p.exposure_on = on,
+        |e, ctx| {
+            // EV: scale = 2^ev.
+            add_param_slider(e, ctx, "EV", -3.0, 3.0, 0.01, p0.ev as f64,
+                |p, v| p.ev = v);
+            // Black point: lifted before scaling (out = (in - black) * scale).
+            add_param_slider(e, ctx, "Black", 0.0, 0.2, 0.001, p0.black as f64,
+                |p, v| p.black = v);
+        })
+}
 
-    // Each slider mutates one field then re-renders. Hue/sat/balance are 0..1;
-    // compress is the C 0..100 slider (pre-scaled in apply_pipeline).
-    let add = |label: &str, max: f64, step: f64, init: f64,
-               set: fn(&mut PreviewParams, f32)| {
-        let row = labeled_slider(label, 0.0, max, step, init);
-        row.scale.connect_value_changed(clone!(@weak picture, @strong base, @strong params => move |s| {
-            set(&mut params.borrow_mut(), s.value() as f32);
-            render_preview(&picture, &base, &params.borrow());
-        }));
-        expander.add_row(&row.row);
-    };
+/// Velvia module: enable switch gates `velvia_on`; strength slider (0..100).
+fn velvia_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Velvia", "saturation boost", p0.velvia_on,
+        |p, on| p.velvia_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Strength", 0.0, 100.0, 1.0, p0.velvia_strength as f64,
+                |p, v| p.velvia_strength = v);
+        })
+}
 
-    add("Shad hue", 1.0, 0.001, p0.split_shadow_hue as f64,
-        |p, v| p.split_shadow_hue = v);
-    add("Shad sat", 1.0, 0.01, p0.split_shadow_sat as f64,
-        |p, v| p.split_shadow_sat = v);
-    add("High hue", 1.0, 0.001, p0.split_highlight_hue as f64,
-        |p, v| p.split_highlight_hue = v);
-    add("High sat", 1.0, 0.01, p0.split_highlight_sat as f64,
-        |p, v| p.split_highlight_sat = v);
-    add("Balance", 1.0, 0.01, p0.split_balance as f64,
-        |p, v| p.split_balance = v);
-    add("Compress", 100.0, 1.0, p0.split_compress as f64,
-        |p, v| p.split_compress = v);
+/// Split-toning module: enable switch gates `split_on`; shadow/highlight
+/// hue+saturation, balance and compress sliders. Hue/sat/balance are 0..1;
+/// compress is the C 0..100 slider (pre-scaled in apply_pipeline).
+fn splittoning_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Split-toning", "shadow / highlight hues", p0.split_on,
+        |p, on| p.split_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Shad hue", 0.0, 1.0, 0.001, p0.split_shadow_hue as f64,
+                |p, v| p.split_shadow_hue = v);
+            add_param_slider(e, ctx, "Shad sat", 0.0, 1.0, 0.01, p0.split_shadow_sat as f64,
+                |p, v| p.split_shadow_sat = v);
+            add_param_slider(e, ctx, "High hue", 0.0, 1.0, 0.001, p0.split_highlight_hue as f64,
+                |p, v| p.split_highlight_hue = v);
+            add_param_slider(e, ctx, "High sat", 0.0, 1.0, 0.01, p0.split_highlight_sat as f64,
+                |p, v| p.split_highlight_sat = v);
+            add_param_slider(e, ctx, "Balance", 0.0, 1.0, 0.01, p0.split_balance as f64,
+                |p, v| p.split_balance = v);
+            add_param_slider(e, ctx, "Compress", 0.0, 100.0, 1.0, p0.split_compress as f64,
+                |p, v| p.split_compress = v);
+        })
+}
 
-    expander
+/// Paint the RGB histogram: dark backdrop with one translucent filled curve per
+/// channel, each normalised to the global max bin.
+fn draw_histogram(cr: &gtk4::cairo::Context, w: i32, h: i32, hist: &Histogram) {
+    let (w, h) = (w as f64, h as f64);
+    cr.set_source_rgb(0.10, 0.10, 0.10);
+    let _ = cr.paint();
+
+    let max = hist
+        .iter()
+        .flat_map(|c| c.iter())
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+
+    let colours = [(0.90, 0.25, 0.25), (0.25, 0.85, 0.30), (0.35, 0.55, 0.95)];
+    for (ch, &(r, g, b)) in colours.iter().enumerate() {
+        cr.set_source_rgba(r, g, b, 0.55);
+        cr.move_to(0.0, h);
+        for (bin, &count) in hist[ch].iter().enumerate() {
+            let x = bin as f64 / 255.0 * w;
+            let y = h - (count as f64 / max) * h;
+            cr.line_to(x, y);
+        }
+        cr.line_to(w, h);
+        cr.close_path();
+        let _ = cr.fill();
+    }
 }
 
 #[cfg(test)]
