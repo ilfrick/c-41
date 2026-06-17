@@ -171,7 +171,17 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // Shared live-preview state. Params are seeded from the DB (saved on a
     // previous edit) before the panel/preview are built, so the sliders and the
     // first render reflect the restored values.
-    let params = Rc::new(RefCell::new(crate::persist::load_params(db_path, file_path)));
+    let seed_params = {
+        let mut p = crate::persist::load_params(db_path, file_path);
+        // Raws are scene-linear, so default the sigmoid display tone-map ON
+        // (unless the user already saved an edit). JPEGs are display-referred —
+        // leave it off so we don't double-tone-map them.
+        if crate::raw_preview::is_raw_path(file_path) && p == PreviewParams::default() {
+            p.sigmoid_on = true;
+        }
+        p
+    };
+    let params = Rc::new(RefCell::new(seed_params));
     let autosave = (!db_path.is_empty()).then(|| {
         Rc::new(AutoSave {
             db_path: db_path.to_string(),

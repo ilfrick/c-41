@@ -56,6 +56,13 @@ pub struct PreviewParams {
     pub mono_r: f32,
     pub mono_g: f32,
     pub mono_b: f32,
+    /// Sigmoid tone-mapping (scene-linear → display) stage on/off. Default-on
+    /// for raws (scene-linear input); off for already-display-referred JPEGs.
+    pub sigmoid_on: bool,
+    /// Sigmoid contrast (middle_grey_contrast), 0.1..10, darktable default 1.5.
+    pub sigmoid_contrast: f32,
+    /// Sigmoid skew (contrast_skewness), -1..1, default 0.
+    pub sigmoid_skew: f32,
 }
 
 impl Default for PreviewParams {
@@ -80,6 +87,10 @@ impl Default for PreviewParams {
             mono_r: 0.21,
             mono_g: 0.72,
             mono_b: 0.07,
+            // Off by default (JPEG path); the darkroom view turns it on for raws.
+            sigmoid_on: false,
+            sigmoid_contrast: 1.5,
+            sigmoid_skew: 0.0,
         }
     }
 }
@@ -98,7 +109,8 @@ impl PreviewParams {
         // (even sat 0 desaturates toned zones toward luminance), so on==off.
         let split_identity = !self.split_on;
         let mono_identity = !self.mono_on; // grayscale conversion is never a no-op
-        exp_identity && vel_identity && split_identity && mono_identity
+        let sigmoid_identity = !self.sigmoid_on; // a tone curve is never a no-op
+        exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -110,18 +122,19 @@ impl PreviewParams {
             velvia_on: false,
             split_on: false,
             mono_on: false,
+            sigmoid_on: false,
             ..*self
         }
     }
 
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
-    /// `[version, 4×bool(u8), 13×f32_le]`. Decoded by [`PreviewParams::decode`].
+    /// `[version, 5×bool(u8), 15×f32_le]`. Decoded by [`PreviewParams::decode`].
     /// This is darkroom-ui's own layout (NOT a C IOP `op_params`), stored under a
     /// synthetic operation name the C reader ignores.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on] {
             v.push(b as u8);
         }
         for f in [
@@ -131,6 +144,7 @@ impl PreviewParams {
             self.split_highlight_hue, self.split_highlight_sat,
             self.split_balance, self.split_compress,
             self.mono_r, self.mono_g, self.mono_b,
+            self.sigmoid_contrast, self.sigmoid_skew,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -138,15 +152,15 @@ impl PreviewParams {
     }
 
     /// Inverse of [`PreviewParams::encode`]. Returns `None` for the wrong version
-    /// byte or wrong length (e.g. a blob written by a future/other schema), so
+    /// byte or wrong length (e.g. a blob written by an older/other schema), so
     /// the caller falls back to defaults rather than loading garbage.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..5];
-        // length is checked above, so exactly 13 f32 chunks follow
-        let f: Vec<f32> = bytes[5..]
+        let bools = &bytes[1..6];
+        // length is checked above, so exactly 15 f32 chunks follow
+        let f: Vec<f32> = bytes[6..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -155,12 +169,14 @@ impl PreviewParams {
             velvia_on: bools[1] != 0,
             split_on: bools[2] != 0,
             mono_on: bools[3] != 0,
+            sigmoid_on: bools[4] != 0,
             black: f[0], ev: f[1],
             velvia_strength: f[2], velvia_bias: f[3],
             split_shadow_hue: f[4], split_shadow_sat: f[5],
             split_highlight_hue: f[6], split_highlight_sat: f[7],
             split_balance: f[8], split_compress: f[9],
             mono_r: f[10], mono_g: f[11], mono_b: f[12],
+            sigmoid_contrast: f[13], sigmoid_skew: f[14],
         })
     }
 
@@ -190,15 +206,27 @@ impl PreviewParams {
         if self.mono_on {
             p.push(Stage::Monochrome { r: self.mono_r, g: self.mono_g, b: self.mono_b });
         }
+        // Sigmoid is the scene-linear → display tone map, so it runs LAST. White
+        // (100%) / black (0.0152%) targets are fixed at the darktable defaults
+        // (both > 0 ⇒ no NaN); only contrast & skew are user-facing here.
+        if self.sigmoid_on {
+            let [white_target, black_target, paper_exp, film_fog, film_power, paper_power] =
+                darkroom_core::iop::sigmoid::rgb_ratio_params(
+                    self.sigmoid_contrast, self.sigmoid_skew, 100.0, 0.0152,
+                );
+            p.push(Stage::Sigmoid {
+                white_target, black_target, paper_exp, film_fog, film_power, paper_power,
+            });
+        }
         p
     }
 }
 
 /// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
-/// to `None` → defaults, rather than mis-parsing).
-const ENCODE_VERSION: u8 = 1;
-/// 1 version byte + 4 bool bytes + 13 little-endian f32.
-const ENCODED_LEN: usize = 1 + 4 + 13 * 4;
+/// to `None` → defaults, rather than mis-parsing). v2 added the sigmoid stage.
+const ENCODE_VERSION: u8 = 2;
+/// 1 version byte + 5 bool bytes + 15 little-endian f32.
+const ENCODED_LEN: usize = 1 + 5 + 15 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -561,6 +589,9 @@ mod tests {
         let mut m = PreviewParams::default();
         m.mono_on = true;
         cfgs.push(m);
+        let mut sig = PreviewParams::default();
+        sig.sigmoid_on = true;
+        cfgs.push(sig);
         // velvia enabled but strength 0 ⇒ still identity (matches to_pipeline gate)
         let mut v0 = PreviewParams::default();
         v0.velvia_on = true;
@@ -584,9 +615,10 @@ mod tests {
             split_highlight_hue: 0.9, split_highlight_sat: 0.3,
             split_balance: 0.4, split_compress: 60.0,
             mono_on: true, mono_r: -0.2, mono_g: 1.5, mono_b: 0.33,
+            sigmoid_on: true, sigmoid_contrast: 1.8, sigmoid_skew: -0.3,
         };
         let blob = p.encode();
-        assert_eq!(blob.len(), 1 + 4 + 13 * 4);
+        assert_eq!(blob.len(), 1 + 5 + 15 * 4);
         assert_eq!(PreviewParams::decode(&blob), Some(p));
         // default round-trips too
         let d = PreviewParams::default();
@@ -599,8 +631,8 @@ mod tests {
         // wrong length
         assert_eq!(PreviewParams::decode(&blob[..blob.len() - 1]), None);
         assert_eq!(PreviewParams::decode(&[]), None);
-        // wrong version byte
-        blob[0] = 2;
+        // wrong (future) version byte
+        blob[0] = 99;
         assert_eq!(PreviewParams::decode(&blob), None);
     }
 
