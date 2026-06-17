@@ -50,6 +50,53 @@ fn channel_order(p: [f32; 3]) -> (usize, usize, usize) {
     else                    { (0, 2, 1) }
 }
 
+/// Middle-grey reference (matches sigmoid.c `MIDDLE_GREY`).
+const MIDDLE_GREY: f32 = 0.1845;
+
+/// Derive the rgb-ratio sigmoid process parameters from the user-facing controls
+/// — `contrast` (middle_grey_contrast), `skew` (contrast_skewness), and the
+/// display white/black targets as percentages — mirroring `commit_params` in
+/// sigmoid.c. Returns `[white_target, black_target, paper_exposure, film_fog,
+/// film_power, paper_power]`: the trailing args of
+/// [`darkroom_sigmoid_rgb_ratio_process`] (its `contrast_power` = `film_power`,
+/// `skew_power` = `paper_power`). The curve is built so f(0)=black_target,
+/// f(MIDDLE_GREY)=MIDDLE_GREY, f(∞)=white_target, with slope at grey set only by
+/// `contrast`.
+pub fn rgb_ratio_params(contrast: f32, skew: f32, white_pct: f32, black_pct: f32) -> [f32; 6] {
+    let mg = MIDDLE_GREY;
+    let delta = 1e-6f32;
+
+    // Reference slope at grey for no skew on a normalised display.
+    let ref_film_power = contrast;
+    let (ref_paper_power, ref_magnitude, ref_film_fog) = (1.0f32, 1.0f32, 0.0f32);
+    let ref_paper_exposure = (ref_film_fog + mg).powf(ref_film_power) * (ref_magnitude / mg - 1.0);
+    let ref_slope = (loglogistic_sigmoid(mg + delta, ref_magnitude, ref_paper_exposure, ref_film_fog, ref_film_power, ref_paper_power)
+        - loglogistic_sigmoid(mg - delta, ref_magnitude, ref_paper_exposure, ref_film_fog, ref_film_power, ref_paper_power))
+        / 2.0 / delta;
+
+    // Skew maps to paper_power; find the film_power that restores the ref slope.
+    let paper_power = 5.0f32.powf(-skew);
+    let temp_film_power = 1.0f32;
+    let temp_white_target = 0.01 * white_pct;
+    let temp_white_grey_relation = (temp_white_target / mg).powf(1.0 / paper_power) - 1.0;
+    let temp_paper_exposure = mg.powf(temp_film_power) * temp_white_grey_relation;
+    let temp_slope = (loglogistic_sigmoid(mg + delta, temp_white_target, temp_paper_exposure, ref_film_fog, temp_film_power, paper_power)
+        - loglogistic_sigmoid(mg - delta, temp_white_target, temp_paper_exposure, ref_film_fog, temp_film_power, paper_power))
+        / 2.0 / delta;
+    let film_power = ref_slope / temp_slope;
+
+    // Remaining parameters now that film/paper power are known.
+    let white_target = 0.01 * white_pct;
+    let black_target = 0.01 * black_pct;
+    let white_grey_relation = (white_target / mg).powf(1.0 / paper_power) - 1.0;
+    let white_black_relation = (black_target / white_target).powf(-1.0 / paper_power) - 1.0;
+    let film_fog = mg * white_grey_relation.powf(1.0 / film_power)
+        / (white_black_relation.powf(1.0 / film_power) - white_grey_relation.powf(1.0 / film_power));
+    let paper_exposure = (film_fog + mg).powf(film_power) * white_grey_relation;
+
+    [white_target, black_target, paper_exposure, film_fog, film_power, paper_power]
+}
+
 /// Hue + energy preserving correction: blends per-channel result toward hue-correct result.
 #[inline(always)]
 fn preserve_hue_and_energy(

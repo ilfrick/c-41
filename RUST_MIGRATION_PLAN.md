@@ -177,7 +177,12 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    (decode→demosaic→WB→downscale→display preview). **m2-4d:** EXIF orientation
    applied (`apply_orientation`) — visual confirmation caught portrait raws
    rendering upside-down; fixed (flips-then-transpose) and re-verified upright on
-   a real EXIF-8 portrait ORF. Remaining: (a) higher-quality
+   a real EXIF-8 portrait ORF. **m2-5a:** `Stage::Sigmoid` tone mapping wired
+   into the core pipeline — `sigmoid::rgb_ratio_params` ports sigmoid.c
+   commit_params (contrast/skew/white/black → the 6 rgb-ratio process args),
+   golden-pinned; the stage reuses the migrated `darkroom_sigmoid_rgb_ratio_process`.
+   Next (m2-5b): wire it into the UI (clamping black/white at the boundary) +
+   visual-verify it gives raws proper contrast. Remaining: (a) higher-quality
    demosaic (PPG/RCD/VNG are migrated; box3 is the current baseline); (b) a
    float `BaseImage` so the preview skips the 8-bit round-trip; (c) ROI/(w,h)
    signature + geometry-aware IOPs; (d) OpenCL.

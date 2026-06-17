@@ -21,7 +21,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, exposure, splittoning, velvia};
+use crate::iop::{channelmixer, exposure, sigmoid, splittoning, velvia};
 
 /// One configured pipeline stage, backed by a migrated darkroom-core IOP.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,6 +41,16 @@ pub enum Stage {
     },
     /// Grayscale mix (channelmixer GRAY mode): the R/G/B → luma weights.
     Monochrome { r: f32, g: f32, b: f32 },
+    /// Sigmoid tone mapping (rgb-ratio path) — scene-linear → display. Holds the
+    /// already-derived process params (see `sigmoid::rgb_ratio_params`).
+    Sigmoid {
+        white_target: f32,
+        black_target: f32,
+        paper_exp: f32,
+        film_fog: f32,
+        film_power: f32,
+        paper_power: f32,
+    },
 }
 
 impl Stage {
@@ -51,6 +61,7 @@ impl Stage {
             Stage::Velvia { .. } => "velvia",
             Stage::Splittoning { .. } => "splittoning",
             Stage::Monochrome { .. } => "channelmixer",
+            Stage::Sigmoid { .. } => "sigmoid",
         }
     }
 
@@ -87,6 +98,32 @@ impl Stage {
                 let rgb_matrix = [r, g, b, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
                 let hsl_matrix = [0.0f32; 9];
                 channelmixer::process_pixels(input, output, &hsl_matrix, &rgb_matrix, 1);
+            }
+            Stage::Sigmoid {
+                white_target,
+                black_target,
+                paper_exp,
+                film_fog,
+                film_power,
+                paper_power,
+            } => {
+                let npixels = input.len() / 4;
+                // Safety: input/output are equal-length packed RGBA (the caller
+                // asserts len % 4 == 0), so each holds exactly npixels*4 floats —
+                // the contract darkroom_sigmoid_rgb_ratio_process documents.
+                unsafe {
+                    sigmoid::darkroom_sigmoid_rgb_ratio_process(
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        npixels,
+                        white_target,
+                        black_target,
+                        paper_exp,
+                        film_fog,
+                        film_power,
+                        paper_power,
+                    );
+                }
             }
         }
     }
@@ -229,6 +266,53 @@ mod tests {
         for i in 0..3 {
             assert!((out[i] - 0.5).abs() < 1e-4, "ch{i} = {}", out[i]);
         }
+    }
+
+    #[test]
+    fn sigmoid_preserves_middle_grey_and_is_monotonic() {
+        // Default sigmoid params (contrast 1.5, no skew, white 100%, black
+        // 0.0152%): a grey ramp must map monotonically, preserve middle grey,
+        // and compress highlights below the white target.
+        let [wt, bt, pe, ff, fp, pp] = sigmoid::rgb_ratio_params(1.5, 0.0, 100.0, 0.0152);
+        for v in [wt, bt, pe, ff, fp, pp] {
+            assert!(v.is_finite(), "param not finite: {v}");
+        }
+        // Golden values pin the derivation against transcription/sign regressions
+        // (a wrong slope can still pass the monotonic + grey-preserved checks).
+        // Verified faithful to sigmoid.c commit_params.
+        assert!((wt - 1.0).abs() < 1e-5);
+        assert!((bt - 0.000152).abs() < 1e-7);
+        assert!((pe - 0.359695).abs() < 1e-4);
+        assert!((ff - 0.0013843).abs() < 1e-6);
+        assert!((fp - 1.490909).abs() < 1e-4);
+        assert!((pp - 1.0).abs() < 1e-6); // skew 0 ⇒ 5^0
+        let p = Pipeline::with_stages(vec![Stage::Sigmoid {
+            white_target: wt, black_target: bt, paper_exp: pe,
+            film_fog: ff, film_power: fp, paper_power: pp,
+        }]);
+        // grey pixels at increasing scene-linear levels
+        let levels = [0.02f32, 0.1845, 0.5, 1.0, 4.0];
+        let mut prev = -1.0f32;
+        let mut mid_out = 0.0f32;
+        for &v in &levels {
+            let out = p.process(&[v, v, v, 1.0]);
+            assert!(out[0] > prev, "not monotonic at {v}: {} <= {prev}", out[0]);
+            assert!(out[0] <= wt + 1e-3, "exceeds white target at {v}: {}", out[0]);
+            prev = out[0];
+            if (v - 0.1845).abs() < 1e-6 {
+                mid_out = out[0];
+            }
+        }
+        // middle grey maps (approximately) to itself
+        assert!((mid_out - 0.1845).abs() < 0.02, "middle grey not preserved: {mid_out}");
+
+        // Slope at middle grey is set by the contrast control (~1.21 for 1.5);
+        // pins the curve *shape*, not just its monotonicity.
+        let d = 1e-3f32;
+        let hi = p.process(&[0.1845 + d, 0.1845 + d, 0.1845 + d, 1.0])[0];
+        let lo = p.process(&[0.1845 - d, 0.1845 - d, 0.1845 - d, 1.0])[0];
+        let slope = (hi - lo) / (2.0 * d);
+        assert!((slope - 1.2068).abs() < 0.01, "grey slope off: {slope}");
     }
 
     #[test]
