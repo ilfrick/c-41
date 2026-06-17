@@ -127,6 +127,82 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<RawImage> {
     })
 }
 
+/// Build darktable's packed Bayer `filters` value from a 2×2 CFA pattern such
+/// that `raw::fc_bayer(row, col, filters) == cfa[row % 2][col % 2]` for all
+/// `row`/`col`. `fc_bayer`'s field shift is periodic-8 in the row, so setting
+/// all eight row-phases from the 2-row pattern reconstructs it exactly.
+pub fn filters_from_cfa(cfa: [[usize; 2]; 2]) -> u32 {
+    let mut f = 0u32;
+    for r in 0u32..8 {
+        for c in 0u32..2 {
+            let shift = (((r << 1) & 14) + (c & 1)) << 1;
+            f |= (cfa[(r % 2) as usize][c as usize] as u32 & 3) << shift;
+        }
+    }
+    f
+}
+
+/// Demosaic a normalised Bayer CFA mosaic to packed RGBA `f32` via the migrated
+/// 3×3 box kernel (`iop::demosaic::darkroom_demosaic_box3`, rcd.c:86) — a fast,
+/// low-quality baseline; the higher-quality PPG/RCD/VNG kernels are migrated and
+/// can replace this later. Bayer only (`cfa` must be 2×2; X-Trans is rejected at
+/// [`load`]).
+pub fn demosaic_box(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2]; 2]) -> Vec<f32> {
+    let mut out = vec![0.0f32; width.saturating_mul(height).saturating_mul(4)];
+    // Guards the malformed/short-plane and zero-dimension cases — the latter so
+    // we never hand box3 a zero-length (dangling) pointer.
+    if mosaic.len() < width.saturating_mul(height) || out.is_empty() {
+        return out;
+    }
+    let filters = filters_from_cfa(cfa);
+    let xtrans = [0u8; 36]; // unused for Bayer (filters != 9) but box3 reads 36 bytes
+    // Safety: `mosaic` has ≥ width*height floats, `out` has width*height*4, and
+    // `xtrans` is 36 bytes — exactly box3's documented contract.
+    unsafe {
+        crate::iop::demosaic::darkroom_demosaic_box3(
+            out.as_mut_ptr(),
+            mosaic.as_ptr(),
+            width,
+            height,
+            filters,
+            xtrans.as_ptr(),
+        );
+    }
+    out
+}
+
+/// Apply green-normalised white balance to packed RGBA `f32` in place: R and B
+/// are scaled by their camera-multiplier ratio to green so neutral scene tones
+/// stay neutral. `wb` is the RGBE multipliers. No-op if green isn't a usable
+/// positive multiplier (some files report all-ones / zeros).
+pub fn apply_white_balance(rgba: &mut [f32], wb: [f32; 4]) {
+    let g = wb[1];
+    if g <= 0.0 || !g.is_finite() || !wb[0].is_finite() || !wb[2].is_finite() {
+        return;
+    }
+    let (rm, bm) = (wb[0] / g, wb[2] / g);
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] *= rm;
+        px[2] *= bm;
+    }
+}
+
+impl RawImage {
+    /// Demosaic + white-balance this raw into a packed **linear RGBA** `f32`
+    /// buffer ready for [`crate::pipeline`]. Returns `(width, height, pixels)`.
+    pub fn to_linear_rgba(&self) -> (usize, usize, Vec<f32>) {
+        let mut rgba = demosaic_box(&self.mosaic, self.width, self.height, self.cfa);
+        apply_white_balance(&mut rgba, self.wb);
+        // box3 leaves the 4th channel at 0 (it has no contributors); set it
+        // opaque so a display upload that honours alpha doesn't render the
+        // preview fully transparent.
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 1.0;
+        }
+        (self.width, self.height, rgba)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +260,74 @@ mod tests {
     #[test]
     fn load_rejects_missing_file() {
         assert!(matches!(load("/no/such/raw.cr2"), Err(Error::Raw(_))));
+    }
+
+    #[test]
+    fn filters_from_cfa_matches_fc_bayer() {
+        // For each Bayer arrangement, the reconstructed `filters` must read back
+        // through fc_bayer as the original 2×2 pattern, at every row/col phase.
+        let patterns = [
+            [[0usize, 1], [1, 2]], // RGGB
+            [[1usize, 0], [2, 1]], // GRBG
+            [[1usize, 2], [0, 1]], // GBRG
+            [[2usize, 1], [1, 0]], // BGGR
+        ];
+        for cfa in patterns {
+            let f = filters_from_cfa(cfa);
+            for row in 0..9i32 {
+                for col in 0..9i32 {
+                    assert_eq!(
+                        crate::raw::fc_bayer(row, col, f),
+                        cfa[(row % 2) as usize][(col % 2) as usize],
+                        "cfa {cfa:?} at ({row},{col})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn demosaic_box_interpolates_rggb_corner() {
+        // 2×2 RGGB: (0,0)=R, (0,1)=G, (1,0)=G, (1,1)=B.
+        let cfa = [[0usize, 1], [1, 2]];
+        let mosaic = [0.4f32, 0.6, 0.2, 0.8];
+        let out = demosaic_box(&mosaic, 2, 2, cfa);
+        // pixel (0,0): R=0.4 (self), G=(0.6+0.2)/2=0.4, B=0.8 (the lone B).
+        assert!((out[0] - 0.4).abs() < 1e-6, "R {}", out[0]);
+        assert!((out[1] - 0.4).abs() < 1e-6, "G {}", out[1]);
+        assert!((out[2] - 0.8).abs() < 1e-6, "B {}", out[2]);
+    }
+
+    #[test]
+    fn to_linear_rgba_composes_demosaic_wb_and_opaque_alpha() {
+        let img = RawImage {
+            width: 2,
+            height: 2,
+            cfa: [[0, 1], [1, 2]], // RGGB
+            wb: [2.0, 1.0, 4.0, 1.0],
+            mosaic: vec![0.4, 0.6, 0.2, 0.8],
+        };
+        let (w, h, rgba) = img.to_linear_rgba();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(rgba.len(), 16);
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px[3], 1.0, "alpha must be opaque");
+        }
+        // pixel (0,0): demosaic R=0.4,G=0.4,B=0.8 → WB green-normalised (g=1):
+        // R=0.4*2=0.8, G=0.4 (unchanged), B=0.8*4=3.2.
+        assert!((rgba[0] - 0.8).abs() < 1e-6, "R {}", rgba[0]);
+        assert!((rgba[1] - 0.4).abs() < 1e-6, "G {}", rgba[1]);
+        assert!((rgba[2] - 3.2).abs() < 1e-6, "B {}", rgba[2]);
+    }
+
+    #[test]
+    fn white_balance_green_normalises_and_guards() {
+        let mut px = vec![1.0f32, 1.0, 1.0, 1.0];
+        apply_white_balance(&mut px, [2.0, 1.0, 4.0, 1.0]);
+        assert_eq!(px, vec![2.0, 1.0, 4.0, 1.0]); // R*2, G*1, B*4
+        // green ≤ 0 ⇒ no-op
+        let mut p2 = vec![1.0f32, 1.0, 1.0, 1.0];
+        apply_white_balance(&mut p2, [2.0, 0.0, 4.0, 1.0]);
+        assert_eq!(p2, vec![1.0, 1.0, 1.0, 1.0]);
     }
 }

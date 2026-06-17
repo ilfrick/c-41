@@ -167,9 +167,13 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `darkroom_core::rawimage` decodes camera raws via the pure-Rust `rawloader`
    (pinned `=0.37.1`) into a black/white-normalised linear CFA mosaic
    (`normalize_cfa`); Bayer only (X-Trans 6x6 rejected until its demosaic is
-   wired). Remaining: (a) CFA->RGBA demosaic + white balance to feed `pipeline`;
-   (b) wire the raw path into darkroom-ui (replacing the 8-bit pixbuf for raws);
-   (c) ROI/(w,h) signature + geometry-aware IOPs; (d) OpenCL.
+   wired). **m2-4b:** `demosaic_box` (reuses the migrated box3 kernel via a
+   tested `filters_from_cfa` bridge) + `apply_white_balance` +
+   `RawImage::to_linear_rgba()` give a full decode→demosaic→WB→linear-RGBA path
+   ready for `pipeline`. Remaining: (a) wire the raw path into darkroom-ui
+   (replacing the 8-bit pixbuf for raws: load → to_linear_rgba → pipeline →
+   tonemap/downscale → display); (b) higher-quality demosaic (PPG/RCD/VNG are
+   migrated); (c) ROI/(w,h) signature + geometry-aware IOPs; (d) OpenCL.
 3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**),
    before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), colour
    picker (**done, ui-20**: click-to-sample the processed pixel; pure
