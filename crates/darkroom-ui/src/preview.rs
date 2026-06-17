@@ -634,6 +634,14 @@ mod tests {
         // wrong (future) version byte
         blob[0] = 99;
         assert_eq!(PreviewParams::decode(&blob), None);
+        // an old v1 blob (version 1, 57 bytes) must be rejected → caller defaults,
+        // never misread as v2 (lengths differ: 57 vs 66).
+        let v1 = {
+            let mut b = vec![0u8; 1 + 4 + 13 * 4];
+            b[0] = 1;
+            b
+        };
+        assert_eq!(PreviewParams::decode(&v1), None);
     }
 
     #[test]
