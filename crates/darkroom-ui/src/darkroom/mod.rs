@@ -22,14 +22,56 @@ use crate::preview::{Histogram, PreviewParams};
 /// Placeholder shown in the colour-picker readout before/after a sample.
 const PICKER_PROMPT: &str = "Pick: click the image to sample a pixel";
 
-/// Decoded preview image kept for live re-processing.
-#[derive(Clone)]
-struct BaseImage {
+/// Decoded preview source kept for live re-processing — either an 8-bit sRGB
+/// image (the JPEG / gdk-pixbuf path) or a **linear scene-referred RGBA f32**
+/// image (the raw path). The raw variant skips the 8-bit round-trip so a
+/// tone-map stage sees the unclipped highlights.
+enum BaseImage {
+    Srgb8 { bytes: Vec<u8>, width: i32, height: i32, rowstride: usize, nch: usize },
+    Linear { width: usize, height: usize, pixels: Vec<f32> },
+}
+
+/// An 8-bit image produced by running the pipeline over a [`BaseImage`], ready
+/// for texture upload / histogram / colour-picker (all of which want 8-bit).
+struct Rendered {
     bytes: Vec<u8>,
     width: i32,
     height: i32,
     rowstride: usize,
     nch: usize,
+}
+
+impl BaseImage {
+    /// Image dimensions in pixels (for widget→image coordinate mapping).
+    fn dims(&self) -> (usize, usize) {
+        match self {
+            BaseImage::Srgb8 { width, height, .. } => (*width as usize, *height as usize),
+            BaseImage::Linear { width, height, .. } => (*width, *height),
+        }
+    }
+
+    /// Run the live pipeline and return the 8-bit sRGB image to display.
+    fn render(&self, params: &PreviewParams) -> Rendered {
+        match self {
+            BaseImage::Srgb8 { bytes, width, height, rowstride, nch } => {
+                let (w, h) = (*width as usize, *height as usize);
+                Rendered {
+                    bytes: crate::preview::apply_pipeline(bytes, w, h, *rowstride, *nch, params),
+                    width: *width,
+                    height: *height,
+                    rowstride: *rowstride,
+                    nch: *nch,
+                }
+            }
+            BaseImage::Linear { width, height, pixels } => Rendered {
+                bytes: crate::preview::render_linear_to_srgb8(pixels, *width, *height, params),
+                width: *width as i32,
+                height: *height as i32,
+                rowstride: width * 3,
+                nch: 3,
+            },
+        }
+    }
 }
 
 /// Shared live-preview state, cloned into every widget callback. Widgets are
@@ -103,21 +145,22 @@ fn render_preview(ctx: &PreviewCtx) {
     let Some(picture) = ctx.picture.upgrade() else { return };
     let params = effective_params(ctx);
     if let Some(b) = ctx.base.borrow().as_ref() {
-        let (w, h) = (b.width as usize, b.height as usize);
-        let processed = crate::preview::apply_pipeline(&b.bytes, w, h, b.rowstride, b.nch, &params);
+        let r = b.render(&params);
 
-        *ctx.hist.borrow_mut() = crate::preview::compute_histogram(&processed, w, h, b.rowstride, b.nch);
+        *ctx.hist.borrow_mut() = crate::preview::compute_histogram(
+            &r.bytes, r.width as usize, r.height as usize, r.rowstride, r.nch,
+        );
         if let Some(area) = ctx.hist_area.upgrade() {
             area.queue_draw();
         }
 
-        let fmt = if b.nch == 4 {
+        let fmt = if r.nch == 4 {
             gtk4::gdk::MemoryFormat::R8g8b8a8
         } else {
             gtk4::gdk::MemoryFormat::R8g8b8
         };
-        let gbytes = glib::Bytes::from_owned(processed);
-        let tex = gtk4::gdk::MemoryTexture::new(b.width, b.height, fmt, &gbytes, b.rowstride);
+        let gbytes = glib::Bytes::from_owned(r.bytes);
+        let tex = gtk4::gdk::MemoryTexture::new(r.width, r.height, fmt, &gbytes, r.rowstride);
         picture.set_paintable(Some(&tex));
 
         // The displayed pixels just changed; any prior pick is now stale.
@@ -212,12 +255,10 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
             let p = path_for_load.clone();
             gio::spawn_blocking(move || {
                 crate::raw_preview::decode_raw_preview(&p, crate::raw_preview::PREVIEW_MAX_DIM)
-                    .map(|rp| BaseImage {
-                        bytes: rp.bytes,
+                    .map(|rp| BaseImage::Linear {
                         width: rp.width,
                         height: rp.height,
-                        rowstride: rp.rowstride,
-                        nch: rp.nch,
+                        pixels: rp.pixels,
                     })
             })
             .await
@@ -233,7 +274,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
                 let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
                 let _ = loader.write(&data);
                 let _ = loader.close();
-                loader.pixbuf().map(|pb| BaseImage {
+                loader.pixbuf().map(|pb| BaseImage::Srgb8 {
                     bytes: pb.read_pixel_bytes().to_vec(),
                     width: pb.width(),
                     height: pb.height(),
@@ -263,20 +304,18 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
             return;
         };
         if let Some(b) = pick_ctx.base.borrow().as_ref() {
-            let (w, h) = (b.width as usize, b.height as usize);
+            let (w, h) = b.dims();
             match crate::preview::map_widget_to_image(
                 pic.width() as f64, pic.height() as f64, w, h, x, y,
             ) {
                 Some((px, py)) => {
                     // Sample what's displayed: re-run the (bypass-aware) pipeline.
-                    let processed = crate::preview::apply_pipeline(
-                        &b.bytes, w, h, b.rowstride, b.nch, &effective_params(&pick_ctx),
-                    );
-                    if let Some((r, g, bl)) =
-                        crate::preview::sample_pixel(&processed, w, h, b.rowstride, b.nch, px, py)
-                    {
+                    let r = b.render(&effective_params(&pick_ctx));
+                    if let Some((rr, gg, bb)) = crate::preview::sample_pixel(
+                        &r.bytes, r.width as usize, r.height as usize, r.rowstride, r.nch, px, py,
+                    ) {
                         label.set_text(&format!(
-                            "Pick ({px},{py}):  R {r}  G {g}  B {bl}   #{r:02X}{g:02X}{bl:02X}"
+                            "Pick ({px},{py}):  R {rr}  G {gg}  B {bb}   #{rr:02X}{gg:02X}{bb:02X}"
                         ));
                     }
                 }
@@ -695,6 +734,22 @@ mod tests {
         let mut on = PreviewParams::default();
         on.sigmoid_on = true;
         assert_eq!(initial_params(Some(on), false), on);
+    }
+
+    #[test]
+    fn linear_base_render_shape() {
+        // BaseImage::Linear renders to tightly-packed RGB8 (nch 3, rowstride w*3)
+        // — the texture-upload contract the Linear arm relies on.
+        let b = BaseImage::Linear {
+            width: 2,
+            height: 1,
+            pixels: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        };
+        let r = b.render(&PreviewParams::default());
+        assert_eq!((r.width, r.height), (2, 1));
+        assert_eq!(r.nch, 3);
+        assert_eq!(r.rowstride, 2 * 3);
+        assert_eq!(r.bytes.len(), 2 * 1 * 3);
     }
 
     /// Every live-module label must still exist verbatim in the catalog, else

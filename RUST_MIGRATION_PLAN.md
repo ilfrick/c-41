@@ -191,8 +191,14 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    sliders) wired into the panel; `persist::load_saved` now returns
    `Option<PreviewParams>` so the raw-default-sigmoid only fires with no saved
    edit (a user can persist sigmoid-off on a raw) — seeding extracted to a pure,
-   unit-tested `initial_params`. Remaining: (a) float `BaseImage` (unclipped
-   highlights into sigmoid + no 8-bit round-trip); (b) higher-quality
+   unit-tested `initial_params`. **m2-6:** **float `BaseImage`** — `BaseImage` is
+   now an enum (`Srgb8` JPEG path unchanged | `Linear` raw path, packed
+   scene-linear RGBA f32, values >1). The raw preview runs the pipeline on the
+   unclipped linear buffer (`render_linear_to_srgb8`), so sigmoid rolls off
+   highlights >1 instead of them clamping to white at an 8-bit boundary —
+   visually verified (sunset sky: blown-white → smooth gradient; preview range
+   now [0, 2.08]). Remaining: (a) cache the picker's render (perf); (b)
+   higher-quality
    demosaic (PPG/RCD/VNG are migrated; box3 is the current baseline); (b) a
    float `BaseImage` so the preview skips the 8-bit round-trip; (c) ROI/(w,h)
    signature + geometry-aware IOPs; (d) OpenCL.

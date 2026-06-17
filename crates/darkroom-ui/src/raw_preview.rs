@@ -15,6 +15,11 @@
 //!   must read the raw fresh and run the float pipeline** (it does — export is
 //!   driven by the file path, not this buffer). A future `BaseImage::Float`
 //!   could carry linear f32 straight into the pipeline.
+//! - **Highlight clipping before tone mapping.** Encoding to 8-bit clamps
+//!   scene-linear values >1.0 to white, so the sigmoid tone-map (run later in
+//!   `apply_pipeline`) can't roll those highlights off — it improves midtone
+//!   contrast but not blown highlights. The float `BaseImage` above also fixes
+//!   this (sigmoid would then see the unclipped >1.0 highlights).
 //! - **`.dng` is a container**: linear/float/already-demosaiced DNGs are rejected
 //!   by the CFA core decoder → `None` (the loader logs and shows nothing).
 //! - **`.raw` is ambiguous** (several vendors + unrelated binary dumps); routed
@@ -25,14 +30,14 @@
 /// future "fit to widget size" / HiDPI value.
 pub const PREVIEW_MAX_DIM: usize = 2048;
 
-/// An 8-bit RGB preview decoded from a raw, shaped like the darkroom view's
-/// `BaseImage` inputs (tightly packed, `nch = 3`).
+/// A decoded, downscaled raw preview in **linear scene-referred RGBA `f32`**
+/// (packed, `width*height*4`, values may exceed 1.0). The darkroom view runs the
+/// pipeline on this directly (no 8-bit round-trip), so a tone-map stage sees the
+/// unclipped highlights.
 pub struct RawPreview {
-    pub bytes: Vec<u8>,
-    pub width: i32,
-    pub height: i32,
-    pub rowstride: usize,
-    pub nch: usize,
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<f32>,
 }
 
 /// File extensions we route through the raw decoder rather than gdk-pixbuf.
@@ -86,21 +91,7 @@ pub fn downscale_rgba(
     (ow, oh, out)
 }
 
-/// Encode a packed linear RGBA `f32` image to tightly-packed 8-bit **sRGB RGB**
-/// (alpha dropped), clamping to [0,1].
-pub fn linear_rgba_to_srgb8(rgba: &[f32], width: usize, height: usize) -> Vec<u8> {
-    let n = width * height;
-    let mut out = vec![0u8; n * 3];
-    for i in 0..n {
-        for c in 0..3 {
-            let enc = darkroom_core::color::linear_to_srgb(rgba[i * 4 + c]);
-            out[i * 3 + c] = (enc.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        }
-    }
-    out
-}
-
-/// Decode a raw file into an 8-bit sRGB [`RawPreview`], downscaled so its longest
+/// Decode a raw file into a linear [`RawPreview`], downscaled so its longest
 /// side is at most `max_dim` (for slider responsiveness). `None` on decode
 /// failure or an unsupported raw (e.g. X-Trans, rejected by the core decoder).
 pub fn decode_raw_preview(path: &str, max_dim: usize) -> Option<RawPreview> {
@@ -112,13 +103,10 @@ pub fn decode_raw_preview(path: &str, max_dim: usize) -> Option<RawPreview> {
     let longest = w.max(h);
     let factor = longest.div_ceil(max_dim.max(1)).max(1);
     let (w2, h2, small) = downscale_rgba(&rgba, w, h, factor);
-    let bytes = linear_rgba_to_srgb8(&small, w2, h2);
     Some(RawPreview {
-        bytes,
-        width: w2 as i32,
-        height: h2 as i32,
-        rowstride: w2 * 3,
-        nch: 3,
+        width: w2,
+        height: h2,
+        pixels: small,
     })
 }
 
@@ -159,14 +147,12 @@ mod tests {
     }
 
     #[test]
-    fn srgb8_encodes_endpoints_and_drops_alpha() {
-        // linear 0→0, 1→255; alpha ignored; output is tightly packed RGB.
-        let rgba = vec![0.0, 1.0, 0.5, 0.0];
-        let out = linear_rgba_to_srgb8(&rgba, 1, 1);
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0], 0);
-        assert_eq!(out[1], 255);
-        // linear 0.5 → sRGB ≈ 0.735 → ~188
-        assert!((out[2] as i32 - 188).abs() <= 1, "mid {}", out[2]);
+    fn downscale_drops_partial_edge_blocks() {
+        // 3x3 at factor 2 ⇒ one full 2x2 block ⇒ 1x1; the partial right/bottom
+        // edge is dropped (documented behaviour).
+        let rgba = vec![0.0f32; 3 * 3 * 4];
+        let (w, h, out) = downscale_rgba(&rgba, 3, 3, 2);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(out.len(), 4);
     }
 }

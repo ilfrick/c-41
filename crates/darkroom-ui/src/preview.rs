@@ -303,6 +303,33 @@ pub fn apply_pipeline(
     outbuf
 }
 
+/// Run the preview pipeline on a packed **linear** RGBA `f32` buffer (e.g. a raw
+/// decoded scene-linear, with values possibly >1.0) and encode the result to
+/// tightly-packed 8-bit sRGB **RGB** for display. Unlike [`apply_pipeline`],
+/// there is no 8-bit round-trip on the way in, so a tone-map stage (sigmoid)
+/// sees the *unclipped* highlights and can roll them off. `linear` must be
+/// `width*height*4` long.
+pub fn render_linear_to_srgb8(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+) -> Vec<u8> {
+    let n = width.saturating_mul(height);
+    if linear.len() < n * 4 {
+        return vec![0u8; n * 3];
+    }
+    let processed = params.to_pipeline().process(&linear[..n * 4]);
+    let mut out = vec![0u8; n * 3];
+    for i in 0..n {
+        for c in 0..3 {
+            let enc = darkroom_core::color::linear_to_srgb(processed[i * 4 + c]);
+            out[i * 3 + c] = (enc.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    out
+}
+
 /// Per-channel (R, G, B) 256-bin histogram of an 8-bit interleaved image.
 pub type Histogram = [[u32; 256]; 3];
 
@@ -604,6 +631,31 @@ mod tests {
                 "is_identity vs empty-pipeline disagree for {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn render_linear_identity_encodes_srgb() {
+        // empty pipeline ⇒ straight linear→sRGB encode, RGB8 (alpha dropped).
+        let lin = vec![0.0f32, 1.0, 0.214, 1.0]; // linear; 0.214 ≈ sRGB 0.5
+        let out = render_linear_to_srgb8(&lin, 1, 1, &PreviewParams::default());
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 255);
+        assert!((out[2] as i32 - 128).abs() <= 1, "mid {}", out[2]);
+    }
+
+    #[test]
+    fn sigmoid_rolls_off_unclipped_highlight() {
+        // The whole point of the float path: a scene-linear highlight >1 must NOT
+        // hard-clip to 255 once sigmoid is on — it rolls off below white.
+        let lin = vec![2.0f32, 2.0, 2.0, 1.0]; // linear, well above display white
+        let plain = render_linear_to_srgb8(&lin, 1, 1, &PreviewParams::default());
+        assert_eq!(plain[0], 255, "no tone-map ⇒ clips to white");
+        let mut p = PreviewParams::default();
+        p.sigmoid_on = true;
+        let toned = render_linear_to_srgb8(&lin, 1, 1, &p);
+        assert!(toned[0] < 255, "sigmoid should roll the highlight off: {}", toned[0]);
+        assert!(toned[0] > 200, "but still bright: {}", toned[0]);
     }
 
     #[test]
