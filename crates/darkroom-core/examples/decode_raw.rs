@@ -12,8 +12,8 @@ fn main() {
 
     let img = rawimage::load(&path).expect("decode failed");
     println!(
-        "decoded: {}x{}  cfa={:?}  wb={:?}",
-        img.width, img.height, img.cfa, img.wb
+        "decoded: {}x{}  cfa={:?}  wb={:?}  orientation(t,fx,fy)={:?}",
+        img.width, img.height, img.cfa, img.wb, img.orientation
     );
     let mosaic_max = img.mosaic.iter().copied().fold(0.0f32, f32::max);
     println!(

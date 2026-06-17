@@ -39,6 +39,9 @@ pub struct RawImage {
     pub cfa: [[usize; 2]; 2],
     /// White-balance multipliers in RGBE order (as encoded in the file).
     pub wb: [f32; 4],
+    /// Display orientation as `(transpose, flip_x, flip_y)` from rawloader's
+    /// `Orientation::to_flips()` — applied (after demosaic) by `to_linear_rgba`.
+    pub orientation: (bool, bool, bool),
     /// Black/white-normalised photosites, row-major, `width * height` long.
     pub mosaic: Vec<f32>,
 }
@@ -123,8 +126,49 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<RawImage> {
         height: raw.height,
         cfa,
         wb: raw.wb_coeffs,
+        orientation: raw.orientation.to_flips(),
         mosaic,
     })
+}
+
+/// Reorient a packed RGBA `f32` image to display orientation, given rawloader's
+/// `(transpose, flip_x, flip_y)` decomposition. The flips are applied in source
+/// space *then* the transpose (rawloader's convention — verified against a real
+/// EXIF-8 portrait raw). Returns the (possibly swapped) dimensions and the
+/// reoriented buffer. `(false, false, false)` is a copy.
+pub fn apply_orientation(
+    rgba: &[f32],
+    width: usize,
+    height: usize,
+    flips: (bool, bool, bool),
+) -> (usize, usize, Vec<f32>) {
+    let (transpose, flip_x, flip_y) = flips;
+    if !transpose && !flip_x && !flip_y {
+        return (width, height, rgba.to_vec());
+    }
+    let (ow, oh) = if transpose { (height, width) } else { (width, height) };
+    let mut out = vec![0.0f32; ow * oh * 4];
+    for oy in 0..oh {
+        for ox in 0..ow {
+            // Forward op order is flip_x, flip_y (in source space), THEN
+            // transpose — rawloader's `to_flips` convention. (Verified against a
+            // real EXIF-8/Rotate270 portrait raw: anything else came out
+            // upside-down.) Map each output pixel back to its source.
+            let (sx, sy) = if transpose {
+                let sr = if flip_y { height - 1 - ox } else { ox };
+                let sc = if flip_x { width - 1 - oy } else { oy };
+                (sc, sr)
+            } else {
+                let sc = if flip_x { width - 1 - ox } else { ox };
+                let sr = if flip_y { height - 1 - oy } else { oy };
+                (sc, sr)
+            };
+            let sp = (sy * width + sx) * 4;
+            let op = (oy * ow + ox) * 4;
+            out[op..op + 4].copy_from_slice(&rgba[sp..sp + 4]);
+        }
+    }
+    (ow, oh, out)
 }
 
 /// Build darktable's packed Bayer `filters` value from a 2×2 CFA pattern such
@@ -199,7 +243,8 @@ impl RawImage {
         for px in rgba.chunks_exact_mut(4) {
             px[3] = 1.0;
         }
-        (self.width, self.height, rgba)
+        // Reorient sensor → display (handles portrait shots etc.).
+        apply_orientation(&rgba, self.width, self.height, self.orientation)
     }
 }
 
@@ -262,6 +307,59 @@ mod tests {
         assert!(matches!(load("/no/such/raw.cr2"), Err(Error::Raw(_))));
     }
 
+    // 2x2 image, channel 0 = row*2+col marker, alpha = 1.
+    fn marker_2x2() -> Vec<f32> {
+        let mut v = Vec::new();
+        for r in 0..2 {
+            for c in 0..2 {
+                v.extend([(r * 2 + c) as f32, 0.0, 0.0, 1.0]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn orientation_identity_flips_transpose() {
+        let img = marker_2x2(); // markers [0,1 / 2,3]
+        // identity
+        let (w, h, o) = apply_orientation(&img, 2, 2, (false, false, false));
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(o[0], 0.0);
+        // flip_x → columns mirrored: [1,0 / 3,2]
+        let (_, _, o) = apply_orientation(&img, 2, 2, (false, true, false));
+        assert_eq!(o[0], 1.0);
+        // flip_y → rows mirrored: [2,3 / 0,1]
+        let (_, _, o) = apply_orientation(&img, 2, 2, (false, false, true));
+        assert_eq!(o[0], 2.0);
+        // transpose → [0,2 / 1,3] (out[0]=0, out at (col0,row1)=1)
+        let (_, _, o) = apply_orientation(&img, 2, 2, (true, false, false));
+        assert_eq!(o[0], 0.0);
+        assert_eq!(o[(1 * 2 + 0) * 4], 1.0);
+    }
+
+    #[test]
+    fn orientation_transpose_swaps_dims() {
+        // 2 wide × 3 tall, ch0 marker = row*2+col.
+        let mut img = Vec::new();
+        for r in 0..3 {
+            for c in 0..2 {
+                img.extend([(r * 2 + c) as f32, 0.0, 0.0, 1.0]);
+            }
+        }
+        let (w, h, o) = apply_orientation(&img, 2, 3, (true, false, false));
+        assert_eq!((w, h), (3, 2)); // dims swapped
+        assert_eq!(o[0], 0.0); // out(0,0) = src(0,0)
+        assert_eq!(o[(0 * 3 + 2) * 4], 4.0); // out(2,0) = src(0,2) = row2col0 = 4
+
+        // Rotate270 = (transpose, flip_x, flip_y) = (true, true, false): the
+        // exact path of the verified EXIF-8 portrait ORF. flips run in source
+        // space, then transpose.
+        let (w, h, o) = apply_orientation(&img, 2, 3, (true, true, false));
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(o[0], 1.0); // out(0,0) = src(row0, col1) = 1
+        assert_eq!(o[(1 * 3 + 2) * 4], 4.0); // out(2,1) = src(row2, col0) = 4
+    }
+
     #[test]
     fn filters_from_cfa_matches_fc_bayer() {
         // For each Bayer arrangement, the reconstructed `filters` must read back
@@ -305,6 +403,7 @@ mod tests {
             height: 2,
             cfa: [[0, 1], [1, 2]], // RGGB
             wb: [2.0, 1.0, 4.0, 1.0],
+            orientation: (false, false, false),
             mosaic: vec![0.4, 0.6, 0.2, 0.8],
         };
         let (w, h, rgba) = img.to_linear_rgba();

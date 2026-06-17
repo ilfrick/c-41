@@ -174,7 +174,10 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    — `crate::raw_preview` (darkroom-ui) decodes off-thread, downscales in linear,
    sRGB-encodes to an 8-bit `BaseImage` that flows through the same preview
    pipeline as a JPEG; verified end-to-end on a real 16MP Olympus ORF
-   (decode→demosaic→WB→downscale→display preview). Remaining: (a) higher-quality
+   (decode→demosaic→WB→downscale→display preview). **m2-4d:** EXIF orientation
+   applied (`apply_orientation`) — visual confirmation caught portrait raws
+   rendering upside-down; fixed (flips-then-transpose) and re-verified upright on
+   a real EXIF-8 portrait ORF. Remaining: (a) higher-quality
    demosaic (PPG/RCD/VNG are migrated; box3 is the current baseline); (b) a
    float `BaseImage` so the preview skips the 8-bit round-trip; (c) ROI/(w,h)
    signature + geometry-aware IOPs; (d) OpenCL.
