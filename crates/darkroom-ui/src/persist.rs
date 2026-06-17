@@ -44,16 +44,20 @@ fn imgid_for_path(conn: &Connection, full_path: &str) -> Option<i32> {
 /// [`PreviewParams::default`] on any miss (no db, image not catalogued, no saved
 /// row, or an undecodable/old blob).
 pub fn load_params(db_path: &str, full_path: &str) -> PreviewParams {
+    load_saved(db_path, full_path).unwrap_or_default()
+}
+
+/// Load the saved preview params for the image, distinguishing **"no saved
+/// edit"** (`None`) from a decoded row (`Some`) — the darkroom view uses that to
+/// decide whether to apply raw-only defaults (e.g. sigmoid on). `None` on: no
+/// db, uncatalogued image, no row, or an undecodable/old-schema blob.
+pub fn load_saved(db_path: &str, full_path: &str) -> Option<PreviewParams> {
     if db_path.is_empty() {
-        return PreviewParams::default();
+        return None;
     }
-    let Ok(conn) = Connection::open(db_path) else {
-        return PreviewParams::default();
-    };
-    match imgid_for_path(&conn, full_path) {
-        Some(imgid) => load_params_conn(&conn, imgid),
-        None => PreviewParams::default(),
-    }
+    let conn = Connection::open(db_path).ok()?;
+    let imgid = imgid_for_path(&conn, full_path)?;
+    load_saved_conn(&conn, imgid)
 }
 
 /// Persist preview params for the image at `full_path`. Best-effort: silently
@@ -72,15 +76,15 @@ pub fn save_params(db_path: &str, full_path: &str, params: &PreviewParams) {
 
 /// Testable core of [`load_params`]. Any error (no row, or the table not yet
 /// created on a pre-feature db) yields defaults.
-fn load_params_conn(conn: &Connection, imgid: i32) -> PreviewParams {
+fn load_saved_conn(conn: &Connection, imgid: i32) -> Option<PreviewParams> {
     let blob: rusqlite::Result<Vec<u8>> = conn.query_row(
         "SELECT params FROM main.darkroom_preview WHERE imgid = ?1",
         rusqlite::params![imgid],
         |row| row.get(0),
     );
     match blob {
-        Ok(b) => PreviewParams::decode(&b).unwrap_or_default(),
-        Err(_) => PreviewParams::default(),
+        Ok(b) => PreviewParams::decode(&b), // None for an old/garbage-version blob
+        Err(_) => None,                     // no row / no table yet
     }
 }
 
@@ -137,17 +141,17 @@ mod tests {
         let db = open_db();
         let p = sample_params();
         save_params_conn(&db, 42, &p).unwrap();
-        assert_eq!(load_params_conn(&db, 42), p);
+        assert_eq!(load_saved_conn(&db, 42), Some(p));
     }
 
     #[test]
-    fn load_defaults_when_table_absent_or_no_row() {
+    fn load_saved_is_none_when_table_absent_or_no_row() {
         let db = open_db();
-        // table doesn't exist yet → defaults (no panic)
-        assert_eq!(load_params_conn(&db, 42), PreviewParams::default());
+        // table doesn't exist yet → None (no panic), distinct from a saved row
+        assert_eq!(load_saved_conn(&db, 42), None);
         // create the table via a save for a different image, then a missing row
         save_params_conn(&db, 99, &sample_params()).unwrap();
-        assert_eq!(load_params_conn(&db, 42), PreviewParams::default());
+        assert_eq!(load_saved_conn(&db, 42), None);
     }
 
     #[test]
@@ -166,6 +170,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
-        assert_eq!(load_params_conn(&db, 42), p2);
+        assert_eq!(load_saved_conn(&db, 42), Some(p2));
     }
 }

@@ -45,6 +45,7 @@ static CATALOG: &[ModuleGroup] = &[
         ModuleGroup {
             name: "Tone",
             modules: &[
+                m("Sigmoid", false),
                 m("Filmic RGB", true),
                 m("Tone equalizer", false),
                 m("Levels", false),

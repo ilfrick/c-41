@@ -171,17 +171,10 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // Shared live-preview state. Params are seeded from the DB (saved on a
     // previous edit) before the panel/preview are built, so the sliders and the
     // first render reflect the restored values.
-    let seed_params = {
-        let mut p = crate::persist::load_params(db_path, file_path);
-        // Raws are scene-linear, so default the sigmoid display tone-map ON
-        // (unless the user already saved an edit). JPEGs are display-referred —
-        // leave it off so we don't double-tone-map them.
-        if crate::raw_preview::is_raw_path(file_path) && p == PreviewParams::default() {
-            p.sigmoid_on = true;
-        }
-        p
-    };
-    let params = Rc::new(RefCell::new(seed_params));
+    let params = Rc::new(RefCell::new(initial_params(
+        crate::persist::load_saved(db_path, file_path),
+        crate::raw_preview::is_raw_path(file_path),
+    )));
     let autosave = (!db_path.is_empty()).then(|| {
         Rc::new(AutoSave {
             db_path: db_path.to_string(),
@@ -478,6 +471,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Velvia" => pg.add(&velvia_module_row(ctx)),
                 "Split-toning" => pg.add(&splittoning_module_row(ctx)),
                 "Monochrome" => pg.add(&monochrome_module_row(ctx)),
+                "Sigmoid" => pg.add(&sigmoid_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -503,7 +497,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -624,6 +618,33 @@ fn monochrome_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         })
 }
 
+/// Choose the initial params for a freshly-opened image: the `saved` edit if
+/// any, else defaults — with the sigmoid display tone-map defaulted ON for raws
+/// that have **no saved edit** (scene-linear input; JPEGs are display-referred,
+/// and a user who saved sigmoid off keeps it off). Pure, so the seeding policy
+/// is unit-tested rather than buried in the GTK builder.
+fn initial_params(saved: Option<PreviewParams>, is_raw: bool) -> PreviewParams {
+    let mut p = saved.unwrap_or_default();
+    if saved.is_none() && is_raw {
+        p.sigmoid_on = true;
+    }
+    p
+}
+
+/// Sigmoid module: enable switch gates `sigmoid_on` (the scene-linear → display
+/// tone map); contrast and skew sliders. Defaults on for raws (set at page load).
+fn sigmoid_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Sigmoid", "tone mapping", p0.sigmoid_on,
+        |p, on| p.sigmoid_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Contrast", 0.1, 10.0, 0.05, p0.sigmoid_contrast as f64,
+                |p, v| p.sigmoid_contrast = v);
+            add_param_slider(e, ctx, "Skew", -1.0, 1.0, 0.01, p0.sigmoid_skew as f64,
+                |p, v| p.sigmoid_skew = v);
+        })
+}
+
 /// Paint the RGB histogram: dark backdrop with one translucent filled curve per
 /// channel, each normalised to the global max bin.
 fn draw_histogram(cr: &gtk4::cairo::Context, w: i32, h: i32, hist: &Histogram) {
@@ -657,6 +678,24 @@ fn draw_histogram(cr: &gtk4::cairo::Context, w: i32, h: i32, hist: &Histogram) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_params_seeding_matrix() {
+        use crate::preview::PreviewParams;
+        // no saved edit + raw ⇒ sigmoid defaulted on
+        assert!(initial_params(None, true).sigmoid_on);
+        // no saved edit + JPEG ⇒ left off (default)
+        assert!(!initial_params(None, false).sigmoid_on);
+        // a saved edit with sigmoid OFF on a raw ⇒ respected (not re-enabled)
+        let mut off = PreviewParams::default();
+        off.sigmoid_on = false;
+        off.ev = 0.3; // a real saved edit
+        assert!(!initial_params(Some(off), true).sigmoid_on);
+        // a saved edit is returned verbatim
+        let mut on = PreviewParams::default();
+        on.sigmoid_on = true;
+        assert_eq!(initial_params(Some(on), false), on);
+    }
 
     /// Every live-module label must still exist verbatim in the catalog, else
     /// `build_modules_panel`'s string dispatch silently renders it inert.

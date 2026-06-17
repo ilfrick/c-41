@@ -187,8 +187,12 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    for raws** (scene-linear) / off for JPEGs (display-referred). Visually verified
    on a real high-DR portrait raw (flat → proper contrast/depth). Known limit: the
    8-bit `BaseImage` clips scene-linear highlights >1 before sigmoid (fixed by the
-   float `BaseImage`). Remaining: (a) a sigmoid module row (toggle/sliders); (b)
-   float `BaseImage`; (c) higher-quality
+   float `BaseImage`). **m2-5c:** Sigmoid module row (enable + contrast/skew
+   sliders) wired into the panel; `persist::load_saved` now returns
+   `Option<PreviewParams>` so the raw-default-sigmoid only fires with no saved
+   edit (a user can persist sigmoid-off on a raw) — seeding extracted to a pure,
+   unit-tested `initial_params`. Remaining: (a) float `BaseImage` (unclipped
+   highlights into sigmoid + no 8-bit round-trip); (b) higher-quality
    demosaic (PPG/RCD/VNG are migrated; box3 is the current baseline); (b) a
    float `BaseImage` so the preview skips the 8-bit round-trip; (c) ROI/(w,h)
    signature + geometry-aware IOPs; (d) OpenCL.
