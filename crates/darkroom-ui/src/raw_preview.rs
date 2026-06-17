@@ -1,0 +1,172 @@
+//! Raw-file preview source (Phase 3 milestone-2): decode a camera raw via
+//! `darkroom_core::rawimage`, downscale it in linear light, and sRGB-encode to
+//! an 8-bit RGB buffer the darkroom view can drive through the same preview
+//! pipeline as a JPEG (`gdk-pixbuf` can't decode raws).
+//!
+//! The decode + demosaic + white-balance live in `darkroom-core`; this module is
+//! just the UI-side marshalling (downscale for responsiveness, linear→sRGB for
+//! display). The pure helpers are unit-tested; the `decode_raw_preview` glue is
+//! exercised by the `raw_preview_stats` example on a real raw.
+//!
+//! Known v1 limitations:
+//! - **8-bit round-trip.** The preview lands in the shared 8-bit `BaseImage`, so
+//!   the linear float we compute here is sRGB-quantised, then `apply_pipeline`
+//!   sRGB-decodes it back to linear. Fine for an on-screen preview; **export
+//!   must read the raw fresh and run the float pipeline** (it does — export is
+//!   driven by the file path, not this buffer). A future `BaseImage::Float`
+//!   could carry linear f32 straight into the pipeline.
+//! - **`.dng` is a container**: linear/float/already-demosaiced DNGs are rejected
+//!   by the CFA core decoder → `None` (the loader logs and shows nothing).
+//! - **`.raw` is ambiguous** (several vendors + unrelated binary dumps); routed
+//!   best-effort, failing gracefully to `None`.
+
+/// Longest-side cap for the raw preview buffer; balances demosaic + per-tick
+/// `apply_pipeline` cost against on-screen sharpness. The natural seam for a
+/// future "fit to widget size" / HiDPI value.
+pub const PREVIEW_MAX_DIM: usize = 2048;
+
+/// An 8-bit RGB preview decoded from a raw, shaped like the darkroom view's
+/// `BaseImage` inputs (tightly packed, `nch = 3`).
+pub struct RawPreview {
+    pub bytes: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+    pub rowstride: usize,
+    pub nch: usize,
+}
+
+/// File extensions we route through the raw decoder rather than gdk-pixbuf.
+const RAW_EXTENSIONS: &[&str] = &[
+    "orf", "cr2", "cr3", "nef", "arw", "raf", "dng", "rw2", "pef", "srw", "raw",
+    "3fr", "iiq", "mrw", "dcr", "kdc", "x3f", "nrw", "sr2",
+];
+
+/// True if `path`'s extension is a camera raw format (case-insensitive).
+pub fn is_raw_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| RAW_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Box-average downscale a packed RGBA `f32` image by an integer `factor`
+/// (averaging in linear light, which is correct). `factor <= 1` returns a copy.
+/// Edge pixels that don't fill a whole `factor × factor` block are dropped.
+pub fn downscale_rgba(
+    rgba: &[f32],
+    width: usize,
+    height: usize,
+    factor: usize,
+) -> (usize, usize, Vec<f32>) {
+    let f = factor.max(1);
+    if f == 1 {
+        return (width, height, rgba.to_vec());
+    }
+    let (ow, oh) = (width / f, height / f);
+    let mut out = vec![0.0f32; ow * oh * 4];
+    let inv = 1.0 / (f * f) as f32;
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut acc = [0.0f32; 4];
+            for by in 0..f {
+                for bx in 0..f {
+                    let p = ((oy * f + by) * width + (ox * f + bx)) * 4;
+                    for (c, a) in acc.iter_mut().enumerate() {
+                        *a += rgba[p + c];
+                    }
+                }
+            }
+            let op = (oy * ow + ox) * 4;
+            for (c, a) in acc.iter().enumerate() {
+                out[op + c] = a * inv;
+            }
+        }
+    }
+    (ow, oh, out)
+}
+
+/// Encode a packed linear RGBA `f32` image to tightly-packed 8-bit **sRGB RGB**
+/// (alpha dropped), clamping to [0,1].
+pub fn linear_rgba_to_srgb8(rgba: &[f32], width: usize, height: usize) -> Vec<u8> {
+    let n = width * height;
+    let mut out = vec![0u8; n * 3];
+    for i in 0..n {
+        for c in 0..3 {
+            let enc = darkroom_core::color::linear_to_srgb(rgba[i * 4 + c]);
+            out[i * 3 + c] = (enc.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    out
+}
+
+/// Decode a raw file into an 8-bit sRGB [`RawPreview`], downscaled so its longest
+/// side is at most `max_dim` (for slider responsiveness). `None` on decode
+/// failure or an unsupported raw (e.g. X-Trans, rejected by the core decoder).
+pub fn decode_raw_preview(path: &str, max_dim: usize) -> Option<RawPreview> {
+    let img = darkroom_core::rawimage::load(path).ok()?;
+    let (w, h, rgba) = img.to_linear_rgba();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let longest = w.max(h);
+    let factor = longest.div_ceil(max_dim.max(1)).max(1);
+    let (w2, h2, small) = downscale_rgba(&rgba, w, h, factor);
+    let bytes = linear_rgba_to_srgb8(&small, w2, h2);
+    Some(RawPreview {
+        bytes,
+        width: w2 as i32,
+        height: h2 as i32,
+        rowstride: w2 * 3,
+        nch: 3,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_raw_path_detects_extensions_case_insensitively() {
+        assert!(is_raw_path("/a/b/P3080001.ORF"));
+        assert!(is_raw_path("shot.cr2"));
+        assert!(is_raw_path("x.DnG"));
+        assert!(!is_raw_path("photo.jpg"));
+        assert!(!is_raw_path("noext"));
+    }
+
+    #[test]
+    fn downscale_averages_blocks_in_linear() {
+        // 2x2 RGBA, factor 2 ⇒ 1 pixel = mean of the four.
+        let rgba = vec![
+            0.0, 0.0, 0.0, 1.0, 0.2, 0.4, 0.6, 1.0, // row 0
+            0.4, 0.4, 0.4, 1.0, 0.6, 0.8, 1.0, 1.0, // row 1
+        ];
+        let (w, h, out) = downscale_rgba(&rgba, 2, 2, 2);
+        assert_eq!((w, h), (1, 1));
+        assert!((out[0] - 0.3).abs() < 1e-6); // (0+0.2+0.4+0.6)/4
+        assert!((out[1] - 0.4).abs() < 1e-6); // (0+0.4+0.4+0.8)/4
+        assert!((out[2] - 0.5).abs() < 1e-6); // (0+0.6+0.4+1.0)/4
+        assert_eq!(out[3], 1.0);
+    }
+
+    #[test]
+    fn downscale_factor_one_is_copy() {
+        let rgba = vec![0.1, 0.2, 0.3, 1.0];
+        let (w, h, out) = downscale_rgba(&rgba, 1, 1, 1);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(out, rgba);
+    }
+
+    #[test]
+    fn srgb8_encodes_endpoints_and_drops_alpha() {
+        // linear 0→0, 1→255; alpha ignored; output is tightly packed RGB.
+        let rgba = vec![0.0, 1.0, 0.5, 0.0];
+        let out = linear_rgba_to_srgb8(&rgba, 1, 1);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 255);
+        // linear 0.5 → sRGB ≈ 0.735 → ~188
+        assert!((out[2] as i32 - 188).abs() <= 1, "mid {}", out[2]);
+    }
+}

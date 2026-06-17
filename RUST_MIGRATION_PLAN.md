@@ -170,10 +170,14 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    wired). **m2-4b:** `demosaic_box` (reuses the migrated box3 kernel via a
    tested `filters_from_cfa` bridge) + `apply_white_balance` +
    `RawImage::to_linear_rgba()` give a full decode→demosaic→WB→linear-RGBA path
-   ready for `pipeline`. Remaining: (a) wire the raw path into darkroom-ui
-   (replacing the 8-bit pixbuf for raws: load → to_linear_rgba → pipeline →
-   tonemap/downscale → display); (b) higher-quality demosaic (PPG/RCD/VNG are
-   migrated); (c) ROI/(w,h) signature + geometry-aware IOPs; (d) OpenCL.
+   ready for `pipeline`. **m2-4c:** the darkroom view now opens **camera raws**
+   — `crate::raw_preview` (darkroom-ui) decodes off-thread, downscales in linear,
+   sRGB-encodes to an 8-bit `BaseImage` that flows through the same preview
+   pipeline as a JPEG; verified end-to-end on a real 16MP Olympus ORF
+   (decode→demosaic→WB→downscale→display preview). Remaining: (a) higher-quality
+   demosaic (PPG/RCD/VNG are migrated; box3 is the current baseline); (b) a
+   float `BaseImage` so the preview skips the 8-bit round-trip; (c) ROI/(w,h)
+   signature + geometry-aware IOPs; (d) OpenCL.
 3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**),
    before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), colour
    picker (**done, ui-20**: click-to-sample the processed pixel; pure

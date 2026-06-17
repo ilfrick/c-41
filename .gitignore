@@ -30,3 +30,6 @@ workspace/
 cmake-build-debug/
 .idea/
 .env
+
+# local raw samples for manual verification (not committed)
+testdata/

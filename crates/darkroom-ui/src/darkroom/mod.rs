@@ -199,26 +199,54 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     });
 
     // Load + decode the image asynchronously so the page appears immediately.
+    // Camera raws go through the Rust raw decoder (gdk-pixbuf can't read them);
+    // everything else through gdk-pixbuf. Both yield an 8-bit `BaseImage`.
     let path_for_load = file_path.to_string();
     glib::spawn_future_local(clone!(@strong ctx => async move {
-        let data = gio::spawn_blocking(move || std::fs::read(&path_for_load).ok())
+        let base = if crate::raw_preview::is_raw_path(&path_for_load) {
+            // Decode + demosaic off the main thread (it's heavy); downscale to a
+            // responsive preview size.
+            let p = path_for_load.clone();
+            gio::spawn_blocking(move || {
+                crate::raw_preview::decode_raw_preview(&p, crate::raw_preview::PREVIEW_MAX_DIM)
+                    .map(|rp| BaseImage {
+                        bytes: rp.bytes,
+                        width: rp.width,
+                        height: rp.height,
+                        rowstride: rp.rowstride,
+                        nch: rp.nch,
+                    })
+            })
             .await
             .ok()
-            .flatten();
-        if let Some(data) = data {
-            let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
-            let _ = loader.write(&data);
-            let _ = loader.close();
-            if let Some(pb) = loader.pixbuf() {
-                *ctx.base.borrow_mut() = Some(BaseImage {
+            .flatten()
+        } else {
+            let p = path_for_load.clone();
+            let data = gio::spawn_blocking(move || std::fs::read(&p).ok())
+                .await
+                .ok()
+                .flatten();
+            data.and_then(|data| {
+                let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
+                let _ = loader.write(&data);
+                let _ = loader.close();
+                loader.pixbuf().map(|pb| BaseImage {
                     bytes: pb.read_pixel_bytes().to_vec(),
                     width: pb.width(),
                     height: pb.height(),
                     rowstride: pb.rowstride() as usize,
                     nch: pb.n_channels() as usize,
-                });
+                })
+            })
+        };
+        match base {
+            Some(base) => {
+                *ctx.base.borrow_mut() = Some(base);
                 render_preview(&ctx);
             }
+            // Don't make a failed decode (unsupported/corrupt raw, unreadable
+            // file) an invisible blank — log it (no toast overlay here yet).
+            None => eprintln!("darkroom preview: could not decode {path_for_load}"),
         }
     }));
 

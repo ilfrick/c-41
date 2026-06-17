@@ -15,6 +15,7 @@ pub mod lighttable;
 pub mod panels;
 pub mod persist;
 pub mod preview;
+pub mod raw_preview;
 
 pub const APP_ID:        &str = "org.darkroom.Darkroom";
 pub const DEFAULT_WIDTH:  i32 = 1280;
