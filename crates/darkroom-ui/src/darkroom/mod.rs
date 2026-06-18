@@ -41,15 +41,19 @@ struct Rendered {
     nch: usize,
 }
 
-impl BaseImage {
-    /// Image dimensions in pixels (for widget→image coordinate mapping).
-    fn dims(&self) -> (usize, usize) {
-        match self {
-            BaseImage::Srgb8 { width, height, .. } => (*width as usize, *height as usize),
-            BaseImage::Linear { width, height, .. } => (*width, *height),
-        }
-    }
+/// The last displayed render, cached for the colour picker so a click samples
+/// it instead of re-running the whole pipeline. `bytes` is the *same* refcounted
+/// buffer uploaded to the texture (a `glib::Bytes` clone is a cheap refcount
+/// bump — no pixel copy).
+struct CachedRender {
+    bytes: glib::Bytes,
+    width: i32,
+    height: i32,
+    rowstride: usize,
+    nch: usize,
+}
 
+impl BaseImage {
     /// Run the live pipeline and return the 8-bit sRGB image to display.
     fn render(&self, params: &PreviewParams) -> Rendered {
         match self {
@@ -92,6 +96,8 @@ struct PreviewCtx {
     bypass: Rc<std::cell::Cell<bool>>,
     /// Debounced DB autosave of the current params (None when there's no db).
     autosave: Option<Rc<AutoSave>>,
+    /// Last displayed render, for the colour picker (see [`CachedRender`]).
+    last_render: Rc<RefCell<Option<CachedRender>>>,
 }
 
 /// Debounced writer that persists the current params a short time after the last
@@ -162,6 +168,19 @@ fn render_preview(ctx: &PreviewCtx) {
         let gbytes = glib::Bytes::from_owned(r.bytes);
         let tex = gtk4::gdk::MemoryTexture::new(r.width, r.height, fmt, &gbytes, r.rowstride);
         picture.set_paintable(Some(&tex));
+
+        // Cache the displayed pixels (same refcounted buffer, no copy) so the
+        // colour picker samples them instead of re-rendering.
+        // INVARIANT: `render_preview` is the *only* writer of both
+        // `picture.set_paintable` and `last_render`; keep them paired here so the
+        // picker can never sample pixels that differ from what's on screen.
+        *ctx.last_render.borrow_mut() = Some(CachedRender {
+            bytes: gbytes,
+            width: r.width,
+            height: r.height,
+            rowstride: r.rowstride,
+            nch: r.nch,
+        });
 
         // The displayed pixels just changed; any prior pick is now stale.
         if let Some(label) = ctx.picker.upgrade() {
@@ -235,6 +254,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         hist: Rc::new(RefCell::new([[0u32; 256]; 3])),
         bypass: Rc::new(std::cell::Cell::new(false)),
         autosave,
+        last_render: Rc::new(RefCell::new(None)),
     };
 
     // The histogram paints from the shared `hist` buffer (no widget captured,
@@ -303,17 +323,16 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         let (Some(pic), Some(label)) = (pick_pic.upgrade(), pick_label.upgrade()) else {
             return;
         };
-        if let Some(b) = pick_ctx.base.borrow().as_ref() {
-            let (w, h) = b.dims();
+        // Sample the last displayed render (no re-render).
+        if let Some(c) = pick_ctx.last_render.borrow().as_ref() {
+            let (w, h) = (c.width as usize, c.height as usize);
             match crate::preview::map_widget_to_image(
                 pic.width() as f64, pic.height() as f64, w, h, x, y,
             ) {
                 Some((px, py)) => {
-                    // Sample what's displayed: re-run the (bypass-aware) pipeline.
-                    let r = b.render(&effective_params(&pick_ctx));
-                    if let Some((rr, gg, bb)) = crate::preview::sample_pixel(
-                        &r.bytes, r.width as usize, r.height as usize, r.rowstride, r.nch, px, py,
-                    ) {
+                    if let Some((rr, gg, bb)) =
+                        crate::preview::sample_pixel(&c.bytes, w, h, c.rowstride, c.nch, px, py)
+                    {
                         label.set_text(&format!(
                             "Pick ({px},{py}):  R {rr}  G {gg}  B {bb}   #{rr:02X}{gg:02X}{bb:02X}"
                         ));
