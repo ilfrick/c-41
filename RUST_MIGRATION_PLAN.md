@@ -197,8 +197,12 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    unclipped linear buffer (`render_linear_to_srgb8`), so sigmoid rolls off
    highlights >1 instead of them clamping to white at an 8-bit boundary —
    visually verified (sunset sky: blown-white → smooth gradient; preview range
-   now [0, 2.08]). Remaining: (a) cache the picker's render (perf); (b)
-   higher-quality
+   now [0, 2.08]). **m2-7a:** colour-picker samples a cached render (refcounted
+   `glib::Bytes`, no per-click re-render). **m2-7b:** **PPG demosaic** — the raw
+   front end now uses the migrated PPG green + red/blue kernels (with a ported
+   3-pixel border interpolate) instead of box3; sharper, fewer colour artefacts,
+   visually verified, box3 kept as the small-image fallback. Remaining: (a)
+   X-Trans support (Fuji); (b) higher-quality
    demosaic (PPG/RCD/VNG are migrated; box3 is the current baseline); (b) a
    float `BaseImage` so the preview skips the 8-bit round-trip; (c) ROI/(w,h)
    signature + geometry-aware IOPs; (d) OpenCL.

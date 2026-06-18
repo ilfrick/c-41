@@ -215,6 +215,84 @@ pub fn demosaic_box(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
     out
 }
 
+/// Demosaic a normalised Bayer CFA mosaic to packed RGBA `f32` via the migrated
+/// **PPG** (Patterned Pixel Grouping) kernels — sharper, with fewer colour
+/// artefacts than [`demosaic_box`]. Ports `demosaic_ppg`'s 3-pixel border
+/// interpolation (ppg.c:28-55), then runs the migrated green + red/blue sweeps
+/// (margin 0, no pre-median). Falls back to the box demosaic for images too
+/// small for the PPG interior ring.
+pub fn demosaic_ppg(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2]; 2]) -> Vec<f32> {
+    let n = width.saturating_mul(height);
+    if mosaic.len() < n || n == 0 {
+        return vec![0.0f32; n * 4];
+    }
+    // PPG's green sweep reaches ±3 rows/cols at R/B sites, so it needs a real
+    // interior; below 16 (comfortably > 2·3) the box fallback avoids under-running
+    // the kernels.
+    if width < 16 || height < 16 {
+        return demosaic_box(mosaic, width, height, cfa);
+    }
+    let filters = filters_from_cfa(cfa);
+    let mut out = vec![0.0f32; n * 4];
+
+    // Border interpolate the outer 3-pixel ring (ppg.c:28-55): each output
+    // channel is the mean of the in-image 3×3 neighbours of that colour, else
+    // the photosite's own value for its native colour.
+    let (w, h) = (width as i32, height as i32);
+    for j in 0..h {
+        let mut i = 0i32;
+        while i < w {
+            if i == 3 && j >= 3 && j < h - 3 {
+                i = w - 3; // skip the interior; the kernels fill it
+            }
+            if i >= w {
+                break;
+            }
+            let mut sum = [0.0f32; 8];
+            for y in (j - 1)..=(j + 1) {
+                for x in (i - 1)..=(i + 1) {
+                    if y >= 0 && x >= 0 && y < h && x < w {
+                        let f = crate::raw::fc_bayer(y, x, filters);
+                        sum[f] += mosaic[y as usize * width + x as usize];
+                        sum[f + 4] += 1.0;
+                    }
+                }
+            }
+            let f = crate::raw::fc_bayer(j, i, filters);
+            let op = 4 * (j as usize * width + i as usize);
+            let own = mosaic[j as usize * width + i as usize].max(0.0);
+            for c in 0..3 {
+                out[op + c] = if c != f && sum[c + 4] > 0.0 {
+                    (sum[c] / sum[c + 4]).max(0.0)
+                } else {
+                    own
+                };
+            }
+            i += 1;
+        }
+    }
+
+    // Green then red/blue interpolation via the migrated PPG kernels. `margin`
+    // is the interior-skip cursor for tiled ROIs; the untiled full-image path
+    // wants a value larger than any image so the skip never fires and the whole
+    // interior is processed (demosaic.c:874 uses 100000). i32::MAX/2 makes that
+    // hold for *any* representable image — no silent banding above some size —
+    // and `margin+3` still can't overflow (the green kernel saturating-adds 3).
+    const FULL_FRAME_MARGIN: i32 = i32::MAX / 2;
+    // Safety: `out` is `n*4` floats and `mosaic` is `>= n` floats — the contracts
+    // both kernels document. `input` and `in_orig` are the same (no pre-median).
+    unsafe {
+        crate::iop::demosaic::darkroom_demosaic_ppg_green(
+            out.as_mut_ptr(), mosaic.as_ptr(), mosaic.as_ptr(),
+            width, height, filters, FULL_FRAME_MARGIN,
+        );
+        crate::iop::demosaic::darkroom_demosaic_ppg_redblue(
+            out.as_mut_ptr(), width, height, filters, FULL_FRAME_MARGIN,
+        );
+    }
+    out
+}
+
 /// Apply green-normalised white balance to packed RGBA `f32` in place: R and B
 /// are scaled by their camera-multiplier ratio to green so neutral scene tones
 /// stay neutral. `wb` is the RGBE multipliers. No-op if green isn't a usable
@@ -235,7 +313,7 @@ impl RawImage {
     /// Demosaic + white-balance this raw into a packed **linear RGBA** `f32`
     /// buffer ready for [`crate::pipeline`]. Returns `(width, height, pixels)`.
     pub fn to_linear_rgba(&self) -> (usize, usize, Vec<f32>) {
-        let mut rgba = demosaic_box(&self.mosaic, self.width, self.height, self.cfa);
+        let mut rgba = demosaic_ppg(&self.mosaic, self.width, self.height, self.cfa);
         apply_white_balance(&mut rgba, self.wb);
         // box3 leaves the 4th channel at 0 (it has no contributors); set it
         // opaque so a display upload that honours alpha doesn't render the
@@ -417,6 +495,71 @@ mod tests {
         assert!((rgba[0] - 0.8).abs() < 1e-6, "R {}", rgba[0]);
         assert!((rgba[1] - 0.4).abs() < 1e-6, "G {}", rgba[1]);
         assert!((rgba[2] - 3.2).abs() < 1e-6, "B {}", rgba[2]);
+    }
+
+    #[test]
+    fn ppg_constant_mosaic_is_neutral() {
+        // A flat 16x16 RGGB mosaic must demosaic to a flat neutral grey
+        // (interpolating a constant gives the constant), interior + border.
+        let cfa = [[0usize, 1], [1, 2]];
+        let mosaic = vec![0.5f32; 16 * 16];
+        let out = demosaic_ppg(&mosaic, 16, 16, cfa);
+        assert_eq!(out.len(), 16 * 16 * 4);
+        for (idx, px) in out.chunks_exact(4).enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (px[c] - 0.5).abs() < 1e-4,
+                    "pixel {idx} ch{c} = {} (not neutral 0.5)",
+                    px[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ppg_gradient_reconstructs_all_channels() {
+        // A smooth horizontal gradient (value depends only on column) must
+        // reconstruct to ~itself in EVERY channel at interior pixels. A flat
+        // field can't catch a channel left at the vec-init 0.0 or a grossly wrong
+        // directional guess (every guess collapses to one value); a gradient can.
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (16usize, 16usize);
+        let mosaic: Vec<f32> = (0..w * h)
+            .map(|idx| (idx % w) as f32 / (w as f32 - 1.0))
+            .collect();
+        let out = demosaic_ppg(&mosaic, w, h, cfa);
+
+        // interior pixel (col 8, row 8): every channel ≈ the gradient value 8/15.
+        let expect = 8.0 / 15.0;
+        let op = (8 * w + 8) * 4;
+        for c in 0..3 {
+            assert!(
+                (out[op + c] - expect).abs() < 0.08,
+                "ch{c} = {} (want ~{expect})",
+                out[op + c]
+            );
+        }
+        // coverage: no interior pixel left all-zero where the input was non-zero.
+        for j in 4..h - 4 {
+            for i in 4..w - 4 {
+                let p = (j * w + i) * 4;
+                assert!(
+                    out[p] != 0.0 || out[p + 1] != 0.0 || out[p + 2] != 0.0,
+                    "pixel ({i},{j}) RGB all-zero"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ppg_falls_back_to_box_for_tiny_images() {
+        // Below the PPG ring size, demosaic_ppg must equal the box demosaic.
+        let cfa = [[0usize, 1], [1, 2]];
+        let mosaic = vec![0.4f32, 0.6, 0.2, 0.8]; // 2x2
+        assert_eq!(
+            demosaic_ppg(&mosaic, 2, 2, cfa),
+            demosaic_box(&mosaic, 2, 2, cfa)
+        );
     }
 
     #[test]
