@@ -175,6 +175,46 @@ fn refresh_history_list(list: &gtk4::ListBox, history: &HistoryStack) {
     }
 }
 
+/// Restore a history entry's params into the live state: write `p`, rebuild the
+/// module sliders (the Reset path, so widgets follow), re-render, and select the
+/// now-current row in the history list. Shared by the click-to-jump handler and
+/// the Undo/Redo buttons — the caller has already moved the history cursor (via
+/// `jump_to`/`undo`/`redo`) so the cursor is the entry being applied, and the
+/// render's debounced record dedups (current == `p`, no spurious branch).
+///
+/// Restoring a snapshot also exits the before/after peek: otherwise `bypass`
+/// would stay set and `render_preview` would paint the *bypassed* image (and a
+/// mismatched histogram) while the params underneath had silently changed — the
+/// viewport lying about the edit state. We clear `bypass` and re-sync the toggle
+/// button, mirroring Reset, so the helper is the single source of truth.
+fn apply_history_params(
+    ctx: &PreviewCtx,
+    panel: &glib::WeakRef<gtk4::Box>,
+    list: &glib::WeakRef<gtk4::ListBox>,
+    before_after: &glib::WeakRef<gtk4::ToggleButton>,
+    p: PreviewParams,
+) {
+    *ctx.params.borrow_mut() = p;
+    ctx.bypass.set(false); // restoring a snapshot exits the before/after peek
+    if let Some(ba) = before_after.upgrade() {
+        ba.set_active(false); // keep the toggle visual in sync with bypass
+    }
+    if let Some(panel) = panel.upgrade() {
+        while let Some(child) = panel.first_child() {
+            panel.remove(&child);
+        }
+        populate_modules(&panel, ctx);
+    }
+    render_preview(ctx);
+    // Keep the list highlight on the cursor (Undo/Redo move it without a click).
+    if let Some(list) = list.upgrade() {
+        let cursor = ctx.history.borrow().cursor();
+        if let Some(row) = list.row_at_index(cursor as i32) {
+            list.select_row(Some(&row));
+        }
+    }
+}
+
 /// Debounced writer that persists the current params a short time after the last
 /// edit (so slider drags don't write per-tick), with an explicit flush on close.
 struct AutoSave {
@@ -454,6 +494,21 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // ── IOP module list (right panel) — hosts the live param widgets ───────
     let (modules_panel, panel_box) = build_modules_panel(&ctx);
 
+    // Before/after toggle (created here so the history handlers below can clear
+    // its bypass state on restore; packed into the header later).
+    let before_after_btn = gtk4::ToggleButton::builder()
+        .icon_name("view-reveal-symbolic")
+        .tooltip_text("Show original (before/after)")
+        .build();
+    // Tooltips aren't reliably exposed as the accessible name for icon-only
+    // buttons, so set it explicitly.
+    before_after_btn.update_property(&[gtk4::accessible::Property::Label("Show original")]);
+    let before_after_ctx = ctx.clone();
+    before_after_btn.connect_toggled(move |b| {
+        before_after_ctx.bypass.set(b.is_active());
+        render_preview(&before_after_ctx);
+    });
+
     // ── History panel (above the modules) — click an entry to jump to it ───
     // One `row-activated` handler (set here, never rebuilt) restores that entry's
     // params and repopulates the module sliders, mirroring the Reset path. The
@@ -462,21 +517,17 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     {
         let jump_ctx = ctx.clone();
         let jump_panel = panel_box.downgrade();
+        let jump_list = history_list.downgrade();
+        let jump_ba = before_after_btn.downgrade();
         history_list.connect_row_activated(move |_, row| {
             let idx = row.index();
             if idx < 0 {
                 return;
             }
             let restored = jump_ctx.history.borrow_mut().jump_to(idx as usize);
-            let Some(p) = restored else { return };
-            *jump_ctx.params.borrow_mut() = p;
-            if let Some(panel) = jump_panel.upgrade() {
-                while let Some(child) = panel.first_child() {
-                    panel.remove(&child);
-                }
-                populate_modules(&panel, &jump_ctx);
+            if let Some(p) = restored {
+                apply_history_params(&jump_ctx, &jump_panel, &jump_list, &jump_ba, p);
             }
-            render_preview(&jump_ctx);
         });
     }
 
@@ -525,24 +576,51 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     let title_widget = adw::WindowTitle::new(&filename, "Darkroom");
     header.set_title_widget(Some(&title_widget));
 
-    // Before/after: while active, show the unprocessed image + its histogram.
-    let before_after_btn = gtk4::ToggleButton::builder()
-        .icon_name("view-reveal-symbolic")
-        .tooltip_text("Show original (before/after)")
-        .build();
-    // Tooltips aren't reliably exposed as the accessible name for icon-only
-    // buttons, so set it explicitly.
-    before_after_btn.update_property(&[gtk4::accessible::Property::Label("Show original")]);
-    let before_after_ctx = ctx.clone();
-    before_after_btn.connect_toggled(move |b| {
-        before_after_ctx.bypass.set(b.is_active());
-        render_preview(&before_after_ctx);
-    });
+    // Before/after toggle was created above (so the history restore can clear
+    // its state); just place it in the header here.
     header.pack_start(&before_after_btn);
 
-    // Reset: restore default params and rebuild the panel so the sliders follow.
-    let reset_btn = gtk4::Button::builder()
+    // Undo / Redo: step the history cursor and restore that entry. No-ops at the
+    // ends (undo at the seed / redo at the newest return None), so the buttons
+    // stay enabled without sensitivity tracking.
+    let undo_btn = gtk4::Button::builder()
         .icon_name("edit-undo-symbolic")
+        .tooltip_text("Undo")
+        .build();
+    undo_btn.update_property(&[gtk4::accessible::Property::Label("Undo")]);
+    let undo_ctx = ctx.clone();
+    let undo_panel = panel_box.downgrade();
+    let undo_list = history_list.downgrade();
+    let undo_ba = before_after_btn.downgrade();
+    undo_btn.connect_clicked(move |_| {
+        let restored = undo_ctx.history.borrow_mut().undo();
+        if let Some(p) = restored {
+            apply_history_params(&undo_ctx, &undo_panel, &undo_list, &undo_ba, p);
+        }
+    });
+    header.pack_start(&undo_btn);
+
+    let redo_btn = gtk4::Button::builder()
+        .icon_name("edit-redo-symbolic")
+        .tooltip_text("Redo")
+        .build();
+    redo_btn.update_property(&[gtk4::accessible::Property::Label("Redo")]);
+    let redo_ctx = ctx.clone();
+    let redo_panel = panel_box.downgrade();
+    let redo_list = history_list.downgrade();
+    let redo_ba = before_after_btn.downgrade();
+    redo_btn.connect_clicked(move |_| {
+        let restored = redo_ctx.history.borrow_mut().redo();
+        if let Some(p) = restored {
+            apply_history_params(&redo_ctx, &redo_panel, &redo_list, &redo_ba, p);
+        }
+    });
+    header.pack_start(&redo_btn);
+
+    // Reset: restore default params and rebuild the panel so the sliders follow.
+    // (Distinct icon from Undo so the two aren't confused.)
+    let reset_btn = gtk4::Button::builder()
+        .icon_name("edit-clear-all-symbolic")
         .tooltip_text("Reset all adjustments")
         .build();
     reset_btn.update_property(&[gtk4::accessible::Property::Label("Reset all adjustments")]);

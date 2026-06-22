@@ -231,9 +231,16 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    entry per settled edit via a `HistoryRecorder` (mirrors `AutoSave`) and shows
    a clickable **History** panel above the modules; clicking an entry restores
    its params and repopulates the sliders (reusing the Reset path), the jump
-   landing on its own entry so the render dedups. Deferred (next): Ctrl+Z/Ctrl+
-   Shift+Z bindings; persisting the stack across reopen (in-memory only now);
-   snapshots panel.
+   landing on its own entry so the render dedups. **m4-2: Undo/Redo header
+   buttons** — step the history cursor via `undo()`/`redo()` (no-op at the ends,
+   so no sensitivity tracking); a shared `apply_history_params` helper (used by
+   jump + undo + redo) restores params, repopulates sliders, re-selects the
+   cursor row, **and exits the before/after peek** (clears `bypass` + syncs the
+   toggle, so a restore can't leave the viewport painting a bypassed image that
+   disagrees with the params — architect S3). Reset icon changed to
+   `edit-clear-all-symbolic` to disambiguate from Undo. Deferred (next):
+   Ctrl+Z/Ctrl+Shift+Z bindings; persisting the stack across reopen (in-memory
+   only now); snapshots panel.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
