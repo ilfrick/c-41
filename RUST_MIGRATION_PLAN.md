@@ -221,7 +221,19 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    picker (**done, ui-20**: click-to-sample the processed pixel; pure
    coordinate-mapping + sampling helpers in `preview.rs`).
 4. *Remaining views/panels* — port src/libs panels (history stack, snapshots,
-   tagging, export) and the other views.
+   tagging, export) and the other views. **m4-1: history-stack panel** —
+   `history.rs` holds a pure `HistoryStack` of `PreviewParams` snapshots
+   (record/undo/redo/jump, redo-tail truncation, dedup of identical states, a
+   100-entry cap that pins the "Original" seed) plus `describe_change` for entry
+   labels (first differing module group); 11 file-free tests incl. an exhaustive
+   `PreviewParams` destructure that fails to compile if a field is added without
+   extending `describe_change`. The darkroom view records one (700ms-debounced)
+   entry per settled edit via a `HistoryRecorder` (mirrors `AutoSave`) and shows
+   a clickable **History** panel above the modules; clicking an entry restores
+   its params and repopulates the sliders (reusing the Reset path), the jump
+   landing on its own entry so the render dedups. Deferred (next): Ctrl+Z/Ctrl+
+   Shift+Z bindings; persisting the stack across reopen (in-memory only now);
+   snapshots panel.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

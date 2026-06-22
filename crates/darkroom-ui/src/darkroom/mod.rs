@@ -17,6 +17,7 @@ use glib::clone;
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::dialogs;
+use crate::history::{describe_change, HistoryStack};
 use crate::preview::{Histogram, PreviewParams};
 
 /// Placeholder shown in the colour-picker readout before/after a sample.
@@ -98,6 +99,80 @@ struct PreviewCtx {
     autosave: Option<Rc<AutoSave>>,
     /// Last displayed render, for the colour picker (see [`CachedRender`]).
     last_render: Rc<RefCell<Option<CachedRender>>>,
+    /// Navigable edit history (undo/redo via the history panel).
+    history: Rc<RefCell<HistoryStack>>,
+    /// Debounced recorder that snapshots a settled edit into `history`.
+    history_rec: Rc<HistoryRecorder>,
+}
+
+/// Debounced recorder that appends one [`HistoryStack`] entry per *settled* edit
+/// (so a slider drag coalesces into a single history item, like [`AutoSave`]),
+/// labelling it by which module changed, then refreshes the history list. The
+/// dedup in [`HistoryStack::record`] means re-renders that don't change the
+/// params (before/after toggle, a jump landing on its own entry) add nothing.
+struct HistoryRecorder {
+    params: Rc<RefCell<PreviewParams>>,
+    history: Rc<RefCell<HistoryStack>>,
+    list: glib::WeakRef<gtk4::ListBox>,
+    pending: RefCell<Option<glib::SourceId>>,
+}
+
+impl HistoryRecorder {
+    /// (Re)arm the debounce; the last edit within the window is the one recorded.
+    fn arm(self: &Rc<Self>) {
+        if let Some(id) = self.pending.borrow_mut().take() {
+            id.remove();
+        }
+        let this = self.clone();
+        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(700), move || {
+            *this.pending.borrow_mut() = None;
+            // Reads the *live* params (`ctx.params`), never `effective_params`:
+            // the before/after toggle paints the bypassed image but must not
+            // record a history entry. Because the live params are unchanged by a
+            // toggle, `record`'s dedup makes the toggle's render a no-op. Do NOT
+            // switch this to `effective_params` — it would log a spurious entry
+            // every time the user peeks at the original (and no test guards it).
+            let params = *this.params.borrow();
+            // Borrow the stack only briefly to read the current state, then to
+            // record — never across the widget refresh.
+            let label = {
+                let h = this.history.borrow();
+                describe_change(&h.current(), &params)
+            };
+            let changed = this.history.borrow_mut().record(label, params);
+            if changed {
+                if let Some(list) = this.list.upgrade() {
+                    refresh_history_list(&list, &this.history.borrow());
+                }
+            }
+        });
+        *self.pending.borrow_mut() = Some(id);
+    }
+}
+
+/// Rebuild the history panel's rows from the stack (oldest → newest) and select
+/// the current cursor row. Programmatic `select_row` fires `row-selected`, not
+/// `row-activated`, so it doesn't re-enter the click-to-jump handler.
+fn refresh_history_list(list: &gtk4::ListBox, history: &HistoryStack) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    for entry in history.entries() {
+        let row = gtk4::ListBoxRow::new();
+        let lbl = gtk4::Label::builder()
+            .label(&entry.label)
+            .halign(gtk4::Align::Start)
+            .margin_start(10)
+            .margin_end(10)
+            .margin_top(3)
+            .margin_bottom(3)
+            .build();
+        row.set_child(Some(&lbl));
+        list.append(&row);
+    }
+    if let Some(row) = list.row_at_index(history.cursor() as i32) {
+        list.select_row(Some(&row));
+    }
 }
 
 /// Debounced writer that persists the current params a short time after the last
@@ -191,6 +266,8 @@ fn render_preview(ctx: &PreviewCtx) {
         if let Some(autosave) = &ctx.autosave {
             autosave.arm();
         }
+        // Debounced history snapshot of the same settled edit.
+        ctx.history_rec.arm();
     }
 }
 
@@ -245,6 +322,22 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
             pending: RefCell::new(None),
         })
     });
+
+    // Edit history: seed with the opening state ("Original"), and a list widget
+    // the recorder rebuilds as edits settle. The list lives outside the modules
+    // panel (which Reset/jump clear and repopulate).
+    let history = Rc::new(RefCell::new(HistoryStack::new("Original", *params.borrow())));
+    let history_list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::Single)
+        .build();
+    history_list.add_css_class("navigation-sidebar");
+    let history_rec = Rc::new(HistoryRecorder {
+        params: params.clone(),
+        history: history.clone(),
+        list: history_list.downgrade(),
+        pending: RefCell::new(None),
+    });
+
     let ctx = PreviewCtx {
         picture: picture.downgrade(),
         hist_area: hist_area.downgrade(),
@@ -255,7 +348,11 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         bypass: Rc::new(std::cell::Cell::new(false)),
         autosave,
         last_render: Rc::new(RefCell::new(None)),
+        history,
+        history_rec,
     };
+    // Show the seed entry immediately.
+    refresh_history_list(&history_list, &ctx.history.borrow());
 
     // The histogram paints from the shared `hist` buffer (no widget captured,
     // so no cycle with hist_area).
@@ -357,13 +454,71 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // ── IOP module list (right panel) — hosts the live param widgets ───────
     let (modules_panel, panel_box) = build_modules_panel(&ctx);
 
-    // ── Split view: image | modules ────────────────────────────────────────
+    // ── History panel (above the modules) — click an entry to jump to it ───
+    // One `row-activated` handler (set here, never rebuilt) restores that entry's
+    // params and repopulates the module sliders, mirroring the Reset path. The
+    // jump moves the history cursor *onto* the restored entry, so the render it
+    // triggers records nothing new (the recorder dedups against the cursor).
+    {
+        let jump_ctx = ctx.clone();
+        let jump_panel = panel_box.downgrade();
+        history_list.connect_row_activated(move |_, row| {
+            let idx = row.index();
+            if idx < 0 {
+                return;
+            }
+            let restored = jump_ctx.history.borrow_mut().jump_to(idx as usize);
+            let Some(p) = restored else { return };
+            *jump_ctx.params.borrow_mut() = p;
+            if let Some(panel) = jump_panel.upgrade() {
+                while let Some(child) = panel.first_child() {
+                    panel.remove(&child);
+                }
+                populate_modules(&panel, &jump_ctx);
+            }
+            render_preview(&jump_ctx);
+        });
+    }
+
+    let history_header = gtk4::Label::builder()
+        .label("History")
+        .halign(gtk4::Align::Start)
+        .margin_top(12)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    history_header.add_css_class("heading");
+    let history_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .min_content_height(120)
+        .max_content_height(220)
+        .child(&history_list)
+        .build();
+    let history_section = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .build();
+    history_section.append(&history_header);
+    history_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    history_section.append(&history_scroll);
+
+    // Right column: history over modules.
+    let right_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .width_request(320)
+        .build();
+    right_box.append(&history_section);
+    right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    right_box.append(&modules_panel);
+
+    // ── Split view: image | (history / modules) ────────────────────────────
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
     content.append(&image_area);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
-    content.append(&modules_panel);
+    content.append(&right_box);
 
     // ── Header bar with Export button ─────────────────────────────────────
     let header = adw::HeaderBar::new();
@@ -394,11 +549,24 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     let reset_ctx = ctx.clone();
     let reset_panel = panel_box.downgrade();
     let reset_ba = before_after_btn.downgrade();
+    let reset_list = history_list.downgrade();
     reset_btn.connect_clicked(move |_| {
         *reset_ctx.params.borrow_mut() = PreviewParams::default();
         reset_ctx.bypass.set(false); // source of truth for bypass
         if let Some(ba) = reset_ba.upgrade() {
             ba.set_active(false); // sync the button visual (bypass already cleared)
+        }
+        // Record an explicit "Reset" entry now (the debounced recorder would
+        // otherwise label it by which module changed); the later render's
+        // recorder then dedups against this entry.
+        let changed = reset_ctx
+            .history
+            .borrow_mut()
+            .record("Reset", PreviewParams::default());
+        if changed {
+            if let Some(list) = reset_list.upgrade() {
+                refresh_history_list(&list, &reset_ctx.history.borrow());
+            }
         }
         if let Some(panel) = reset_panel.upgrade() {
             while let Some(child) = panel.first_child() {
@@ -482,7 +650,8 @@ fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> Lab
 /// effect) from [`crate::catalog`]. Modules backed by a migrated `darkroom-core`
 /// IOP (Exposure, Velvia) render as expandable rows with a live enable switch
 /// and parameter sliders wired to the preview pipeline; the rest are inert
-/// enable-toggle rows (history-stack wiring is a later milestone).
+/// enable-toggle rows. The navigable history panel is built separately in
+/// [`darkroom_page`] and lives above this (it survives the Reset/jump rebuilds).
 fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
     let panel = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
