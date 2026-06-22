@@ -93,7 +93,7 @@ pub fn downscale_rgba(
 
 /// Decode a raw file into a linear [`RawPreview`], downscaled so its longest
 /// side is at most `max_dim` (for slider responsiveness). `None` on decode
-/// failure or an unsupported raw (e.g. X-Trans, rejected by the core decoder).
+/// failure or an unsupported raw (e.g. a CFA period the core decoder rejects).
 pub fn decode_raw_preview(path: &str, max_dim: usize) -> Option<RawPreview> {
     let img = darkroom_core::rawimage::load(path).ok()?;
     let (w, h, rgba) = img.to_linear_rgba();

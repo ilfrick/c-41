@@ -201,11 +201,21 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `glib::Bytes`, no per-click re-render). **m2-7b:** **PPG demosaic** — the raw
    front end now uses the migrated PPG green + red/blue kernels (with a ported
    3-pixel border interpolate) instead of box3; sharper, fewer colour artefacts,
-   visually verified, box3 kept as the small-image fallback. Remaining: (a)
-   X-Trans support (Fuji); (b) higher-quality
-   demosaic (PPG/RCD/VNG are migrated; box3 is the current baseline); (b) a
-   float `BaseImage` so the preview skips the 8-bit round-trip; (c) ROI/(w,h)
-   signature + geometry-aware IOPs; (d) OpenCL.
+   visually verified, box3 kept as the small-image fallback. **m2-7c:** **X-Trans
+   (Fuji) support** — `RawImage` gains `xtrans: Option<[[u8;6];6]>`; a pure,
+   closure-driven `classify_cfa` distinguishes 2×2 Bayer from 6×6 X-Trans
+   (fail-closed on any other period / out-of-range colour, 5 file-free tests);
+   `normalize_xtrans` + `demosaic_xtrans` route through the migrated single-pass
+   **Markesteijn** kernel (self-tiling, so one full-frame call), `to_linear_rgba`
+   switches on the sensor. Unit-verified on synthetic X-Trans mosaics (neutral +
+   gradient reconstruction). **Deferred:** real-`.raf` visual verification — no
+   Fuji sample is available; the synthetic tests build the mosaic from the same
+   CFA table they demosaic with, so they are tautologically phase-aligned and
+   **cannot catch a real-sensor CFA crop/phase offset** (the most likely
+   real-image bug — shows as colour-swap/zippering). That is the headline item on
+   the X-Trans verification ticket. Remaining: (a) the deferred X-Trans visual
+   check; (b) higher-quality Bayer demosaic (PPG is the current baseline; RCD/VNG
+   migrated); (c) ROI/(w,h) signature + geometry-aware IOPs; (d) OpenCL.
 3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**),
    before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), colour
    picker (**done, ui-20**: click-to-sample the processed pixel; pure

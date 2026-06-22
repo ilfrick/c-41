@@ -2,19 +2,17 @@
 //! scene-referred front end for `pipeline`).
 //!
 //! Uses the pure-Rust [`rawloader`] crate to decode a camera raw file into a
-//! Bayer/X-Trans CFA mosaic, then normalises each photosite to linear [0,1] by
-//! subtracting the per-colour black level and scaling by the per-colour range
-//! (`white - black`). The result is a single-channel float mosaic ready to feed
-//! the migrated demosaic (wired in a later increment) and then [`pipeline`].
+//! Bayer **or Fuji X-Trans** CFA mosaic, then normalises each photosite to
+//! linear [0,1] by subtracting the per-colour black level and scaling by the
+//! per-colour range (`white - black`). The result is a single-channel float
+//! mosaic ready to feed the migrated demosaic (Bayer → PPG; X-Trans →
+//! Markesteijn) and then [`pipeline`].
 //!
 //! rawloader's `blacklevels`/`whitelevels`/`wb_coeffs` are in **RGBE order**
 //! indexed by `CFA::color_at` (0=R, 1=G, 2=B, 3=E), which is exactly the index
 //! [`normalize_cfa`] uses.
 //!
 //! Known v1 gaps (to address as the front end matures — none block Bayer):
-//! - **Bayer only.** A non-2×2 CFA (Fuji X-Trans is 6×6) is rejected by [`load`]
-//!   until the X-Trans demosaic is wired through; our [`RawImage`] models a 2×2
-//!   pattern.
 //! - **Black level from `blacklevels` only.** Cameras that report `0` and expect
 //!   the black point from the masked optical-black border (`blackareas`) get no
 //!   black subtraction yet (slightly lifted shadows).
@@ -30,13 +28,18 @@ use crate::{Error, Result};
 /// A decoded, black/white-normalised CFA mosaic plus the metadata the demosaic
 /// and white-balance steps need. `mosaic` is `width * height` linear [0,1]
 /// photosites (single channel); `cfa` is the 2×2 colour pattern (indices into
-/// the RGBE-ordered `wb`).
+/// the RGBE-ordered `wb`). For a Fuji X-Trans sensor `xtrans` carries the full
+/// 6×6 pattern and the demosaic routes to Markesteijn instead of PPG; `cfa` is
+/// then just the (unused) 2×2 snapshot at the origin.
 #[derive(Clone, Debug)]
 pub struct RawImage {
     pub width: usize,
     pub height: usize,
     /// 2×2 CFA colour indices: `cfa[row % 2][col % 2]` (0=R, 1=G, 2=B, 3=E).
     pub cfa: [[usize; 2]; 2],
+    /// `Some(6×6 pattern)` for a Fuji X-Trans sensor (colours 0=R,1=G,2=B),
+    /// `None` for a 2×2 Bayer sensor. Selects the demosaic in `to_linear_rgba`.
+    pub xtrans: Option<[[u8; 6]; 6]>,
     /// White-balance multipliers in RGBE order (as encoded in the file).
     pub wb: [f32; 4],
     /// Display orientation as `(transpose, flip_x, flip_y)` from rawloader's
@@ -75,6 +78,86 @@ pub fn normalize_cfa(
     out
 }
 
+/// Normalise a Fuji **X-Trans** CFA plane to linear [0,1], the 6×6 analogue of
+/// [`normalize_cfa`]: per photosite the colour is `xtrans[row % 6][col % 6]`
+/// (0=R, 1=G, 2=B) and `black`/`white` are indexed by that colour (RGBE order).
+/// Pure — no decode dependency.
+pub fn normalize_xtrans(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    xtrans: &[[u8; 6]; 6],
+    black: [f32; 4],
+    white: [f32; 4],
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; width.saturating_mul(height)];
+    if data.len() < out.len() {
+        return out; // malformed: short plane ⇒ all-black rather than a panic
+    }
+    for row in 0..height {
+        for col in 0..width {
+            let color = xtrans[row % 6][col % 6] as usize;
+            let b = black[color];
+            let range = (white[color] - b).max(1.0);
+            let v = (data[row * width + col] as f32 - b) / range;
+            out[row * width + col] = v.clamp(0.0, 1.0);
+        }
+    }
+    out
+}
+
+/// The CFA layouts the front end recognises: a 2×2 Bayer pattern or a 6×6 Fuji
+/// X-Trans pattern. Anything else is rejected at [`load`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CfaKind {
+    /// 2×2 Bayer (`cfa[row % 2][col % 2]`, colours 0=R,1=G,2=B,3=E).
+    Bayer([[usize; 2]; 2]),
+    /// 6×6 Fuji X-Trans (`pat[row % 6][col % 6]`, colours 0=R,1=G,2=B).
+    Xtrans([[u8; 6]; 6]),
+}
+
+/// Classify a CFA from a colour-lookup probe `color_at(row, col)` (0=R,1=G,2=B,
+/// 3=E, as `rawloader::CFA::color_at` returns). A pattern that is 2×2-periodic
+/// across the 6×6 window (6 = lcm(2,6)) is [`CfaKind::Bayer`]; otherwise one that
+/// is 6×6-periodic across a 12×12 window is [`CfaKind::Xtrans`]. Validates the
+/// colour indices fit the level arrays (RGBE for Bayer, RGB for X-Trans).
+///
+/// Pure (closure-driven) so the classification — which can't be exercised on a
+/// real file in CI without a sample of every sensor — is fully unit-testable.
+/// Fail-closed: an unrecognised period or out-of-range colour returns an error
+/// rather than guessing.
+pub fn classify_cfa(color_at: impl Fn(usize, usize) -> usize) -> Result<CfaKind> {
+    let cfa = [
+        [color_at(0, 0), color_at(0, 1)],
+        [color_at(1, 0), color_at(1, 1)],
+    ];
+    let is_2x2 = (0..6).all(|r| (0..6).all(|c| color_at(r, c) == cfa[r % 2][c % 2]));
+    if is_2x2 {
+        // Trust-boundary guard: color_at must index the length-4 RGBE arrays.
+        if cfa.iter().flatten().any(|&c| c >= 4) {
+            return Err(Error::Raw("CFA colour index outside RGBE range".into()));
+        }
+        return Ok(CfaKind::Bayer(cfa));
+    }
+    // Snapshot the 6×6 pattern and confirm it really is 6×6-periodic (checked
+    // over a 12×12 window) rather than some other CFA we don't model.
+    let mut xt = [[0u8; 6]; 6];
+    for (r, row) in xt.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            *cell = color_at(r, c) as u8;
+        }
+    }
+    let is_6x6 = (0..12).all(|r| (0..12).all(|c| color_at(r, c) == xt[r % 6][c % 6] as usize));
+    if !is_6x6 {
+        return Err(Error::Raw("unsupported CFA period (not 2×2 or 6×6)".into()));
+    }
+    // X-Trans is RGB only (no 'E'); guard the level-array indexing.
+    if xt.iter().flatten().any(|&c| c >= 3) {
+        return Err(Error::Raw("X-Trans colour index outside RGB range".into()));
+    }
+    Ok(CfaKind::Xtrans(xt))
+}
+
 /// Decode a camera raw file into a normalised [`RawImage`].
 ///
 /// Only single-component CFA mosaics (`cpp == 1`, integer data) are supported
@@ -100,31 +183,27 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<RawImage> {
         [raw.cfa.color_at(0, 0), raw.cfa.color_at(0, 1)],
         [raw.cfa.color_at(1, 0), raw.cfa.color_at(1, 1)],
     ];
-    // We model only a 2×2 Bayer pattern. Reject anything that isn't truly
-    // 2×2-periodic (e.g. Fuji X-Trans is 6×6) rather than silently snapshotting
-    // a larger pattern into 2×2 and mis-normalising most photosites. 6 = lcm(2,6)
-    // covers the common CFA periods.
-    for row in 0..6 {
-        for col in 0..6 {
-            if raw.cfa.color_at(row, col) != cfa[row % 2][col % 2] {
-                return Err(Error::Raw(
-                    "non-2x2 CFA (e.g. Fuji X-Trans) not supported yet".into(),
-                ));
-            }
-        }
-    }
-    // Trust-boundary guard: color_at must index the length-4 RGBE level arrays.
-    if cfa.iter().flatten().any(|&c| c >= 4) {
-        return Err(Error::Raw("CFA colour index outside RGBE range".into()));
-    }
     let black: [f32; 4] = std::array::from_fn(|i| raw.blacklevels[i] as f32);
     let white: [f32; 4] = std::array::from_fn(|i| raw.whitelevels[i] as f32);
-    let mosaic = normalize_cfa(data, raw.width, raw.height, cfa, black, white);
+
+    // Classify the CFA period (Bayer 2×2 vs X-Trans 6×6) and normalise with the
+    // matching layout. `cfa` (the origin 2×2 snapshot) is kept on the struct for
+    // the Bayer path; for X-Trans it's an unused placeholder.
+    let (xtrans, mosaic) = match classify_cfa(|r, c| raw.cfa.color_at(r, c))? {
+        CfaKind::Bayer(cfa2) => {
+            (None, normalize_cfa(data, raw.width, raw.height, cfa2, black, white))
+        }
+        CfaKind::Xtrans(xt) => (
+            Some(xt),
+            normalize_xtrans(data, raw.width, raw.height, &xt, black, white),
+        ),
+    };
 
     Ok(RawImage {
         width: raw.width,
         height: raw.height,
         cfa,
+        xtrans,
         wb: raw.wb_coeffs,
         orientation: raw.orientation.to_flips(),
         mosaic,
@@ -189,8 +268,8 @@ pub fn filters_from_cfa(cfa: [[usize; 2]; 2]) -> u32 {
 /// Demosaic a normalised Bayer CFA mosaic to packed RGBA `f32` via the migrated
 /// 3×3 box kernel (`iop::demosaic::darkroom_demosaic_box3`, rcd.c:86) — a fast,
 /// low-quality baseline; the higher-quality PPG/RCD/VNG kernels are migrated and
-/// can replace this later. Bayer only (`cfa` must be 2×2; X-Trans is rejected at
-/// [`load`]).
+/// can replace this later. Bayer only (`cfa` must be 2×2; X-Trans routes to
+/// [`demosaic_xtrans`]).
 pub fn demosaic_box(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2]; 2]) -> Vec<f32> {
     let mut out = vec![0.0f32; width.saturating_mul(height).saturating_mul(4)];
     // Guards the malformed/short-plane and zero-dimension cases — the latter so
@@ -293,6 +372,56 @@ pub fn demosaic_ppg(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
     out
 }
 
+/// Demosaic a normalised **X-Trans** CFA mosaic to packed RGBA `f32` via the
+/// migrated single-pass **Markesteijn** interpolation
+/// (`iop::markesteijn::darkroom_xtrans_markesteijn`, xtrans.c:45). The kernel
+/// tiles the full frame internally, so this is one call over the whole image.
+/// Returns a zeroed buffer for a malformed/short plane or an image too small for
+/// one Markesteijn tile interior (real X-Trans frames are always large).
+pub fn demosaic_xtrans(
+    mosaic: &[f32],
+    width: usize,
+    height: usize,
+    xtrans: &[[u8; 6]; 6],
+) -> Vec<f32> {
+    let n = width.saturating_mul(height);
+    let mut out = vec![0.0f32; n.saturating_mul(4)];
+    // Markesteijn reads ±pad_tile (12) around each tile; below ~16px a full
+    // frame can't supply a written interior. Real raws are thousands of px, so
+    // this only guards synthetic/degenerate inputs (left zeroed, not a panic).
+    // The `i32::MAX` cap closes the unsafe path: the kernel takes `width`/`height`
+    // as `i32` and rebuilds its slice lengths from them, so a dimension that
+    // wraps negative on the cast would under-size the slice → OOB (no real raw
+    // is anywhere near 2³¹px, but the cast must be sound regardless).
+    if mosaic.len() < n
+        || width < 16
+        || height < 16
+        || width > i32::MAX as usize
+        || height > i32::MAX as usize
+    {
+        return out;
+    }
+    let xt: [u8; 36] = std::array::from_fn(|i| xtrans[i / 6][i % 6]);
+    // darktable marks an X-Trans sensor with filters == 9; the kernel ignores
+    // the value (it reads the 6×6 `xtrans` table) but we pass it for fidelity.
+    const XTRANS_FILTERS: u32 = 9;
+    const PASSES: i32 = 1; // single-pass Markesteijn (3-pass is slower, marginal)
+    // Safety: `out` is `n*4` floats, `mosaic` is `>= n` floats, and `xt` is 36
+    // bytes — exactly the kernel's documented contract.
+    unsafe {
+        crate::iop::markesteijn::darkroom_xtrans_markesteijn(
+            out.as_mut_ptr(),
+            mosaic.as_ptr(),
+            width as i32,
+            height as i32,
+            xt.as_ptr(),
+            PASSES,
+            XTRANS_FILTERS,
+        );
+    }
+    out
+}
+
 /// Apply green-normalised white balance to packed RGBA `f32` in place: R and B
 /// are scaled by their camera-multiplier ratio to green so neutral scene tones
 /// stay neutral. `wb` is the RGBE multipliers. No-op if green isn't a usable
@@ -313,9 +442,12 @@ impl RawImage {
     /// Demosaic + white-balance this raw into a packed **linear RGBA** `f32`
     /// buffer ready for [`crate::pipeline`]. Returns `(width, height, pixels)`.
     pub fn to_linear_rgba(&self) -> (usize, usize, Vec<f32>) {
-        let mut rgba = demosaic_ppg(&self.mosaic, self.width, self.height, self.cfa);
+        let mut rgba = match &self.xtrans {
+            Some(xt) => demosaic_xtrans(&self.mosaic, self.width, self.height, xt),
+            None => demosaic_ppg(&self.mosaic, self.width, self.height, self.cfa),
+        };
         apply_white_balance(&mut rgba, self.wb);
-        // box3 leaves the 4th channel at 0 (it has no contributors); set it
+        // the demosaic leaves the 4th channel at 0 (it has no contributors); set it
         // opaque so a display upload that honours alpha doesn't render the
         // preview fully transparent.
         for px in rgba.chunks_exact_mut(4) {
@@ -480,6 +612,7 @@ mod tests {
             width: 2,
             height: 2,
             cfa: [[0, 1], [1, 2]], // RGGB
+            xtrans: None,
             wb: [2.0, 1.0, 4.0, 1.0],
             orientation: (false, false, false),
             mosaic: vec![0.4, 0.6, 0.2, 0.8],
@@ -560,6 +693,131 @@ mod tests {
             demosaic_ppg(&mosaic, 2, 2, cfa),
             demosaic_box(&mosaic, 2, 2, cfa)
         );
+    }
+
+    // Standard Fuji X-Trans 6×6 CFA (0=R, 1=G, 2=B).
+    const XTRANS: [[u8; 6]; 6] = [
+        [1, 1, 0, 1, 1, 2],
+        [1, 1, 2, 1, 1, 0],
+        [2, 0, 1, 0, 2, 1],
+        [1, 1, 2, 1, 1, 0],
+        [1, 1, 0, 1, 1, 2],
+        [0, 2, 1, 2, 0, 1],
+    ];
+
+    #[test]
+    fn normalize_xtrans_subtracts_black_and_scales_per_colour() {
+        // 6×6 X-Trans, per-colour black/white. A handful of photosites of each
+        // colour must pick the right colour's levels via xtrans[row%6][col%6].
+        let black = [10.0, 20.0, 30.0, 0.0];
+        let white = [1010.0, 1020.0, 1030.0, 1.0]; // range 1000 each
+        let data = vec![520u16; 36];
+        let out = normalize_xtrans(&data, 6, 6, &XTRANS, black, white);
+        // (0,0)=G → (520-20)/1000 = 0.5; (0,2)=R → (520-10)/1000 = 0.51;
+        // (0,5)=B → (520-30)/1000 = 0.49.
+        assert!((out[0] - 0.5).abs() < 1e-6, "G {}", out[0]);
+        assert!((out[2] - 0.51).abs() < 1e-6, "R {}", out[2]);
+        assert!((out[5] - 0.49).abs() < 1e-6, "B {}", out[5]);
+    }
+
+    #[test]
+    fn xtrans_constant_mosaic_is_neutral() {
+        // A flat X-Trans field must Markesteijn-demosaic to a flat neutral grey
+        // at interior pixels (interpolating a constant gives the constant).
+        let (w, h) = (66usize, 66usize);
+        let mosaic = vec![0.5f32; w * h];
+        let out = demosaic_xtrans(&mosaic, w, h, &XTRANS);
+        assert_eq!(out.len(), w * h * 4);
+        for j in 24..h - 24 {
+            for i in 24..w - 24 {
+                let p = (j * w + i) * 4;
+                for c in 0..3 {
+                    assert!(
+                        (out[p + c] - 0.5).abs() < 0.03,
+                        "pixel ({i},{j}) ch{c} = {} (not neutral 0.5)",
+                        out[p + c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xtrans_gradient_reconstructs_all_channels() {
+        // A smooth horizontal gradient (value depends only on column) must
+        // reconstruct to ~itself in every channel at interior pixels, and leave
+        // no interior pixel all-zero (the demosaic actually ran).
+        let (w, h) = (66usize, 66usize);
+        let mosaic: Vec<f32> = (0..w * h)
+            .map(|idx| (idx % w) as f32 / (w as f32 - 1.0))
+            .collect();
+        let out = demosaic_xtrans(&mosaic, w, h, &XTRANS);
+
+        for j in 28..h - 28 {
+            for i in 28..w - 28 {
+                let p = (j * w + i) * 4;
+                let expect = i as f32 / (w as f32 - 1.0);
+                for c in 0..3 {
+                    assert!(
+                        (out[p + c] - expect).abs() < 0.12,
+                        "pixel ({i},{j}) ch{c} = {} (want ~{expect})",
+                        out[p + c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classify_cfa_detects_bayer() {
+        // An RGGB probe is 2×2-periodic ⇒ Bayer with the origin 2×2 snapshot.
+        let rggb = [[0usize, 1], [1, 2]];
+        let got = classify_cfa(|r, c| rggb[r % 2][c % 2]).unwrap();
+        assert_eq!(got, CfaKind::Bayer(rggb));
+    }
+
+    #[test]
+    fn classify_cfa_detects_xtrans() {
+        // A genuine 6×6 X-Trans probe (not 2×2-periodic) ⇒ Xtrans with the table.
+        let got = classify_cfa(|r, c| XTRANS[r % 6][c % 6] as usize).unwrap();
+        assert_eq!(got, CfaKind::Xtrans(XTRANS));
+    }
+
+    #[test]
+    fn classify_cfa_rejects_unsupported_period() {
+        // A period-5 column pattern is neither 2×2- nor 6×6-periodic ⇒ rejected
+        // rather than mis-snapshotted into either layout.
+        let got = classify_cfa(|_, c| (c % 5) % 3);
+        assert!(matches!(got, Err(Error::Raw(_))), "got {got:?}");
+    }
+
+    #[test]
+    fn classify_cfa_rejects_bayer_colour_out_of_rgbe_range() {
+        // 2×2-periodic but a colour index ≥ 4 would index past the RGBE arrays.
+        let got = classify_cfa(|r, c| if r % 2 == 0 && c % 2 == 0 { 4 } else { 1 });
+        assert!(matches!(got, Err(Error::Raw(_))), "got {got:?}");
+    }
+
+    #[test]
+    fn classify_cfa_rejects_xtrans_colour_out_of_rgb_range() {
+        // 6×6-periodic (X-Trans-shaped) but a colour index ≥ 3 (no 'E' in X-Trans)
+        // would index past the per-colour levels we use.
+        let got = classify_cfa(|r, c| {
+            if (r % 6, c % 6) == (2, 2) {
+                3
+            } else {
+                XTRANS[r % 6][c % 6] as usize
+            }
+        });
+        assert!(matches!(got, Err(Error::Raw(_))), "got {got:?}");
+    }
+
+    #[test]
+    fn xtrans_tiny_image_is_zeroed_not_panic() {
+        // Below the Markesteijn tile interior we return zeros rather than risk an
+        // under-run; real X-Trans frames are always far larger.
+        let out = demosaic_xtrans(&vec![0.5f32; 8 * 8], 8, 8, &XTRANS);
+        assert_eq!(out, vec![0.0f32; 8 * 8 * 4]);
     }
 
     #[test]
