@@ -19,6 +19,10 @@ use std::rc::Rc;
 use crate::dialogs;
 use crate::history::{describe_change, HistoryStack};
 use crate::preview::{Histogram, PreviewParams};
+use crate::snapshots::{SnapshotStore, SNAPSHOT_CAP};
+
+/// Shared snapshot store over the cached-render payload (the frozen pixels).
+type SnapStore = Rc<RefCell<SnapshotStore<CachedRender>>>;
 
 /// Placeholder shown in the colour-picker readout before/after a sample.
 const PICKER_PROMPT: &str = "Pick: click the image to sample a pixel";
@@ -46,6 +50,7 @@ struct Rendered {
 /// it instead of re-running the whole pipeline. `bytes` is the *same* refcounted
 /// buffer uploaded to the texture (a `glib::Bytes` clone is a cheap refcount
 /// bump — no pixel copy).
+#[derive(Clone)]
 struct CachedRender {
     bytes: glib::Bytes,
     width: i32,
@@ -215,6 +220,85 @@ fn apply_history_params(
     }
 }
 
+/// Rebuild the snapshots panel's rows from the store. Each row is a label plus a
+/// remove button (per-row index closures, rebuilt here so indices stay valid);
+/// clicking a row body activates the side-by-side compare (one handler set in
+/// [`darkroom_page`]). Removing a snapshot also hides the compare view, since the
+/// snapshot being shown may be the one removed.
+fn refresh_snapshot_list(
+    list: &gtk4::ListBox,
+    store: &SnapStore,
+    snapshot_pic: &glib::WeakRef<gtk4::Picture>,
+) {
+    // Tearing down old rows drops their remove-button closures (which hold an
+    // `Rc` clone of the store, not a borrow) — so teardown never re-enters a
+    // store borrow. Snapshot the labels into an owned Vec and drop the store
+    // borrow before building rows, so the per-row closures can borrow freely.
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let labels: Vec<String> = store.borrow().entries().iter().map(|e| e.label.clone()).collect();
+    if labels.is_empty() {
+        let row = gtk4::ListBoxRow::new();
+        row.set_selectable(false);
+        row.set_activatable(false);
+        let lbl = gtk4::Label::builder()
+            .label("(no snapshots)")
+            .halign(gtk4::Align::Start)
+            .margin_start(10)
+            .margin_end(10)
+            .margin_top(3)
+            .margin_bottom(3)
+            .build();
+        lbl.add_css_class("dim-label");
+        row.set_child(Some(&lbl));
+        list.append(&row);
+        return;
+    }
+    for (i, label) in labels.iter().enumerate() {
+        let row = gtk4::ListBoxRow::new();
+        let hbox = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .margin_start(10)
+            .margin_end(6)
+            .margin_top(2)
+            .margin_bottom(2)
+            .build();
+        let name = gtk4::Label::builder()
+            .label(label)
+            .halign(gtk4::Align::Start)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+            .build();
+        let remove = gtk4::Button::builder()
+            .icon_name("window-close-symbolic")
+            .has_frame(false)
+            .valign(gtk4::Align::Center)
+            .tooltip_text("Remove snapshot")
+            .build();
+        let store_cl = store.clone();
+        let list_cl = list.downgrade();
+        let pic_cl = snapshot_pic.clone();
+        remove.connect_clicked(move |_| {
+            // Drop the `borrow_mut` at the `;` *before* `refresh_snapshot_list`
+            // re-borrows the store — that ordering is what keeps this panic-free.
+            store_cl.borrow_mut().remove(i);
+            if let Some(p) = pic_cl.upgrade() {
+                p.set_visible(false); // stop showing a possibly-removed snapshot
+            }
+            if let Some(l) = list_cl.upgrade() {
+                l.unselect_all();
+                refresh_snapshot_list(&l, &store_cl, &pic_cl);
+            }
+        });
+        hbox.append(&name);
+        hbox.append(&remove);
+        row.set_child(Some(&hbox));
+        list.append(&row);
+    }
+}
+
 /// Debounced writer that persists the current params a short time after the last
 /// edit (so slider drags don't write per-tick), with an explicit flush on close.
 struct AutoSave {
@@ -247,6 +331,20 @@ impl AutoSave {
     }
 }
 
+/// Build a `gdk::MemoryTexture` from a cached render (shared by the live
+/// preview and the snapshot comparison view).
+fn cached_render_texture(c: &CachedRender) -> gtk4::gdk::MemoryTexture {
+    // The render only ever emits 3- or 4-channel buffers; anything else would
+    // mis-map the format (and could over-read in MemoryTexture::new).
+    debug_assert!(c.nch == 3 || c.nch == 4, "unexpected channel count {}", c.nch);
+    let fmt = if c.nch == 4 {
+        gtk4::gdk::MemoryFormat::R8g8b8a8
+    } else {
+        gtk4::gdk::MemoryFormat::R8g8b8
+    };
+    gtk4::gdk::MemoryTexture::new(c.width, c.height, fmt, &c.bytes, c.rowstride)
+}
+
 /// The params the preview is currently showing: the live params, or their
 /// bypassed (all-stages-off) form while the before/after toggle is active.
 fn effective_params(ctx: &PreviewCtx) -> PreviewParams {
@@ -275,27 +373,22 @@ fn render_preview(ctx: &PreviewCtx) {
             area.queue_draw();
         }
 
-        let fmt = if r.nch == 4 {
-            gtk4::gdk::MemoryFormat::R8g8b8a8
-        } else {
-            gtk4::gdk::MemoryFormat::R8g8b8
-        };
-        let gbytes = glib::Bytes::from_owned(r.bytes);
-        let tex = gtk4::gdk::MemoryTexture::new(r.width, r.height, fmt, &gbytes, r.rowstride);
-        picture.set_paintable(Some(&tex));
-
-        // Cache the displayed pixels (same refcounted buffer, no copy) so the
-        // colour picker samples them instead of re-rendering.
-        // INVARIANT: `render_preview` is the *only* writer of both
-        // `picture.set_paintable` and `last_render`; keep them paired here so the
-        // picker can never sample pixels that differ from what's on screen.
-        *ctx.last_render.borrow_mut() = Some(CachedRender {
-            bytes: gbytes,
+        let cr = CachedRender {
+            bytes: glib::Bytes::from_owned(r.bytes),
             width: r.width,
             height: r.height,
             rowstride: r.rowstride,
             nch: r.nch,
-        });
+        };
+        picture.set_paintable(Some(&cached_render_texture(&cr)));
+
+        // Cache the displayed pixels (same refcounted buffer, no copy) so the
+        // colour picker samples them instead of re-rendering, and a "Take
+        // snapshot" freezes exactly what's on screen.
+        // INVARIANT: `render_preview` is the *only* writer of both
+        // `picture.set_paintable` and `last_render`; keep them paired here so the
+        // picker can never sample pixels that differ from what's on screen.
+        *ctx.last_render.borrow_mut() = Some(cr);
 
         // The displayed pixels just changed; any prior pick is now stale.
         if let Some(label) = ctx.picker.upgrade() {
@@ -330,6 +423,16 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .vexpand(true)
         .content_fit(gtk4::ContentFit::Contain)
         .build();
+
+    // Second picture for side-by-side snapshot comparison (hidden until a
+    // snapshot is selected; shares the image row's width 50/50 when shown).
+    let snapshot_pic = gtk4::Picture::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .content_fit(gtk4::ContentFit::Contain)
+        .visible(false)
+        .build();
+    let snapshots: SnapStore = Rc::new(RefCell::new(SnapshotStore::new(SNAPSHOT_CAP)));
 
     // ── Live RGB histogram strip under the image ───────────────────────────
     let hist_area = gtk4::DrawingArea::builder()
@@ -481,12 +584,20 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     });
     picture.add_controller(click);
 
-    // ── Left: image over histogram + picker readout ────────────────────────
+    // ── Left: image (+ optional snapshot compare) over histogram + picker ──
+    let image_row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    image_row.append(&picture);
+    image_row.append(&snapshot_pic);
+
     let image_area = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .hexpand(true)
         .build();
-    image_area.append(&picture);
+    image_area.append(&image_row);
     image_area.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     image_area.append(&hist_area);
     image_area.append(&picker_label);
@@ -554,12 +665,117 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     history_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     history_section.append(&history_scroll);
 
-    // Right column: history over modules.
+    // ── Snapshots panel — take the current view + compare side-by-side ─────
+    let snapshot_list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::Single)
+        .build();
+    snapshot_list.add_css_class("navigation-sidebar");
+
+    // Compare handler (set once): clicking a snapshot reveals it beside the live
+    // image. Reads the frozen payload by row index; the row rebuild keeps indices
+    // aligned with the store.
+    {
+        let snap_store = snapshots.clone();
+        let snap_pic_weak = snapshot_pic.downgrade();
+        snapshot_list.connect_row_activated(move |_, row| {
+            let idx = row.index();
+            if idx < 0 {
+                return;
+            }
+            let Some(pic) = snap_pic_weak.upgrade() else { return };
+            if let Some(snap) = snap_store.borrow().get(idx as usize) {
+                pic.set_paintable(Some(&cached_render_texture(&snap.payload)));
+                pic.set_visible(true);
+            }
+        });
+    }
+
+    // "Take snapshot": freeze the last displayed render (the cached pixels) into
+    // the store. No-op until the first render has populated `last_render`.
+    let take_btn = gtk4::Button::builder()
+        .icon_name("list-add-symbolic")
+        .has_frame(false)
+        .tooltip_text("Take a snapshot of the current view")
+        .build();
+    take_btn.update_property(&[gtk4::accessible::Property::Label("Take snapshot")]);
+    {
+        let take_ctx = ctx.clone();
+        let take_store = snapshots.clone();
+        let take_list = snapshot_list.downgrade();
+        let take_pic = snapshot_pic.downgrade();
+        take_btn.connect_clicked(move |_| {
+            let current = take_ctx.last_render.borrow().clone();
+            if let Some(cr) = current {
+                take_store.borrow_mut().capture(cr);
+                if let Some(l) = take_list.upgrade() {
+                    refresh_snapshot_list(&l, &take_store, &take_pic);
+                }
+            }
+        });
+    }
+
+    // "Stop comparing": hide the snapshot picture and clear the selection.
+    let stop_btn = gtk4::Button::builder()
+        .icon_name("view-restore-symbolic")
+        .has_frame(false)
+        .tooltip_text("Stop comparing")
+        .build();
+    stop_btn.update_property(&[gtk4::accessible::Property::Label("Stop comparing")]);
+    {
+        let stop_pic = snapshot_pic.downgrade();
+        let stop_list = snapshot_list.downgrade();
+        stop_btn.connect_clicked(move |_| {
+            if let Some(p) = stop_pic.upgrade() {
+                p.set_visible(false);
+            }
+            if let Some(l) = stop_list.upgrade() {
+                l.unselect_all();
+            }
+        });
+    }
+
+    let snapshot_header = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(12)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(6)
+        .build();
+    let snapshot_title = gtk4::Label::builder()
+        .label("Snapshots")
+        .halign(gtk4::Align::Start)
+        .hexpand(true)
+        .build();
+    snapshot_title.add_css_class("heading");
+    snapshot_header.append(&snapshot_title);
+    snapshot_header.append(&take_btn);
+    snapshot_header.append(&stop_btn);
+
+    let snapshot_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .min_content_height(90)
+        .max_content_height(180)
+        .child(&snapshot_list)
+        .build();
+    let snapshot_section = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .build();
+    snapshot_section.append(&snapshot_header);
+    snapshot_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    snapshot_section.append(&snapshot_scroll);
+    // Seed the placeholder row.
+    refresh_snapshot_list(&snapshot_list, &snapshots, &snapshot_pic.downgrade());
+
+    // Right column: history over snapshots over modules.
     let right_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .width_request(320)
         .build();
     right_box.append(&history_section);
+    right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    right_box.append(&snapshot_section);
     right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     right_box.append(&modules_panel);
 

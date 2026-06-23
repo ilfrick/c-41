@@ -243,8 +243,18 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `ToolbarView`, so it covers header + content and dies on page pop) binds
    Ctrl+Z → Undo and Ctrl+Shift+Z / Ctrl+Y → Redo by re-emitting the buttons'
    `clicked` (single source of truth; `undo`/`redo` bounds-check so repeats past
-   the ends are safe no-ops). Deferred (next): persisting the stack across reopen
-   (in-memory only now); snapshots panel.
+   the ends are safe no-ops). **m4-4: snapshots panel** — pure `snapshots.rs`
+   (`SnapshotStore<P>`: monotonic auto-labels, cap-8 oldest-eviction, remove/
+   clear; 6 tests) instantiated over the cached render. A "Take" button freezes
+   `last_render` (refcounted `glib::Bytes`, no copy); a Snapshots list shows the
+   captures (per-row remove); clicking one reveals it in a **second `Picture`**
+   beside the live image (side-by-side compare, `cached_render_texture` shared
+   with `render_preview`), "Stop comparing" hides it. The second Picture is a
+   separate widget, so the `render_preview` sole-writer invariant (picker
+   correctness) is untouched. Compare is approximate (independent `Contain`
+   letterboxing), not a scale-locked wipe — that's a future increment. Deferred
+   (next): persisting history/snapshots across reopen (in-memory only now);
+   scale-locked overlay wipe.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
