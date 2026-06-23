@@ -282,7 +282,9 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    replication, short-buffer defence); the cairo surface is built once per
    selection. `WipeCompare::{show,clear}` own the overlay; the
    `render_preview` sole-writer invariant on the live `Picture`/`last_render` is
-   untouched (the wipe owns a separate widget). **Milestone 4 panels complete.**
+   untouched (the wipe owns a separate widget). The **history + snapshots cluster
+   is complete**; the remaining m4 panels are **tagging** and a persistent
+   **export** panel (currently a dialog).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
