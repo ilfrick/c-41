@@ -238,9 +238,13 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    cursor row, **and exits the before/after peek** (clears `bypass` + syncs the
    toggle, so a restore can't leave the viewport painting a bypassed image that
    disagrees with the params — architect S3). Reset icon changed to
-   `edit-clear-all-symbolic` to disambiguate from Undo. Deferred (next):
-   Ctrl+Z/Ctrl+Shift+Z bindings; persisting the stack across reopen (in-memory
-   only now); snapshots panel.
+   `edit-clear-all-symbolic` to disambiguate from Undo. **m4-3: keyboard
+   shortcuts** — a page-root `ShortcutController` (`Local` scope on the
+   `ToolbarView`, so it covers header + content and dies on page pop) binds
+   Ctrl+Z → Undo and Ctrl+Shift+Z / Ctrl+Y → Redo by re-emitting the buttons'
+   `clicked` (single source of truth; `undo`/`redo` bounds-check so repeats past
+   the ends are safe no-ops). Deferred (next): persisting the stack across reopen
+   (in-memory only now); snapshots panel.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

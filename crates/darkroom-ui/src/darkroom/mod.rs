@@ -617,6 +617,33 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     });
     header.pack_start(&redo_btn);
 
+    // Keyboard shortcuts: Ctrl+Z = Undo, Ctrl+Shift+Z / Ctrl+Y = Redo. Each just
+    // re-emits the matching button's `clicked`, so the history logic lives in one
+    // place (and `undo`/`redo` bounds-check by returning None at the ends, so a
+    // repeated key past the seed/tip is a safe no-op regardless of the button).
+    // Attached to the page root (`toolbar_view`, below) with `Local` scope so it
+    // covers the whole page — header buttons included — and dies cleanly when the
+    // page is popped (no leak to the lighttable).
+    let shortcuts = gtk4::ShortcutController::new();
+    shortcuts.set_scope(gtk4::ShortcutScope::Local);
+    let emit_click = |btn: &gtk4::Button| {
+        let w = btn.downgrade();
+        gtk4::CallbackAction::new(move |_, _| {
+            if let Some(b) = w.upgrade() {
+                b.emit_clicked();
+            }
+            glib::Propagation::Stop
+        })
+    };
+    if let Some(t) = gtk4::ShortcutTrigger::parse_string("<Control>z") {
+        shortcuts.add_shortcut(gtk4::Shortcut::new(Some(t), Some(emit_click(&undo_btn))));
+    }
+    for combo in ["<Control><Shift>z", "<Control>y"] {
+        if let Some(t) = gtk4::ShortcutTrigger::parse_string(combo) {
+            shortcuts.add_shortcut(gtk4::Shortcut::new(Some(t), Some(emit_click(&redo_btn))));
+        }
+    }
+
     // Reset: restore default params and rebuild the panel so the sliders follow.
     // (Distinct icon from Undo so the two aren't confused.)
     let reset_btn = gtk4::Button::builder()
@@ -676,6 +703,8 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&content));
+    // Page-root scope: covers header + content, scoped to this page.
+    toolbar_view.add_controller(shortcuts);
 
     let page = adw::NavigationPage::builder()
         .title(&filename)
