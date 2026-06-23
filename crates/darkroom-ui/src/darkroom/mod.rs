@@ -299,12 +299,16 @@ fn refresh_snapshot_list(
     }
 }
 
-/// Debounced writer that persists the current params a short time after the last
-/// edit (so slider drags don't write per-tick), with an explicit flush on close.
+/// Debounced writer that persists the current params **and the edit-history
+/// stack** a short time after the last edit (so slider drags don't write
+/// per-tick), with an explicit flush on close. Persisting the stack here covers
+/// every state change — new entries (recorder fires at 700ms < this 800ms) and
+/// cursor moves (undo/redo/jump re-render → re-arm) — without a second timer.
 struct AutoSave {
     db_path: String,
     file_path: String,
     params: Rc<RefCell<PreviewParams>>,
+    history: Rc<RefCell<HistoryStack>>,
     pending: RefCell<Option<glib::SourceId>>,
 }
 
@@ -317,17 +321,38 @@ impl AutoSave {
         let this = self.clone();
         let id = glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
             *this.pending.borrow_mut() = None;
-            crate::persist::save_params(&this.db_path, &this.file_path, &this.params.borrow());
+            this.persist();
         });
         *self.pending.borrow_mut() = Some(id);
     }
 
     /// Cancel any pending timer and save immediately (final flush on page close).
+    /// Force-records the current params first: a flush can pre-empt the 700ms
+    /// history recorder, so the in-flight edit might not be in the stack yet
+    /// (`record` dedups if it already is).
     fn flush(&self) {
         if let Some(id) = self.pending.borrow_mut().take() {
             id.remove();
         }
+        // Capture an in-flight edit the 700ms recorder hasn't recorded yet (a
+        // close can pre-empt it) — but ONLY when the live params differ from the
+        // cursor entry. Skipping `record` entirely on a clean close (incl. right
+        // after an undo/redo/jump, where params already == current) means we
+        // never exercise the redo-tail-truncation path on a mid-stack cursor.
+        let p = *self.params.borrow();
+        let cur = self.history.borrow().current();
+        if cur != p {
+            self.history
+                .borrow_mut()
+                .record(describe_change(&cur, &p), p);
+        }
+        self.persist();
+    }
+
+    /// Write the params row and the history-stack row (best-effort).
+    fn persist(&self) {
         crate::persist::save_params(&self.db_path, &self.file_path, &self.params.borrow());
+        crate::persist::save_history(&self.db_path, &self.file_path, &self.history.borrow());
     }
 }
 
@@ -450,26 +475,41 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .build();
     picker_label.add_css_class("monospace");
 
-    // Shared live-preview state. Params are seeded from the DB (saved on a
-    // previous edit) before the panel/preview are built, so the sliders and the
-    // first render reflect the restored values.
-    let params = Rc::new(RefCell::new(initial_params(
-        crate::persist::load_saved(db_path, file_path),
-        crate::raw_preview::is_raw_path(file_path),
-    )));
+    // Edit history + live params are seeded together from the DB so the sliders,
+    // the first render, and the history panel all reflect the restored state.
+    // A saved history (its cursor = the last viewed state) wins; otherwise we
+    // fall back to the backward-compatible params-only row (old dbs) through
+    // `initial_params` (which applies raw-only defaults when there's no edit).
+    let saved_history = crate::persist::load_history(db_path, file_path);
+    let initial = match &saved_history {
+        Some(h) => h.current(),
+        None => initial_params(
+            crate::persist::load_saved(db_path, file_path),
+            crate::raw_preview::is_raw_path(file_path),
+        ),
+    };
+    let params = Rc::new(RefCell::new(initial));
+    // Fallback seed label is "Original" even when `initial` came from a restored
+    // params-only row (an old db) rather than the true unedited state — it's the
+    // root of *this* session's history timeline. A best-effort approximation: the
+    // pre-feature db never stored the original, so this is the honest starting
+    // point we have.
+    let history = Rc::new(RefCell::new(
+        saved_history.unwrap_or_else(|| HistoryStack::new("Original", *params.borrow())),
+    ));
+
     let autosave = (!db_path.is_empty()).then(|| {
         Rc::new(AutoSave {
             db_path: db_path.to_string(),
             file_path: file_path.to_string(),
             params: params.clone(),
+            history: history.clone(),
             pending: RefCell::new(None),
         })
     });
 
-    // Edit history: seed with the opening state ("Original"), and a list widget
-    // the recorder rebuilds as edits settle. The list lives outside the modules
-    // panel (which Reset/jump clear and repopulate).
-    let history = Rc::new(RefCell::new(HistoryStack::new("Original", *params.borrow())));
+    // History list widget the recorder rebuilds as edits settle. It lives outside
+    // the modules panel (which Reset/jump clear and repopulate).
     let history_list = gtk4::ListBox::builder()
         .selection_mode(gtk4::SelectionMode::Single)
         .build();

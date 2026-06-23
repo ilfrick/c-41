@@ -252,9 +252,20 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    with `render_preview`), "Stop comparing" hides it. The second Picture is a
    separate widget, so the `render_preview` sole-writer invariant (picker
    correctness) is untouched. Compare is approximate (independent `Contain`
-   letterboxing), not a scale-locked wipe — that's a future increment. Deferred
-   (next): persisting history/snapshots across reopen (in-memory only now);
-   scale-locked overlay wipe.
+   letterboxing), not a scale-locked wipe — that's a future increment.
+   **m4-5: persist the edit-history stack** — `HistoryStack` gains a versioned LE
+   `encode`/`decode` (fully bounds-checked: rejects bad version / truncation /
+   trailing bytes / out-of-range cursor / 0-or-over-cap count; embeds the fixed
+   `PreviewParams` blob per entry); `persist.rs` stores it in a new private
+   `main.darkroom_history` table (separate from `darkroom_preview`, so the
+   backward-compat params path is undisturbed); `AutoSave` now persists params +
+   stack (its debounce covers new entries — the 700ms recorder fires first — and
+   cursor moves via re-render), and flush force-records an in-flight edit only
+   when it differs from the cursor entry (never truncates the redo tail on a
+   clean close). Reopen restores the stack at its saved cursor (resume where you
+   left off); old dbs (params row, no history) fall back to a fresh single-entry
+   stack. Snapshots stay **session-only** by design (pixel-heavy, transient — as
+   in darktable). Deferred (next): scale-locked snapshot overlay wipe.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

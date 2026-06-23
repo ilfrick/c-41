@@ -131,6 +131,89 @@ impl HistoryStack {
     pub fn entries(&self) -> &[HistoryEntry] {
         &self.entries
     }
+
+    /// Serialise the stack to a versioned little-endian blob for persistence:
+    /// `[ver u8][cursor u32][count u32]` then per entry
+    /// `[label_len u16][label utf8][params blob]`. The params blob is
+    /// [`PreviewParams::encode`] (fixed length). Round-trips with [`decode`].
+    ///
+    /// [`decode`]: Self::decode
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(HISTORY_ENCODE_VERSION);
+        v.extend_from_slice(&(self.cursor as u32).to_le_bytes());
+        v.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for e in &self.entries {
+            let label = e.label.as_bytes();
+            // Labels are short module names; clamp defensively so the u16 length
+            // prefix can't truncate-then-mismatch on decode.
+            let len = label.len().min(u16::MAX as usize);
+            v.extend_from_slice(&(len as u16).to_le_bytes());
+            v.extend_from_slice(&label[..len]);
+            v.extend_from_slice(&e.params.encode());
+        }
+        v
+    }
+
+    /// Parse a blob from [`encode`]. Returns `None` on any malformation (wrong
+    /// version, truncation, a bad params blob, an out-of-range cursor, an empty
+    /// or over-cap count) — the caller falls back to a fresh stack.
+    ///
+    /// [`encode`]: Self::encode
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        // Length of one params blob (fixed; computed from a default encode).
+        let plen = PreviewParams::default().encode().len();
+        let mut p = 0usize;
+        let take = |p: &mut usize, n: usize| -> Option<()> {
+            (*p + n <= bytes.len()).then(|| *p += n)
+        };
+
+        if *bytes.first()? != HISTORY_ENCODE_VERSION {
+            return None;
+        }
+        p += 1;
+        let cursor = read_u32(bytes, &mut p)? as usize;
+        let count = read_u32(bytes, &mut p)? as usize;
+        // A valid stack always holds ≥ 1 entry and never exceeds the cap; reject
+        // anything else rather than allocate from a corrupt length.
+        if count == 0 || count > HISTORY_CAP {
+            return None;
+        }
+
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let label_len = read_u16(bytes, &mut p)? as usize;
+            let lstart = p;
+            take(&mut p, label_len)?;
+            let label = std::str::from_utf8(&bytes[lstart..p]).ok()?.to_string();
+            let pstart = p;
+            take(&mut p, plen)?;
+            let params = PreviewParams::decode(&bytes[pstart..p])?;
+            entries.push(HistoryEntry { label, params });
+        }
+        // No trailing garbage, and the cursor must index a real entry.
+        if p != bytes.len() || cursor >= entries.len() {
+            return None;
+        }
+        Some(Self { entries, cursor })
+    }
+}
+
+/// Version byte for [`HistoryStack::encode`]; bump on any layout change.
+const HISTORY_ENCODE_VERSION: u8 = 1;
+
+fn read_u32(bytes: &[u8], p: &mut usize) -> Option<u32> {
+    let end = p.checked_add(4)?;
+    let slice = bytes.get(*p..end)?;
+    *p = end;
+    Some(u32::from_le_bytes(slice.try_into().ok()?))
+}
+
+fn read_u16(bytes: &[u8], p: &mut usize) -> Option<u16> {
+    let end = p.checked_add(2)?;
+    let slice = bytes.get(*p..end)?;
+    *p = end;
+    Some(u16::from_le_bytes(slice.try_into().ok()?))
 }
 
 /// Name the module whose parameters changed between two states, for the history
@@ -327,6 +410,90 @@ mod tests {
         let base = PreviewParams::default();
         let both = PreviewParams { ev: 1.0, mono_r: 0.9, ..PreviewParams::default() };
         assert_eq!(describe_change(&base, &both), "Exposure");
+    }
+
+    #[test]
+    fn encode_decode_round_trips_with_cursor_and_labels() {
+        let mut h = HistoryStack::new("Original", params(0.0));
+        h.record("Exposure", params(1.0));
+        h.record("Velvia", params(2.0));
+        h.undo(); // cursor at index 1, with a redo tail present
+        let blob = h.encode();
+        let got = HistoryStack::decode(&blob).expect("decode");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.cursor(), 1);
+        assert_eq!(got.entries()[0].label, "Original");
+        assert_eq!(got.entries()[2].label, "Velvia");
+        assert_eq!(got.current(), params(1.0));
+        // Full structural equality of the entries.
+        assert_eq!(got.entries(), h.entries());
+    }
+
+    #[test]
+    fn decode_rejects_bad_version_truncation_and_bad_cursor() {
+        let mut h = HistoryStack::new("Original", params(0.0));
+        h.record("Exposure", params(1.0));
+        let good = h.encode();
+
+        // wrong version
+        let mut bad = good.clone();
+        bad[0] = 9;
+        assert!(HistoryStack::decode(&bad).is_none());
+
+        // truncated mid-blob
+        assert!(HistoryStack::decode(&good[..good.len() - 3]).is_none());
+
+        // trailing garbage
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(HistoryStack::decode(&extra).is_none());
+
+        // cursor past the end (cursor is bytes 1..5, little-endian)
+        let mut bad_cursor = good.clone();
+        bad_cursor[1..5].copy_from_slice(&99u32.to_le_bytes());
+        assert!(HistoryStack::decode(&bad_cursor).is_none());
+
+        // empty input
+        assert!(HistoryStack::decode(&[]).is_none());
+    }
+
+    #[test]
+    fn flush_style_record_after_undo_preserves_redo_tail() {
+        // Pins the data-safety invariant the persistence flush depends on:
+        // recording the current params while the cursor is mid-stack (params ==
+        // current) must dedup and must NOT truncate the redo tail.
+        let mut h = HistoryStack::new("Original", params(0.0));
+        h.record("a", params(1.0));
+        h.record("b", params(2.0));
+        h.undo(); // cursor at index 1, redo tail = [b]
+        let cur = h.current();
+        assert!(!h.record(describe_change(&cur, &cur), cur)); // dedup ⇒ no-op
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.cursor(), 1);
+        assert!(h.can_redo());
+    }
+
+    #[test]
+    fn previewparams_encode_len_is_pinned() {
+        // Each history entry embeds a fixed-length PreviewParams::encode() blob.
+        // If that length changes (a field added/removed), bump
+        // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
+        // history blobs are rejected rather than mis-parsed. This pin forces the
+        // deliberate decision when the length drifts.
+        assert_eq!(PreviewParams::default().encode().len(), 66);
+    }
+
+    #[test]
+    fn decode_rejects_zero_and_over_cap_count() {
+        let h = HistoryStack::new("Original", params(0.0));
+        let good = h.encode();
+        // count is bytes 5..9.
+        let mut zero = good.clone();
+        zero[5..9].copy_from_slice(&0u32.to_le_bytes());
+        assert!(HistoryStack::decode(&zero).is_none());
+        let mut huge = good.clone();
+        huge[5..9].copy_from_slice(&(HISTORY_CAP as u32 + 1).to_le_bytes());
+        assert!(HistoryStack::decode(&huge).is_none());
     }
 
     #[test]

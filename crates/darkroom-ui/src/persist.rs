@@ -16,6 +16,7 @@
 //! by design.
 
 use rusqlite::Connection;
+use crate::history::HistoryStack;
 use crate::preview::PreviewParams;
 
 /// DDL for the preview-params table. `CREATE … IF NOT EXISTS` on every save so
@@ -23,6 +24,15 @@ use crate::preview::PreviewParams;
 const PREVIEW_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS main.darkroom_preview \
      (imgid INTEGER PRIMARY KEY, params BLOB NOT NULL)";
+
+/// DDL for the edit-history table (one blob per image, same private-table
+/// rationale as `darkroom_preview`). A separate table so persisting history
+/// never disturbs the params row read by the backward-compatible `load_saved`
+/// path (old dbs have a params row but no history row → history falls back to a
+/// fresh single-entry stack seeded from those params).
+const HISTORY_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS main.darkroom_history \
+     (imgid INTEGER PRIMARY KEY, stack BLOB NOT NULL)";
 
 /// Resolve a file path to its `images.id` via folder + filename (mirrors the
 /// lighttable's lookup). `None` if the image isn't in the catalogue.
@@ -100,6 +110,58 @@ fn save_params_conn(conn: &Connection, imgid: i32, params: &PreviewParams) -> ru
     Ok(())
 }
 
+/// Load the saved edit-history stack for the image at `full_path`, or `None`
+/// (no db, uncatalogued image, no row, table absent, or an undecodable/old-schema
+/// blob). On `None` the darkroom view seeds a fresh single-entry stack.
+pub fn load_history(db_path: &str, full_path: &str) -> Option<HistoryStack> {
+    if db_path.is_empty() {
+        return None;
+    }
+    let conn = Connection::open(db_path).ok()?;
+    let imgid = imgid_for_path(&conn, full_path)?;
+    load_history_conn(&conn, imgid)
+}
+
+/// Persist the edit-history stack for the image at `full_path`. Best-effort:
+/// silently no-ops with no db or an uncatalogued image.
+pub fn save_history(db_path: &str, full_path: &str, history: &HistoryStack) {
+    if db_path.is_empty() {
+        return;
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return;
+    };
+    if let Some(imgid) = imgid_for_path(&conn, full_path) {
+        let _ = save_history_conn(&conn, imgid, history);
+    }
+}
+
+/// Testable core of [`load_history`]: any error (no row, table not yet created)
+/// or an undecodable blob yields `None`.
+fn load_history_conn(conn: &Connection, imgid: i32) -> Option<HistoryStack> {
+    let blob: rusqlite::Result<Vec<u8>> = conn.query_row(
+        "SELECT stack FROM main.darkroom_history WHERE imgid = ?1",
+        rusqlite::params![imgid],
+        |row| row.get(0),
+    );
+    match blob {
+        Ok(b) => HistoryStack::decode(&b),
+        Err(_) => None,
+    }
+}
+
+/// Testable core of [`save_history`]: upsert the single history row (PK on
+/// `imgid` ⇒ one row; `ON CONFLICT` makes it an update).
+fn save_history_conn(conn: &Connection, imgid: i32, history: &HistoryStack) -> rusqlite::Result<()> {
+    conn.execute(HISTORY_TABLE_DDL, [])?;
+    conn.execute(
+        "INSERT INTO main.darkroom_history (imgid, stack) VALUES (?1, ?2) \
+         ON CONFLICT(imgid) DO UPDATE SET stack = excluded.stack",
+        rusqlite::params![imgid, history.encode()],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +233,50 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(load_saved_conn(&db, 42), Some(p2));
+    }
+
+    fn sample_history() -> HistoryStack {
+        let mut h = HistoryStack::new("Original", PreviewParams::default());
+        h.record("Exposure", sample_params());
+        let mut p2 = sample_params();
+        p2.ev = 0.9;
+        h.record("Exposure", p2);
+        h.undo(); // leave the cursor mid-stack
+        h
+    }
+
+    #[test]
+    fn history_save_then_load_roundtrips() {
+        let db = open_db();
+        let h = sample_history();
+        save_history_conn(&db, 42, &h).unwrap();
+        let got = load_history_conn(&db, 42).expect("load");
+        assert_eq!(got.entries(), h.entries());
+        assert_eq!(got.cursor(), h.cursor());
+    }
+
+    #[test]
+    fn history_load_is_none_when_table_absent_or_no_row() {
+        let db = open_db();
+        assert!(load_history_conn(&db, 42).is_none()); // no table yet
+        save_history_conn(&db, 99, &sample_history()).unwrap(); // creates table
+        assert!(load_history_conn(&db, 42).is_none()); // still no row for 42
+    }
+
+    #[test]
+    fn history_save_upserts_single_row() {
+        let db = open_db();
+        save_history_conn(&db, 42, &sample_history()).unwrap();
+        let h2 = HistoryStack::new("Original", PreviewParams::default());
+        save_history_conn(&db, 42, &h2).unwrap();
+        let n: i32 = db
+            .query_row(
+                "SELECT COUNT(*) FROM main.darkroom_history WHERE imgid = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(load_history_conn(&db, 42).map(|h| h.len()), Some(1));
     }
 }
