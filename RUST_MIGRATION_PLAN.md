@@ -265,7 +265,24 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    clean close). Reopen restores the stack at its saved cursor (resume where you
    left off); old dbs (params row, no history) fall back to a fresh single-entry
    stack. Snapshots stay **session-only** by design (pixel-heavy, transient — as
-   in darktable). Deferred (next): scale-locked snapshot overlay wipe.
+   in darktable). **m4-6: scale-locked snapshot wipe** — replaced the approximate
+   side-by-side compare (two independently-letterboxed `Picture`s) with a
+   darktable-style **wipe**: a transparent `DrawingArea` layered over the live
+   `Picture` via a `gtk4::Overlay` paints the selected snapshot (a cached cairo
+   `Rgb24` surface) into the *same* `ContentFit::Contain` rect the live image
+   occupies, clipped left of a draggable divider; the right side stays transparent
+   so the live image shows through (`draw_wipe`). The alignment invariant is the
+   Overlay's *equal child allocation* + a **shared** `preview::contain_rect`
+   (extracted from `map_widget_to_image`, so picker and wipe letterbox
+   identically) — a feature sits at the same panel pixel across the divider. A
+   `GestureDrag` moves the divider (`wipe_fraction` clamps to the letterbox); the
+   overlay is `can_target(false)` when idle so picker clicks fall through to the
+   live image, `true` only while comparing. Pixel packing is the pure, headless-
+   tested `preview::pack_rgb24` (R,G,B→cairo native-endian B,G,R,x, greyscale
+   replication, short-buffer defence); the cairo surface is built once per
+   selection. `WipeCompare::{show,clear}` own the overlay; the
+   `render_preview` sole-writer invariant on the live `Picture`/`last_render` is
+   untouched (the wipe owns a separate widget). **Milestone 4 panels complete.**
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

@@ -367,6 +367,84 @@ pub fn compute_histogram(
     h
 }
 
+/// The on-screen rectangle an image of `img_w × img_h` occupies inside a
+/// `widget_w × widget_h` widget under `ContentFit::Contain` (scaled to fit the
+/// tighter axis, preserving aspect, centred with letterbox/pillarbox bars):
+/// top-left offset, displayed size, and the image→widget `scale`. Shared by the
+/// colour-picker hit-test and the snapshot wipe overlay so both letterbox with
+/// *identical* geometry — features line up across the wipe divider.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContainRect {
+    pub off_x: f64,
+    pub off_y: f64,
+    pub disp_w: f64,
+    pub disp_h: f64,
+    pub scale: f64,
+}
+
+/// Compute the [`ContainRect`] for `img_w × img_h` inside `widget_w × widget_h`.
+/// Returns `None` for degenerate (non-positive) sizes.
+pub fn contain_rect(widget_w: f64, widget_h: f64, img_w: usize, img_h: usize) -> Option<ContainRect> {
+    if img_w == 0 || img_h == 0 || widget_w <= 0.0 || widget_h <= 0.0 {
+        return None;
+    }
+    let (iwf, ihf) = (img_w as f64, img_h as f64);
+    let scale = (widget_w / iwf).min(widget_h / ihf); // Contain: fit the tighter axis
+    let (disp_w, disp_h) = (iwf * scale, ihf * scale);
+    let (off_x, off_y) = ((widget_w - disp_w) / 2.0, (widget_h - disp_h) / 2.0);
+    Some(ContainRect { off_x, off_y, disp_w, disp_h, scale })
+}
+
+/// Clamp pointer `x` (widget space) to a fraction in `[0, 1]` across the
+/// displayed image width of `rect` (left edge → 0, right edge → 1). Positions the
+/// snapshot wipe divider; clamps so a drag past the letterbox bars pins to an end.
+pub fn wipe_fraction(rect: &ContainRect, x: f64) -> f64 {
+    if rect.disp_w <= 0.0 {
+        return 0.0;
+    }
+    ((x - rect.off_x) / rect.disp_w).clamp(0.0, 1.0)
+}
+
+/// Pack an 8-bit interleaved `src` image into a cairo `Rgb24`-layout buffer of
+/// `dst_stride * height` bytes: each pixel becomes 4 bytes in native-endian order
+/// (little-endian: B, G, R, x — the order cairo's `Rgb24` expects). Greyscale
+/// (<3 channels) replicates its last channel; a pixel whose source bytes run past
+/// `src` is left black (defends a short/corrupt buffer); `nch == 0` yields an
+/// all-zero buffer. Pure (no GTK), so the byte-swap/greyscale logic is unit-tested
+/// headless — the thin cairo-surface wrapper lives in the darkroom view.
+pub fn pack_rgb24(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    rowstride: usize,
+    nch: usize,
+    dst_stride: usize,
+) -> Vec<u8> {
+    debug_assert!(dst_stride >= width * 4, "dst_stride must hold one Rgb24 pixel per column");
+    let mut data = vec![0u8; dst_stride * height];
+    let colour = nch.min(3);
+    if colour == 0 {
+        return data;
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let sp = y * rowstride + x * nch;
+            if sp + colour > src.len() {
+                continue;
+            }
+            let r = src[sp];
+            let g = src[sp + 1.min(colour - 1)];
+            let b = src[sp + 2.min(colour - 1)];
+            let dp = y * dst_stride + x * 4;
+            data[dp] = b;
+            data[dp + 1] = g;
+            data[dp + 2] = r;
+            data[dp + 3] = 0xff;
+        }
+    }
+    data
+}
+
 /// Map a click at widget-space `(x, y)` to an image pixel `(col, row)` for a
 /// `Picture` using `ContentFit::Contain` (image scaled to fit, preserving aspect,
 /// centred with letterbox/pillarbox bars). Returns `None` when the click lands on
@@ -379,16 +457,10 @@ pub fn map_widget_to_image(
     x: f64,
     y: f64,
 ) -> Option<(usize, usize)> {
-    if img_w == 0 || img_h == 0 || widget_w <= 0.0 || widget_h <= 0.0 {
-        return None;
-    }
-    let (iwf, ihf) = (img_w as f64, img_h as f64);
-    let scale = (widget_w / iwf).min(widget_h / ihf); // Contain: fit the tighter axis
-    let (disp_w, disp_h) = (iwf * scale, ihf * scale);
-    let (off_x, off_y) = ((widget_w - disp_w) / 2.0, (widget_h - disp_h) / 2.0);
-    let ix = (x - off_x) / scale;
-    let iy = (y - off_y) / scale;
-    if ix < 0.0 || iy < 0.0 || ix >= iwf || iy >= ihf {
+    let r = contain_rect(widget_w, widget_h, img_w, img_h)?;
+    let ix = (x - r.off_x) / r.scale;
+    let iy = (y - r.off_y) / r.scale;
+    if ix < 0.0 || iy < 0.0 || ix >= img_w as f64 || iy >= img_h as f64 {
         return None;
     }
     Some((ix as usize, iy as usize))
@@ -710,6 +782,52 @@ mod tests {
         // degenerate
         assert_eq!(map_widget_to_image(0.0, 100.0, 100, 100, 1.0, 1.0), None);
         assert_eq!(map_widget_to_image(100.0, 100.0, 0, 0, 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn contain_rect_centres_and_letterboxes() {
+        // 200x100 widget, 100x100 image → scale 1.0, pillarbox (off_x 50).
+        let r = contain_rect(200.0, 100.0, 100, 100).unwrap();
+        assert_eq!((r.scale, r.off_x, r.off_y), (1.0, 50.0, 0.0));
+        assert_eq!((r.disp_w, r.disp_h), (100.0, 100.0));
+        // 2x downscale, no bars.
+        let r2 = contain_rect(100.0, 100.0, 200, 200).unwrap();
+        assert_eq!((r2.scale, r2.off_x, r2.off_y), (0.5, 0.0, 0.0));
+        // degenerate sizes → None.
+        assert!(contain_rect(0.0, 100.0, 10, 10).is_none());
+        assert!(contain_rect(100.0, 100.0, 0, 10).is_none());
+    }
+
+    #[test]
+    fn wipe_fraction_clamps_across_displayed_width() {
+        // image spans widget x∈[50,150].
+        let r = contain_rect(200.0, 100.0, 100, 100).unwrap();
+        assert_eq!(wipe_fraction(&r, 50.0), 0.0); // left edge
+        assert_eq!(wipe_fraction(&r, 100.0), 0.5); // centre
+        assert_eq!(wipe_fraction(&r, 150.0), 1.0); // right edge
+        assert_eq!(wipe_fraction(&r, 0.0), 0.0); // past the left bar → clamped
+        assert_eq!(wipe_fraction(&r, 999.0), 1.0); // past the right bar → clamped
+    }
+
+    #[test]
+    fn pack_rgb24_swaps_channels_and_handles_greyscale() {
+        // 2x1 RGB, dst stride 8: pixel0 (10,20,30) → B,G,R,x = 30,20,10,255.
+        let src = vec![10u8, 20, 30, 40, 50, 60];
+        let out = pack_rgb24(&src, 2, 1, 6, 3, 8);
+        assert_eq!(&out[0..4], &[30, 20, 10, 0xff]);
+        assert_eq!(&out[4..8], &[60, 50, 40, 0xff]);
+        // 4-channel: alpha dropped, RGB still swapped.
+        let rgba = vec![1u8, 2, 3, 99];
+        assert_eq!(&pack_rgb24(&rgba, 1, 1, 4, 4, 4)[0..4], &[3, 2, 1, 0xff]);
+        // greyscale replicates the single channel.
+        assert_eq!(&pack_rgb24(&[77u8], 1, 1, 1, 1, 4)[0..4], &[77, 77, 77, 0xff]);
+        // truncated source: present pixel packed, missing pixel left black (no panic).
+        let short = vec![5u8, 6, 7]; // only pixel0 of a 2x1 RGB
+        let ot = pack_rgb24(&short, 2, 1, 6, 3, 8);
+        assert_eq!(&ot[0..4], &[7, 6, 5, 0xff]);
+        assert_eq!(&ot[4..8], &[0, 0, 0, 0]);
+        // nch 0 → all zeros.
+        assert_eq!(pack_rgb24(&[], 1, 1, 0, 0, 4), vec![0u8; 4]);
     }
 
     #[test]

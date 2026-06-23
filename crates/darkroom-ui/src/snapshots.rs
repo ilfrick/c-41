@@ -5,12 +5,13 @@
 //! display-free discipline). The GTK layer instantiates it over the cached
 //! render payload (`SnapshotStore<CachedRender>`).
 //!
-//! v1 comparison is **side-by-side** (snapshot in a second `Picture` beside the
-//! live image, each `Contain`-fit in equal halves). It is approximate, not
-//! pixel-aligned: a snapshot frozen at one preview size and the live image at
-//! another letterbox independently, so a feature won't sit at the same panel-x
-//! across the divider. darktable's scale-locked overlay with a draggable wipe
-//! line is a future increment.
+//! Comparison is a **scale-locked wipe** (darktable-style): the selected snapshot
+//! is painted over the live image in a transparent overlay `DrawingArea`, clipped
+//! to the left of a draggable divider and scaled into the *same* `Contain`
+//! rectangle the live image occupies — so a feature sits at the same panel-x on
+//! both sides of the wipe (`darkroom::draw_wipe`, geometry from
+//! `preview::contain_rect`). The GTK layer owns the overlay; this module stays the
+//! pure store.
 
 /// One captured snapshot: an auto-assigned label plus an opaque payload (the
 /// frozen render in the GTK layer; any `P` in tests).

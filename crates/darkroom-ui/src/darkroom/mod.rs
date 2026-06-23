@@ -222,13 +222,13 @@ fn apply_history_params(
 
 /// Rebuild the snapshots panel's rows from the store. Each row is a label plus a
 /// remove button (per-row index closures, rebuilt here so indices stay valid);
-/// clicking a row body activates the side-by-side compare (one handler set in
-/// [`darkroom_page`]). Removing a snapshot also hides the compare view, since the
+/// clicking a row body activates the wipe overlay (one handler set in
+/// [`darkroom_page`]). Removing a snapshot also clears the wipe overlay, since the
 /// snapshot being shown may be the one removed.
 fn refresh_snapshot_list(
     list: &gtk4::ListBox,
     store: &SnapStore,
-    snapshot_pic: &glib::WeakRef<gtk4::Picture>,
+    wipe: &WipeCompare,
 ) {
     // Tearing down old rows drops their remove-button closures (which hold an
     // `Rc` clone of the store, not a borrow) — so teardown never re-enters a
@@ -279,17 +279,15 @@ fn refresh_snapshot_list(
             .build();
         let store_cl = store.clone();
         let list_cl = list.downgrade();
-        let pic_cl = snapshot_pic.clone();
+        let wipe_cl = wipe.clone();
         remove.connect_clicked(move |_| {
             // Drop the `borrow_mut` at the `;` *before* `refresh_snapshot_list`
             // re-borrows the store — that ordering is what keeps this panic-free.
             store_cl.borrow_mut().remove(i);
-            if let Some(p) = pic_cl.upgrade() {
-                p.set_visible(false); // stop showing a possibly-removed snapshot
-            }
+            wipe_cl.clear(); // stop showing a possibly-removed snapshot
             if let Some(l) = list_cl.upgrade() {
                 l.unselect_all();
-                refresh_snapshot_list(&l, &store_cl, &pic_cl);
+                refresh_snapshot_list(&l, &store_cl, &wipe_cl);
             }
         });
         hbox.append(&name);
@@ -368,6 +366,132 @@ fn cached_render_texture(c: &CachedRender) -> gtk4::gdk::MemoryTexture {
         gtk4::gdk::MemoryFormat::R8g8b8
     };
     gtk4::gdk::MemoryTexture::new(c.width, c.height, fmt, &c.bytes, c.rowstride)
+}
+
+/// A snapshot frozen for the **scale-locked wipe** overlay: the captured pixels
+/// as a cairo surface plus their dimensions, so the wipe layer can paint them
+/// into the *same* `Contain` rectangle the live image occupies — features line up
+/// across the divider (unlike the old independent side-by-side letterboxing).
+struct CompareState {
+    surface: gtk4::cairo::ImageSurface,
+    img_w: usize,
+    img_h: usize,
+}
+
+/// Drives the snapshot wipe overlay: a transparent `DrawingArea` layered over the
+/// live image that paints the selected snapshot to the left of a draggable
+/// divider. Idle (no snapshot selected) it holds no state and is click-through
+/// (`can_target(false)`), so the colour picker keeps working on the live image.
+#[derive(Clone)]
+struct WipeCompare {
+    area: glib::WeakRef<gtk4::DrawingArea>,
+    state: Rc<RefCell<Option<CompareState>>>,
+    /// Divider position as a fraction [0,1] of the displayed image width.
+    frac: Rc<std::cell::Cell<f64>>,
+}
+
+impl WipeCompare {
+    /// Begin comparing against `c`: build the cairo surface, reset the divider to
+    /// centre, take pointer input, and repaint. No-op if the surface can't be
+    /// built (degenerate size).
+    fn show(&self, c: &CachedRender) {
+        let Some(surface) = cached_render_surface(c) else { return };
+        *self.state.borrow_mut() = Some(CompareState {
+            surface,
+            img_w: c.width as usize,
+            img_h: c.height as usize,
+        });
+        self.frac.set(0.5);
+        if let Some(area) = self.area.upgrade() {
+            area.set_can_target(true);
+            area.queue_draw();
+        }
+    }
+
+    /// Stop comparing: drop the snapshot, become click-through again, and repaint
+    /// (the empty overlay reveals the live image in full).
+    fn clear(&self) {
+        self.state.borrow_mut().take();
+        if let Some(area) = self.area.upgrade() {
+            area.set_can_target(false);
+            area.queue_draw();
+        }
+    }
+}
+
+/// Move the wipe divider to widget-space `x`, mapped to a fraction of the
+/// displayed image width and repainting. No-op while not comparing.
+fn set_wipe_from_x(wipe: &WipeCompare, x: f64) {
+    let Some(area) = wipe.area.upgrade() else { return };
+    // Scope the `state` borrow to exactly the geometry read, so nothing on this
+    // path can ever sit under a live borrow (the draw func borrows `state` too).
+    let rect = {
+        let guard = wipe.state.borrow();
+        let Some(state) = guard.as_ref() else { return };
+        crate::preview::contain_rect(area.width() as f64, area.height() as f64, state.img_w, state.img_h)
+    };
+    if let Some(rect) = rect {
+        wipe.frac.set(crate::preview::wipe_fraction(&rect, x));
+        area.queue_draw();
+    }
+}
+
+/// Convert a cached render to a cairo `Rgb24` surface for the wipe overlay. Thin
+/// cairo wrapper over the pure [`crate::preview::pack_rgb24`] (the byte-swap and
+/// greyscale logic is tested there). Runs once per snapshot selection (cached in
+/// [`CompareState`]), not per draw. `None` on degenerate size or a cairo error.
+fn cached_render_surface(c: &CachedRender) -> Option<gtk4::cairo::ImageSurface> {
+    use gtk4::cairo::Format;
+    if c.width <= 0 || c.height <= 0 {
+        return None;
+    }
+    let stride = Format::Rgb24.stride_for_width(c.width as u32).ok()? as usize;
+    let data = crate::preview::pack_rgb24(
+        c.bytes.as_ref(),
+        c.width as usize,
+        c.height as usize,
+        c.rowstride,
+        c.nch,
+        stride,
+    );
+    // `create_for_data` takes ownership of `data` and keeps a pointer into it for
+    // the surface's lifetime — never refactor this to a borrow or a buffer mutated
+    // afterwards.
+    gtk4::cairo::ImageSurface::create_for_data(data, Format::Rgb24, c.width, c.height, stride as i32)
+        .ok()
+}
+
+/// Paint the snapshot wipe overlay: the snapshot scaled into the live image's
+/// `Contain` rect, clipped to the left of the divider, with a 1px divider line.
+/// Untouched regions stay transparent, so the live image below shows through on
+/// the right.
+fn draw_wipe(cr: &gtk4::cairo::Context, w: i32, h: i32, state: &CompareState, frac: f64) {
+    let Some(rect) = crate::preview::contain_rect(w as f64, h as f64, state.img_w, state.img_h)
+    else {
+        return;
+    };
+    let wipe_x = rect.off_x + rect.disp_w * frac;
+
+    // Snapshot side: clip to [off_x, wipe_x] and paint the surface scaled into the
+    // contain rect (same geometry as the live Picture, so the two align).
+    let _ = cr.save();
+    cr.rectangle(rect.off_x, rect.off_y, (wipe_x - rect.off_x).max(0.0), rect.disp_h);
+    cr.clip();
+    cr.translate(rect.off_x, rect.off_y);
+    cr.scale(rect.disp_w / state.img_w as f64, rect.disp_h / state.img_h as f64);
+    if cr.set_source_surface(&state.surface, 0.0, 0.0).is_ok() {
+        let _ = cr.paint();
+    } else {
+        eprintln!("darkroom wipe: set_source_surface failed; snapshot pane left empty");
+    }
+    let _ = cr.restore();
+
+    // Divider line down the displayed image height.
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_line_width(1.0);
+    cr.move_to(wipe_x, rect.off_y);
+    cr.line_to(wipe_x, rect.off_y + rect.disp_h);
+    let _ = cr.stroke();
 }
 
 /// The params the preview is currently showing: the live params, or their
@@ -449,14 +573,42 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .content_fit(gtk4::ContentFit::Contain)
         .build();
 
-    // Second picture for side-by-side snapshot comparison (hidden until a
-    // snapshot is selected; shares the image row's width 50/50 when shown).
-    let snapshot_pic = gtk4::Picture::builder()
+    // Scale-locked snapshot wipe: a transparent DrawingArea layered over the live
+    // image (via the Overlay below) paints the selected snapshot to the left of a
+    // draggable divider, sharing the live image's Contain geometry so features
+    // line up across the wipe. Idle it's click-through, so the picker still works.
+    let wipe_area = gtk4::DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
-        .content_fit(gtk4::ContentFit::Contain)
-        .visible(false)
+        .can_target(false)
         .build();
+    let wipe = WipeCompare {
+        area: wipe_area.downgrade(),
+        state: Rc::new(RefCell::new(None)),
+        frac: Rc::new(std::cell::Cell::new(0.5)),
+    };
+    {
+        let draw_state = wipe.state.clone();
+        let draw_frac = wipe.frac.clone();
+        wipe_area.set_draw_func(move |_, cr, w, h| {
+            if let Some(st) = draw_state.borrow().as_ref() {
+                draw_wipe(cr, w, h, st, draw_frac.get());
+            }
+        });
+    }
+    // Drag (or click) anywhere on the overlay to move the divider.
+    {
+        let drag = gtk4::GestureDrag::new();
+        let w_begin = wipe.clone();
+        drag.connect_drag_begin(move |_, x, _| set_wipe_from_x(&w_begin, x));
+        let w_update = wipe.clone();
+        drag.connect_drag_update(move |g, ox, _| {
+            if let Some((sx, _)) = g.start_point() {
+                set_wipe_from_x(&w_update, sx + ox);
+            }
+        });
+        wipe_area.add_controller(drag);
+    }
     let snapshots: SnapStore = Rc::new(RefCell::new(SnapshotStore::new(SNAPSHOT_CAP)));
 
     // ── Live RGB histogram strip under the image ───────────────────────────
@@ -624,20 +776,24 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     });
     picture.add_controller(click);
 
-    // ── Left: image (+ optional snapshot compare) over histogram + picker ──
-    let image_row = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
+    // ── Left: image (+ snapshot wipe overlay) over histogram + picker ──────
+    // ALIGNMENT INVARIANT: the Overlay allocates `wipe_area` the *same* rect as
+    // `picture`, and both letterbox via `preview::contain_rect` — that equal
+    // allocation + shared geometry is what makes a feature land at the same panel
+    // pixel on both sides of the wipe. (It does NOT rely on the snapshot and live
+    // image sharing dimensions; `draw_wipe` uses the snapshot's own dims.)
+    let image_overlay = gtk4::Overlay::builder()
         .hexpand(true)
         .vexpand(true)
         .build();
-    image_row.append(&picture);
-    image_row.append(&snapshot_pic);
+    image_overlay.set_child(Some(&picture));
+    image_overlay.add_overlay(&wipe_area);
 
     let image_area = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .hexpand(true)
         .build();
-    image_area.append(&image_row);
+    image_area.append(&image_overlay);
     image_area.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     image_area.append(&hist_area);
     image_area.append(&picker_label);
@@ -711,21 +867,21 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .build();
     snapshot_list.add_css_class("navigation-sidebar");
 
-    // Compare handler (set once): clicking a snapshot reveals it beside the live
-    // image. Reads the frozen payload by row index; the row rebuild keeps indices
-    // aligned with the store.
+    // Compare handler (set once): clicking a snapshot loads it into the wipe
+    // overlay. Reads the frozen payload by row index; the row rebuild keeps
+    // indices aligned with the store. Clone the payload out so the store borrow
+    // is dropped before `show` builds the cairo surface.
     {
         let snap_store = snapshots.clone();
-        let snap_pic_weak = snapshot_pic.downgrade();
+        let snap_wipe = wipe.clone();
         snapshot_list.connect_row_activated(move |_, row| {
             let idx = row.index();
             if idx < 0 {
                 return;
             }
-            let Some(pic) = snap_pic_weak.upgrade() else { return };
-            if let Some(snap) = snap_store.borrow().get(idx as usize) {
-                pic.set_paintable(Some(&cached_render_texture(&snap.payload)));
-                pic.set_visible(true);
+            let payload = snap_store.borrow().get(idx as usize).map(|s| s.payload.clone());
+            if let Some(p) = payload {
+                snap_wipe.show(&p);
             }
         });
     }
@@ -742,19 +898,19 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         let take_ctx = ctx.clone();
         let take_store = snapshots.clone();
         let take_list = snapshot_list.downgrade();
-        let take_pic = snapshot_pic.downgrade();
+        let take_wipe = wipe.clone();
         take_btn.connect_clicked(move |_| {
             let current = take_ctx.last_render.borrow().clone();
             if let Some(cr) = current {
                 take_store.borrow_mut().capture(cr);
                 if let Some(l) = take_list.upgrade() {
-                    refresh_snapshot_list(&l, &take_store, &take_pic);
+                    refresh_snapshot_list(&l, &take_store, &take_wipe);
                 }
             }
         });
     }
 
-    // "Stop comparing": hide the snapshot picture and clear the selection.
+    // "Stop comparing": clear the wipe overlay and the row selection.
     let stop_btn = gtk4::Button::builder()
         .icon_name("view-restore-symbolic")
         .has_frame(false)
@@ -762,12 +918,10 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .build();
     stop_btn.update_property(&[gtk4::accessible::Property::Label("Stop comparing")]);
     {
-        let stop_pic = snapshot_pic.downgrade();
+        let stop_wipe = wipe.clone();
         let stop_list = snapshot_list.downgrade();
         stop_btn.connect_clicked(move |_| {
-            if let Some(p) = stop_pic.upgrade() {
-                p.set_visible(false);
-            }
+            stop_wipe.clear();
             if let Some(l) = stop_list.upgrade() {
                 l.unselect_all();
             }
@@ -806,7 +960,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     snapshot_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     snapshot_section.append(&snapshot_scroll);
     // Seed the placeholder row.
-    refresh_snapshot_list(&snapshot_list, &snapshots, &snapshot_pic.downgrade());
+    refresh_snapshot_list(&snapshot_list, &snapshots, &wipe);
 
     // Right column: history over snapshots over modules.
     let right_box = gtk4::Box::builder()
