@@ -130,6 +130,55 @@ pub fn fit_within(orig_w: u32, orig_h: u32, r: &Resize) -> (u32, u32) {
     (w, h)
 }
 
+/// The default output-path template: an `exports/` subfolder beside the source,
+/// keeping the original base name. The output *extension* is **not** part of the
+/// template — `--out-ext` appends it (the CLI strips a redundant trailing `.ext`
+/// and the format module re-applies the real one), so a bare stem is correct.
+pub const DEFAULT_OUTPUT_TEMPLATE: &str = "$(FILE_FOLDER)/exports/$(FILE_NAME)";
+
+/// Expand the output-path `template` for one `input_path` into a concrete,
+/// extension-less destination path to hand `darktable-cli` (which then appends the
+/// `--out-ext` extension). We expand only the subset of darktable variables we own
+/// — `$(FILE_FOLDER)` (input's parent dir, no trailing slash), `$(FILE_NAME)`
+/// (input stem, no extension), and `$(SEQUENCE)` (4-digit zero-padded batch index)
+/// — so the panel can preview the resolved path and batch exports don't collide.
+/// Any other `$(…)` token is left **verbatim** so the CLI's own `dt_variables`
+/// expansion (e.g. `$(YEAR)`, `$(EXIF_…)`) still applies at export time.
+pub fn expand_output_template(template: &str, input_path: &str, sequence: u32) -> String {
+    let p = std::path::Path::new(input_path);
+    // Resolve the source folder. A bare/relative input has an empty parent — fall
+    // back to "." (CWD-relative) rather than letting `$(FILE_FOLDER)/…` root the
+    // dest at the filesystem root (`/exports/…`), a permissions trap especially in
+    // the container. The filesystem-root case keeps "/".
+    let folder = match p.parent().and_then(|d| d.to_str()) {
+        None | Some("") => ".".to_string(),
+        // The filesystem root "/" trims to "" so the template's own separator
+        // (`$(FILE_FOLDER)/…`) yields a single leading slash, not "//".
+        Some(d) => d.trim_end_matches('/').to_string(),
+    };
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    template
+        .replace("$(FILE_FOLDER)", &folder)
+        .replace("$(FILE_NAME)", stem)
+        .replace("$(SEQUENCE)", &format!("{sequence:04}"))
+}
+
+/// Make a `template` safe for a batch of `batch_len` images: if more than one
+/// image is being exported and the template doesn't already disambiguate via
+/// `$(SEQUENCE)`, append a `_$(SEQUENCE)` suffix so two sources that map to the
+/// same stem can't silently overwrite each other — e.g. a RAW+JPEG pair
+/// `IMG.CR2`/`IMG.JPG` in one folder, both expanding to `exports/IMG`. The CLI's
+/// own overwrite-vs-rename behaviour is governed by the disk storage's
+/// `onsave_action`, which `darktable-cli` never sets, so uniqueness is ours to
+/// guarantee. Single-image exports keep clean, suffix-free names.
+pub fn batch_output_template(template: &str, batch_len: usize) -> String {
+    if batch_len > 1 && !template.contains("$(SEQUENCE)") {
+        format!("{template}_$(SEQUENCE)")
+    } else {
+        template.to_string()
+    }
+}
+
 /// Build the `darktable-cli` argument vector (everything after argv[0]) to export
 /// `input` into `output_dest` (a directory or a `$(…)` filename pattern that the
 /// CLI expands). `--style none --apply-custom-presets false` gives a neutral
@@ -292,6 +341,51 @@ mod tests {
         let core_at = a.iter().position(|x| x == "--core").unwrap();
         let width_at = a.iter().position(|x| x == "--width").unwrap();
         assert!(width_at < core_at);
+    }
+
+    #[test]
+    fn expand_template_default_puts_export_subfolder_beside_source() {
+        // Default template → exports/ beside the source, stem kept, no extension.
+        let out = expand_output_template(DEFAULT_OUTPUT_TEMPLATE, "/photos/raw/IMG_1234.CR2", 0);
+        assert_eq!(out, "/photos/raw/exports/IMG_1234");
+    }
+
+    #[test]
+    fn expand_template_sequence_and_unknown_tokens() {
+        // SEQUENCE is zero-padded to 4 digits; unknown $(…) tokens pass through
+        // verbatim for the CLI's own dt_variables expansion.
+        let out = expand_output_template(
+            "$(FILE_FOLDER)/$(FILE_NAME)_$(SEQUENCE)_$(YEAR)", "/a/b/pic.raw", 7);
+        assert_eq!(out, "/a/b/pic_0007_$(YEAR)");
+    }
+
+    #[test]
+    fn expand_template_handles_missing_parent_and_extension() {
+        // A bare filename has no parent dir → FILE_FOLDER falls back to "." so the
+        // dest stays CWD-relative instead of rooting at "/". Stem is the whole name
+        // when there's no extension.
+        assert_eq!(expand_output_template("$(FILE_FOLDER)/$(FILE_NAME)", "pic", 0), "./pic");
+        assert_eq!(expand_output_template("$(FILE_NAME)", "/a/b/noext", 0), "noext");
+        // A file at the filesystem root keeps "/".
+        assert_eq!(expand_output_template("$(FILE_FOLDER)/$(FILE_NAME)", "/pic.jpg", 0), "/pic");
+    }
+
+    #[test]
+    fn batch_template_adds_sequence_to_prevent_overwrite() {
+        // Single image: template untouched (clean, suffix-free names).
+        assert_eq!(batch_output_template(DEFAULT_OUTPUT_TEMPLATE, 1), DEFAULT_OUTPUT_TEMPLATE);
+        // Batch without $(SEQUENCE): suffix appended so a RAW+JPEG pair in one
+        // folder (IMG.CR2 / IMG.JPG → both exports/IMG) can't collide.
+        let t = batch_output_template(DEFAULT_OUTPUT_TEMPLATE, 2);
+        assert_eq!(t, "$(FILE_FOLDER)/exports/$(FILE_NAME)_$(SEQUENCE)");
+        let a = expand_output_template(&t, "/f/IMG.CR2", 1);
+        let b = expand_output_template(&t, "/f/IMG.JPG", 2);
+        assert_eq!(a, "/f/exports/IMG_0001");
+        assert_eq!(b, "/f/exports/IMG_0002");
+        assert_ne!(a, b);
+        // Batch already carrying $(SEQUENCE): left as-is (no double suffix).
+        let custom = "$(FILE_NAME)_$(SEQUENCE)";
+        assert_eq!(batch_output_template(custom, 5), custom);
     }
 
     #[test]

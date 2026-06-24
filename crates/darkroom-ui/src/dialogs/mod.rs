@@ -24,43 +24,26 @@ pub fn show_export_dialog(
         .body(&format!("Export {} image(s)", paths.len()))
         .build();
 
-    // Controls packed into the dialog body
-    let content_box = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(8)
-        .margin_top(8)
-        .build();
-
-    let format_row = adw::ComboRow::builder().title("Format").build();
-    let format_labels: Vec<&str> =
-        crate::export::ExportFormat::ALL.iter().map(|f| f.label()).collect();
-    format_row.set_model(Some(&gtk4::StringList::new(&format_labels)));
-    content_box.append(&format_row);
-
-    let quality_row = adw::SpinRow::builder().title("JPEG quality").build();
-    quality_row.set_adjustment(Some(&gtk4::Adjustment::new(95.0, 1.0, 100.0, 1.0, 10.0, 0.0)));
-    content_box.append(&quality_row);
-
-    dialog.set_extra_child(Some(&content_box));
+    // The reusable export panel collects format / quality / resize / template.
+    let panel = crate::export_panel::ExportPanel::new();
+    dialog.set_extra_child(Some(&panel.widget));
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("export", "Export");
     dialog.set_response_appearance("export", adw::ResponseAppearance::Suggested);
 
     let toast_fn = std::rc::Rc::new(toast_fn);
     dialog.connect_response(Some("export"), move |_, _| {
-        let settings = crate::export::ExportSettings {
-            format: crate::export::ExportFormat::from_index(format_row.selected()),
-            quality: quality_row.value() as u32,
-            resize: None, // the dialog has no resize controls; the panel (m4-7b) will
-        };
+        let settings = panel.settings();
+        let template = panel.template();
         let out_paths = paths.clone();
         let n         = out_paths.len();
         let tf        = toast_fn.clone();
 
         glib::spawn_future_local(async move {
-            match export_images_async(out_paths, settings).await {
-                Ok(())  => tf(format!("Exported {n} image(s)")),
-                Err(e)  => tf(format!("Export failed: {e}")),
+            match export_images_async(out_paths, settings, template).await {
+                Ok(0)      => tf(format!("Exported {n} image(s)")),
+                Ok(failed) => tf(format!("Exported {} of {n} ({failed} failed)", n - failed)),
+                Err(e)     => tf(format!("Export failed: {e}")),
             }
         });
     });
@@ -68,37 +51,44 @@ pub fn show_export_dialog(
     dialog.present(Some(parent.upcast_ref::<gtk4::Widget>()));
 }
 
-/// Run `darkroom-cli` for each image asynchronously on a thread pool, building
-/// the argv from the shared (unit-tested) [`crate::export::cli_args`]. Each image
-/// is written into an `exports/` subfolder beside it.
+/// Run `darkroom-cli` for each image asynchronously on a thread pool, building the
+/// argv from the shared (unit-tested) [`crate::export::cli_args`]. The output
+/// destination is the per-image expansion of `template` (1-based `$(SEQUENCE)`);
+/// the template is first made batch-safe so same-stem sources can't overwrite, and
+/// each dest's parent directory is created first since the CLI won't. Returns the
+/// number of images that **failed** so the caller can surface it (a green
+/// "Exported N" toast over 0 written files would otherwise hide the failure).
 async fn export_images_async(
     paths: Vec<String>,
     settings: crate::export::ExportSettings,
-) -> Result<()> {
-    gio::spawn_blocking(move || {
-        for path in &paths {
-            let out_dir = std::path::Path::new(path)
-                .parent()
-                .map(|p| p.join("exports"))
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    template: String,
+) -> Result<usize> {
+    let failed = gio::spawn_blocking(move || {
+        let template = crate::export::batch_output_template(&template, paths.len());
+        let mut failed = 0usize;
+        for (i, path) in paths.iter().enumerate() {
+            // Extension-less destination; `--out-ext` (in cli_args) appends the ext.
+            let dest = crate::export::expand_output_template(&template, path, (i + 1) as u32);
+            if let Some(parent) = std::path::Path::new(&dest).parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("darkroom export: cannot create {parent:?}: {e}");
+                    failed += 1;
+                    continue;
+                }
+            }
 
-            let _ = std::fs::create_dir_all(&out_dir);
-            let out_dest = out_dir.to_str().unwrap_or("/tmp");
-
-            let status = std::process::Command::new("darkroom-cli")
-                .args(crate::export::cli_args(path, out_dest, &settings))
-                .status();
-
-            match status {
-                Ok(s) if !s.success() =>
-                    eprintln!("darkroom-cli exit {s} for {path}"),
-                Err(e) =>
-                    eprintln!("darkroom-cli not found for {path}: {e}"),
-                _ => {}
+            match std::process::Command::new("darkroom-cli")
+                .args(crate::export::cli_args(path, &dest, &settings))
+                .status()
+            {
+                Ok(s) if s.success() => {}
+                Ok(s)  => { eprintln!("darkroom-cli exit {s} for {path}"); failed += 1; }
+                Err(e) => { eprintln!("darkroom-cli not found for {path}: {e}"); failed += 1; }
             }
         }
+        failed
     }).await.map_err(|e| anyhow::anyhow!("thread panicked: {e:?}"))?;
-    Ok(())
+    Ok(failed)
 }
 
 // ── Import folder dialog ──────────────────────────────────────────────────
