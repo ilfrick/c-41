@@ -329,7 +329,19 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    new tags / counts appear without restarting. Known non-blocker: a selected
    tag's highlight drops on refresh (the grid filter state lives outside the box,
    and attach doesn't re-run the filter) — to fold in when attach re-filters the
-   grid. **Milestone 4 is now complete** (m4-1..m4-8).
+   grid. **m4-8 done; m4-1..m4-8 complete the original Milestone 4 panels.**
+   **Tag-management depth (follow-on):** **m4-9** — the metadata-panel tag chips
+   gained an inline ✕ detach button (`tag_detach` DAO), routed through the same
+   `on_tags_changed` hook so left-panel counts refresh too; `load_tags` now
+   returns `(id, name)`. **m4-10** — right-clicking a left-panel tag row opens a
+   context popover with inline Rename (`tag_rename`; UNIQUE clash logs + no-op)
+   and a confirmed Delete (`adw::AlertDialog` → `tag_delete`); the per-row gesture
+   captures weak refs + db path (rehydrates a transient `LeftPanel` per click) to
+   avoid a tag_box↔row↔gesture↔LeftPanel strong-ref cycle. Both refresh the list.
+   Known follow-ups: re-run the grid filter on attach/detach (closes the m4-8c
+   highlight non-blocker); bring `add_tag_to_image`/`load_tags` fault-logging up
+   to `detach`'s parity; a left-panel rename/delete doesn't refresh the
+   currently-shown chips until reselect.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
