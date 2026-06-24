@@ -407,10 +407,12 @@ impl MetadataPanel {
             tag_entry.connect_activate(move |entry| {
                 let tag_name = entry.text().trim().to_string();
                 if tag_name.is_empty() { return; }
-                let (ref path, ref db) = *ctx2.borrow();
+                // Clone the (path, db) out so the cell isn't borrowed while
+                // rebuild_tags_flow re-borrows it.
+                let (path, db) = ctx2.borrow().clone();
                 if !db.is_empty() {
-                    add_tag_to_image(path, db, &tag_name);
-                    rebuild_tags_flow(&flow_ref, path, db);
+                    add_tag_to_image(&path, &db, &tag_name);
+                    rebuild_tags_flow(&flow_ref, &ctx2, &notify);
                     // Notify other panels (clone the callback out before invoking
                     // so the cell isn't borrowed while it runs).
                     let cb = notify.borrow().clone();
@@ -455,11 +457,11 @@ impl MetadataPanel {
             .unwrap_or_else(|_| "\u{2014}".into());
         self.size_lbl.set_label(&disk);
 
-        // Store context for the tag-entry handler
+        // Store context for the tag-entry / detach handlers
         *self.ctx.borrow_mut() = (full_path.to_string(), db_path.to_string());
 
-        // Rebuild tag chips
-        rebuild_tags_flow(&self.tags_flow, full_path, db_path);
+        // Rebuild tag chips (display only — no notify on a mere selection change)
+        rebuild_tags_flow(&self.tags_flow, &self.ctx, &self.on_tags_changed);
         self.tag_entry.set_text("");
     }
 }
@@ -470,13 +472,25 @@ impl Default for MetadataPanel {
 
 // ── Tag helpers ───────────────────────────────────────────────────────────
 
-fn rebuild_tags_flow(flow: &gtk4::FlowBox, full_path: &str, db_path: &str) {
+/// Rebuild the per-image tag chips. Each chip carries an inline ✕ button that
+/// detaches the tag and refreshes; `ctx` (live path/db) and `notify` (the
+/// "tags mutated" hook) are threaded through so the detach handler can re-read
+/// the current image and fan the change out to the left-panel Tags list.
+///
+/// Rebuilding alone never fires `notify` — only an actual detach does — so a
+/// mere selection change repaints chips without spuriously refreshing siblings.
+fn rebuild_tags_flow(
+    flow: &gtk4::FlowBox,
+    ctx: &std::rc::Rc<std::cell::RefCell<(String, String)>>,
+    notify: &std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
+) {
     // Clear existing chips
     while let Some(child) = flow.first_child() {
         flow.remove(&child);
     }
 
-    let tags = load_tags(full_path, db_path);
+    let (full_path, db_path) = ctx.borrow().clone();
+    let tags = load_tags(&full_path, &db_path);
     if tags.is_empty() {
         let lbl = gtk4::Label::builder().label("(none)").build();
         lbl.add_css_class("dim-label");
@@ -484,18 +498,49 @@ fn rebuild_tags_flow(flow: &gtk4::FlowBox, full_path: &str, db_path: &str) {
         return;
     }
 
-    for tag in tags {
-        let chip = gtk4::Label::builder()
-            .label(&tag)
+    for (tag_id, name) in tags {
+        let chip = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(2)
             .margin_start(4).margin_end(4)
             .margin_top(2).margin_bottom(2)
             .build();
         chip.add_css_class("tag");
+
+        let lbl = gtk4::Label::builder().label(&name).build();
+        chip.append(&lbl);
+
+        let close = gtk4::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Remove tag")
+            .build();
+        close.add_css_class("flat");
+        close.add_css_class("circular");
+
+        // Detach reads the *current* image from ctx at click time (the chip may
+        // outlive a selection change in flight), removes the tag, rebuilds the
+        // chips, then fires the shared notify so the left-panel counts update.
+        let flow_w   = flow.downgrade();
+        let ctx_c    = ctx.clone();
+        let notify_c = notify.clone();
+        close.connect_clicked(move |_| {
+            let (p, d) = ctx_c.borrow().clone();
+            if d.is_empty() { return; }
+            detach_tag_from_image(&p, &d, tag_id);
+            if let Some(flow) = flow_w.upgrade() {
+                rebuild_tags_flow(&flow, &ctx_c, &notify_c);
+            }
+            let cb = notify_c.borrow().clone();
+            if let Some(cb) = cb { cb(); }
+        });
+        chip.append(&close);
+
         flow.insert(&chip, -1);
     }
 }
 
-fn load_tags(full_path: &str, db_path: &str) -> Vec<String> {
+/// Tags attached to an image, as `(tag_id, name)` so chips can offer detach.
+fn load_tags(full_path: &str, db_path: &str) -> Vec<(u32, String)> {
     if db_path.is_empty() { return Vec::new(); }
     let conn = match rusqlite::Connection::open(db_path) {
         Ok(c) => c,
@@ -508,8 +553,26 @@ fn load_tags(full_path: &str, db_path: &str) -> Vec<String> {
     darkroom_db::tags::tag_get_attached(&conn, imgid)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|id| darkroom_db::tags::tag_get_name(&conn, id).ok().flatten())
+        .filter_map(|id| {
+            darkroom_db::tags::tag_get_name(&conn, id).ok().flatten().map(|n| (id, n))
+        })
         .collect()
+}
+
+/// Detach a tag from the image at `full_path` (best-effort; logs faults).
+fn detach_tag_from_image(full_path: &str, db_path: &str, tag_id: u32) {
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("darkroom: cannot open library db to detach tag: {e}"); return; }
+    };
+    let imgid = match darkroom_db::image::image_get_id_by_path(&conn, full_path) {
+        Ok(Some(id)) => id,
+        Ok(None) => return,            // image not in catalog — nothing to detach
+        Err(e) => { eprintln!("darkroom: image lookup failed on tag detach: {e}"); return; }
+    };
+    if let Err(e) = darkroom_db::tags::tag_detach(&conn, tag_id, imgid) {
+        eprintln!("darkroom: tag detach failed: {e}");
+    }
 }
 
 fn add_tag_to_image(full_path: &str, db_path: &str, tag_name: &str) {
