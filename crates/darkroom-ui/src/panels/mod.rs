@@ -6,7 +6,9 @@
 
 use adw::prelude::*;
 use glib::clone;
-use crate::lighttable::{LighttableModel, lighttable_load_by_folder, lighttable_load_by_tag};
+use crate::lighttable::{
+    LighttableModel, lighttable_load_by_folder, lighttable_load_by_tag, lighttable_load_from_db,
+};
 use darkroom_db;
 
 // ── Left panel (collections) ──────────────────────────────────────────────
@@ -31,6 +33,13 @@ pub struct LeftPanel {
     tags_header: gtk4::Label,
     tags_sep:    gtk4::Separator,
     db_path:     String,
+    /// Shared "currently-filtering tag id" (None = no tag filter). Kept current
+    /// by the folder/tag click handlers; read by `delete_tag` so deleting the
+    /// filtered-on tag can drop the now-dangling filter and revert to All.
+    active_tag:  std::rc::Rc<std::cell::Cell<Option<u32>>>,
+    /// The lighttable grid model, so `delete_tag` can reload it to "All images"
+    /// when the active tag filter is invalidated.
+    lt_model:    LighttableModel,
     /// Optional notify fired after a library-wide tag mutation here (rename /
     /// delete), so the metadata panel can re-render the current image's chips.
     /// Mirror of `MetadataPanel::on_tags_changed`. Set via `set_on_tags_changed`.
@@ -38,7 +47,14 @@ pub struct LeftPanel {
 }
 
 impl LeftPanel {
-    pub fn new(db_path: &str, lt_model: &LighttableModel) -> Self {
+    /// `active_tag` is the shared "currently-filtering tag id" (None = no tag
+    /// filter). The folder/tag click handlers keep it current so a later tag
+    /// mutation can decide whether to re-run the grid filter.
+    pub fn new(
+        db_path: &str,
+        lt_model: &LighttableModel,
+        active_tag: &std::rc::Rc<std::cell::Cell<Option<u32>>>,
+    ) -> Self {
         let panel = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .spacing(0)
@@ -84,8 +100,10 @@ impl LeftPanel {
 
         // Activate: reload lighttable with folder filter, dropping any tag filter.
         let db = db_path.to_string();
+        let at_folder = active_tag.clone();
         list_box.connect_row_activated(clone!(@weak lt_model, @weak tag_box => move |_, row| {
             tag_box.unselect_all();
+            at_folder.set(None);   // a folder/all view is not a tag filter
             let folder_filter: Option<String> = row
                 .widget_name()
                 .as_str()
@@ -108,10 +126,12 @@ impl LeftPanel {
         content.append(&tags_sep);
 
         let db_tags = db_path.to_string();
+        let at_tag = active_tag.clone();
         tag_box.connect_row_activated(clone!(@weak lt_model, @weak list_box => move |_, row| {
             list_box.unselect_all();
             // The tag id is encoded in the row's widget name (see append_tag_row).
             if let Ok(tag_id) = row.widget_name().as_str().parse::<u32>() {
+                at_tag.set(Some(tag_id));   // remember the active tag filter
                 lighttable_load_by_tag(&lt_model, &db_tags, tag_id);
             }
         }));
@@ -131,6 +151,8 @@ impl LeftPanel {
             tags_header,
             tags_sep,
             db_path: db_path.to_string(),
+            active_tag: active_tag.clone(),
+            lt_model: lt_model.clone(),
             on_tags_changed: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         lp.refresh_tags();
@@ -217,9 +239,11 @@ impl LeftPanel {
         let header_w  = self.tags_header.downgrade();
         let sep_w     = self.tags_sep.downgrade();
         let db        = self.db_path.clone();
-        // The notify Rc points at the metadata panel, never back at the left
-        // panel widgets, so capturing it strongly introduces no widget cycle.
-        let notify    = self.on_tags_changed.clone();
+        // The notify Rc, active-tag cell and grid model never reference back at
+        // the left-panel widgets, so capturing them strongly introduces no cycle.
+        let notify     = self.on_tags_changed.clone();
+        let active_tag = self.active_tag.clone();
+        let lt_model   = self.lt_model.clone();
         let name_owned = name.to_string();
         let row_w     = row.downgrade();
         gesture.connect_pressed(move |g, _, x, y| {
@@ -230,6 +254,7 @@ impl LeftPanel {
             ) {
                 let lp = LeftPanel {
                     widget, tag_box, tags_header, tags_sep, db_path: db.clone(),
+                    active_tag: active_tag.clone(), lt_model: lt_model.clone(),
                     on_tags_changed: notify.clone(),
                 };
                 lp.show_tag_menu(&row, id, &name_owned, count, x, y);
@@ -349,6 +374,10 @@ impl LeftPanel {
     }
 
     /// Delete a tag and its associations (best-effort; logs faults), then refresh.
+    ///
+    /// If the deleted tag is the one currently filtering the grid, the filter is
+    /// now dangling (and its id could later be reused by SQLite) — so we drop it
+    /// and revert the grid to "All images" rather than leave a stale/empty view.
     fn delete_tag(&self, id: u32) {
         if self.db_path.is_empty() { return; }
         match rusqlite::Connection::open(&self.db_path) {
@@ -359,8 +388,25 @@ impl LeftPanel {
             }
             Err(e) => eprintln!("darkroom: cannot open library db to delete tag: {e}"),
         }
+        let was_active = self.active_tag.get() == Some(id);
+        self.active_tag.set(next_active_tag(self.active_tag.get(), id));
         self.refresh_tags();
+        if was_active {
+            // active_tag is now None, so the on_tags_changed `reapply` below is a
+            // no-op; reload the grid here to surface the full library again.
+            lighttable_load_from_db(&self.lt_model, &self.db_path);
+        }
         self.fire_tags_changed();
+    }
+}
+
+/// Resolve the active tag filter after a tag is deleted: clears it when it
+/// pointed at the just-deleted tag, otherwise leaves it untouched. Kept as a
+/// free function so the (display-bound) `delete_tag` logic has a unit-testable core.
+fn next_active_tag(current: Option<u32>, deleted: u32) -> Option<u32> {
+    match current {
+        Some(id) if id == deleted => None,
+        other => other,
     }
 }
 
@@ -789,4 +835,24 @@ fn format_bytes(n: u64) -> String {
     if n < 1024 { format!("{n} B") }
     else if n < 1024 * 1024 { format!("{:.1} KB", n as f64 / 1024.0) }
     else { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_active_tag_clears_when_deleted_tag_is_active() {
+        assert_eq!(next_active_tag(Some(5), 5), None);
+    }
+
+    #[test]
+    fn next_active_tag_keeps_unrelated_filter() {
+        assert_eq!(next_active_tag(Some(3), 5), Some(3));
+    }
+
+    #[test]
+    fn next_active_tag_noop_when_no_filter() {
+        assert_eq!(next_active_tag(None, 5), None);
+    }
 }

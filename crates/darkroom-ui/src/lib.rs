@@ -61,22 +61,46 @@ fn build_main_window(app: &Application) {
     lighttable::lighttable_load_from_db(&lt_model, &db_path);
 
     // ── Panels ─────────────────────────────────────────────────────────────
-    let left  = panels::LeftPanel::new(&db_path, &lt_model);
+    // Shared "currently-filtering tag id" (None = no tag filter). Set by the
+    // left-panel folder/tag clicks and the search/import paths below; read by
+    // the tag-mutation callbacks to decide whether to re-run the grid filter.
+    let active_tag: std::rc::Rc<std::cell::Cell<Option<u32>>> =
+        std::rc::Rc::new(std::cell::Cell::new(None));
+
+    let left  = panels::LeftPanel::new(&db_path, &lt_model, &active_tag);
     let right = panels::MetadataPanel::new();
+
+    // Re-run the grid filter after a tag mutation, but ONLY when a tag filter is
+    // active — so e.g. detaching the filtered-on tag drops the image from the
+    // grid, while ordinary tagging under an All/Folder/Search view leaves the
+    // grid (and selection) untouched.
+    let reapply_tag_filter = {
+        let at  = active_tag.clone();
+        let mdl = lt_model.clone();
+        let db  = db_path.clone();
+        move || {
+            if let Some(id) = at.get() {
+                lighttable::lighttable_load_by_tag(&mdl, &db, id);
+            }
+        }
+    };
 
     // Bidirectional tag-change refresh:
     //  • attaching/detaching a tag in the metadata panel refreshes the
     //    left-panel Tags list (new tags / changed counts);
     //  • renaming/deleting a tag in the left panel re-renders the metadata
     //    panel's chips for the current image.
-    // Neither callback re-enters the other's mutation path, so there is no loop.
+    // Both then re-run the active tag filter. Neither callback re-enters the
+    // other's mutation path, so there is no loop.
     {
         let lp = left.clone();
-        right.set_on_tags_changed(move || lp.refresh_tags());
+        let reapply = reapply_tag_filter.clone();
+        right.set_on_tags_changed(move || { lp.refresh_tags(); reapply(); });
     }
     {
         let meta = right.clone();
-        left.set_on_tags_changed(move || meta.refresh_tags_display());
+        let reapply = reapply_tag_filter.clone();
+        left.set_on_tags_changed(move || { meta.refresh_tags_display(); reapply(); });
     }
 
     // Selection → metadata
@@ -120,8 +144,10 @@ fn build_main_window(app: &Application) {
             .width_request(200)
             .build();
         let db = db_path.clone();
+        let at = active_tag.clone();
         search.connect_search_changed(clone!(@weak lt_model => move |s| {
             let query = s.text().to_string();
+            at.set(None);   // a name search supersedes any tag filter
             lighttable::lighttable_filter_by_name(&lt_model, &db, &query);
         }));
         lt_header.pack_start(&search);
@@ -135,13 +161,15 @@ fn build_main_window(app: &Application) {
             .build();
         let db         = db_path.clone();
         let toast_fn   = make_toast.clone();
+        let at         = active_tag.clone();
         btn.connect_clicked(clone!(@weak window, @weak lt_model => move |_| {
             let db_inner    = db.clone();
             let toast_inner = toast_fn.clone();
             dialogs::show_import_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
-                clone!(@weak lt_model, @strong db_inner => move || {
+                clone!(@weak lt_model, @strong db_inner, @strong at => move || {
+                    at.set(None);   // post-import view shows all images
                     lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
                 toast_inner,
@@ -210,6 +238,7 @@ fn build_main_window(app: &Application) {
         // win.import — Ctrl+I
         let db         = db_path.clone();
         let toast_fn   = make_toast.clone();
+        let at         = active_tag.clone();
         let import_act = gtk4::gio::SimpleAction::new("import", None);
         import_act.connect_activate(clone!(@weak window, @weak lt_model => move |_, _| {
             let db_inner    = db.clone();
@@ -217,7 +246,8 @@ fn build_main_window(app: &Application) {
             dialogs::show_import_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
-                clone!(@weak lt_model, @strong db_inner => move || {
+                clone!(@weak lt_model, @strong db_inner, @strong at => move || {
+                    at.set(None);   // post-import view shows all images
                     lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
                 toast_inner,

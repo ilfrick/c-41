@@ -344,9 +344,17 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    the current image's chips live (and attach/detach still refreshes the left
    list). Loop-free by construction: the notify fires ONLY from user mutation
    handlers, never from a rebuild, so each mutation yields exactly one cross-panel
-   refresh. Known follow-ups: re-run the grid filter on attach/detach (closes the
-   m4-8c highlight non-blocker); bring `add_tag_to_image`/`load_tags` fault-logging
-   up to `detach`'s parity.
+   refresh. **m4-12** — re-run the active tag filter on tag mutation (closes the
+   m4-8c non-blocker): a shared `active_tag: Rc<Cell<Option<u32>>>` tracks the
+   currently-filtering tag id (set by the folder→None / tag→Some click handlers
+   and the search/import→None paths); both `on_tags_changed` callbacks re-run
+   `lighttable_load_by_tag` *only* when a tag filter is active, so detaching the
+   filtered-on tag drops the image while ordinary tagging under All/Folder/Search
+   leaves the grid (and selection) untouched. Deleting the filtered-on tag clears
+   the now-dangling filter (guards against SQLite id-reuse) via the unit-tested
+   `next_active_tag` helper and reverts the grid to "All images". Known follow-ups:
+   bring `add_tag_to_image`/`load_tags` fault-logging up to `detach`'s parity;
+   hierarchical (`a|b`) tags; selection preservation across grid reloads.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
