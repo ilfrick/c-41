@@ -320,9 +320,16 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `SelectionMode::Single` boxes) now clear each other's selection on activate (weak
    refs, no widget cycle) so a filter never leaves a stale highlight implying an
    AND; "All images" is the clear-tag-filter path; tag read faults are logged (a
-   corrupt/locked catalog now reads differently from "no tags"). **Still open in
-   m4-8: live refresh** of the Tags list after a tag is attached via the metadata
-   panel (currently built once at startup). That is the last m4 item.
+   corrupt/locked catalog now reads differently from "no tags"). **m4-8c** — the
+   Tags list now live-refreshes: the left panel became a `LeftPanel` struct with
+   a stable `tag_box` and a `refresh_tags()` that rebuilds only its rows (so the
+   folder↔tag handlers stay valid) and toggles the section's visibility; the
+   metadata panel exposes an `on_tags_changed` notify (the canonical "tags
+   mutated" hook) wired in lib.rs to fire `refresh_tags()` after each attach, so
+   new tags / counts appear without restarting. Known non-blocker: a selected
+   tag's highlight drops on refresh (the grid filter state lives outside the box,
+   and attach doesn't re-run the filter) — to fold in when attach re-filters the
+   grid. **Milestone 4 is now complete** (m4-1..m4-8).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
