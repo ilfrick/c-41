@@ -186,6 +186,28 @@ pub fn tag_get_attached(conn: &Connection, imgid: i32) -> rusqlite::Result<Vec<T
     Ok(ids)
 }
 
+/// List every user tag with the number of images it is attached to, ordered by
+/// name. Internal darktable tags (`darktable|…`, e.g. the colour-label and
+/// rejected tags) are excluded so this drives a user-facing tag browser. The
+/// count comes from a `LEFT JOIN` so tags attached to nothing still appear (count
+/// 0). Returns `(id, name, count)` triples.
+pub fn tag_list_with_counts(conn: &Connection) -> rusqlite::Result<Vec<(TagId, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, COUNT(ti.imgid) \
+         FROM data.tags t \
+         LEFT JOIN main.tagged_images ti ON ti.tagid = t.id \
+         WHERE t.name NOT LIKE 'darktable|%' \
+         GROUP BY t.id, t.name \
+         ORDER BY t.name",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, TagId>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Delete a tag and all its image associations.
 pub fn tag_delete(conn: &Connection, tagid: TagId) -> rusqlite::Result<()> {
     conn.execute(
@@ -309,6 +331,43 @@ mod tests {
         tag_attach(&db, dt,   7).unwrap();
         assert_eq!(tag_count_attached(&db, 7, false).unwrap(), 1); // user only
         assert_eq!(tag_count_attached(&db, 7, true).unwrap(),  2); // all
+    }
+
+    #[test]
+    fn list_with_counts_orders_by_name_counts_and_excludes_dt_tags() {
+        let db = open_test_db();
+        let beach = tag_new(&db, "beach").unwrap().unwrap();
+        let _city = tag_new(&db, "city").unwrap().unwrap();   // attached to nothing
+        let arch  = tag_new(&db, "arch").unwrap().unwrap();
+        let _dt   = tag_new(&db, "darktable|color|red").unwrap().unwrap();
+        tag_attach(&db, beach, 1).unwrap();
+        tag_attach(&db, beach, 2).unwrap();
+        tag_attach(&db, arch,  1).unwrap();
+
+        let list = tag_list_with_counts(&db).unwrap();
+        // Internal darktable| tags excluded; user tags ordered by name.
+        let names: Vec<&str> = list.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert_eq!(names, ["arch", "beach", "city"]);
+        // Counts: arch=1, beach=2, city=0 (LEFT JOIN keeps the unattached tag).
+        let by_name = |want: &str| list.iter().find(|(_, n, _)| n == want).unwrap().2;
+        assert_eq!(by_name("arch"), 1);
+        assert_eq!(by_name("beach"), 2);
+        assert_eq!(by_name("city"), 0);
+    }
+
+    #[test]
+    fn list_with_counts_excludes_only_pipe_namespaced_dt_tags() {
+        // Guard the `NOT LIKE 'darktable|%'` filter: only the pipe-namespaced
+        // internal tag is hidden; user tags that merely share the prefix stay.
+        let db = open_test_db();
+        tag_new(&db, "darkroom").unwrap();          // unrelated user tag
+        tag_new(&db, "darktable").unwrap();         // bare word, not namespaced
+        tag_new(&db, "darktable|style|foo").unwrap(); // internal → excluded
+        let names: Vec<String> =
+            tag_list_with_counts(&db).unwrap().into_iter().map(|(_, n, _)| n).collect();
+        assert!(names.contains(&"darkroom".to_string()));
+        assert!(names.contains(&"darktable".to_string()));
+        assert!(!names.iter().any(|n| n.starts_with("darktable|")));
     }
 
     #[test]

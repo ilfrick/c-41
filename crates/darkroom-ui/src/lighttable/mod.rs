@@ -335,6 +335,39 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
     }
 }
 
+/// Filter the lighttable to images carrying the tag `tag_id`. Empty result (or a
+/// db without the tag tables, e.g. the demo db) shows a placeholder.
+pub fn lighttable_load_by_tag(model: &LighttableModel, db_path: &str, tag_id: u32) {
+    while model.n_items() > 0 {
+        model.remove(0);
+    }
+    let conn = if db_path.is_empty() {
+        open_demo_db()
+    } else {
+        rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
+    };
+    let rows: Vec<String> = conn
+        .prepare(
+            "SELECT f.folder || '/' || i.filename \
+             FROM main.images i \
+             JOIN main.film_rolls f ON f.id = i.film_id \
+             JOIN main.tagged_images ti ON ti.imgid = i.id \
+             WHERE ti.tagid = ?1 \
+             ORDER BY f.folder, i.filename LIMIT 2000",
+        )
+        .and_then(|mut s| {
+            s.query_map([tag_id], |r| r.get::<_, String>(0))
+                .map(|it| it.flatten().collect())
+        })
+        .unwrap_or_default();
+    for path in rows {
+        model.append(&path);
+    }
+    if model.n_items() == 0 {
+        model.append("(No images with this tag)");
+    }
+}
+
 fn open_demo_db() -> rusqlite::Connection {
     use rusqlite::Connection;
     let conn = Connection::open_in_memory().expect("in-memory db");

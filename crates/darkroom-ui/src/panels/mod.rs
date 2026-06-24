@@ -6,7 +6,7 @@
 
 use adw::prelude::*;
 use glib::clone;
-use crate::lighttable::{LighttableModel, lighttable_load_by_folder};
+use crate::lighttable::{LighttableModel, lighttable_load_by_folder, lighttable_load_by_tag};
 use darkroom_db;
 
 // ── Left panel (collections) ──────────────────────────────────────────────
@@ -22,15 +22,16 @@ pub fn left_panel(db_path: &str, lt_model: &LighttableModel) -> gtk4::Box {
         .width_request(210)
         .build();
 
-    let header = gtk4::Label::builder()
-        .label("Collections")
-        .halign(gtk4::Align::Start)
-        .margin_top(12).margin_bottom(6)
-        .margin_start(12).margin_end(12)
+    // Both the Collections and Tags sections scroll together inside one content
+    // box so neither steals the other's vertical space.
+    let content = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(0)
         .build();
-    header.add_css_class("heading");
-    panel.append(&header);
-    panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    // ── Collections (film rolls) ──────────────────────────────────────────
+    content.append(&section_header("Collections"));
+    content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
     let list_box = gtk4::ListBox::builder()
         .selection_mode(gtk4::SelectionMode::Single)
@@ -60,15 +61,97 @@ pub fn left_panel(db_path: &str, lt_model: &LighttableModel) -> gtk4::Box {
             folder_filter.as_deref(),
         );
     }));
+    content.append(&list_box);
+
+    // ── Tags ──────────────────────────────────────────────────────────────
+    // Only shown when the library has user tags. Clicking one filters the grid.
+    let tags = load_tags_with_counts(db_path);
+    if !tags.is_empty() {
+        content.append(&section_header("Tags"));
+        content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        let tag_box = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .build();
+        tag_box.add_css_class("navigation-sidebar");
+        for (id, name, count) in &tags {
+            append_tag_row(&tag_box, *id, name, *count);
+        }
+
+        let db_tags = db_path.to_string();
+        tag_box.connect_row_activated(clone!(@weak lt_model => move |_, row| {
+            // The tag id is encoded in the row's widget name (see append_tag_row).
+            if let Ok(tag_id) = row.widget_name().as_str().parse::<u32>() {
+                lighttable_load_by_tag(&lt_model, &db_tags, tag_id);
+            }
+        }));
+        content.append(&tag_box);
+    }
 
     let scroll = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vscrollbar_policy(gtk4::PolicyType::Automatic)
-        .child(&list_box)
+        .child(&content)
         .vexpand(true)
         .build();
     panel.append(&scroll);
     panel
+}
+
+/// A section heading label styled like the panel headers.
+fn section_header(text: &str) -> gtk4::Label {
+    let header = gtk4::Label::builder()
+        .label(text)
+        .halign(gtk4::Align::Start)
+        .margin_top(12).margin_bottom(6)
+        .margin_start(12).margin_end(12)
+        .build();
+    header.add_css_class("heading");
+    header
+}
+
+/// Append a tag row carrying its attached-image count; the tag id is stashed in
+/// the row's widget name so the activation handler can recover it.
+fn append_tag_row(list_box: &gtk4::ListBox, id: u32, name: &str, count: i64) {
+    let row = gtk4::ListBoxRow::new();
+    row.set_widget_name(&id.to_string());
+
+    let hbox = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(12).margin_end(8)
+        .margin_top(6).margin_bottom(6)
+        .build();
+
+    let name_lbl = gtk4::Label::builder()
+        .label(name)
+        .halign(gtk4::Align::Start)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+        .build();
+    hbox.append(&name_lbl);
+
+    let count_lbl = gtk4::Label::builder()
+        .label(&count.to_string())
+        .halign(gtk4::Align::End)
+        .build();
+    count_lbl.add_css_class("dim-label");
+    count_lbl.add_css_class("numeric");
+    hbox.append(&count_lbl);
+
+    row.set_tooltip_text(Some(name));
+    row.set_child(Some(&hbox));
+    list_box.append(&row);
+}
+
+fn load_tags_with_counts(db_path: &str) -> Vec<(u32, String, i64)> {
+    if db_path.is_empty() {
+        return Vec::new();
+    }
+    match rusqlite::Connection::open(db_path) {
+        Ok(conn) => darkroom_db::tags::tag_list_with_counts(&conn).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn append_roll_row(list_box: &gtk4::ListBox, label: &str, count: i64, folder: Option<&str>) {
