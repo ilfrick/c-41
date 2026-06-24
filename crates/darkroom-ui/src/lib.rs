@@ -61,8 +61,15 @@ fn build_main_window(app: &Application) {
     lighttable::lighttable_load_from_db(&lt_model, &db_path);
 
     // ── Panels ─────────────────────────────────────────────────────────────
-    let left  = panels::left_panel(&db_path, &lt_model);
+    let left  = panels::LeftPanel::new(&db_path, &lt_model);
     let right = panels::MetadataPanel::new();
+
+    // Attaching a tag in the metadata panel refreshes the left-panel Tags list
+    // so new tags / changed counts appear without restarting.
+    {
+        let lp = left.clone();
+        right.set_on_tags_changed(move || lp.refresh_tags());
+    }
 
     // Selection → metadata
     {
@@ -88,7 +95,7 @@ fn build_main_window(app: &Application) {
     let hbox = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
-    hbox.append(&left);
+    hbox.append(&left.widget);
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     hbox.append(&scroll);
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));

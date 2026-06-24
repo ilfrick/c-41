@@ -1,7 +1,7 @@
 //! Side-panel widgets -- collections list and metadata inspector.
 //!
 //! Phase 3-ui-6:
-//!   left_panel  -- film rolls with image counts; clicking filters the grid
+//!   LeftPanel  -- film rolls with image counts; clicking filters the grid
 //!   MetadataPanel -- right panel that updates when an image is selected
 
 use adw::prelude::*;
@@ -11,78 +11,97 @@ use darkroom_db;
 
 // ── Left panel (collections) ──────────────────────────────────────────────
 
-/// Build the collections (left) panel.
+/// The collections (left) panel: film rolls plus a live Tags section.
 ///
-/// Clicking a film roll reloads `lt_model` to show only images from that
-/// folder. The first row ("All images") clears the filter.
-pub fn left_panel(db_path: &str, lt_model: &LighttableModel) -> gtk4::Box {
-    let panel = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(0)
-        .width_request(210)
-        .build();
+/// Clicking a film roll reloads the lighttable to show only that folder; the
+/// first row ("All images") clears the filter. The Tags section can be rebuilt
+/// in place via [`LeftPanel::refresh_tags`] after a tag is attached elsewhere
+/// (e.g. from the metadata panel), so newly-created tags and changed counts
+/// appear without restarting the app.
+///
+/// All fields are GObject ref-counts (plus a `String`), so `LeftPanel` is Clone
+/// and can be handed to the metadata panel's change callback cheaply.
+#[derive(Clone)]
+pub struct LeftPanel {
+    pub widget:  gtk4::Box,
+    /// Stable tag list box; only its rows are rebuilt on refresh so the
+    /// folder↔tag selection-coordination handlers (bound once) stay valid.
+    tag_box:     gtk4::ListBox,
+    /// Section chrome whose visibility tracks whether any user tags exist.
+    tags_header: gtk4::Label,
+    tags_sep:    gtk4::Separator,
+    db_path:     String,
+}
 
-    // Both the Collections and Tags sections scroll together inside one content
-    // box so neither steals the other's vertical space.
-    let content = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(0)
-        .build();
+impl LeftPanel {
+    pub fn new(db_path: &str, lt_model: &LighttableModel) -> Self {
+        let panel = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(0)
+            .width_request(210)
+            .build();
 
-    // ── Collections (film rolls) ──────────────────────────────────────────
-    content.append(&section_header("Collections"));
-    content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        // Both the Collections and Tags sections scroll together inside one
+        // content box so neither steals the other's vertical space.
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(0)
+            .build();
 
-    let list_box = gtk4::ListBox::builder()
-        .selection_mode(gtk4::SelectionMode::Single)
-        .build();
-    list_box.add_css_class("navigation-sidebar");
-
-    // "All images" row
-    append_roll_row(&list_box, "All images", -1, None);
-
-    // Film roll rows from DB
-    let rolls = load_film_rolls(db_path);
-    for (folder, count) in &rolls {
-        append_roll_row(&list_box, folder, *count, Some(folder.as_str()));
-    }
-
-    // The Tags list box is built up-front (even if not shown) so the folder
-    // handler can clear its selection — the two SelectionMode::Single boxes are
-    // mutually exclusive, so a folder/tag filter never leaves a stale highlight in
-    // the other list implying an AND that isn't running. Clicking "All images"
-    // (which clears the tag highlight too) is the way out of a tag filter.
-    let tags = load_tags_with_counts(db_path);
-    let tag_box = gtk4::ListBox::builder()
-        .selection_mode(gtk4::SelectionMode::Single)
-        .build();
-    tag_box.add_css_class("navigation-sidebar");
-    for (id, name, count) in &tags {
-        append_tag_row(&tag_box, *id, name, *count);
-    }
-
-    // Activate: reload lighttable with folder filter, dropping any tag filter.
-    let db = db_path.to_string();
-    list_box.connect_row_activated(clone!(@weak lt_model, @weak tag_box => move |_, row| {
-        tag_box.unselect_all();
-        let folder_filter: Option<String> = row
-            .widget_name()
-            .as_str()
-            .ne("all")
-            .then(|| row.widget_name().to_string());
-        lighttable_load_by_folder(
-            &lt_model,
-            &db,
-            folder_filter.as_deref(),
-        );
-    }));
-    content.append(&list_box);
-
-    // ── Tags ──────────────────────────────────────────────────────────────
-    // Only shown when the library has user tags. Clicking one filters the grid.
-    if !tags.is_empty() {
-        content.append(&section_header("Tags"));
+        // ── Collections (film rolls) ──────────────────────────────────────
+        content.append(&section_header("Collections"));
         content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        let list_box = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .build();
+        list_box.add_css_class("navigation-sidebar");
+
+        // "All images" row
+        append_roll_row(&list_box, "All images", -1, None);
+
+        // Film roll rows from DB
+        let rolls = load_film_rolls(db_path);
+        for (folder, count) in &rolls {
+            append_roll_row(&list_box, folder, *count, Some(folder.as_str()));
+        }
+
+        // The Tags list box is built up-front (even if empty) so the folder
+        // handler can clear its selection — the two SelectionMode::Single boxes
+        // are mutually exclusive, so a folder/tag filter never leaves a stale
+        // highlight in the other list implying an AND that isn't running.
+        // Clicking "All images" (which clears the tag highlight too) is the way
+        // out of a tag filter. The box is stable across refreshes; only its rows
+        // are rebuilt, so the handlers bound below never go stale.
+        let tag_box = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .build();
+        tag_box.add_css_class("navigation-sidebar");
+
+        // Activate: reload lighttable with folder filter, dropping any tag filter.
+        let db = db_path.to_string();
+        list_box.connect_row_activated(clone!(@weak lt_model, @weak tag_box => move |_, row| {
+            tag_box.unselect_all();
+            let folder_filter: Option<String> = row
+                .widget_name()
+                .as_str()
+                .ne("all")
+                .then(|| row.widget_name().to_string());
+            lighttable_load_by_folder(
+                &lt_model,
+                &db,
+                folder_filter.as_deref(),
+            );
+        }));
+        content.append(&list_box);
+
+        // ── Tags ──────────────────────────────────────────────────────────
+        // The header/separator/box are always present; their visibility tracks
+        // whether the library has any user tags (toggled in `refresh_tags`).
+        let tags_header = section_header("Tags");
+        let tags_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        content.append(&tags_header);
+        content.append(&tags_sep);
 
         let db_tags = db_path.to_string();
         tag_box.connect_row_activated(clone!(@weak lt_model, @weak list_box => move |_, row| {
@@ -93,16 +112,45 @@ pub fn left_panel(db_path: &str, lt_model: &LighttableModel) -> gtk4::Box {
             }
         }));
         content.append(&tag_box);
+
+        let scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .child(&content)
+            .vexpand(true)
+            .build();
+        panel.append(&scroll);
+
+        let lp = Self {
+            widget: panel,
+            tag_box,
+            tags_header,
+            tags_sep,
+            db_path: db_path.to_string(),
+        };
+        lp.refresh_tags();
+        lp
     }
 
-    let scroll = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vscrollbar_policy(gtk4::PolicyType::Automatic)
-        .child(&content)
-        .vexpand(true)
-        .build();
-    panel.append(&scroll);
-    panel
+    /// Rebuild the Tags section in place from the current library state.
+    ///
+    /// Clears and repopulates only the tag rows (the box itself is stable, so
+    /// the activation handler bound in `new` keeps working), then shows or hides
+    /// the section depending on whether any user tags exist. Safe to call after
+    /// a tag is attached from the metadata panel to surface new tags / counts.
+    pub fn refresh_tags(&self) {
+        while let Some(child) = self.tag_box.first_child() {
+            self.tag_box.remove(&child);
+        }
+        let tags = load_tags_with_counts(&self.db_path);
+        for (id, name, count) in &tags {
+            append_tag_row(&self.tag_box, *id, name, *count);
+        }
+        let has_tags = !tags.is_empty();
+        self.tags_header.set_visible(has_tags);
+        self.tags_sep.set_visible(has_tags);
+        self.tag_box.set_visible(has_tags);
+    }
 }
 
 /// A section heading label styled like the panel headers.
@@ -260,6 +308,9 @@ pub struct MetadataPanel {
     tag_entry:    gtk4::Entry,
     /// Shared (path, db_path) for the add-tag handler
     ctx: std::rc::Rc<std::cell::RefCell<(String, String)>>,
+    /// Optional notify fired after a tag is attached, so other panels (the
+    /// left-panel Tags section) can refresh. Set via [`set_on_tags_changed`].
+    on_tags_changed: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
 }
 
 impl MetadataPanel {
@@ -345,11 +396,14 @@ impl MetadataPanel {
         panel.append(&placeholder);
 
         let ctx = std::rc::Rc::new(std::cell::RefCell::new((String::new(), String::new())));
+        let on_tags_changed: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
 
         // Wire add-tag on Enter key
         {
             let ctx2      = ctx.clone();
             let flow_ref  = tags_flow.clone();
+            let notify    = on_tags_changed.clone();
             tag_entry.connect_activate(move |entry| {
                 let tag_name = entry.text().trim().to_string();
                 if tag_name.is_empty() { return; }
@@ -357,13 +411,28 @@ impl MetadataPanel {
                 if !db.is_empty() {
                     add_tag_to_image(path, db, &tag_name);
                     rebuild_tags_flow(&flow_ref, path, db);
+                    // Notify other panels (clone the callback out before invoking
+                    // so the cell isn't borrowed while it runs).
+                    let cb = notify.borrow().clone();
+                    if let Some(cb) = cb { cb(); }
                 }
                 entry.set_text("");
             });
         }
 
         Self { widget: panel, filename_lbl, folder_lbl, dims_lbl, size_lbl,
-               tags_flow, tag_entry, ctx }
+               tags_flow, tag_entry, ctx, on_tags_changed }
+    }
+
+    /// Register a callback fired whenever a tag is attached from this panel.
+    ///
+    /// Used to keep the left-panel Tags list in sync with newly-created tags
+    /// and changed image counts. Replaces any previously-set callback. This is
+    /// the canonical "tags mutated" hook: future tag *detach* / *rename* paths
+    /// should route through it too, so the left-panel count refresh stays
+    /// single-sourced.
+    pub fn set_on_tags_changed<F: Fn() + 'static>(&self, f: F) {
+        *self.on_tags_changed.borrow_mut() = Some(std::rc::Rc::new(f));
     }
 
     /// Refresh the panel for the image at `full_path`.
