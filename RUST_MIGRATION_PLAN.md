@@ -338,10 +338,15 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    and a confirmed Delete (`adw::AlertDialog` → `tag_delete`); the per-row gesture
    captures weak refs + db path (rehydrates a transient `LeftPanel` per click) to
    avoid a tag_box↔row↔gesture↔LeftPanel strong-ref cycle. Both refresh the list.
-   Known follow-ups: re-run the grid filter on attach/detach (closes the m4-8c
-   highlight non-blocker); bring `add_tag_to_image`/`load_tags` fault-logging up
-   to `detach`'s parity; a left-panel rename/delete doesn't refresh the
-   currently-shown chips until reselect.
+   **m4-11** — bidirectional tag-change refresh: `LeftPanel` gained a mirror
+   `on_tags_changed` notify fired by `rename_tag`/`delete_tag`, wired in lib.rs to
+   `MetadataPanel::refresh_tags_display()` so a left-panel rename/delete updates
+   the current image's chips live (and attach/detach still refreshes the left
+   list). Loop-free by construction: the notify fires ONLY from user mutation
+   handlers, never from a rebuild, so each mutation yields exactly one cross-panel
+   refresh. Known follow-ups: re-run the grid filter on attach/detach (closes the
+   m4-8c highlight non-blocker); bring `add_tag_to_image`/`load_tags` fault-logging
+   up to `detach`'s parity.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
