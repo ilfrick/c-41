@@ -144,12 +144,197 @@ impl LeftPanel {
         }
         let tags = load_tags_with_counts(&self.db_path);
         for (id, name, count) in &tags {
-            append_tag_row(&self.tag_box, *id, name, *count);
+            self.append_tag_row(*id, name, *count);
         }
         let has_tags = !tags.is_empty();
         self.tags_header.set_visible(has_tags);
         self.tags_sep.set_visible(has_tags);
         self.tag_box.set_visible(has_tags);
+    }
+
+    /// Append a tag row carrying its attached-image count; the tag id is stashed
+    /// in the row's widget name so the activation handler can recover it. A
+    /// secondary (right) click opens a rename/delete context popover.
+    fn append_tag_row(&self, id: u32, name: &str, count: i64) {
+        let row = gtk4::ListBoxRow::new();
+        row.set_widget_name(&id.to_string());
+
+        let hbox = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(12).margin_end(8)
+            .margin_top(6).margin_bottom(6)
+            .build();
+
+        let name_lbl = gtk4::Label::builder()
+            .label(name)
+            .halign(gtk4::Align::Start)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+            .build();
+        hbox.append(&name_lbl);
+
+        let count_lbl = gtk4::Label::builder()
+            .label(&count.to_string())
+            .halign(gtk4::Align::End)
+            .build();
+        count_lbl.add_css_class("dim-label");
+        count_lbl.add_css_class("numeric");
+        hbox.append(&count_lbl);
+
+        row.set_tooltip_text(Some(name));
+        row.set_child(Some(&hbox));
+
+        // Secondary-click → rename/delete popover. The gesture lives as long as
+        // the row (so for the app lifetime while the row is in `tag_box`); to
+        // avoid a strong-ref cycle (tag_box→row→gesture→LeftPanel→tag_box) it
+        // captures only weak refs + the db path and reconstructs a transient
+        // `LeftPanel` on demand. Removed rows then free cleanly on refresh.
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+        let widget_w  = self.widget.downgrade();
+        let tag_box_w = self.tag_box.downgrade();
+        let header_w  = self.tags_header.downgrade();
+        let sep_w     = self.tags_sep.downgrade();
+        let db        = self.db_path.clone();
+        let name_owned = name.to_string();
+        let row_w     = row.downgrade();
+        gesture.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk4::EventSequenceState::Claimed);
+            if let (Some(widget), Some(tag_box), Some(tags_header), Some(tags_sep), Some(row)) = (
+                widget_w.upgrade(), tag_box_w.upgrade(), header_w.upgrade(),
+                sep_w.upgrade(), row_w.upgrade(),
+            ) {
+                let lp = LeftPanel {
+                    widget, tag_box, tags_header, tags_sep, db_path: db.clone(),
+                };
+                lp.show_tag_menu(&row, id, &name_owned, count, x, y);
+            }
+        });
+        row.add_controller(gesture);
+
+        self.tag_box.append(&row);
+    }
+
+    /// Pop up the rename/delete menu for a tag row at the click point.
+    fn show_tag_menu(&self, row: &gtk4::ListBoxRow, id: u32, name: &str, count: i64, x: f64, y: f64) {
+        let popover = gtk4::Popover::builder().build();
+        popover.set_parent(row);
+        popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+        let vbox = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
+            .margin_start(6).margin_end(6).margin_top(6).margin_bottom(6)
+            .build();
+
+        let entry = gtk4::Entry::builder().text(name).build();
+        vbox.append(&entry);
+
+        let rename_btn = gtk4::Button::with_label("Rename");
+        rename_btn.add_css_class("suggested-action");
+        vbox.append(&rename_btn);
+
+        vbox.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        let plural = if count == 1 { "" } else { "s" };
+        let delete_btn = gtk4::Button::with_label(&format!("Delete (from {count} image{plural})"));
+        delete_btn.add_css_class("destructive-action");
+        vbox.append(&delete_btn);
+
+        popover.set_child(Some(&vbox));
+
+        // Rename on button click or Enter in the entry (skipped if blank or
+        // unchanged — no needless write/refresh).
+        let do_rename = {
+            let lp = self.clone();
+            let pop = popover.clone();
+            let entry = entry.clone();
+            let original = name.to_string();
+            move || {
+                // Read the entry, then dismiss the popover BEFORE refresh_tags
+                // removes its parent row — so no orphaned subtree exists mid-call.
+                let new_name = entry.text().trim().to_string();
+                pop.popdown();
+                if !new_name.is_empty() && new_name != original {
+                    lp.rename_tag(id, &new_name);
+                }
+            }
+        };
+        rename_btn.connect_clicked({
+            let f = do_rename.clone();
+            move |_| f()
+        });
+        entry.connect_activate({
+            let f = do_rename.clone();
+            move |_| f()
+        });
+
+        // Delete (confirmed) on button click.
+        {
+            let lp = self.clone();
+            let pop = popover.clone();
+            let name_owned = name.to_string();
+            delete_btn.connect_clicked(move |_| {
+                pop.popdown();
+                lp.confirm_delete_tag(id, &name_owned, count);
+            });
+        }
+
+        // The popover is parented to the row; unparent it when dismissed so it
+        // doesn't outlive (and leak against) the row it points at.
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+    }
+
+    /// Rename a tag library-wide (best-effort; a UNIQUE-name clash logs and
+    /// leaves the tag unchanged), then refresh the list.
+    fn rename_tag(&self, id: u32, new_name: &str) {
+        if self.db_path.is_empty() { return; }
+        match rusqlite::Connection::open(&self.db_path) {
+            Ok(conn) => {
+                if let Err(e) = darkroom_db::tags::tag_rename(&conn, id, new_name) {
+                    eprintln!("darkroom: tag rename failed (duplicate name?): {e}");
+                }
+            }
+            Err(e) => eprintln!("darkroom: cannot open library db to rename tag: {e}"),
+        }
+        self.refresh_tags();
+    }
+
+    /// Confirm, then delete a tag and all its image associations.
+    fn confirm_delete_tag(&self, id: u32, name: &str, count: i64) {
+        let plural = if count == 1 { "" } else { "s" };
+        let dialog = adw::AlertDialog::new(
+            Some("Delete tag?"),
+            Some(&format!(
+                "\u{201c}{name}\u{201d} will be removed from {count} image{plural}. \
+                 This cannot be undone."
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let lp = self.clone();
+        dialog.connect_response(None, move |_, resp| {
+            if resp == "delete" { lp.delete_tag(id); }
+        });
+        dialog.present(Some(&self.widget));
+    }
+
+    /// Delete a tag and its associations (best-effort; logs faults), then refresh.
+    fn delete_tag(&self, id: u32) {
+        if self.db_path.is_empty() { return; }
+        match rusqlite::Connection::open(&self.db_path) {
+            Ok(conn) => {
+                if let Err(e) = darkroom_db::tags::tag_delete(&conn, id) {
+                    eprintln!("darkroom: tag delete failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("darkroom: cannot open library db to delete tag: {e}"),
+        }
+        self.refresh_tags();
     }
 }
 
@@ -163,40 +348,6 @@ fn section_header(text: &str) -> gtk4::Label {
         .build();
     header.add_css_class("heading");
     header
-}
-
-/// Append a tag row carrying its attached-image count; the tag id is stashed in
-/// the row's widget name so the activation handler can recover it.
-fn append_tag_row(list_box: &gtk4::ListBox, id: u32, name: &str, count: i64) {
-    let row = gtk4::ListBoxRow::new();
-    row.set_widget_name(&id.to_string());
-
-    let hbox = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .margin_start(12).margin_end(8)
-        .margin_top(6).margin_bottom(6)
-        .build();
-
-    let name_lbl = gtk4::Label::builder()
-        .label(name)
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .ellipsize(gtk4::pango::EllipsizeMode::Middle)
-        .build();
-    hbox.append(&name_lbl);
-
-    let count_lbl = gtk4::Label::builder()
-        .label(&count.to_string())
-        .halign(gtk4::Align::End)
-        .build();
-    count_lbl.add_css_class("dim-label");
-    count_lbl.add_css_class("numeric");
-    hbox.append(&count_lbl);
-
-    row.set_tooltip_text(Some(name));
-    row.set_child(Some(&hbox));
-    list_box.append(&row);
 }
 
 fn load_tags_with_counts(db_path: &str) -> Vec<(u32, String, i64)> {
