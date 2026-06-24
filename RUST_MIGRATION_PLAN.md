@@ -309,7 +309,20 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    hinges on the disk `onsave_action`, which `darktable-cli` never sets; an empty
    `$(FILE_FOLDER)` falls back to `.` (no rooting at `/`); and the export counts
    per-image failures, surfacing "Exported X of N (Y failed)" instead of a green
-   toast over zero written files. The remaining m4 panel is **tagging**.
+   toast over zero written files. **m4-8: tagging panel.** **m4-8a** — filter the
+   lighttable by tag: new `darkroom-db::tags::tag_list_with_counts` (all user tags
+   with attached-image counts via `LEFT JOIN`, excluding pipe-namespaced
+   `darktable|…` internal tags, ordered by name; unit-tested) + `lighttable_load_
+   by_tag` (3-table JOIN filter). The left collections panel grows a conditional
+   "Tags" section (rendered only when the library has user tags) sharing one scroll
+   with Collections; tag rows encode the tag id in the GTK widget-name and clicking
+   one filters the grid. **m4-8b** — the Collections and Tags lists (two
+   `SelectionMode::Single` boxes) now clear each other's selection on activate (weak
+   refs, no widget cycle) so a filter never leaves a stale highlight implying an
+   AND; "All images" is the clear-tag-filter path; tag read faults are logged (a
+   corrupt/locked catalog now reads differently from "no tags"). **Still open in
+   m4-8: live refresh** of the Tags list after a tag is attached via the metadata
+   panel (currently built once at startup). That is the last m4 item.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
