@@ -283,8 +283,19 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    selection. `WipeCompare::{show,clear}` own the overlay; the
    `render_preview` sole-writer invariant on the live `Picture`/`last_render` is
    untouched (the wipe owns a separate widget). The **history + snapshots cluster
-   is complete**; the remaining m4 panels are **tagging** and a persistent
-   **export** panel (currently a dialog).
+   is complete**. **m4-7a: pure export model + CLI-contract fix** — extracted the
+   export format/quality/resize model and the `darktable-cli` argv construction
+   into a headless-tested `export.rs`, fixing two silent no-ops in the old export
+   dialog: (1) JPEG quality was passed as a bare `--quality`, which the CLI does
+   not parse (the value was swallowed as the positional output path) — now routed
+   through the trailing `--core --conf`; (2) the quality conf was keyed on the file
+   *extension* (`jpg`/`tif`) but the imageio core keys it on the *module* name
+   (`jpeg`/`tiff`) — added `ExportFormat::module_name()` and key on it. Also emits a
+   truthful `plugins/imageio/format/tiff/bpp=16` for the "TIFF 16-bit" option and
+   collapses to a single trailing `--core` block. `cli_args`/`fit_within` are pure
+   and unit-tested (conf-key pinning, `--core`-once, resize aspect math, ALL/
+   from_index drift guard). The remaining m4 work is the persistent **export**
+   panel UI (m4-7b, over this model) and the **tagging** panel.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
