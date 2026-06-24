@@ -32,7 +32,9 @@ pub fn show_export_dialog(
         .build();
 
     let format_row = adw::ComboRow::builder().title("Format").build();
-    format_row.set_model(Some(&gtk4::StringList::new(&["JPEG (sRGB)", "TIFF 16-bit", "PNG"])));
+    let format_labels: Vec<&str> =
+        crate::export::ExportFormat::ALL.iter().map(|f| f.label()).collect();
+    format_row.set_model(Some(&gtk4::StringList::new(&format_labels)));
     content_box.append(&format_row);
 
     let quality_row = adw::SpinRow::builder().title("JPEG quality").build();
@@ -46,19 +48,17 @@ pub fn show_export_dialog(
 
     let toast_fn = std::rc::Rc::new(toast_fn);
     dialog.connect_response(Some("export"), move |_, _| {
-        let fmt = match format_row.selected() {
-            0 => "jpeg",
-            1 => "tiff",
-            _ => "png",
+        let settings = crate::export::ExportSettings {
+            format: crate::export::ExportFormat::from_index(format_row.selected()),
+            quality: quality_row.value() as u32,
+            resize: None, // the dialog has no resize controls; the panel (m4-7b) will
         };
-        let quality   = quality_row.value() as u32;
         let out_paths = paths.clone();
-        let fmt_str   = fmt.to_string();
         let n         = out_paths.len();
         let tf        = toast_fn.clone();
 
         glib::spawn_future_local(async move {
-            match export_images_async(out_paths, fmt_str, quality).await {
+            match export_images_async(out_paths, settings).await {
                 Ok(())  => tf(format!("Exported {n} image(s)")),
                 Err(e)  => tf(format!("Export failed: {e}")),
             }
@@ -68,8 +68,13 @@ pub fn show_export_dialog(
     dialog.present(Some(parent.upcast_ref::<gtk4::Widget>()));
 }
 
-/// Run `darkroom-cli` for each image asynchronously on a thread pool.
-async fn export_images_async(paths: Vec<String>, format: String, quality: u32) -> Result<()> {
+/// Run `darkroom-cli` for each image asynchronously on a thread pool, building
+/// the argv from the shared (unit-tested) [`crate::export::cli_args`]. Each image
+/// is written into an `exports/` subfolder beside it.
+async fn export_images_async(
+    paths: Vec<String>,
+    settings: crate::export::ExportSettings,
+) -> Result<()> {
     gio::spawn_blocking(move || {
         for path in &paths {
             let out_dir = std::path::Path::new(path)
@@ -78,15 +83,10 @@ async fn export_images_async(paths: Vec<String>, format: String, quality: u32) -
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
 
             let _ = std::fs::create_dir_all(&out_dir);
+            let out_dest = out_dir.to_str().unwrap_or("/tmp");
 
             let status = std::process::Command::new("darkroom-cli")
-                .args([
-                    path.as_str(),
-                    out_dir.to_str().unwrap_or("/tmp"),
-                    "--style", "none",
-                    "--out-ext", &format,
-                    "--quality", &quality.to_string(),
-                ])
+                .args(crate::export::cli_args(path, out_dest, &settings))
                 .status();
 
             match status {

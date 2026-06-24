@@ -11,6 +11,7 @@ use glib::clone;
 pub mod catalog;
 pub mod darkroom;
 pub mod dialogs;
+pub mod export;
 pub mod history;
 pub mod lighttable;
 pub mod panels;
