@@ -346,7 +346,7 @@ pub fn lighttable_load_by_tag(model: &LighttableModel, db_path: &str, tag_id: u3
     } else {
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
-    let rows: Vec<String> = conn
+    let rows: Vec<String> = match conn
         .prepare(
             "SELECT f.folder || '/' || i.filename \
              FROM main.images i \
@@ -358,8 +358,13 @@ pub fn lighttable_load_by_tag(model: &LighttableModel, db_path: &str, tag_id: u3
         .and_then(|mut s| {
             s.query_map([tag_id], |r| r.get::<_, String>(0))
                 .map(|it| it.flatten().collect())
-        })
-        .unwrap_or_default();
+        }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("darkroom: tag filter query failed (tag {tag_id}): {e}");
+            Vec::new()
+        }
+    };
     for path in rows {
         model.append(&path);
     }

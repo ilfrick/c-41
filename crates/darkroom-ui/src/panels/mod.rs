@@ -47,9 +47,24 @@ pub fn left_panel(db_path: &str, lt_model: &LighttableModel) -> gtk4::Box {
         append_roll_row(&list_box, folder, *count, Some(folder.as_str()));
     }
 
-    // Activate: reload lighttable with folder filter
+    // The Tags list box is built up-front (even if not shown) so the folder
+    // handler can clear its selection — the two SelectionMode::Single boxes are
+    // mutually exclusive, so a folder/tag filter never leaves a stale highlight in
+    // the other list implying an AND that isn't running. Clicking "All images"
+    // (which clears the tag highlight too) is the way out of a tag filter.
+    let tags = load_tags_with_counts(db_path);
+    let tag_box = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::Single)
+        .build();
+    tag_box.add_css_class("navigation-sidebar");
+    for (id, name, count) in &tags {
+        append_tag_row(&tag_box, *id, name, *count);
+    }
+
+    // Activate: reload lighttable with folder filter, dropping any tag filter.
     let db = db_path.to_string();
-    list_box.connect_row_activated(clone!(@weak lt_model => move |_, row| {
+    list_box.connect_row_activated(clone!(@weak lt_model, @weak tag_box => move |_, row| {
+        tag_box.unselect_all();
         let folder_filter: Option<String> = row
             .widget_name()
             .as_str()
@@ -65,21 +80,13 @@ pub fn left_panel(db_path: &str, lt_model: &LighttableModel) -> gtk4::Box {
 
     // ── Tags ──────────────────────────────────────────────────────────────
     // Only shown when the library has user tags. Clicking one filters the grid.
-    let tags = load_tags_with_counts(db_path);
     if !tags.is_empty() {
         content.append(&section_header("Tags"));
         content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-        let tag_box = gtk4::ListBox::builder()
-            .selection_mode(gtk4::SelectionMode::Single)
-            .build();
-        tag_box.add_css_class("navigation-sidebar");
-        for (id, name, count) in &tags {
-            append_tag_row(&tag_box, *id, name, *count);
-        }
-
         let db_tags = db_path.to_string();
-        tag_box.connect_row_activated(clone!(@weak lt_model => move |_, row| {
+        tag_box.connect_row_activated(clone!(@weak lt_model, @weak list_box => move |_, row| {
+            list_box.unselect_all();
             // The tag id is encoded in the row's widget name (see append_tag_row).
             if let Ok(tag_id) = row.widget_name().as_str().parse::<u32>() {
                 lighttable_load_by_tag(&lt_model, &db_tags, tag_id);
@@ -148,9 +155,21 @@ fn load_tags_with_counts(db_path: &str) -> Vec<(u32, String, i64)> {
     if db_path.is_empty() {
         return Vec::new();
     }
+    // Log faults so a corrupt/locked catalog reads differently from "no tags"
+    // (the Tags section is simply hidden either way, but the cause is recoverable
+    // from the logs — the established read-path discipline).
     match rusqlite::Connection::open(db_path) {
-        Ok(conn) => darkroom_db::tags::tag_list_with_counts(&conn).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(conn) => match darkroom_db::tags::tag_list_with_counts(&conn) {
+            Ok(tags) => tags,
+            Err(e) => {
+                eprintln!("darkroom: tag list query failed: {e}");
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            eprintln!("darkroom: cannot open library db for tags: {e}");
+            Vec::new()
+        }
     }
 }
 
