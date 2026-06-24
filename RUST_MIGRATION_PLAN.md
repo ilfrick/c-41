@@ -294,8 +294,22 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    truthful `plugins/imageio/format/tiff/bpp=16` for the "TIFF 16-bit" option and
    collapses to a single trailing `--core` block. `cli_args`/`fit_within` are pure
    and unit-tested (conf-key pinning, `--core`-once, resize aspect math, ALL/
-   from_index drift guard). The remaining m4 work is the persistent **export**
-   panel UI (m4-7b, over this model) and the **tagging** panel.
+   from_index drift guard). **m4-7b: export panel + output templating** — a
+   reusable `ExportPanel` libadwaita widget over that model (format combo, JPEG-
+   quality spin greyed unless the format honours it, a resize box — limit switch +
+   max width/height + allow-upscale with sub-controls greyed when off — and an
+   output-path template), hosted in the export dialog for now (dockable later).
+   Output paths come from a pure, headless-tested `expand_output_template` that
+   owns `$(FILE_FOLDER)`/`$(FILE_NAME)`/`$(SEQUENCE)` and passes other `$(…)`
+   tokens through to the CLI's `dt_variables`; it returns an *extension-less* path
+   (`--out-ext` appends the real one, per the verified main.c:724-731 contract).
+   Review-hardened for data safety: `batch_output_template` appends `_$(SEQUENCE)`
+   when exporting >1 image with a template lacking it, so same-stem sources (a
+   RAW+JPEG pair → `exports/IMG`) can't silently overwrite — the CLI's rename
+   hinges on the disk `onsave_action`, which `darktable-cli` never sets; an empty
+   `$(FILE_FOLDER)` falls back to `.` (no rooting at `/`); and the export counts
+   per-image failures, surfacing "Exported X of N (Y failed)" instead of a green
+   toast over zero written files. The remaining m4 panel is **tagging**.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
