@@ -64,11 +64,19 @@ fn build_main_window(app: &Application) {
     let left  = panels::LeftPanel::new(&db_path, &lt_model);
     let right = panels::MetadataPanel::new();
 
-    // Attaching a tag in the metadata panel refreshes the left-panel Tags list
-    // so new tags / changed counts appear without restarting.
+    // Bidirectional tag-change refresh:
+    //  • attaching/detaching a tag in the metadata panel refreshes the
+    //    left-panel Tags list (new tags / changed counts);
+    //  • renaming/deleting a tag in the left panel re-renders the metadata
+    //    panel's chips for the current image.
+    // Neither callback re-enters the other's mutation path, so there is no loop.
     {
         let lp = left.clone();
         right.set_on_tags_changed(move || lp.refresh_tags());
+    }
+    {
+        let meta = right.clone();
+        left.set_on_tags_changed(move || meta.refresh_tags_display());
     }
 
     // Selection → metadata

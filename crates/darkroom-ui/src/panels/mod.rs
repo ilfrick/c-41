@@ -31,6 +31,10 @@ pub struct LeftPanel {
     tags_header: gtk4::Label,
     tags_sep:    gtk4::Separator,
     db_path:     String,
+    /// Optional notify fired after a library-wide tag mutation here (rename /
+    /// delete), so the metadata panel can re-render the current image's chips.
+    /// Mirror of `MetadataPanel::on_tags_changed`. Set via `set_on_tags_changed`.
+    on_tags_changed: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
 }
 
 impl LeftPanel {
@@ -127,9 +131,25 @@ impl LeftPanel {
             tags_header,
             tags_sep,
             db_path: db_path.to_string(),
+            on_tags_changed: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         lp.refresh_tags();
         lp
+    }
+
+    /// Register a callback fired after a tag is renamed or deleted here, so the
+    /// metadata panel can re-render the current image's chips. Mirror of
+    /// `MetadataPanel::set_on_tags_changed`; replaces any previous callback. The
+    /// callback must not re-enter a left-panel tag mutation, or it would loop.
+    pub fn set_on_tags_changed<F: Fn() + 'static>(&self, f: F) {
+        *self.on_tags_changed.borrow_mut() = Some(std::rc::Rc::new(f));
+    }
+
+    /// Fire the tags-changed notify, if set (clone out of the cell first so it
+    /// isn't borrowed while the callback runs).
+    fn fire_tags_changed(&self) {
+        let cb = self.on_tags_changed.borrow().clone();
+        if let Some(cb) = cb { cb(); }
     }
 
     /// Rebuild the Tags section in place from the current library state.
@@ -197,6 +217,9 @@ impl LeftPanel {
         let header_w  = self.tags_header.downgrade();
         let sep_w     = self.tags_sep.downgrade();
         let db        = self.db_path.clone();
+        // The notify Rc points at the metadata panel, never back at the left
+        // panel widgets, so capturing it strongly introduces no widget cycle.
+        let notify    = self.on_tags_changed.clone();
         let name_owned = name.to_string();
         let row_w     = row.downgrade();
         gesture.connect_pressed(move |g, _, x, y| {
@@ -207,6 +230,7 @@ impl LeftPanel {
             ) {
                 let lp = LeftPanel {
                     widget, tag_box, tags_header, tags_sep, db_path: db.clone(),
+                    on_tags_changed: notify.clone(),
                 };
                 lp.show_tag_menu(&row, id, &name_owned, count, x, y);
             }
@@ -300,6 +324,7 @@ impl LeftPanel {
             Err(e) => eprintln!("darkroom: cannot open library db to rename tag: {e}"),
         }
         self.refresh_tags();
+        self.fire_tags_changed();
     }
 
     /// Confirm, then delete a tag and all its image associations.
@@ -335,6 +360,7 @@ impl LeftPanel {
             Err(e) => eprintln!("darkroom: cannot open library db to delete tag: {e}"),
         }
         self.refresh_tags();
+        self.fire_tags_changed();
     }
 }
 
@@ -583,9 +609,19 @@ impl MetadataPanel {
     /// and changed image counts. Replaces any previously-set callback. This is
     /// the canonical "tags mutated" hook: future tag *detach* / *rename* paths
     /// should route through it too, so the left-panel count refresh stays
-    /// single-sourced.
+    /// single-sourced. The callback must not re-enter a metadata-panel tag
+    /// mutation, or it would loop.
     pub fn set_on_tags_changed<F: Fn() + 'static>(&self, f: F) {
         *self.on_tags_changed.borrow_mut() = Some(std::rc::Rc::new(f));
+    }
+
+    /// Re-render the current image's tag chips from the DB without changing the
+    /// selected image. Used as the left-panel's "tags mutated" callback so a
+    /// rename/delete there updates chips shown here immediately.
+    pub fn refresh_tags_display(&self) {
+        // Nothing selected yet → leave the placeholder; skip a pointless rebuild.
+        if self.ctx.borrow().0.is_empty() { return; }
+        rebuild_tags_flow(&self.tags_flow, &self.ctx, &self.on_tags_changed);
     }
 
     /// Refresh the panel for the image at `full_path`.
