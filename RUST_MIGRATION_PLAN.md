@@ -386,9 +386,17 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    hazard) — `next_active_tag` + the `active_tag`/`lt_model` `LeftPanel` fields
    removed; `delete_tag` just refreshes + fires the notify, and the wired reapply
    re-runs the prefix (surviving descendants stay; deleting the exact filtered-on
-   leaf collapses to the empty placeholder). Known follow-ups: a `… (showing first
-   2000)` affordance now a parent can gather a large subtree; a `with_image_id`
-   helper if a fifth tag op appears.
+   leaf collapses to the empty placeholder). **m4-17** — surface grid-result
+   truncation: all four lighttable loaders silently cut at `LIMIT 2000`, which
+   m4-16's subtree-gathering prefix made far likelier to hit. Now a
+   `const GRID_CAP = 2000`; every loader queries `LIMIT GRID_CAP + 1` so a full
+   page is distinguishable from an over-full one, routed through the pure
+   unit-tested `cap_rows` (truncate + trailing notice "(showing first 2000 —
+   refine your filter)") and the shared `fill_grid` tail (capped rows + notice +
+   empty placeholder). The notice carries no `/`, so the grid's
+   selection/activation/export guards skip it like the empty-state rows. Known
+   follow-ups: segment-only rename in the hierarchy; a `with_image_id` helper if
+   a fifth tag op appears.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
