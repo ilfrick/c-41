@@ -73,14 +73,20 @@ fn build_main_window(app: &Application) {
     // Re-run the grid filter after a tag mutation, but ONLY when a tag filter is
     // active — so e.g. detaching the filtered-on tag drops the image from the
     // grid, while ordinary tagging under an All/Folder/Search view leaves the
-    // grid (and selection) untouched.
+    // grid (and selection) untouched. Across the reload we preserve the selected
+    // image so an unrelated attach/rename doesn't yank the user back to index 0;
+    // if the image left the grid (detached the filtered-on tag) the default
+    // selection stands.
     let reapply_tag_filter = {
         let at  = active_tag.clone();
         let mdl = lt_model.clone();
+        let sel = lt_selection.clone();
         let db  = db_path.clone();
         move || {
             if let Some(id) = at.get() {
+                let prev = lighttable::selected_path(&sel);
                 lighttable::lighttable_load_by_tag(&mdl, &db, id);
+                lighttable::reselect_path(&sel, prev.as_deref());
             }
         }
     };

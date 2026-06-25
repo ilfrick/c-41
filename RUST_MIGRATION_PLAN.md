@@ -357,10 +357,16 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    faults (open / image-lookup / attached-read / tag-create) like
    `detach_tag_from_image` instead of silently swallowing them, splitting the old
    catch-all `_`/`else`/`unwrap_or_default` into explicit `Ok(None)` (silent, an
-   uncatalogued image) vs `Err` (logged) arms — no behaviour change. Known
-   follow-ups: hierarchical (`a|b`) tags; selection preservation across grid
-   reloads; a `with_image_id` helper if a fifth tag op appears (4 copies of the
-   open→lookup→fault-log ceremony now exist).
+   uncatalogued image) vs `Err` (logged) arms — no behaviour change. **m4-14** —
+   preserve grid selection across the m4-12 reapply: the active-tag-filter reload
+   now captures the selected image path (`lighttable::selected_path`) before
+   reloading and restores it after (`reselect_path`, backed by the unit-tested
+   pure `index_of_path`), so an unrelated attach/rename under a tag filter no
+   longer yanks the user back to index 0; if the image left the grid (detached
+   the filtered-on tag) the default index-0 selection stands. Scoped to the
+   reapply path ONLY — folder/tag/search/import are deliberate view changes where
+   resetting to the first image is expected. Known follow-ups: hierarchical
+   (`a|b`) tags; a `with_image_id` helper if a fifth tag op appears.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

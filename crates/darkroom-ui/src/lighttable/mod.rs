@@ -373,6 +373,44 @@ pub fn lighttable_load_by_tag(model: &LighttableModel, db_path: &str, tag_id: u3
     }
 }
 
+// ── Selection preservation across reloads ──────────────────────────────────
+
+/// The full image path currently selected in the grid, or `None` if nothing
+/// real is selected (e.g. a placeholder row, which carries no `/`). Capture this
+/// BEFORE a model reload so the selection can be restored afterwards.
+pub fn selected_path(selection: &SingleSelection) -> Option<String> {
+    let model = selection.model()?;
+    let s = model
+        .item(selection.selected())
+        .and_downcast::<gtk4::StringObject>()?
+        .string()
+        .to_string();
+    s.contains('/').then_some(s)
+}
+
+/// Re-select `prev` in the grid if it survived a reload; otherwise leave the
+/// model's default (autoselected index 0) in place. No-op when `prev` is `None`.
+pub fn reselect_path(selection: &SingleSelection, prev: Option<&str>) {
+    let Some(prev) = prev else { return };
+    let Some(model) = selection.model() else { return };
+    let paths: Vec<String> = (0..model.n_items())
+        .filter_map(|i| {
+            model.item(i).and_downcast::<gtk4::StringObject>().map(|o| o.string().to_string())
+        })
+        .collect();
+    if let Some(idx) = index_of_path(&paths, prev) {
+        selection.set_selected(idx);
+    }
+}
+
+/// Pure core of [`reselect_path`]: the index of `target` in `paths`, if present.
+/// Kept separate so the (display-bound) reselect logic has a unit-testable seam.
+/// Returns the FIRST match; assumes grid paths are unique (the loaders' joins
+/// yield distinct `folder/filename` rows today — revisit if that ever changes).
+fn index_of_path(paths: &[String], target: &str) -> Option<u32> {
+    paths.iter().position(|p| p == target).map(|i| i as u32)
+}
+
 fn open_demo_db() -> rusqlite::Connection {
     use rusqlite::Connection;
     let conn = Connection::open_in_memory().expect("in-memory db");
@@ -387,4 +425,30 @@ fn open_demo_db() -> rusqlite::Connection {
     )
     .expect("demo data");
     conn
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_of_path;
+
+    fn paths() -> Vec<String> {
+        ["/a/1.jpg", "/a/2.jpg", "/b/3.jpg"].iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn index_of_path_finds_surviving_selection() {
+        assert_eq!(index_of_path(&paths(), "/a/2.jpg"), Some(1));
+        assert_eq!(index_of_path(&paths(), "/b/3.jpg"), Some(2));
+    }
+
+    #[test]
+    fn index_of_path_none_when_dropped() {
+        // e.g. the filtered-on tag was detached, so the image left the grid
+        assert_eq!(index_of_path(&paths(), "/a/9.jpg"), None);
+    }
+
+    #[test]
+    fn index_of_path_none_in_empty_grid() {
+        assert_eq!(index_of_path(&[], "/a/1.jpg"), None);
+    }
 }
