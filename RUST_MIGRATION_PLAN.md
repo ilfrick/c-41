@@ -352,9 +352,15 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    filtered-on tag drops the image while ordinary tagging under All/Folder/Search
    leaves the grid (and selection) untouched. Deleting the filtered-on tag clears
    the now-dangling filter (guards against SQLite id-reuse) via the unit-tested
-   `next_active_tag` helper and reverts the grid to "All images". Known follow-ups:
-   bring `add_tag_to_image`/`load_tags` fault-logging up to `detach`'s parity;
-   hierarchical (`a|b`) tags; selection preservation across grid reloads.
+   `next_active_tag` helper and reverts the grid to "All images". **m4-13** —
+   observability parity: `add_tag_to_image`/`load_tags` now log structural DB
+   faults (open / image-lookup / attached-read / tag-create) like
+   `detach_tag_from_image` instead of silently swallowing them, splitting the old
+   catch-all `_`/`else`/`unwrap_or_default` into explicit `Ok(None)` (silent, an
+   uncatalogued image) vs `Err` (logged) arms — no behaviour change. Known
+   follow-ups: hierarchical (`a|b`) tags; selection preservation across grid
+   reloads; a `with_image_id` helper if a fifth tag op appears (4 copies of the
+   open→lookup→fault-log ceremony now exist).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

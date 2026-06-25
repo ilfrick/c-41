@@ -773,18 +773,29 @@ fn rebuild_tags_flow(
 }
 
 /// Tags attached to an image, as `(tag_id, name)` so chips can offer detach.
+/// Best-effort: structural faults log (parity with `detach_tag_from_image`); an
+/// uncatalogued image is a silent empty (nothing attached), as is a single tag
+/// whose name can't be resolved (best-effort display, not worth spamming).
+/// NOTE: this runs on every lighttable selection change, so the `Err` logs fire
+/// per-repaint under a genuinely broken db — kept loud on purpose (the healthy
+/// `Ok(None)` path is silent); if this ever ships to users, latch "db unhealthy"
+/// once per session rather than making this log quieter.
 fn load_tags(full_path: &str, db_path: &str) -> Vec<(u32, String)> {
     if db_path.is_empty() { return Vec::new(); }
     let conn = match rusqlite::Connection::open(db_path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => { eprintln!("darkroom: cannot open library db to load tags: {e}"); return Vec::new(); }
     };
     let imgid = match darkroom_db::image::image_get_id_by_path(&conn, full_path) {
         Ok(Some(id)) => id,
-        _ => return Vec::new(),
+        Ok(None) => return Vec::new(),   // image not in catalog — no tags
+        Err(e) => { eprintln!("darkroom: image lookup failed on load tags: {e}"); return Vec::new(); }
     };
-    darkroom_db::tags::tag_get_attached(&conn, imgid)
-        .unwrap_or_default()
+    let attached = match darkroom_db::tags::tag_get_attached(&conn, imgid) {
+        Ok(ids) => ids,
+        Err(e) => { eprintln!("darkroom: cannot read attached tags: {e}"); return Vec::new(); }
+    };
+    attached
         .into_iter()
         .filter_map(|id| {
             darkroom_db::tags::tag_get_name(&conn, id).ok().flatten().map(|n| (id, n))
@@ -808,12 +819,28 @@ fn detach_tag_from_image(full_path: &str, db_path: &str, tag_id: u32) {
     }
 }
 
+/// Create the tag if needed and attach it to the image at `full_path`
+/// (best-effort; logs faults — parity with `detach_tag_from_image`). An
+/// uncatalogued image is a silent no-op (nothing to attach to).
 fn add_tag_to_image(full_path: &str, db_path: &str, tag_name: &str) {
-    let Ok(conn) = rusqlite::Connection::open(db_path) else { return };
-    let Ok(Some(imgid)) = darkroom_db::image::image_get_id_by_path(&conn, full_path) else { return };
-    // Create tag if it doesn't exist, then attach it
-    if let Ok(Some(tag_id)) = darkroom_db::tags::tag_new(&conn, tag_name) {
-        let _ = darkroom_db::tags::tag_attach(&conn, tag_id, imgid);
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("darkroom: cannot open library db to add tag: {e}"); return; }
+    };
+    let imgid = match darkroom_db::image::image_get_id_by_path(&conn, full_path) {
+        Ok(Some(id)) => id,
+        Ok(None) => return,            // image not in catalog — nothing to attach
+        Err(e) => { eprintln!("darkroom: image lookup failed on tag add: {e}"); return; }
+    };
+    // Create tag if it doesn't exist, then attach it.
+    match darkroom_db::tags::tag_new(&conn, tag_name) {
+        Ok(Some(tag_id)) => {
+            if let Err(e) = darkroom_db::tags::tag_attach(&conn, tag_id, imgid) {
+                eprintln!("darkroom: tag attach failed: {e}");
+            }
+        }
+        Ok(None) => eprintln!("darkroom: could not create or find tag \u{201c}{tag_name}\u{201d}"),
+        Err(e) => eprintln!("darkroom: tag create failed: {e}"),
     }
 }
 
