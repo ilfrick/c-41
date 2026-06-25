@@ -249,6 +249,41 @@ fn save_rating(full_path: &str, db_path: &str, rating: u8) -> rusqlite::Result<(
 
 // ── DB-backed load functions ──────────────────────────────────────────────
 
+/// Hard cap on grid rows per load. Every loader queries `LIMIT GRID_CAP + 1` so a
+/// full page (exactly `GRID_CAP` images) can be told apart from an over-full one
+/// and flagged, rather than silently truncating.
+const GRID_CAP: usize = 2000;
+
+/// Split a loader's fetched rows (queried with `LIMIT GRID_CAP + 1`) into the
+/// rows to display (capped at `GRID_CAP`) and an optional trailing notice shown
+/// when the result was truncated. The notice carries no `/`, so the grid's
+/// selection/activation guards skip it exactly like the empty-state placeholders.
+/// Pure (no GTK) so it can be unit-tested under the display-free discipline.
+fn cap_rows(mut rows: Vec<String>) -> (Vec<String>, Option<String>) {
+    if rows.len() > GRID_CAP {
+        rows.truncate(GRID_CAP);
+        (rows, Some(format!("(showing first {GRID_CAP} — refine your filter)")))
+    } else {
+        (rows, None)
+    }
+}
+
+/// Append a loader's rows to the (freshly-cleared) grid model: cap them, add the
+/// truncation notice if any, and fall back to `empty_placeholder` when nothing
+/// matched. The single place the cap/notice tail lives, shared by every loader.
+fn fill_grid(model: &LighttableModel, rows: Vec<String>, empty_placeholder: &str) {
+    let (rows, notice) = cap_rows(rows);
+    for path in rows {
+        model.append(&path);
+    }
+    if let Some(notice) = notice {
+        model.append(&notice);
+    }
+    if model.n_items() == 0 {
+        model.append(empty_placeholder);
+    }
+}
+
 pub fn lighttable_load_from_db(model: &LighttableModel, db_path: &str) {
     lighttable_load_by_folder(model, db_path, None);
 }
@@ -266,23 +301,23 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
 
     let rows: Vec<String> = match folder {
         Some(f) => {
-            conn.prepare(
+            conn.prepare(&format!(
                 "SELECT f.folder || '/' || i.filename \
                  FROM main.images i \
                  JOIN main.film_rolls f ON f.id = i.film_id \
                  WHERE f.folder = ?1 \
-                 ORDER BY i.filename LIMIT 2000",
+                 ORDER BY i.filename LIMIT {}", GRID_CAP + 1),
             )
             .and_then(|mut s| s.query_map([f], |r| r.get::<_, String>(0))
                 .map(|it| it.flatten().collect()))
             .unwrap_or_default()
         }
         None => {
-            conn.prepare(
+            conn.prepare(&format!(
                 "SELECT f.folder || '/' || i.filename \
                  FROM main.images i \
                  JOIN main.film_rolls f ON f.id = i.film_id \
-                 ORDER BY f.folder, i.filename LIMIT 2000",
+                 ORDER BY f.folder, i.filename LIMIT {}", GRID_CAP + 1),
             )
             .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(0))
                 .map(|it| it.flatten().collect()))
@@ -290,13 +325,7 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
         }
     };
 
-    for path in rows {
-        model.append(&path);
-    }
-
-    if model.n_items() == 0 {
-        model.append("(No images in this collection)");
-    }
+    fill_grid(model, rows, "(No images in this collection)");
 }
 
 /// Filter the lighttable to images whose filename contains `query` (case-insensitive).
@@ -316,23 +345,18 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
     };
     let pattern = format!("%{query}%");
     let rows: Vec<String> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT f.folder || '/' || i.filename \
              FROM main.images i JOIN main.film_rolls f ON f.id = i.film_id \
              WHERE i.filename LIKE ?1 \
-             ORDER BY f.folder, i.filename LIMIT 2000",
+             ORDER BY f.folder, i.filename LIMIT {}", GRID_CAP + 1),
         )
         .and_then(|mut s| {
             s.query_map([pattern.as_str()], |r| r.get::<_, String>(0))
                 .map(|it| it.flatten().collect())
         })
         .unwrap_or_default();
-    for path in rows {
-        model.append(&path);
-    }
-    if model.n_items() == 0 {
-        model.append("(No results)");
-    }
+    fill_grid(model, rows, "(No results)");
 }
 
 /// Filter the lighttable to images tagged with `prefix` **or any hierarchical
@@ -364,14 +388,14 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
     // appear once per matching tag.
     let descendants = format!("{}|%", escape_like(prefix));
     let rows: Vec<String> = match conn
-        .prepare(
+        .prepare(&format!(
             "SELECT DISTINCT f.folder || '/' || i.filename \
              FROM main.images i \
              JOIN main.film_rolls f ON f.id = i.film_id \
              JOIN main.tagged_images ti ON ti.imgid = i.id \
              JOIN data.tags t ON t.id = ti.tagid \
              WHERE t.name = ?1 OR t.name LIKE ?2 ESCAPE '\\' \
-             ORDER BY f.folder, i.filename LIMIT 2000",
+             ORDER BY f.folder, i.filename LIMIT {}", GRID_CAP + 1),
         )
         .and_then(|mut s| {
             s.query_map(rusqlite::params![prefix, descendants], |r| r.get::<_, String>(0))
@@ -383,12 +407,7 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
             Vec::new()
         }
     };
-    for path in rows {
-        model.append(&path);
-    }
-    if model.n_items() == 0 {
-        model.append("(No images with this tag)");
-    }
+    fill_grid(model, rows, "(No images with this tag)");
 }
 
 /// Escape the SQL `LIKE` metacharacters (`%`, `_`) and the escape char itself
@@ -454,7 +473,36 @@ fn open_demo_db() -> rusqlite::Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_like, index_of_path};
+    use super::{cap_rows, escape_like, index_of_path, GRID_CAP};
+
+    fn n_rows(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("/a/{i}.jpg")).collect()
+    }
+
+    #[test]
+    fn cap_rows_under_cap_passes_through_without_notice() {
+        let (rows, notice) = cap_rows(n_rows(3));
+        assert_eq!(rows.len(), 3);
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn cap_rows_exactly_at_cap_has_no_notice() {
+        // A full page is NOT truncation — the +1 fetch is what disambiguates.
+        let (rows, notice) = cap_rows(n_rows(GRID_CAP));
+        assert_eq!(rows.len(), GRID_CAP);
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn cap_rows_over_cap_truncates_and_notices() {
+        // Loaders fetch GRID_CAP + 1; that extra row triggers the notice and is
+        // dropped so the grid still shows exactly GRID_CAP real items.
+        let (rows, notice) = cap_rows(n_rows(GRID_CAP + 1));
+        assert_eq!(rows.len(), GRID_CAP);
+        let notice = notice.expect("over-cap result must carry a notice");
+        assert!(!notice.contains('/'), "notice must be inert (no `/`)");
+    }
 
     #[test]
     fn escape_like_passes_plain_text_through() {
