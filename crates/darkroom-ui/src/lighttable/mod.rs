@@ -335,9 +335,22 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
     }
 }
 
-/// Filter the lighttable to images carrying the tag `tag_id`. Empty result (or a
-/// db without the tag tables, e.g. the demo db) shows a placeholder.
-pub fn lighttable_load_by_tag(model: &LighttableModel, db_path: &str, tag_id: u32) {
+/// Filter the lighttable to images tagged with `prefix` **or any hierarchical
+/// descendant** of it (`prefix|child`, `prefix|child|grandchild`, …). darktable
+/// stores hierarchy as `parent|child` in `data.tags.name`, so a leaf tag's
+/// prefix matches only itself (subsuming the old id-based filter) while a parent
+/// or virtual node gathers its whole subtree. Empty result, or a db without the
+/// tag tables (e.g. the demo db), shows a placeholder.
+///
+/// Matching `prefix` requires `data.tags` (tag names live only there); that is
+/// the same connection-reachability contract the left-panel tag tree already
+/// relies on — the clicked node was produced by `tag_list_with_counts`
+/// (panels::load_tags_with_counts), which queries `data.tags` over the same bare
+/// `Connection::open`, so whenever a clickable node exists this JOIN is reachable
+/// too. If the tag tree is ever re-sourced (e.g. cached), revisit this. `prefix` is
+/// matched literally: its LIKE metacharacters are escaped (see [`escape_like`])
+/// so a tag containing `%`/`_` can't widen the descendant match.
+pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, prefix: &str) {
     while model.n_items() > 0 {
         model.remove(0);
     }
@@ -346,22 +359,27 @@ pub fn lighttable_load_by_tag(model: &LighttableModel, db_path: &str, tag_id: u3
     } else {
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
+    // `prefix` itself (the exact tag) OR `prefix|…` (any descendant). DISTINCT
+    // because an image carrying several tags under `prefix` would otherwise
+    // appear once per matching tag.
+    let descendants = format!("{}|%", escape_like(prefix));
     let rows: Vec<String> = match conn
         .prepare(
-            "SELECT f.folder || '/' || i.filename \
+            "SELECT DISTINCT f.folder || '/' || i.filename \
              FROM main.images i \
              JOIN main.film_rolls f ON f.id = i.film_id \
              JOIN main.tagged_images ti ON ti.imgid = i.id \
-             WHERE ti.tagid = ?1 \
+             JOIN data.tags t ON t.id = ti.tagid \
+             WHERE t.name = ?1 OR t.name LIKE ?2 ESCAPE '\\' \
              ORDER BY f.folder, i.filename LIMIT 2000",
         )
         .and_then(|mut s| {
-            s.query_map([tag_id], |r| r.get::<_, String>(0))
+            s.query_map(rusqlite::params![prefix, descendants], |r| r.get::<_, String>(0))
                 .map(|it| it.flatten().collect())
         }) {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!("darkroom: tag filter query failed (tag {tag_id}): {e}");
+            eprintln!("darkroom: tag-prefix filter query failed (prefix {prefix:?}): {e}");
             Vec::new()
         }
     };
@@ -371,6 +389,13 @@ pub fn lighttable_load_by_tag(model: &LighttableModel, db_path: &str, tag_id: u3
     if model.n_items() == 0 {
         model.append("(No images with this tag)");
     }
+}
+
+/// Escape the SQL `LIKE` metacharacters (`%`, `_`) and the escape char itself
+/// (`\`) in `s`, for use as a literal segment in a `LIKE … ESCAPE '\'` pattern.
+/// Backslash is escaped first so the escapes we add for `%`/`_` aren't re-escaped.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 // ── Selection preservation across reloads ──────────────────────────────────
@@ -429,7 +454,29 @@ fn open_demo_db() -> rusqlite::Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::index_of_path;
+    use super::{escape_like, index_of_path};
+
+    #[test]
+    fn escape_like_passes_plain_text_through() {
+        assert_eq!(escape_like("places"), "places");
+        // The hierarchy separator is not a LIKE metachar, so it survives verbatim
+        // (the `|%` descendant wildcard is appended by the caller, not here).
+        assert_eq!(escape_like("places|Italy"), "places|Italy");
+    }
+
+    #[test]
+    fn escape_like_escapes_metacharacters() {
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like("a_b"), "a\\_b");
+    }
+
+    #[test]
+    fn escape_like_escapes_backslash_first() {
+        // A literal backslash must become `\\` and must not double-escape the
+        // escapes we add for `%`/`_` — order matters.
+        assert_eq!(escape_like("a\\b"), "a\\\\b");
+        assert_eq!(escape_like("a\\%b"), "a\\\\\\%b");
+    }
 
     fn paths() -> Vec<String> {
         ["/a/1.jpg", "/a/2.jpg", "/b/3.jpg"].iter().map(|s| s.to_string()).collect()

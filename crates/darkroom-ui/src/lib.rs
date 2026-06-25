@@ -61,11 +61,12 @@ fn build_main_window(app: &Application) {
     lighttable::lighttable_load_from_db(&lt_model, &db_path);
 
     // ── Panels ─────────────────────────────────────────────────────────────
-    // Shared "currently-filtering tag id" (None = no tag filter). Set by the
-    // left-panel folder/tag clicks and the search/import paths below; read by
-    // the tag-mutation callbacks to decide whether to re-run the grid filter.
-    let active_tag: std::rc::Rc<std::cell::Cell<Option<u32>>> =
-        std::rc::Rc::new(std::cell::Cell::new(None));
+    // Shared "currently-filtering tag prefix" (None = no tag filter): the full
+    // `parent|child` path of the clicked tag-tree node. Set by the left-panel
+    // folder/tag clicks and the search/import paths below; read by the
+    // tag-mutation callbacks to decide whether to re-run the hierarchical filter.
+    let active_tag: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
 
     let left  = panels::LeftPanel::new(&db_path, &lt_model, &active_tag);
     let right = panels::MetadataPanel::new();
@@ -83,9 +84,12 @@ fn build_main_window(app: &Application) {
         let sel = lt_selection.clone();
         let db  = db_path.clone();
         move || {
-            if let Some(id) = at.get() {
+            // Clone the prefix out before the load so the RefCell borrow is
+            // released (the loader doesn't touch active_tag, but keep it tight).
+            let cur = at.borrow().clone();
+            if let Some(prefix) = cur {
                 let prev = lighttable::selected_path(&sel);
-                lighttable::lighttable_load_by_tag(&mdl, &db, id);
+                lighttable::lighttable_load_by_tag_prefix(&mdl, &db, &prefix);
                 lighttable::reselect_path(&sel, prev.as_deref());
             }
         }
@@ -153,7 +157,7 @@ fn build_main_window(app: &Application) {
         let at = active_tag.clone();
         search.connect_search_changed(clone!(@weak lt_model => move |s| {
             let query = s.text().to_string();
-            at.set(None);   // a name search supersedes any tag filter
+            *at.borrow_mut() = None;   // a name search supersedes any tag filter
             lighttable::lighttable_filter_by_name(&lt_model, &db, &query);
         }));
         lt_header.pack_start(&search);
@@ -175,7 +179,7 @@ fn build_main_window(app: &Application) {
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
                 clone!(@weak lt_model, @strong db_inner, @strong at => move || {
-                    at.set(None);   // post-import view shows all images
+                    *at.borrow_mut() = None;   // post-import view shows all images
                     lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
                 toast_inner,
@@ -253,7 +257,7 @@ fn build_main_window(app: &Application) {
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
                 clone!(@weak lt_model, @strong db_inner, @strong at => move || {
-                    at.set(None);   // post-import view shows all images
+                    *at.borrow_mut() = None;   // post-import view shows all images
                     lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
                 toast_inner,

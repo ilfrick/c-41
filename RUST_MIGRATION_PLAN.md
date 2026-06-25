@@ -372,10 +372,23 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    rows for path prefixes with no tag of their own, skips empty/malformed
    segments). Real tags keep their exact-tag click filter + count + rename/delete
    popover UNCHANGED (so `active_tag`/m4-12 is untouched); virtual parents render
-   dim, non-selectable and inert (no count/menu). Known follow-ups: **slice 2 —
-   prefix filtering** so a parent click filters to it + descendants (`name = p OR
-   name LIKE p||'|%'`), extending `active_tag` to track an id-or-prefix; a
-   `with_image_id` helper if a fifth tag op appears.
+   dim, non-selectable and inert (no count/menu). **m4-16** — hierarchical tag
+   prefix filtering (slice 2): clicking any tag-tree node now filters the grid to
+   that tag **plus all descendants**. The new loader
+   `lighttable_load_by_tag_prefix` JOINs `data.tags` and matches `t.name = ?1 OR
+   t.name LIKE ?2 ESCAPE '\'` (`?2 = escape_like(prefix)||'|%'`, `SELECT DISTINCT`),
+   replacing the id-based `lighttable_load_by_tag`; the unit-tested `escape_like`
+   neutralises `%`/`_`/`\` so a tag name can't widen the match. `active_tag`
+   widened `Rc<Cell<Option<u32>>>` → `Rc<RefCell<Option<String>>>` (the full path);
+   virtual parents became activatable (every row encodes its `full_name` in the
+   widget-name, guarded by `!is_empty()` instead of `parse::<u32>()`). The m4-12
+   dangling-delete special-case retired (a path filter has no SQLite id-reuse
+   hazard) — `next_active_tag` + the `active_tag`/`lt_model` `LeftPanel` fields
+   removed; `delete_tag` just refreshes + fires the notify, and the wired reapply
+   re-runs the prefix (surviving descendants stay; deleting the exact filtered-on
+   leaf collapses to the empty placeholder). Known follow-ups: a `… (showing first
+   2000)` affordance now a parent can gather a large subtree; a `with_image_id`
+   helper if a fifth tag op appears.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

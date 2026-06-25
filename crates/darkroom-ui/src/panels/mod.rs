@@ -7,7 +7,7 @@
 use adw::prelude::*;
 use glib::clone;
 use crate::lighttable::{
-    LighttableModel, lighttable_load_by_folder, lighttable_load_by_tag, lighttable_load_from_db,
+    LighttableModel, lighttable_load_by_folder, lighttable_load_by_tag_prefix,
 };
 use darkroom_db;
 
@@ -33,13 +33,6 @@ pub struct LeftPanel {
     tags_header: gtk4::Label,
     tags_sep:    gtk4::Separator,
     db_path:     String,
-    /// Shared "currently-filtering tag id" (None = no tag filter). Kept current
-    /// by the folder/tag click handlers; read by `delete_tag` so deleting the
-    /// filtered-on tag can drop the now-dangling filter and revert to All.
-    active_tag:  std::rc::Rc<std::cell::Cell<Option<u32>>>,
-    /// The lighttable grid model, so `delete_tag` can reload it to "All images"
-    /// when the active tag filter is invalidated.
-    lt_model:    LighttableModel,
     /// Optional notify fired after a library-wide tag mutation here (rename /
     /// delete), so the metadata panel can re-render the current image's chips.
     /// Mirror of `MetadataPanel::on_tags_changed`. Set via `set_on_tags_changed`.
@@ -47,13 +40,14 @@ pub struct LeftPanel {
 }
 
 impl LeftPanel {
-    /// `active_tag` is the shared "currently-filtering tag id" (None = no tag
-    /// filter). The folder/tag click handlers keep it current so a later tag
-    /// mutation can decide whether to re-run the grid filter.
+    /// `active_tag` is the shared "currently-filtering tag prefix" (None = no tag
+    /// filter). It holds a tag's full `parent|child` path; the folder/tag click
+    /// handlers keep it current so a later tag mutation can re-run the same
+    /// hierarchical-prefix grid filter.
     pub fn new(
         db_path: &str,
         lt_model: &LighttableModel,
-        active_tag: &std::rc::Rc<std::cell::Cell<Option<u32>>>,
+        active_tag: &std::rc::Rc<std::cell::RefCell<Option<String>>>,
     ) -> Self {
         let panel = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
@@ -103,7 +97,7 @@ impl LeftPanel {
         let at_folder = active_tag.clone();
         list_box.connect_row_activated(clone!(@weak lt_model, @weak tag_box => move |_, row| {
             tag_box.unselect_all();
-            at_folder.set(None);   // a folder/all view is not a tag filter
+            *at_folder.borrow_mut() = None;   // a folder/all view is not a tag filter
             let folder_filter: Option<String> = row
                 .widget_name()
                 .as_str()
@@ -129,10 +123,13 @@ impl LeftPanel {
         let at_tag = active_tag.clone();
         tag_box.connect_row_activated(clone!(@weak lt_model, @weak list_box => move |_, row| {
             list_box.unselect_all();
-            // The tag id is encoded in the row's widget name (see append_tag_row).
-            if let Ok(tag_id) = row.widget_name().as_str().parse::<u32>() {
-                at_tag.set(Some(tag_id));   // remember the active tag filter
-                lighttable_load_by_tag(&lt_model, &db_tags, tag_id);
+            // The full `parent|child` path is encoded in the row's widget name
+            // (see append_tag_tree_row) for both real and virtual nodes. Clicking
+            // either filters to that tag plus its whole hierarchical subtree.
+            let prefix = row.widget_name().to_string();
+            if !prefix.is_empty() {
+                *at_tag.borrow_mut() = Some(prefix.clone());   // remember the filter
+                lighttable_load_by_tag_prefix(&lt_model, &db_tags, &prefix);
             }
         }));
         content.append(&tag_box);
@@ -151,8 +148,6 @@ impl LeftPanel {
             tags_header,
             tags_sep,
             db_path: db_path.to_string(),
-            active_tag: active_tag.clone(),
-            lt_model: lt_model.clone(),
             on_tags_changed: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         lp.refresh_tags();
@@ -197,12 +192,13 @@ impl LeftPanel {
 
     /// Append one hierarchical tag row, indented by its depth in the `|`-tree.
     ///
-    /// A **real** tag (`row.id` is `Some`) stashes its id in the widget name so
-    /// the activation handler can recover it (click → filter by that tag), shows
-    /// its count, and gets a secondary-click rename/delete popover. A **virtual**
-    /// parent (a path prefix with no tag of its own) is rendered dim and
-    /// non-interactive (no id, no count, no menu) — purely a grouping header;
-    /// filtering a parent by prefix is a later slice.
+    /// Every row stashes its full `parent|child` path in the widget name so the
+    /// activation handler can filter to that path plus its subtree (see the
+    /// `tag_box` row-activated handler in `new`). A **real** tag (`row.id` is
+    /// `Some`) additionally shows its count and gets a secondary-click
+    /// rename/delete popover. A **virtual** parent (a path prefix with no tag of
+    /// its own) is rendered dim and stays count-less and menu-less, but is still
+    /// clickable — activating it filters the grid to its whole subtree.
     fn append_tag_tree_row(&self, row_data: &TagTreeRow) {
         let row = gtk4::ListBoxRow::new();
 
@@ -223,18 +219,22 @@ impl LeftPanel {
             .build();
         hbox.append(&name_lbl);
 
+        // The full `parent|child` path drives prefix filtering on click (real and
+        // virtual rows alike); stash it in the widget name for the activation
+        // handler. flatten_tag_tree never emits an empty `full_name`, so the
+        // handler's non-empty guard always admits a genuine tag row.
+        row.set_widget_name(&row_data.full_name);
+
         let Some(id) = row_data.id else {
-            // Virtual parent: dim, non-selectable, no count, no context menu.
+            // Virtual parent: dim and count-less (a path prefix with no tag of its
+            // own, so nothing to rename/delete), but still clickable — activating
+            // it filters the grid to the whole subtree under this prefix.
             name_lbl.add_css_class("dim-label");
-            row.set_selectable(false);
-            row.set_activatable(false);
             row.set_tooltip_text(Some(&row_data.full_name));
             row.set_child(Some(&hbox));
             self.tag_box.append(&row);
             return;
         };
-
-        row.set_widget_name(&id.to_string());
 
         let count_lbl = gtk4::Label::builder()
             .label(&row_data.count.to_string())
@@ -261,11 +261,9 @@ impl LeftPanel {
         let header_w  = self.tags_header.downgrade();
         let sep_w     = self.tags_sep.downgrade();
         let db        = self.db_path.clone();
-        // The notify Rc, active-tag cell and grid model never reference back at
-        // the left-panel widgets, so capturing them strongly introduces no cycle.
+        // The notify Rc never references back at the left-panel widgets, so
+        // capturing it strongly introduces no cycle.
         let notify     = self.on_tags_changed.clone();
-        let active_tag = self.active_tag.clone();
-        let lt_model   = self.lt_model.clone();
         let name_owned = row_data.full_name.clone();
         let count      = row_data.count;
         let row_w     = row.downgrade();
@@ -277,7 +275,6 @@ impl LeftPanel {
             ) {
                 let lp = LeftPanel {
                     widget, tag_box, tags_header, tags_sep, db_path: db.clone(),
-                    active_tag: active_tag.clone(), lt_model: lt_model.clone(),
                     on_tags_changed: notify.clone(),
                 };
                 lp.show_tag_menu(&row, id, &name_owned, count, x, y);
@@ -398,9 +395,13 @@ impl LeftPanel {
 
     /// Delete a tag and its associations (best-effort; logs faults), then refresh.
     ///
-    /// If the deleted tag is the one currently filtering the grid, the filter is
-    /// now dangling (and its id could later be reused by SQLite) — so we drop it
-    /// and revert the grid to "All images" rather than leave a stale/empty view.
+    /// The active filter is a tag **path** (not an id), so a delete can't leave a
+    /// dangling id-reuse hazard the way the old id-based filter could. We simply
+    /// refresh the tree and fire the change notify: the wired `reapply` re-runs
+    /// the current hierarchical-prefix filter, so deleting a parent keeps its
+    /// surviving descendants on screen, while deleting the exact filtered-on leaf
+    /// collapses to the empty-result placeholder (the user clicks a folder/All to
+    /// leave it).
     fn delete_tag(&self, id: u32) {
         if self.db_path.is_empty() { return; }
         match rusqlite::Connection::open(&self.db_path) {
@@ -411,25 +412,8 @@ impl LeftPanel {
             }
             Err(e) => eprintln!("darkroom: cannot open library db to delete tag: {e}"),
         }
-        let was_active = self.active_tag.get() == Some(id);
-        self.active_tag.set(next_active_tag(self.active_tag.get(), id));
         self.refresh_tags();
-        if was_active {
-            // active_tag is now None, so the on_tags_changed `reapply` below is a
-            // no-op; reload the grid here to surface the full library again.
-            lighttable_load_from_db(&self.lt_model, &self.db_path);
-        }
         self.fire_tags_changed();
-    }
-}
-
-/// Resolve the active tag filter after a tag is deleted: clears it when it
-/// pointed at the just-deleted tag, otherwise leaves it untouched. Kept as a
-/// free function so the (display-bound) `delete_tag` logic has a unit-testable core.
-fn next_active_tag(current: Option<u32>, deleted: u32) -> Option<u32> {
-    match current {
-        Some(id) if id == deleted => None,
-        other => other,
     }
 }
 
@@ -962,21 +946,6 @@ fn format_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn next_active_tag_clears_when_deleted_tag_is_active() {
-        assert_eq!(next_active_tag(Some(5), 5), None);
-    }
-
-    #[test]
-    fn next_active_tag_keeps_unrelated_filter() {
-        assert_eq!(next_active_tag(Some(3), 5), Some(3));
-    }
-
-    #[test]
-    fn next_active_tag_noop_when_no_filter() {
-        assert_eq!(next_active_tag(None, 5), None);
-    }
 
     fn t(id: u32, name: &str, count: i64) -> (u32, String, i64) {
         (id, name.to_string(), count)
