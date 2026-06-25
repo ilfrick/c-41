@@ -365,8 +365,17 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    longer yanks the user back to index 0; if the image left the grid (detached
    the filtered-on tag) the default index-0 selection stands. Scoped to the
    reapply path ONLY — folder/tag/search/import are deliberate view changes where
-   resetting to the first image is expected. Known follow-ups: hierarchical
-   (`a|b`) tags; a `with_image_id` helper if a fifth tag op appears.
+   resetting to the first image is expected. **m4-15** — hierarchical tag display
+   (slice 1 of `a|b` tags): the left-panel Tags list now renders the flat tag
+   list as an indented tree via the pure unit-tested `flatten_tag_tree` (splits
+   names on `|` darktable-style, alphabetises children, synthesises virtual parent
+   rows for path prefixes with no tag of their own, skips empty/malformed
+   segments). Real tags keep their exact-tag click filter + count + rename/delete
+   popover UNCHANGED (so `active_tag`/m4-12 is untouched); virtual parents render
+   dim, non-selectable and inert (no count/menu). Known follow-ups: **slice 2 —
+   prefix filtering** so a parent click filters to it + descendants (`name = p OR
+   name LIKE p||'|%'`), extending `active_tag` to track an id-or-prefix; a
+   `with_image_id` helper if a fifth tag op appears.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

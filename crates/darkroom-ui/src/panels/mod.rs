@@ -185,46 +185,66 @@ impl LeftPanel {
             self.tag_box.remove(&child);
         }
         let tags = load_tags_with_counts(&self.db_path);
-        for (id, name, count) in &tags {
-            self.append_tag_row(*id, name, *count);
+        let rows = flatten_tag_tree(&tags);
+        for r in &rows {
+            self.append_tag_tree_row(r);
         }
-        let has_tags = !tags.is_empty();
+        let has_tags = !rows.is_empty();
         self.tags_header.set_visible(has_tags);
         self.tags_sep.set_visible(has_tags);
         self.tag_box.set_visible(has_tags);
     }
 
-    /// Append a tag row carrying its attached-image count; the tag id is stashed
-    /// in the row's widget name so the activation handler can recover it. A
-    /// secondary (right) click opens a rename/delete context popover.
-    fn append_tag_row(&self, id: u32, name: &str, count: i64) {
+    /// Append one hierarchical tag row, indented by its depth in the `|`-tree.
+    ///
+    /// A **real** tag (`row.id` is `Some`) stashes its id in the widget name so
+    /// the activation handler can recover it (click → filter by that tag), shows
+    /// its count, and gets a secondary-click rename/delete popover. A **virtual**
+    /// parent (a path prefix with no tag of its own) is rendered dim and
+    /// non-interactive (no id, no count, no menu) — purely a grouping header;
+    /// filtering a parent by prefix is a later slice.
+    fn append_tag_tree_row(&self, row_data: &TagTreeRow) {
         let row = gtk4::ListBoxRow::new();
-        row.set_widget_name(&id.to_string());
 
+        // Indent by depth; the base margin matches the old flat rows (12px).
+        let indent = 12 + (row_data.depth as i32) * 16;
         let hbox = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(8)
-            .margin_start(12).margin_end(8)
+            .margin_start(indent).margin_end(8)
             .margin_top(6).margin_bottom(6)
             .build();
 
         let name_lbl = gtk4::Label::builder()
-            .label(name)
+            .label(&row_data.label)
             .halign(gtk4::Align::Start)
             .hexpand(true)
             .ellipsize(gtk4::pango::EllipsizeMode::Middle)
             .build();
         hbox.append(&name_lbl);
 
+        let Some(id) = row_data.id else {
+            // Virtual parent: dim, non-selectable, no count, no context menu.
+            name_lbl.add_css_class("dim-label");
+            row.set_selectable(false);
+            row.set_activatable(false);
+            row.set_tooltip_text(Some(&row_data.full_name));
+            row.set_child(Some(&hbox));
+            self.tag_box.append(&row);
+            return;
+        };
+
+        row.set_widget_name(&id.to_string());
+
         let count_lbl = gtk4::Label::builder()
-            .label(&count.to_string())
+            .label(&row_data.count.to_string())
             .halign(gtk4::Align::End)
             .build();
         count_lbl.add_css_class("dim-label");
         count_lbl.add_css_class("numeric");
         hbox.append(&count_lbl);
 
-        row.set_tooltip_text(Some(name));
+        row.set_tooltip_text(Some(&row_data.full_name));
         row.set_child(Some(&hbox));
 
         // Secondary-click → rename/delete popover. The gesture lives as long as
@@ -232,6 +252,8 @@ impl LeftPanel {
         // avoid a strong-ref cycle (tag_box→row→gesture→LeftPanel→tag_box) it
         // captures only weak refs + the db path and reconstructs a transient
         // `LeftPanel` on demand. Removed rows then free cleanly on refresh.
+        // The popover operates on the FULL tag path (rename/delete are per-tag,
+        // hierarchy-unaware in this slice — segment-only rename is a later step).
         let gesture = gtk4::GestureClick::new();
         gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
         let widget_w  = self.widget.downgrade();
@@ -244,7 +266,8 @@ impl LeftPanel {
         let notify     = self.on_tags_changed.clone();
         let active_tag = self.active_tag.clone();
         let lt_model   = self.lt_model.clone();
-        let name_owned = name.to_string();
+        let name_owned = row_data.full_name.clone();
+        let count      = row_data.count;
         let row_w     = row.downgrade();
         gesture.connect_pressed(move |g, _, x, y| {
             g.set_state(gtk4::EventSequenceState::Claimed);
@@ -408,6 +431,78 @@ fn next_active_tag(current: Option<u32>, deleted: u32) -> Option<u32> {
         Some(id) if id == deleted => None,
         other => other,
     }
+}
+
+/// One row of the hierarchical tag display, in pre-order render order.
+/// `depth` is the nesting level (0 = top), `label` the path segment shown, and
+/// `full_name` the cumulative `a|b|c` path (used by the rename/delete popover and
+/// later by prefix filtering). `id`/`count` are set only for a **real** tag; a
+/// **virtual** parent (a path prefix with no tag of its own) has `id: None` and
+/// `count: 0` — descendant counts are deliberately NOT summed, since an image
+/// carrying two sibling tags would be double-counted.
+#[derive(Debug, Clone, PartialEq)]
+struct TagTreeRow {
+    depth:     usize,
+    label:     String,
+    full_name: String,
+    id:        Option<u32>,
+    count:     i64,
+}
+
+/// Build the pre-order hierarchical display rows from the flat `(id, name, count)`
+/// tag list. Names use `|` as the hierarchy separator (darktable convention);
+/// children are alphabetised, and intermediate path segments with no tag of their
+/// own become virtual parent rows so a `places|Italy` tag still shows a `places`
+/// group even when `places` itself is untagged.
+fn flatten_tag_tree(tags: &[(u32, String, i64)]) -> Vec<TagTreeRow> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Node {
+        children: BTreeMap<String, Node>,
+        tag:      Option<(u32, i64)>,   // (id, count) when a real tag ends here
+    }
+
+    let mut root = Node::default();
+    for (id, name, count) in tags {
+        // Skip empty segments so a malformed name ("a|", "a||b", "|a") collapses
+        // to its meaningful ancestry rather than rendering a blank-label row —
+        // which would otherwise carry a working count + rename/delete popover on
+        // a tag the user can't see. A name that is all separators yields nothing.
+        let mut segs = name.split('|').filter(|s| !s.is_empty()).peekable();
+        if segs.peek().is_none() {
+            continue;
+        }
+        let mut cur = &mut root;
+        while let Some(seg) = segs.next() {
+            cur = cur.children.entry(seg.to_string()).or_default();
+            if segs.peek().is_none() {
+                // Safe last-write: `data.tags.name` is UNIQUE, so no two distinct
+                // ids ever resolve to the same full path (no real-tag clobber).
+                cur.tag = Some((*id, *count));
+            }
+        }
+    }
+
+    fn dfs(node: &Node, depth: usize, prefix: &str, out: &mut Vec<TagTreeRow>) {
+        for (seg, child) in &node.children {
+            let full_name = if prefix.is_empty() {
+                seg.clone()
+            } else {
+                format!("{prefix}|{seg}")
+            };
+            let (id, count) = match child.tag {
+                Some((id, count)) => (Some(id), count),
+                None => (None, 0),
+            };
+            out.push(TagTreeRow { depth, label: seg.clone(), full_name: full_name.clone(), id, count });
+            dfs(child, depth + 1, &full_name, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    dfs(&root, 0, "", &mut out);
+    out
 }
 
 /// A section heading label styled like the panel headers.
@@ -881,5 +976,71 @@ mod tests {
     #[test]
     fn next_active_tag_noop_when_no_filter() {
         assert_eq!(next_active_tag(None, 5), None);
+    }
+
+    fn t(id: u32, name: &str, count: i64) -> (u32, String, i64) {
+        (id, name.to_string(), count)
+    }
+
+    #[test]
+    fn flatten_flat_tags_are_depth_zero_reals() {
+        let rows = flatten_tag_tree(&[t(1, "landscape", 4), t(2, "portrait", 2)]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], TagTreeRow { depth: 0, label: "landscape".into(), full_name: "landscape".into(), id: Some(1), count: 4 });
+        assert_eq!(rows[1], TagTreeRow { depth: 0, label: "portrait".into(), full_name: "portrait".into(), id: Some(2), count: 2 });
+    }
+
+    #[test]
+    fn flatten_synthesises_virtual_parent() {
+        // "places" is not itself a tag — it must appear as a virtual group.
+        let rows = flatten_tag_tree(&[t(7, "places|Italy", 3)]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], TagTreeRow { depth: 0, label: "places".into(), full_name: "places".into(), id: None, count: 0 });
+        assert_eq!(rows[1], TagTreeRow { depth: 1, label: "Italy".into(), full_name: "places|Italy".into(), id: Some(7), count: 3 });
+    }
+
+    #[test]
+    fn flatten_real_parent_keeps_its_id_and_count() {
+        // "places" is BOTH a tag and a parent.
+        let rows = flatten_tag_tree(&[t(1, "places", 5), t(2, "places|Italy", 3)]);
+        assert_eq!(rows[0], TagTreeRow { depth: 0, label: "places".into(), full_name: "places".into(), id: Some(1), count: 5 });
+        assert_eq!(rows[1], TagTreeRow { depth: 1, label: "Italy".into(), full_name: "places|Italy".into(), id: Some(2), count: 3 });
+    }
+
+    #[test]
+    fn flatten_orders_children_alphabetically_per_level() {
+        // Input order is irrelevant; siblings sort, subtrees stay grouped.
+        let rows = flatten_tag_tree(&[t(3, "b", 1), t(1, "a|z", 1), t(2, "a|m", 1)]);
+        let shape: Vec<(usize, &str)> = rows.iter().map(|r| (r.depth, r.label.as_str())).collect();
+        assert_eq!(shape, vec![(0, "a"), (1, "m"), (1, "z"), (0, "b")]);
+    }
+
+    #[test]
+    fn flatten_handles_three_levels() {
+        let rows = flatten_tag_tree(&[t(1, "a|b|c", 9)]);
+        let shape: Vec<(usize, &str, Option<u32>)> =
+            rows.iter().map(|r| (r.depth, r.label.as_str(), r.id)).collect();
+        assert_eq!(shape, vec![(0, "a", None), (1, "b", None), (2, "c", Some(1))]);
+    }
+
+    #[test]
+    fn flatten_collapses_trailing_separator() {
+        // "a|" must render as a normal `a` tag, not `a > (blank)`.
+        let rows = flatten_tag_tree(&[t(1, "a|", 2)]);
+        assert_eq!(rows, vec![TagTreeRow { depth: 0, label: "a".into(), full_name: "a".into(), id: Some(1), count: 2 }]);
+    }
+
+    #[test]
+    fn flatten_collapses_double_and_leading_separator() {
+        let rows = flatten_tag_tree(&[t(1, "a||b", 1), t(2, "|c", 1)]);
+        let shape: Vec<(usize, &str, Option<u32>)> =
+            rows.iter().map(|r| (r.depth, r.label.as_str(), r.id)).collect();
+        assert_eq!(shape, vec![(0, "a", None), (1, "b", Some(1)), (0, "c", Some(2))]);
+    }
+
+    #[test]
+    fn flatten_drops_all_separator_name() {
+        // A name with no representable segment contributes nothing.
+        assert!(flatten_tag_tree(&[t(1, "|", 1), t(2, "", 1)]).is_empty());
     }
 }
