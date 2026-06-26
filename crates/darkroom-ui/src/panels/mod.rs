@@ -27,9 +27,15 @@ use darkroom_db;
 #[derive(Clone)]
 pub struct LeftPanel {
     pub widget:  gtk4::Box,
+    /// Film-roll (folder) list box, incl. the "All images" row. Held so
+    /// [`LeftPanel::clear_filter_highlights`] can drop a stale highlight.
+    list_box:    gtk4::ListBox,
     /// Stable tag list box; only its rows are rebuilt on refresh so the
     /// folder↔tag selection-coordination handlers (bound once) stay valid.
     tag_box:     gtk4::ListBox,
+    /// Colour-label filter list box (five fixed rows). Held for the same
+    /// stale-highlight reason as `list_box`.
+    color_box:   gtk4::ListBox,
     /// Section chrome whose visibility tracks whether any user tags exist.
     tags_header: gtk4::Label,
     tags_sep:    gtk4::Separator,
@@ -191,7 +197,9 @@ impl LeftPanel {
 
         let lp = Self {
             widget: panel,
+            list_box,
             tag_box,
+            color_box,
             tags_header,
             tags_sep,
             db_path: db_path.to_string(),
@@ -199,6 +207,23 @@ impl LeftPanel {
         };
         lp.refresh_tags();
         lp
+    }
+
+    /// Drop the selection highlight from all three filter boxes (folders / tags /
+    /// colours). Called from lib.rs when something *outside* the left panel takes
+    /// over the grid — a name search or an import/reset — so a highlighted row
+    /// doesn't outlive the filter it stood for. The in-panel folder/tag/colour
+    /// handlers already cross-clear each other on click; this covers the paths
+    /// that can't reach the boxes (they only hold the shared `active_tag`).
+    ///
+    /// Invariant: call this exactly on the paths that *supersede* the active
+    /// filter (i.e. null `active_tag`). Do NOT call it from a path that reloads
+    /// the grid while *preserving* the filter (e.g. `reapply_tag_filter`), or the
+    /// highlight would be wrongly cleared from a filter that's still in force.
+    pub fn clear_filter_highlights(&self) {
+        self.list_box.unselect_all();
+        self.tag_box.unselect_all();
+        self.color_box.unselect_all();
     }
 
     /// Register a callback fired after a tag is renamed or deleted here, so the
@@ -304,7 +329,9 @@ impl LeftPanel {
         let gesture = gtk4::GestureClick::new();
         gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
         let widget_w  = self.widget.downgrade();
+        let list_box_w  = self.list_box.downgrade();
         let tag_box_w = self.tag_box.downgrade();
+        let color_box_w = self.color_box.downgrade();
         let header_w  = self.tags_header.downgrade();
         let sep_w     = self.tags_sep.downgrade();
         let db        = self.db_path.clone();
@@ -314,15 +341,24 @@ impl LeftPanel {
         let name_owned = row_data.full_name.clone();
         let count      = row_data.count;
         let row_w     = row.downgrade();
+        // NOTE: this reconstructs a transient `LeftPanel` purely to call the
+        // `&self` method `show_tag_menu` (which only touches the tag fields), so it
+        // must supply every field — incl. `list_box`/`color_box` the menu ignores.
+        // A cleaner future cleanup is to make `show_tag_menu` a free fn over just
+        // the bits it needs; until then we keep the weak-ref reconstruction whole.
         gesture.connect_pressed(move |g, _, x, y| {
             g.set_state(gtk4::EventSequenceState::Claimed);
-            if let (Some(widget), Some(tag_box), Some(tags_header), Some(tags_sep), Some(row)) = (
-                widget_w.upgrade(), tag_box_w.upgrade(), header_w.upgrade(),
-                sep_w.upgrade(), row_w.upgrade(),
+            if let (
+                Some(widget), Some(list_box), Some(tag_box), Some(color_box),
+                Some(tags_header), Some(tags_sep), Some(row),
+            ) = (
+                widget_w.upgrade(), list_box_w.upgrade(), tag_box_w.upgrade(),
+                color_box_w.upgrade(), header_w.upgrade(), sep_w.upgrade(),
+                row_w.upgrade(),
             ) {
                 let lp = LeftPanel {
-                    widget, tag_box, tags_header, tags_sep, db_path: db.clone(),
-                    on_tags_changed: notify.clone(),
+                    widget, list_box, tag_box, color_box, tags_header, tags_sep,
+                    db_path: db.clone(), on_tags_changed: notify.clone(),
                 };
                 lp.show_tag_menu(&row, id, &name_owned, count, x, y);
             }

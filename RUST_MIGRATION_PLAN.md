@@ -461,6 +461,31 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    filter but can't reach the boxes to drop their highlight — pre-existing for
    `tag_box`, now also `color_box`; clean fix is a `LeftPanel::clear_filter_
    highlights()`. ui 100 tests.
+   **m4-22** — `LeftPanel::clear_filter_highlights()` (DONE). Closes the m4-21
+   carry-forward: a method that `unselect_all`s the folder / tag / colour boxes,
+   wired into the three lib.rs grid-takeover paths (name-search, import button,
+   import action) which clear `active_tag` but couldn't reach the boxes. Stored the
+   `list_box` + `color_box` handles as `LeftPanel` fields (only `tag_box` was). The
+   **supersede invariant** (architect): call it exactly on paths that null
+   `active_tag`; NOT from a preserve-filter reload like `reapply_tag_filter`.
+   Collateral: the `append_tag_tree_row` secondary-click hack reconstructs a
+   transient `LeftPanel` from weak upgrades to call `&self show_tag_menu`, so it now
+   captures two more weak refs the menu ignores — deferred clean fix is making
+   `show_tag_menu` a free fn. Architect SHIP. ui 100 tests, clippy unchanged.
+
+   **Candidate next increments after m4-22** (recorded so they survive a context
+   clear — the colour-label arc m4-19/20/21 is otherwise complete):
+   - **Colour-label keyboard shortcuts** (darktable F1–F5): an accelerator per
+     colour that toggles the label on the *selected* grid image and repaints that
+     cell's dots. Non-trivial: the cell is a recycled `GridView` item, so repainting
+     just the touched cell (vs. a full reload) needs care — see
+     `reference_gtk_signallistitemfactory_recycling`.
+   - **Show colour labels in the darkroom (single-image) view**, mirroring the
+     star rating already shown there.
+   - **Multi-colour filter** (OR/AND a colour mask) instead of the single-colour
+     row — would extend `lighttable_load_by_color` to take a mask + combine mode.
+   - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
+     tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

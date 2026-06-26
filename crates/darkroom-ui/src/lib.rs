@@ -155,8 +155,10 @@ fn build_main_window(app: &Application) {
             .build();
         let db = db_path.clone();
         let at = active_tag.clone();
+        let lp = left.clone();
         search.connect_search_changed(clone!(@weak lt_model => move |s| {
             let query = s.text().to_string();
+            lp.clear_filter_highlights();   // a name search supersedes any filter highlight
             *at.borrow_mut() = None;   // a name search supersedes any tag filter
             lighttable::lighttable_filter_by_name(&lt_model, &db, &query);
         }));
@@ -172,13 +174,16 @@ fn build_main_window(app: &Application) {
         let db         = db_path.clone();
         let toast_fn   = make_toast.clone();
         let at         = active_tag.clone();
+        let lp         = left.clone();
         btn.connect_clicked(clone!(@weak window, @weak lt_model => move |_| {
             let db_inner    = db.clone();
             let toast_inner = toast_fn.clone();
+            let lp_inner    = lp.clone();
             dialogs::show_import_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
                 clone!(@weak lt_model, @strong db_inner, @strong at => move || {
+                    lp_inner.clear_filter_highlights();   // post-import view shows all images
                     *at.borrow_mut() = None;   // post-import view shows all images
                     lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
@@ -249,14 +254,17 @@ fn build_main_window(app: &Application) {
         let db         = db_path.clone();
         let toast_fn   = make_toast.clone();
         let at         = active_tag.clone();
+        let lp         = left.clone();
         let import_act = gtk4::gio::SimpleAction::new("import", None);
         import_act.connect_activate(clone!(@weak window, @weak lt_model => move |_, _| {
             let db_inner    = db.clone();
             let toast_inner = toast_fn.clone();
+            let lp_inner    = lp.clone();
             dialogs::show_import_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
                 clone!(@weak lt_model, @strong db_inner, @strong at => move || {
+                    lp_inner.clear_filter_highlights();   // post-import view shows all images
                     *at.borrow_mut() = None;   // post-import view shows all images
                     lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
