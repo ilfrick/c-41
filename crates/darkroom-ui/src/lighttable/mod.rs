@@ -318,7 +318,9 @@ fn save_rating(full_path: &str, db_path: &str, rating: u8) -> rusqlite::Result<(
 // ── Colour-label helpers ──────────────────────────────────────────────────
 
 /// Number of colour labels, mirroring `darkroom_db::colorlabels::COLOR_COUNT`.
-const COLOR_COUNT: u8 = darkroom_db::colorlabels::COLOR_COUNT;
+/// `pub(crate)` so the left-panel colour filter (`panels`) can iterate the same
+/// colour domain and render matching swatches without redefining it.
+pub(crate) const COLOR_COUNT: u8 = darkroom_db::colorlabels::COLOR_COUNT;
 
 /// Display hex per colour index (0 red, 1 yellow, 2 green, 3 blue, 4 purple).
 const COLOR_HEX: [&str; COLOR_COUNT as usize] =
@@ -329,7 +331,9 @@ const COLOR_DIM_HEX: &str = "#777777";
 
 /// Pango markup for one colour dot: its own hue when `lit`, dim grey otherwise.
 /// Pure (no GTK) so it's unit-testable; an out-of-range `idx` falls back to grey.
-fn color_dot_markup(idx: u8, lit: bool) -> String {
+/// `pub(crate)` so the left-panel colour filter reuses the exact same hues as the
+/// grid cells (one source of truth for colour rendering across `darkroom-ui`).
+pub(crate) fn color_dot_markup(idx: u8, lit: bool) -> String {
     let hex = match COLOR_HEX.get(idx as usize) {
         Some(h) if lit => h,
         _ => COLOR_DIM_HEX,
@@ -579,6 +583,44 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
         }
     };
     fill_grid(model, rows, "(No images with this tag)");
+}
+
+/// Reload the grid to show only images carrying colour label `color` (0 red,
+/// 1 yellow, 2 green, 3 blue, 4 purple). Mirrors [`lighttable_load_by_tag_prefix`]
+/// but keyed on `main.color_labels` instead of the tag tree. `color` is the same
+/// `0..COLOR_COUNT` domain the DAO and grid dots use; an out-of-range value simply
+/// matches no rows (the table never holds such a `color` — see
+/// `darkroom_db::colorlabels`). The `color_labels` `UNIQUE(imgid, color)` index
+/// means an image matches at most once, so no `DISTINCT` is needed.
+pub fn lighttable_load_by_color(model: &LighttableModel, db_path: &str, color: u8) {
+    while model.n_items() > 0 {
+        model.remove(0);
+    }
+    let conn = if db_path.is_empty() {
+        open_demo_db()
+    } else {
+        rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
+    };
+    let rows: Vec<String> = match conn
+        .prepare(&format!(
+            "SELECT f.folder || '/' || i.filename \
+             FROM main.images i \
+             JOIN main.film_rolls f ON f.id = i.film_id \
+             JOIN main.color_labels cl ON cl.imgid = i.id \
+             WHERE cl.color = ?1 \
+             ORDER BY f.folder, i.filename LIMIT {}", GRID_CAP + 1),
+        )
+        .and_then(|mut s| {
+            s.query_map(rusqlite::params![color], |r| r.get::<_, String>(0))
+                .map(|it| it.flatten().collect())
+        }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("darkroom: colour-label filter query failed (color {color}): {e}");
+            Vec::new()
+        }
+    };
+    fill_grid(model, rows, "(No images with this colour label)");
 }
 
 /// Escape the SQL `LIKE` metacharacters (`%`, `_`) and the escape char itself

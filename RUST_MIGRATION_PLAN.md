@@ -442,6 +442,25 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    on resolve if the name no longer matches — so a slow read can't smear image A
    onto a cell recycled to image B (or to a placeholder). Display-bound wiring
    untested by discipline; the pure markup core has 3 unit tests. ui 98 tests.
+   **m4-21** — colour-label filtering in the left panel. A new "Colours" section
+   adds a third `SelectionMode::Single` ListBox (`color_box`) with five fixed rows
+   (one per label, each a `color_dot_markup(idx, true)` swatch + name from a pure
+   unit-tested `color_filter_name`); clicking a row runs the new
+   `lighttable_load_by_color` loader (JOIN `main.color_labels` `WHERE cl.color=?1`,
+   the GRID_CAP+1/`fill_grid` contract, no `DISTINCT` thanks to the
+   `UNIQUE(imgid,color)` index). The three filter boxes (folders / tags / colours)
+   are mutually exclusive: activating any one `unselect_all`s the other two and
+   clears the shared `active_tag`, so no stale highlight implies an AND that isn't
+   running. The colour filter is deliberately **not** wired into the
+   `reapply_tag_filter` machinery (it clears `active_tag` to `None`) — toggling a
+   label on a grid cell while colour-filtered doesn't auto-refresh the grid, the
+   same non-reactivity a folder filter already has, avoiding a colour-changed
+   callback up to lib.rs. `color_dot_markup`/`COLOR_COUNT` were promoted to
+   `pub(crate)` so panel and grid share one source of truth for the hues. Known
+   carry-forward (TODO in code): a name-search/import in lib.rs clears the active
+   filter but can't reach the boxes to drop their highlight — pre-existing for
+   `tag_box`, now also `color_box`; clean fix is a `LeftPanel::clear_filter_
+   highlights()`. ui 100 tests.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

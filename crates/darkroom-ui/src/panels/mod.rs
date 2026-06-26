@@ -7,7 +7,8 @@
 use adw::prelude::*;
 use glib::clone;
 use crate::lighttable::{
-    LighttableModel, lighttable_load_by_folder, lighttable_load_by_tag_prefix,
+    LighttableModel, lighttable_load_by_color, lighttable_load_by_folder,
+    lighttable_load_by_tag_prefix, color_dot_markup, COLOR_COUNT,
 };
 use darkroom_db;
 
@@ -92,11 +93,26 @@ impl LeftPanel {
             .build();
         tag_box.add_css_class("navigation-sidebar");
 
+        // Colour-label filter box, built up-front for the same reason as `tag_box`:
+        // the folder/tag/colour boxes are three mutually-exclusive Single-selection
+        // lists, so activating any one clears the highlight in the other two (no
+        // stale highlight implying an AND that isn't running).
+        // TODO(m4-2x): a name-search or import in lib.rs clears the active filter
+        // but can't reach these boxes to drop their highlight (no widget handle),
+        // so the highlighted row can outlive its filter. Pre-existing for tag_box;
+        // the clean fix is a `LeftPanel::clear_filter_highlights()` lib.rs can call.
+        let color_box = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .build();
+        color_box.add_css_class("navigation-sidebar");
+
         // Activate: reload lighttable with folder filter, dropping any tag filter.
         let db = db_path.to_string();
         let at_folder = active_tag.clone();
-        list_box.connect_row_activated(clone!(@weak lt_model, @weak tag_box => move |_, row| {
+        list_box.connect_row_activated(
+            clone!(@weak lt_model, @weak tag_box, @weak color_box => move |_, row| {
             tag_box.unselect_all();
+            color_box.unselect_all();
             *at_folder.borrow_mut() = None;   // a folder/all view is not a tag filter
             let folder_filter: Option<String> = row
                 .widget_name()
@@ -111,6 +127,35 @@ impl LeftPanel {
         }));
         content.append(&list_box);
 
+        // ── Colours (colour-label filter) ─────────────────────────────────
+        // A fixed list of the five colour labels; clicking one shows only images
+        // carrying that label. Unlike Tags this section is always present (the
+        // colour domain is fixed, not data-driven), so no refresh/visibility
+        // toggle is needed.
+        content.append(&section_header("Colours"));
+        content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        for idx in 0..COLOR_COUNT {
+            append_color_row(&color_box, idx);
+        }
+        let db_colors = db_path.to_string();
+        let at_color = active_tag.clone();
+        color_box.connect_row_activated(
+            clone!(@weak lt_model, @weak list_box, @weak tag_box => move |_, row| {
+            list_box.unselect_all();
+            tag_box.unselect_all();
+            // A colour view is not a tag filter; clear the active tag so a later
+            // tag mutation doesn't re-run the tag-prefix loader over this grid.
+            *at_color.borrow_mut() = None;
+            match row.widget_name().parse::<u8>() {
+                Ok(color) => lighttable_load_by_color(&lt_model, &db_colors, color),
+                // Unreachable from `append_color_row` (it writes a plain `idx`),
+                // but log rather than silently no-op if that encoding ever drifts.
+                Err(e) => eprintln!(
+                    "darkroom: colour row has unparseable name {:?}: {e}", row.widget_name()),
+            }
+        }));
+        content.append(&color_box);
+
         // ── Tags ──────────────────────────────────────────────────────────
         // The header/separator/box are always present; their visibility tracks
         // whether the library has any user tags (toggled in `refresh_tags`).
@@ -121,8 +166,10 @@ impl LeftPanel {
 
         let db_tags = db_path.to_string();
         let at_tag = active_tag.clone();
-        tag_box.connect_row_activated(clone!(@weak lt_model, @weak list_box => move |_, row| {
+        tag_box.connect_row_activated(
+            clone!(@weak lt_model, @weak list_box, @weak color_box => move |_, row| {
             list_box.unselect_all();
+            color_box.unselect_all();
             // The full `parent|child` path is encoded in the row's widget name
             // (see append_tag_tree_row) for both real and virtual nodes. Clicking
             // either filters to that tag plus its whole hierarchical subtree.
@@ -610,6 +657,46 @@ fn append_roll_row(list_box: &gtk4::ListBox, label: &str, count: i64, folder: Op
     list_box.append(&row);
 }
 
+/// Human-readable names for the colour-label filter rows, indexed by colour
+/// (0 red … 4 purple) to match `darkroom_db::colorlabels` and the grid dots.
+const COLOR_NAMES: [&str; COLOR_COUNT as usize] =
+    ["Red", "Yellow", "Green", "Blue", "Purple"];
+
+/// Name for colour index `idx`, or `None` if out of range. Pure (no GTK) so the
+/// index↔name mapping has a unit-testable seam under the display-free discipline.
+fn color_filter_name(idx: u8) -> Option<&'static str> {
+    COLOR_NAMES.get(idx as usize).copied()
+}
+
+/// Append one colour-label filter row: a coloured dot plus its name. The colour
+/// index is stashed in the row's widget name so the activation handler (in `new`)
+/// can parse it back and load the matching images.
+fn append_color_row(list_box: &gtk4::ListBox, idx: u8) {
+    let row = gtk4::ListBoxRow::new();
+    row.set_widget_name(&idx.to_string());
+
+    let hbox = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(12).margin_end(8)
+        .margin_top(6).margin_bottom(6)
+        .build();
+
+    let dot = gtk4::Label::new(None);
+    dot.set_markup(&color_dot_markup(idx, true));
+    hbox.append(&dot);
+
+    let name_lbl = gtk4::Label::builder()
+        .label(color_filter_name(idx).unwrap_or(""))
+        .halign(gtk4::Align::Start)
+        .hexpand(true)
+        .build();
+    hbox.append(&name_lbl);
+
+    row.set_child(Some(&hbox));
+    list_box.append(&row);
+}
+
 fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {
     let conn = if db_path.is_empty() {
         match rusqlite::Connection::open_in_memory() {
@@ -1036,6 +1123,24 @@ mod tests {
         assert_eq!(respliced_tag_path("places|Italy", "Italy|north"), None);
         assert_eq!(respliced_tag_path("places|Italy", "a|b"), None);
         assert_eq!(respliced_tag_path("landscape", "a|b"), None);
+    }
+
+    #[test]
+    fn color_filter_name_covers_every_label_in_range() {
+        // Every colour in the DAO's domain has a name; the array length tracks
+        // COLOR_COUNT so the two can't silently drift apart.
+        assert_eq!(COLOR_NAMES.len(), COLOR_COUNT as usize);
+        assert_eq!(color_filter_name(0), Some("Red"));
+        assert_eq!(color_filter_name(4), Some("Purple"));
+        for idx in 0..COLOR_COUNT {
+            assert!(color_filter_name(idx).is_some(), "idx {idx} unnamed");
+        }
+    }
+
+    #[test]
+    fn color_filter_name_is_none_out_of_range() {
+        assert_eq!(color_filter_name(COLOR_COUNT), None);
+        assert_eq!(color_filter_name(99), None);
     }
 
     #[test]
