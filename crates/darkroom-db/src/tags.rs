@@ -123,13 +123,53 @@ pub fn tag_get_name(conn: &Connection, tagid: TagId) -> rusqlite::Result<Option<
     .optional()
 }
 
-/// Rename a tag.
+/// Rename a single tag by id (flat, no hierarchy awareness). The UI renames via
+/// [`tag_rename_subtree`] instead, so a parent rename carries its descendants and
+/// can't orphan them; this primitive is kept for callers that genuinely want to
+/// touch exactly one row.
 pub fn tag_rename(conn: &Connection, tagid: TagId, new_name: &str) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE data.tags SET name = ?1 WHERE id = ?2",
         params![new_name, tagid],
     )?;
     Ok(())
+}
+
+/// Escape the SQL `LIKE` metacharacters (`%`, `_`) and the escape char (`\`) in
+/// `s`, for use as a literal segment in a `LIKE … ESCAPE '\'` pattern. Backslash
+/// is escaped first so the escapes added for `%`/`_` aren't re-escaped.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// Rename a tag **and all its hierarchical descendants** by rewriting the `old`
+/// path prefix to `new`. darktable stores hierarchy as `parent|child` in
+/// `data.tags.name`, so renaming `places|Italy` → `places|Italia` must also move
+/// `places|Italy|Rome` → `places|Italia|Rome`. The leading `old` segment of each
+/// matched name is replaced with `new`, preserving the descendant suffix.
+///
+/// `substr` uses SQLite's `length(?1)` (character count), NOT Rust's byte length,
+/// so multi-byte tag names (`Café|…`) rewrite at the correct offset. The whole
+/// `UPDATE` is one atomic statement: if any rewritten name collides with the
+/// `UNIQUE` `data.tags.name` index (the destination path already exists) the
+/// statement rolls back entirely and the error surfaces — no partial rename and
+/// no silent merge (merging into an existing tag is a later concern). Returns the
+/// number of tag rows rewritten.
+///
+/// The caller must pass a non-empty, `|`-delimited `old` path (the UI builds it
+/// from real tag segments, never empty/trailing-`|`) — an empty `old` would make
+/// the LIKE pattern `|%` and match unrelated names. The UI also forbids a `|` in
+/// the renamed segment, so the rewrite cannot map a row onto another row it is
+/// itself moving (a self-collision); see `respliced_tag_path`.
+pub fn tag_rename_subtree(conn: &Connection, old: &str, new: &str) -> rusqlite::Result<usize> {
+    let descendants = format!("{}|%", escape_like(old));
+    let n = conn.execute(
+        "UPDATE data.tags \
+         SET name = ?2 || substr(name, length(?1) + 1) \
+         WHERE name = ?1 OR name LIKE ?3 ESCAPE '\\'",
+        params![old, new, descendants],
+    )?;
+    Ok(n)
 }
 
 /// Attach a tag to an image. Returns `true` if the row was newly inserted.
@@ -275,6 +315,92 @@ mod tests {
         let id = tag_new(&db, "old").unwrap().unwrap();
         tag_rename(&db, id, "new").unwrap();
         assert_eq!(tag_get_name(&db, id).unwrap().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn rename_subtree_rewrites_node_and_descendants() {
+        let db = open_test_db();
+        let parent = tag_new(&db, "places|Italy").unwrap().unwrap();
+        let child  = tag_new(&db, "places|Italy|Rome").unwrap().unwrap();
+        let n = tag_rename_subtree(&db, "places|Italy", "places|Italia").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(tag_get_name(&db, parent).unwrap().as_deref(), Some("places|Italia"));
+        assert_eq!(tag_get_name(&db, child).unwrap().as_deref(),  Some("places|Italia|Rome"));
+    }
+
+    #[test]
+    fn rename_subtree_leaves_siblings_and_prefixes_untouched() {
+        let db = open_test_db();
+        // `places|Italian` shares the textual prefix "places|Italy" only up to a
+        // point — it must NOT match (the LIKE anchors on `places|Italy|`), and the
+        // sibling `places|France` is independent.
+        let italy   = tag_new(&db, "places|Italy").unwrap().unwrap();
+        let italian = tag_new(&db, "places|Italian").unwrap().unwrap();
+        let france  = tag_new(&db, "places|France").unwrap().unwrap();
+        let n = tag_rename_subtree(&db, "places|Italy", "places|Italia").unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(tag_get_name(&db, italy).unwrap().as_deref(),   Some("places|Italia"));
+        assert_eq!(tag_get_name(&db, italian).unwrap().as_deref(), Some("places|Italian"));
+        assert_eq!(tag_get_name(&db, france).unwrap().as_deref(),  Some("places|France"));
+    }
+
+    #[test]
+    fn rename_subtree_handles_multibyte_prefix() {
+        let db = open_test_db();
+        // `length()` is SQLite's character count, so the substr offset is correct
+        // even when the prefix has multi-byte UTF-8 (would be wrong with byte len).
+        let parent = tag_new(&db, "Café").unwrap().unwrap();
+        let child  = tag_new(&db, "Café|latte").unwrap().unwrap();
+        let n = tag_rename_subtree(&db, "Café", "Coffee").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(tag_get_name(&db, parent).unwrap().as_deref(), Some("Coffee"));
+        assert_eq!(tag_get_name(&db, child).unwrap().as_deref(),  Some("Coffee|latte"));
+    }
+
+    #[test]
+    fn rename_subtree_rolls_back_on_unique_collision() {
+        let db = open_test_db();
+        // Renaming `a|x` → `a|y` collides with the existing `a|y`; the UNIQUE index
+        // must abort the whole UPDATE, leaving every name unchanged.
+        let ax = tag_new(&db, "a|x").unwrap().unwrap();
+        let ay = tag_new(&db, "a|y").unwrap().unwrap();
+        assert!(tag_rename_subtree(&db, "a|x", "a|y").is_err());
+        assert_eq!(tag_get_name(&db, ax).unwrap().as_deref(), Some("a|x"));
+        assert_eq!(tag_get_name(&db, ay).unwrap().as_deref(), Some("a|y"));
+    }
+
+    #[test]
+    fn rename_subtree_deepening_collision_aborts_atomically() {
+        let db = open_test_db();
+        // The UI forbids a `|` in the segment so this can't be reached from the
+        // popover, but the DAO must still behave: deepening `a|b` → `a|b|b` maps
+        // `a|b`→`a|b|b` and the existing `a|b|b`→`a|b|b|b`. SQLite checks the
+        // UNIQUE index per row in unspecified order, so if `a|b` is written before
+        // the existing `a|b|b` is moved aside it transiently duplicates and the
+        // statement ABORTs. Pin that it's all-or-nothing — never a partial rename.
+        let ab  = tag_new(&db, "a|b").unwrap().unwrap();
+        let abb = tag_new(&db, "a|b|b").unwrap().unwrap();
+        let res = tag_rename_subtree(&db, "a|b", "a|b|b");
+        match res {
+            Ok(n) => {
+                assert_eq!(n, 2);
+                assert_eq!(tag_get_name(&db, ab).unwrap().as_deref(),  Some("a|b|b"));
+                assert_eq!(tag_get_name(&db, abb).unwrap().as_deref(), Some("a|b|b|b"));
+            }
+            Err(_) => {
+                // Aborted: both rows must be exactly as they started.
+                assert_eq!(tag_get_name(&db, ab).unwrap().as_deref(),  Some("a|b"));
+                assert_eq!(tag_get_name(&db, abb).unwrap().as_deref(), Some("a|b|b"));
+            }
+        }
+    }
+
+    #[test]
+    fn escape_like_escapes_metachars_backslash_first() {
+        // Backslash MUST be escaped before `%`/`_` so their added escapes aren't
+        // themselves re-escaped (a reorder would silently double-escape).
+        assert_eq!(escape_like("a%_\\b"), "a\\%\\_\\\\b");
+        assert_eq!(escape_like("plain"), "plain");
     }
 
     #[test]

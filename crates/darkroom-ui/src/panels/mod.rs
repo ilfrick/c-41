@@ -297,8 +297,19 @@ impl LeftPanel {
             .margin_start(6).margin_end(6).margin_top(6).margin_bottom(6)
             .build();
 
-        let entry = gtk4::Entry::builder().text(name).build();
+        // Edit only this node's own segment (the last `|` component); the parent
+        // prefix is fixed and the whole subtree moves with it (see do_rename).
+        let segment = name.rsplit_once('|').map(|(_, s)| s).unwrap_or(name);
+        let entry = gtk4::Entry::builder().text(segment).build();
         vbox.append(&entry);
+
+        let hint = gtk4::Label::builder()
+            .label("Renames this tag and any sub-tags")
+            .halign(gtk4::Align::Start)
+            .build();
+        hint.add_css_class("dim-label");
+        hint.add_css_class("caption");
+        vbox.append(&hint);
 
         let rename_btn = gtk4::Button::with_label("Rename");
         rename_btn.add_css_class("suggested-action");
@@ -319,14 +330,16 @@ impl LeftPanel {
             let lp = self.clone();
             let pop = popover.clone();
             let entry = entry.clone();
-            let original = name.to_string();
+            let old_full = name.to_string();
             move || {
                 // Read the entry, then dismiss the popover BEFORE refresh_tags
                 // removes its parent row — so no orphaned subtree exists mid-call.
-                let new_name = entry.text().trim().to_string();
+                // respliced_tag_path re-attaches the fixed parent prefix and
+                // returns None for a blank/unchanged segment (no needless write).
+                let new_segment = entry.text().to_string();
                 pop.popdown();
-                if !new_name.is_empty() && new_name != original {
-                    lp.rename_tag(id, &new_name);
+                if let Some(new_full) = respliced_tag_path(&old_full, &new_segment) {
+                    lp.rename_tag_subtree(&old_full, &new_full);
                 }
             }
         };
@@ -356,13 +369,15 @@ impl LeftPanel {
         popover.popup();
     }
 
-    /// Rename a tag library-wide (best-effort; a UNIQUE-name clash logs and
-    /// leaves the tag unchanged), then refresh the list.
-    fn rename_tag(&self, id: u32, new_name: &str) {
+    /// Rename a tag's segment library-wide, rewriting the whole `old_full`→
+    /// `new_full` subtree so descendants move with it (best-effort; a UNIQUE-name
+    /// clash with an existing destination path logs and — because the underlying
+    /// UPDATE is atomic — leaves every tag unchanged), then refresh the list.
+    fn rename_tag_subtree(&self, old_full: &str, new_full: &str) {
         if self.db_path.is_empty() { return; }
         match rusqlite::Connection::open(&self.db_path) {
             Ok(conn) => {
-                if let Err(e) = darkroom_db::tags::tag_rename(&conn, id, new_name) {
+                if let Err(e) = darkroom_db::tags::tag_rename_subtree(&conn, old_full, new_full) {
                     eprintln!("darkroom: tag rename failed (duplicate name?): {e}");
                 }
             }
@@ -415,6 +430,35 @@ impl LeftPanel {
         self.refresh_tags();
         self.fire_tags_changed();
     }
+}
+
+/// Compute the new full tag path when a node's own segment is renamed in place.
+/// `full_name` is the node's `parent|child` path; `new_segment` is the user's
+/// replacement for the LAST segment (trimmed here). Returns the rewritten full
+/// path, or `None` when the edit is a no-op — blank input or the segment is
+/// unchanged — so the caller skips the DB write. A `new_segment` containing the
+/// `|` hierarchy separator is rejected (also `None`): this popover renames a node
+/// in place, so re-parenting/deepening the tree via a typed `|` is out of scope —
+/// and forbidding it also rules out a rewrite that could self-collide against a
+/// row it is itself moving. The parent prefix is preserved verbatim; a top-level
+/// tag (no `|`) just becomes `new_segment`. Kept as a free function so the
+/// (display-bound) rename popover has a unit-testable core.
+fn respliced_tag_path(full_name: &str, new_segment: &str) -> Option<String> {
+    let new_segment = new_segment.trim();
+    if new_segment.is_empty() || new_segment.contains('|') {
+        return None;
+    }
+    let (parent, segment) = match full_name.rsplit_once('|') {
+        Some((p, s)) => (Some(p), s),
+        None => (None, full_name),
+    };
+    if new_segment == segment {
+        return None;
+    }
+    Some(match parent {
+        Some(p) => format!("{p}|{new_segment}"),
+        None => new_segment.to_string(),
+    })
 }
 
 /// One row of the hierarchical tag display, in pre-order render order.
@@ -949,6 +993,49 @@ mod tests {
 
     fn t(id: u32, name: &str, count: i64) -> (u32, String, i64) {
         (id, name.to_string(), count)
+    }
+
+    #[test]
+    fn resplice_rewrites_last_segment_keeping_parent() {
+        assert_eq!(
+            respliced_tag_path("places|Italy", "Italia").as_deref(),
+            Some("places|Italia"),
+        );
+        assert_eq!(
+            respliced_tag_path("a|b|c", "z").as_deref(),
+            Some("a|b|z"),
+        );
+    }
+
+    #[test]
+    fn resplice_top_level_tag_has_no_parent() {
+        assert_eq!(respliced_tag_path("landscape", "scenery").as_deref(), Some("scenery"));
+    }
+
+    #[test]
+    fn resplice_is_noop_when_blank_or_unchanged() {
+        assert_eq!(respliced_tag_path("places|Italy", "Italy"), None);
+        assert_eq!(respliced_tag_path("places|Italy", "   "), None);
+        assert_eq!(respliced_tag_path("places|Italy", ""), None);
+        // Trimmed input equal to the current segment is still a no-op.
+        assert_eq!(respliced_tag_path("places|Italy", "  Italy  "), None);
+    }
+
+    #[test]
+    fn resplice_trims_input() {
+        assert_eq!(
+            respliced_tag_path("places|Italy", "  Italia  ").as_deref(),
+            Some("places|Italia"),
+        );
+    }
+
+    #[test]
+    fn resplice_rejects_pipe_in_segment() {
+        // A typed `|` would re-parent/deepen the tree (out of scope for an
+        // in-place segment rename) and could let the rewrite self-collide.
+        assert_eq!(respliced_tag_path("places|Italy", "Italy|north"), None);
+        assert_eq!(respliced_tag_path("places|Italy", "a|b"), None);
+        assert_eq!(respliced_tag_path("landscape", "a|b"), None);
     }
 
     #[test]

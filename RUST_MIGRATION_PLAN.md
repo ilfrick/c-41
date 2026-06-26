@@ -394,9 +394,24 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    unit-tested `cap_rows` (truncate + trailing notice "(showing first 2000 —
    refine your filter)") and the shared `fill_grid` tail (capped rows + notice +
    empty placeholder). The notice carries no `/`, so the grid's
-   selection/activation/export guards skip it like the empty-state rows. Known
-   follow-ups: segment-only rename in the hierarchy; a `with_image_id` helper if
-   a fifth tag op appears.
+   selection/activation/export guards skip it like the empty-state rows. **m4-18**
+   — segment-only hierarchical rename. The rename popover used to edit the full
+   `parent|child` path and call an id-based single-row rename, which orphaned a
+   parent's descendants (rename `places` and `places|Italy` dangled). Now the
+   popover pre-fills only the node's own last segment (with a "Renames this tag
+   and any sub-tags" caption); the pure `respliced_tag_path` re-attaches the fixed
+   parent prefix (rejecting blank, unchanged, or a `|`-containing segment — the
+   last would re-parent/deepen the tree and could let the rewrite self-collide),
+   and `darkroom_db::tags::tag_rename_subtree` rewrites the node **plus every
+   descendant** in one atomic `UPDATE` (`SET name = ?new || substr(name,
+   length(?old)+1)` over `name = ?old OR name LIKE ?old||'|%'`). `length()` is
+   SQLite's char count so multi-byte prefixes rewrite at the right offset; the
+   `|`-anchored LIKE excludes look-alikes (`places|Italian`); a UNIQUE-name clash
+   ABORTs the whole statement (no partial rename, no merge) and is logged
+   best-effort. NB: this is a destructive op with **no undo** (the C side still
+   owns undo) — flagged for when undo lands in Rust. Known follow-ups: surface a
+   collision to the user (this panel has no toast access; metadata panel does);
+   tag merge-on-collision; a `with_image_id` helper if a fifth tag op appears.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
