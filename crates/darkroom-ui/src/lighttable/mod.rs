@@ -1,7 +1,10 @@
-//! Lighttable view -- async thumbnail grid + star ratings.
+//! Lighttable view -- async thumbnail grid + star ratings + colour labels.
 //!
 //! Phase 3-ui-8: each cell has a 5-star rating row that reads/writes
 //! the rating from/to darkroom-db asynchronously.
+//! Phase 3-m4-20: each cell also has a 5-dot colour-label row (red/yellow/
+//! green/blue/purple); clicking a dot toggles that label via the
+//! `darkroom_db::colorlabels` DAO, resolving the image id by path.
 
 use adw::prelude::*;
 use gtk4::{GridView, ListItem, ScrolledWindow, SignalListItemFactory, SingleSelection};
@@ -53,9 +56,22 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
             stars_box.append(&star);
         }
 
+        // Colour-label row: 5 filled-circle Labels, coloured via Pango markup.
+        let colors_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(2)
+            .halign(gtk4::Align::Center)
+            .build();
+        for idx in 0..COLOR_COUNT {
+            let dot = gtk4::Label::new(None);
+            dot.set_markup(&color_dot_markup(idx, false));
+            colors_box.append(&dot);
+        }
+
         vbox.append(&thumb);
         vbox.append(&label);
         vbox.append(&stars_box);
+        vbox.append(&colors_box);
         item.set_child(Some(&vbox));
     });
 
@@ -69,6 +85,8 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
             .unwrap_or_else(|| gtk4::Label::new(None));
         let stars_box  = nth_child(&vbox, 2).and_downcast::<gtk4::Box>()
             .unwrap_or_else(|| gtk4::Box::new(gtk4::Orientation::Horizontal, 0));
+        let colors_box = nth_child(&vbox, 3).and_downcast::<gtk4::Box>()
+            .unwrap_or_else(|| gtk4::Box::new(gtk4::Orientation::Horizontal, 0));
 
         let string_obj = item.item().and_downcast::<gtk4::StringObject>().unwrap();
         let full_path  = string_obj.string().to_string();
@@ -78,8 +96,22 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
         label.set_label(&filename);
         thumb.set_paintable(gtk4::gdk::Paintable::NONE);
 
+        // Stamp each async-painted widget with the identity it's now bound to,
+        // UNCONDITIONALLY — including placeholder rows. GTK recycles cells: a cell
+        // can be rebound (even to a placeholder) while an earlier async read for
+        // the PREVIOUS path is still in flight. Each task re-checks the widget's
+        // name on resolve and bails if it no longer matches, so a slow read can't
+        // smear image A onto image B — nor re-wire an A-path gesture onto a cell
+        // that has since become a placeholder. Stamping must precede the
+        // placeholder early-return below, or the stale name would survive and the
+        // in-flight read would still match and paint/wire.
+        thumb.set_widget_name(&full_path);
+        stars_box.set_widget_name(&full_path);
+        colors_box.set_widget_name(&full_path);
+
         if !full_path.contains('/') {
             set_stars(&stars_box, 0);
+            set_color_dots(&colors_box, 0);
             return;
         }
 
@@ -88,6 +120,7 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
             let path = full_path.clone();
             let bytes = gio::spawn_blocking(move || std::fs::read(&path).ok())
                 .await.ok().flatten();
+            if thumb.widget_name() != full_path { return; } // cell rebound mid-read
             if let Some(data) = bytes {
                 let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
                 let _ = loader.write(&data);
@@ -110,10 +143,26 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
             let db2  = db.clone();
             let rating = gio::spawn_blocking(move || query_rating(&path, &db2))
                 .await.ok().flatten().unwrap_or(0);
+            if stars_box.widget_name() != fp { return; } // cell rebound mid-read
             set_stars(&stars_box, rating);
 
-            // Wire star click handlers (only once — remove then re-add)
+            // Re-wire the star click handlers for THIS bind. bind() fires on every
+            // cell recycle, so wire_star_clicks strips the prior gestures first —
+            // otherwise a recycled cell accumulates one stale-path gesture per bind.
             wire_star_clicks(&stars_box, fp, db);
+        }));
+
+        // Async colour-label load + click wiring (mirrors the rating block).
+        let db_c = db_for_bind.clone();
+        let fp_c = string_obj.string().to_string();
+        glib::spawn_future_local(clone!(@weak colors_box => async move {
+            let path = fp_c.clone();
+            let db2  = db_c.clone();
+            let mask = gio::spawn_blocking(move || query_color_labels(&path, &db2))
+                .await.unwrap_or(0);
+            if colors_box.widget_name() != fp_c { return; } // cell rebound mid-read
+            set_color_dots(&colors_box, mask);
+            wire_color_clicks(&colors_box, fp_c, db_c);
         }));
     });
 
@@ -126,6 +175,9 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
             }
             if let Some(stars) = nth_child(&vbox, 2).and_downcast::<gtk4::Box>() {
                 set_stars(&stars, 0);
+            }
+            if let Some(colors) = nth_child(&vbox, 3).and_downcast::<gtk4::Box>() {
+                set_color_dots(&colors, 0);
             }
         }
     });
@@ -181,7 +233,26 @@ fn set_stars(stars_box: &gtk4::Box, rating: u8) {
     }
 }
 
-/// Attach GestureClick to each star so clicking star k sets rating k.
+/// Remove every `GestureClick` previously attached to `w`. `connect_bind` fires
+/// on every cell recycle and the wire_* helpers run inside it, so without this a
+/// single recycled label accumulates one gesture per bind — each carrying a
+/// now-stale path — and one user click fans out into N writes. Stripping first
+/// keeps exactly one live gesture (the current bind's) per label.
+fn clear_click_gestures(w: &gtk4::Widget) {
+    let controllers = w.observe_controllers();
+    let mut stale = Vec::new();
+    for i in 0..controllers.n_items() {
+        if let Some(g) = controllers.item(i).and_downcast::<gtk4::GestureClick>() {
+            stale.push(g);
+        }
+    }
+    for g in stale {
+        w.remove_controller(&g);
+    }
+}
+
+/// Attach GestureClick to each star so clicking star k sets rating k. Strips the
+/// prior bind's gestures first (see `clear_click_gestures`).
 fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path: String) {
     let mut child = stars_box.first_child();
     let mut k = 0u8;
@@ -189,10 +260,7 @@ fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path: String) {
         k += 1;
         let pos = k;
         if let Some(lbl) = w.downcast_ref::<gtk4::Label>() {
-            // Remove any existing gesture so we don't double-attach
-            // (gtk4 doesn't expose a way to remove by type, so we just add;
-            //  in practice wire_star_clicks is only called once per bind cycle
-            //  after the async rating query)
+            clear_click_gestures(lbl.upcast_ref());
             let gesture = gtk4::GestureClick::new();
             let sb  = stars_box.clone();
             let fp  = full_path.clone();
@@ -245,6 +313,109 @@ fn save_rating(full_path: &str, db_path: &str, rating: u8) -> rusqlite::Result<(
         rusqlite::params![bits, folder, filename],
     )?;
     Ok(())
+}
+
+// ── Colour-label helpers ──────────────────────────────────────────────────
+
+/// Number of colour labels, mirroring `darkroom_db::colorlabels::COLOR_COUNT`.
+const COLOR_COUNT: u8 = darkroom_db::colorlabels::COLOR_COUNT;
+
+/// Display hex per colour index (0 red, 1 yellow, 2 green, 3 blue, 4 purple).
+const COLOR_HEX: [&str; COLOR_COUNT as usize] =
+    ["#e74c3c", "#f1c40f", "#27ae60", "#3498db", "#9b59b6"];
+
+/// Grey used for an unassigned (unlit) dot.
+const COLOR_DIM_HEX: &str = "#777777";
+
+/// Pango markup for one colour dot: its own hue when `lit`, dim grey otherwise.
+/// Pure (no GTK) so it's unit-testable; an out-of-range `idx` falls back to grey.
+fn color_dot_markup(idx: u8, lit: bool) -> String {
+    let hex = match COLOR_HEX.get(idx as usize) {
+        Some(h) if lit => h,
+        _ => COLOR_DIM_HEX,
+    };
+    format!("<span foreground=\"{hex}\">\u{25cf}</span>") // ●
+}
+
+/// Repaint the dot row from a 5-bit colour-label mask (bit `c` = colour `c`).
+fn set_color_dots(colors_box: &gtk4::Box, mask: u8) {
+    let mut child = colors_box.first_child();
+    let mut idx = 0u8;
+    while let Some(w) = child {
+        if let Some(lbl) = w.downcast_ref::<gtk4::Label>() {
+            lbl.set_markup(&color_dot_markup(idx, mask & (1 << idx) != 0));
+            idx += 1;
+        }
+        child = w.next_sibling();
+    }
+}
+
+/// Attach a GestureClick to each dot so clicking colour `c` toggles that label
+/// and repaints the row from the resulting mask (see `wire_star_clicks` for the
+/// once-per-bind-cycle rationale).
+fn wire_color_clicks(colors_box: &gtk4::Box, full_path: String, db_path: String) {
+    let mut child = colors_box.first_child();
+    let mut idx = 0u8;
+    while let Some(w) = child {
+        if let Some(lbl) = w.downcast_ref::<gtk4::Label>() {
+            clear_click_gestures(lbl.upcast_ref());
+            let color = idx;
+            let gesture = gtk4::GestureClick::new();
+            let cb = colors_box.clone();
+            let fp = full_path.clone();
+            let db = db_path.clone();
+            gesture.connect_pressed(move |_, _, _, _| {
+                let cb2 = cb.clone();
+                let fp2 = fp.clone();
+                let db2 = db.clone();
+                glib::spawn_future_local(async move {
+                    let path = fp2.clone();
+                    let mask = gio::spawn_blocking(move || toggle_color_label(&fp2, &db2, color))
+                        .await.unwrap_or(0);
+                    // Skip the repaint if the cell was recycled while the toggle ran.
+                    if cb2.widget_name() == path {
+                        set_color_dots(&cb2, mask);
+                    }
+                });
+            });
+            lbl.add_controller(gesture);
+            idx += 1;
+        }
+        child = w.next_sibling();
+    }
+}
+
+/// Read an image's colour-label mask by path. Returns 0 for the demo/empty db, an
+/// unresolvable path, or any DB error (the dots simply show unlit).
+fn query_color_labels(full_path: &str, db_path: &str) -> u8 {
+    if db_path.is_empty() { return 0; }
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let imgid = match darkroom_db::image::image_get_id_by_path(&conn, full_path) {
+        Ok(Some(id)) => id,
+        _ => return 0,
+    };
+    darkroom_db::colorlabels::color_labels_get(&conn, imgid).unwrap_or(0)
+}
+
+/// Toggle one colour label for an image (by path) and return the resulting mask
+/// so the caller can repaint. A no-op returning 0 if the path can't be resolved.
+fn toggle_color_label(full_path: &str, db_path: &str, color: u8) -> u8 {
+    if db_path.is_empty() { return 0; }
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let imgid = match darkroom_db::image::image_get_id_by_path(&conn, full_path) {
+        Ok(Some(id)) => id,
+        _ => return 0,
+    };
+    if let Err(e) = darkroom_db::colorlabels::color_label_toggle(&conn, imgid, color) {
+        eprintln!("darkroom: colour-label toggle failed: {e}");
+    }
+    darkroom_db::colorlabels::color_labels_get(&conn, imgid).unwrap_or(0)
 }
 
 // ── DB-backed load functions ──────────────────────────────────────────────
@@ -473,7 +644,8 @@ fn open_demo_db() -> rusqlite::Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_rows, escape_like, index_of_path, GRID_CAP};
+    use super::{cap_rows, color_dot_markup, escape_like, index_of_path,
+                COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
 
     fn n_rows(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("/a/{i}.jpg")).collect()
@@ -545,5 +717,29 @@ mod tests {
     #[test]
     fn index_of_path_none_in_empty_grid() {
         assert_eq!(index_of_path(&[], "/a/1.jpg"), None);
+    }
+
+    #[test]
+    fn color_dot_lit_uses_its_own_hue() {
+        for idx in 0..COLOR_COUNT {
+            let m = color_dot_markup(idx, true);
+            assert!(m.contains(COLOR_HEX[idx as usize]), "idx {idx}: {m}");
+            assert!(m.contains('\u{25cf}'));
+        }
+    }
+
+    #[test]
+    fn color_dot_unlit_is_dim_grey() {
+        for idx in 0..COLOR_COUNT {
+            let m = color_dot_markup(idx, false);
+            assert!(m.contains(COLOR_DIM_HEX), "idx {idx}: {m}");
+        }
+    }
+
+    #[test]
+    fn color_dot_out_of_range_falls_back_to_grey() {
+        // Even "lit", an index past the palette can't panic and shows grey.
+        assert!(color_dot_markup(COLOR_COUNT, true).contains(COLOR_DIM_HEX));
+        assert!(color_dot_markup(99, true).contains(COLOR_DIM_HEX));
     }
 }

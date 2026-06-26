@@ -425,6 +425,23 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    overflow; `_remove_all` clears one image. 8 unit tests (in-memory fixture). The
    UI consumer (a colour-dot row per lighttable cell, click-to-toggle, resolving
    imgid via the existing `image_get_id_by_path`) is the next slice (m4-20).
+   **m4-20** — colour labels in the lighttable. Each grid cell gains a 5-dot row
+   below the star row; dots render via a pure unit-tested `color_dot_markup(idx,
+   lit)` (Pango `<span foreground>●</span>` — own hue when set, dim grey when not,
+   out-of-range→grey, no markup-injection surface since only fixed hex constants
+   are interpolated). Clicking a dot toggles that label off-thread
+   (`gio::spawn_blocking` → `color_label_toggle`) and repaints from the returned
+   mask. **GTK cell-recycling correctness** (architect-caught, fixed for the star
+   row too): (1) the wire_* helpers run inside `connect_bind`, which fires on every
+   recycle, so they now `clear_click_gestures` (strip prior `GestureClick`s via
+   `observe_controllers`) before adding one — else a cell accumulated one
+   stale-path gesture per bind and one click fanned out into N writes (far worse
+   for the *relative* colour toggle than the *absolute* star set); (2) every
+   async-painted widget is stamped with its bound path via `set_widget_name`
+   (unconditionally, before the placeholder early-return) and each async read bails
+   on resolve if the name no longer matches — so a slow read can't smear image A
+   onto a cell recycled to image B (or to a placeholder). Display-bound wiring
+   untested by discipline; the pure markup core has 3 unit tests. ui 98 tests.
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
