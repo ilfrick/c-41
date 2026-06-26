@@ -473,13 +473,26 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    captures two more weak refs the menu ignores — deferred clean fix is making
    `show_tag_menu` a free fn. Architect SHIP. ui 100 tests, clippy unchanged.
 
-   **Candidate next increments after m4-22** (recorded so they survive a context
-   clear — the colour-label arc m4-19/20/21 is otherwise complete):
-   - **Colour-label keyboard shortcuts** (darktable F1–F5): an accelerator per
-     colour that toggles the label on the *selected* grid image and repaints that
-     cell's dots. Non-trivial: the cell is a recycled `GridView` item, so repainting
-     just the touched cell (vs. a full reload) needs care — see
-     `reference_gtk_signallistitemfactory_recycling`.
+   **m4-23** — colour-label keyboard shortcuts (darktable F1–F5). An
+   `EventControllerKey` on the `GridView` maps plain F1..F5 → colour 0..4 and
+   toggles that label on the *selected* image, repainting just the touched cell's
+   dot row in place (no full reload — scroll position and other cells' in-flight
+   async loads are untouched). Pieces: pure `fkey_to_color` seam (unit-tested,
+   display-free); `toggle_selected_color` (selected_path → off-thread DB toggle →
+   in-place repaint); `repaint_color_dots_for_path` → `find_color_box_for_path`, a
+   DFS of the grid's realized cells. The keyboard path holds no `colors_box` ref
+   (unlike `wire_color_clicks`), so it locates the row by the bind-time
+   `widget_name` stamp. Architect nit (SHIP-WITH-NITS): that stamp is shared by a
+   cell's thumb/stars/colours and grid-path uniqueness is only an *assumption*
+   (`index_of_path`), so the finder now requires BOTH thumb AND colour row to carry
+   `path`; cross-cell uniqueness still rests on the loaders' distinct rows, worst
+   case a self-healing transient repaint, DB write always correct. Controller on
+   the grid scopes it to lighttable focus (not the darkroom page / search entry);
+   Ctrl/Alt + F-key propagate. ui 102 tests, clippy unchanged. See
+   `reference_gtk_signallistitemfactory_recycling`.
+
+   **Candidate next increments after m4-23** (recorded so they survive a context
+   clear — the colour-label arc m4-19/20/21/23 is otherwise complete):
    - **Show colour labels in the darkroom (single-image) view**, mirroring the
      star rating already shown there.
    - **Multi-colour filter** (OR/AND a colour mask) instead of the single-colour

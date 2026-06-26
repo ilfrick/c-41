@@ -232,7 +232,7 @@ fn build_main_window(app: &Application) {
     let nav = adw::NavigationView::new();
     nav.push(&lt_page);
 
-    // Double-click → darkroom page
+    // Double-click → darkroom page; F1–F5 → toggle colour label on selection.
     {
         let scroll_ref = scroll.downcast_ref::<gtk4::ScrolledWindow>().unwrap();
         if let Some(grid) = scroll_ref.child().and_downcast::<gtk4::GridView>() {
@@ -245,6 +245,28 @@ fn build_main_window(app: &Application) {
                     nav.push(&darkroom::darkroom_page(&path, &db_path));
                 }
             }));
+
+            // Colour-label keyboard shortcuts (darktable F1–F5): plain F1..F5
+            // toggle colour label 0..4 on the selected grid image and repaint that
+            // cell's dot row in place. The controller lives on the grid, so it only
+            // fires when the lighttable has focus — not the darkroom page, and not
+            // while the user is typing in the search entry. Modifier combos
+            // (Ctrl/Alt + F-key) are left to propagate so they can't be mistaken
+            // for a colour toggle.
+            let key = gtk4::EventControllerKey::new();
+            let sel = lt_selection.clone();
+            let db  = db_path.clone();
+            key.connect_key_pressed(clone!(@weak grid => @default-return glib::Propagation::Proceed, move |_, keyval, _, state| {
+                if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK) {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(color) = lighttable::fkey_to_color(keyval) else {
+                    return glib::Propagation::Proceed;
+                };
+                lighttable::toggle_selected_color(&grid, &sel, &db, color);
+                glib::Propagation::Stop
+            }));
+            grid.add_controller(key);
         }
     }
 

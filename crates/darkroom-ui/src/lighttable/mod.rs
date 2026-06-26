@@ -404,6 +404,99 @@ fn query_color_labels(full_path: &str, db_path: &str) -> u8 {
     darkroom_db::colorlabels::color_labels_get(&conn, imgid).unwrap_or(0)
 }
 
+/// Map a function key F1–F5 to its colour-label index (0–4, matching darktable's
+/// lighttable accelerators: red/yellow/green/blue/purple), or `None` for any other
+/// key. Pure (no GTK realization needed — `gdk::Key` constants are plain keyvals)
+/// so the keyboard handler's mapping is unit-testable under the display-free
+/// discipline; the toggle + repaint it drives is GTK-bound and tested by Docker.
+pub(crate) fn fkey_to_color(keyval: gtk4::gdk::Key) -> Option<u8> {
+    match keyval {
+        gtk4::gdk::Key::F1 => Some(0),
+        gtk4::gdk::Key::F2 => Some(1),
+        gtk4::gdk::Key::F3 => Some(2),
+        gtk4::gdk::Key::F4 => Some(3),
+        gtk4::gdk::Key::F5 => Some(4),
+        _ => None,
+    }
+}
+
+/// Toggle colour label `color` on the grid's currently-selected image and repaint
+/// that one cell's dot row in place (no full reload, so scroll position and the
+/// other cells' in-flight async loads are untouched). No-op when nothing real is
+/// selected (a placeholder row carries no `/`, so `selected_path` returns `None`).
+///
+/// The DB write runs off the main thread; the in-place repaint then targets the
+/// realized cell still bound to `path` — matched exactly like `wire_color_clicks`,
+/// except the keyboard path holds no `colors_box` reference, so it must *find* the
+/// row among the grid's cells (see [`repaint_color_dots_for_path`]). If the cell
+/// was recycled or scrolled off-screen by the time the toggle resolves, the
+/// repaint is a no-op and the next bind paints the new mask from the DB.
+pub fn toggle_selected_color(
+    grid: &GridView,
+    selection: &SingleSelection,
+    db_path: &str,
+    color: u8,
+) {
+    let Some(path) = selected_path(selection) else { return };
+    let db = db_path.to_string();
+    glib::spawn_future_local(clone!(@weak grid => async move {
+        let p   = path.clone();
+        let db2 = db.clone();
+        let mask = gio::spawn_blocking(move || toggle_color_label(&p, &db2, color))
+            .await.unwrap_or(0);
+        repaint_color_dots_for_path(&grid, &path, mask);
+    }));
+}
+
+/// Repaint the colour-dot row bound to `path` among the grid's *realized* cells,
+/// from `mask`. The keyboard toggle (unlike the per-dot click handlers) holds no
+/// reference to the cell's `colors_box`, so it locates the row here. Cells are
+/// recycled, so we match BOTH the bound identity (`widget_name == path`) and the
+/// structural slot (4th child of a `Picture`-led cell vbox) — `stars_box` carries
+/// the same name, so name alone is ambiguous. No-op if the image isn't realized
+/// (off-screen); the next bind paints it from the DB.
+fn repaint_color_dots_for_path(grid: &GridView, path: &str, mask: u8) {
+    if let Some(colors) = find_color_box_for_path(grid.upcast_ref::<gtk4::Widget>(), path) {
+        set_color_dots(&colors, mask);
+    }
+}
+
+/// Depth-first search of `root`'s descendants for the colour-dot `Box` of the cell
+/// currently bound to `path`. A cell vbox is recognised by its first child being
+/// the thumbnail `Picture`; its 4th child (index 3) is the colour row. Returns the
+/// first match, or `None` if no realized cell is showing `path`.
+///
+/// `widget_name` is the bind-time stamp and is shared by the cell's thumb/stars/
+/// colour widgets, so we require BOTH the thumb AND the colour row to carry `path`
+/// — a single stale stamp (a cell mid-recycle, where the bind hasn't re-stamped
+/// every child yet) can't then mis-target a neighbouring cell. Cross-*cell*
+/// uniqueness still rests on grid paths being distinct, the same assumption
+/// [`index_of_path`] documents; the loaders' joins yield distinct `folder/filename`
+/// rows today, so at most one realized cell carries a given `path`. Worst case if
+/// that ever breaks is a transient repaint of a duplicate's twin that self-heals
+/// on its next bind — the DB write (the source of truth) is unaffected.
+fn find_color_box_for_path(root: &gtk4::Widget, path: &str) -> Option<gtk4::Box> {
+    let mut child = root.first_child();
+    while let Some(w) = child {
+        if let Some(vbox) = w.downcast_ref::<gtk4::Box>() {
+            if let Some(thumb) = vbox.first_child().and_downcast::<gtk4::Picture>() {
+                if thumb.widget_name().as_str() == path {
+                    if let Some(colors) = nth_child(vbox, 3).and_downcast::<gtk4::Box>() {
+                        if colors.widget_name().as_str() == path {
+                            return Some(colors);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(found) = find_color_box_for_path(&w, path) {
+            return Some(found);
+        }
+        child = w.next_sibling();
+    }
+    None
+}
+
 /// Toggle one colour label for an image (by path) and return the resulting mask
 /// so the caller can repaint. A no-op returning 0 if the path can't be resolved.
 fn toggle_color_label(full_path: &str, db_path: &str, color: u8) -> u8 {
@@ -686,7 +779,7 @@ fn open_demo_db() -> rusqlite::Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_rows, color_dot_markup, escape_like, index_of_path,
+    use super::{cap_rows, color_dot_markup, escape_like, fkey_to_color, index_of_path,
                 COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
 
     fn n_rows(n: usize) -> Vec<String> {
@@ -776,6 +869,32 @@ mod tests {
             let m = color_dot_markup(idx, false);
             assert!(m.contains(COLOR_DIM_HEX), "idx {idx}: {m}");
         }
+    }
+
+    #[test]
+    fn fkey_maps_f1_through_f5_to_colour_indices() {
+        use gtk4::gdk::Key;
+        // F1..F5 → red/yellow/green/blue/purple, matching COLOR_HEX order and the
+        // darktable accelerators. Off-by-one here would silently mislabel images.
+        assert_eq!(fkey_to_color(Key::F1), Some(0));
+        assert_eq!(fkey_to_color(Key::F2), Some(1));
+        assert_eq!(fkey_to_color(Key::F3), Some(2));
+        assert_eq!(fkey_to_color(Key::F4), Some(3));
+        assert_eq!(fkey_to_color(Key::F5), Some(4));
+        // Every mapped index stays inside the colour domain.
+        for k in [Key::F1, Key::F2, Key::F3, Key::F4, Key::F5] {
+            assert!(fkey_to_color(k).unwrap() < COLOR_COUNT);
+        }
+    }
+
+    #[test]
+    fn fkey_other_keys_are_ignored() {
+        use gtk4::gdk::Key;
+        // Keys just past the range and unrelated keys must not toggle anything.
+        assert_eq!(fkey_to_color(Key::F6), None);
+        assert_eq!(fkey_to_color(Key::F12), None);
+        assert_eq!(fkey_to_color(Key::a), None);
+        assert_eq!(fkey_to_color(Key::Return), None);
     }
 
     #[test]
