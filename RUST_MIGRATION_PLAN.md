@@ -412,6 +412,19 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    owns undo) — flagged for when undo lands in Rust. Known follow-ups: surface a
    collision to the user (this panel has no toast access; metadata panel does);
    tag merge-on-collision; a `with_image_id` helper if a fifth tag op appears.
+   **m4-19** — colour-label DAO layer (`darkroom-db/src/colorlabels.rs`), the
+   tested core for a new lighttable feature. darktable's 5 per-image colour labels
+   (red/yellow/green/blue/purple, 0–4) live in `main.color_labels(imgid, color)`
+   with a `UNIQUE(imgid, color)` index, so an image carries any **subset** (unlike
+   the single star rating in `images.flags`). DAOs mirror C `colorlabels.c`:
+   `color_labels_get` folds rows into a 5-bit mask (`mask |= 1 << c`, dropping
+   out-of-range `color`s by design); `color_label_set` (`INSERT OR IGNORE`,
+   idempotent), `_remove`, and `_toggle` (read-then-opposite-write) all reject a
+   `color >= COLOR_COUNT` as a no-op — closing the write/read asymmetry (no "ghost"
+   row `_get` would silently drop) and guarding `1 << color` against debug
+   overflow; `_remove_all` clears one image. 8 unit tests (in-memory fixture). The
+   UI consumer (a colour-dot row per lighttable cell, click-to-toggle, resolving
+   imgid via the existing `image_get_id_by_path`) is the next slice (m4-20).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
