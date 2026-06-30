@@ -483,6 +483,25 @@ pub fn toggle_selected_color(
     }));
 }
 
+/// Re-read an image's colour-label mask from the DB and repaint its realized grid
+/// cell in place (m4-25). Used to sync the lighttable after the darkroom
+/// single-image view may have toggled labels: on `NavigationView` pop we don't
+/// know *whether* anything changed, so we just re-query and repaint — visually a
+/// no-op when unchanged. Same off-thread-read → in-place-repaint shape as
+/// [`toggle_selected_color`], minus the write; a no-op if the cell isn't realized
+/// (scrolled off / never on-screen), since the next bind paints it from the DB.
+pub fn refresh_color_dots_for_path(grid: &GridView, db_path: &str, path: &str) {
+    let db = db_path.to_string();
+    let path = path.to_string();
+    glib::spawn_future_local(clone!(@weak grid => async move {
+        let p   = path.clone();
+        let db2 = db.clone();
+        let mask = gio::spawn_blocking(move || query_color_labels(&p, &db2))
+            .await.unwrap_or(0);
+        repaint_color_dots_for_path(&grid, &path, mask);
+    }));
+}
+
 /// Repaint the colour-dot row bound to `path` among the grid's *realized* cells,
 /// from `mask`. The keyboard toggle (unlike the per-dot click handlers) holds no
 /// reference to the cell's `colors_box`, so it locates the row here. Cells are

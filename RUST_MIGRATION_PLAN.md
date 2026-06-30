@@ -509,11 +509,26 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    already-realized lighttable cell stale until it rebinds. ui 102 tests, clippy
    unchanged.
 
-   **Candidate next increments after m4-24** (recorded so they survive a context
-   clear — the colour-label arc m4-19/20/21/23/24 is otherwise complete):
-   - **Cross-view colour-label sync**: re-query/repaint the lighttable cell (or
-     the whole grid) on darkroom→lighttable pop so a label toggled in the
-     single-image view shows immediately (closes the m4-24 known gap).
+   **m4-25** — cross-view colour-label sync (DONE). Closes the m4-24 known gap: a
+   label toggled in the darkroom single-image view now shows in the lighttable cell
+   on return, instead of staying stale until GTK rebinds. On `NavigationView` pop,
+   re-query the DB for the popped image's mask and repaint that cell in place. New
+   `refresh_color_dots_for_path(grid, db, path)` — the same off-thread-read →
+   in-place-repaint shape as `toggle_selected_color`, minus the write (queries
+   `query_color_labels`, reuses `repaint_color_dots_for_path`/`find_color_box_for_path`).
+   The darkroom page is tagged with its image path (`set_tag`) at push so the
+   `connect_popped` handler recovers which cell to refresh regardless of dismissal
+   route (back / Escape / swipe / programmatic); the handler guards on `/` like the
+   loaders. Self-healing failure mode: if the cell isn't realized when the read
+   resolves, the repaint is a no-op and the next bind paints from the DB. Architect
+   (SHIP-WITH-NITS): both nits cleared without code change — the toggle-then-fast-
+   dismiss read race can't blank the dots because `open_colorlabels_conn`'s 3s
+   `busy_timeout` (m4-24) makes the read wait out the in-flight write; dots-only
+   scope is correct since the darkroom view has no star/rating control. ui 102
+   tests, clippy unchanged. **Colour-label arc m4-19/20/21/23/24/25 now complete.**
+
+   **Candidate next increments after m4-25** (recorded so they survive a context
+   clear — the colour-label arc m4-19/20/21/23/24/25 is otherwise complete):
    - **Multi-colour filter** (OR/AND a colour mask) instead of the single-colour
      row — would extend `lighttable_load_by_color` to take a mask + combine mode.
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the

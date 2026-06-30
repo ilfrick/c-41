@@ -242,7 +242,23 @@ fn build_main_window(app: &Application) {
                     .map(|o| o.string().to_string())
                     .filter(|p| p.contains('/'))
                 {
-                    nav.push(&darkroom::darkroom_page(&path, &db_path));
+                    let page = darkroom::darkroom_page(&path, &db_path);
+                    // Tag the page with its image path so the pop handler below can
+                    // recover which cell to re-sync (m4-25), regardless of how the
+                    // page was dismissed (back button / Escape / swipe gesture).
+                    page.set_tag(Some(&path));
+                    nav.push(&page);
+                }
+            }));
+
+            // m4-25: when a darkroom page is popped, its colour labels may have been
+            // toggled in that view; re-query the DB and repaint the returning grid
+            // cell so the lighttable doesn't show a stale dot row until it rebinds.
+            // Every page pushed past the lighttable root IS a darkroom page, and its
+            // tag carries the image path; we guard on the `/` just like the loaders.
+            nav.connect_popped(clone!(@weak grid, @strong db_path => move |_, page| {
+                if let Some(path) = page.tag().map(|s| s.to_string()).filter(|p| p.contains('/')) {
+                    lighttable::refresh_color_dots_for_path(&grid, &db_path, &path);
                 }
             }));
 
