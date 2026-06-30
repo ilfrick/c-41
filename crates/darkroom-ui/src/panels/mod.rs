@@ -7,7 +7,7 @@
 use adw::prelude::*;
 use glib::clone;
 use crate::lighttable::{
-    LighttableModel, lighttable_load_by_color, lighttable_load_by_folder,
+    LighttableModel, lighttable_load_by_color_mask, lighttable_load_by_folder,
     lighttable_load_by_tag_prefix, color_dot_markup, COLOR_COUNT,
 };
 use darkroom_db;
@@ -33,9 +33,15 @@ pub struct LeftPanel {
     /// Stable tag list box; only its rows are rebuilt on refresh so the
     /// folder↔tag selection-coordination handlers (bound once) stay valid.
     tag_box:     gtk4::ListBox,
-    /// Colour-label filter list box (five fixed rows). Held for the same
-    /// stale-highlight reason as `list_box`.
-    color_box:   gtk4::ListBox,
+    /// Colour-label filter box: five independent `CheckButton`s (multi-select,
+    /// unlike the Single-selection folder/tag lists), so a filter can combine
+    /// several colours. Held so [`LeftPanel::clear_filter_highlights`] can reset
+    /// the checks when something outside the panel takes over the grid.
+    color_box:   gtk4::Box,
+    /// Guards the colour `CheckButton`s' `connect_toggled` while we reset them
+    /// programmatically (mutual-exclusion / clear), so a batch of unchecks fires
+    /// no grid reload. Shared with the colour handlers built in `new`.
+    color_suppress: std::rc::Rc<std::cell::Cell<bool>>,
     /// Section chrome whose visibility tracks whether any user tags exist.
     tags_header: gtk4::Label,
     tags_sep:    gtk4::Separator,
@@ -99,26 +105,41 @@ impl LeftPanel {
             .build();
         tag_box.add_css_class("navigation-sidebar");
 
-        // Colour-label filter box, built up-front for the same reason as `tag_box`:
-        // the folder/tag/colour boxes are three mutually-exclusive Single-selection
-        // lists, so activating any one clears the highlight in the other two (no
-        // stale highlight implying an AND that isn't running).
-        // TODO(m4-2x): a name-search or import in lib.rs clears the active filter
-        // but can't reach these boxes to drop their highlight (no widget handle),
-        // so the highlighted row can outlive its filter. Pre-existing for tag_box;
-        // the clean fix is a `LeftPanel::clear_filter_highlights()` lib.rs can call.
-        let color_box = gtk4::ListBox::builder()
-            .selection_mode(gtk4::SelectionMode::Single)
+        // Colour-label filter box, built up-front for the same reason as `tag_box`
+        // (the folder handler below clears it on a folder click). UNLIKE the folder
+        // and tag Single-selection lists, this is a multi-select set of independent
+        // `CheckButton`s (m4-26): a colour filter can combine several colours under
+        // an Any (OR) / All (AND) combine mode (the `mode_toggle` below). Picking a
+        // folder or tag still clears every colour check (mutual exclusion — no stale
+        // check implying a colour filter that isn't running), via `clear_color_checks`
+        // under `color_suppress` so the batch unchecks fire no grid reload.
+        let color_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
             .build();
-        color_box.add_css_class("navigation-sidebar");
+        let color_suppress = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Combine mode: false = Any (OR, the default), true = All (AND). Shared with
+        // the colour handlers; sticky across clears (clearing resets checks, not mode).
+        let color_mode = std::rc::Rc::new(std::cell::Cell::new(false));
+        for idx in 0..COLOR_COUNT {
+            append_color_check(&color_box, idx);
+        }
+        let mode_toggle = gtk4::ToggleButton::builder()
+            .label("Match any")
+            .tooltip_text("Match images with ANY selected colour; toggle for ALL")
+            .halign(gtk4::Align::Start)
+            .margin_start(12)
+            .margin_end(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
 
         // Activate: reload lighttable with folder filter, dropping any tag filter.
         let db = db_path.to_string();
         let at_folder = active_tag.clone();
         list_box.connect_row_activated(
-            clone!(@weak lt_model, @weak tag_box, @weak color_box => move |_, row| {
+            clone!(@weak lt_model, @weak tag_box, @weak color_box, @strong color_suppress => move |_, row| {
             tag_box.unselect_all();
-            color_box.unselect_all();
+            clear_color_checks(&color_box, &color_suppress);   // drop any colour filter
             *at_folder.borrow_mut() = None;   // a folder/all view is not a tag filter
             let folder_filter: Option<String> = row
                 .widget_name()
@@ -134,32 +155,66 @@ impl LeftPanel {
         content.append(&list_box);
 
         // ── Colours (colour-label filter) ─────────────────────────────────
-        // A fixed list of the five colour labels; clicking one shows only images
-        // carrying that label. Unlike Tags this section is always present (the
-        // colour domain is fixed, not data-driven), so no refresh/visibility
-        // toggle is needed.
+        // The five colour labels as independent checks plus an Any/All combine
+        // toggle; checking any subset shows the images matching that colour mask
+        // (m4-26). Always present (the colour domain is fixed, not data-driven), so
+        // no refresh/visibility toggle is needed. The `color_box` + checks were
+        // built above; here we wire the shared reload and append the widgets.
         content.append(&section_header("Colours"));
         content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        for idx in 0..COLOR_COUNT {
-            append_color_row(&color_box, idx);
-        }
+
+        // Shared reload: read the current colour mask off the checks, clear the
+        // folder/tag highlights + active tag (a colour view is not a tag filter, so
+        // a later tag mutation must not re-run the tag-prefix loader here), and load
+        // by mask + mode. An empty mask loads all images (handled in the loader), so
+        // unchecking the last colour cleanly returns to the full library.
         let db_colors = db_path.to_string();
         let at_color = active_tag.clone();
-        color_box.connect_row_activated(
-            clone!(@weak lt_model, @weak list_box, @weak tag_box => move |_, row| {
-            list_box.unselect_all();
-            tag_box.unselect_all();
-            // A colour view is not a tag filter; clear the active tag so a later
-            // tag mutation doesn't re-run the tag-prefix loader over this grid.
-            *at_color.borrow_mut() = None;
-            match row.widget_name().parse::<u8>() {
-                Ok(color) => lighttable_load_by_color(&lt_model, &db_colors, color),
-                // Unreachable from `append_color_row` (it writes a plain `idx`),
-                // but log rather than silently no-op if that encoding ever drifts.
-                Err(e) => eprintln!(
-                    "darkroom: colour row has unparseable name {:?}: {e}", row.widget_name()),
+        let reload_colors: std::rc::Rc<dyn Fn()> = {
+            let lt_w = lt_model.downgrade();
+            let list_box_w = list_box.downgrade();
+            let tag_box_w = tag_box.downgrade();
+            let color_box_w = color_box.downgrade();
+            let mode = color_mode.clone();
+            std::rc::Rc::new(move || {
+                let (Some(lt), Some(color_box)) = (lt_w.upgrade(), color_box_w.upgrade())
+                else { return };
+                if let Some(lb) = list_box_w.upgrade() { lb.unselect_all(); }
+                if let Some(tb) = tag_box_w.upgrade() { tb.unselect_all(); }
+                *at_color.borrow_mut() = None;
+                let mask = color_mask_from_box(&color_box);
+                lighttable_load_by_color_mask(&lt, &db_colors, mask, mode.get());
+            })
+        };
+
+        // Each colour check reloads when toggled (unless we're resetting them).
+        let mut child = color_box.first_child();
+        while let Some(w) = child {
+            if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
+                let r = reload_colors.clone();
+                let supp = color_suppress.clone();
+                check.connect_toggled(move |_| {
+                    if !supp.get() { r(); }
+                });
             }
-        }));
+            child = w.next_sibling();
+        }
+
+        // Any/All toggle flips the combine mode and re-runs the filter (only if a
+        // colour is actually selected — flipping mode with none checked is a no-op).
+        {
+            let r = reload_colors.clone();
+            let mode = color_mode.clone();
+            let color_box_w = color_box.downgrade();
+            mode_toggle.connect_toggled(move |btn| {
+                mode.set(btn.is_active());
+                btn.set_label(if btn.is_active() { "Match all" } else { "Match any" });
+                if let Some(color_box) = color_box_w.upgrade() {
+                    if color_mask_from_box(&color_box) != 0 { r(); }
+                }
+            });
+        }
+        content.append(&mode_toggle);
         content.append(&color_box);
 
         // ── Tags ──────────────────────────────────────────────────────────
@@ -173,9 +228,9 @@ impl LeftPanel {
         let db_tags = db_path.to_string();
         let at_tag = active_tag.clone();
         tag_box.connect_row_activated(
-            clone!(@weak lt_model, @weak list_box, @weak color_box => move |_, row| {
+            clone!(@weak lt_model, @weak list_box, @weak color_box, @strong color_suppress => move |_, row| {
             list_box.unselect_all();
-            color_box.unselect_all();
+            clear_color_checks(&color_box, &color_suppress);   // drop any colour filter
             // The full `parent|child` path is encoded in the row's widget name
             // (see append_tag_tree_row) for both real and virtual nodes. Clicking
             // either filters to that tag plus its whole hierarchical subtree.
@@ -200,6 +255,7 @@ impl LeftPanel {
             list_box,
             tag_box,
             color_box,
+            color_suppress,
             tags_header,
             tags_sep,
             db_path: db_path.to_string(),
@@ -223,7 +279,7 @@ impl LeftPanel {
     pub fn clear_filter_highlights(&self) {
         self.list_box.unselect_all();
         self.tag_box.unselect_all();
-        self.color_box.unselect_all();
+        clear_color_checks(&self.color_box, &self.color_suppress);
     }
 
     /// Register a callback fired after a tag is renamed or deleted here, so the
@@ -332,6 +388,10 @@ impl LeftPanel {
         let list_box_w  = self.list_box.downgrade();
         let tag_box_w = self.tag_box.downgrade();
         let color_box_w = self.color_box.downgrade();
+        // `color_suppress` is leaf data (an `Rc<Cell<bool>>`, holds no widget), so
+        // capturing it strongly forms no widget cycle; it lets the transient carry
+        // the REAL suppress flag rather than a throwaway, though the menu ignores it.
+        let color_suppress = self.color_suppress.clone();
         let header_w  = self.tags_header.downgrade();
         let sep_w     = self.tags_sep.downgrade();
         let db        = self.db_path.clone();
@@ -343,9 +403,9 @@ impl LeftPanel {
         let row_w     = row.downgrade();
         // NOTE: this reconstructs a transient `LeftPanel` purely to call the
         // `&self` method `show_tag_menu` (which only touches the tag fields), so it
-        // must supply every field — incl. `list_box`/`color_box` the menu ignores.
-        // A cleaner future cleanup is to make `show_tag_menu` a free fn over just
-        // the bits it needs; until then we keep the weak-ref reconstruction whole.
+        // must supply every field — incl. `list_box`/`color_box`/`color_suppress`
+        // the menu ignores. A cleaner future cleanup is to make `show_tag_menu` a
+        // free fn over just the bits it needs; until then we keep it whole.
         gesture.connect_pressed(move |g, _, x, y| {
             g.set_state(gtk4::EventSequenceState::Claimed);
             if let (
@@ -357,7 +417,9 @@ impl LeftPanel {
                 row_w.upgrade(),
             ) {
                 let lp = LeftPanel {
-                    widget, list_box, tag_box, color_box, tags_header, tags_sep,
+                    widget, list_box, tag_box, color_box,
+                    color_suppress: color_suppress.clone(),
+                    tags_header, tags_sep,
                     db_path: db.clone(), on_tags_changed: notify.clone(),
                 };
                 lp.show_tag_menu(&row, id, &name_owned, count, x, y);
@@ -704,18 +766,20 @@ fn color_filter_name(idx: u8) -> Option<&'static str> {
     COLOR_NAMES.get(idx as usize).copied()
 }
 
-/// Append one colour-label filter row: a coloured dot plus its name. The colour
-/// index is stashed in the row's widget name so the activation handler (in `new`)
-/// can parse it back and load the matching images.
-fn append_color_row(list_box: &gtk4::ListBox, idx: u8) {
-    let row = gtk4::ListBoxRow::new();
-    row.set_widget_name(&idx.to_string());
+/// Append one colour-label filter check: a `CheckButton` whose child is a coloured
+/// dot plus its name. The colour index is stashed in the check's widget name so
+/// [`color_mask_from_box`] can read the mask back off the active checks. Independent
+/// (not a Single-selection row) so several colours can be combined (m4-26).
+fn append_color_check(color_box: &gtk4::Box, idx: u8) {
+    let check = gtk4::CheckButton::builder()
+        .margin_start(12).margin_end(8)
+        .margin_top(2).margin_bottom(2)
+        .build();
+    check.set_widget_name(&idx.to_string());
 
     let hbox = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
-        .margin_start(12).margin_end(8)
-        .margin_top(6).margin_bottom(6)
         .build();
 
     let dot = gtk4::Label::new(None);
@@ -729,8 +793,48 @@ fn append_color_row(list_box: &gtk4::ListBox, idx: u8) {
         .build();
     hbox.append(&name_lbl);
 
-    row.set_child(Some(&hbox));
-    list_box.append(&row);
+    check.set_child(Some(&hbox));
+    color_box.append(&check);
+}
+
+/// Read the colour-label mask off `color_box`'s active checks: bit `c` set iff the
+/// check for colour `c` is ticked. The index is parsed from each check's widget
+/// name (stamped by [`append_color_check`]); an unparseable name is skipped (it
+/// can't occur from `append_color_check`, but we never want a stray child to panic
+/// the mask read). Thin GTK glue over the pure `build_color_mask_query` seam.
+fn color_mask_from_box(color_box: &gtk4::Box) -> u8 {
+    let mut mask = 0u8;
+    let mut child = color_box.first_child();
+    while let Some(w) = child {
+        if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
+            if check.is_active() {
+                if let Ok(idx) = check.widget_name().parse::<u8>() {
+                    mask |= 1 << idx;
+                }
+            }
+        }
+        child = w.next_sibling();
+    }
+    mask
+}
+
+/// Uncheck every colour check in `color_box` without firing a grid reload — the
+/// caller is switching to a folder/tag filter (or clearing all filters), which
+/// loads the grid itself. `suppress` gates the checks' `connect_toggled` reload
+/// for the duration of the programmatic unticks.
+fn clear_color_checks(color_box: &gtk4::Box, suppress: &std::cell::Cell<bool>) {
+    // Save/restore (not a bare set-false) so this stays correct if a future caller
+    // ever wraps it inside its own suppressed batch — the outer window isn't
+    // prematurely re-armed. No caller nests it today; this just removes the footgun.
+    let prev = suppress.replace(true);
+    let mut child = color_box.first_child();
+    while let Some(w) = child {
+        if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
+            check.set_active(false);
+        }
+        child = w.next_sibling();
+    }
+    suppress.set(prev);
 }
 
 fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {

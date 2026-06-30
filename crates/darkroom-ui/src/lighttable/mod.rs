@@ -732,14 +732,71 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
     fill_grid(model, rows, "(No images with this tag)");
 }
 
-/// Reload the grid to show only images carrying colour label `color` (0 red,
-/// 1 yellow, 2 green, 3 blue, 4 purple). Mirrors [`lighttable_load_by_tag_prefix`]
-/// but keyed on `main.color_labels` instead of the tag tree. `color` is the same
-/// `0..COLOR_COUNT` domain the DAO and grid dots use; an out-of-range value simply
-/// matches no rows (the table never holds such a `color` — see
-/// `darkroom_db::colorlabels`). The `color_labels` `UNIQUE(imgid, color)` index
-/// means an image matches at most once, so no `DISTINCT` is needed.
-pub fn lighttable_load_by_color(model: &LighttableModel, db_path: &str, color: u8) {
+/// Colour indices (ascending) selected by a 5-bit `mask` (bit `c` set = colour
+/// `c`). Out-of-range bits can't be set (`mask` is `u8` but only `0..COLOR_COUNT`
+/// are ever produced). Pure (no GTK / DB) so the mask→indices step is unit-tested.
+fn colors_from_mask(mask: u8) -> Vec<u8> {
+    (0..COLOR_COUNT).filter(|c| mask & (1 << c) != 0).collect()
+}
+
+/// Build the SQL that lists images by a colour-label `mask`. `match_all` true =
+/// the image must carry EVERY selected colour (AND); false = ANY of them (OR).
+/// Returns `None` for an empty mask (the caller then shows all images), so the
+/// "nothing selected" state never reaches the DB. The colour ints are derived
+/// from the mask (`0..COLOR_COUNT`), never user text, so inlining them in the
+/// `IN (…)` list is injection-safe. AND uses `GROUP BY … HAVING COUNT(DISTINCT
+/// cl.color) = N` over the selected colours (`UNIQUE(imgid,color)` makes that
+/// count exactly how many of the selected labels the image has); OR uses `SELECT
+/// DISTINCT` (an image with several selected colours would otherwise repeat).
+/// `ORDER BY`/`LIMIT` mirror the other loaders. Pure (returns a string) so the
+/// AND/OR shape is unit-testable under the display-free discipline.
+fn build_color_mask_query(mask: u8, match_all: bool) -> Option<String> {
+    let colors = colors_from_mask(mask);
+    if colors.is_empty() {
+        return None;
+    }
+    let in_list = colors.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+    let limit = GRID_CAP + 1;
+    let sql = if match_all {
+        format!(
+            "SELECT f.folder || '/' || i.filename \
+             FROM main.images i \
+             JOIN main.film_rolls f ON f.id = i.film_id \
+             JOIN main.color_labels cl ON cl.imgid = i.id \
+             WHERE cl.color IN ({in_list}) \
+             GROUP BY i.id HAVING COUNT(DISTINCT cl.color) = {n} \
+             ORDER BY f.folder, i.filename LIMIT {limit}",
+            n = colors.len(),
+        )
+    } else {
+        format!(
+            "SELECT DISTINCT f.folder || '/' || i.filename \
+             FROM main.images i \
+             JOIN main.film_rolls f ON f.id = i.film_id \
+             JOIN main.color_labels cl ON cl.imgid = i.id \
+             WHERE cl.color IN ({in_list}) \
+             ORDER BY f.folder, i.filename LIMIT {limit}",
+        )
+    };
+    Some(sql)
+}
+
+/// Reload the grid to show images matching a colour-label `mask` under AND
+/// (`match_all`) / OR semantics — see [`build_color_mask_query`]. An **empty mask
+/// shows all images** (the no-colour-filter state), so the left panel can route
+/// every colour-filter change here without special-casing "nothing selected".
+/// The single-colour case is just a one-bit mask, so this is the sole colour
+/// loader the panel needs (m4-26).
+pub fn lighttable_load_by_color_mask(
+    model: &LighttableModel,
+    db_path: &str,
+    mask: u8,
+    match_all: bool,
+) {
+    let Some(sql) = build_color_mask_query(mask, match_all) else {
+        lighttable_load_from_db(model, db_path);
+        return;
+    };
     while model.n_items() > 0 {
         model.remove(0);
     }
@@ -749,25 +806,20 @@ pub fn lighttable_load_by_color(model: &LighttableModel, db_path: &str, color: u
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
     let rows: Vec<String> = match conn
-        .prepare(&format!(
-            "SELECT f.folder || '/' || i.filename \
-             FROM main.images i \
-             JOIN main.film_rolls f ON f.id = i.film_id \
-             JOIN main.color_labels cl ON cl.imgid = i.id \
-             WHERE cl.color = ?1 \
-             ORDER BY f.folder, i.filename LIMIT {}", GRID_CAP + 1),
-        )
+        .prepare(&sql)
         .and_then(|mut s| {
-            s.query_map(rusqlite::params![color], |r| r.get::<_, String>(0))
+            s.query_map([], |r| r.get::<_, String>(0))
                 .map(|it| it.flatten().collect())
         }) {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!("darkroom: colour-label filter query failed (color {color}): {e}");
+            eprintln!(
+                "darkroom: colour-mask filter query failed (mask {mask:05b}, all={match_all}): {e}"
+            );
             Vec::new()
         }
     };
-    fill_grid(model, rows, "(No images with this colour label)");
+    fill_grid(model, rows, "(No images with these colour labels)");
 }
 
 /// Escape the SQL `LIKE` metacharacters (`%`, `_`) and the escape char itself
@@ -833,11 +885,59 @@ fn open_demo_db() -> rusqlite::Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_rows, color_dot_markup, escape_like, fkey_to_color, index_of_path,
+    use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
+                escape_like, fkey_to_color, index_of_path,
                 COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
 
     fn n_rows(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("/a/{i}.jpg")).collect()
+    }
+
+    #[test]
+    fn colors_from_mask_extracts_set_bits_ascending() {
+        assert_eq!(colors_from_mask(0), Vec::<u8>::new());
+        assert_eq!(colors_from_mask(0b00001), vec![0]);
+        assert_eq!(colors_from_mask(0b10000), vec![4]);
+        assert_eq!(colors_from_mask(0b10101), vec![0, 2, 4]);
+        assert_eq!(colors_from_mask(0b11111), (0..COLOR_COUNT).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn colors_from_mask_ignores_bits_above_the_colour_domain() {
+        // Only 0..COLOR_COUNT are scanned, so a stray high bit can't widen the set.
+        assert_eq!(colors_from_mask(0b1010_0001), vec![0]);
+    }
+
+    #[test]
+    fn build_color_mask_query_none_for_empty_mask() {
+        assert!(build_color_mask_query(0, false).is_none());
+        assert!(build_color_mask_query(0, true).is_none());
+    }
+
+    #[test]
+    fn build_color_mask_query_or_uses_distinct_no_having() {
+        let sql = build_color_mask_query(0b10101, false).expect("non-empty mask");
+        assert!(sql.contains("SELECT DISTINCT"), "{sql}");
+        assert!(sql.contains("cl.color IN (0,2,4)"), "{sql}");
+        assert!(!sql.contains("HAVING"), "OR must not group/having: {sql}");
+        assert!(sql.contains(&format!("LIMIT {}", GRID_CAP + 1)), "{sql}");
+    }
+
+    #[test]
+    fn build_color_mask_query_and_groups_and_counts_selected() {
+        let sql = build_color_mask_query(0b01010, true).expect("non-empty mask");
+        assert!(sql.contains("cl.color IN (1,3)"), "{sql}");
+        // AND => image must carry both selected colours; N = popcount(mask).
+        assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 2"), "{sql}");
+        assert!(!sql.contains("SELECT DISTINCT"), "AND path must not DISTINCT: {sql}");
+    }
+
+    #[test]
+    fn build_color_mask_query_single_colour_counts_one() {
+        // The single-colour case (one-bit mask) collapses to N=1 under AND.
+        let sql = build_color_mask_query(0b00100, true).expect("non-empty mask");
+        assert!(sql.contains("cl.color IN (2)"), "{sql}");
+        assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 1"), "{sql}");
     }
 
     #[test]

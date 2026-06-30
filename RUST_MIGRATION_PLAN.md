@@ -527,10 +527,44 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    scope is correct since the darkroom view has no star/rating control. ui 102
    tests, clippy unchanged. **Colour-label arc m4-19/20/21/23/24/25 now complete.**
 
-   **Candidate next increments after m4-25** (recorded so they survive a context
-   clear — the colour-label arc m4-19/20/21/23/24/25 is otherwise complete):
-   - **Multi-colour filter** (OR/AND a colour mask) instead of the single-colour
-     row — would extend `lighttable_load_by_color` to take a mask + combine mode.
+   **m4-26** — multi-colour filter (Any/All) (DONE). Turns the left-panel colour
+   filter from single-colour (m4-21) into a multi-select mask with an Any (OR) /
+   All (AND) combine mode. Two slices. **m4-26a** (lighttable): pure unit-tested
+   `colors_from_mask` + `build_color_mask_query(mask, match_all)` (None for empty
+   mask; OR = `SELECT DISTINCT … WHERE cl.color IN (…)`, AND = `… GROUP BY i.id
+   HAVING COUNT(DISTINCT cl.color) = N`; colour ints derived from the mask so the
+   inlined `IN`-list is injection-safe) feeding `lighttable_load_by_color_mask`
+   (empty mask → `lighttable_load_from_db`/show-all). Replaces the single-colour
+   `lighttable_load_by_color` (removed — the one-bit mask subsumes it). 6 new
+   tests. **m4-26b** (panels): `color_box` is now a `gtk4::Box` of 5 independent
+   `CheckButton`s (index in `widget_name`) + a "Match any"/"Match all" `ToggleButton`.
+   A shared `reload_colors: Rc<dyn Fn()>` reads the mask off the checks
+   (`color_mask_from_box`), clears folder+tag highlights + `active_tag`, and loads
+   by mask+mode. `color_suppress: Rc<Cell<bool>>` (new field) gates the checks'
+   `connect_toggled` during programmatic resets; folder/tag activation + the lib.rs
+   `clear_filter_highlights` takeover path now call `clear_color_checks` (save/
+   restore suppress, nesting-proof). Mutual exclusion stays symmetric; mode is
+   sticky across folder/tag switches (a preference, not a filter). Architect
+   (SHIP-WITH-NITS): SQL AND/OR correct (GROUP BY i.id deterministic — PK +
+   functional dep; UNIQUE(imgid,color) makes the DISTINCT count exact); suppress
+   sound under GTK's synchronous single-thread model; no ref cycle (reload_colors
+   holds weak widget refs + leaf Rcs); applied the actionable nit (drop orphaned
+   `lighttable_load_by_color`) + the nesting-proof suppress. The transient-LeftPanel
+   reconstruction in the tag-row gesture now threads `color_suppress` too — the
+   deferred clean fix (make `show_tag_menu` a free fn) is now a real backlog item,
+   not just a code comment. ui 108 tests, clippy unchanged. **Colour-label arc
+   m4-19/20/21/23/24/25/26 now complete.**
+
+   **Candidate next increments after m4-26** (recorded so they survive a context
+   clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete):
+   - **`show_tag_menu` free-fn cleanup** — retire the transient-`LeftPanel`
+     reconstruction in the tag-row secondary-click gesture (now threads 2 leaf
+     fields it ignores); make `show_tag_menu` a free fn / small ctx over just the
+     tag fields it needs. Cost of the deferral is now visibly accruing (m4-26).
+   - **Star rating in the darkroom single-image view** — reuse the m4-24 metadata-
+     readout + m4-25 pop-sync pattern to add a 0–5 star control to the darkroom
+     header (the view's first rating UI; would also extend the m4-25 pop handler to
+     re-sync the cell's stars, not just its colour dots).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
