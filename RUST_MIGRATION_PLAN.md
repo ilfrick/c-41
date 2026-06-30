@@ -491,10 +491,29 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    Ctrl/Alt + F-key propagate. ui 102 tests, clippy unchanged. See
    `reference_gtk_signallistitemfactory_recycling`.
 
-   **Candidate next increments after m4-23** (recorded so they survive a context
-   clear — the colour-label arc m4-19/20/21/23 is otherwise complete):
-   - **Show colour labels in the darkroom (single-image) view**, mirroring the
-     star rating already shown there.
+   **m4-24** — colour labels in the darkroom (single-image) view (DONE). A 5-dot
+   colour row in the `adw::HeaderBar`, `pack_end`ed left of Export, mirroring the
+   lighttable's grid dots. Reuses the lighttable colour toolkit as one source of
+   truth: `build_color_dots_box()` (newly extracted, also adopted by the grid
+   factory) builds the row; `query_color_labels` seeds the lit mask synchronously
+   at open (consistent with the sibling `load_history`/`load_saved` sync reads);
+   `wire_color_clicks` wires click-to-toggle. Key reuse seam: `wire_color_clicks`'
+   repaint is guarded by the lighttable's cell-recycle check `widget_name() ==
+   path`, so the static header box is stamped `widget_name = file_path` for the
+   guard to pass (an unstamped box silently skips the repaint). Architect
+   (SHIP-WITH-NITS) P2 fixes applied: colour-label DB connections now take a 3s
+   `busy_timeout` (`open_colorlabels_conn`) so a toggle doesn't silently drop on
+   `SQLITE_BUSY` against the view's autosave writer; the dot row gets an
+   accessible Group role + "Colour labels" name (both views inherit it). Known
+   gap (deferred): no cross-view live sync — a toggle in the darkroom leaves an
+   already-realized lighttable cell stale until it rebinds. ui 102 tests, clippy
+   unchanged.
+
+   **Candidate next increments after m4-24** (recorded so they survive a context
+   clear — the colour-label arc m4-19/20/21/23/24 is otherwise complete):
+   - **Cross-view colour-label sync**: re-query/repaint the lighttable cell (or
+     the whole grid) on darkroom→lighttable pop so a label toggled in the
+     single-image view shows immediately (closes the m4-24 known gap).
    - **Multi-colour filter** (OR/AND a colour mask) instead of the single-colour
      row — would extend `lighttable_load_by_color` to take a mask + combine mode.
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the

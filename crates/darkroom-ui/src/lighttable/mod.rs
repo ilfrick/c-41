@@ -57,16 +57,7 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
         }
 
         // Colour-label row: 5 filled-circle Labels, coloured via Pango markup.
-        let colors_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .spacing(2)
-            .halign(gtk4::Align::Center)
-            .build();
-        for idx in 0..COLOR_COUNT {
-            let dot = gtk4::Label::new(None);
-            dot.set_markup(&color_dot_markup(idx, false));
-            colors_box.append(&dot);
-        }
+        let colors_box = build_color_dots_box();
 
         vbox.append(&thumb);
         vbox.append(&label);
@@ -329,6 +320,31 @@ const COLOR_HEX: [&str; COLOR_COUNT as usize] =
 /// Grey used for an unassigned (unlit) dot.
 const COLOR_DIM_HEX: &str = "#777777";
 
+/// Build a fresh colour-label dot row: `COLOR_COUNT` filled-circle `Label`s, all
+/// unlit, in a centred horizontal box. One source of truth for the dot-row layout
+/// shared by the lighttable grid cells and the darkroom header (m4-24); the caller
+/// then seeds the lit state via [`set_color_dots`] and wires toggling via
+/// [`wire_color_clicks`]. `pub(crate)` so the darkroom view reuses the exact same
+/// construction without redefining the dot geometry.
+pub(crate) fn build_color_dots_box() -> gtk4::Box {
+    let colors_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(2)
+        .halign(gtk4::Align::Center)
+        .build();
+    // The dots are pure Pango-markup glyphs, invisible to assistive tech; give the
+    // row a group role + accessible name so screen readers announce it in both the
+    // grid cells and the darkroom header (one fix, both call sites inherit it).
+    colors_box.set_accessible_role(gtk4::AccessibleRole::Group);
+    colors_box.update_property(&[gtk4::accessible::Property::Label("Colour labels")]);
+    for idx in 0..COLOR_COUNT {
+        let dot = gtk4::Label::new(None);
+        dot.set_markup(&color_dot_markup(idx, false));
+        colors_box.append(&dot);
+    }
+    colors_box
+}
+
 /// Pango markup for one colour dot: its own hue when `lit`, dim grey otherwise.
 /// Pure (no GTK) so it's unit-testable; an out-of-range `idx` falls back to grey.
 /// `pub(crate)` so the left-panel colour filter reuses the exact same hues as the
@@ -342,7 +358,8 @@ pub(crate) fn color_dot_markup(idx: u8, lit: bool) -> String {
 }
 
 /// Repaint the dot row from a 5-bit colour-label mask (bit `c` = colour `c`).
-fn set_color_dots(colors_box: &gtk4::Box, mask: u8) {
+/// `pub(crate)` so the darkroom header (m4-24) seeds its dot row from the same path.
+pub(crate) fn set_color_dots(colors_box: &gtk4::Box, mask: u8) {
     let mut child = colors_box.first_child();
     let mut idx = 0u8;
     while let Some(w) = child {
@@ -357,7 +374,13 @@ fn set_color_dots(colors_box: &gtk4::Box, mask: u8) {
 /// Attach a GestureClick to each dot so clicking colour `c` toggles that label
 /// and repaints the row from the resulting mask (see `wire_star_clicks` for the
 /// once-per-bind-cycle rationale).
-fn wire_color_clicks(colors_box: &gtk4::Box, full_path: String, db_path: String) {
+///
+/// The repaint is guarded by `cb2.widget_name() == path`, the lighttable's
+/// cell-recycle check. Callers with a static (non-recycled) row — e.g. the
+/// darkroom header (m4-24) — must therefore stamp the box's `widget_name` with
+/// `full_path` so the guard passes; an unstamped box would silently skip repaints.
+/// `pub(crate)` so the darkroom view reuses the exact toggle/repaint wiring.
+pub(crate) fn wire_color_clicks(colors_box: &gtk4::Box, full_path: String, db_path: String) {
     let mut child = colors_box.first_child();
     let mut idx = 0u8;
     while let Some(w) = child {
@@ -389,13 +412,25 @@ fn wire_color_clicks(colors_box: &gtk4::Box, full_path: String, db_path: String)
     }
 }
 
+/// Open the colour-labels DB connection with a 3s `busy_timeout` so a colour-label
+/// read/write waits out a transient lock instead of failing immediately. Matters
+/// now that the darkroom header (m4-24) can toggle a label while the same view's
+/// debounced autosave/history writer holds the DB — default SQLite returns
+/// `SQLITE_BUSY` at once, silently dropping the toggle; the timeout lets it retry.
+fn open_colorlabels_conn(db_path: &str) -> Option<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
+    Some(conn)
+}
+
 /// Read an image's colour-label mask by path. Returns 0 for the demo/empty db, an
 /// unresolvable path, or any DB error (the dots simply show unlit).
-fn query_color_labels(full_path: &str, db_path: &str) -> u8 {
+/// `pub(crate)` so the darkroom header (m4-24) seeds its dot row on image open.
+pub(crate) fn query_color_labels(full_path: &str, db_path: &str) -> u8 {
     if db_path.is_empty() { return 0; }
-    let conn = match rusqlite::Connection::open(db_path) {
-        Ok(c) => c,
-        Err(_) => return 0,
+    let conn = match open_colorlabels_conn(db_path) {
+        Some(c) => c,
+        None => return 0,
     };
     let imgid = match darkroom_db::image::image_get_id_by_path(&conn, full_path) {
         Ok(Some(id)) => id,
@@ -501,9 +536,9 @@ fn find_color_box_for_path(root: &gtk4::Widget, path: &str) -> Option<gtk4::Box>
 /// so the caller can repaint. A no-op returning 0 if the path can't be resolved.
 fn toggle_color_label(full_path: &str, db_path: &str, color: u8) -> u8 {
     if db_path.is_empty() { return 0; }
-    let conn = match rusqlite::Connection::open(db_path) {
-        Ok(c) => c,
-        Err(_) => return 0,
+    let conn = match open_colorlabels_conn(db_path) {
+        Some(c) => c,
+        None => return 0,
     };
     let imgid = match darkroom_db::image::image_get_id_by_path(&conn, full_path) {
         Ok(Some(id)) => id,

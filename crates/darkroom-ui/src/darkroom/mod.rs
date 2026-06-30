@@ -1110,6 +1110,23 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     });
     header.pack_end(&export_btn);
 
+    // ── Colour-label dot row (m4-24) ──────────────────────────────────────
+    // Mirror the lighttable's 5-dot colour row in the header so the single-image
+    // view shows (and can toggle) the same labels. Reuses the lighttable toolkit
+    // for one source of truth on dot geometry, hues, DB read and toggle wiring.
+    // The box is static (no cell recycling here), but `wire_color_clicks`' repaint
+    // is guarded by `widget_name() == path`, so we stamp the box with `file_path`
+    // for the guard to pass. The initial mask is read synchronously — consistent
+    // with the history/params seeds already loaded sync at open just above.
+    let colors_box = crate::lighttable::build_color_dots_box();
+    colors_box.set_widget_name(file_path);
+    colors_box.set_margin_end(8);
+    colors_box.set_tooltip_text(Some("Colour labels (click to toggle)"));
+    let initial_mask = crate::lighttable::query_color_labels(file_path, db_path);
+    crate::lighttable::set_color_dots(&colors_box, initial_mask);
+    crate::lighttable::wire_color_clicks(&colors_box, file_path.to_string(), db_path.to_string());
+    header.pack_end(&colors_box);
+
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&content));
