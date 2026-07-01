@@ -264,13 +264,13 @@ fn build_main_window(app: &Application) {
                 }
             }));
 
-            // Colour-label keyboard shortcuts (darktable F1–F5): plain F1..F5
-            // toggle colour label 0..4 on the selected grid image and repaint that
-            // cell's dot row in place. The controller lives on the grid, so it only
-            // fires when the lighttable has focus — not the darkroom page, and not
-            // while the user is typing in the search entry. Modifier combos
-            // (Ctrl/Alt + F-key) are left to propagate so they can't be mistaken
-            // for a colour toggle.
+            // Metadata keyboard shortcuts on the selected grid image (darktable):
+            // plain F1..F5 toggle colour label 0..4; plain 0..5 set the star rating.
+            // Both repaint just that cell's row in place. The controller lives on the
+            // grid, so it only fires when the lighttable has focus — not the darkroom
+            // page, and not while the user is typing in the search entry. Modifier
+            // combos (Ctrl/Alt + key) are left to propagate so they can't be mistaken
+            // for a metadata shortcut.
             let key = gtk4::EventControllerKey::new();
             let sel = lt_selection.clone();
             let db  = db_path.clone();
@@ -278,11 +278,15 @@ fn build_main_window(app: &Application) {
                 if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK) {
                     return glib::Propagation::Proceed;
                 }
-                let Some(color) = lighttable::fkey_to_color(keyval) else {
-                    return glib::Propagation::Proceed;
-                };
-                lighttable::toggle_selected_color(&grid, &sel, &db, color);
-                glib::Propagation::Stop
+                if let Some(color) = lighttable::fkey_to_color(keyval) {
+                    lighttable::toggle_selected_color(&grid, &sel, &db, color);
+                    return glib::Propagation::Stop;
+                }
+                if let Some(rating) = lighttable::digit_to_rating(keyval) {
+                    lighttable::set_selected_rating(&grid, &sel, &db, rating);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
             }));
             grid.add_controller(key);
         }

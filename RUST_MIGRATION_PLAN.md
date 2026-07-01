@@ -602,14 +602,31 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    on the colour path). ui 108 tests, clippy unchanged. **The darkroom single-image
    view now shows + edits both rating and colour labels, syncing both to the grid.**
 
-   **Candidate next increments after m4-28** (recorded so they survive a context
+   **m4-29** — star-rating keyboard shortcuts (0–5) in the lighttable (DONE).
+   Direct analogue of the m4-23 F1–F5 colour keys, on the same grid
+   `EventControllerKey`. Pieces (lighttable): pure unit-tested `digit_to_rating`
+   (top-row `Key::_0.._5` AND keypad `Key::KP_0..KP_5` → rating 0–5, else None;
+   keypad arm assumes NumLock on — documented); `set_selected_rating` (star sibling
+   of `toggle_selected_color`, but an ABSOLUTE set — digit k → rating k, matching
+   the star click handler + darktable — so it repaints from the KNOWN rating, no
+   read-back → no blank-on-busy risk); extracted `repaint_stars_for_path` (find+set,
+   now shared by `set_selected_rating` + `refresh_stars_for_path`). lib.rs: the key
+   handler tries `fkey_to_color` first (Stop on match) then `digit_to_rating` (Stop),
+   else Proceed; Ctrl/Alt still propagate; digit `0` clears the rating (a superset of
+   the click handler, which only reaches 1–5). Architect **SHIP** (clean, faithful
+   mirror); applied the one doc nit (NumLock note). ui 110 tests (2 new), clippy
+   unchanged.
+
+   **Candidate next increments after m4-29** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete):
-   - **Star-rating keyboard shortcuts (0–5) in the lighttable** (darktable's 0–5
-     keys), analogous to the m4-23 F1–F5 colour keys — `toggle_selected_color` has a
-     `toggle_selected_rating` sibling waiting to be written.
-   - Log-on-failure for `save_rating`/`toggle_color_label` writes (both currently
-     `let _`-discard the off-thread write result; a `busy_timeout` post-expiry `Err`
-     is silent — bring writes up to the read paths' fault-logging).
+   - **Harden off-thread metadata writes** (one increment for the whole class):
+     `save_rating`/`toggle_color_label`/star-click/keyboard writes all `let _`-discard
+     the off-thread result, so a post-`busy_timeout` `Err` — AND a `spawn_blocking`
+     `JoinError` (task panic) — are both silent; rapid keypresses/clicks also race in
+     the thread pool with no per-path serialization (final DB state = completion
+     order, not input order; low-probability given ~100ms human gaps vs sub-ms
+     writes). Fix once: serialize-per-path + surface both failure layers (log), rather
+     than piecemeal (which would break symmetry across the four write sites).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.

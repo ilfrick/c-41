@@ -550,9 +550,60 @@ pub fn refresh_stars_for_path(grid: &GridView, db_path: &str, path: &str) {
         let db2 = db.clone();
         let rating = gio::spawn_blocking(move || query_rating(&p, &db2))
             .await.ok().flatten().unwrap_or(0);
-        if let Some(stars) = find_stars_box_for_path(grid.upcast_ref::<gtk4::Widget>(), &path) {
-            set_stars(&stars, rating);
-        }
+        repaint_stars_for_path(&grid, &path, rating);
+    }));
+}
+
+/// Repaint the star row bound to `path` among the grid's *realized* cells, to
+/// `rating`. Star sibling of [`repaint_color_dots_for_path`]; no-op if the image
+/// isn't realized (off-screen), the next bind painting it from the DB.
+fn repaint_stars_for_path(grid: &GridView, path: &str, rating: u8) {
+    if let Some(stars) = find_stars_box_for_path(grid.upcast_ref::<gtk4::Widget>(), path) {
+        set_stars(&stars, rating);
+    }
+}
+
+/// Map a top-row or keypad digit `0`–`5` to its star rating (darktable's lighttable
+/// rating accelerators), or `None` for any other key. Pure (`gdk::Key` constants are
+/// plain keyvals) so it's unit-testable under the display-free discipline, like
+/// [`fkey_to_color`]; the set + repaint it drives is GTK-bound and Docker-tested.
+///
+/// The keypad arm assumes NumLock is ON (with it off the keypad emits `KP_Insert`/
+/// `KP_End`/… instead of `KP_0`/`KP_1`/…, so keypad rating simply won't fire — the
+/// top-row digits work regardless, matching darktable and near-universal behaviour).
+pub(crate) fn digit_to_rating(keyval: gtk4::gdk::Key) -> Option<u8> {
+    use gtk4::gdk::Key;
+    match keyval {
+        Key::_0 | Key::KP_0 => Some(0),
+        Key::_1 | Key::KP_1 => Some(1),
+        Key::_2 | Key::KP_2 => Some(2),
+        Key::_3 | Key::KP_3 => Some(3),
+        Key::_4 | Key::KP_4 => Some(4),
+        Key::_5 | Key::KP_5 => Some(5),
+        _ => None,
+    }
+}
+
+/// Set the star `rating` on the grid's currently-selected image and repaint that
+/// cell's star row in place (m4-29). Star sibling of [`toggle_selected_color`],
+/// except ratings are an ABSOLUTE set (digit `k` → rating `k`, matching the star
+/// click handler and darktable) rather than a toggle. No-op when nothing real is
+/// selected. The DB write runs off the main thread; the in-place repaint then
+/// targets the realized cell still bound to `path` (a no-op if it was recycled /
+/// scrolled off, the next bind painting from the DB).
+pub fn set_selected_rating(
+    grid: &GridView,
+    selection: &SingleSelection,
+    db_path: &str,
+    rating: u8,
+) {
+    let Some(path) = selected_path(selection) else { return };
+    let db = db_path.to_string();
+    glib::spawn_future_local(clone!(@weak grid => async move {
+        let p   = path.clone();
+        let db2 = db.clone();
+        let _ = gio::spawn_blocking(move || save_rating(&p, &db2, rating)).await;
+        repaint_stars_for_path(&grid, &path, rating);
     }));
 }
 
@@ -951,7 +1002,7 @@ fn open_demo_db() -> rusqlite::Connection {
 #[cfg(test)]
 mod tests {
     use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
-                escape_like, fkey_to_color, index_of_path,
+                digit_to_rating, escape_like, fkey_to_color, index_of_path,
                 COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
 
     fn n_rows(n: usize) -> Vec<String> {
@@ -1114,6 +1165,35 @@ mod tests {
         assert_eq!(fkey_to_color(Key::F12), None);
         assert_eq!(fkey_to_color(Key::a), None);
         assert_eq!(fkey_to_color(Key::Return), None);
+    }
+
+    #[test]
+    fn digit_maps_0_through_5_to_ratings_top_row_and_keypad() {
+        use gtk4::gdk::Key;
+        // 0..5 → rating 0..5 (darktable), identity mapping — an off-by-one would
+        // silently misrate images. Both the top-row and keypad digits map the same.
+        for (k, kp, r) in [
+            (Key::_0, Key::KP_0, 0u8),
+            (Key::_1, Key::KP_1, 1),
+            (Key::_2, Key::KP_2, 2),
+            (Key::_3, Key::KP_3, 3),
+            (Key::_4, Key::KP_4, 4),
+            (Key::_5, Key::KP_5, 5),
+        ] {
+            assert_eq!(digit_to_rating(k), Some(r));
+            assert_eq!(digit_to_rating(kp), Some(r));
+        }
+    }
+
+    #[test]
+    fn digit_other_keys_are_ignored() {
+        use gtk4::gdk::Key;
+        // 6..9 are out of the 0–5 rating range; unrelated keys map to None too.
+        assert_eq!(digit_to_rating(Key::_6), None);
+        assert_eq!(digit_to_rating(Key::_9), None);
+        assert_eq!(digit_to_rating(Key::KP_9), None);
+        assert_eq!(digit_to_rating(Key::a), None);
+        assert_eq!(digit_to_rating(Key::Return), None);
     }
 
     #[test]
