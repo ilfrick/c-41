@@ -617,16 +617,29 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    mirror); applied the one doc nit (NumLock note). ui 110 tests (2 new), clippy
    unchanged.
 
-   **Candidate next increments after m4-29** (recorded so they survive a context
+   **m4-30** — harden off-thread metadata writes (the whole class, one increment
+   for symmetry) (DONE). All four write sites (star click, rating key, colour click,
+   colour key) previously `let _`-discarded / `unwrap_or(0)`'d the off-thread
+   result, so a `spawn_blocking` `JoinError` (task panic) AND a post-`busy_timeout`
+   rusqlite `Err` were both silent; rapid same-image inputs also raced in the glib
+   pool with no serialization (a colour toggle is a read-modify-write → lost
+   update). Fix: `path_write_lock(path) -> Arc<Mutex<()>>` (process-wide registry,
+   `OnceLock<Mutex<HashMap<..>>>`) + one `serialized_write(path, closure)` choke
+   point all four route through — it takes the per-path lock *inside* the
+   `spawn_blocking` worker (never on the main loop, so no UI stall) and logs the
+   `JoinError`; `save_rating` `Err` logged at the two rating sites (`toggle_color_label`
+   already logs its own). Guarantee (architect-clarified): per-write atomicity +
+   repaint-tracks-committed-value (completion order == commit order, so UI never
+   diverges from DB); NOT last-input-wins (`Mutex` unfair, `spawn_blocking` not
+   FIFO) — harmless for commuting colour bit-flips, acceptable for ratings. Colour
+   sites now skip the repaint on a worker panic (`None` → mask unknown, don't clear
+   labels still in the DB; next rebind paints from DB). Architect **SHIP** after
+   one must-fix doc reword (drop the implied input-ordering claim); deferred idea
+   filed inline: a single DB-writer thread would bound pool use + coalesce. ui 111
+   tests (1 new: `path_write_lock` same-Arc/distinct-Arc), clippy unchanged.
+
+   **Candidate next increments after m4-30** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete):
-   - **Harden off-thread metadata writes** (one increment for the whole class):
-     `save_rating`/`toggle_color_label`/star-click/keyboard writes all `let _`-discard
-     the off-thread result, so a post-`busy_timeout` `Err` — AND a `spawn_blocking`
-     `JoinError` (task panic) — are both silent; rapid keypresses/clicks also race in
-     the thread pool with no per-path serialization (final DB state = completion
-     order, not input order; low-probability given ~100ms human gaps vs sub-ms
-     writes). Fix once: serialize-per-path + surface both failure layers (log), rather
-     than piecemeal (which would break symmetry across the four write sites).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.

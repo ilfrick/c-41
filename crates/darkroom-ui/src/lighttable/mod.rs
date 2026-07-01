@@ -9,6 +9,8 @@
 use adw::prelude::*;
 use gtk4::{GridView, ListItem, ScrolledWindow, SignalListItemFactory, SingleSelection};
 use glib::clone;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const THUMB_SIZE: i32 = 160;
 
@@ -281,8 +283,10 @@ pub(crate) fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path
                 let fp2 = fp.clone();
                 let db2 = db.clone();
                 glib::spawn_future_local(async move {
-                    let _ = gio::spawn_blocking(move || {
-                        save_rating(&fp2, &db2, new_rating)
+                    serialized_write(fp2.clone(), move || {
+                        if let Err(e) = save_rating(&fp2, &db2, new_rating) {
+                            eprintln!("darkroom: save rating failed for {fp2}: {e}");
+                        }
                     }).await;
                 });
             });
@@ -339,6 +343,61 @@ fn save_rating(full_path: &str, db_path: &str, rating: u8) -> rusqlite::Result<(
         rusqlite::params![bits, folder, filename],
     )?;
     Ok(())
+}
+
+// ── Off-thread metadata-write serialization ───────────────────────────────
+
+/// Per-image lock making off-thread metadata writes (star rating + colour label)
+/// to the *same* image mutually exclusive, so rapid inputs can't interleave a
+/// read-modify-write. What it guarantees: each write runs atomically, and since
+/// completion order equals lock-release (== DB-commit) order, the *last* repaint
+/// continuation always reflects the *last committed* value — the UI never
+/// diverges from the DB. What it does NOT guarantee: input order. `std::sync::
+/// Mutex` is unfair and `spawn_blocking` dispatch isn't FIFO, so two truly
+/// simultaneous same-image writes can commit in either order. That's harmless
+/// for colour labels (bit-flips commute) and acceptable for ratings (a same-image
+/// double-set is a race the user can't perceive; both DB and UI stay consistent,
+/// just not necessarily on the later keystroke). Keyed by path string; the lock
+/// is only ever held inside a `spawn_blocking` worker thread (never on the GTK
+/// main loop), so it can't stall the UI. The registry grows one small entry per
+/// distinct image written this session — bounded by library size, not worth
+/// evicting. (A single dedicated DB-writer thread fed by a channel would also
+/// bound blocking-pool use and coalesce writes — deferred, not needed at input
+/// rates.)
+fn path_write_lock(path: &str) -> Arc<Mutex<()>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(path.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Run metadata-write closure `f` for `path` off the main thread, serialized
+/// against other writes to the same image (via [`path_write_lock`]) and with the
+/// `spawn_blocking` join failure logged instead of silently swallowed. Returns
+/// the closure's value, or `None` if the worker thread panicked so callers can
+/// fall back (e.g. repaint from 0). The single choke point all four write sites
+/// (star click, rating key, colour click, colour key) route through, so the
+/// serialize-and-log guarantee stays symmetric across them.
+async fn serialized_write<T, F>(path: String, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let lock = path_write_lock(&path);
+    match gio::spawn_blocking(move || {
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    })
+    .await
+    {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("darkroom: metadata-write worker failed for {path}: {e:?}");
+            None
+        }
+    }
 }
 
 // ── Colour-label helpers ──────────────────────────────────────────────────
@@ -432,11 +491,15 @@ pub(crate) fn wire_color_clicks(colors_box: &gtk4::Box, full_path: String, db_pa
                 let db2 = db.clone();
                 glib::spawn_future_local(async move {
                     let path = fp2.clone();
-                    let mask = gio::spawn_blocking(move || toggle_color_label(&fp2, &db2, color))
-                        .await.unwrap_or(0);
-                    // Skip the repaint if the cell was recycled while the toggle ran.
-                    if cb2.widget_name() == path {
-                        set_color_dots(&cb2, mask);
+                    // On a worker panic the mask is unknown, so skip the repaint
+                    // rather than clear labels still in the DB (the next rebind
+                    // paints from the DB); likewise skip if the cell was recycled.
+                    if let Some(mask) =
+                        serialized_write(fp2.clone(), move || toggle_color_label(&fp2, &db2, color)).await
+                    {
+                        if cb2.widget_name() == path {
+                            set_color_dots(&cb2, mask);
+                        }
                     }
                 });
             });
@@ -512,9 +575,13 @@ pub fn toggle_selected_color(
     glib::spawn_future_local(clone!(@weak grid => async move {
         let p   = path.clone();
         let db2 = db.clone();
-        let mask = gio::spawn_blocking(move || toggle_color_label(&p, &db2, color))
-            .await.unwrap_or(0);
-        repaint_color_dots_for_path(&grid, &path, mask);
+        // Skip the repaint on a worker panic (mask unknown — don't clear labels
+        // still in the DB); the next rebind paints the row from the DB.
+        if let Some(mask) =
+            serialized_write(path.clone(), move || toggle_color_label(&p, &db2, color)).await
+        {
+            repaint_color_dots_for_path(&grid, &path, mask);
+        }
     }));
 }
 
@@ -602,7 +669,11 @@ pub fn set_selected_rating(
     glib::spawn_future_local(clone!(@weak grid => async move {
         let p   = path.clone();
         let db2 = db.clone();
-        let _ = gio::spawn_blocking(move || save_rating(&p, &db2, rating)).await;
+        serialized_write(path.clone(), move || {
+            if let Err(e) = save_rating(&p, &db2, rating) {
+                eprintln!("darkroom: save rating failed for {p}: {e}");
+            }
+        }).await;
         repaint_stars_for_path(&grid, &path, rating);
     }));
 }
@@ -1002,11 +1073,23 @@ fn open_demo_db() -> rusqlite::Connection {
 #[cfg(test)]
 mod tests {
     use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
-                digit_to_rating, escape_like, fkey_to_color, index_of_path,
+                digit_to_rating, escape_like, fkey_to_color, index_of_path, path_write_lock,
                 COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
+    use std::sync::Arc;
 
     fn n_rows(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("/a/{i}.jpg")).collect()
+    }
+
+    #[test]
+    fn path_write_lock_is_stable_per_path_and_distinct_across_paths() {
+        // Same path → same lock (so writes to one image serialize against each
+        // other); different paths → different locks (so they run concurrently).
+        let a1 = path_write_lock("/lib/a.raw");
+        let a2 = path_write_lock("/lib/a.raw");
+        let b  = path_write_lock("/lib/b.raw");
+        assert!(Arc::ptr_eq(&a1, &a2), "same path must map to the same lock");
+        assert!(!Arc::ptr_eq(&a1, &b), "distinct paths must map to distinct locks");
     }
 
     #[test]
