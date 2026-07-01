@@ -14,25 +14,47 @@ use darkroom_db;
 
 // ── Left panel (collections) ──────────────────────────────────────────────
 
+/// The tag-section state a tag rename/delete popover needs, split out of
+/// `LeftPanel` (m4-27) so the per-row secondary-click gesture reconstructs
+/// exactly these fields on demand rather than a whole `LeftPanel` (which would
+/// otherwise have to supply the folder/colour-filter fields the menu ignores).
+/// All fields are GObject ref-counts (plus a `String`), so it is `Clone` and cheap
+/// to hand to the deferred rename/delete closures. Owns every tag-mutation method
+/// (refresh / append-row / rename / delete); `LeftPanel` delegates to it.
+#[derive(Clone)]
+struct TagPanel {
+    /// Stable tag list box; only its rows are rebuilt on refresh so the
+    /// folder↔tag selection-coordination handlers (bound once) stay valid.
+    tag_box:     gtk4::ListBox,
+    /// Section chrome whose visibility tracks whether any user tags exist.
+    tags_header: gtk4::Label,
+    tags_sep:    gtk4::Separator,
+    db_path:     String,
+    /// Optional notify fired after a library-wide tag mutation here (rename /
+    /// delete), so the metadata panel can re-render the current image's chips.
+    /// Mirror of `MetadataPanel::on_tags_changed`. Set via `set_on_tags_changed`.
+    on_tags_changed: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
+}
+
 /// The collections (left) panel: film rolls plus a live Tags section.
 ///
 /// Clicking a film roll reloads the lighttable to show only that folder; the
 /// first row ("All images") clears the filter. The Tags section can be rebuilt
 /// in place via [`LeftPanel::refresh_tags`] after a tag is attached elsewhere
 /// (e.g. from the metadata panel), so newly-created tags and changed counts
-/// appear without restarting the app.
+/// appear without restarting the app. The tag list + all tag-mutation logic live
+/// in the [`TagPanel`] field; `LeftPanel` owns the folder + colour filters and
+/// delegates the tag operations.
 ///
-/// All fields are GObject ref-counts (plus a `String`), so `LeftPanel` is Clone
-/// and can be handed to the metadata panel's change callback cheaply.
+/// All fields are GObject ref-counts (plus the `TagPanel`, itself ref-counts), so
+/// `LeftPanel` is Clone and can be handed to the metadata panel's change callback
+/// cheaply.
 #[derive(Clone)]
 pub struct LeftPanel {
     pub widget:  gtk4::Box,
     /// Film-roll (folder) list box, incl. the "All images" row. Held so
     /// [`LeftPanel::clear_filter_highlights`] can drop a stale highlight.
     list_box:    gtk4::ListBox,
-    /// Stable tag list box; only its rows are rebuilt on refresh so the
-    /// folder↔tag selection-coordination handlers (bound once) stay valid.
-    tag_box:     gtk4::ListBox,
     /// Colour-label filter box: five independent `CheckButton`s (multi-select,
     /// unlike the Single-selection folder/tag lists), so a filter can combine
     /// several colours. Held so [`LeftPanel::clear_filter_highlights`] can reset
@@ -42,14 +64,9 @@ pub struct LeftPanel {
     /// programmatically (mutual-exclusion / clear), so a batch of unchecks fires
     /// no grid reload. Shared with the colour handlers built in `new`.
     color_suppress: std::rc::Rc<std::cell::Cell<bool>>,
-    /// Section chrome whose visibility tracks whether any user tags exist.
-    tags_header: gtk4::Label,
-    tags_sep:    gtk4::Separator,
-    db_path:     String,
-    /// Optional notify fired after a library-wide tag mutation here (rename /
-    /// delete), so the metadata panel can re-render the current image's chips.
-    /// Mirror of `MetadataPanel::on_tags_changed`. Set via `set_on_tags_changed`.
-    on_tags_changed: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
+    /// Tag section (list + all tag-mutation methods), split out so its rename/
+    /// delete popover doesn't reconstruct the whole panel — see [`TagPanel`].
+    tags:        TagPanel,
 }
 
 impl LeftPanel {
@@ -250,18 +267,21 @@ impl LeftPanel {
             .build();
         panel.append(&scroll);
 
-        let lp = Self {
-            widget: panel,
-            list_box,
+        let tags = TagPanel {
             tag_box,
-            color_box,
-            color_suppress,
             tags_header,
             tags_sep,
             db_path: db_path.to_string(),
             on_tags_changed: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
-        lp.refresh_tags();
+        let lp = Self {
+            widget: panel,
+            list_box,
+            color_box,
+            color_suppress,
+            tags,
+        };
+        lp.tags.refresh_tags();
         lp
     }
 
@@ -278,15 +298,30 @@ impl LeftPanel {
     /// highlight would be wrongly cleared from a filter that's still in force.
     pub fn clear_filter_highlights(&self) {
         self.list_box.unselect_all();
-        self.tag_box.unselect_all();
+        self.tags.tag_box.unselect_all();
         clear_color_checks(&self.color_box, &self.color_suppress);
     }
 
     /// Register a callback fired after a tag is renamed or deleted here, so the
+    /// metadata panel can re-render the current image's chips. Delegates to the
+    /// [`TagPanel`]; see [`TagPanel::set_on_tags_changed`].
+    pub fn set_on_tags_changed<F: Fn() + 'static>(&self, f: F) {
+        self.tags.set_on_tags_changed(f);
+    }
+
+    /// Rebuild the Tags section in place from the current library state. Delegates
+    /// to the [`TagPanel`]; see [`TagPanel::refresh_tags`].
+    pub fn refresh_tags(&self) {
+        self.tags.refresh_tags();
+    }
+}
+
+impl TagPanel {
+    /// Register a callback fired after a tag is renamed or deleted here, so the
     /// metadata panel can re-render the current image's chips. Mirror of
     /// `MetadataPanel::set_on_tags_changed`; replaces any previous callback. The
     /// callback must not re-enter a left-panel tag mutation, or it would loop.
-    pub fn set_on_tags_changed<F: Fn() + 'static>(&self, f: F) {
+    fn set_on_tags_changed<F: Fn() + 'static>(&self, f: F) {
         *self.on_tags_changed.borrow_mut() = Some(std::rc::Rc::new(f));
     }
 
@@ -303,7 +338,7 @@ impl LeftPanel {
     /// the activation handler bound in `new` keeps working), then shows or hides
     /// the section depending on whether any user tags exist. Safe to call after
     /// a tag is attached from the metadata panel to surface new tags / counts.
-    pub fn refresh_tags(&self) {
+    fn refresh_tags(&self) {
         while let Some(child) = self.tag_box.first_child() {
             self.tag_box.remove(&child);
         }
@@ -377,52 +412,34 @@ impl LeftPanel {
 
         // Secondary-click → rename/delete popover. The gesture lives as long as
         // the row (so for the app lifetime while the row is in `tag_box`); to
-        // avoid a strong-ref cycle (tag_box→row→gesture→LeftPanel→tag_box) it
-        // captures only weak refs + the db path and reconstructs a transient
-        // `LeftPanel` on demand. Removed rows then free cleanly on refresh.
-        // The popover operates on the FULL tag path (rename/delete are per-tag,
-        // hierarchy-unaware in this slice — segment-only rename is a later step).
+        // avoid a strong-ref cycle (tag_box→row→gesture→TagPanel→tag_box) it
+        // captures only weak widget refs (+ the leaf `db`/`notify`) and rebuilds a
+        // transient `TagPanel` on demand. Removed rows then free cleanly on refresh.
+        // Since `TagPanel` holds ONLY the tag fields `show_tag_menu` needs (m4-27),
+        // the reconstruction supplies nothing the menu ignores. The popover operates
+        // on the FULL tag path (rename/delete are per-tag, hierarchy-unaware here).
         let gesture = gtk4::GestureClick::new();
         gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
-        let widget_w  = self.widget.downgrade();
-        let list_box_w  = self.list_box.downgrade();
         let tag_box_w = self.tag_box.downgrade();
-        let color_box_w = self.color_box.downgrade();
-        // `color_suppress` is leaf data (an `Rc<Cell<bool>>`, holds no widget), so
-        // capturing it strongly forms no widget cycle; it lets the transient carry
-        // the REAL suppress flag rather than a throwaway, though the menu ignores it.
-        let color_suppress = self.color_suppress.clone();
         let header_w  = self.tags_header.downgrade();
         let sep_w     = self.tags_sep.downgrade();
         let db        = self.db_path.clone();
-        // The notify Rc never references back at the left-panel widgets, so
-        // capturing it strongly introduces no cycle.
+        // The notify Rc never references back at the panel widgets, so capturing it
+        // strongly introduces no cycle.
         let notify     = self.on_tags_changed.clone();
         let name_owned = row_data.full_name.clone();
         let count      = row_data.count;
         let row_w     = row.downgrade();
-        // NOTE: this reconstructs a transient `LeftPanel` purely to call the
-        // `&self` method `show_tag_menu` (which only touches the tag fields), so it
-        // must supply every field — incl. `list_box`/`color_box`/`color_suppress`
-        // the menu ignores. A cleaner future cleanup is to make `show_tag_menu` a
-        // free fn over just the bits it needs; until then we keep it whole.
         gesture.connect_pressed(move |g, _, x, y| {
             g.set_state(gtk4::EventSequenceState::Claimed);
-            if let (
-                Some(widget), Some(list_box), Some(tag_box), Some(color_box),
-                Some(tags_header), Some(tags_sep), Some(row),
-            ) = (
-                widget_w.upgrade(), list_box_w.upgrade(), tag_box_w.upgrade(),
-                color_box_w.upgrade(), header_w.upgrade(), sep_w.upgrade(),
-                row_w.upgrade(),
+            if let (Some(tag_box), Some(tags_header), Some(tags_sep), Some(row)) = (
+                tag_box_w.upgrade(), header_w.upgrade(), sep_w.upgrade(), row_w.upgrade(),
             ) {
-                let lp = LeftPanel {
-                    widget, list_box, tag_box, color_box,
-                    color_suppress: color_suppress.clone(),
-                    tags_header, tags_sep,
+                let tp = TagPanel {
+                    tag_box, tags_header, tags_sep,
                     db_path: db.clone(), on_tags_changed: notify.clone(),
                 };
-                lp.show_tag_menu(&row, id, &name_owned, count, x, y);
+                tp.show_tag_menu(&row, id, &name_owned, count, x, y);
             }
         });
         row.add_controller(gesture);
@@ -550,7 +567,9 @@ impl LeftPanel {
         dialog.connect_response(None, move |_, resp| {
             if resp == "delete" { lp.delete_tag(id); }
         });
-        dialog.present(Some(&self.widget));
+        // Any widget in the tree resolves the root window; `tag_box` is always in
+        // it (TagPanel holds no top-level `widget` ref — m4-27).
+        dialog.present(Some(&self.tag_box));
     }
 
     /// Delete a tag and its associations (best-effort; logs faults), then refresh.

@@ -555,12 +555,29 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    not just a code comment. ui 108 tests, clippy unchanged. **Colour-label arc
    m4-19/20/21/23/24/25/26 now complete.**
 
-   **Candidate next increments after m4-26** (recorded so they survive a context
+   **m4-27** — `TagPanel` extraction / tag-menu cleanup (DONE). Pure refactor (no
+   behaviour change) that retires the "transient-`LeftPanel` reconstruction" smell
+   the m4-22/26 reviews flagged: the per-tag-row secondary-click gesture used to
+   rebuild a whole `LeftPanel` (supplying folder/colour-filter fields the rename/
+   delete menu ignores) to call `&self show_tag_menu`. Extracted a private
+   `TagPanel` struct holding EXACTLY the tag fields (`tag_box`, `tags_header`,
+   `tags_sep`, `db_path`, `on_tags_changed`) and moved the whole tag-mutation
+   cluster onto `impl TagPanel` (`set_on_tags_changed`, `fire_tags_changed`,
+   `refresh_tags`, `append_tag_tree_row`, `show_tag_menu`, `rename_tag_subtree`,
+   `confirm_delete_tag`, `delete_tag`). `LeftPanel` now holds `tags: TagPanel` and
+   delegates its unchanged public API (`refresh_tags`/`set_on_tags_changed`;
+   `clear_filter_highlights` reaches `self.tags.tag_box`). The gesture now rebuilds
+   a `TagPanel` from weak refs — nothing ignored; the `Clone`-and-reconstruct shape
+   is kept (a single strong `TagPanel` capture would re-form the cycle). `confirm_
+   delete_tag` presents its dialog off `self.tag_box` (any in-tree widget resolves
+   the root window) since `TagPanel` holds no top-level widget. Architect
+   (SHIP-WITH-NITS): behaviour-preservation clean pass on all runtime questions;
+   fixed the one blocking nit (the inserted `TagPanel` doc had orphaned `LeftPanel`'s
+   rustdoc — restored so the `pub` struct keeps its docs). ui 108 tests, clippy +
+   `cargo doc` clean.
+
+   **Candidate next increments after m4-27** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete):
-   - **`show_tag_menu` free-fn cleanup** — retire the transient-`LeftPanel`
-     reconstruction in the tag-row secondary-click gesture (now threads 2 leaf
-     fields it ignores); make `show_tag_menu` a free fn / small ctx over just the
-     tag fields it needs. Cost of the deferral is now visibly accruing (m4-26).
    - **Star rating in the darkroom single-image view** — reuse the m4-24 metadata-
      readout + m4-25 pop-sync pattern to add a 0–5 star control to the darkroom
      header (the view's first rating UI; would also extend the m4-25 pop handler to
