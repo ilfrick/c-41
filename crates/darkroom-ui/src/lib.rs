@@ -251,14 +251,16 @@ fn build_main_window(app: &Application) {
                 }
             }));
 
-            // m4-25: when a darkroom page is popped, its colour labels may have been
-            // toggled in that view; re-query the DB and repaint the returning grid
-            // cell so the lighttable doesn't show a stale dot row until it rebinds.
-            // Every page pushed past the lighttable root IS a darkroom page, and its
-            // tag carries the image path; we guard on the `/` just like the loaders.
+            // m4-25/m4-28: when a darkroom page is popped, its colour labels and/or
+            // star rating may have been changed in that view; re-query the DB and
+            // repaint the returning grid cell's dot + star rows so the lighttable
+            // doesn't show stale metadata until it rebinds. Every page pushed past
+            // the lighttable root IS a darkroom page, and its tag carries the image
+            // path; we guard on the `/` just like the loaders.
             nav.connect_popped(clone!(@weak grid, @strong db_path => move |_, page| {
                 if let Some(path) = page.tag().map(|s| s.to_string()).filter(|p| p.contains('/')) {
                     lighttable::refresh_color_dots_for_path(&grid, &db_path, &path);
+                    lighttable::refresh_stars_for_path(&grid, &db_path, &path);
                 }
             }));
 

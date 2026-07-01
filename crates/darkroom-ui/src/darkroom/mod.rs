@@ -1127,6 +1127,19 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     crate::lighttable::wire_color_clicks(&colors_box, file_path.to_string(), db_path.to_string());
     header.pack_end(&colors_box);
 
+    // ── Star-rating row (m4-28) ───────────────────────────────────────────
+    // Mirror the lighttable's 5-star row, left of the colour dots. Reuses the
+    // lighttable toolkit (build/set/wire, one source of truth). Unlike the colour
+    // row, `wire_star_clicks` repaints synchronously and has no async read-back, so
+    // it needs no `widget_name` stamp. Initial rating read synchronously, as above.
+    let stars_box = crate::lighttable::build_stars_box();
+    stars_box.set_margin_end(8);
+    stars_box.set_tooltip_text(Some("Star rating (click a star to set)"));
+    let initial_rating = crate::lighttable::query_rating(file_path, db_path).unwrap_or(0);
+    crate::lighttable::set_stars(&stars_box, initial_rating);
+    crate::lighttable::wire_star_clicks(&stars_box, file_path.to_string(), db_path.to_string());
+    header.pack_end(&stars_box);
+
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&content));

@@ -576,12 +576,40 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    rustdoc — restored so the `pub` struct keeps its docs). ui 108 tests, clippy +
    `cargo doc` clean.
 
-   **Candidate next increments after m4-27** (recorded so they survive a context
+   **m4-28** — star rating in the darkroom single-image view (DONE). Star analogue
+   of m4-24 (header readout + click) + m4-25 (pop-sync). A 5-star row in the darkroom
+   `HeaderBar`, `pack_end`ed left of the m4-24 colour dots (so L→R: stars, colours,
+   Export), reusing the lighttable star toolkit as one source of truth: extracted
+   `build_stars_box()` (factory setup now calls it; also adds an `AccessibleRole::
+   Group` + "Star rating" a11y label, inherited by every grid cell too) and bumped
+   `set_stars`/`wire_star_clicks`/`query_rating` to `pub(crate)`. Rating read
+   synchronously at open. **Unlike the colour dots, the star box needs NO
+   `widget_name` stamp**: `wire_star_clicks` repaints synchronously then persists
+   off-thread with no async read-back, so it has no recycle guard to satisfy.
+   Cross-view sync: generalised the m4-23 cell finder into `find_cell_row_for_path
+   (root, path, child_index)` (stars = idx 2, colours = idx 3; the dual thumb+row
+   `widget_name==path` guard holds for both), added `refresh_stars_for_path` (star
+   sibling of `refresh_color_dots_for_path`), and the m4-25 `connect_popped` handler
+   now refreshes BOTH. Architect (SHIP-WITH-NITS): applied the one data-safety fix —
+   new `open_rating_conn` gives `query_rating`/`save_rating` a 3s `busy_timeout`
+   (mirrors `open_colorlabels_conn`), since m4-28 adds a rating WRITE from the
+   darkroom header concurrent with the autosave writer → same `SQLITE_BUSY`
+   silent-drop race m4-24 fixed for colours; returns `Result` so `save_rating`
+   `?`-propagates. Toggle-to-zero intentionally NOT added (parity with the existing
+   lighttable star control; if wanted, do once in shared `wire_star_clicks` later).
+   The toggle-during-autosave race is display/timing-bound → not headless-verifiable
+   (busy_timeout narrows the window; the write result is still `let _`-discarded, as
+   on the colour path). ui 108 tests, clippy unchanged. **The darkroom single-image
+   view now shows + edits both rating and colour labels, syncing both to the grid.**
+
+   **Candidate next increments after m4-28** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete):
-   - **Star rating in the darkroom single-image view** — reuse the m4-24 metadata-
-     readout + m4-25 pop-sync pattern to add a 0–5 star control to the darkroom
-     header (the view's first rating UI; would also extend the m4-25 pop handler to
-     re-sync the cell's stars, not just its colour dots).
+   - **Star-rating keyboard shortcuts (0–5) in the lighttable** (darktable's 0–5
+     keys), analogous to the m4-23 F1–F5 colour keys — `toggle_selected_color` has a
+     `toggle_selected_rating` sibling waiting to be written.
+   - Log-on-failure for `save_rating`/`toggle_color_label` writes (both currently
+     `let _`-discard the off-thread write result; a `busy_timeout` post-expiry `Err`
+     is silent — bring writes up to the read paths' fault-logging).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.

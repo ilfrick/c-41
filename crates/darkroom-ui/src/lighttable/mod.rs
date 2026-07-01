@@ -45,16 +45,7 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
         label.add_css_class("caption");
 
         // Star rating row: 5 Labels "★"
-        let stars_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .spacing(1)
-            .halign(gtk4::Align::Center)
-            .build();
-        for _ in 0..5 {
-            let star = gtk4::Label::new(Some("\u{2605}"));  // ★
-            star.add_css_class("dim-label");
-            stars_box.append(&star);
-        }
+        let stars_box = build_stars_box();
 
         // Colour-label row: 5 filled-circle Labels, coloured via Pango markup.
         let colors_box = build_color_dots_box();
@@ -206,7 +197,32 @@ fn nth_child(b: &gtk4::Box, n: usize) -> Option<gtk4::Widget> {
     child
 }
 
-fn set_stars(stars_box: &gtk4::Box, rating: u8) {
+/// Build a fresh star-rating row: 5 unlit `★` `Label`s in a centred horizontal
+/// box. One source of truth for the star-row layout shared by the lighttable grid
+/// cells and the darkroom header (m4-28); the caller seeds the lit count via
+/// [`set_stars`] and wires click-to-rate via [`wire_star_clicks`]. `pub(crate)`
+/// so the darkroom view reuses the exact construction (mirrors `build_color_dots_box`).
+pub(crate) fn build_stars_box() -> gtk4::Box {
+    let stars_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(1)
+        .halign(gtk4::Align::Center)
+        .build();
+    // The stars are pure glyphs; give the row a group role + name so assistive
+    // tech announces it in both the grid cells and the darkroom header.
+    stars_box.set_accessible_role(gtk4::AccessibleRole::Group);
+    stars_box.update_property(&[gtk4::accessible::Property::Label("Star rating")]);
+    for _ in 0..5 {
+        let star = gtk4::Label::new(Some("\u{2605}")); // ★
+        star.add_css_class("dim-label");
+        stars_box.append(&star);
+    }
+    stars_box
+}
+
+/// Paint the first `rating` stars lit (accent) and the rest dim. `pub(crate)` so
+/// the darkroom header (m4-28) seeds its star row from the same rating.
+pub(crate) fn set_stars(stars_box: &gtk4::Box, rating: u8) {
     let mut child = stars_box.first_child();
     let mut i = 0u8;
     while let Some(w) = child {
@@ -243,8 +259,11 @@ fn clear_click_gestures(w: &gtk4::Widget) {
 }
 
 /// Attach GestureClick to each star so clicking star k sets rating k. Strips the
-/// prior bind's gestures first (see `clear_click_gestures`).
-fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path: String) {
+/// prior bind's gestures first (see `clear_click_gestures`). Repaints synchronously
+/// then persists off-thread — no async read-back, so (unlike `wire_color_clicks`)
+/// it needs no `widget_name` recycle guard and works on a static box too.
+/// `pub(crate)` so the darkroom header (m4-28) reuses the exact click-to-rate wiring.
+pub(crate) fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path: String) {
     let mut child = stars_box.first_child();
     let mut k = 0u8;
     while let Some(w) = child {
@@ -273,9 +292,25 @@ fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path: String) {
     }
 }
 
-fn query_rating(full_path: &str, db_path: &str) -> Option<u8> {
+/// Read an image's 0–5 star rating (from `images.flags` bits 1–3) by path, or
+/// `None` for the empty/absent db or an unresolvable path. `pub(crate)` so the
+/// darkroom header (m4-28) seeds its star row on image open.
+/// Open the rating DB connection with a 3s `busy_timeout` so a rating read/write
+/// waits out a transient lock instead of failing immediately. Matters now that the
+/// darkroom header (m4-28) can set a rating while the same view's debounced
+/// autosave/history writer holds the DB — default SQLite returns `SQLITE_BUSY` at
+/// once, silently dropping the write; the timeout lets it retry. Rating sibling of
+/// [`open_colorlabels_conn`]; returns a `Result` (not `Option`) so `save_rating`
+/// can `?`-propagate the real open error while `query_rating` maps it with `.ok()`.
+fn open_rating_conn(db_path: &str) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
+    Ok(conn)
+}
+
+pub(crate) fn query_rating(full_path: &str, db_path: &str) -> Option<u8> {
     if db_path.is_empty() { return None; }
-    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let conn = open_rating_conn(db_path).ok()?;
     let p    = std::path::Path::new(full_path);
     let filename = p.file_name()?.to_str()?;
     let folder   = p.parent()?.to_str()?;
@@ -291,7 +326,7 @@ fn query_rating(full_path: &str, db_path: &str) -> Option<u8> {
 
 fn save_rating(full_path: &str, db_path: &str, rating: u8) -> rusqlite::Result<()> {
     if db_path.is_empty() { return Ok(()); }
-    let conn     = rusqlite::Connection::open(db_path)?;
+    let conn     = open_rating_conn(db_path)?;
     let p        = std::path::Path::new(full_path);
     let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let folder   = p.parent().and_then(|d| d.to_str()).unwrap_or("");
@@ -502,6 +537,25 @@ pub fn refresh_color_dots_for_path(grid: &GridView, db_path: &str, path: &str) {
     }));
 }
 
+/// Re-read an image's star rating from the DB and repaint its realized grid cell's
+/// star row in place (m4-28). Star sibling of [`refresh_color_dots_for_path`], used
+/// by the same `NavigationView` pop handler so a rating changed in the darkroom
+/// single-image view shows in the lighttable on return. No-op if the cell isn't
+/// realized; the next bind paints it from the DB.
+pub fn refresh_stars_for_path(grid: &GridView, db_path: &str, path: &str) {
+    let db = db_path.to_string();
+    let path = path.to_string();
+    glib::spawn_future_local(clone!(@weak grid => async move {
+        let p   = path.clone();
+        let db2 = db.clone();
+        let rating = gio::spawn_blocking(move || query_rating(&p, &db2))
+            .await.ok().flatten().unwrap_or(0);
+        if let Some(stars) = find_stars_box_for_path(grid.upcast_ref::<gtk4::Widget>(), &path) {
+            set_stars(&stars, rating);
+        }
+    }));
+}
+
 /// Repaint the colour-dot row bound to `path` among the grid's *realized* cells,
 /// from `mask`. The keyboard toggle (unlike the per-dot click handlers) holds no
 /// reference to the cell's `colors_box`, so it locates the row here. Cells are
@@ -515,13 +569,14 @@ fn repaint_color_dots_for_path(grid: &GridView, path: &str, mask: u8) {
     }
 }
 
-/// Depth-first search of `root`'s descendants for the colour-dot `Box` of the cell
+/// Depth-first search of `root`'s descendants for a per-cell metadata row `Box`
+/// (`child_index` within the cell vbox: 2 = stars, 3 = colour dots) of the cell
 /// currently bound to `path`. A cell vbox is recognised by its first child being
-/// the thumbnail `Picture`; its 4th child (index 3) is the colour row. Returns the
-/// first match, or `None` if no realized cell is showing `path`.
+/// the thumbnail `Picture`. Returns the first match, or `None` if no realized cell
+/// is showing `path`.
 ///
 /// `widget_name` is the bind-time stamp and is shared by the cell's thumb/stars/
-/// colour widgets, so we require BOTH the thumb AND the colour row to carry `path`
+/// colour widgets, so we require BOTH the thumb AND the target row to carry `path`
 /// — a single stale stamp (a cell mid-recycle, where the bind hasn't re-stamped
 /// every child yet) can't then mis-target a neighbouring cell. Cross-*cell*
 /// uniqueness still rests on grid paths being distinct, the same assumption
@@ -529,26 +584,36 @@ fn repaint_color_dots_for_path(grid: &GridView, path: &str, mask: u8) {
 /// rows today, so at most one realized cell carries a given `path`. Worst case if
 /// that ever breaks is a transient repaint of a duplicate's twin that self-heals
 /// on its next bind — the DB write (the source of truth) is unaffected.
-fn find_color_box_for_path(root: &gtk4::Widget, path: &str) -> Option<gtk4::Box> {
+fn find_cell_row_for_path(root: &gtk4::Widget, path: &str, child_index: usize) -> Option<gtk4::Box> {
     let mut child = root.first_child();
     while let Some(w) = child {
         if let Some(vbox) = w.downcast_ref::<gtk4::Box>() {
             if let Some(thumb) = vbox.first_child().and_downcast::<gtk4::Picture>() {
                 if thumb.widget_name().as_str() == path {
-                    if let Some(colors) = nth_child(vbox, 3).and_downcast::<gtk4::Box>() {
-                        if colors.widget_name().as_str() == path {
-                            return Some(colors);
+                    if let Some(row) = nth_child(vbox, child_index).and_downcast::<gtk4::Box>() {
+                        if row.widget_name().as_str() == path {
+                            return Some(row);
                         }
                     }
                 }
             }
         }
-        if let Some(found) = find_color_box_for_path(&w, path) {
+        if let Some(found) = find_cell_row_for_path(&w, path, child_index) {
             return Some(found);
         }
         child = w.next_sibling();
     }
     None
+}
+
+/// Colour-dot row (4th child, index 3) of the realized cell bound to `path`.
+fn find_color_box_for_path(root: &gtk4::Widget, path: &str) -> Option<gtk4::Box> {
+    find_cell_row_for_path(root, path, 3)
+}
+
+/// Star-rating row (3rd child, index 2) of the realized cell bound to `path`.
+fn find_stars_box_for_path(root: &gtk4::Widget, path: &str) -> Option<gtk4::Box> {
+    find_cell_row_for_path(root, path, 2)
 }
 
 /// Toggle one colour label for an image (by path) and return the resulting mask
