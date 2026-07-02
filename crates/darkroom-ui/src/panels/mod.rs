@@ -473,6 +473,19 @@ impl TagPanel {
         hint.add_css_class("caption");
         vbox.append(&hint);
 
+        // Inline failure message (m4-32): a rename collision keeps the popover
+        // open and shows why here, rather than dismissing to a modal. Hidden
+        // until a rename actually fails.
+        let error_label = gtk4::Label::builder()
+            .halign(gtk4::Align::Start)
+            .wrap(true)
+            .max_width_chars(28)
+            .visible(false)
+            .build();
+        error_label.add_css_class("error");
+        error_label.add_css_class("caption");
+        vbox.append(&error_label);
+
         let rename_btn = gtk4::Button::with_label("Rename");
         rename_btn.add_css_class("suggested-action");
         vbox.append(&rename_btn);
@@ -492,16 +505,35 @@ impl TagPanel {
             let lp = self.clone();
             let pop = popover.clone();
             let entry = entry.clone();
+            let err_lbl = error_label.clone();
             let old_full = name.to_string();
             move || {
-                // Read the entry, then dismiss the popover BEFORE refresh_tags
-                // removes its parent row — so no orphaned subtree exists mid-call.
                 // respliced_tag_path re-attaches the fixed parent prefix and
-                // returns None for a blank/unchanged segment (no needless write).
+                // returns None for a blank/unchanged/`|` segment (a no-op edit —
+                // treat as cancel and just dismiss).
                 let new_segment = entry.text().to_string();
-                pop.popdown();
-                if let Some(new_full) = respliced_tag_path(&old_full, &new_segment) {
-                    lp.rename_tag_subtree(&old_full, &new_full);
+                let Some(new_full) = respliced_tag_path(&old_full, &new_segment) else {
+                    pop.popdown();
+                    return;
+                };
+                match lp.write_tag_rename(&old_full, &new_full) {
+                    // Success: dismiss BEFORE refresh_tags removes the popover's
+                    // parent row, so no orphaned subtree exists mid-call.
+                    Ok(()) => {
+                        pop.popdown();
+                        lp.refresh_tags();
+                        lp.fire_tags_changed();
+                    }
+                    // Failure (UNIQUE clash → atomic rollback, or db open error):
+                    // nothing changed, so keep the popover open, show why, and
+                    // refocus the entry so the user can correct the name in place.
+                    Err(e) => {
+                        eprintln!("darkroom: tag rename failed: {e}");
+                        err_lbl.set_text(&rename_failure_message(&e, &new_full));
+                        err_lbl.set_visible(true);
+                        entry.grab_focus();
+                        entry.select_region(0, -1);
+                    }
                 }
             }
         };
@@ -512,6 +544,18 @@ impl TagPanel {
         entry.connect_activate({
             let f = do_rename.clone();
             move |_| f()
+        });
+        // Clear a stale failure message once the user edits the name — the label
+        // should reflect only the last submit, not linger during correction. The
+        // closure param IS this entry, so nothing extra is captured (only a weak
+        // ref to the label, which lives in the same popover subtree).
+        entry.connect_changed({
+            let err_lbl = error_label.downgrade();
+            move |_| {
+                if let Some(l) = err_lbl.upgrade() {
+                    l.set_visible(false);
+                }
+            }
         });
 
         // Delete (confirmed) on button click.
@@ -531,44 +575,22 @@ impl TagPanel {
         popover.popup();
     }
 
-    /// Rename a tag's segment library-wide, rewriting the whole `old_full`→
-    /// `new_full` subtree so descendants move with it. Only refresh the list and
-    /// fire the change notify when the rename actually succeeded: the underlying
-    /// UPDATE is atomic, so a UNIQUE-name clash (the destination path or a
-    /// descendant's already exists) rolls back leaving every tag unchanged — in
-    /// that case we surface the reason in a dialog (m4-31) and skip the refresh,
-    /// which would otherwise spuriously re-run the active filter over a no-op.
-    fn rename_tag_subtree(&self, old_full: &str, new_full: &str) {
-        if self.db_path.is_empty() { return; }
-        match rusqlite::Connection::open(&self.db_path) {
-            Ok(conn) => match darkroom_db::tags::tag_rename_subtree(&conn, old_full, new_full) {
-                Ok(_) => {
-                    self.refresh_tags();
-                    self.fire_tags_changed();
-                }
-                Err(e) => {
-                    eprintln!("darkroom: tag rename failed: {e}");
-                    self.show_rename_error(new_full, &e);
-                }
-            },
-            Err(e) => eprintln!("darkroom: cannot open library db to rename tag: {e}"),
-        }
-    }
-
-    /// Report a failed subtree rename in a dismiss-only `AlertDialog`, presented
-    /// off `tag_box` like [`confirm_delete_tag`] (any in-tree widget resolves the
-    /// root window; TagPanel holds no top-level ref — m4-27). The message is built
-    /// by the pure [`rename_failure_message`] so the common duplicate-name case is
-    /// named specifically.
-    fn show_rename_error(&self, new_full: &str, err: &rusqlite::Error) {
-        let dialog = adw::AlertDialog::new(
-            Some("Rename failed"),
-            Some(&rename_failure_message(err, new_full)),
-        );
-        dialog.add_responses(&[("ok", "OK")]);
-        dialog.set_default_response(Some("ok"));
-        dialog.set_close_response("ok");
-        dialog.present(Some(&self.tag_box));
+    /// Write half of a subtree rename: open the library db and run the atomic
+    /// `tag_rename_subtree` UPDATE (rewriting the whole `old_full`→`new_full`
+    /// subtree so descendants move with it), returning the DB outcome and
+    /// touching NO UI. `Ok(())` = the rewrite committed; `Err` = nothing changed
+    /// — either a UNIQUE-name clash (the destination path or a descendant's
+    /// already exists; the UPDATE is atomic so it rolls back leaving every tag
+    /// unchanged) or the db couldn't open. The caller (the rename popover)
+    /// orchestrates the UI: on `Ok` it dismisses BEFORE `refresh_tags` (so the
+    /// popover's parent row isn't removed mid-call → no orphaned subtree), on
+    /// `Err` it keeps the popover open and shows [`rename_failure_message`] inline
+    /// (m4-32). An empty `db_path` (demo mode, no library) is a no-op `Ok`.
+    fn write_tag_rename(&self, old_full: &str, new_full: &str) -> rusqlite::Result<()> {
+        if self.db_path.is_empty() { return Ok(()); }
+        let conn = rusqlite::Connection::open(&self.db_path)?;
+        darkroom_db::tags::tag_rename_subtree(&conn, old_full, new_full)?;
+        Ok(())
     }
 
     /// Confirm, then delete a tag and all its image associations.
@@ -655,8 +677,9 @@ fn respliced_tag_path(full_name: &str, new_segment: &str) -> Option<String> {
 /// `places`→`europe` can fail because `europe|Italy` exists though no `europe`
 /// does), so the message says "would clash" rather than asserting `new_full`
 /// itself already exists. Any other DB error gets a generic message. Pure so the
-/// (display-bound) [`show_rename_error`](TagPanel::show_rename_error) dialog has
-/// a unit-testable core.
+/// rename popover's (display-bound) inline error label — set in `show_tag_menu`
+/// on a failed [`write_tag_rename`](TagPanel::write_tag_rename) — has a
+/// unit-testable core.
 fn rename_failure_message(err: &rusqlite::Error, new_full: &str) -> String {
     match err {
         rusqlite::Error::SqliteFailure(e, _)

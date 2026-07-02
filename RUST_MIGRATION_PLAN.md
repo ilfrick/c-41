@@ -653,13 +653,43 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    in the reworded message + a darkroom-db regression test pinning the load-bearing
    invariant (parent rename onto an existing name aborts, leaving parent+descendant
    intact). Primary `code == ConstraintViolation` is sufficient (only the name
-   UNIQUE index can trip this UPDATE). Deferred (backlog): keep the popover open
-   with an inline error on failure instead of a modal (needs run-rename-then-branch
-   ordering — popdown before refresh only on success). db 85 tests (+1), ui 112
-   tests (+1), clippy unchanged.
+   UNIQUE index can trip this UPDATE). db 85 tests (+1), ui 112 tests (+1),
+   clippy unchanged.
 
-   **Candidate next increments after m4-31** (recorded so they survive a context
+   **m4-32** — rename-failure inline UX (supersedes m4-31's modal) (DONE).
+   Implements the exact deferred design from the m4-31 review: run the rename
+   FIRST, branch on the result. Split the DB write into a UI-free
+   `write_tag_rename -> rusqlite::Result<()>` (open db + atomic DAO UPDATE, touches
+   no widgets); the popover's `do_rename` closure orchestrates: `Ok` → `popdown()`
+   BEFORE `refresh_tags` (the ordering trap — dismiss before the refresh removes the
+   popover's parent row, else orphaned subtree) + notify; `Err` → keep the popover
+   open, set+show an inline `error_label` (`.error`/`.caption`, hidden until
+   failure) via the pure `rename_failure_message`, `grab_focus`+`select_region(0,-1)`
+   so the user corrects in place. Removed the m4-31 `show_rename_error` AlertDialog +
+   the old `rename_tag_subtree`; repointed the `rename_failure_message` doc intra-link
+   (m4-27 lesson: `cargo doc` after doc-link changes — verified no NEW broken-link
+   warning). Added clear-on-`changed` (label hides once the user edits — standard
+   inline-validation convention; closure captures only a weak label ref). Architect
+   (Opus) **SHIP, no blockers** (faithful; failure-path lifetime clean —
+   `write_tag_rename` drops its own conn, no borrow across the UI mutation). No new
+   test (pure `rename_failure_message` already covered; orchestration is a trivial
+   display-bound 2-arm match — architect agreed no seam worth extracting). ui 112
+   tests, clippy unchanged. **Deferred follow-ups the architect flagged (neither
+   blocking, can land together — both touch the popover handlers):** (a) **pre-existing
+   cyclic-capture popover leak** — the rename/delete button + entry-activate handlers
+   capture `pop`/`entry` STRONGLY, so the popover subtree leaks on every right-click
+   (self-cycle prevents disposal); fix by weak-capturing `pop`/`entry`/`err_lbl` and
+   `upgrade()` inside, matching `append_tag_tree_row`'s existing row-gesture
+   discipline (`lp` can stay strong — its `tag_box` lives outside the popover). NOT a
+   regression from m4-32. (b) **a11y**: associate the error label with the entry
+   (`accessible::Relation::ErrorMessage` + `State::Invalid`) so screen readers
+   announce the reason on the focus move — deferred to get the version-sensitive
+   gtk4-rs signature right rather than guess.
+
+   **Candidate next increments after m4-32** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete):
+   - **Popover handler weak-capture fix + a11y error relation** (m4-32 (a)+(b)
+     above) — one focused increment over the same handlers.
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
    - Rename-failure UX: keep the popover open + inline error (see m4-31 deferred).
