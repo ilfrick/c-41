@@ -686,13 +686,38 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    announce the reason on the focus move — deferred to get the version-sensitive
    gtk4-rs signature right rather than guess.
 
-   **Candidate next increments after m4-32** (recorded so they survive a context
-   clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete):
-   - **Popover handler weak-capture fix + a11y error relation** (m4-32 (a)+(b)
-     above) — one focused increment over the same handlers.
+   **m4-33** — popover handler weak-capture leak fix + a11y error relation
+   (closes both m4-32 deferred follow-ups in one increment over the same handlers)
+   (DONE). **(a) Leak:** the tag rename/delete popover is `set_parent`ed into a
+   `tag_box` row, and its `do_rename`/delete closures (stored on the popover's own
+   buttons + entry) captured `pop`/`entry`/`err_lbl` STRONGLY → a self-cycle
+   (popover→button→handler→closure→pop→popover) kept the whole popover alive after
+   `connect_closed`'s `unparent` — one leaked popover per right-click. Fix:
+   `downgrade()` those three to weak in every subtree-resident handler,
+   `upgrade()`-or-`return` inside; `lp` (TagPanel) stays strong — its `tag_box`
+   lives OUTSIDE the popover subtree, and `unparent` severs the row→popover edge so
+   the `lp` arm points strictly outward, never cycling back. Matches
+   `append_tag_tree_row`'s existing `downgrade()` discipline (explicit weak/upgrade,
+   NOT `clone!` — CLAUDE.md flags that deprecation as out-of-scope). **(b) a11y:**
+   `entry.update_relation(Relation::ErrorMessage(&[error_label]))` set once
+   (permanent association) + `State::Invalid(True)` on failure / `(False)` on
+   `changed`, the ARIA contract (errormessage only surfaced while invalid) so a
+   screen reader announces the reason on the error-path `grab_focus`. **gtk4-rs
+   0.9.7 gotcha (compiler-verified): `Relation::ErrorMessage` takes `&[&Accessible]`
+   (a many-targets SLICE), not the single ref first assumed — upcast the label into
+   a 1-element slice.** Architect (Opus) **SHIP, correct & complete, no must-fix**;
+   traced every subtree handler (cycle fully broken), confirmed the failure-path
+   `grab_focus`/`select_region`/`set_text` don't emit `changed` so `Invalid=True`
+   isn't self-clobbered, and actively recommended AGAINST gating `Invalid=False`
+   (idempotent no-op; a captured bool for zero benefit). No new test (pure
+   lifetime/a11y plumbing, display-bound; `rename_failure_message` + DB-rollback
+   tests remain the coverage boundary). ui 112 tests, clippy unchanged.
+
+   **Candidate next increments after m4-33** (recorded so they survive a context
+   clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
+   the tag rename/delete popover is now leak-free + a11y-complete):
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
-   - Rename-failure UX: keep the popover open + inline error (see m4-31 deferred).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in

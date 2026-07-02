@@ -485,6 +485,13 @@ impl TagPanel {
         error_label.add_css_class("error");
         error_label.add_css_class("caption");
         vbox.append(&error_label);
+        // a11y: relate the error label to the entry so a screen reader announces
+        // the reason when focus moves to the entry on a failed rename. Per ARIA,
+        // an error message is only surfaced while the field is marked invalid, so
+        // the Invalid state is toggled with the label's visibility below.
+        entry.update_relation(&[gtk4::accessible::Relation::ErrorMessage(&[
+            error_label.upcast_ref::<gtk4::Accessible>(),
+        ])]);
 
         let rename_btn = gtk4::Button::with_label("Rename");
         rename_btn.add_css_class("suggested-action");
@@ -501,13 +508,26 @@ impl TagPanel {
 
         // Rename on button click or Enter in the entry (skipped if blank or
         // unchanged — no needless write/refresh).
+        //
+        // Weak captures for `pop`/`entry`/`err_lbl`: all three live in THIS
+        // popover's subtree, and this closure is stored in the button/entry signal
+        // handlers (also in the subtree), so capturing them strongly would form a
+        // self-cycle (e.g. popover→button→handler→closure→pop→popover) that keeps
+        // the whole popover alive after `unparent` — leaking one popover per
+        // right-click. `lp` stays strong: `TagPanel`'s `tag_box` lives OUTSIDE the
+        // popover subtree, so it can't close a cycle back to the popover, which is
+        // then freed on unparent. Mirrors `append_tag_tree_row`'s row-gesture
+        // discipline. Upgrades fail only if the popover is already gone → no-op.
         let do_rename = {
             let lp = self.clone();
-            let pop = popover.clone();
-            let entry = entry.clone();
-            let err_lbl = error_label.clone();
+            let pop_w = popover.downgrade();
+            let entry_w = entry.downgrade();
+            let err_lbl_w = error_label.downgrade();
             let old_full = name.to_string();
             move || {
+                let (Some(pop), Some(entry), Some(err_lbl)) =
+                    (pop_w.upgrade(), entry_w.upgrade(), err_lbl_w.upgrade())
+                else { return };
                 // respliced_tag_path re-attaches the fixed parent prefix and
                 // returns None for a blank/unchanged/`|` segment (a no-op edit —
                 // treat as cancel and just dismiss).
@@ -531,6 +551,9 @@ impl TagPanel {
                         eprintln!("darkroom: tag rename failed: {e}");
                         err_lbl.set_text(&rename_failure_message(&e, &new_full));
                         err_lbl.set_visible(true);
+                        entry.update_state(&[gtk4::accessible::State::Invalid(
+                            gtk4::AccessibleInvalidState::True,
+                        )]);
                         entry.grab_focus();
                         entry.select_region(0, -1);
                     }
@@ -551,20 +574,28 @@ impl TagPanel {
         // ref to the label, which lives in the same popover subtree).
         entry.connect_changed({
             let err_lbl = error_label.downgrade();
-            move |_| {
+            move |e| {
                 if let Some(l) = err_lbl.upgrade() {
                     l.set_visible(false);
                 }
+                // Clear the a11y invalid marker in step with the hidden label.
+                e.update_state(&[gtk4::accessible::State::Invalid(
+                    gtk4::AccessibleInvalidState::False,
+                )]);
             }
         });
 
-        // Delete (confirmed) on button click.
+        // Delete (confirmed) on button click. Same weak-`pop` discipline as the
+        // rename handler (this closure lives on `delete_btn`, a popover child, so a
+        // strong `pop` would self-cycle and leak the popover); `lp` stays strong.
         {
             let lp = self.clone();
-            let pop = popover.clone();
+            let pop_w = popover.downgrade();
             let name_owned = name.to_string();
             delete_btn.connect_clicked(move |_| {
-                pop.popdown();
+                if let Some(pop) = pop_w.upgrade() {
+                    pop.popdown();
+                }
                 lp.confirm_delete_tag(id, &name_owned, count);
             });
         }
