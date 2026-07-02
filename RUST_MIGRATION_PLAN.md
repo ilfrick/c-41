@@ -713,9 +713,39 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    lifetime/a11y plumbing, display-bound; `rename_failure_message` + DB-rollback
    tests remain the coverage boundary). ui 112 tests, clippy unchanged.
 
-   **Candidate next increments after m4-33** (recorded so they survive a context
+   **m4-34** — camera-RGB → sRGB colour matrix in the preview pipeline (pipeline
+   depth, user-chosen direction) (DONE). The Rust preview path (`rawimage::
+   to_linear_rgba`, separate from the C FFI port) ignored the camera colour matrix,
+   treating camera-native RGB as linear sRGB → wrong colours. Now derive camera→sRGB
+   from `rawloader`'s `xyz_to_cam` and apply it after WB. Pure `darkroom-core`, no
+   UI/persistence churn. New `srgb_from_cam_matrix(xyz_to_cam:[[f32;3];4]) ->
+   [[f32;3];3]` follows dcraw's `cam_xyz_coeff`: `cam_rgb = xyz_to_cam·XYZ_RGB`
+   (sRGB→XYZ, dcraw constants) → row-normalise (neutral-preserving) → `mat3_inverse`
+   → camera→sRGB; `IDENTITY3` fallback on all-zero (unknown camera) or singular.
+   Uses top 3 rows (RGB/X-Trans are 3-colour; 4th row ignored). `apply_color_matrix`
+   per-pixel after `apply_white_balance` in `to_linear_rgba` (order = darktable
+   WB→input-profile; exact no-op for IDENTITY3, so the synthetic/demo path is
+   unchanged). Negatives left unclamped for the scene-linear tone map (darktable
+   input-profile behaviour). Architect (Opus) verified the construction line-by-line
+   vs dcraw (square-case inverse == pseudoinverse) — **SHIP after one should-fix**:
+   the neutral test can't catch a wrong matrix (grey is preserved by construction
+   for ANY invertible row-normalised matrix), so added a **golden regression** —
+   Canon 5D Mk III `xyz_to_cam` (dcraw `adobe_coeff`) → expected camera→sRGB from an
+   independent pure-Python dcraw impl; a transposed multiply / wrong constant /
+   inversion bug all diverge from it (the non-symmetric matrix locks multiply
+   order). darkroom-core 509→514 tests (+5), clippy clean.
+   **KNOWN SIMPLIFICATION (architect-flagged, deferred):** the working space is
+   sRGB primaries, so saturation ops (velvia, sigmoid) push colours out-of-gamut /
+   negative sooner than darktable's Rec.2020 pipe would — fine for a preview; widen
+   to a larger working gamut later.
+
+   **Candidate next increments after m4-34** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
+   - **Pipeline depth (continue):** wider working-space gamut (Rec.2020) so
+     saturation/tone ops have headroom before clipping (see m4-34 simplification);
+     or a higher-quality Bayer demosaic in the preview path (currently PPG); or
+     geometry IOPs (crop/rotate) needing an ROI/(w,h)-aware pipeline.
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
