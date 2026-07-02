@@ -532,21 +532,43 @@ impl TagPanel {
     }
 
     /// Rename a tag's segment library-wide, rewriting the whole `old_full`→
-    /// `new_full` subtree so descendants move with it (best-effort; a UNIQUE-name
-    /// clash with an existing destination path logs and — because the underlying
-    /// UPDATE is atomic — leaves every tag unchanged), then refresh the list.
+    /// `new_full` subtree so descendants move with it. Only refresh the list and
+    /// fire the change notify when the rename actually succeeded: the underlying
+    /// UPDATE is atomic, so a UNIQUE-name clash (the destination path or a
+    /// descendant's already exists) rolls back leaving every tag unchanged — in
+    /// that case we surface the reason in a dialog (m4-31) and skip the refresh,
+    /// which would otherwise spuriously re-run the active filter over a no-op.
     fn rename_tag_subtree(&self, old_full: &str, new_full: &str) {
         if self.db_path.is_empty() { return; }
         match rusqlite::Connection::open(&self.db_path) {
-            Ok(conn) => {
-                if let Err(e) = darkroom_db::tags::tag_rename_subtree(&conn, old_full, new_full) {
-                    eprintln!("darkroom: tag rename failed (duplicate name?): {e}");
+            Ok(conn) => match darkroom_db::tags::tag_rename_subtree(&conn, old_full, new_full) {
+                Ok(_) => {
+                    self.refresh_tags();
+                    self.fire_tags_changed();
                 }
-            }
+                Err(e) => {
+                    eprintln!("darkroom: tag rename failed: {e}");
+                    self.show_rename_error(new_full, &e);
+                }
+            },
             Err(e) => eprintln!("darkroom: cannot open library db to rename tag: {e}"),
         }
-        self.refresh_tags();
-        self.fire_tags_changed();
+    }
+
+    /// Report a failed subtree rename in a dismiss-only `AlertDialog`, presented
+    /// off `tag_box` like [`confirm_delete_tag`] (any in-tree widget resolves the
+    /// root window; TagPanel holds no top-level ref — m4-27). The message is built
+    /// by the pure [`rename_failure_message`] so the common duplicate-name case is
+    /// named specifically.
+    fn show_rename_error(&self, new_full: &str, err: &rusqlite::Error) {
+        let dialog = adw::AlertDialog::new(
+            Some("Rename failed"),
+            Some(&rename_failure_message(err, new_full)),
+        );
+        dialog.add_responses(&[("ok", "OK")]);
+        dialog.set_default_response(Some("ok"));
+        dialog.set_close_response("ok");
+        dialog.present(Some(&self.tag_box));
     }
 
     /// Confirm, then delete a tag and all its image associations.
@@ -623,6 +645,30 @@ fn respliced_tag_path(full_name: &str, new_segment: &str) -> Option<String> {
         Some(p) => format!("{p}|{new_segment}"),
         None => new_segment.to_string(),
     })
+}
+
+/// Turn a `tag_rename_subtree` failure into a user-facing message. A SQLite
+/// `ConstraintViolation` means the UNIQUE `data.tags.name` index rejected the
+/// rewrite — some rewritten path already exists — so the atomic UPDATE rolled
+/// back and nothing changed; that common case gets its own wording. NOTE the
+/// clash may be a *descendant's* new path, not `new_full` itself (renaming
+/// `places`→`europe` can fail because `europe|Italy` exists though no `europe`
+/// does), so the message says "would clash" rather than asserting `new_full`
+/// itself already exists. Any other DB error gets a generic message. Pure so the
+/// (display-bound) [`show_rename_error`](TagPanel::show_rename_error) dialog has
+/// a unit-testable core.
+fn rename_failure_message(err: &rusqlite::Error, new_full: &str) -> String {
+    match err {
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            format!(
+                "Renaming to \u{201c}{new_full}\u{201d} would clash with an \
+                 existing tag. Nothing was renamed."
+            )
+        }
+        _ => format!("The tag could not be renamed to \u{201c}{new_full}\u{201d}."),
+    }
 }
 
 /// One row of the hierarchical tag display, in pre-order render order.
@@ -1239,6 +1285,24 @@ mod tests {
 
     fn t(id: u32, name: &str, count: i64) -> (u32, String, i64) {
         (id, name.to_string(), count)
+    }
+
+    #[test]
+    fn rename_failure_message_flags_the_clash_only_for_constraint_violations() {
+        // A UNIQUE clash (SQLITE_CONSTRAINT == 19) → the clash message, echoing
+        // the destination path but only claiming a clash (not that new_full
+        // itself exists — the collision may be a descendant's rewritten path).
+        let dup = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(19), None);
+        let msg = rename_failure_message(&dup, "places|Italy");
+        assert!(msg.contains("clash"), "{msg}");
+        assert!(msg.contains("places|Italy"), "{msg}");
+
+        // Any other error → the generic message, never claiming a clash.
+        let other = rusqlite::Error::QueryReturnedNoRows;
+        let msg = rename_failure_message(&other, "places|Italy");
+        assert!(!msg.contains("clash"), "{msg}");
+        assert!(msg.contains("could not be renamed"), "{msg}");
+        assert!(msg.contains("places|Italy"), "{msg}");
     }
 
     #[test]

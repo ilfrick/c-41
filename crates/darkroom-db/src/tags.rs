@@ -370,6 +370,23 @@ mod tests {
     }
 
     #[test]
+    fn rename_subtree_parent_collision_leaves_descendants_intact() {
+        let db = open_test_db();
+        // Renaming the parent `a` → `b` rewrites `a`→`b` AND `a|x`→`b|x`; the
+        // existing `b` makes the parent row collide, so the atomic UPDATE aborts.
+        // This is the subtree case the UI's m4-31 dialog rests on: the clash is on
+        // the renamed node itself, yet a DESCENDANT exists — pin that it's Err and
+        // every row (parent + child) is exactly as it started (nothing renamed).
+        let a  = tag_new(&db, "a").unwrap().unwrap();
+        let ax = tag_new(&db, "a|x").unwrap().unwrap();
+        let b  = tag_new(&db, "b").unwrap().unwrap();
+        assert!(tag_rename_subtree(&db, "a", "b").is_err());
+        assert_eq!(tag_get_name(&db, a).unwrap().as_deref(),  Some("a"));
+        assert_eq!(tag_get_name(&db, ax).unwrap().as_deref(), Some("a|x"));
+        assert_eq!(tag_get_name(&db, b).unwrap().as_deref(),  Some("b"));
+    }
+
+    #[test]
     fn rename_subtree_deepening_collision_aborts_atomically() {
         let db = open_test_db();
         // The UI forbids a `|` in the segment so this can't be reached from the

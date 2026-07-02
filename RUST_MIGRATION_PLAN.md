@@ -638,10 +638,31 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    filed inline: a single DB-writer thread would bound pool use + coalesce. ui 111
    tests (1 new: `path_write_lock` same-Arc/distinct-Arc), clippy unchanged.
 
-   **Candidate next increments after m4-30** (recorded so they survive a context
+   **m4-31** — surface a tag rename collision to the user (closes the long-standing
+   m4-18 S2 backlog) (DONE). `tag_rename_subtree`'s UNIQUE clash used to only
+   `eprintln!` then unconditionally `refresh_tags`/`fire_tags_changed` — a silent
+   no-op rename plus a spurious active-filter reapply. Now branch on the DAO
+   result: `Ok` → refresh+notify as before; `Err` → log + `show_rename_error`
+   (a dismiss-only `adw::AlertDialog` presented off `tag_box`, mirroring
+   `confirm_delete_tag`) and NO refresh (the atomic UPDATE rolled back → nothing
+   changed; single-autocommit-statement so `Err` ⇒ zero rows changed, no
+   false-skip). Message from pure `rename_failure_message(err, new_full)`:
+   `ConstraintViolation` → "would clash with an existing tag" (deliberately NOT
+   "`new_full` already exists" — the clash may be a *descendant's* rewritten path,
+   architect Q6 honesty fix), else generic. Architect **SHIP**, no blockers; folded
+   in the reworded message + a darkroom-db regression test pinning the load-bearing
+   invariant (parent rename onto an existing name aborts, leaving parent+descendant
+   intact). Primary `code == ConstraintViolation` is sufficient (only the name
+   UNIQUE index can trip this UPDATE). Deferred (backlog): keep the popover open
+   with an inline error on failure instead of a modal (needs run-rename-then-branch
+   ordering — popdown before refresh only on success). db 85 tests (+1), ui 112
+   tests (+1), clippy unchanged.
+
+   **Candidate next increments after m4-31** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete):
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
+   - Rename-failure UX: keep the popover open + inline error (see m4-31 deferred).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
 The UI work is largely independent of the per-IOP loop ports and can proceed in
