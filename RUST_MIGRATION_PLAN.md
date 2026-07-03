@@ -794,14 +794,45 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    test) + the mono+splittoning-tint doc note. darkroom-ui 114→115 tests, Docker
    check/clippy/test green, both remotes synced.
 
-   **Candidate next increments after m4-36** (recorded so they survive a context
+   **m4-37** — port RCD (Ratio Corrected Demosaicing) to Rust (pipeline depth)
+   (DONE, commit `e40ff6df3c`). New `demosaic_rcd` in
+   `crates/darkroom-core/src/rawimage.rs`, a faithful port of darktable's
+   `rcd_demosaic` (`src/iop/demosaicing/rcd.c`) — the default high-quality Bayer
+   demosaicer, far fewer maze/zipper artefacts than PPG. **Correction to the
+   m4-36 candidate note above:** RCD/VNG were NOT actually migrated — only VNG
+   *helper* loops existed (no orchestrator) and RCD not at all; this ports RCD
+   in full. Keeps darktable's exact 112px tiling (`RCD_TILEVALID=92`): the
+   demosaic runs at full sensor resolution *before* the preview downscale, so a
+   whole-image scratch would be hundreds of MB while per-tile buffers stay
+   ~350 KB. A full-frame `demosaic_ppg` is the base; RCD overwrites each tile's
+   valid interior (outermost tiles use `RCD_MARGIN=9`, joins `RCD_BORDER=10`).
+   Tiles serial for now. **Intentional divergences from C:** step-1's rolling
+   3-row VH window → two full-tile `vsq`/`hsq` buffers (clearer, same result);
+   `lpf`/`pq_dir` separate (not aliased); every buffer zeroed per tile (stricter
+   than C's partial-tile-only memset). Opus architect review verified all index
+   arithmetic / bounds / parity / the step-1 rewrite: **no correctness
+   blockers**; applied all 3 should-fix test-coverage additions (interior-tile
+   join 250×250, single-tile 50×50, BGGR parity) + nits (lpf half-stride comment,
+   step-3 `debug_assert`, hoisted `fc_bayer`). darkroom-core 516→523 tests.
+
+   **m4-38** — use RCD as the Bayer demosaic in the preview pipeline (DONE,
+   commit `daf8db6b1d`). One-line default swap: `RawImage::to_linear_rgba`'s
+   Bayer branch `demosaic_ppg` → `demosaic_rcd` (X-Trans still Markesteijn). RCD
+   falls back to the PPG base for sub-tile frames, so the small-fixture test is
+   unchanged. Wiring-only follow-up to the m4-37 review; Docker green
+   (core 523, ui 115, clippy clean). RCD runs once per file open, off-thread, at
+   full res — a one-time load cost, not per-slider.
+
+   **Candidate next increments after m4-38** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
-   - **Pipeline depth (continue):** a higher-quality Bayer demosaic in the
-     preview path (currently PPG; RCD/VNG already migrated in darkroom-core —
-     wire one into the raw preview); or geometry IOPs (crop/rotate) needing an
-     ROI/(w,h)-aware pipeline. (The velvia-clamp item is now moot — m4-36 moved
-     velvia after the tone map.)
+   - **m4-39 (natural next):** rayon-parallelise `demosaic_rcd` over tiles (the C
+     `DT_OMP` parallelism dropped in the port) if full-res load latency warrants
+     it — needs per-thread scratch buffers (currently one reused set).
+   - **Pipeline depth (other):** geometry IOPs (crop/rotate) needing an
+     ROI/(w,h)-aware pipeline; or assemble a full VNG Bayer orchestrator from the
+     existing `iop::demosaic` VNG helper loops. (The velvia-clamp item is moot —
+     m4-36 moved velvia after the tone map.)
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
