@@ -379,6 +379,333 @@ pub fn demosaic_ppg(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
     out
 }
 
+/// Demosaic a normalised Bayer CFA mosaic to packed RGBA `f32` via the migrated
+/// **RCD** (Ratio Corrected Demosaicing) algorithm — darktable's default, with
+/// noticeably fewer maze/zipper artefacts on fine detail than [`demosaic_ppg`].
+/// Faithful port of `rcd_demosaic` (`src/iop/demosaicing/rcd.c:98`).
+///
+/// A full-frame [`demosaic_ppg`] provides the base image; RCD then overwrites
+/// each tile interior. Like the C source this tiles the frame into
+/// `DT_RCD_TILESIZE`-square (112 px) tiles with a `RCD_TILEVALID` (92 px) valid
+/// stride, so the per-tile scratch buffers stay small (~350 KB total) even at
+/// full sensor resolution — the demosaic runs before the preview downscale, so
+/// a whole-image scratch would be hundreds of MB. Tiles are processed serially
+/// (the C `DT_OMP` parallelism is a future rayon follow-up). The tile-local
+/// index space matches C exactly: `RCD_TILEVALID` is even, so tile-local (row,
+/// col) parity equals absolute parity and `fc_bayer` is correct on either.
+///
+/// Falls back to the [`demosaic_ppg`] base for frames narrower/shorter than one
+/// border pair (`2·RCD_BORDER`). Leaves the 4th channel at 0 like the other
+/// demosaicers — [`RawImage::to_linear_rgba`] sets alpha opaque afterwards.
+pub fn demosaic_rcd(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2]; 2]) -> Vec<f32> {
+    // Base image: full-frame PPG. RCD refines the interior on top (rcd.c:105).
+    let mut out = demosaic_ppg(mosaic, width, height, cfa);
+    const BORDER: usize = 10; // RCD_BORDER — inter-tile overlap discarded per tile
+    const MARGIN: usize = 9; // RCD_MARGIN — smaller border for the outermost tiles
+    const TS: usize = 112; // DT_RCD_TILESIZE
+    const TILEVALID: usize = TS - 2 * BORDER; // 92 (even ⇒ parity-preserving)
+    const W1: usize = TS;
+    const W2: usize = 2 * TS;
+    const W3: usize = 3 * TS;
+    const W4: usize = 4 * TS;
+    const EPS: f32 = 1e-5;
+    const EPSSQ: f32 = 1e-10;
+    if width < 2 * BORDER || height < 2 * BORDER || mosaic.len() < width * height {
+        return out;
+    }
+    use crate::raw::fc_bayer;
+    let filters = filters_from_cfa(cfa);
+    let sqrf = |a: f32| a * a;
+    let clip01 = |x: f32| if x >= 0.0 { x.min(1.0) } else { 0.0 };
+    // interpolatef(a, b, c) = a*b + (1-a)*c  (math.h:141)
+    let interp = |a: f32, b: f32, c: f32| a * (b - c) + c;
+
+    let num_vertical = (height - 2 * BORDER).saturating_sub(1) / TILEVALID + 1;
+    let num_horizontal = (width - 2 * BORDER).saturating_sub(1) / TILEVALID + 1;
+
+    // Per-tile scratch, allocated once and cleared per tile (C calloc/memset).
+    let mut cfa_b = vec![0.0f32; TS * TS];
+    let mut rgb = vec![0.0f32; 3 * TS * TS]; // planes: rgb[c*TS*TS + indx]
+    let mut vh_dir = vec![0.0f32; TS * TS];
+    let mut pq_dir = vec![0.0f32; TS * TS / 2];
+    // Half-resolution low-pass filter. Stored one entry per *written* pixel
+    // (every other column) but indexed with the FULL stride `W1`/`±1`, so
+    // `lpf[lp ± W1]` steps two rows (to the same-colour Bayer neighbour) and
+    // `lpf[lp ± 1]` steps two columns — this half-stride encoding is why the
+    // `RCD_TILEVALID`-even parity guarantee matters (see the fn doc).
+    let mut lpf = vec![0.0f32; TS * TS / 2];
+    let mut p_cdiff = vec![0.0f32; TS * TS / 2];
+    let mut q_cdiff = vec![0.0f32; TS * TS / 2];
+    // Squared vertical/horizontal colour-difference HPF (step 1); computed into
+    // full-tile buffers instead of C's rolling three-row window — same result,
+    // clearer, and the extra 2·TS² floats are negligible at tile scale.
+    let mut vsq = vec![0.0f32; TS * TS];
+    let mut hsq = vec![0.0f32; TS * TS];
+    let plane = TS * TS; // green plane base = 1*plane
+
+    for tv in 0..num_vertical {
+        for th in 0..num_horizontal {
+            let row_start = tv * TILEVALID;
+            let row_end = (row_start + TS).min(height);
+            let col_start = th * TILEVALID;
+            let col_end = (col_start + TS).min(width);
+            let tile_rows = (row_end - row_start).min(TS) as i32;
+            let tile_cols = (col_end - col_start).min(TS) as i32;
+
+            for b in [&mut cfa_b, &mut rgb, &mut vh_dir, &mut vsq, &mut hsq] {
+                b.fill(0.0);
+            }
+            for b in [&mut pq_dir, &mut lpf, &mut p_cdiff, &mut q_cdiff] {
+                b.fill(0.0);
+            }
+
+            // Step 0: fill cfa; seed both in-row colour planes with the raw value.
+            for row in row_start..row_end {
+                let c0 = fc_bayer(row as i32, col_start as i32, filters);
+                let c1 = fc_bayer(row as i32, (col_start + 1) as i32, filters);
+                let base = (row - row_start) * TS;
+                for (k, col) in (col_start..col_end).enumerate() {
+                    let indx = base + k;
+                    let v = mosaic[row * width + col].max(0.0); // _safe_in, scaler = 1
+                    cfa_b[indx] = v;
+                    rgb[c0 * plane + indx] = v;
+                    rgb[c1 * plane + indx] = v;
+                }
+            }
+
+            // Step 1.1: squared vertical/horizontal colour-difference HPF.
+            for row in 3..(tile_rows - 3) {
+                for col in 4..(tile_cols - 4) {
+                    let i = (row * TS as i32 + col) as usize;
+                    vsq[i] = sqrf(
+                        (cfa_b[i - W3] - cfa_b[i - W1] - cfa_b[i + W1] + cfa_b[i + W3])
+                            - 3.0 * (cfa_b[i - W2] + cfa_b[i + W2])
+                            + 6.0 * cfa_b[i],
+                    );
+                }
+            }
+            for row in 4..(tile_rows - 4) {
+                for col in 3..(tile_cols - 3) {
+                    let i = (row * TS as i32 + col) as usize;
+                    hsq[i] = sqrf(
+                        (cfa_b[i - 3] - cfa_b[i - 1] - cfa_b[i + 1] + cfa_b[i + 3])
+                            - 3.0 * (cfa_b[i - 2] + cfa_b[i + 2])
+                            + 6.0 * cfa_b[i],
+                    );
+                }
+            }
+            // Step 1.2: vertical/horizontal directional discrimination strength.
+            for row in 4..(tile_rows - 4) {
+                for col in 4..(tile_cols - 4) {
+                    let i = (row * TS as i32 + col) as usize;
+                    let v_stat = EPSSQ.max(vsq[i - W1] + vsq[i] + vsq[i + W1]);
+                    let h_stat = EPSSQ.max(hsq[i - 1] + hsq[i] + hsq[i + 1]);
+                    vh_dir[i] = v_stat / (v_stat + h_stat);
+                }
+            }
+
+            // Step 2: low pass filter (green/red/blue local samples).
+            for row in 2..(tile_rows - 2) {
+                let mut col = 2 + (fc_bayer(row, 0, filters) & 1) as i32;
+                while col < tile_cols - 2 {
+                    let i = (row * TS as i32 + col) as usize;
+                    lpf[i / 2] = cfa_b[i]
+                        + 0.5 * (cfa_b[i - W1] + cfa_b[i + W1] + cfa_b[i - 1] + cfa_b[i + 1])
+                        + 0.25
+                            * (cfa_b[i - W1 - 1]
+                                + cfa_b[i - W1 + 1]
+                                + cfa_b[i + W1 - 1]
+                                + cfa_b[i + W1 + 1]);
+                    col += 2;
+                }
+            }
+
+            // Step 3: green channel at blue and red CFA positions.
+            for row in 4..(tile_rows - 4) {
+                let mut col = 4 + (fc_bayer(row, 0, filters) & 1) as i32;
+                while col < tile_cols - 4 {
+                    let i = (row * TS as i32 + col) as usize;
+                    // Tightest usize-subtraction invariant in the whole port:
+                    // `cfa_b[i - W4]` below. row ≥ 4 ∧ col ≥ 4 ⇒ i ≥ 452 > W4.
+                    debug_assert!(i >= W4, "step-3 usize guard (i - W4)");
+                    let lp = i / 2;
+                    let cfai = cfa_b[i];
+                    let n_grad = EPS
+                        + (cfa_b[i - W1] - cfa_b[i + W1]).abs()
+                        + (cfai - cfa_b[i - W2]).abs()
+                        + (cfa_b[i - W1] - cfa_b[i - W3]).abs()
+                        + (cfa_b[i - W2] - cfa_b[i - W4]).abs();
+                    let s_grad = EPS
+                        + (cfa_b[i + W1] - cfa_b[i - W1]).abs()
+                        + (cfai - cfa_b[i + W2]).abs()
+                        + (cfa_b[i + W1] - cfa_b[i + W3]).abs()
+                        + (cfa_b[i + W2] - cfa_b[i + W4]).abs();
+                    let w_grad = EPS
+                        + (cfa_b[i - 1] - cfa_b[i + 1]).abs()
+                        + (cfai - cfa_b[i - 2]).abs()
+                        + (cfa_b[i - 1] - cfa_b[i - 3]).abs()
+                        + (cfa_b[i - 2] - cfa_b[i - 4]).abs();
+                    let e_grad = EPS
+                        + (cfa_b[i + 1] - cfa_b[i - 1]).abs()
+                        + (cfai - cfa_b[i + 2]).abs()
+                        + (cfa_b[i + 1] - cfa_b[i + 3]).abs()
+                        + (cfa_b[i + 2] - cfa_b[i + 4]).abs();
+                    let lpfi = lpf[lp];
+                    let n_est = cfa_b[i - W1] * (lpfi + lpfi) / (EPS + lpfi + lpf[lp - W1]);
+                    let s_est = cfa_b[i + W1] * (lpfi + lpfi) / (EPS + lpfi + lpf[lp + W1]);
+                    let w_est = cfa_b[i - 1] * (lpfi + lpfi) / (EPS + lpfi + lpf[lp - 1]);
+                    let e_est = cfa_b[i + 1] * (lpfi + lpfi) / (EPS + lpfi + lpf[lp + 1]);
+                    let v_est = (s_grad * n_est + n_grad * s_est) / (n_grad + s_grad);
+                    let h_est = (w_grad * e_est + e_grad * w_est) / (e_grad + w_grad);
+                    let vh_c = vh_dir[i];
+                    let vh_n = 0.25
+                        * (vh_dir[i - W1 - 1]
+                            + vh_dir[i - W1 + 1]
+                            + vh_dir[i + W1 - 1]
+                            + vh_dir[i + W1 + 1]);
+                    let vh_disc = if (0.5 - vh_c).abs() < (0.5 - vh_n).abs() { vh_n } else { vh_c };
+                    rgb[plane + i] = interp(clip01(vh_disc), h_est, v_est);
+                    col += 2;
+                }
+            }
+
+            // Step 4.0: squared P/Q diagonal colour-difference HPF.
+            for row in 3..(tile_rows - 3) {
+                let mut col = 3;
+                while col < tile_cols - 3 {
+                    let i = (row * TS as i32 + col) as usize;
+                    let i2 = i / 2;
+                    p_cdiff[i2] = sqrf(
+                        (cfa_b[i - W3 - 3] - cfa_b[i - W1 - 1] - cfa_b[i + W1 + 1] + cfa_b[i + W3 + 3])
+                            - 3.0 * (cfa_b[i - W2 - 2] + cfa_b[i + W2 + 2])
+                            + 6.0 * cfa_b[i],
+                    );
+                    q_cdiff[i2] = sqrf(
+                        (cfa_b[i - W3 + 3] - cfa_b[i - W1 + 1] - cfa_b[i + W1 - 1] + cfa_b[i + W3 - 3])
+                            - 3.0 * (cfa_b[i - W2 + 2] + cfa_b[i + W2 - 2])
+                            + 6.0 * cfa_b[i],
+                    );
+                    col += 2;
+                }
+            }
+            // Step 4.1: P/Q diagonal directional discrimination strength.
+            for row in 4..(tile_rows - 4) {
+                let mut col = 4 + (fc_bayer(row, 0, filters) & 1) as i32;
+                while col < tile_cols - 4 {
+                    let i = (row * TS as i32 + col) as usize;
+                    let i2 = i / 2;
+                    let i3 = (i - W1 - 1) / 2;
+                    let i4 = (i + W1 - 1) / 2;
+                    let p_stat = EPSSQ.max(p_cdiff[i3] + p_cdiff[i2] + p_cdiff[i4 + 1]);
+                    let q_stat = EPSSQ.max(q_cdiff[i3 + 1] + q_cdiff[i2] + q_cdiff[i4]);
+                    pq_dir[i2] = p_stat / (p_stat + q_stat);
+                    col += 2;
+                }
+            }
+            // Step 4.2: red and blue channels at blue and red CFA positions.
+            for row in 4..(tile_rows - 4) {
+                let start = 4 + (fc_bayer(row, 0, filters) & 1) as i32;
+                // Every non-green site in a Bayer row is the same colour, so the
+                // opposite chroma plane is constant across the row — hoist it.
+                let c = 2 - fc_bayer(row, start, filters);
+                let rc = c * plane;
+                let mut col = start;
+                while col < tile_cols - 4 {
+                    let i = (row * TS as i32 + col) as usize;
+                    let pq = i / 2;
+                    let pq2 = (i - W1 - 1) / 2;
+                    let pq3 = (i + W1 - 1) / 2;
+                    let pq_c = pq_dir[pq];
+                    let pq_n = 0.25 * (pq_dir[pq2] + pq_dir[pq2 + 1] + pq_dir[pq3] + pq_dir[pq3 + 1]);
+                    let pq_disc = if (0.5 - pq_c).abs() < (0.5 - pq_n).abs() { pq_n } else { pq_c };
+                    let nw_grad = EPS
+                        + (rgb[rc + i - W1 - 1] - rgb[rc + i + W1 + 1]).abs()
+                        + (rgb[rc + i - W1 - 1] - rgb[rc + i - W3 - 3]).abs()
+                        + (rgb[plane + i] - rgb[plane + i - W2 - 2]).abs();
+                    let ne_grad = EPS
+                        + (rgb[rc + i - W1 + 1] - rgb[rc + i + W1 - 1]).abs()
+                        + (rgb[rc + i - W1 + 1] - rgb[rc + i - W3 + 3]).abs()
+                        + (rgb[plane + i] - rgb[plane + i - W2 + 2]).abs();
+                    let sw_grad = EPS
+                        + (rgb[rc + i - W1 + 1] - rgb[rc + i + W1 - 1]).abs()
+                        + (rgb[rc + i + W1 - 1] - rgb[rc + i + W3 - 3]).abs()
+                        + (rgb[plane + i] - rgb[plane + i + W2 - 2]).abs();
+                    let se_grad = EPS
+                        + (rgb[rc + i - W1 - 1] - rgb[rc + i + W1 + 1]).abs()
+                        + (rgb[rc + i + W1 + 1] - rgb[rc + i + W3 + 3]).abs()
+                        + (rgb[plane + i] - rgb[plane + i + W2 + 2]).abs();
+                    let nw_est = rgb[rc + i - W1 - 1] - rgb[plane + i - W1 - 1];
+                    let ne_est = rgb[rc + i - W1 + 1] - rgb[plane + i - W1 + 1];
+                    let sw_est = rgb[rc + i + W1 - 1] - rgb[plane + i + W1 - 1];
+                    let se_est = rgb[rc + i + W1 + 1] - rgb[plane + i + W1 + 1];
+                    let p_est = (nw_grad * se_est + se_grad * nw_est) / (nw_grad + se_grad);
+                    let q_est = (ne_grad * sw_est + sw_grad * ne_est) / (ne_grad + sw_grad);
+                    rgb[rc + i] = rgb[plane + i] + interp(clip01(pq_disc), q_est, p_est);
+                    col += 2;
+                }
+            }
+            // Step 4.3: red and blue channels at green CFA positions.
+            for row in 4..(tile_rows - 4) {
+                let mut col = 4 + (fc_bayer(row, 1, filters) & 1) as i32;
+                while col < tile_cols - 4 {
+                    let i = (row * TS as i32 + col) as usize;
+                    let vh_c = vh_dir[i];
+                    let vh_n = 0.25
+                        * (vh_dir[i - W1 - 1]
+                            + vh_dir[i - W1 + 1]
+                            + vh_dir[i + W1 - 1]
+                            + vh_dir[i + W1 + 1]);
+                    let vh_disc = if (0.5 - vh_c).abs() < (0.5 - vh_n).abs() { vh_n } else { vh_c };
+                    let g = rgb[plane + i];
+                    let n1 = EPS + (g - rgb[plane + i - W2]).abs();
+                    let s1 = EPS + (g - rgb[plane + i + W2]).abs();
+                    let w1v = EPS + (g - rgb[plane + i - 2]).abs();
+                    let e1 = EPS + (g - rgb[plane + i + 2]).abs();
+                    let g_mw1 = rgb[plane + i - W1];
+                    let g_pw1 = rgb[plane + i + W1];
+                    let g_m1 = rgb[plane + i - 1];
+                    let g_p1 = rgb[plane + i + 1];
+                    for c in [0usize, 2] {
+                        let rc = c * plane;
+                        let snabs = (rgb[rc + i - W1] - rgb[rc + i + W1]).abs();
+                        let ewabs = (rgb[rc + i - 1] - rgb[rc + i + 1]).abs();
+                        let n_grad = n1 + snabs + (rgb[rc + i - W1] - rgb[rc + i - W3]).abs();
+                        let s_grad = s1 + snabs + (rgb[rc + i + W1] - rgb[rc + i + W3]).abs();
+                        let w_grad = w1v + ewabs + (rgb[rc + i - 1] - rgb[rc + i - 3]).abs();
+                        let e_grad = e1 + ewabs + (rgb[rc + i + 1] - rgb[rc + i + 3]).abs();
+                        let n_est = rgb[rc + i - W1] - g_mw1;
+                        let s_est = rgb[rc + i + W1] - g_pw1;
+                        let w_est = rgb[rc + i - 1] - g_m1;
+                        let e_est = rgb[rc + i + 1] - g_p1;
+                        let v_est = (n_grad * s_est + s_grad * n_est) / (n_grad + s_grad);
+                        let h_est = (e_grad * w_est + w_grad * e_est) / (e_grad + w_grad);
+                        rgb[rc + i] = g + interp(clip01(vh_disc), h_est, v_est);
+                    }
+                    col += 2;
+                }
+            }
+
+            // Write the valid region back to the RGBA output (image coordinates).
+            // Outermost tiles use the smaller RCD_MARGIN, interior joins RCD_BORDER.
+            let first_v = row_start + if tv == 0 { MARGIN } else { BORDER };
+            let last_v = row_end - if tv == num_vertical - 1 { MARGIN } else { BORDER };
+            let first_h = col_start + if th == 0 { MARGIN } else { BORDER };
+            let last_h = col_end - if th == num_horizontal - 1 { MARGIN } else { BORDER };
+            for row in first_v..last_v {
+                for col in first_h..last_h {
+                    let idx = (row - row_start) * TS + (col - col_start);
+                    let o = (row * width + col) * 4;
+                    out[o] = rgb[idx].max(0.0);
+                    out[o + 1] = rgb[plane + idx].max(0.0);
+                    out[o + 2] = rgb[2 * plane + idx].max(0.0);
+                    out[o + 3] = 0.0;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Demosaic a normalised **X-Trans** CFA mosaic to packed RGBA `f32` via the
 /// migrated single-pass **Markesteijn** interpolation
 /// (`iop::markesteijn::darkroom_xtrans_markesteijn`, xtrans.c:45). The kernel
@@ -937,6 +1264,162 @@ mod tests {
             demosaic_ppg(&mosaic, 2, 2, cfa),
             demosaic_box(&mosaic, 2, 2, cfa)
         );
+    }
+
+    /// Build an RGGB Bayer mosaic sampling a per-pixel true colour `f(col,row)
+    /// -> [r,g,b]` at each site's native colour (0=R, 1=G, 2=B).
+    fn rggb_mosaic_from(w: usize, h: usize, f: impl Fn(usize, usize) -> [f32; 3]) -> Vec<f32> {
+        let cfa = [[0usize, 1], [1, 2]];
+        (0..w * h)
+            .map(|idx| {
+                let (col, row) = (idx % w, idx / w);
+                f(col, row)[cfa[row % 2][col % 2]]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rcd_constant_mosaic_is_neutral() {
+        // A flat field is the one input RCD reconstructs exactly: all gradients
+        // collapse to eps, every directional estimate is the constant, and the
+        // green→red/blue colour differences are zero. Interior must be a flat
+        // grey. Frame > one 112px tile so the tile loop and joins are exercised.
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (200usize, 130usize);
+        let out = demosaic_rcd(&vec![0.5f32; w * h], w, h, cfa);
+        assert_eq!(out.len(), w * h * 4);
+        for j in 12..h - 12 {
+            for i in 12..w - 12 {
+                let p = (j * w + i) * 4;
+                for c in 0..3 {
+                    assert!(
+                        (out[p + c] - 0.5).abs() < 1e-4,
+                        "pixel ({i},{j}) ch{c} = {} (not neutral 0.5)",
+                        out[p + c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rcd_reconstructs_flat_colour_separating_channels() {
+        // A flat, non-grey field: RCD must recover each channel's constant at
+        // interior pixels (a flat mosaic can't catch a channel left at 0 or a
+        // swapped plane — a coloured one can). Larger than one tile.
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (160usize, 120usize);
+        let truth = [0.8f32, 0.4, 0.2];
+        let mosaic = rggb_mosaic_from(w, h, |_, _| truth);
+        let out = demosaic_rcd(&mosaic, w, h, cfa);
+        let p = (60 * w + 80) * 4;
+        for c in 0..3 {
+            assert!(
+                (out[p + c] - truth[c]).abs() < 1e-3,
+                "ch{c} = {} (want {})",
+                out[p + c],
+                truth[c]
+            );
+        }
+    }
+
+    #[test]
+    fn rcd_gradient_output_is_finite_and_covered() {
+        // A smooth diagonal gradient across a multi-tile frame: every interior
+        // pixel must be finite (no NaN from a divide-by-zero guard miss) and no
+        // interior RGB left all-zero. Also pins that RCD refines a real interior
+        // (differs from the PPG base at high-detail sites).
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (150usize, 140usize);
+        let mosaic = rggb_mosaic_from(w, h, |c, r| {
+            let v = (c + r) as f32 / (w + h) as f32;
+            [v, v * 0.9, v * 0.8]
+        });
+        let out = demosaic_rcd(&mosaic, w, h, cfa);
+        assert_eq!(out.len(), w * h * 4);
+        for j in 12..h - 12 {
+            for i in 12..w - 12 {
+                let p = (j * w + i) * 4;
+                for c in 0..3 {
+                    assert!(out[p + c].is_finite(), "pixel ({i},{j}) ch{c} not finite");
+                }
+                assert!(
+                    out[p] != 0.0 || out[p + 1] != 0.0 || out[p + 2] != 0.0,
+                    "pixel ({i},{j}) RGB all-zero"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rcd_small_image_falls_back_to_ppg_base() {
+        // Below one border pair (2·RCD_BORDER = 20) there's no tile interior, so
+        // RCD returns the PPG base unchanged.
+        let cfa = [[0usize, 1], [1, 2]];
+        let mosaic = rggb_mosaic_from(16, 16, |c, _| {
+            let v = c as f32 / 15.0;
+            [v, v, v]
+        });
+        assert_eq!(
+            demosaic_rcd(&mosaic, 16, 16, cfa),
+            demosaic_ppg(&mosaic, 16, 16, cfa)
+        );
+    }
+
+    #[test]
+    fn rcd_interior_tile_join_is_covered() {
+        // The BORDER (not MARGIN) trim on BOTH sides of a tile only runs for a
+        // tile that is neither first nor last on its axis — i.e. ≥ 3 tiles, which
+        // needs ≥ 2·BORDER + 2·TILEVALID + 1 = 205 px. Smaller frames leave this
+        // interior-join branch unexecuted. 250×250 ⇒ 3×3 tiles; the centre tile
+        // trims BORDER on all four sides. Flat grey ⇒ exact neutral there.
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (250usize, 250usize);
+        let out = demosaic_rcd(&vec![0.5f32; w * h], w, h, cfa);
+        let p = (125 * w + 125) * 4;
+        for c in 0..3 {
+            assert!(
+                (out[p + c] - 0.5).abs() < 1e-4,
+                "interior-join ch{c} = {}",
+                out[p + c]
+            );
+        }
+    }
+
+    #[test]
+    fn rcd_single_tile_rggb_is_neutral() {
+        // 50×50 passes the ≥ 2·BORDER guard and yields exactly one tile
+        // (num_v == num_h == 1), so every axis takes the MARGIN-on-both-ends
+        // branch — a path the 16×16 fallback test never reaches.
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (50usize, 50usize);
+        let out = demosaic_rcd(&vec![0.5f32; w * h], w, h, cfa);
+        let p = (25 * w + 25) * 4;
+        for c in 0..3 {
+            assert!(
+                (out[p + c] - 0.5).abs() < 1e-4,
+                "single-tile ch{c} = {}",
+                out[p + c]
+            );
+        }
+    }
+
+    #[test]
+    fn rcd_constant_bggr_is_neutral() {
+        // Non-RGGB parity: BGGR flips which sites are R/B vs the RGGB tests, so
+        // it catches any inversion in `fc_bayer(row,0)&1` gating or the
+        // `c = 2 - fc_bayer(..)` chroma-plane assignment. Flat grey ⇒ neutral.
+        let cfa = [[2usize, 1], [1, 0]]; // BGGR
+        let (w, h) = (200usize, 130usize);
+        let out = demosaic_rcd(&vec![0.5f32; w * h], w, h, cfa);
+        let p = (65 * w + 100) * 4;
+        for c in 0..3 {
+            assert!(
+                (out[p + c] - 0.5).abs() < 1e-4,
+                "BGGR ch{c} = {}",
+                out[p + c]
+            );
+        }
     }
 
     // Standard Fuji X-Trans 6×6 CFA (0=R, 1=G, 2=B).
