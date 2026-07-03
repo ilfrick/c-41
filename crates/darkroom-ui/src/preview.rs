@@ -6,8 +6,9 @@
 //!
 //! Phase 3-m2-2: the stage chaining now lives in `darkroom_core::pipeline`.
 //! [`PreviewParams::to_pipeline`] maps the UI sliders (UI ranges) to a
-//! `Pipeline` of physical-param `Stage`s (exposure → velvia → splittoning →
-//! monochrome); [`apply_pipeline`] just marshals the 8-bit pixbuf to/from the
+//! `Pipeline` of physical-param `Stage`s in darktable's canonical iop order
+//! (exposure → monochrome → sigmoid → velvia → splittoning);
+//! [`apply_pipeline`] just marshals the 8-bit pixbuf to/from the
 //! float RGBA the core pipeline runs on, preserving the source alpha channel and
 //! rowstride padding byte-for-byte.
 //!
@@ -21,7 +22,8 @@ use darkroom_core::pipeline::{Pipeline, Stage};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `darkroom-core` IOP, in pixelpipe order
-/// (exposure → velvia → splittoning → monochrome; see [`Self::to_pipeline`]).
+/// (exposure → monochrome → sigmoid → velvia → splittoning; see
+/// [`Self::to_pipeline`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreviewParams {
     /// Exposure stage on/off.
@@ -185,10 +187,48 @@ impl PreviewParams {
     /// strength /100, split compress (c/110)/2) and including only the enabled
     /// stages that would actually change the image (so a bypassed/neutral set
     /// yields an empty, identity pipeline).
+    ///
+    /// Stage order follows darktable's canonical v3.0 scene-referred iop order
+    /// (`src/common/iop_order.c`: exposure 21 → channelmixerrgb 39 →
+    /// sigmoid 45.3 → velvia 57 → splittoning 67). The scene-referred stages
+    /// (exposure, the channel-mix to grey) run on unbounded linear data; sigmoid
+    /// tone-maps to display range; the display-referred creative stages (velvia,
+    /// splittoning) run after it, where their [0,1] clamps are semantically
+    /// correct — running them before the tone map would hard-clip scene-linear
+    /// highlights (>1.0) that sigmoid is meant to roll off.
+    ///
+    /// Note the grey conversion here ports the *legacy* `channelmixer`, which in
+    /// darktable ran display-referred (~pos 65); we place it at the scene-referred
+    /// `channelmixerrgb` position 39 because linear luminance is the correct
+    /// domain to tone-map as luminance. A visible consequence of the reorder: with
+    /// `mono_on && split_on`, splittoning now tints the tone-mapped B&W image (the
+    /// intended split-toned-monochrome result). In the old order mono ran last and
+    /// silently discarded whatever velvia/splittoning had done.
+    ///
+    /// This only eliminates the highlight crush when sigmoid is *enabled*. With
+    /// `sigmoid_on == false` and a scene-linear source (the raw path, values
+    /// >1.0), velvia and splittoning still assume [0,1] display-referred input
+    /// and clamp — sigmoid is off for already-display-referred JPEGs, where that
+    /// assumption holds, and on for raws, where it is what saves the highlights.
     pub fn to_pipeline(&self) -> Pipeline {
         let mut p = Pipeline::new();
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
+        }
+        if self.mono_on {
+            p.push(Stage::Monochrome { r: self.mono_r, g: self.mono_g, b: self.mono_b });
+        }
+        // Sigmoid is the scene-linear → display tone map. White (100%) / black
+        // (0.0152%) targets are fixed at the darktable defaults (both > 0 ⇒ no
+        // NaN); only contrast & skew are user-facing here.
+        if self.sigmoid_on {
+            let [white_target, black_target, paper_exp, film_fog, film_power, paper_power] =
+                darkroom_core::iop::sigmoid::rgb_ratio_params(
+                    self.sigmoid_contrast, self.sigmoid_skew, 100.0, 0.0152,
+                );
+            p.push(Stage::Sigmoid {
+                white_target, black_target, paper_exp, film_fog, film_power, paper_power,
+            });
         }
         if self.velvia_on && self.velvia_strength > 0.0 {
             p.push(Stage::Velvia { strength: self.velvia_strength / 100.0, bias: self.velvia_bias });
@@ -201,21 +241,6 @@ impl PreviewParams {
                 highlight_sat: self.split_highlight_sat,
                 balance: self.split_balance,
                 compress: (self.split_compress / 110.0) / 2.0,
-            });
-        }
-        if self.mono_on {
-            p.push(Stage::Monochrome { r: self.mono_r, g: self.mono_g, b: self.mono_b });
-        }
-        // Sigmoid is the scene-linear → display tone map, so it runs LAST. White
-        // (100%) / black (0.0152%) targets are fixed at the darktable defaults
-        // (both > 0 ⇒ no NaN); only contrast & skew are user-facing here.
-        if self.sigmoid_on {
-            let [white_target, black_target, paper_exp, film_fog, film_power, paper_power] =
-                darkroom_core::iop::sigmoid::rgb_ratio_params(
-                    self.sigmoid_contrast, self.sigmoid_skew, 100.0, 0.0152,
-                );
-            p.push(Stage::Sigmoid {
-                white_target, black_target, paper_exp, film_fog, film_power, paper_power,
             });
         }
         p
@@ -730,6 +755,81 @@ mod tests {
             assert!((out[3 + c] as i32 - 128).abs() <= 1, "mid {}", out[3 + c]);
             assert_eq!(out[6 + c], 255, "white");
         }
+    }
+
+    #[test]
+    fn to_pipeline_orders_stages_canonically() {
+        // Pins darktable's v3.0 scene-referred iop order (iop_order.c): the
+        // display-referred creative stages (velvia, splittoning) must run AFTER
+        // the sigmoid tone map, the scene-referred ones (exposure, channel-mix)
+        // before it. A regression here silently re-clips scene-linear
+        // highlights (see velvia_after_sigmoid_* below).
+        let mut p = PreviewParams::default();
+        p.exposure_on = true;
+        p.ev = 0.5;
+        p.mono_on = true;
+        p.sigmoid_on = true;
+        p.velvia_on = true;
+        p.velvia_strength = 50.0;
+        p.split_on = true;
+        let names: Vec<&str> = p.to_pipeline().stages.iter().map(|s| s.name()).collect();
+        assert_eq!(
+            names,
+            ["exposure", "channelmixer", "sigmoid", "velvia", "splittoning"]
+        );
+    }
+
+    #[test]
+    fn velvia_after_sigmoid_preserves_scene_linear_highlight() {
+        // Velvia is identity on greys (the chroma boost is 0 when R=G=B) but
+        // hard-clamps its output to [0,1] — a faithful port of the
+        // display-referred C module. Before the tone map that clamp crushed a
+        // scene-linear neutral highlight (2.0 → 1.0), dimming what sigmoid
+        // rendered. In canonical order (velvia AFTER sigmoid) enabling velvia
+        // must not change a neutral highlight at all.
+        let lin = vec![2.0f32, 2.0, 2.0, 1.0];
+        let mut sig_only = PreviewParams::default();
+        sig_only.sigmoid_on = true;
+        let mut with_velvia = sig_only;
+        with_velvia.velvia_on = true;
+        with_velvia.velvia_strength = 80.0;
+        assert_eq!(
+            render_linear_to_srgb8(&lin, 1, 1, &sig_only),
+            render_linear_to_srgb8(&lin, 1, 1, &with_velvia),
+            "velvia on a tone-mapped neutral must be an exact no-op"
+        );
+    }
+
+    #[test]
+    fn canonical_order_preserves_chromatic_highlight_velvia_first_crushes_it() {
+        // The grey test above cannot distinguish stage orders — velvia is
+        // identity on R=G=B regardless of position. This one does, on a
+        // *chromatic* scene-linear highlight whose red channel is >1.0.
+        //
+        // Canonical (m4-36) order sigmoid → velvia: the tone map rolls the 3.0
+        // red into display range first, so velvia's [0,1] clamp never touches
+        // the highlight. Pre-m4-36 order velvia → sigmoid: velvia clamps the
+        // 3.0 red down to 1.0 *before* the tone map, permanently discarding
+        // everything the sigmoid rolloff would have preserved. Building the two
+        // pipelines explicitly (bypassing to_pipeline) pins that the canonical
+        // order keeps the red highlight strictly brighter than the reversed one.
+        let lin = [3.0f32, 1.5, 0.5, 1.0];
+        let [white_target, black_target, paper_exp, film_fog, film_power, paper_power] =
+            darkroom_core::iop::sigmoid::rgb_ratio_params(1.5, 0.0, 100.0, 0.0152);
+        let sigmoid = Stage::Sigmoid {
+            white_target, black_target, paper_exp, film_fog, film_power, paper_power,
+        };
+        let velvia = Stage::Velvia { strength: 0.8, bias: 1.0 };
+
+        let canonical = Pipeline::with_stages(vec![sigmoid, velvia]).process(&lin);
+        let reversed = Pipeline::with_stages(vec![velvia, sigmoid]).process(&lin);
+
+        assert!(
+            canonical[0] > reversed[0],
+            "canonical (sigmoid→velvia) red {} must exceed velvia-first red {}: \
+             velvia-first clipped the scene-linear highlight before the tone map",
+            canonical[0], reversed[0]
+        );
     }
 
     #[test]
