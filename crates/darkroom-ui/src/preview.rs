@@ -303,12 +303,15 @@ pub fn apply_pipeline(
     outbuf
 }
 
-/// Run the preview pipeline on a packed **linear** RGBA `f32` buffer (e.g. a raw
-/// decoded scene-linear, with values possibly >1.0) and encode the result to
-/// tightly-packed 8-bit sRGB **RGB** for display. Unlike [`apply_pipeline`],
-/// there is no 8-bit round-trip on the way in, so a tone-map stage (sigmoid)
-/// sees the *unclipped* highlights and can roll them off. `linear` must be
-/// `width*height*4` long.
+/// Run the preview pipeline on a packed **linear Rec.2020** RGBA `f32` buffer
+/// (the raw path decodes to the Rec.2020 working space, values possibly >1.0),
+/// convert to sRGB, and encode to tightly-packed 8-bit sRGB **RGB** for display.
+/// Unlike [`apply_pipeline`], there is no 8-bit round-trip on the way in, so a
+/// tone-map stage (sigmoid) sees the *unclipped* highlights and can roll them
+/// off. The stages run in Rec.2020 (wide gamut → less premature clipping); the
+/// `REC2020_TO_SRGB` map just before the OETF is neutral-preserving, and any
+/// out-of-sRGB-gamut colour goes negative and hard-clips at the encode (the
+/// display can't show it). `linear` must be `width*height*4` long.
 pub fn render_linear_to_srgb8(
     linear: &[f32],
     width: usize,
@@ -319,7 +322,12 @@ pub fn render_linear_to_srgb8(
     if linear.len() < n * 4 {
         return vec![0u8; n * 3];
     }
-    let processed = params.to_pipeline().process(&linear[..n * 4]);
+    let mut processed = params.to_pipeline().process(&linear[..n * 4]);
+    // Working space (Rec.2020) → sRGB before the display OETF (m4-35).
+    darkroom_core::rawimage::apply_color_matrix(
+        &mut processed,
+        darkroom_core::rawimage::REC2020_TO_SRGB,
+    );
     let mut out = vec![0u8; n * 3];
     for i in 0..n {
         for c in 0..3 {
@@ -707,13 +715,21 @@ mod tests {
 
     #[test]
     fn render_linear_identity_encodes_srgb() {
-        // empty pipeline ⇒ straight linear→sRGB encode, RGB8 (alpha dropped).
-        let lin = vec![0.0f32, 1.0, 0.214, 1.0]; // linear; 0.214 ≈ sRGB 0.5
-        let out = render_linear_to_srgb8(&lin, 1, 1, &PreviewParams::default());
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0], 0);
-        assert_eq!(out[1], 255);
-        assert!((out[2] as i32 - 128).abs() <= 1, "mid {}", out[2]);
+        // empty pipeline ⇒ Rec.2020→sRGB (neutral-preserving, so a no-op for
+        // greys) then the linear→sRGB OETF, RGB8 (alpha dropped). Three grey
+        // levels exercise black/mid/white: 0→0, 0.214≈sRGB 0.5→128, 1→255.
+        let lin = vec![
+            0.0f32, 0.0, 0.0, 1.0, // black
+            0.214, 0.214, 0.214, 1.0, // mid grey (0.214 ≈ sRGB 0.5)
+            1.0, 1.0, 1.0, 1.0, // white
+        ];
+        let out = render_linear_to_srgb8(&lin, 3, 1, &PreviewParams::default());
+        assert_eq!(out.len(), 9);
+        for c in 0..3 {
+            assert_eq!(out[c], 0, "black");
+            assert!((out[3 + c] as i32 - 128).abs() <= 1, "mid {}", out[3 + c]);
+            assert_eq!(out[6 + c], 255, "white");
+        }
     }
 
     #[test]

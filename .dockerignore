@@ -1,2 +1,6 @@
+target/
+build/
+.git/
+*.log
+crates/*/target/
 docker-images
-.git

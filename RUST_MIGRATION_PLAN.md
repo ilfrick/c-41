@@ -739,13 +739,42 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    negative sooner than darktable's Rec.2020 pipe would — fine for a preview; widen
    to a larger working gamut later.
 
-   **Candidate next increments after m4-34** (recorded so they survive a context
+   **m4-35** — linear Rec.2020 working colour space for the raw preview pipeline
+   (pipeline depth; resolves the m4-34 KNOWN SIMPLIFICATION) (DONE). The raw path
+   now decodes camera-native RGB into **linear Rec.2020** instead of linear sRGB:
+   `srgb_from_cam_matrix` → `rec2020_from_cam_matrix` (same dcraw `cam_xyz_coeff`
+   construction, target primaries = Rec.2020), `XYZ_RGB` → `REC2020_XYZ`
+   (Rec.2020→XYZ D65, Lindbloom construction from CIE chromaticities), struct field
+   `cam_to_srgb` → `cam_to_working`. The wide gamut gives the saturation/tone
+   stages (velvia, sigmoid) headroom before clipping. Display seam: new
+   `pub REC2020_TO_SRGB` (`inv(sRGB→XYZ)·(Rec.2020→XYZ)`, rows sum to 1 so
+   neutrals map exactly) applied in `render_linear_to_srgb8` after
+   `Pipeline::process`, just before the sRGB OETF; out-of-sRGB-gamut colours go
+   negative and hard-clip at the encode. The `Srgb8`/`apply_pipeline` (JPEG) path
+   never enters Rec.2020 — no seam, correctly; export shells out to the C
+   `darktable-cli`, untouched. Architect (Opus) traced every buffer consumer:
+   **no double- or missed-conversion path**; active stages (exposure, velvia,
+   splittoning, monochrome, sigmoid) verified space-agnostic. Both matrices
+   verified against an independent exact-arithmetic CIE-chromaticity derivation
+   (~4e-5 agreement; residual = D65 rounding convention). Must-fix from review:
+   non-grey golden for `REC2020_TO_SRGB` (Rec.2020 red → sRGB
+   [1.660, -0.125, -0.018]) since the grey test passes for ANY row-normalised
+   matrix; plus a Canon 5D Mk III camera→Rec.2020 golden re-derived offline.
+   darkroom-core 514→516 tests (+2), all green in Docker.
+   **Deferred (architect-flagged, out of scope):** velvia hard-clamps [0,1]
+   pre-sigmoid (pre-existing, loses >1.0 scene-linear data); default monochrome
+   weights are Rec.709 luma now applied to Rec.2020 primaries (off by default,
+   user-adjustable); `basicadj.rs`/`gamma.rs` carry sRGB/Rec.601 luma constants
+   but are not wired into the `Stage` enum — revisit if they ever join the
+   pipeline.
+
+   **Candidate next increments after m4-35** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
-   - **Pipeline depth (continue):** wider working-space gamut (Rec.2020) so
-     saturation/tone ops have headroom before clipping (see m4-34 simplification);
-     or a higher-quality Bayer demosaic in the preview path (currently PPG); or
-     geometry IOPs (crop/rotate) needing an ROI/(w,h)-aware pipeline.
+   - **Pipeline depth (continue):** a higher-quality Bayer demosaic in the
+     preview path (currently PPG); or geometry IOPs (crop/rotate) needing an
+     ROI/(w,h)-aware pipeline; or lift velvia's [0,1] clamp so scene-linear
+     highlights survive to the sigmoid (see m4-35 deferred list).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.

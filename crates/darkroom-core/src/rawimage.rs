@@ -45,11 +45,12 @@ pub struct RawImage {
     /// Display orientation as `(transpose, flip_x, flip_y)` from rawloader's
     /// `Orientation::to_flips()` — applied (after demosaic) by `to_linear_rgba`.
     pub orientation: (bool, bool, bool),
-    /// Camera-native RGB → linear-sRGB (D65) 3×3, derived from the raw's
-    /// XYZ→camera matrix by [`srgb_from_cam_matrix`] and applied (after white
+    /// Camera-native RGB → linear-Rec.2020 (D65) 3×3, derived from the raw's
+    /// XYZ→camera matrix by [`rec2020_from_cam_matrix`] and applied (after white
     /// balance) by `to_linear_rgba`. [`IDENTITY3`] when the file carries no usable
-    /// matrix — the pre-m4-34 behaviour of treating camera colours as sRGB.
-    pub cam_to_srgb: [[f32; 3]; 3],
+    /// matrix. Rec.2020 is the working space (m4-35); the display seam converts it
+    /// to sRGB via [`REC2020_TO_SRGB`].
+    pub cam_to_working: [[f32; 3]; 3],
     /// Black/white-normalised photosites, row-major, `width * height` long.
     pub mosaic: Vec<f32>,
 }
@@ -211,7 +212,7 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<RawImage> {
         xtrans,
         wb: raw.wb_coeffs,
         orientation: raw.orientation.to_flips(),
-        cam_to_srgb: srgb_from_cam_matrix(raw.xyz_to_cam),
+        cam_to_working: rec2020_from_cam_matrix(raw.xyz_to_cam),
         mosaic,
     })
 }
@@ -429,16 +430,33 @@ pub fn demosaic_xtrans(
 }
 
 /// The identity 3×3: camera colours passed through unchanged (treated as already
-/// sRGB). The colour-matrix fallback when a file carries no usable XYZ→camera
-/// matrix, and the neutral value for the demo/test `RawImage`.
+/// Rec.2020, the working space — the display seam still applies to them). The
+/// colour-matrix fallback when a file carries no usable XYZ→camera matrix, and
+/// the neutral value for the demo/test `RawImage`.
 pub const IDENTITY3: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
-/// Linear-sRGB → CIE XYZ (D65), matching dcraw's `xyz_rgb` constants. Composed
-/// with the raw's XYZ→camera matrix to build the camera→sRGB transform.
-const XYZ_RGB: [[f64; 3]; 3] = [
-    [0.412453, 0.357580, 0.180423],
-    [0.212671, 0.715160, 0.072169],
-    [0.019334, 0.119193, 0.950227],
+/// Linear Rec.2020 → CIE XYZ (D65), derived from the Rec.2020 primaries and the
+/// D65 white (Lindbloom construction, so RGB white maps exactly to XYZ D65).
+/// Composed with the raw's XYZ→camera matrix to build camera→Rec.2020 (the
+/// working space, m4-35). Rec.2020 is wider than sRGB, so saturated camera
+/// colours stay in-gamut through the tone/saturation stages instead of clipping.
+const REC2020_XYZ: [[f64; 3]; 3] = [
+    [0.63701019, 0.14461503, 0.16884478],
+    [0.26272172, 0.67798928, 0.05928901],
+    [0.00000000, 0.02807233, 1.06075767],
+];
+
+/// Linear Rec.2020 → linear sRGB (D65), for the display-encode seam: the preview
+/// stages run in the Rec.2020 working space, then this maps to sRGB just before
+/// the OETF (`preview::render_linear_to_srgb8`). Derived as `inv(sRGB→XYZ) ·
+/// (Rec.2020→XYZ)` from the same D65 primaries construction as [`REC2020_XYZ`],
+/// so every row sums to 1 — a neutral maps to a neutral EXACTLY (no grey tint).
+/// Out-of-sRGB-gamut Rec.2020 colours produce negatives here, hard-clipped at the
+/// OETF (the display can't show them). `pub` for the darkroom-ui render seam.
+pub const REC2020_TO_SRGB: [[f32; 3]; 3] = [
+    [1.66036266, -0.58754000, -0.07282266],
+    [-0.12456355, 1.13291137, -0.00834783],
+    [-0.01815661, -0.10060173, 1.11875834],
 ];
 
 /// Invert a 3×3 matrix, or `None` when it is (near-)singular.
@@ -469,27 +487,28 @@ fn mat3_inverse(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
     ])
 }
 
-/// Derive the camera-native-RGB → linear-sRGB (D65) 3×3 from the raw's XYZ→camera
-/// matrix (`rawloader`'s `xyz_to_cam`; the top 3 rows are used — a 4-colour CFA's
-/// 4th row is ignored, since our demosaic yields 3-channel RGB). Follows dcraw's
-/// `cam_xyz_coeff`: form `cam_rgb = xyz_to_cam · (sRGB→XYZ)` (an sRGB→camera map),
-/// row-normalise it so a neutral maps to a neutral (each camera channel's response
-/// to sRGB white is unity), then invert to get camera→sRGB. Returns [`IDENTITY3`]
-/// when the matrix is absent (rawloader reports all-zeros for an unknown camera)
-/// or singular, so the pipeline falls back to treating camera colours as sRGB.
-pub fn srgb_from_cam_matrix(xyz_to_cam: [[f32; 3]; 4]) -> [[f32; 3]; 3] {
-    // cam_rgb = xyz_to_cam(3×3) · XYZ_RGB  → maps linear sRGB to camera native.
+/// Derive the camera-native-RGB → linear-Rec.2020 (D65) 3×3 from the raw's
+/// XYZ→camera matrix (`rawloader`'s `xyz_to_cam`; the top 3 rows are used — a
+/// 4-colour CFA's 4th row is ignored, since our demosaic yields 3-channel RGB).
+/// Follows dcraw's `cam_xyz_coeff`: form `cam_rgb = xyz_to_cam · (Rec.2020→XYZ)`
+/// (a Rec.2020→camera map), row-normalise it so a neutral maps to a neutral (each
+/// camera channel's response to Rec.2020 white is unity), then invert to get
+/// camera→Rec.2020. Returns [`IDENTITY3`] when the matrix is absent (rawloader
+/// reports all-zeros for an unknown camera) or singular, so the pipeline falls
+/// back to treating camera colours as the working space untransformed.
+pub fn rec2020_from_cam_matrix(xyz_to_cam: [[f32; 3]; 4]) -> [[f32; 3]; 3] {
+    // cam_rgb = xyz_to_cam(3×3) · REC2020_XYZ  → maps Rec.2020 to camera native.
     let mut cam_rgb = [[0.0f64; 3]; 3];
     for (i, row) in cam_rgb.iter_mut().enumerate() {
         for (j, cell) in row.iter_mut().enumerate() {
             *cell = (0..3)
-                .map(|k| xyz_to_cam[i][k] as f64 * XYZ_RGB[k][j])
+                .map(|k| xyz_to_cam[i][k] as f64 * REC2020_XYZ[k][j])
                 .sum();
         }
     }
     // Row-normalise (dcraw's `num`): make each row sum to 1 so camera white ==
-    // sRGB white, keeping neutrals neutral. A zero row (no matrix) is left as-is
-    // and makes the inverse fail below → identity fallback.
+    // Rec.2020 white, keeping neutrals neutral. A zero row (no matrix) is left
+    // as-is and makes the inverse fail below → identity fallback.
     for row in cam_rgb.iter_mut() {
         let num: f64 = row.iter().sum();
         if num.abs() > 1e-12 {
@@ -498,7 +517,7 @@ pub fn srgb_from_cam_matrix(xyz_to_cam: [[f32; 3]; 4]) -> [[f32; 3]; 3] {
             }
         }
     }
-    // Invert (camera→sRGB); identity fallback when the file gave no usable matrix.
+    // Invert (camera→Rec.2020); identity fallback when the file gave no usable matrix.
     match mat3_inverse(cam_rgb) {
         Some(inv) => {
             let mut out = IDENTITY3;
@@ -513,8 +532,9 @@ pub fn srgb_from_cam_matrix(xyz_to_cam: [[f32; 3]; 4]) -> [[f32; 3]; 3] {
     }
 }
 
-/// Apply a 3×3 colour matrix to packed RGBA `f32` in place (alpha untouched),
-/// mapping camera-native RGB to linear sRGB. Exactly a no-op for [`IDENTITY3`]
+/// Apply a 3×3 colour matrix to packed RGBA `f32` in place (alpha untouched).
+/// Used both for camera-native RGB → working space (Rec.2020) and for the
+/// working space → sRGB display seam ([`REC2020_TO_SRGB`]). Exactly a no-op for [`IDENTITY3`]
 /// (`x*1 + y*0 + z*0 == x`). Out-of-gamut results may go slightly negative; that
 /// is left unclamped for the scene-linear pipeline (the tone map rolls it off),
 /// matching darktable's input-profile behaviour.
@@ -552,10 +572,11 @@ impl RawImage {
             None => demosaic_ppg(&self.mosaic, self.width, self.height, self.cfa),
         };
         apply_white_balance(&mut rgba, self.wb);
-        // Camera-native RGB → linear sRGB (no-op when the file gave no matrix, so
-        // this is the identity for the synthetic/demo path). After WB so the
-        // neutral-preserving, row-normalised matrix sees a white-balanced neutral.
-        apply_color_matrix(&mut rgba, self.cam_to_srgb);
+        // Camera-native RGB → linear Rec.2020 working space (no-op when the file
+        // gave no matrix, so this is the identity for the synthetic/demo path).
+        // After WB so the neutral-preserving, row-normalised matrix sees a
+        // white-balanced neutral. The display seam later maps Rec.2020 → sRGB.
+        apply_color_matrix(&mut rgba, self.cam_to_working);
         // the demosaic leaves the 4th channel at 0 (it has no contributors); set it
         // opaque so a display upload that honours alpha doesn't render the
         // preview fully transparent.
@@ -724,7 +745,7 @@ mod tests {
             xtrans: None,
             wb: [2.0, 1.0, 4.0, 1.0],
             orientation: (false, false, false),
-            cam_to_srgb: IDENTITY3, // colour matrix is a no-op for this fixture
+            cam_to_working: IDENTITY3, // colour matrix is a no-op for this fixture
             mosaic: vec![0.4, 0.6, 0.2, 0.8],
         };
         let (w, h, rgba) = img.to_linear_rgba();
@@ -741,25 +762,25 @@ mod tests {
     }
 
     #[test]
-    fn srgb_from_cam_matrix_zero_falls_back_to_identity() {
+    fn rec2020_from_cam_matrix_zero_falls_back_to_identity() {
         // rawloader reports an all-zero matrix for an unknown camera → identity
-        // (treat camera colours as sRGB, the pre-m4-34 behaviour).
-        assert_eq!(srgb_from_cam_matrix([[0.0; 3]; 4]), IDENTITY3);
+        // (treat camera colours as the working space untransformed).
+        assert_eq!(rec2020_from_cam_matrix([[0.0; 3]; 4]), IDENTITY3);
     }
 
     #[test]
-    fn srgb_from_cam_matrix_preserves_neutral_and_ignores_4th_row() {
+    fn rec2020_from_cam_matrix_preserves_neutral_and_ignores_4th_row() {
         // For any non-singular matrix the row-normalise-then-invert construction
-        // maps a camera neutral to an sRGB neutral. The 4th row is ignored.
+        // maps a camera neutral to a working-space neutral. The 4th row is ignored.
         let xyz_to_cam = [
             [0.6, 0.1, -0.1],
             [-0.2, 1.1, 0.1],
             [0.0, 0.1, 0.7],
             [9.9, 9.9, 9.9], // 4th row: must not affect the RGB result
         ];
-        let m = srgb_from_cam_matrix(xyz_to_cam);
+        let m = rec2020_from_cam_matrix(xyz_to_cam);
         assert_ne!(m, IDENTITY3, "a real camera matrix must transform colour");
-        // camera neutral (1,1,1) → sRGB neutral (1,1,1)
+        // camera neutral (1,1,1) → working-space neutral (1,1,1)
         let mut px = vec![1.0f32, 1.0, 1.0, 1.0];
         apply_color_matrix(&mut px, m);
         for (c, v) in px[..3].iter().enumerate() {
@@ -769,15 +790,16 @@ mod tests {
     }
 
     #[test]
-    fn srgb_from_cam_matrix_matches_dcraw_golden_for_a_real_camera() {
+    fn rec2020_from_cam_matrix_matches_dcraw_golden_for_a_real_camera() {
         // Golden regression pinning the FULL construction (multiply order +
         // row-normalise + invert + constants), not just the by-construction
         // neutral invariant. `xyz_to_cam` is the Canon EOS 5D Mark III matrix from
-        // dcraw's `adobe_coeff` (cam_xyz × 1e-4); the expected camera→sRGB was
+        // dcraw's `adobe_coeff` (cam_xyz × 1e-4); the expected camera→Rec.2020 was
         // computed by an independent pure-Python implementation of dcraw's
-        // `cam_xyz_coeff`. A transposed multiply, a wrong sRGB constant, or an
-        // inversion bug all diverge from these numbers (a neutral-only test would
-        // not — grey is preserved for any invertible row-normalised matrix).
+        // `cam_xyz_coeff` (target primaries = Rec.2020). A transposed multiply, a
+        // wrong primaries constant, or an inversion bug all diverge from these
+        // numbers (a neutral-only test would not — grey is preserved for any
+        // invertible row-normalised matrix).
         let xyz_to_cam = [
             [0.6722, -0.0635, -0.0963],
             [-0.4287, 1.2460, 0.2028],
@@ -785,11 +807,11 @@ mod tests {
             [0.0, 0.0, 0.0],
         ];
         let expected = [
-            [1.964400, -1.119710, 0.155311],
-            [-0.241156, 1.673722, -0.432566],
-            [0.013887, -0.549820, 1.535933],
+            [1.15376201, -0.17528879, 0.02152677],
+            [-0.08583896, 1.45544251, -0.36960355],
+            [0.02341822, -0.36338841, 1.33997019],
         ];
-        let m = srgb_from_cam_matrix(xyz_to_cam);
+        let m = rec2020_from_cam_matrix(xyz_to_cam);
         for i in 0..3 {
             for j in 0..3 {
                 assert!(
@@ -816,6 +838,40 @@ mod tests {
         let mut px = vec![0.1f32, 0.2, 0.3, 1.0];
         apply_color_matrix(&mut px, swap);
         assert_eq!(px, vec![0.3, 0.2, 0.1, 1.0]);
+    }
+
+    #[test]
+    fn rec2020_to_srgb_preserves_neutral() {
+        // The display-seam matrix must map grey→grey exactly (its rows sum to 1),
+        // else a neutral would pick up a colour cast on the way to the screen.
+        let mut px = vec![0.5f32, 0.5, 0.5, 1.0];
+        apply_color_matrix(&mut px, REC2020_TO_SRGB);
+        for (c, v) in px[..3].iter().enumerate() {
+            assert!((v - 0.5).abs() < 1e-5, "channel {c} = {v}, expected 0.5");
+        }
+        assert_eq!(px[3], 1.0);
+    }
+
+    #[test]
+    fn rec2020_to_srgb_matches_golden_for_rec2020_red() {
+        // Non-grey golden for the display-seam constant. The neutral test above
+        // passes for ANY row-normalised matrix (even identity or a transpose);
+        // this pins the actual values: the Rec.2020 red primary maps to sRGB as
+        // ~[1.660, -0.125, -0.018] (out of sRGB gamut, hence >1 and negatives).
+        // Expected values verified against an independent exact-arithmetic
+        // derivation from the CIE chromaticity coordinates (agreement ~2e-4;
+        // the residual is D65 white rounding conventions). A transposed matrix
+        // would yield [1.660, -0.588, -0.073] here and fail hard.
+        let mut px = vec![1.0f32, 0.0, 0.0, 1.0];
+        apply_color_matrix(&mut px, REC2020_TO_SRGB);
+        let expected = [1.66036266, -0.12456355, -0.01815661];
+        for (c, (v, e)) in px[..3].iter().zip(expected).enumerate() {
+            assert!(
+                (v - e).abs() < 1e-4,
+                "channel {c} = {v}, expected {e}"
+            );
+        }
+        assert_eq!(px[3], 1.0, "alpha untouched");
     }
 
     #[test]
