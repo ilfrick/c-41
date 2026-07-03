@@ -893,10 +893,14 @@ pub fn apply_white_balance(rgba: &mut [f32], wb: [f32; 4]) {
 impl RawImage {
     /// Demosaic + white-balance this raw into a packed **linear RGBA** `f32`
     /// buffer ready for [`crate::pipeline`]. Returns `(width, height, pixels)`.
+    ///
+    /// Bayer sensors use [`demosaic_rcd`] (darktable's default, high quality);
+    /// X-Trans uses the Markesteijn [`demosaic_xtrans`]. RCD internally falls
+    /// back to the [`demosaic_ppg`] base for frames too small for a tile.
     pub fn to_linear_rgba(&self) -> (usize, usize, Vec<f32>) {
         let mut rgba = match &self.xtrans {
             Some(xt) => demosaic_xtrans(&self.mosaic, self.width, self.height, xt),
-            None => demosaic_ppg(&self.mosaic, self.width, self.height, self.cfa),
+            None => demosaic_rcd(&self.mosaic, self.width, self.height, self.cfa),
         };
         apply_white_balance(&mut rgba, self.wb);
         // Camera-native RGB → linear Rec.2020 working space (no-op when the file
