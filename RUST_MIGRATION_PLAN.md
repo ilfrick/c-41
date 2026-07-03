@@ -768,13 +768,40 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    but are not wired into the `Stage` enum — revisit if they ever join the
    pipeline.
 
-   **Candidate next increments after m4-35** (recorded so they survive a context
+   **m4-36** — canonical scene-referred iop stage order in the preview pipeline
+   (pipeline depth; supersedes the m4-35-deferred "velvia clamps pre-sigmoid"
+   item) (DONE, commit `84abf4a038`). `PreviewParams::to_pipeline` reordered
+   from `exposure → velvia → splittoning → monochrome → sigmoid` to darktable's
+   canonical v3.0 order `exposure → channelmixer(grey) → sigmoid → velvia →
+   splittoning` (`src/common/iop_order.c`). velvia/splittoning are
+   display-referred and hard-clamp output to [0,1] (faithful C ports); running
+   them BEFORE the sigmoid tone map crushed scene-linear highlights (>1.0), and
+   monochrome-last silently discarded velvia/splittoning output (split-toning a
+   B&W image was a no-op). Now velvia runs post-sigmoid on display-referred data
+   where the [0,1] clamp is correct — so the m4-35 velvia-clamp deferral is
+   resolved without lifting the clamp. Docstring cites `channelmixerrgb 39` (the
+   scene-referred module) as the ordering reference and notes the legacy
+   `channelmixer` port is placed there for the photometric reason (linear
+   luminance is the correct domain to tone-map as luminance), plus the
+   sigmoid-off raw-path clipping caveat. Tests: `to_pipeline_orders_stages_
+   canonically` pins the `.name()` order; `canonical_order_preserves_chromatic_
+   highlight_velvia_first_crushes_it` builds both stage orders via
+   `Pipeline::with_stages` and asserts the canonical order keeps a chromatic
+   scene-linear highlight brighter than velvia-first (a grey pixel can't
+   distinguish orders — velvia is identity on greys). Two Opus reviews (2nd read
+   the C-port sources): reorder correct, **no blockers**; applied both should-fix
+   items (the `channelmixerrgb`-vs-legacy-`channelmixer` citation fix, chromatic
+   test) + the mono+splittoning-tint doc note. darkroom-ui 114→115 tests, Docker
+   check/clippy/test green, both remotes synced.
+
+   **Candidate next increments after m4-36** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
    - **Pipeline depth (continue):** a higher-quality Bayer demosaic in the
-     preview path (currently PPG); or geometry IOPs (crop/rotate) needing an
-     ROI/(w,h)-aware pipeline; or lift velvia's [0,1] clamp so scene-linear
-     highlights survive to the sigmoid (see m4-35 deferred list).
+     preview path (currently PPG; RCD/VNG already migrated in darkroom-core —
+     wire one into the raw preview); or geometry IOPs (crop/rotate) needing an
+     ROI/(w,h)-aware pipeline. (The velvia-clamp item is now moot — m4-36 moved
+     velvia after the tone map.)
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
