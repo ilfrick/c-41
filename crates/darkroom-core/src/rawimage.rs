@@ -122,6 +122,23 @@ pub enum CfaKind {
     Xtrans([[u8; 6]; 6]),
 }
 
+/// Bayer demosaic algorithm choice for [`RawImage::to_linear_rgba_with`]. Only
+/// affects Bayer sensors — X-Trans always uses Markesteijn regardless. [`Rcd`]
+/// is the default (darktable's default; highest quality). Ordered/keep the
+/// discriminants stable: they are persisted (see the UI preview params).
+///
+/// [`Rcd`]: DemosaicMethod::Rcd
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DemosaicMethod {
+    /// Ratio Corrected Demosaicing ([`demosaic_rcd`]) — darktable's default.
+    #[default]
+    Rcd,
+    /// Variable Number of Gradients ([`demosaic_vng`]).
+    Vng,
+    /// Patterned Pixel Grouping ([`demosaic_ppg`]) — fastest, lowest quality.
+    Ppg,
+}
+
 /// Classify a CFA from a colour-lookup probe `color_at(row, col)` (0=R,1=G,2=B,
 /// 3=E, as `rawloader::CFA::color_at` returns). A pattern that is 2×2-periodic
 /// across the 6×6 window (6 = lcm(2,6)) is [`CfaKind::Bayer`]; otherwise one that
@@ -1145,15 +1162,27 @@ pub fn apply_white_balance(rgba: &mut [f32], wb: [f32; 4]) {
 
 impl RawImage {
     /// Demosaic + white-balance this raw into a packed **linear RGBA** `f32`
-    /// buffer ready for [`crate::pipeline`]. Returns `(width, height, pixels)`.
-    ///
-    /// Bayer sensors use [`demosaic_rcd`] (darktable's default, high quality);
-    /// X-Trans uses the Markesteijn [`demosaic_xtrans`]. RCD internally falls
-    /// back to the [`demosaic_ppg`] base for frames too small for a tile.
+    /// buffer ready for [`crate::pipeline`], using the default Bayer demosaicer
+    /// ([`DemosaicMethod::Rcd`]). Returns `(width, height, pixels)`.
     pub fn to_linear_rgba(&self) -> (usize, usize, Vec<f32>) {
+        self.to_linear_rgba_with(DemosaicMethod::default())
+    }
+
+    /// Demosaic + white-balance with an explicit Bayer [`DemosaicMethod`].
+    ///
+    /// The method selects the Bayer demosaicer ([`demosaic_rcd`] / [`demosaic_vng`]
+    /// / [`demosaic_ppg`]); **X-Trans ignores it** and always uses the Markesteijn
+    /// [`demosaic_xtrans`]. RCD/PPG internally fall back to a simpler kernel for
+    /// frames too small for their interior.
+    pub fn to_linear_rgba_with(&self, method: DemosaicMethod) -> (usize, usize, Vec<f32>) {
+        let (w, h) = (self.width, self.height);
         let mut rgba = match &self.xtrans {
-            Some(xt) => demosaic_xtrans(&self.mosaic, self.width, self.height, xt),
-            None => demosaic_rcd(&self.mosaic, self.width, self.height, self.cfa),
+            Some(xt) => demosaic_xtrans(&self.mosaic, w, h, xt),
+            None => match method {
+                DemosaicMethod::Rcd => demosaic_rcd(&self.mosaic, w, h, self.cfa),
+                DemosaicMethod::Vng => demosaic_vng(&self.mosaic, w, h, self.cfa),
+                DemosaicMethod::Ppg => demosaic_ppg(&self.mosaic, w, h, self.cfa),
+            },
         };
         apply_white_balance(&mut rgba, self.wb);
         // Camera-native RGB → linear Rec.2020 working space (no-op when the file
@@ -1343,6 +1372,70 @@ mod tests {
         assert!((rgba[0] - 0.8).abs() < 1e-6, "R {}", rgba[0]);
         assert!((rgba[1] - 0.4).abs() < 1e-6, "G {}", rgba[1]);
         assert!((rgba[2] - 3.2).abs() < 1e-6, "B {}", rgba[2]);
+    }
+
+    #[test]
+    fn to_linear_rgba_with_dispatches_by_method() {
+        // 40×40 Bayer so every demosaicer runs its real interior (RCD needs
+        // ≥ 2·RCD_BORDER = 20, PPG ≥ 16, VNG ≥ 6); a diagonal gradient gives both
+        // H and V structure so the three algorithms' directional logic diverges.
+        let (w, h) = (40usize, 40usize);
+        let cfa = [[0usize, 1], [1, 2]];
+        let mosaic: Vec<f32> = (0..w * h)
+            .map(|i| ((i % w + i / w) as f32) / ((w + h) as f32))
+            .collect();
+        let img = RawImage {
+            width: w,
+            height: h,
+            cfa,
+            xtrans: None,
+            wb: [1.0, 1.0, 1.0, 1.0],
+            orientation: (false, false, false),
+            cam_to_working: IDENTITY3,
+            mosaic,
+        };
+        // The no-arg entry point delegates to RCD, byte-for-byte.
+        assert_eq!(
+            img.to_linear_rgba(),
+            img.to_linear_rgba_with(DemosaicMethod::Rcd)
+        );
+        let (_, _, rcd) = img.to_linear_rgba_with(DemosaicMethod::Rcd);
+        let (_, _, vng) = img.to_linear_rgba_with(DemosaicMethod::Vng);
+        let (_, _, ppg) = img.to_linear_rgba_with(DemosaicMethod::Ppg);
+        // Distinct algorithms ⇒ distinct output on a gradient — proves the match
+        // arms actually reach different demosaicers, not one aliased path.
+        assert_ne!(rcd, vng, "RCD and VNG output must differ");
+        assert_ne!(rcd, ppg, "RCD and PPG output must differ");
+        assert_ne!(vng, ppg, "VNG and PPG output must differ");
+        for buf in [&rcd, &vng, &ppg] {
+            assert_eq!(buf.len(), w * h * 4);
+            assert!(buf.iter().all(|v| v.is_finite()), "non-finite output");
+            for px in buf.chunks_exact(4) {
+                assert_eq!(px[3], 1.0, "alpha must be opaque");
+            }
+        }
+    }
+
+    #[test]
+    fn to_linear_rgba_with_method_ignored_for_xtrans() {
+        // X-Trans always uses Markesteijn, so the Bayer method must not change
+        // the result (guards the dispatch order: xtrans checked before method).
+        let xt = XTRANS;
+        let (w, h) = (24usize, 24usize); // multiple of the 6×6 pattern
+        let mosaic: Vec<f32> = (0..w * h).map(|i| (i % 7) as f32 / 7.0).collect();
+        let img = RawImage {
+            width: w,
+            height: h,
+            cfa: [[0, 1], [1, 2]],
+            xtrans: Some(xt),
+            wb: [1.0, 1.0, 1.0, 1.0],
+            orientation: (false, false, false),
+            cam_to_working: IDENTITY3,
+            mosaic,
+        };
+        let rcd = img.to_linear_rgba_with(DemosaicMethod::Rcd);
+        assert_eq!(rcd, img.to_linear_rgba_with(DemosaicMethod::Vng));
+        assert_eq!(rcd, img.to_linear_rgba_with(DemosaicMethod::Ppg));
     }
 
     #[test]
