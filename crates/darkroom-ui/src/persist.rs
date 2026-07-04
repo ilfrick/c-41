@@ -16,6 +16,7 @@
 //! by design.
 
 use rusqlite::Connection;
+use darkroom_core::rawimage::DemosaicMethod;
 use crate::history::HistoryStack;
 use crate::preview::PreviewParams;
 
@@ -33,6 +34,16 @@ const PREVIEW_TABLE_DDL: &str =
 const HISTORY_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS main.darkroom_history \
      (imgid INTEGER PRIMARY KEY, stack BLOB NOT NULL)";
+
+/// DDL for the per-image Bayer demosaic-method table (same private-table
+/// rationale as `darkroom_preview`). A separate table — NOT a field of the
+/// params blob — because the demosaic choice is *decode-time* state: changing
+/// it re-decodes the raw, whereas params changes only re-run the pipeline; and
+/// keeping it out of [`PreviewParams`] avoids rippling into its Copy /
+/// history-snapshot / before-after-bypass machinery.
+const DEMOSAIC_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS main.darkroom_demosaic \
+     (imgid INTEGER PRIMARY KEY, method INTEGER NOT NULL)";
 
 /// Resolve a file path to its `images.id` via folder + filename (mirrors the
 /// lighttable's lookup). `None` if the image isn't in the catalogue.
@@ -162,6 +173,63 @@ fn save_history_conn(conn: &Connection, imgid: i32, history: &HistoryStack) -> r
     Ok(())
 }
 
+/// Load the saved Bayer [`DemosaicMethod`] for the image at `full_path`, falling
+/// back to the default (RCD) on any miss (no db, uncatalogued image, no row, or
+/// table absent). Unknown stored codes also decode to the default — see
+/// [`DemosaicMethod::from_u8`].
+pub fn load_demosaic(db_path: &str, full_path: &str) -> DemosaicMethod {
+    if db_path.is_empty() {
+        return DemosaicMethod::default();
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return DemosaicMethod::default();
+    };
+    match imgid_for_path(&conn, full_path) {
+        Some(imgid) => load_demosaic_conn(&conn, imgid),
+        None => DemosaicMethod::default(),
+    }
+}
+
+/// Persist the Bayer [`DemosaicMethod`] for the image at `full_path`.
+/// Best-effort: silently no-ops with no db or an uncatalogued image.
+pub fn save_demosaic(db_path: &str, full_path: &str, method: DemosaicMethod) {
+    if db_path.is_empty() {
+        return;
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return;
+    };
+    if let Some(imgid) = imgid_for_path(&conn, full_path) {
+        let _ = save_demosaic_conn(&conn, imgid, method);
+    }
+}
+
+/// Testable core of [`load_demosaic`]: no row / no table / an unknown code all
+/// yield the default method (never an error path).
+fn load_demosaic_conn(conn: &Connection, imgid: i32) -> DemosaicMethod {
+    let code: rusqlite::Result<i64> = conn.query_row(
+        "SELECT method FROM main.darkroom_demosaic WHERE imgid = ?1",
+        rusqlite::params![imgid],
+        |row| row.get(0),
+    );
+    match code {
+        Ok(v) => DemosaicMethod::from_u8(v as u8),
+        Err(_) => DemosaicMethod::default(),
+    }
+}
+
+/// Testable core of [`save_demosaic`]: upsert the single method row (PK on
+/// `imgid` ⇒ one row; `ON CONFLICT` makes it an update).
+fn save_demosaic_conn(conn: &Connection, imgid: i32, method: DemosaicMethod) -> rusqlite::Result<()> {
+    conn.execute(DEMOSAIC_TABLE_DDL, [])?;
+    conn.execute(
+        "INSERT INTO main.darkroom_demosaic (imgid, method) VALUES (?1, ?2) \
+         ON CONFLICT(imgid) DO UPDATE SET method = excluded.method",
+        rusqlite::params![imgid, method.as_u8() as i64],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +301,46 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(load_saved_conn(&db, 42), Some(p2));
+    }
+
+    #[test]
+    fn demosaic_save_then_load_roundtrips() {
+        let db = open_db();
+        save_demosaic_conn(&db, 42, DemosaicMethod::Vng).unwrap();
+        assert_eq!(load_demosaic_conn(&db, 42), DemosaicMethod::Vng);
+        // upsert: PK ⇒ one row holding the latest method
+        save_demosaic_conn(&db, 42, DemosaicMethod::Ppg).unwrap();
+        let n: i32 = db
+            .query_row(
+                "SELECT COUNT(*) FROM main.darkroom_demosaic WHERE imgid = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(load_demosaic_conn(&db, 42), DemosaicMethod::Ppg);
+    }
+
+    #[test]
+    fn demosaic_load_defaults_when_table_absent_or_no_row() {
+        let db = open_db();
+        // table doesn't exist yet → default (no panic), not an error path
+        assert_eq!(load_demosaic_conn(&db, 42), DemosaicMethod::default());
+        // create the table via a save for a different image, then a missing row
+        save_demosaic_conn(&db, 99, DemosaicMethod::Vng).unwrap();
+        assert_eq!(load_demosaic_conn(&db, 42), DemosaicMethod::default());
+    }
+
+    #[test]
+    fn demosaic_unknown_stored_code_decodes_to_default() {
+        let db = open_db();
+        db.execute(DEMOSAIC_TABLE_DDL, []).unwrap();
+        db.execute(
+            "INSERT INTO main.darkroom_demosaic (imgid, method) VALUES (42, 77)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(load_demosaic_conn(&db, 42), DemosaicMethod::default());
     }
 
     fn sample_history() -> HistoryStack {
