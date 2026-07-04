@@ -706,6 +706,259 @@ pub fn demosaic_rcd(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
     out
 }
 
+// dcraw VNG gradient term table (64 terms × {y1,x1,y2,x2,weight,grad-bits}) plus
+// the 8 clockwise gradient-direction offsets (chood), transcribed EXACTLY from
+// vng.c:97-115 (extracted programmatically, not hand-typed). Grad bytes ≥ 0x80
+// become negative `i8`, but only bits 0..7 are ever tested via
+// `(v as i32) & (1 << g)`, which reproduces C's signed-char→int promotion.
+#[rustfmt::skip]
+static VNG_TERMS: [i8; 384] = [
+    -2, -2, 0, -1, 1, 1,   -2, -2, 0, 0, 2, 1,   -2, -1, -1, 0, 1, 1,   -2, -1, 0, -1, 1, 2,
+    -2, -1, 0, 0, 1, 3,    -2, -1, 0, 1, 2, 1,   -2, 0, 0, -1, 1, 6,    -2, 0, 0, 0, 2, 2,
+    -2, 0, 0, 1, 1, 3,     -2, 1, -1, 0, 1, 4,   -2, 1, 0, -1, 2, 4,    -2, 1, 0, 0, 1, 6,
+    -2, 1, 0, 1, 1, 2,     -2, 2, 0, 0, 2, 4,    -2, 2, 0, 1, 1, 4,     -1, -2, -1, 0, 1, -128,
+    -1, -2, 0, -1, 1, 1,   -1, -2, 1, -1, 1, 1,  -1, -2, 1, 0, 2, 1,    -1, -1, -1, 1, 1, -120,
+    -1, -1, 1, -2, 1, 64,  -1, -1, 1, -1, 1, 34, -1, -1, 1, 0, 1, 51,   -1, -1, 1, 1, 2, 17,
+    -1, 0, -1, 2, 1, 8,    -1, 0, 0, -1, 1, 68,  -1, 0, 0, 1, 1, 17,    -1, 0, 1, -2, 2, 64,
+    -1, 0, 1, -1, 1, 102,  -1, 0, 1, 0, 2, 34,   -1, 0, 1, 1, 1, 51,    -1, 0, 1, 2, 2, 16,
+    -1, 1, 1, -1, 2, 68,   -1, 1, 1, 0, 1, 102,  -1, 1, 1, 1, 1, 34,    -1, 1, 1, 2, 1, 16,
+    -1, 2, 0, 1, 1, 4,     -1, 2, 1, 0, 2, 4,    -1, 2, 1, 1, 1, 4,     0, -2, 0, 0, 2, -128,
+    0, -1, 0, 1, 2, -120,  0, -1, 1, -2, 1, 64,  0, -1, 1, 0, 1, 17,    0, -1, 2, -2, 1, 64,
+    0, -1, 2, -1, 1, 32,   0, -1, 2, 0, 1, 48,   0, -1, 2, 1, 2, 16,    0, 0, 0, 2, 2, 8,
+    0, 0, 2, -2, 2, 64,    0, 0, 2, -1, 1, 96,   0, 0, 2, 0, 2, 32,     0, 0, 2, 1, 1, 48,
+    0, 0, 2, 2, 2, 16,     0, 1, 1, 0, 1, 68,    0, 1, 1, 2, 1, 16,     0, 1, 2, -1, 2, 64,
+    0, 1, 2, 0, 1, 96,     0, 1, 2, 1, 1, 32,    0, 1, 2, 2, 1, 16,     1, -2, 1, 0, 1, -128,
+    1, -1, 1, 1, 1, -120,  1, 0, 1, 2, 1, 8,     1, 0, 2, -1, 1, 64,    1, 0, 2, 1, 1, 16,
+];
+#[rustfmt::skip]
+static VNG_CHOOD: [i8; 16] = [
+    -1, -1, -1, 0, -1, 1, 0, 1,   1, 1, 1, 0, 1, -1, 0, -1,
+];
+
+/// Build the VNG linear-interpolation lookup table (`_vng_lininterpolate`,
+/// vng.c:46-75) as the flat `i32[16*16*32]` the `darkroom_demosaic_vng_lookup`
+/// kernel consumes. Bayer-only (size 16). Neighbour offsets are in pixels and
+/// depend on `width`, so this is rebuilt per call. Per cell `[row*16+col]`:
+/// `[0]` = neighbour count `np`, then `np` (offset, weight, colour) triples,
+/// then `colours-1` (colour, weight-sum) pairs, then the centre colour.
+fn build_vng_lookup(width: usize, filters4: u32) -> Vec<i32> {
+    use crate::raw::fcol;
+    let xt = [[0u8; 6]; 6]; // unused for Bayer
+    let mut lut = vec![0i32; 16 * 16 * 32];
+    let w = width as i32;
+    for row in 0..16i32 {
+        for col in 0..16i32 {
+            let cell = ((row * 16 + col) as usize) * 32;
+            let f = fcol(row, col, filters4, &xt);
+            let mut sum = [0i32; 4];
+            let mut k = cell + 1;
+            let mut np = 0i32;
+            for y in -1..=1 {
+                for x in -1..=1 {
+                    let weight = 1i32 << (((y == 0) as i32) + ((x == 0) as i32));
+                    let color = fcol(row + y, col + x, filters4, &xt);
+                    if color == f {
+                        continue;
+                    }
+                    lut[k] = w * y + x;
+                    lut[k + 1] = weight;
+                    lut[k + 2] = color as i32;
+                    sum[color] += weight;
+                    k += 3;
+                    np += 1;
+                }
+            }
+            lut[cell] = np;
+            // `colors == sum.len()` for Bayer; emit a (colour, weight-sum) pair
+            // for every colour except the centre's own.
+            for (c, &s) in sum.iter().enumerate() {
+                if c != f {
+                    lut[k] = c as i32;
+                    lut[k + 1] = s;
+                    k += 2;
+                }
+            }
+            lut[k] = f as i32;
+        }
+    }
+    lut
+}
+
+/// Build the VNG gradient `code[prow][pcol]` streams (vng.c:161-197), one
+/// `Vec<i32>` per `(row, col)`, row-major (`row*pcol + col`). Each stream is the
+/// `INT_MAX`-terminated term list (per surviving term: two packed neighbour
+/// offsets, a weight, the set gradient-direction indices, `-1`) followed by 8
+/// chood (offset, colour-or-0) pairs. Offsets are baked to RGBA stride and
+/// depend on `width`.
+fn build_vng_code(prow: usize, pcol: usize, width: usize, filters4: u32) -> Vec<Vec<i32>> {
+    use crate::raw::fcol;
+    let xt = [[0u8; 6]; 6];
+    let w = width as i32;
+    let mut code = Vec::with_capacity(prow * pcol);
+    for row in 0..prow as i32 {
+        for col in 0..pcol as i32 {
+            let mut ip: Vec<i32> = Vec::with_capacity(320);
+            for t in 0..64usize {
+                let b = t * 6;
+                let (y1, x1) = (VNG_TERMS[b] as i32, VNG_TERMS[b + 1] as i32);
+                let (y2, x2) = (VNG_TERMS[b + 2] as i32, VNG_TERMS[b + 3] as i32);
+                let weight = VNG_TERMS[b + 4] as i32;
+                let grads = VNG_TERMS[b + 5] as i32;
+                let color = fcol(row + y1, col + x1, filters4, &xt);
+                if fcol(row + y2, col + x2, filters4, &xt) != color {
+                    continue;
+                }
+                let diag = if fcol(row, col + 1, filters4, &xt) == color
+                    && fcol(row + 1, col, filters4, &xt) == color
+                {
+                    2
+                } else {
+                    1
+                };
+                if (y1 - y2).abs() == diag && (x1 - x2).abs() == diag {
+                    continue;
+                }
+                ip.push((y1 * w + x1) * 4 + color as i32);
+                ip.push((y2 * w + x2) * 4 + color as i32);
+                ip.push(weight);
+                for g in 0..8 {
+                    if grads & (1 << g) != 0 {
+                        ip.push(g);
+                    }
+                }
+                ip.push(-1);
+            }
+            ip.push(i32::MAX);
+            for g in 0..8usize {
+                let (y, x) = (VNG_CHOOD[2 * g] as i32, VNG_CHOOD[2 * g + 1] as i32);
+                ip.push((y * w + x) * 4);
+                let color = fcol(row, col, filters4, &xt);
+                if fcol(row + y, col + x, filters4, &xt) != color
+                    && fcol(row + 2 * y, col + 2 * x, filters4, &xt) == color
+                {
+                    ip.push((y * w + x) * 8 + color as i32);
+                } else {
+                    ip.push(0);
+                }
+            }
+            code.push(ip);
+        }
+    }
+    code
+}
+
+/// Demosaic a normalised Bayer CFA mosaic via **VNG** (Variable Number of
+/// Gradients) — dcraw's threshold-based interpolation, a high-quality
+/// alternative to [`demosaic_rcd`]. Assembles darktable's `vng_interpolate`
+/// (`src/iop/demosaicing/vng.c`) natively: the migrated per-pass kernels in
+/// [`crate::iop::demosaic`] (`vng_border`, `vng_lookup`, `vng_gradient_row`,
+/// `vng_finish`) driven by the table builders ported here ([`build_vng_lookup`],
+/// [`build_vng_code`]) plus the C 3-row ring buffer with its 2-row-deferred
+/// write-back (so the gradient kernel always reads the un-refined base image).
+///
+/// Bayer only (X-Trans routes to [`demosaic_xtrans`]). RGGB greens are split
+/// into G1/G2 (`filters4`) for the 4-colour interpolation, then re-merged by the
+/// finish pass. Frames too small for the gradient interior get the linear-only
+/// VNG (border + lookup), itself a complete demosaic. Leaves the 4th channel at
+/// 0 like the sibling demosaicers; [`RawImage::to_linear_rgba`] sets alpha.
+pub fn demosaic_vng(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2]; 2]) -> Vec<f32> {
+    let n = width.saturating_mul(height);
+    let mut out = vec![0.0f32; n * 4];
+    if mosaic.len() < n || n == 0 {
+        return out;
+    }
+    let filters = filters_from_cfa(cfa);
+    // Separate the two Bayer greens (G1=1, G2=3) so the 4-colour VNG treats them
+    // apart (vng.c:137-143); the finish pass averages them back into green.
+    let filters4 = if (filters & 3) == 1 {
+        filters | 0x0303_0303
+    } else {
+        filters | 0x0c0c_0c0c
+    };
+    let colors = 4usize; // Bayer
+    let (prow, pcol) = (8usize, 2usize);
+    let xtb = [0u8; 36]; // unused for Bayer, but the kernels read 36 bytes
+
+    // Linear VNG: border ring interpolation + lookup-table interior. `border`
+    // = 1_000_000 disables the tile ring-skip (full-frame path), matching C.
+    // Safety: `out` is n*4 floats, `mosaic` is ≥ n, `xtb` is 36 bytes, `lookup`
+    // is exactly 16*16*32 i32 — every kernel's documented contract.
+    unsafe {
+        crate::iop::demosaic::darkroom_demosaic_vng_border(
+            out.as_mut_ptr(),
+            mosaic.as_ptr(),
+            width,
+            height,
+            filters4,
+            xtb.as_ptr(),
+        );
+    }
+    let lookup = build_vng_lookup(width, filters4);
+    unsafe {
+        crate::iop::demosaic::darkroom_demosaic_vng_lookup(
+            out.as_mut_ptr(),
+            mosaic.as_ptr(),
+            width,
+            height,
+            filters4,
+            1_000_000,
+            lookup.as_ptr(),
+        );
+    }
+
+    // Gradient VNG: needs a 2-row interior and the ring buffer. The gradient
+    // kernel writes brow[2]; the copy of brow[0] into `out` is deferred by two
+    // rows so no gradient ever reads an already-refined row (C vng.c:199-213).
+    if width >= 6 && height >= 6 {
+        let code = build_vng_code(prow, pcol, width, filters4);
+        let row_len = width * 4;
+        let mut brow: [Vec<f32>; 3] =
+            [vec![0.0; row_len], vec![0.0; row_len], vec![0.0; row_len]];
+        let copy_len = (width - 4) * 4; // interior cols 2..width-2
+        // Ring-buffer rows are copied out from float offset 8 = col 2 (2 pixels
+        // × 4 channels), matching C's `(float *)(brow[.] + 2)`.
+        for row in 2..height - 2 {
+            let pr = (row % prow) * pcol;
+            // `code` is never mutated in this loop, so these raw pointers into
+            // its inner Vecs stay valid for the whole gradient call.
+            let cptrs: [*const i32; 2] = [code[pr].as_ptr(), code[pr + 1].as_ptr()];
+            // Safety: `out` is n*4 floats (read-only here), `brow[2]` is width*4,
+            // `xtb` 36 bytes, `cptrs` holds `pcol` valid INT_MAX-terminated
+            // streams; column reads are independent so serial == the C OMP sweep.
+            unsafe {
+                crate::iop::demosaic::darkroom_demosaic_vng_gradient_row(
+                    out.as_ptr(),
+                    brow[2].as_mut_ptr(),
+                    width,
+                    height,
+                    row as i32,
+                    filters4,
+                    xtb.as_ptr(),
+                    colors as i32,
+                    cptrs.as_ptr(),
+                    pcol as i32,
+                );
+            }
+            if row > 3 {
+                let dst = ((row - 2) * width + 2) * 4;
+                out[dst..dst + copy_len].copy_from_slice(&brow[0][8..8 + copy_len]);
+            }
+            brow.rotate_left(1);
+        }
+        let d0 = ((height - 4) * width + 2) * 4;
+        out[d0..d0 + copy_len].copy_from_slice(&brow[0][8..8 + copy_len]);
+        let d1 = ((height - 3) * width + 2) * 4;
+        out[d1..d1 + copy_len].copy_from_slice(&brow[1][8..8 + copy_len]);
+    }
+
+    // Finish: average G1/G2 back into the green channel + clip negatives.
+    // Safety: `out` is n*4 floats.
+    unsafe {
+        crate::iop::demosaic::darkroom_demosaic_vng_finish(out.as_mut_ptr(), n, 1);
+    }
+    out
+}
+
 /// Demosaic a normalised **X-Trans** CFA mosaic to packed RGBA `f32` via the
 /// migrated single-pass **Markesteijn** interpolation
 /// (`iop::markesteijn::darkroom_xtrans_markesteijn`, xtrans.c:45). The kernel
@@ -1421,6 +1674,93 @@ mod tests {
             assert!(
                 (out[p + c] - 0.5).abs() < 1e-4,
                 "BGGR ch{c} = {}",
+                out[p + c]
+            );
+        }
+    }
+
+    #[test]
+    fn vng_constant_mosaic_is_neutral() {
+        // Flat field through the full VNG path (border + lookup + gradient +
+        // green-mix finish): interior must be flat neutral. A frame > a couple of
+        // prow/pcol periods exercises the ring buffer and the deferred copies.
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (200usize, 130usize);
+        let out = demosaic_vng(&vec![0.5f32; w * h], w, h, cfa);
+        assert_eq!(out.len(), w * h * 4);
+        for j in 6..h - 6 {
+            for i in 6..w - 6 {
+                let p = (j * w + i) * 4;
+                for c in 0..3 {
+                    assert!(
+                        (out[p + c] - 0.5).abs() < 1e-4,
+                        "pixel ({i},{j}) ch{c} = {} (not neutral 0.5)",
+                        out[p + c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vng_reconstructs_flat_colour_separating_channels() {
+        // Flat non-grey field: VNG must recover each channel's constant at an
+        // interior pixel (catches a swapped/zeroed plane or a bad G1/G2 re-merge).
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (160usize, 120usize);
+        let truth = [0.8f32, 0.4, 0.2];
+        let mosaic = rggb_mosaic_from(w, h, |_, _| truth);
+        let out = demosaic_vng(&mosaic, w, h, cfa);
+        let p = (60 * w + 80) * 4;
+        for c in 0..3 {
+            assert!(
+                (out[p + c] - truth[c]).abs() < 2e-2,
+                "ch{c} = {} (want {})",
+                out[p + c],
+                truth[c]
+            );
+        }
+    }
+
+    #[test]
+    fn vng_gradient_output_is_finite_and_covered() {
+        // Smooth diagonal gradient: every interior pixel finite (no NaN leaking
+        // from the lookup 0/0 or a gradient divide) and no RGB left all-zero.
+        let cfa = [[0usize, 1], [1, 2]];
+        let (w, h) = (150usize, 140usize);
+        let mosaic = rggb_mosaic_from(w, h, |c, r| {
+            let v = (c + r) as f32 / (w + h) as f32;
+            [v, v * 0.9, v * 0.8]
+        });
+        let out = demosaic_vng(&mosaic, w, h, cfa);
+        assert_eq!(out.len(), w * h * 4);
+        for j in 6..h - 6 {
+            for i in 6..w - 6 {
+                let p = (j * w + i) * 4;
+                for c in 0..3 {
+                    assert!(out[p + c].is_finite(), "pixel ({i},{j}) ch{c} not finite");
+                }
+                assert!(
+                    out[p] != 0.0 || out[p + 1] != 0.0 || out[p + 2] != 0.0,
+                    "pixel ({i},{j}) RGB all-zero"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vng_constant_bggr_is_neutral() {
+        // Non-RGGB parity through VNG: BGGR flips G1/G2 site assignment; a flat
+        // field must still come out neutral (guards the filters4 green-split and
+        // the finish re-merge on the other phase).
+        let cfa = [[2usize, 1], [1, 0]]; // BGGR
+        let (w, h) = (200usize, 130usize);
+        let out = demosaic_vng(&vec![0.5f32; w * h], w, h, cfa);
+        let p = (65 * w + 100) * 4;
+        for c in 0..3 {
+            assert!(
+                (out[p + c] - 0.5).abs() < 1e-4,
+                "BGGR VNG ch{c} = {}",
                 out[p + c]
             );
         }
