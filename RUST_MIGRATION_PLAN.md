@@ -823,16 +823,38 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    (core 523, ui 115, clippy clean). RCD runs once per file open, off-thread, at
    full res — a one-time load cost, not per-slider.
 
-   **Candidate next increments after m4-38** (recorded so they survive a context
+   **m4-39** — assemble a native-Rust VNG (Variable Number of Gradients) Bayer
+   demosaic orchestrator (DONE, commit `b8fe557afe`). The VNG per-pass *kernels*
+   were already migrated as C-ABI fns in `iop::demosaic` (`vng_border`/`_lookup`/
+   `_gradient_row`/`_finish`) but had NO orchestrator and the two lookup-table
+   builders stayed in C. New `demosaic_vng` in `rawimage.rs` ports
+   `vng_interpolate` (`src/iop/demosaicing/vng.c`) natively: `build_vng_lookup`
+   (the `lookup[16][16][32]` linear-interp table) + `build_vng_code` (the
+   `code[prow][pcol]` gradient streams from the dcraw `terms[]`/`chood[]` tables,
+   extracted programmatically as `VNG_TERMS`/`VNG_CHOOD` — grad bytes ≥0x80 are
+   negative i8 but only bits 0..7 tested, reproducing C's signed-char→int
+   promotion), plus the 3-row ring buffer with C's **2-row-deferred write-back**
+   (so the gradient kernel always reads the un-refined base — no read-after-write
+   hazard; `[Vec;3]::rotate_left(1)` == C's `brow[(g-1)&3]` rotation). Bayer only;
+   RGGB greens split into G1/G2 (`filters4`) then re-merged by the finish pass;
+   sub-interior frames fall back to linear-only VNG. **NOT wired as a default** —
+   RCD stays the Bayer default (m4-38); this makes VNG available for a future
+   demosaic-method selector. Opus review: faithful to C, no P0/P1 (verified
+   builders, negative-coord `fcol`, ring rotation, 6×6 bounds, pointer
+   lifetimes); applied the 2 P2 clarity comments. darkroom-core 523→527 tests.
+
+   **Candidate next increments after m4-39** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
-   - **m4-39 (natural next):** rayon-parallelise `demosaic_rcd` over tiles (the C
-     `DT_OMP` parallelism dropped in the port) if full-res load latency warrants
-     it — needs per-thread scratch buffers (currently one reused set).
+   - **Demosaic-method selector:** two high-quality Bayer demosaicers now exist
+     (RCD default + VNG); expose a preview/per-image choice (needs a `RawImage`/
+     preview param + a UI control + persistence). Would make VNG user-reachable.
+   - **Perf:** rayon-parallelise `demosaic_rcd` (over tiles) and/or `demosaic_vng`
+     (over rows, but the ring buffer serialises write-back — would need a
+     per-row-independent restructure) if full-res load latency warrants it.
    - **Pipeline depth (other):** geometry IOPs (crop/rotate) needing an
-     ROI/(w,h)-aware pipeline; or assemble a full VNG Bayer orchestrator from the
-     existing `iop::demosaic` VNG helper loops. (The velvia-clamp item is moot —
-     m4-36 moved velvia after the tone map.)
+     ROI/(w,h)-aware pipeline. (The velvia-clamp item is moot — m4-36 moved
+     velvia after the tone map.)
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
