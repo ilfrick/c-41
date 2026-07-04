@@ -139,6 +139,29 @@ pub enum DemosaicMethod {
     Ppg,
 }
 
+impl DemosaicMethod {
+    /// Stable persistence code (must not change — stored per image). See
+    /// [`from_u8`](Self::from_u8).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            DemosaicMethod::Rcd => 0,
+            DemosaicMethod::Vng => 1,
+            DemosaicMethod::Ppg => 2,
+        }
+    }
+
+    /// Decode a persisted [`as_u8`](Self::as_u8) code. Any unknown byte (older
+    /// or corrupt data, or a future method this build doesn't know) falls back
+    /// to the [default](Self::default) so persistence can never fail a load.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => DemosaicMethod::Vng,
+            2 => DemosaicMethod::Ppg,
+            _ => DemosaicMethod::Rcd,
+        }
+    }
+}
+
 /// Classify a CFA from a colour-lookup probe `color_at(row, col)` (0=R,1=G,2=B,
 /// 3=E, as `rawloader::CFA::color_at` returns). A pattern that is 2×2-periodic
 /// across the 6×6 window (6 = lcm(2,6)) is [`CfaKind::Bayer`]; otherwise one that
@@ -1436,6 +1459,18 @@ mod tests {
         let rcd = img.to_linear_rgba_with(DemosaicMethod::Rcd);
         assert_eq!(rcd, img.to_linear_rgba_with(DemosaicMethod::Vng));
         assert_eq!(rcd, img.to_linear_rgba_with(DemosaicMethod::Ppg));
+    }
+
+    #[test]
+    fn demosaic_method_u8_round_trips_and_defaults() {
+        for m in [DemosaicMethod::Rcd, DemosaicMethod::Vng, DemosaicMethod::Ppg] {
+            assert_eq!(DemosaicMethod::from_u8(m.as_u8()), m);
+        }
+        assert_eq!(DemosaicMethod::Rcd.as_u8(), 0); // default code is 0
+        // Unknown/corrupt codes fall back to the default, never panic.
+        for v in [3u8, 7, 255] {
+            assert_eq!(DemosaicMethod::from_u8(v), DemosaicMethod::default());
+        }
     }
 
     #[test]

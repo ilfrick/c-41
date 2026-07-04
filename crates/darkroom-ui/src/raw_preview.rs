@@ -91,12 +91,26 @@ pub fn downscale_rgba(
     (ow, oh, out)
 }
 
-/// Decode a raw file into a linear [`RawPreview`], downscaled so its longest
-/// side is at most `max_dim` (for slider responsiveness). `None` on decode
-/// failure or an unsupported raw (e.g. a CFA period the core decoder rejects).
+/// Decode a raw file into a linear [`RawPreview`] using the default Bayer
+/// demosaicer ([`DemosaicMethod::Rcd`](darkroom_core::rawimage::DemosaicMethod)).
+/// See [`decode_raw_preview_with`].
 pub fn decode_raw_preview(path: &str, max_dim: usize) -> Option<RawPreview> {
+    decode_raw_preview_with(path, max_dim, Default::default())
+}
+
+/// Decode a raw file into a linear [`RawPreview`] with an explicit Bayer
+/// [`DemosaicMethod`](darkroom_core::rawimage::DemosaicMethod), downscaled so
+/// its longest side is at most `max_dim` (for slider responsiveness). `None` on
+/// decode failure or an unsupported raw (e.g. a CFA period the core decoder
+/// rejects). Changing the method requires re-running this (it re-decodes the
+/// full raw), unlike the pipeline sliders which reuse the downscaled buffer.
+pub fn decode_raw_preview_with(
+    path: &str,
+    max_dim: usize,
+    method: darkroom_core::rawimage::DemosaicMethod,
+) -> Option<RawPreview> {
     let img = darkroom_core::rawimage::load(path).ok()?;
-    let (w, h, rgba) = img.to_linear_rgba();
+    let (w, h, rgba) = img.to_linear_rgba_with(method);
     if w == 0 || h == 0 {
         return None;
     }
