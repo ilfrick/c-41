@@ -5,6 +5,7 @@
 
 pub mod color;
 pub mod error;
+pub mod geometry;
 pub mod interp;
 pub mod iop;
 pub mod math;

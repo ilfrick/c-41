@@ -25,7 +25,9 @@ macro_rules! geom_iop_stub {
     };
 }
 
-geom_iop_stub!(Crop,          "crop");
+// `CropIop` (not `Crop`) to avoid a homonym with the preview-side crop pass
+// `crate::geometry::Crop`; the IOP `name()` string "crop" is unchanged.
+geom_iop_stub!(CropIop,       "crop");
 geom_iop_stub!(Flip,          "flip");
 geom_iop_stub!(Borders,       "borders");
 geom_iop_stub!(Enlargecanvas, "enlargecanvas");
