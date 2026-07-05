@@ -843,18 +843,41 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    builders, negative-coord `fcol`, ring rotation, 6×6 bounds, pointer
    lifetimes); applied the 2 P2 clarity comments. darkroom-core 523→527 tests.
 
-   **Candidate next increments after m4-39** (recorded so they survive a context
+   **m4-40..m4-43 — per-image Bayer demosaic-method selector (COMPLETE):** a
+   user choice of RCD / VNG / PPG for the raw preview, persisted per image.
+   - **m4-40** (`c120823050`): `DemosaicMethod` enum (Rcd default / Vng / Ppg,
+     stable discriminants) + `RawImage::to_linear_rgba_with(method)` dispatching
+     the Bayer branch; X-Trans ignores it (checked before method). No-arg
+     `to_linear_rgba` delegates to Rcd → all callers byte-identical. +2 tests
+     (dispatch distinctness on a 40×40 gradient; X-Trans method-invariance).
+   - **m4-41** (`b4e09f87cc`): `DemosaicMethod::as_u8`/`from_u8` (stable 1-byte
+     codec, unknown→default) + `raw_preview::decode_raw_preview_with(method)`
+     (the no-arg wrapper delegates; examples unchanged). +1 codec test.
+   - **m4-42** (`8ddafabff6`): persist to a dedicated `main.darkroom_demosaic`
+     (imgid PK, method INTEGER) — a SEPARATE table, not a `PreviewParams` field,
+     because the method is *decode-time* state (a change re-decodes the raw, not
+     re-runs the pipeline) and to keep it out of PreviewParams' Copy /
+     history-snapshot / before-after-bypass machinery. +3 tests.
+   - **m4-43** (`d6945340a6`): the UI — a `gtk4::DropDown` in the darkroom right
+     panel (raw only), seeded from the persisted method; changing it re-decodes
+     + persists. Old inline load refactored into `spawn_decode`; a `decode_gen`
+     generation guard makes only the newest decode paint (stale-paint guard for
+     rapid switching). Opus review 9/10, no blockers; applied N1/N2/N3 (X-Trans
+     tooltip caveat, failed-decode comment, stale raw_preview.rs doc fix).
+     darkroom-ui 115→119 tests, darkroom-core 527→530.
+
+   **Candidate next increments after m4-43** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
-   - **Demosaic-method selector:** two high-quality Bayer demosaicers now exist
-     (RCD default + VNG); expose a preview/per-image choice (needs a `RawImage`/
-     preview param + a UI control + persistence). Would make VNG user-reachable.
    - **Perf:** rayon-parallelise `demosaic_rcd` (over tiles) and/or `demosaic_vng`
      (over rows, but the ring buffer serialises write-back — would need a
      per-row-independent restructure) if full-res load latency warrants it.
    - **Pipeline depth (other):** geometry IOPs (crop/rotate) needing an
      ROI/(w,h)-aware pipeline. (The velvia-clamp item is moot — m4-36 moved
      velvia after the tone map.)
+   - **Selector polish (deferred from m4-43 N3):** hide the demosaic DropDown for
+     X-Trans files (needs the sensor kind surfaced from the decode up to the UI —
+     currently just a tooltip caveat since detection needs a decode).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
