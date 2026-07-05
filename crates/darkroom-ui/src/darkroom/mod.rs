@@ -19,6 +19,7 @@ use std::rc::Rc;
 use crate::dialogs;
 use crate::history::{describe_change, HistoryStack};
 use crate::preview::{Histogram, PreviewParams};
+use darkroom_core::rawimage::DemosaicMethod;
 use crate::snapshots::{SnapshotStore, SNAPSHOT_CAP};
 
 /// Shared snapshot store over the cached-render payload (the frozen pixels).
@@ -96,6 +97,10 @@ struct PreviewCtx {
     /// sample never lingers after an edit changes the displayed pixels.
     picker: glib::WeakRef<gtk4::Label>,
     base: Rc<RefCell<Option<BaseImage>>>,
+    /// Monotonic decode generation. Each [`spawn_decode`] bumps it and captures
+    /// the value; a completed decode only paints if it is still the newest, so a
+    /// slow earlier demosaic can't overwrite a newer one (stale-paint guard).
+    decode_gen: Rc<std::cell::Cell<u64>>,
     params: Rc<RefCell<PreviewParams>>,
     hist: Rc<RefCell<Histogram>>,
     /// While set, the preview shows the unprocessed image (before/after toggle).
@@ -553,6 +558,81 @@ fn render_preview(ctx: &PreviewCtx) {
     }
 }
 
+/// Bayer demosaic selector option labels, ordered to match
+/// [`DemosaicMethod::as_u8`] (0=RCD, 1=VNG, 2=PPG) so a `DropDown`'s selected
+/// index round-trips through [`DemosaicMethod::from_u8`] with no extra mapping.
+fn demosaic_method_labels() -> [&'static str; 3] {
+    ["RCD — best quality", "VNG", "PPG — fastest"]
+}
+
+/// Decode + downscale the image off the main thread, store it as the
+/// [`PreviewCtx`] base, and render. Camera raws go through the Rust decoder with
+/// the chosen Bayer [`DemosaicMethod`] (`method` is ignored for non-raw files and
+/// for X-Trans sensors); everything else through gdk-pixbuf. Re-run to change the
+/// demosaic method — it re-decodes the full raw, unlike the pipeline sliders
+/// which reuse the already-downscaled buffer.
+fn spawn_decode(ctx: &PreviewCtx, path: String, method: DemosaicMethod) {
+    // Claim the newest generation; a stale (superseded) decode discards below.
+    let generation = ctx.decode_gen.get().wrapping_add(1);
+    ctx.decode_gen.set(generation);
+    glib::spawn_future_local(clone!(@strong ctx => async move {
+        let base = if crate::raw_preview::is_raw_path(&path) {
+            // Decode + demosaic off the main thread (it's heavy); downscale to a
+            // responsive preview size.
+            let p = path.clone();
+            gio::spawn_blocking(move || {
+                crate::raw_preview::decode_raw_preview_with(
+                    &p,
+                    crate::raw_preview::PREVIEW_MAX_DIM,
+                    method,
+                )
+                .map(|rp| BaseImage::Linear {
+                    width: rp.width,
+                    height: rp.height,
+                    pixels: rp.pixels,
+                })
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            let p = path.clone();
+            let data = gio::spawn_blocking(move || std::fs::read(&p).ok())
+                .await
+                .ok()
+                .flatten();
+            data.and_then(|data| {
+                let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
+                let _ = loader.write(&data);
+                let _ = loader.close();
+                loader.pixbuf().map(|pb| BaseImage::Srgb8 {
+                    bytes: pb.read_pixel_bytes().to_vec(),
+                    width: pb.width(),
+                    height: pb.height(),
+                    rowstride: pb.rowstride() as usize,
+                    nch: pb.n_channels() as usize,
+                })
+            })
+        };
+        // A newer decode was requested while this one ran (rapid method
+        // switching) — drop this result so it can't paint over the newer one.
+        if ctx.decode_gen.get() != generation {
+            return;
+        }
+        match base {
+            Some(base) => {
+                *ctx.base.borrow_mut() = Some(base);
+                render_preview(&ctx);
+            }
+            // Don't make a failed decode (unsupported/corrupt raw, unreadable
+            // file) an invisible blank — log it (no toast overlay here yet).
+            // `ctx.base` and the display stay on the last successful result; the
+            // selector, however, now shows the attempted (failed) method.
+            None => eprintln!("darkroom preview: could not decode {path}"),
+        }
+    }));
+}
+
 /// Build a NavigationPage for editing a single image at `file_path`.
 ///
 /// The page title is set to the filename. The caller pushes this page onto
@@ -678,6 +758,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         hist_area: hist_area.downgrade(),
         picker: picker_label.downgrade(),
         base: Rc::new(RefCell::new(None)),
+        decode_gen: Rc::new(std::cell::Cell::new(0)),
         params,
         hist: Rc::new(RefCell::new([[0u32; 256]; 3])),
         bypass: Rc::new(std::cell::Cell::new(false)),
@@ -697,54 +778,10 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     });
 
     // Load + decode the image asynchronously so the page appears immediately.
-    // Camera raws go through the Rust raw decoder (gdk-pixbuf can't read them);
-    // everything else through gdk-pixbuf. Both yield an 8-bit `BaseImage`.
-    let path_for_load = file_path.to_string();
-    glib::spawn_future_local(clone!(@strong ctx => async move {
-        let base = if crate::raw_preview::is_raw_path(&path_for_load) {
-            // Decode + demosaic off the main thread (it's heavy); downscale to a
-            // responsive preview size.
-            let p = path_for_load.clone();
-            gio::spawn_blocking(move || {
-                crate::raw_preview::decode_raw_preview(&p, crate::raw_preview::PREVIEW_MAX_DIM)
-                    .map(|rp| BaseImage::Linear {
-                        width: rp.width,
-                        height: rp.height,
-                        pixels: rp.pixels,
-                    })
-            })
-            .await
-            .ok()
-            .flatten()
-        } else {
-            let p = path_for_load.clone();
-            let data = gio::spawn_blocking(move || std::fs::read(&p).ok())
-                .await
-                .ok()
-                .flatten();
-            data.and_then(|data| {
-                let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
-                let _ = loader.write(&data);
-                let _ = loader.close();
-                loader.pixbuf().map(|pb| BaseImage::Srgb8 {
-                    bytes: pb.read_pixel_bytes().to_vec(),
-                    width: pb.width(),
-                    height: pb.height(),
-                    rowstride: pb.rowstride() as usize,
-                    nch: pb.n_channels() as usize,
-                })
-            })
-        };
-        match base {
-            Some(base) => {
-                *ctx.base.borrow_mut() = Some(base);
-                render_preview(&ctx);
-            }
-            // Don't make a failed decode (unsupported/corrupt raw, unreadable
-            // file) an invisible blank — log it (no toast overlay here yet).
-            None => eprintln!("darkroom preview: could not decode {path_for_load}"),
-        }
-    }));
+    // The saved Bayer demosaic method (raw only) seeds the first decode; the
+    // selector below re-runs `spawn_decode` when the user changes it.
+    let demosaic = crate::persist::load_demosaic(db_path, file_path);
+    spawn_decode(&ctx, file_path.to_string(), demosaic);
 
     // ── Colour picker: click the image to read the processed pixel ─────────
     let click = gtk4::GestureClick::new();
@@ -967,6 +1004,46 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .orientation(gtk4::Orientation::Vertical)
         .width_request(320)
         .build();
+
+    // Bayer demosaic-method selector — raw images only (JPEGs aren't
+    // demosaiced). Changing it re-decodes the raw with the chosen algorithm and
+    // persists the choice per image. The DropDown's index is DemosaicMethod's
+    // as_u8 code, so it round-trips through from_u8 with no extra mapping.
+    if crate::raw_preview::is_raw_path(file_path) {
+        let demosaic_header = gtk4::Label::builder()
+            .label("Demosaic")
+            .halign(gtk4::Align::Start)
+            .margin_start(10)
+            .margin_top(8)
+            .margin_bottom(4)
+            .build();
+        demosaic_header.add_css_class("heading");
+        let dropdown = gtk4::DropDown::from_strings(&demosaic_method_labels());
+        dropdown.set_margin_start(10);
+        dropdown.set_margin_end(10);
+        dropdown.set_margin_bottom(8);
+        // The method only affects Bayer sensors; X-Trans (.raf) always uses
+        // Markesteijn, so switching it there re-decodes to identical pixels.
+        dropdown.set_tooltip_text(Some(
+            "Bayer demosaic algorithm (X-Trans files always use Markesteijn)",
+        ));
+        dropdown.update_property(&[gtk4::accessible::Property::Label("Demosaic algorithm")]);
+        // Seed the current selection WITHOUT re-decoding: set before connecting
+        // the handler (the initial `spawn_decode` already used this method).
+        dropdown.set_selected(demosaic.as_u8() as u32);
+        let dd_ctx = ctx.clone();
+        let dd_path = file_path.to_string();
+        let dd_db = db_path.to_string();
+        dropdown.connect_selected_notify(move |dd| {
+            let method = DemosaicMethod::from_u8(dd.selected() as u8);
+            crate::persist::save_demosaic(&dd_db, &dd_path, method);
+            spawn_decode(&dd_ctx, dd_path.clone(), method);
+        });
+        right_box.append(&demosaic_header);
+        right_box.append(&dropdown);
+        right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    }
+
     right_box.append(&history_section);
     right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     right_box.append(&snapshot_section);
@@ -1469,6 +1546,23 @@ mod tests {
         let mut on = PreviewParams::default();
         on.sigmoid_on = true;
         assert_eq!(initial_params(Some(on), false), on);
+    }
+
+    #[test]
+    fn demosaic_labels_align_with_method_codes() {
+        // The selector relies on DropDown index == DemosaicMethod::as_u8, so a
+        // change handler can `from_u8(dd.selected())`. Pin one label per method,
+        // each code in range, and no duplicate labels.
+        let labels = demosaic_method_labels();
+        assert_eq!(labels.len(), 3);
+        for (i, m) in [DemosaicMethod::Rcd, DemosaicMethod::Vng, DemosaicMethod::Ppg]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(m.as_u8() as usize, i, "{m:?} code must equal its label index");
+            assert_eq!(DemosaicMethod::from_u8(i as u8), m);
+        }
+        assert!(!labels[0].is_empty() && labels[0] != labels[1] && labels[1] != labels[2]);
     }
 
     #[test]

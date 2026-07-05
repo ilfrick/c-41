@@ -1,25 +1,21 @@
 //! Raw-file preview source (Phase 3 milestone-2): decode a camera raw via
-//! `darkroom_core::rawimage`, downscale it in linear light, and sRGB-encode to
-//! an 8-bit RGB buffer the darkroom view can drive through the same preview
-//! pipeline as a JPEG (`gdk-pixbuf` can't decode raws).
+//! `darkroom_core::rawimage`, downscale it in linear light, and hand the darkroom
+//! view a **linear scene-referred f32 RGBA** buffer ([`RawPreview`]) it drives
+//! through the float preview pipeline (`gdk-pixbuf` can't decode raws).
 //!
 //! The decode + demosaic + white-balance live in `darkroom-core`; this module is
-//! just the UI-side marshalling (downscale for responsiveness, linear→sRGB for
-//! display). The pure helpers are unit-tested; the `decode_raw_preview` glue is
-//! exercised by the `raw_preview_stats` example on a real raw.
+//! just the UI-side marshalling (downscale for responsiveness). No 8-bit
+//! round-trip: the pipeline runs on the f32 buffer directly (`BaseImage::Linear`)
+//! and only sRGB-encodes at display time, so the sigmoid tone-map sees the
+//! unclipped >1.0 highlights. The pure helpers are unit-tested; the
+//! `decode_raw_preview` glue is exercised by the `raw_preview_stats` example on
+//! a real raw. The Bayer demosaicer is selectable ([`decode_raw_preview_with`]).
 //!
-//! Known v1 limitations:
-//! - **8-bit round-trip.** The preview lands in the shared 8-bit `BaseImage`, so
-//!   the linear float we compute here is sRGB-quantised, then `apply_pipeline`
-//!   sRGB-decodes it back to linear. Fine for an on-screen preview; **export
-//!   must read the raw fresh and run the float pipeline** (it does — export is
-//!   driven by the file path, not this buffer). A future `BaseImage::Float`
-//!   could carry linear f32 straight into the pipeline.
-//! - **Highlight clipping before tone mapping.** Encoding to 8-bit clamps
-//!   scene-linear values >1.0 to white, so the sigmoid tone-map (run later in
-//!   `apply_pipeline`) can't roll those highlights off — it improves midtone
-//!   contrast but not blown highlights. The float `BaseImage` above also fixes
-//!   this (sigmoid would then see the unclipped >1.0 highlights).
+//! Known limitations:
+//! - **Preview-only resolution.** The buffer is downscaled to `PREVIEW_MAX_DIM`
+//!   for slider responsiveness, so **export must read the raw fresh and run the
+//!   full-res pipeline** (it does — export is driven by the file path, via the C
+//!   `darktable-cli`, not this buffer).
 //! - **`.dng` is a container**: linear/float/already-demosaiced DNGs are rejected
 //!   by the CFA core decoder → `None` (the loader logs and shows nothing).
 //! - **`.raw` is ambiguous** (several vendors + unrelated binary dumps); routed
