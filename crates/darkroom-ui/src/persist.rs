@@ -16,6 +16,7 @@
 //! by design.
 
 use rusqlite::Connection;
+use darkroom_core::geometry::Geometry;
 use darkroom_core::rawimage::DemosaicMethod;
 use crate::history::HistoryStack;
 use crate::preview::PreviewParams;
@@ -44,6 +45,14 @@ const HISTORY_TABLE_DDL: &str =
 const DEMOSAIC_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS main.darkroom_demosaic \
      (imgid INTEGER PRIMARY KEY, method INTEGER NOT NULL)";
+
+/// DDL for the per-image geometry (straighten + crop) table (same private-table
+/// rationale as the others). A separate table from the params blob: geometry is
+/// applied to the decoded buffer *before* the colour pipeline (it changes the
+/// preview dimensions), not a `PreviewParams` pipeline field.
+const GEOMETRY_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS main.darkroom_geometry \
+     (imgid INTEGER PRIMARY KEY, geom BLOB NOT NULL)";
 
 /// Resolve a file path to its `images.id` via folder + filename (mirrors the
 /// lighttable's lookup). `None` if the image isn't in the catalogue.
@@ -230,6 +239,62 @@ fn save_demosaic_conn(conn: &Connection, imgid: i32, method: DemosaicMethod) -> 
     Ok(())
 }
 
+/// Load the saved [`Geometry`] for the image at `full_path`, or the default
+/// (identity — no rotation, whole image) on any miss (no db, uncatalogued image,
+/// no row, table absent, or an undecodable/old-version blob).
+pub fn load_geometry(db_path: &str, full_path: &str) -> Geometry {
+    if db_path.is_empty() {
+        return Geometry::default();
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return Geometry::default();
+    };
+    match imgid_for_path(&conn, full_path) {
+        Some(imgid) => load_geometry_conn(&conn, imgid).unwrap_or_default(),
+        None => Geometry::default(),
+    }
+}
+
+/// Persist the [`Geometry`] for the image at `full_path`. Best-effort: silently
+/// no-ops with no db or an uncatalogued image.
+pub fn save_geometry(db_path: &str, full_path: &str, geom: &Geometry) {
+    if db_path.is_empty() {
+        return;
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return;
+    };
+    if let Some(imgid) = imgid_for_path(&conn, full_path) {
+        let _ = save_geometry_conn(&conn, imgid, geom);
+    }
+}
+
+/// Testable core of [`load_geometry`]: no row / no table / an undecodable blob
+/// all yield `None` (→ the default at the call site).
+fn load_geometry_conn(conn: &Connection, imgid: i32) -> Option<Geometry> {
+    let blob: rusqlite::Result<Vec<u8>> = conn.query_row(
+        "SELECT geom FROM main.darkroom_geometry WHERE imgid = ?1",
+        rusqlite::params![imgid],
+        |row| row.get(0),
+    );
+    match blob {
+        Ok(b) => Geometry::decode(&b),
+        Err(_) => None,
+    }
+}
+
+/// Testable core of [`save_geometry`]: upsert the single geometry row (PK on
+/// `imgid` ⇒ one row; `ON CONFLICT` makes it an update).
+fn save_geometry_conn(conn: &Connection, imgid: i32, geom: &Geometry) -> rusqlite::Result<()> {
+    conn.execute(GEOMETRY_TABLE_DDL, [])?;
+    conn.execute(
+        "INSERT INTO main.darkroom_geometry (imgid, geom) VALUES (?1, ?2) \
+         ON CONFLICT(imgid) DO UPDATE SET geom = excluded.geom",
+        rusqlite::params![imgid, geom.encode()],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +406,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_demosaic_conn(&db, 42), DemosaicMethod::default());
+    }
+
+    fn sample_geometry() -> Geometry {
+        Geometry {
+            crop: darkroom_core::geometry::Crop { left: 0.1, top: 0.15, right: 0.9, bottom: 0.85 },
+            angle: 0.03,
+        }
+    }
+
+    #[test]
+    fn geometry_save_then_load_roundtrips() {
+        let db = open_db();
+        let g = sample_geometry();
+        save_geometry_conn(&db, 42, &g).unwrap();
+        assert_eq!(load_geometry_conn(&db, 42), Some(g));
+        // upsert: PK ⇒ one row holding the latest geometry
+        let g2 = Geometry::default();
+        save_geometry_conn(&db, 42, &g2).unwrap();
+        let n: i32 = db
+            .query_row(
+                "SELECT COUNT(*) FROM main.darkroom_geometry WHERE imgid = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(load_geometry_conn(&db, 42), Some(g2));
+    }
+
+    #[test]
+    fn geometry_load_is_none_when_table_absent_or_no_row() {
+        let db = open_db();
+        assert_eq!(load_geometry_conn(&db, 42), None); // no table yet, no panic
+        save_geometry_conn(&db, 99, &sample_geometry()).unwrap();
+        assert_eq!(load_geometry_conn(&db, 42), None); // table exists, no row
+    }
+
+    #[test]
+    fn geometry_undecodable_blob_is_none() {
+        let db = open_db();
+        db.execute(GEOMETRY_TABLE_DDL, []).unwrap();
+        db.execute(
+            "INSERT INTO main.darkroom_geometry (imgid, geom) VALUES (42, ?1)",
+            rusqlite::params![vec![9u8, 9, 9]], // wrong length/version
+        )
+        .unwrap();
+        assert_eq!(load_geometry_conn(&db, 42), None);
     }
 
     fn sample_history() -> HistoryStack {

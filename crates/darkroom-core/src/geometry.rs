@@ -164,6 +164,76 @@ pub fn apply_rotate(pixels: &[f32], w: usize, h: usize, angle: f32) -> (usize, u
     (w2, h2, out)
 }
 
+/// Version byte for [`Geometry::encode`] — bump if the field layout changes so
+/// an old persisted blob is rejected (→ defaults) rather than misread.
+const GEOMETRY_ENCODE_VERSION: u8 = 1;
+/// Encoded length: 1 version byte + 5 little-endian f32 (crop l/t/r/b + angle).
+const GEOMETRY_ENCODE_LEN: usize = 1 + 5 * 4;
+
+/// The full per-image geometry edit: a straighten [`angle`](Self::angle) then a
+/// [`Crop`]. Applied [rotate-then-crop](Self::apply) so the crop rectangle lives
+/// in the *rotated* frame (darktable's straighten-and-crop), letting the crop
+/// trim the black corners the rotation introduces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Geometry {
+    /// Crop rectangle, in fractions of the rotated image.
+    pub crop: Crop,
+    /// Straighten angle in radians (positive = counter-clockwise).
+    pub angle: f32,
+}
+
+impl Default for Geometry {
+    /// Identity — no rotation, whole image.
+    fn default() -> Self {
+        Self { crop: Crop::default(), angle: 0.0 }
+    }
+}
+
+impl Geometry {
+    /// True when neither the rotation nor the crop changes the image, so the
+    /// geometry pass can be skipped.
+    pub fn is_identity(&self) -> bool {
+        self.angle.abs() < MIN_ANGLE && self.crop.is_identity()
+    }
+
+    /// Apply the straighten then the crop to a packed linear RGBA `f32` buffer,
+    /// returning `(new_w, new_h, pixels)`. Identity (or a degenerate buffer)
+    /// returns the source dimensions and a verbatim copy.
+    pub fn apply(&self, pixels: &[f32], w: usize, h: usize) -> (usize, usize, Vec<f32>) {
+        if self.is_identity() {
+            return (w, h, pixels.to_vec());
+        }
+        let (rw, rh, rotated) = apply_rotate(pixels, w, h, self.angle);
+        apply_crop(&rotated, rw, rh, self.crop)
+    }
+
+    /// Serialise to a versioned little-endian blob for per-image persistence.
+    /// Fixed [`GEOMETRY_ENCODE_LEN`] bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(GEOMETRY_ENCODE_LEN);
+        v.push(GEOMETRY_ENCODE_VERSION);
+        for f in [self.crop.left, self.crop.top, self.crop.right, self.crop.bottom, self.angle] {
+            v.extend_from_slice(&f.to_le_bytes());
+        }
+        v
+    }
+
+    /// Decode an [`encode`](Self::encode) blob. `None` on a wrong version or
+    /// length (old/corrupt data) so a load falls back to the default; the raw
+    /// values are returned unsanitised — [`apply`](Self::apply) normalises the
+    /// crop and guards a non-finite angle.
+    pub fn decode(bytes: &[u8]) -> Option<Geometry> {
+        if bytes.len() != GEOMETRY_ENCODE_LEN || bytes[0] != GEOMETRY_ENCODE_VERSION {
+            return None;
+        }
+        let f = |i: usize| f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        Some(Geometry {
+            crop: Crop { left: f(1), top: f(5), right: f(9), bottom: f(13) },
+            angle: f(17),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +464,50 @@ mod tests {
         assert_eq!(apply_rotate(&px, 0, 4, 0.3), (0, 4, px.clone()));
         let short = vec![0.0f32; 3 * 4];
         assert_eq!(apply_rotate(&short, 4, 4, 0.3), (4, 4, short));
+    }
+
+    #[test]
+    fn geometry_identity_is_a_verbatim_copy() {
+        let px = grid(6, 4);
+        assert!(Geometry::default().is_identity());
+        let (w, h, out) = Geometry::default().apply(&px, 6, 4);
+        assert_eq!((w, h), (6, 4));
+        assert_eq!(out, px);
+    }
+
+    #[test]
+    fn geometry_applies_rotate_then_crop() {
+        // A straighten + crop must equal apply_crop(apply_rotate(..)) — crop in
+        // the rotated frame. Check against the manual composition.
+        let px = uniform(40, 30, 0.5);
+        let g = Geometry { crop: Crop { left: 0.2, top: 0.2, right: 0.8, bottom: 0.8 }, angle: 0.2 };
+        let (rw, rh, rot) = apply_rotate(&px, 40, 30, 0.2);
+        let expect = apply_crop(&rot, rw, rh, g.crop);
+        assert_eq!(g.apply(&px, 40, 30), expect);
+        assert!(!g.is_identity());
+    }
+
+    #[test]
+    fn geometry_encode_decode_round_trips() {
+        let g = Geometry { crop: Crop { left: 0.1, top: 0.2, right: 0.85, bottom: 0.9 }, angle: -0.05 };
+        let blob = g.encode();
+        assert_eq!(blob.len(), GEOMETRY_ENCODE_LEN);
+        assert_eq!(Geometry::decode(&blob), Some(g));
+        // Wrong version / truncation / trailing byte ⇒ None (→ default on load).
+        let mut bad_ver = blob.clone();
+        bad_ver[0] = 2;
+        assert_eq!(Geometry::decode(&bad_ver), None);
+        assert_eq!(Geometry::decode(&blob[..blob.len() - 1]), None);
+        let mut too_long = blob.clone();
+        too_long.push(0);
+        assert_eq!(Geometry::decode(&too_long), None);
+    }
+
+    #[test]
+    fn geometry_encode_len_is_pinned() {
+        // If this fails, a Geometry field changed — bump GEOMETRY_ENCODE_VERSION
+        // and this constant together so old blobs are rejected, not misread.
+        assert_eq!(GEOMETRY_ENCODE_LEN, 21);
+        assert_eq!(Geometry::default().encode().len(), 21);
     }
 }
