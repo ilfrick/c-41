@@ -866,15 +866,37 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      tooltip caveat, failed-decode comment, stale raw_preview.rs doc fix).
      darkroom-ui 115→119 tests, darkroom-core 527→530.
 
-   **Candidate next increments after m4-43** (recorded so they survive a context
+   **m4-44/m4-45 — geometry primitives (crop + rotate), core done:** a new
+   `darkroom_core::geometry` module, kept SEPARATE from the per-pixel
+   `pipeline` (every current stage is position-independent, so geometry commutes
+   with them and the ping-pong Pipeline stays size-agnostic; caveat noted in
+   both modules — revisit once a spatially-varying IOP lands).
+   - **m4-44** (`588bfa8a54`): `Crop` (resolution-independent fractional rect;
+     `normalized()` clamps + NaN→identity-edge + inverted/sub-MIN_EXTENT axis →
+     full; `is_identity()`, `pixel_rect()`) + `apply_crop` (row-slice, no-ops on
+     identity/degenerate). Also renamed the colliding `iop::geometry::Crop` stub →
+     `CropIop` (Rust-only; `name()` "crop" unchanged). Opus 8/10. 9 tests.
+   - **m4-45** (`62134c6665`): `apply_rotate(pixels,w,h,angle)` + `MIN_ANGLE` —
+     rotate about centre, EXPAND canvas to the bbox, transparent-black corners,
+     bilinear via the shared `interp::compute_pixel4c` (NOT the C rotatepixels
+     kernel — architect-endorsed). Positive = CCW. `ceil_dim` sub-pixel epsilon
+     fixes a float-`ceil` bbox-inflation bug at near-axis angles (safe ≲22 000px).
+     Composes with `apply_crop` for straighten-and-crop. Opus: correct, no
+     blocker. 7 tests. darkroom-core 530→545 tests.
+
+   **Candidate next increments after m4-45** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
+   - **Geometry UI (m4-46+, the natural next):** wire crop + rotate into the
+     darkroom view — a crop overlay with draggable handles + a rotate/straighten
+     control, coordinate mapping (widget ↔ rotated ↔ cropped ↔ full image), apply
+     `apply_rotate` then `apply_crop` to the decoded buffer before display, and
+     per-image persistence (a `darkroom_crop` table + codec, mirroring the m4-42
+     `darkroom_demosaic` one). Display-dependent — extract pure helpers, verify
+     the GTK wiring by review + running the app.
    - **Perf:** rayon-parallelise `demosaic_rcd` (over tiles) and/or `demosaic_vng`
      (over rows, but the ring buffer serialises write-back — would need a
      per-row-independent restructure) if full-res load latency warrants it.
-   - **Pipeline depth (other):** geometry IOPs (crop/rotate) needing an
-     ROI/(w,h)-aware pipeline. (The velvia-clamp item is moot — m4-36 moved
-     velvia after the tone map.)
    - **Selector polish (deferred from m4-43 N3):** hide the demosaic DropDown for
      X-Trans files (needs the sensor kind surfaced from the decode up to the UI —
      currently just a tooltip caveat since detection needs a decode).
