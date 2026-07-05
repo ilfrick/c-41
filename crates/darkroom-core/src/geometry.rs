@@ -108,6 +108,62 @@ pub fn apply_crop(pixels: &[f32], w: usize, h: usize, crop: Crop) -> (usize, usi
     (cw, ch, out)
 }
 
+/// Below this magnitude (radians, ~0.006°) a rotation is treated as identity —
+/// avoids a pointless full-frame resample for a numerically-zero angle.
+pub const MIN_ANGLE: f32 = 1e-4;
+
+/// Rotate a packed linear RGBA `f32` buffer (`pixels`, `w × h`) by `angle`
+/// **radians** about the image centre, **expanding the canvas** to contain the
+/// whole rotated image; pixels that fall outside the source become transparent
+/// black `(0,0,0,0)`. Positive `angle` rotates the image counter-clockwise.
+/// Returns `(new_w, new_h, pixels)`.
+///
+/// Resampling is bilinear via [`crate::interp::compute_pixel4c`]. A near-zero
+/// angle ([`MIN_ANGLE`]), a non-finite angle, or a zero-dim / short buffer
+/// returns the source dimensions and a verbatim copy — geometry never fails a
+/// render. The expanded canvas + black corners compose cleanly with
+/// [`apply_crop`] (crop the rotated buffer to trim the corners), which is how
+/// the UI will straighten-and-crop.
+pub fn apply_rotate(pixels: &[f32], w: usize, h: usize, angle: f32) -> (usize, usize, Vec<f32>) {
+    if w == 0 || h == 0 || pixels.len() < w * h * 4 || !angle.is_finite() || angle.abs() < MIN_ANGLE
+    {
+        return (w, h, pixels.to_vec());
+    }
+    let (sin, cos) = angle.sin_cos();
+    let (wf, hf) = (w as f32, h as f32);
+    // Axis-aligned bounding box of the rotated rectangle. Subtract a sub-pixel
+    // epsilon before `ceil` so float sin/cos artefacts at near-axis angles (e.g.
+    // cos(π/2) ≈ 4e-8 instead of 0) can't inflate the canvas by a spurious
+    // row/column. Safe while w,h ≲ 22 000 px (worst-case artefact w·4.37e-8 <
+    // 1e-3); for larger buffers shrink the epsilon or use f64 here. The cost is
+    // ≤ 1e-3 px of extremal-corner content excluded — visually zero for a
+    // preview (those corners are the least-reliable mirror-clamp samples anyway).
+    let ceil_dim = |v: f32| (v - 1e-3).ceil().max(1.0) as usize;
+    let w2 = ceil_dim((wf * cos.abs()) + (hf * sin.abs()));
+    let h2 = ceil_dim((wf * sin.abs()) + (hf * cos.abs()));
+    // Grid centres in pixel-index space (integer for odd extents).
+    let (scx, scy) = ((wf - 1.0) * 0.5, (hf - 1.0) * 0.5);
+    let (dcx, dcy) = ((w2 as f32 - 1.0) * 0.5, (h2 as f32 - 1.0) * 0.5);
+    let ls = (w * 4) as i32;
+    let mut out = vec![0.0f32; w2 * h2 * 4];
+    for j in 0..h2 {
+        let dy = j as f32 - dcy;
+        for i in 0..w2 {
+            let dx = i as f32 - dcx;
+            // Inverse rotation (dest → source): rotate the dest offset by -angle.
+            let sx = scx + dx * cos + dy * sin;
+            let sy = scy - dx * sin + dy * cos;
+            if sx >= 0.0 && sy >= 0.0 && sx < wf && sy < hf {
+                let base = (j * w2 + i) * 4;
+                let px = crate::interp::compute_pixel4c(pixels, sx, sy, w as i32, h as i32, ls, 0);
+                out[base..base + 4].copy_from_slice(&px);
+            }
+            // else: leave transparent black (buffer is zero-initialised)
+        }
+    }
+    (w2, h2, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +272,127 @@ mod tests {
         assert!(!Crop { left: 0.1, top: 0.0, right: 1.0, bottom: 1.0 }.is_identity());
         // An inverted crop normalizes back to identity.
         assert!(Crop { left: 0.9, top: 0.0, right: 0.905, bottom: 1.0 }.is_identity());
+    }
+
+    /// A uniform `w×h` field of colour `v` (alpha 1) — the robust rotate fixture:
+    /// bilinear sampling anywhere inside returns `v`, so only in-vs-out-of-source
+    /// matters (independent of sub-pixel resampling error).
+    fn uniform(w: usize, h: usize, v: f32) -> Vec<f32> {
+        let mut px = vec![0.0f32; w * h * 4];
+        for p in px.chunks_exact_mut(4) {
+            p[0] = v;
+            p[1] = v;
+            p[2] = v;
+            p[3] = 1.0;
+        }
+        px
+    }
+
+    #[test]
+    fn rotate_zero_and_tiny_angle_are_identity() {
+        let px = grid(6, 4);
+        assert_eq!(apply_rotate(&px, 6, 4, 0.0), (6, 4, px.clone()));
+        // Below MIN_ANGLE ⇒ identity (verbatim copy, no resample).
+        assert_eq!(apply_rotate(&px, 6, 4, MIN_ANGLE * 0.5), (6, 4, px));
+    }
+
+    #[test]
+    fn rotate_ninety_swaps_dimensions() {
+        // 90°: bbox = (w·|cos90| + h·|sin90|) × (w·|sin90| + h·|cos90|) = h × w.
+        let px = uniform(8, 5, 0.5);
+        let (w2, h2, _) = apply_rotate(&px, 8, 5, std::f32::consts::FRAC_PI_2);
+        assert_eq!((w2, h2), (5, 8));
+    }
+
+    #[test]
+    fn rotate_fills_interior_and_blackens_new_corners() {
+        // Rotate a uniform field: the centre stays in-source (→ v, opaque); the
+        // expanded canvas corners fall outside the source (→ transparent black).
+        let (w, h) = (40usize, 30usize);
+        let px = uniform(w, h, 0.5);
+        let (w2, h2, out) = apply_rotate(&px, w, h, 0.3);
+        assert!(w2 > w && h2 > h, "canvas expands: {w2}x{h2}");
+        let centre = ((h2 / 2) * w2 + w2 / 2) * 4;
+        for c in 0..3 {
+            assert!((out[centre + c] - 0.5).abs() < 1e-4, "centre ch{c}={}", out[centre + c]);
+        }
+        assert_eq!(out[centre + 3], 1.0, "centre opaque");
+        // Top-left corner of the expanded canvas is outside the rotated source.
+        assert_eq!(&out[0..4], &[0.0, 0.0, 0.0, 0.0], "corner transparent black");
+    }
+
+    #[test]
+    fn rotate_ninety_moves_left_half_to_top() {
+        // Direction pin: source is white on the LEFT half, black on the right.
+        // A +90° (counter-clockwise) rotation sends the left edge to the TOP, so
+        // the dest top must read white and the dest bottom black. Guards the
+        // rotation sense + centring convention (the uniform tests can't).
+        let (w, h) = (8usize, 8usize);
+        let mut px = vec![0.0f32; w * h * 4];
+        for row in 0..h {
+            for col in 0..w {
+                let v = if col < w / 2 { 1.0 } else { 0.0 };
+                let p = (row * w + col) * 4;
+                px[p] = v;
+                px[p + 1] = v;
+                px[p + 2] = v;
+                px[p + 3] = 1.0;
+            }
+        }
+        let (w2, h2, out) = apply_rotate(&px, w, h, std::f32::consts::FRAC_PI_2);
+        assert_eq!((w2, h2), (8, 8));
+        let top = (1 * w2 + 4) * 4; // near top, mid-column
+        let bottom = (6 * w2 + 4) * 4; // near bottom, mid-column
+        assert!(out[top] > 0.6, "top should be white, got {}", out[top]);
+        assert!(out[bottom] < 0.4, "bottom should be black, got {}", out[bottom]);
+    }
+
+    #[test]
+    fn rotate_neg_ninety_moves_left_half_to_bottom() {
+        // Direction pin for the OTHER sign: −90° (clockwise) sends the left edge
+        // to the bottom. A flipped sin sign would pass the +90° test (symmetric
+        // halves) but fail here.
+        let (w, h) = (8usize, 8usize);
+        let mut px = vec![0.0f32; w * h * 4];
+        for row in 0..h {
+            for col in 0..w {
+                let v = if col < w / 2 { 1.0 } else { 0.0 };
+                let p = (row * w + col) * 4;
+                px[p] = v;
+                px[p + 1] = v;
+                px[p + 2] = v;
+                px[p + 3] = 1.0;
+            }
+        }
+        let (w2, h2, out) = apply_rotate(&px, w, h, -std::f32::consts::FRAC_PI_2);
+        assert_eq!((w2, h2), (8, 8));
+        let top = (1 * w2 + 4) * 4;
+        let bottom = (6 * w2 + 4) * 4;
+        assert!(out[top] < 0.4, "top should be black, got {}", out[top]);
+        assert!(out[bottom] > 0.6, "bottom should be white, got {}", out[bottom]);
+    }
+
+    #[test]
+    fn rotate_bounding_box_dimensions() {
+        let px = uniform(8, 5, 0.5);
+        // Non-square at a general angle: w2 = ceil(8·cos.5 + 5·sin.5) = 10,
+        // h2 = ceil(8·sin.5 + 5·cos.5) = 9.
+        let (w2, h2, _) = apply_rotate(&px, 8, 5, 0.5);
+        assert_eq!((w2, h2), (10, 9));
+        // 180° must preserve dimensions exactly (the -1e-3 epsilon is what keeps
+        // cos(π) ≈ -1 with a float sin(π) ≈ 8.7e-8 from inflating to (9, 6)).
+        let (w3, h3, _) = apply_rotate(&px, 8, 5, std::f32::consts::PI);
+        assert_eq!((w3, h3), (8, 5));
+    }
+
+    #[test]
+    fn rotate_degenerate_inputs_no_op() {
+        let px = uniform(4, 4, 0.5);
+        assert_eq!(apply_rotate(&px, 4, 4, f32::NAN), (4, 4, px.clone()));
+        assert_eq!(apply_rotate(&px, 4, 4, f32::INFINITY), (4, 4, px.clone()));
+        assert_eq!(apply_rotate(&px, 4, 4, f32::NEG_INFINITY), (4, 4, px.clone()));
+        assert_eq!(apply_rotate(&px, 0, 4, 0.3), (0, 4, px.clone()));
+        let short = vec![0.0f32; 3 * 4];
+        assert_eq!(apply_rotate(&short, 4, 4, 0.3), (4, 4, short));
     }
 }
