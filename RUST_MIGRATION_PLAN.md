@@ -884,16 +884,36 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      Composes with `apply_crop` for straighten-and-crop. Opus: correct, no
      blocker. 7 tests. darkroom-core 530→545 tests.
 
-   **Candidate next increments after m4-45** (recorded so they survive a context
+   **m4-46/m4-47 — geometry backend + straighten UI (done):**
+   - **m4-46** (`d1411ef414`): `geometry::Geometry { crop, angle }` — one value
+     for the per-image straighten+crop with `apply(pixels,w,h)` (rotate∘crop, crop
+     in the rotated frame) + `is_identity()` + a versioned 21-byte `encode`/`decode`
+     codec. Persistence mirrors m4-42: a separate `main.darkroom_geometry(imgid PK,
+     geom BLOB)` table + `persist::{load,save}_geometry` (best-effort → default).
+     Self-reviewed (mirrors reviewed patterns). core +4 / ui +3 tests.
+   - **m4-47** (`a5036e5897`): straighten (rotate) slider wired into the darkroom
+     view. `PreviewCtx` gains `pristine` (decoded raw BEFORE geometry) + `geometry`
+     (Cell), seeded from `load_geometry` before the first decode. `spawn_decode`
+     restructured (raw → store pristine + `apply_geometry_to_base`; JPEG → clear
+     pristine, 8-bit base; `decode_gen` guard kept in both). A raw-only "Straighten"
+     slider (−45..45°) re-applies `Geometry` to the pristine buffer (cheap resample,
+     not a re-decode) + persists, debounced 160ms (cancel-and-rearm) for drag
+     responsiveness. **fricktrade-architect review was quota-blocked (weekly limit)
+     → self-reviewed; a follow-up architect pass is queued for the reset.**
+     darkroom-ui 122→123.
+
+   **Candidate next increments after m4-47** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
-   - **Geometry UI (m4-46+, the natural next):** wire crop + rotate into the
-     darkroom view — a crop overlay with draggable handles + a rotate/straighten
-     control, coordinate mapping (widget ↔ rotated ↔ cropped ↔ full image), apply
-     `apply_rotate` then `apply_crop` to the decoded buffer before display, and
-     per-image persistence (a `darkroom_crop` table + codec, mirroring the m4-42
-     `darkroom_demosaic` one). Display-dependent — extract pure helpers, verify
-     the GTK wiring by review + running the app.
+   - **m4-48 crop overlay (the natural next):** a draggable crop rectangle over
+     the preview (handles + drag-to-resize + aspect constraints) updating the same
+     `ctx.geometry` Cell's `crop`, coordinate mapping (widget ↔ displayed image ↔
+     crop fractions), reusing `preview::contain_rect`. Split it: the interaction
+     math is pure/headless-testable (do first); the GTK overlay + gestures are
+     display-dependent (architect-review once the quota resets). Straighten
+     currently shows black corners until this crop trims them.
+   - **Deferred architect pass:** run the m4-47 fricktrade-architect review after
+     the weekly quota resets; address any findings.
    - **Perf:** rayon-parallelise `demosaic_rcd` (over tiles) and/or `demosaic_vng`
      (over rows, but the ring buffer serialises write-back — would need a
      per-row-independent restructure) if full-res load latency warrants it.
