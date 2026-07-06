@@ -19,6 +19,7 @@ use std::rc::Rc;
 use crate::dialogs;
 use crate::history::{describe_change, HistoryStack};
 use crate::preview::{Histogram, PreviewParams};
+use darkroom_core::geometry::Geometry;
 use darkroom_core::rawimage::DemosaicMethod;
 use crate::snapshots::{SnapshotStore, SNAPSHOT_CAP};
 
@@ -97,6 +98,13 @@ struct PreviewCtx {
     /// sample never lingers after an edit changes the displayed pixels.
     picker: glib::WeakRef<gtk4::Label>,
     base: Rc<RefCell<Option<BaseImage>>>,
+    /// The decoded raw preview BEFORE geometry (linear RGBA `f32` + dims), kept
+    /// so a straighten/crop change re-applies [`Geometry`] to it without a full
+    /// re-decode. `None` for the JPEG path (no geometry there yet).
+    pristine: Rc<RefCell<Option<(usize, usize, Vec<f32>)>>>,
+    /// Current per-image geometry (straighten + crop), applied to `pristine` to
+    /// produce the displayed `base`.
+    geometry: Rc<std::cell::Cell<Geometry>>,
     /// Monotonic decode generation. Each [`spawn_decode`] bumps it and captures
     /// the value; a completed decode only paints if it is still the newest, so a
     /// slow earlier demosaic can't overwrite a newer one (stale-paint guard).
@@ -565,69 +573,108 @@ fn demosaic_method_labels() -> [&'static str; 3] {
     ["RCD — best quality", "VNG", "PPG — fastest"]
 }
 
-/// Decode + downscale the image off the main thread, store it as the
-/// [`PreviewCtx`] base, and render. Camera raws go through the Rust decoder with
-/// the chosen Bayer [`DemosaicMethod`] (`method` is ignored for non-raw files and
-/// for X-Trans sensors); everything else through gdk-pixbuf. Re-run to change the
-/// demosaic method — it re-decodes the full raw, unlike the pipeline sliders
+/// Straighten-slider degrees → [`Geometry::angle`] radians.
+fn straighten_deg_to_rad(deg: f64) -> f32 {
+    (deg * std::f64::consts::PI / 180.0) as f32
+}
+
+/// [`Geometry::angle`] radians → straighten-slider degrees (for seeding).
+fn straighten_rad_to_deg(rad: f32) -> f64 {
+    rad as f64 * 180.0 / std::f64::consts::PI
+}
+
+/// Apply the current [`PreviewCtx::geometry`] to the cached un-geometried raw
+/// buffer ([`PreviewCtx::pristine`]) to produce the displayed `base`, then
+/// re-render. No-op when there is no pristine buffer (the JPEG path, or before
+/// the first decode). Cheap enough to re-run on every geometry change (a
+/// downscaled-buffer resample), unlike a full re-decode.
+fn apply_geometry_to_base(ctx: &PreviewCtx) {
+    let geom = ctx.geometry.get();
+    let base = {
+        let pristine = ctx.pristine.borrow();
+        let Some((w, h, pixels)) = pristine.as_ref() else {
+            return;
+        };
+        let (gw, gh, gpixels) = geom.apply(pixels, *w, *h);
+        BaseImage::Linear { width: gw, height: gh, pixels: gpixels }
+    };
+    *ctx.base.borrow_mut() = Some(base);
+    render_preview(ctx);
+}
+
+/// Decode + downscale the image off the main thread, then display it. Camera
+/// raws go through the Rust decoder with the chosen Bayer [`DemosaicMethod`]
+/// (`method` is ignored for non-raw files and for X-Trans sensors), are stored
+/// as the un-geometried [`PreviewCtx::pristine`] buffer, and get the current
+/// [`Geometry`] applied to produce `base`; everything else goes through
+/// gdk-pixbuf straight to `base` (no geometry). Re-run to change the demosaic
+/// method — it re-decodes the full raw, unlike the geometry/pipeline changes
 /// which reuse the already-downscaled buffer.
 fn spawn_decode(ctx: &PreviewCtx, path: String, method: DemosaicMethod) {
     // Claim the newest generation; a stale (superseded) decode discards below.
     let generation = ctx.decode_gen.get().wrapping_add(1);
     ctx.decode_gen.set(generation);
     glib::spawn_future_local(clone!(@strong ctx => async move {
-        let base = if crate::raw_preview::is_raw_path(&path) {
+        if crate::raw_preview::is_raw_path(&path) {
             // Decode + demosaic off the main thread (it's heavy); downscale to a
-            // responsive preview size.
+            // responsive preview size. Keep the un-geometried buffer.
             let p = path.clone();
-            gio::spawn_blocking(move || {
+            let decoded = gio::spawn_blocking(move || {
                 crate::raw_preview::decode_raw_preview_with(
                     &p,
                     crate::raw_preview::PREVIEW_MAX_DIM,
                     method,
                 )
-                .map(|rp| BaseImage::Linear {
-                    width: rp.width,
-                    height: rp.height,
-                    pixels: rp.pixels,
-                })
+                .map(|rp| (rp.width, rp.height, rp.pixels))
             })
             .await
             .ok()
-            .flatten()
-        } else {
-            let p = path.clone();
-            let data = gio::spawn_blocking(move || std::fs::read(&p).ok())
-                .await
-                .ok()
-                .flatten();
-            data.and_then(|data| {
-                let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
-                let _ = loader.write(&data);
-                let _ = loader.close();
-                loader.pixbuf().map(|pb| BaseImage::Srgb8 {
-                    bytes: pb.read_pixel_bytes().to_vec(),
-                    width: pb.width(),
-                    height: pb.height(),
-                    rowstride: pb.rowstride() as usize,
-                    nch: pb.n_channels() as usize,
-                })
-            })
-        };
-        // A newer decode was requested while this one ran (rapid method
-        // switching) — drop this result so it can't paint over the newer one.
+            .flatten();
+            // A newer decode was requested while this ran (rapid method
+            // switching) — drop this result so it can't paint over the newer one.
+            if ctx.decode_gen.get() != generation {
+                return;
+            }
+            match decoded {
+                Some(pris) => {
+                    *ctx.pristine.borrow_mut() = Some(pris);
+                    apply_geometry_to_base(&ctx); // sets base + renders
+                }
+                // Don't make a failed decode an invisible blank — log it.
+                // `base`/`pristine` and the display stay on the last successful
+                // result; the selector shows the attempted (failed) method.
+                None => eprintln!("darkroom preview: could not decode {path}"),
+            }
+            return;
+        }
+
+        // Non-raw (JPEG etc.): gdk-pixbuf straight to an 8-bit base, no geometry.
+        let p = path.clone();
+        let data = gio::spawn_blocking(move || std::fs::read(&p).ok())
+            .await
+            .ok()
+            .flatten();
         if ctx.decode_gen.get() != generation {
             return;
         }
+        let base = data.and_then(|data| {
+            let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
+            let _ = loader.write(&data);
+            let _ = loader.close();
+            loader.pixbuf().map(|pb| BaseImage::Srgb8 {
+                bytes: pb.read_pixel_bytes().to_vec(),
+                width: pb.width(),
+                height: pb.height(),
+                rowstride: pb.rowstride() as usize,
+                nch: pb.n_channels() as usize,
+            })
+        });
         match base {
             Some(base) => {
+                *ctx.pristine.borrow_mut() = None; // no geometry on the JPEG path
                 *ctx.base.borrow_mut() = Some(base);
                 render_preview(&ctx);
             }
-            // Don't make a failed decode (unsupported/corrupt raw, unreadable
-            // file) an invisible blank — log it (no toast overlay here yet).
-            // `ctx.base` and the display stay on the last successful result; the
-            // selector, however, now shows the attempted (failed) method.
             None => eprintln!("darkroom preview: could not decode {path}"),
         }
     }));
@@ -753,11 +800,16 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         pending: RefCell::new(None),
     });
 
+    // Restore the saved per-image geometry (identity for JPEGs / no db) BEFORE
+    // the first decode, so the initial render applies it.
+    let geometry0 = crate::persist::load_geometry(db_path, file_path);
     let ctx = PreviewCtx {
         picture: picture.downgrade(),
         hist_area: hist_area.downgrade(),
         picker: picker_label.downgrade(),
         base: Rc::new(RefCell::new(None)),
+        pristine: Rc::new(RefCell::new(None)),
+        geometry: Rc::new(std::cell::Cell::new(geometry0)),
         decode_gen: Rc::new(std::cell::Cell::new(0)),
         params,
         hist: Rc::new(RefCell::new([[0u32; 256]; 3])),
@@ -1041,6 +1093,53 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         });
         right_box.append(&demosaic_header);
         right_box.append(&dropdown);
+        right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        // Straighten (rotate) — a per-image geometry edit re-applied to the
+        // cached pristine buffer (not a re-decode). The heavy resample + DB write
+        // are debounced so a slider drag stays responsive.
+        let geom_header = gtk4::Label::builder()
+            .label("Geometry")
+            .halign(gtk4::Align::Start)
+            .margin_start(10)
+            .margin_top(8)
+            .margin_bottom(4)
+            .build();
+        geom_header.add_css_class("heading");
+        let angle0_deg = straighten_rad_to_deg(ctx.geometry.get().angle);
+        // labeled_slider sets the value internally, so the handler is connected
+        // *after* the initial value → no spurious geometry apply on build.
+        let straighten = labeled_slider("Straighten", -45.0, 45.0, 0.1, angle0_deg);
+        straighten
+            .scale
+            .set_tooltip_text(Some("Rotate the image, degrees"));
+        let g_ctx = ctx.clone();
+        let g_path = file_path.to_string();
+        let g_db = db_path.to_string();
+        let g_debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        straighten.scale.connect_value_changed(move |sc| {
+            let mut geom = g_ctx.geometry.get();
+            geom.angle = straighten_deg_to_rad(sc.value());
+            g_ctx.geometry.set(geom);
+            // Debounce the resample + persist so a drag doesn't thrash them; the
+            // last value within the window is the one applied.
+            if let Some(id) = g_debounce.borrow_mut().take() {
+                id.remove();
+            }
+            let d_ctx = g_ctx.clone();
+            let d_path = g_path.clone();
+            let d_db = g_db.clone();
+            let d_deb = g_debounce.clone();
+            let id =
+                glib::timeout_add_local_once(std::time::Duration::from_millis(160), move || {
+                    *d_deb.borrow_mut() = None;
+                    crate::persist::save_geometry(&d_db, &d_path, &d_ctx.geometry.get());
+                    apply_geometry_to_base(&d_ctx);
+                });
+            *g_debounce.borrow_mut() = Some(id);
+        });
+        right_box.append(&geom_header);
+        right_box.append(&straighten.row);
         right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     }
 
@@ -1563,6 +1662,18 @@ mod tests {
             assert_eq!(DemosaicMethod::from_u8(i as u8), m);
         }
         assert!(!labels[0].is_empty() && labels[0] != labels[1] && labels[1] != labels[2]);
+    }
+
+    #[test]
+    fn straighten_deg_rad_round_trip() {
+        // 0 maps to 0; a mid value round-trips within float tolerance; the
+        // slider extremes map to the expected radian magnitude (±π/4).
+        assert_eq!(straighten_deg_to_rad(0.0), 0.0);
+        for deg in [-45.0, -12.3, 7.5, 45.0] {
+            let back = straighten_rad_to_deg(straighten_deg_to_rad(deg));
+            assert!((back - deg).abs() < 1e-4, "deg {deg} -> {back}");
+        }
+        assert!((straighten_deg_to_rad(45.0) - std::f32::consts::FRAC_PI_4).abs() < 1e-6);
     }
 
     #[test]
