@@ -9,6 +9,7 @@ use gtk4::ApplicationWindow;
 use glib::clone;
 
 pub mod catalog;
+pub mod crop_overlay;
 pub mod darkroom;
 pub mod dialogs;
 pub mod export;
