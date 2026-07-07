@@ -916,17 +916,37 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      no blockers; applied the should-fix (entering crop dismisses any active wipe
      compare — mutual-exclusion) + 2 nice-to-haves. **m4-47 deferred review also
      ran: clean, no blocker/should-fix.** darkroom-ui 123→127 tests.
-   - **Geometry now: shown + persisted in the darkroom; NOT yet applied at export**
-     (export shells to `darktable-cli`). Applying the stored crop/angle to export
-     output is the natural geometry follow-up.
+   **m4-49/m4-50 — Rust-native export (DONE): geometry + colour params now reach
+   the exported file** (user chose the Rust-render route over post-processing
+   darktable-cli). Export previously ALWAYS shelled to `darktable-cli`, which
+   develops the raw with darktable's own history and ignores every darkroom-ui
+   edit; now the single-image darkroom export renders through OUR pipeline so it
+   matches the preview.
+   - **m4-49** (`d93b409429`): `export::render_export_rgb8(img, method, geometry,
+     params) -> (w,h,rgb8)` — the preview pipeline at full res (demosaic + WB +
+     Rec.2020 → geometry → colour pipeline + Rec.2020→sRGB + OETF). 2 tests.
+   - **m4-50** (`74cc45e1e6`): `export::ExportEdit { method, geometry, params }`
+     threaded through `show_export_dialog`/`export_images_async` as
+     `Option<ExportEdit>`. Per image: `Some(edit) && is_raw_path` →
+     `render_raw_export` (Rust render → `Pixbuf::from_bytes` → optional
+     `fit_within` scale → `savev` png/jpeg/tiff), else `darktable-cli`. The
+     darkroom Export button bakes the current edit at click time; both lighttable
+     callers pass `None` (multi-export unchanged). gdk-pixbuf encode runs in the
+     export `spawn_blocking` pool (Pixbuf/Bytes thread-local; captures Copy/Send).
+     Opus review: no blockers; applied the should-fix ("TIFF 16-bit" label →
+     "TIFF", since the Rust path is 8-bit gdk-pixbuf while darktable-cli is 16-bit).
 
-   **Candidate next increments after m4-48** (recorded so they survive a context
+   **Candidate next increments after m4-50** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
-   - **Geometry follow-ups:** apply the stored crop/angle at export (pass to
-     `darktable-cli`, or render via the Rust pipeline); aspect-ratio-locked crop;
-     reset-geometry control; darktable's Reset also resetting geometry (m4-47
-     review noted Reset currently leaves geometry — a UX decision).
+   - **Export follow-ups (from m4-50 review):** 16-bit TIFF/PNG from the linear
+     f32 buffer (needs a `tiff`/`png` encoder crate — gdk-pixbuf caps at 8-bit);
+     verify the gdk-pixbuf TIFF saver is in the app Docker image; a toast in the
+     darkroom view (the `toast_fn` hook exists, currently `eprintln!`); optionally
+     let the lighttable multi-export also render per-image edits via Rust.
+   - **Geometry follow-ups:** aspect-ratio-locked crop; a reset-geometry control;
+     whether darktable's Reset should also reset geometry (m4-47 review noted
+     Reset currently leaves geometry — a UX decision).
    - **Perf:** rayon-parallelise `demosaic_rcd` (over tiles) and/or `demosaic_vng`
      (over rows, but the ring buffer serialises write-back — would need a
      per-row-independent restructure) if full-res load latency warrants it.
