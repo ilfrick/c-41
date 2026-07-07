@@ -232,9 +232,83 @@ pub fn cli_args(input: &str, output_dest: &str, s: &ExportSettings) -> Vec<Strin
     a
 }
 
+/// Render a decoded [`RawImage`] to a packed 8-bit **sRGB RGB** buffer
+/// (`width*height*3`) through the darkroom-ui pipeline — the full-resolution
+/// twin of the darkroom preview, so a Rust-native export matches what the user
+/// edited. Composition mirrors the preview exactly: demosaic + white-balance +
+/// camera→Rec.2020 ([`RawImage::to_linear_rgba_with`]) → geometry
+/// ([`Geometry::apply`], straighten then crop) → the colour pipeline + Rec.2020→
+/// sRGB display seam + sRGB OETF ([`crate::preview::render_linear_to_srgb8`]).
+/// Returns the geometry-adjusted `(width, height)` and the RGB bytes.
+pub fn render_export_rgb8(
+    img: &darkroom_core::rawimage::RawImage,
+    method: darkroom_core::rawimage::DemosaicMethod,
+    geometry: darkroom_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+) -> (usize, usize, Vec<u8>) {
+    let (w, h, linear) = img.to_linear_rgba_with(method);
+    let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    let rgb = crate::preview::render_linear_to_srgb8(&geom_linear, gw, gh, params);
+    (gw, gh, rgb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small synthetic Bayer raw (diagonal-gradient mosaic) for exercising the
+    /// Rust export render path without a real raw file.
+    fn synthetic_raw(w: usize, h: usize) -> darkroom_core::rawimage::RawImage {
+        let mosaic: Vec<f32> = (0..w * h)
+            .map(|i| ((i % w + i / w) as f32) / ((w + h) as f32))
+            .collect();
+        darkroom_core::rawimage::RawImage {
+            width: w,
+            height: h,
+            cfa: [[0, 1], [1, 2]], // RGGB
+            xtrans: None,
+            wb: [1.0, 1.0, 1.0, 1.0],
+            orientation: (false, false, false),
+            cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            mosaic,
+        }
+    }
+
+    #[test]
+    fn render_export_rgb8_identity_keeps_source_dims() {
+        use darkroom_core::geometry::Geometry;
+        use darkroom_core::rawimage::DemosaicMethod;
+        let img = synthetic_raw(40, 30);
+        let (w, h, rgb) = render_export_rgb8(
+            &img,
+            DemosaicMethod::Rcd,
+            Geometry::default(),
+            &crate::preview::PreviewParams::default(),
+        );
+        assert_eq!((w, h), (40, 30));
+        assert_eq!(rgb.len(), 40 * 30 * 3);
+        assert!(rgb.iter().any(|&b| b != 0), "produced a non-blank image");
+    }
+
+    #[test]
+    fn render_export_rgb8_applies_crop_dims() {
+        use darkroom_core::geometry::{Crop, Geometry};
+        use darkroom_core::rawimage::DemosaicMethod;
+        let img = synthetic_raw(40, 30);
+        // Horizontal crop 0.25..0.75 of 40 px = a 20-wide, full-height result.
+        let geom = Geometry {
+            crop: Crop { left: 0.25, top: 0.0, right: 0.75, bottom: 1.0 },
+            angle: 0.0,
+        };
+        let (w, h, rgb) = render_export_rgb8(
+            &img,
+            DemosaicMethod::Rcd,
+            geom,
+            &crate::preview::PreviewParams::default(),
+        );
+        assert_eq!((w, h), (20, 30));
+        assert_eq!(rgb.len(), 20 * 30 * 3);
+    }
 
     #[test]
     fn format_index_and_ext_roundtrip() {
