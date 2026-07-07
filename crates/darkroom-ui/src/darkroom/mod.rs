@@ -19,7 +19,7 @@ use std::rc::Rc;
 use crate::dialogs;
 use crate::history::{describe_change, HistoryStack};
 use crate::preview::{Histogram, PreviewParams};
-use darkroom_core::geometry::Geometry;
+use darkroom_core::geometry::{Crop, Geometry};
 use darkroom_core::rawimage::DemosaicMethod;
 use crate::snapshots::{SnapshotStore, SNAPSHOT_CAP};
 
@@ -105,6 +105,10 @@ struct PreviewCtx {
     /// Current per-image geometry (straighten + crop), applied to `pristine` to
     /// produce the displayed `base`.
     geometry: Rc<std::cell::Cell<Geometry>>,
+    /// While set (crop-edit mode), the displayed `base` is rotated but UNcropped
+    /// so the crop overlay can be dragged over the full frame; cleared, `base`
+    /// shows the actual cropped result.
+    crop_editing: Rc<std::cell::Cell<bool>>,
     /// Monotonic decode generation. Each [`spawn_decode`] bumps it and captures
     /// the value; a completed decode only paints if it is still the newest, so a
     /// slow earlier demosaic can't overwrite a newer one (stale-paint guard).
@@ -507,6 +511,151 @@ fn draw_wipe(cr: &gtk4::cairo::Context, w: i32, h: i32, state: &CompareState, fr
     let _ = cr.stroke();
 }
 
+/// Interactive crop-rectangle overlay (m4-48b). Layered over the `Picture` like
+/// [`WipeCompare`]; idle it is click-through so the colour picker works, and it
+/// is only interactive while crop-edit mode (`editing`) is on. Draws the crop
+/// rect + 8 handles and dims outside; a `GestureDrag` grabs a handle (via
+/// [`crate::crop_overlay::hit_test`]) and resizes/moves the crop in
+/// [`PreviewCtx::geometry`]. While editing, the displayed image is rotated but
+/// UNcropped (see [`apply_geometry_to_base`]) so the rect can be dragged over the
+/// full frame; leaving crop mode shows the actual cropped result.
+#[derive(Clone)]
+struct CropOverlay {
+    area: glib::WeakRef<gtk4::DrawingArea>,
+    geometry: Rc<std::cell::Cell<Geometry>>,
+    editing: Rc<std::cell::Cell<bool>>,
+    /// Shared with the ctx: the current (rotated) base, for its display dims.
+    base: Rc<RefCell<Option<BaseImage>>>,
+    /// In-flight drag: the grabbed handle + the crop and pointer at drag start.
+    drag: Rc<RefCell<Option<CropDrag>>>,
+}
+
+/// The state captured when a crop drag begins, so each update recomputes from the
+/// original crop (not the last frame) — no drift accumulation.
+struct CropDrag {
+    handle: crate::crop_overlay::CropHandle,
+    start_crop: darkroom_core::geometry::Crop,
+    start_fx: f32,
+    start_fy: f32,
+}
+
+/// Display dimensions of the current base (`None` if not yet decoded).
+fn base_dims(base: &Option<BaseImage>) -> Option<(usize, usize)> {
+    match base.as_ref()? {
+        BaseImage::Srgb8 { width, height, .. } => Some((*width as usize, *height as usize)),
+        BaseImage::Linear { width, height, .. } => Some((*width, *height)),
+    }
+}
+
+/// Paint the crop overlay: dim outside the crop rect, outline it, draw
+/// rule-of-thirds guides and 8 grab handles. Coordinates come from
+/// [`crate::preview::contain_rect`] over the current (rotated) base dims so the
+/// rect lines up with the displayed image.
+fn draw_crop(cr: &gtk4::cairo::Context, w: i32, h: i32, base_w: usize, base_h: usize, crop: Crop) {
+    let Some(rect) = crate::preview::contain_rect(w as f64, h as f64, base_w, base_h) else {
+        return;
+    };
+    let crop = crop.normalized();
+    let x0 = rect.off_x + rect.disp_w * crop.left as f64;
+    let x1 = rect.off_x + rect.disp_w * crop.right as f64;
+    let y0 = rect.off_y + rect.disp_h * crop.top as f64;
+    let y1 = rect.off_y + rect.disp_h * crop.bottom as f64;
+    let (ix, iy, iw, ih) = (rect.off_x, rect.off_y, rect.disp_w, rect.disp_h);
+
+    // Dim the four bands outside the crop rect (within the displayed image).
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.5);
+    cr.rectangle(ix, iy, iw, y0 - iy); // top
+    cr.rectangle(ix, y1, iw, iy + ih - y1); // bottom
+    cr.rectangle(ix, y0, x0 - ix, y1 - y0); // left
+    cr.rectangle(x1, y0, ix + iw - x1, y1 - y0); // right
+    let _ = cr.fill();
+
+    // Rule-of-thirds guides (faint).
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+    cr.set_line_width(1.0);
+    for i in 1..3 {
+        let gx = x0 + (x1 - x0) * i as f64 / 3.0;
+        cr.move_to(gx, y0);
+        cr.line_to(gx, y1);
+        let gy = y0 + (y1 - y0) * i as f64 / 3.0;
+        cr.move_to(x0, gy);
+        cr.line_to(x1, gy);
+    }
+    let _ = cr.stroke();
+
+    // Rect outline + 8 handles.
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+    let _ = cr.stroke();
+    let hs = 4.0;
+    let (xm, ym) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    for &(hx, hy) in &[
+        (x0, y0), (xm, y0), (x1, y0), (x1, ym), (x1, y1), (xm, y1), (x0, y1), (x0, ym),
+    ] {
+        cr.rectangle(hx - hs, hy - hs, hs * 2.0, hs * 2.0);
+    }
+    let _ = cr.fill();
+}
+
+/// The displayed-image rect for the crop overlay's current base, if editable.
+/// Scopes the `base` borrow to exactly the dims read (the draw func borrows
+/// `base` too), mirroring [`set_wipe_from_x`].
+fn crop_contain_rect(ov: &CropOverlay) -> Option<(gtk4::DrawingArea, crate::preview::ContainRect)> {
+    let area = ov.area.upgrade()?;
+    let (bw, bh) = base_dims(&ov.base.borrow())?;
+    let rect = crate::preview::contain_rect(area.width() as f64, area.height() as f64, bw, bh)?;
+    Some((area, rect))
+}
+
+/// Grab a crop handle at widget point `(x, y)` — records the drag state so
+/// updates recompute from the original crop.
+fn crop_drag_begin(ov: &CropOverlay, x: f64, y: f64) {
+    if !ov.editing.get() {
+        return;
+    }
+    let Some((_, rect)) = crop_contain_rect(ov) else {
+        return;
+    };
+    let (fx, fy) = crate::crop_overlay::widget_to_fraction(&rect, x, y);
+    let crop = ov.geometry.get().crop.normalized();
+    // ~12 px grab tolerance expressed as a fraction of the displayed width.
+    let tol = if rect.disp_w > 0.0 { (12.0 / rect.disp_w) as f32 } else { 0.05 };
+    let handle = crate::crop_overlay::hit_test(crop, fx, fy, tol);
+    *ov.drag.borrow_mut() = Some(CropDrag { handle, start_crop: crop, start_fx: fx, start_fy: fy });
+}
+
+/// Update the crop from the grabbed handle and the current widget point
+/// `(x, y)`, writing the new crop into `geometry` and repainting the overlay.
+fn crop_drag_update(ov: &CropOverlay, x: f64, y: f64) {
+    if !ov.editing.get() {
+        return;
+    }
+    let drag = {
+        let d = ov.drag.borrow();
+        match d.as_ref() {
+            Some(d) => (d.handle, d.start_crop, d.start_fx, d.start_fy),
+            None => return,
+        }
+    };
+    let (handle, start_crop, sfx, sfy) = drag;
+    if handle == crate::crop_overlay::CropHandle::None {
+        return;
+    }
+    let Some((area, rect)) = crop_contain_rect(ov) else {
+        return;
+    };
+    let (fx, fy) = crate::crop_overlay::widget_to_fraction(&rect, x, y);
+    let new_crop = if handle == crate::crop_overlay::CropHandle::Inside {
+        crate::crop_overlay::translate(start_crop, fx - sfx, fy - sfy)
+    } else {
+        crate::crop_overlay::resize_to(start_crop, handle, fx, fy)
+    };
+    let mut g = ov.geometry.get();
+    g.crop = new_crop;
+    ov.geometry.set(g);
+    area.queue_draw();
+}
+
 /// The params the preview is currently showing: the live params, or their
 /// bypassed (all-stages-off) form while the before/after toggle is active.
 fn effective_params(ctx: &PreviewCtx) -> PreviewParams {
@@ -590,12 +739,19 @@ fn straighten_rad_to_deg(rad: f32) -> f64 {
 /// downscaled-buffer resample), unlike a full re-decode.
 fn apply_geometry_to_base(ctx: &PreviewCtx) {
     let geom = ctx.geometry.get();
+    let editing = ctx.crop_editing.get();
     let base = {
         let pristine = ctx.pristine.borrow();
         let Some((w, h, pixels)) = pristine.as_ref() else {
             return;
         };
-        let (gw, gh, gpixels) = geom.apply(pixels, *w, *h);
+        // Crop-edit mode shows the rotated-but-uncropped frame (the overlay draws
+        // the crop rect on top); otherwise the actual cropped result.
+        let (gw, gh, gpixels) = if editing {
+            darkroom_core::geometry::apply_rotate(pixels, *w, *h, geom.angle)
+        } else {
+            geom.apply(pixels, *w, *h)
+        };
         BaseImage::Linear { width: gw, height: gh, pixels: gpixels }
     };
     *ctx.base.borrow_mut() = Some(base);
@@ -736,6 +892,15 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         });
         wipe_area.add_controller(drag);
     }
+
+    // Crop overlay: a second DrawingArea layered over the Picture. Idle it's
+    // click-through (the picker still works); interactive only in crop-edit mode.
+    // Its `CropOverlay` (draw func + gesture) is wired after `ctx` exists.
+    let crop_area = gtk4::DrawingArea::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .can_target(false)
+        .build();
     let snapshots: SnapStore = Rc::new(RefCell::new(SnapshotStore::new(SNAPSHOT_CAP)));
 
     // ── Live RGB histogram strip under the image ───────────────────────────
@@ -810,6 +975,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         base: Rc::new(RefCell::new(None)),
         pristine: Rc::new(RefCell::new(None)),
         geometry: Rc::new(std::cell::Cell::new(geometry0)),
+        crop_editing: Rc::new(std::cell::Cell::new(false)),
         decode_gen: Rc::new(std::cell::Cell::new(0)),
         params,
         hist: Rc::new(RefCell::new([[0u32; 256]; 3])),
@@ -834,6 +1000,58 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // selector below re-runs `spawn_decode` when the user changes it.
     let demosaic = crate::persist::load_demosaic(db_path, file_path);
     spawn_decode(&ctx, file_path.to_string(), demosaic);
+
+    // ── Crop overlay wiring (draw func + drag gesture) ─────────────────────
+    let crop_overlay = CropOverlay {
+        area: crop_area.downgrade(),
+        geometry: ctx.geometry.clone(),
+        editing: ctx.crop_editing.clone(),
+        base: ctx.base.clone(),
+        drag: Rc::new(RefCell::new(None)),
+    };
+    {
+        let ov = crop_overlay.clone();
+        crop_area.set_draw_func(move |_, cr, w, h| {
+            if !ov.editing.get() {
+                return;
+            }
+            // Scope the `base` borrow to the dims read (apply_geometry_to_base
+            // borrows it mutably on other turns; never nested with this).
+            // GTK4 `queue_draw` is asynchronous — this draw func fires at the next
+            // frame boundary, never reentrantly during a synchronous `base` borrow.
+            if let Some((bw, bh)) = base_dims(&ov.base.borrow()) {
+                draw_crop(cr, w, h, bw, bh, ov.geometry.get().crop);
+            }
+        });
+    }
+    {
+        let drag = gtk4::GestureDrag::new();
+        let ov_begin = crop_overlay.clone();
+        drag.connect_drag_begin(move |_, x, y| crop_drag_begin(&ov_begin, x, y));
+        let ov_update = crop_overlay.clone();
+        drag.connect_drag_update(move |g, ox, oy| {
+            if let Some((sx, sy)) = g.start_point() {
+                crop_drag_update(&ov_update, sx + ox, sy + oy);
+            }
+        });
+        // Persist the crop when the drag settles (cheap; not per-frame), but only
+        // if a handle was actually grabbed — a click-through with no handle
+        // (CropHandle::None) leaves the crop unchanged, so skip the DB write.
+        let end_geom = ctx.geometry.clone();
+        let end_drag = crop_overlay.drag.clone();
+        let end_db = db_path.to_string();
+        let end_path = file_path.to_string();
+        drag.connect_drag_end(move |_, _, _| {
+            let grabbed = end_drag
+                .borrow()
+                .as_ref()
+                .is_some_and(|d| d.handle != crate::crop_overlay::CropHandle::None);
+            if grabbed {
+                crate::persist::save_geometry(&end_db, &end_path, &end_geom.get());
+            }
+        });
+        crop_area.add_controller(drag);
+    }
 
     // ── Colour picker: click the image to read the processed pixel ─────────
     let click = gtk4::GestureClick::new();
@@ -877,6 +1095,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .build();
     image_overlay.set_child(Some(&picture));
     image_overlay.add_overlay(&wipe_area);
+    image_overlay.add_overlay(&crop_area);
 
     let image_area = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -1165,6 +1384,41 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // Before/after toggle was created above (so the history restore can clear
     // its state); just place it in the header here.
     header.pack_start(&before_after_btn);
+
+    // Crop-mode toggle (raw only). On: show the rotated-uncropped frame + the
+    // interactive crop overlay. Off: show the cropped result and persist.
+    if crate::raw_preview::is_raw_path(file_path) {
+        let crop_btn = gtk4::ToggleButton::builder()
+            .label("Crop")
+            .tooltip_text("Crop / straighten overlay")
+            .build();
+        crop_btn.update_property(&[gtk4::accessible::Property::Label("Crop mode")]);
+        let cb_ctx = ctx.clone();
+        let cb_area = crop_area.downgrade();
+        let cb_wipe = wipe.clone();
+        let cb_db = db_path.to_string();
+        let cb_path = file_path.to_string();
+        crop_btn.connect_toggled(move |b| {
+            let editing = b.is_active();
+            cb_ctx.crop_editing.set(editing);
+            if editing {
+                // Only one overlay may be interactive: dismiss any active wipe
+                // compare (it would show through the dim bands and its gesture
+                // would fight the crop drag).
+                cb_wipe.clear();
+            }
+            if let Some(area) = cb_area.upgrade() {
+                area.set_can_target(editing); // interactive only while editing
+                area.queue_draw();
+            }
+            // Re-render the base: rotated-uncropped while editing, cropped when done.
+            apply_geometry_to_base(&cb_ctx);
+            if !editing {
+                crate::persist::save_geometry(&cb_db, &cb_path, &cb_ctx.geometry.get());
+            }
+        });
+        header.pack_start(&crop_btn);
+    }
 
     // Undo / Redo: step the history cursor and restore that entry. No-ops at the
     // ends (undo at the seed / redo at the newest return None), so the buttons
