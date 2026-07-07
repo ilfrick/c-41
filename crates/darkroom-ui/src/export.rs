@@ -53,7 +53,9 @@ impl ExportFormat {
     pub fn label(self) -> &'static str {
         match self {
             ExportFormat::Jpeg => "JPEG (sRGB)",
-            ExportFormat::Tiff => "TIFF 16-bit",
+            // No bit-depth claim: the Rust export path writes 8-bit (gdk-pixbuf),
+            // the darktable-cli path 16-bit — the shared label can't promise one.
+            ExportFormat::Tiff => "TIFF",
             ExportFormat::Png => "PNG",
         }
     }
@@ -230,6 +232,18 @@ pub fn cli_args(input: &str, output_dest: &str, s: &ExportSettings) -> Vec<Strin
         }
     }
     a
+}
+
+/// The darkroom-ui edit to bake into a Rust-native export so the output matches
+/// the preview: the Bayer demosaic method, the geometry (straighten + crop), and
+/// the colour-pipeline params. Plain `Copy` data (safe to send to the export
+/// thread). Passed as `Some` for the single-image darkroom export; `None` for the
+/// lighttable multi-export, which stays on `darktable-cli`.
+#[derive(Clone, Copy)]
+pub struct ExportEdit {
+    pub method: darkroom_core::rawimage::DemosaicMethod,
+    pub geometry: darkroom_core::geometry::Geometry,
+    pub params: crate::preview::PreviewParams,
 }
 
 /// Render a decoded [`RawImage`] to a packed 8-bit **sRGB RGB** buffer

@@ -1529,11 +1529,22 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .build();
     export_btn.add_css_class("suggested-action");
     let path_for_export = file_path.to_string();
+    let ex_ctx = ctx.clone();
+    let ex_db = db_path.to_string();
     export_btn.connect_clicked(move |btn| {
         if let Some(root) = btn.root().and_downcast::<gtk4::Window>() {
+            // Bake the current darkroom-ui edit so a Rust-native export matches
+            // the preview (geometry uses the committed crop even mid-crop-edit).
+            // Raws render via our pipeline; a JPEG falls back to darktable-cli.
+            let edit = crate::export::ExportEdit {
+                method: crate::persist::load_demosaic(&ex_db, &path_for_export),
+                geometry: ex_ctx.geometry.get(),
+                params: *ex_ctx.params.borrow(),
+            };
             dialogs::show_export_dialog(
                 root.upcast_ref::<gtk4::Window>(),
                 vec![path_for_export.clone()],
+                Some(edit),
                 |msg| eprintln!("{msg}"), // darkroom view has no toast overlay yet
             );
         }

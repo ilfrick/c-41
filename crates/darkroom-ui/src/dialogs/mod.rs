@@ -13,6 +13,7 @@ use anyhow::Result;
 pub fn show_export_dialog(
     parent: &gtk4::Window,
     paths: Vec<String>,
+    edit: Option<crate::export::ExportEdit>,
     toast_fn: impl Fn(String) + 'static,
 ) {
     if paths.is_empty() {
@@ -40,7 +41,7 @@ pub fn show_export_dialog(
         let tf        = toast_fn.clone();
 
         glib::spawn_future_local(async move {
-            match export_images_async(out_paths, settings, template).await {
+            match export_images_async(out_paths, settings, template, edit).await {
                 Ok(0)      => tf(format!("Exported {n} image(s)")),
                 Ok(failed) => tf(format!("Exported {} of {n} ({failed} failed)", n - failed)),
                 Err(e)     => tf(format!("Export failed: {e}")),
@@ -62,17 +63,33 @@ async fn export_images_async(
     paths: Vec<String>,
     settings: crate::export::ExportSettings,
     template: String,
+    edit: Option<crate::export::ExportEdit>,
 ) -> Result<usize> {
     let failed = gio::spawn_blocking(move || {
         let template = crate::export::batch_output_template(&template, paths.len());
         let mut failed = 0usize;
         for (i, path) in paths.iter().enumerate() {
-            // Extension-less destination; `--out-ext` (in cli_args) appends the ext.
+            // Extension-less destination; the CLI's `--out-ext` (or the Rust
+            // encoder) appends the extension.
             let dest = crate::export::expand_output_template(&template, path, (i + 1) as u32);
             if let Some(parent) = std::path::Path::new(&dest).parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     eprintln!("darkroom export: cannot create {parent:?}: {e}");
                     failed += 1;
+                    continue;
+                }
+            }
+
+            // Rust-native render for a raw WITH a darkroom-ui edit (so the export
+            // matches the preview + applies geometry/params); everything else
+            // (JPEGs, or lighttable multi-export with no edit) via darktable-cli,
+            // which develops with darktable's own history.
+            if let Some(edit) = edit {
+                if crate::raw_preview::is_raw_path(path) {
+                    if let Err(e) = render_raw_export(path, &dest, &settings, edit) {
+                        eprintln!("darkroom export: Rust render failed for {path}: {e}");
+                        failed += 1;
+                    }
                     continue;
                 }
             }
@@ -89,6 +106,55 @@ async fn export_images_async(
         failed
     }).await.map_err(|e| anyhow::anyhow!("thread panicked: {e:?}"))?;
     Ok(failed)
+}
+
+/// Export one raw through the Rust pipeline (matching the darkroom preview):
+/// decode → [`crate::export::render_export_rgb8`] (demosaic + geometry + colour
+/// params) → optional resize → encode via gdk-pixbuf to `<dest>.<ext>`. Runs on
+/// the export thread pool; the Pixbuf is a thread-local (never crosses threads).
+fn render_raw_export(
+    path: &str,
+    dest: &str,
+    settings: &crate::export::ExportSettings,
+    edit: crate::export::ExportEdit,
+) -> Result<()> {
+    use gtk4::gdk_pixbuf::{Colorspace, InterpType, Pixbuf};
+
+    let img = darkroom_core::rawimage::load(path)
+        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    let (w, h, rgb) =
+        crate::export::render_export_rgb8(&img, edit.method, edit.geometry, &edit.params);
+    if w == 0 || h == 0 || rgb.len() < w * h * 3 {
+        return Err(anyhow::anyhow!("empty render"));
+    }
+    // Own the bytes for the Pixbuf's lifetime (RGB, no alpha, rowstride w*3).
+    let bytes = glib::Bytes::from_owned(rgb);
+    let pb = Pixbuf::from_bytes(&bytes, Colorspace::Rgb, false, 8, w as i32, h as i32, (w * 3) as i32);
+    let pb = match &settings.resize {
+        Some(r) => {
+            let (tw, th) = crate::export::fit_within(w as u32, h as u32, r);
+            pb.scale_simple(tw.max(1) as i32, th.max(1) as i32, InterpType::Bilinear)
+                .ok_or_else(|| anyhow::anyhow!("resize failed"))?
+        }
+        None => pb,
+    };
+
+    let dest_ext = format!("{dest}.{}", settings.format.out_ext());
+    let ptype = match settings.format {
+        crate::export::ExportFormat::Jpeg => "jpeg",
+        crate::export::ExportFormat::Tiff => "tiff",
+        crate::export::ExportFormat::Png => "png",
+    };
+    // JPEG takes a quality option (1..=100); PNG/TIFF ignore it.
+    let quality = settings.quality.clamp(1, 100).to_string();
+    let opts: &[(&str, &str)] = if matches!(settings.format, crate::export::ExportFormat::Jpeg) {
+        &[("quality", quality.as_str())]
+    } else {
+        &[]
+    };
+    pb.savev(&dest_ext, ptype, opts)
+        .map_err(|e| anyhow::anyhow!("encode {ptype}: {e}"))?;
+    Ok(())
 }
 
 // ── Import folder dialog ──────────────────────────────────────────────────

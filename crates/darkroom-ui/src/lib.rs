@@ -213,6 +213,7 @@ fn build_main_window(app: &Application) {
             dialogs::show_export_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 paths,
+                None, // lighttable multi-export: darktable-cli (no per-image edit)
                 toast_fn.clone(),
             );
         }));
@@ -331,6 +332,7 @@ fn build_main_window(app: &Application) {
             dialogs::show_export_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 paths,
+                None, // lighttable multi-export: darktable-cli (no per-image edit)
                 toast_fn2.clone(),
             );
         }));
