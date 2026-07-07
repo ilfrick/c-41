@@ -902,18 +902,31 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      → self-reviewed; a follow-up architect pass is queued for the reset.**
      darkroom-ui 122→123.
 
-   **Candidate next increments after m4-47** (recorded so they survive a context
+   **m4-48 — interactive crop overlay (DONE):** completes the straighten-and-crop UX.
+   - **m4-48a** (`bc646f5746`): pure `crop_overlay` interaction math (fraction
+     space): `widget_to_fraction`, `hit_test` (corner>edge>inside), `resize_to`
+     (clamp + MIN 2% + no-invert), `translate` (bounded). 4 headless tests.
+   - **m4-48b** (`bb071aac0d`): the GTK overlay. Raw-only "Crop" header toggle →
+     `PreviewCtx.crop_editing`; `apply_geometry_to_base` shows rotated-uncropped
+     while editing (apply_rotate) else the cropped result (geom.apply). A second
+     `DrawingArea` over the Picture (mirrors `WipeCompare`, click-through idle),
+     `draw_crop` (dim + thirds + rect + 8 handles via `contain_rect`), a
+     `GestureDrag` grabbing a handle and `resize_to`/`translate`-ing the drag-start
+     crop (no drift) into `ctx.geometry`, `save_geometry` on drag-end. Opus review:
+     no blockers; applied the should-fix (entering crop dismisses any active wipe
+     compare — mutual-exclusion) + 2 nice-to-haves. **m4-47 deferred review also
+     ran: clean, no blocker/should-fix.** darkroom-ui 123→127 tests.
+   - **Geometry now: shown + persisted in the darkroom; NOT yet applied at export**
+     (export shells to `darktable-cli`). Applying the stored crop/angle to export
+     output is the natural geometry follow-up.
+
+   **Candidate next increments after m4-48** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
-   - **m4-48 crop overlay (the natural next):** a draggable crop rectangle over
-     the preview (handles + drag-to-resize + aspect constraints) updating the same
-     `ctx.geometry` Cell's `crop`, coordinate mapping (widget ↔ displayed image ↔
-     crop fractions), reusing `preview::contain_rect`. Split it: the interaction
-     math is pure/headless-testable (do first); the GTK overlay + gestures are
-     display-dependent (architect-review once the quota resets). Straighten
-     currently shows black corners until this crop trims them.
-   - **Deferred architect pass:** run the m4-47 fricktrade-architect review after
-     the weekly quota resets; address any findings.
+   - **Geometry follow-ups:** apply the stored crop/angle at export (pass to
+     `darktable-cli`, or render via the Rust pipeline); aspect-ratio-locked crop;
+     reset-geometry control; darktable's Reset also resetting geometry (m4-47
+     review noted Reset currently leaves geometry — a UX decision).
    - **Perf:** rayon-parallelise `demosaic_rcd` (over tiles) and/or `demosaic_vng`
      (over rows, but the ring buffer serialises write-back — would need a
      per-row-independent restructure) if full-res load latency warrants it.
