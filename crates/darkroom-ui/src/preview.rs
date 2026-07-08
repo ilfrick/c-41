@@ -347,17 +347,49 @@ pub fn render_linear_to_srgb8(
     if linear.len() < n * 4 {
         return vec![0u8; n * 3];
     }
+    srgb_encode_rgb(linear, width, height, params)
+        .iter()
+        .map(|&e| (e.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+        .collect()
+}
+
+/// 16-bit sRGB variant of [`render_linear_to_srgb8`] for high-bit-depth export
+/// (PNG/TIFF): same pipeline + Rec.2020→sRGB + OETF, quantised to 16 bits so
+/// tonal gradients keep more headroom than an 8-bit encode. Tightly-packed
+/// **RGB** `u16`, `width*height*3`.
+pub fn render_linear_to_srgb16(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+) -> Vec<u16> {
+    let n = width.saturating_mul(height);
+    if linear.len() < n * 4 {
+        return vec![0u16; n * 3];
+    }
+    srgb_encode_rgb(linear, width, height, params)
+        .iter()
+        .map(|&e| (e.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16)
+        .collect()
+}
+
+/// Shared render core: run the preview pipeline, map the Rec.2020 working space
+/// to sRGB, and apply the sRGB OETF, yielding tightly-packed **RGB** sRGB floats
+/// (`width*height*3`, pre-quantisation — values may fall outside `[0,1]` for
+/// out-of-gamut colours, which the callers clamp). `linear` must be
+/// `width*height*4` (callers guard the short case).
+fn srgb_encode_rgb(linear: &[f32], width: usize, height: usize, params: &PreviewParams) -> Vec<f32> {
+    let n = width.saturating_mul(height);
     let mut processed = params.to_pipeline().process(&linear[..n * 4]);
     // Working space (Rec.2020) → sRGB before the display OETF (m4-35).
     darkroom_core::rawimage::apply_color_matrix(
         &mut processed,
         darkroom_core::rawimage::REC2020_TO_SRGB,
     );
-    let mut out = vec![0u8; n * 3];
+    let mut out = vec![0.0f32; n * 3];
     for i in 0..n {
         for c in 0..3 {
-            let enc = darkroom_core::color::linear_to_srgb(processed[i * 4 + c]);
-            out[i * 3 + c] = (enc.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            out[i * 3 + c] = darkroom_core::color::linear_to_srgb(processed[i * 4 + c]);
         }
     }
     out

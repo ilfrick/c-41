@@ -53,8 +53,9 @@ impl ExportFormat {
     pub fn label(self) -> &'static str {
         match self {
             ExportFormat::Jpeg => "JPEG (sRGB)",
-            // No bit-depth claim: the Rust export path writes 8-bit (gdk-pixbuf),
-            // the darktable-cli path 16-bit — the shared label can't promise one.
+            // No bit-depth claim: the Rust export path writes 8-bit for JPEG
+            // (inherent) and 16-bit for PNG/TIFF (via the `image` crate); keep the
+            // label neutral in case the CLI path or a future path differs.
             ExportFormat::Tiff => "TIFF",
             ExportFormat::Png => "PNG",
         }
@@ -266,6 +267,21 @@ pub fn render_export_rgb8(
     (gw, gh, rgb)
 }
 
+/// 16-bit twin of [`render_export_rgb8`] for high-bit-depth export (PNG/TIFF):
+/// identical pipeline, quantised to 16 bits. Returns the geometry-adjusted
+/// `(width, height)` and packed RGB `u16`.
+pub fn render_export_rgb16(
+    img: &darkroom_core::rawimage::RawImage,
+    method: darkroom_core::rawimage::DemosaicMethod,
+    geometry: darkroom_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+) -> (usize, usize, Vec<u16>) {
+    let (w, h, linear) = img.to_linear_rgba_with(method);
+    let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    let rgb = crate::preview::render_linear_to_srgb16(&geom_linear, gw, gh, params);
+    (gw, gh, rgb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +338,28 @@ mod tests {
         );
         assert_eq!((w, h), (20, 30));
         assert_eq!(rgb.len(), 20 * 30 * 3);
+    }
+
+    #[test]
+    fn render_export_rgb16_dims_and_matches_8bit_scaled() {
+        use darkroom_core::geometry::Geometry;
+        use darkroom_core::rawimage::DemosaicMethod;
+        let img = synthetic_raw(40, 30);
+        let params = crate::preview::PreviewParams::default();
+        let (w, h, rgb16) =
+            render_export_rgb16(&img, DemosaicMethod::Rcd, Geometry::default(), &params);
+        assert_eq!((w, h), (40, 30));
+        assert_eq!(rgb16.len(), 40 * 30 * 3);
+        // The 16-bit encode is the same sRGB values at higher precision: the top
+        // 8 bits of each u16 must equal the 8-bit render (within ±1 from rounding).
+        let (_, _, rgb8) =
+            render_export_rgb8(&img, DemosaicMethod::Rcd, Geometry::default(), &params);
+        for (i, (&hi, &lo)) in rgb16.iter().zip(rgb8.iter()).enumerate() {
+            // 65535 = 255·257, so the top byte of the 16-bit encode is ~0.4% above
+            // the 8-bit one; with independent rounding they agree within ±2.
+            let hi8 = (hi >> 8) as i32;
+            assert!((hi8 - lo as i32).abs() <= 2, "sample {i}: 16→8 {hi8} vs 8-bit {lo}");
+        }
     }
 
     #[test]

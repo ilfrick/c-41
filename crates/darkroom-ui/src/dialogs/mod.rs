@@ -109,51 +109,58 @@ async fn export_images_async(
 }
 
 /// Export one raw through the Rust pipeline (matching the darkroom preview):
-/// decode → [`crate::export::render_export_rgb8`] (demosaic + geometry + colour
-/// params) → optional resize → encode via gdk-pixbuf to `<dest>.<ext>`. Runs on
-/// the export thread pool; the Pixbuf is a thread-local (never crosses threads).
+/// decode → render (demosaic + geometry + colour params) → optional resize →
+/// encode via the pure-Rust `image` crate to `<dest>.<ext>`. **PNG/TIFF are
+/// 16-bit** (`render_export_rgb16`), JPEG is 8-bit (inherently). Runs on the
+/// export thread pool; all types here are plain Rust (no GTK), so no main-thread
+/// constraint. `w`/`h` come from `render_export_*` and always match the buffer.
 fn render_raw_export(
     path: &str,
     dest: &str,
     settings: &crate::export::ExportSettings,
     edit: crate::export::ExportEdit,
 ) -> Result<()> {
-    use gtk4::gdk_pixbuf::{Colorspace, InterpType, Pixbuf};
+    use crate::export::ExportFormat;
+    use image::{imageops::FilterType, ImageBuffer, ImageEncoder, Rgb};
 
-    let img = darkroom_core::rawimage::load(path)
-        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    let (w, h, rgb) =
-        crate::export::render_export_rgb8(&img, edit.method, edit.geometry, &edit.params);
-    if w == 0 || h == 0 || rgb.len() < w * h * 3 {
-        return Err(anyhow::anyhow!("empty render"));
-    }
-    // Own the bytes for the Pixbuf's lifetime (RGB, no alpha, rowstride w*3).
-    let bytes = glib::Bytes::from_owned(rgb);
-    let pb = Pixbuf::from_bytes(&bytes, Colorspace::Rgb, false, 8, w as i32, h as i32, (w * 3) as i32);
-    let pb = match &settings.resize {
-        Some(r) => {
-            let (tw, th) = crate::export::fit_within(w as u32, h as u32, r);
-            pb.scale_simple(tw.max(1) as i32, th.max(1) as i32, InterpType::Bilinear)
-                .ok_or_else(|| anyhow::anyhow!("resize failed"))?
-        }
-        None => pb,
-    };
-
+    let img = darkroom_core::rawimage::load(path).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
     let dest_ext = format!("{dest}.{}", settings.format.out_ext());
-    let ptype = match settings.format {
-        crate::export::ExportFormat::Jpeg => "jpeg",
-        crate::export::ExportFormat::Tiff => "tiff",
-        crate::export::ExportFormat::Png => "png",
+
+    // Target size for the optional resize box (None ⇒ keep source size).
+    // `fit_within` already guarantees each dimension ≥ 1. The resize below runs
+    // in sRGB-encoded (gamma) space — technically inexact, but matches gdk-pixbuf
+    // and virtually every other tool; acceptable for export.
+    let target = |w: usize, h: usize| -> Option<(u32, u32)> {
+        settings.resize.as_ref().map(|r| crate::export::fit_within(w as u32, h as u32, r))
     };
-    // JPEG takes a quality option (1..=100); PNG/TIFF ignore it.
-    let quality = settings.quality.clamp(1, 100).to_string();
-    let opts: &[(&str, &str)] = if matches!(settings.format, crate::export::ExportFormat::Jpeg) {
-        &[("quality", quality.as_str())]
-    } else {
-        &[]
-    };
-    pb.savev(&dest_ext, ptype, opts)
-        .map_err(|e| anyhow::anyhow!("encode {ptype}: {e}"))?;
+
+    match settings.format {
+        ExportFormat::Jpeg => {
+            let (w, h, rgb) =
+                crate::export::render_export_rgb8(&img, edit.method, edit.geometry, &edit.params);
+            let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
+                .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+            if let Some((tw, th)) = target(w, h) {
+                buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+            }
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&dest_ext)?);
+            let q = settings.quality.clamp(1, 100) as u8;
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, q)
+                .write_image(buf.as_raw(), buf.width(), buf.height(), image::ExtendedColorType::Rgb8)
+                .map_err(|e| anyhow::anyhow!("encode jpeg: {e}"))?;
+        }
+        ExportFormat::Png | ExportFormat::Tiff => {
+            let (w, h, rgb) =
+                crate::export::render_export_rgb16(&img, edit.method, edit.geometry, &edit.params);
+            let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
+                .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+            if let Some((tw, th)) = target(w, h) {
+                buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+            }
+            // `save` infers the encoder from the extension (.png/.tif → 16-bit).
+            buf.save(&dest_ext).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        }
+    }
     Ok(())
 }
 

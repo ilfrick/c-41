@@ -15,3 +15,6 @@ glib          = "0.20"
 gio           = "0.20"
 rusqlite      = { workspace = true }
 walkdir       = { workspace = true }
+# Rust-native export encode (8/16-bit PNG/TIFF, 8-bit JPEG) + resize. Only the
+# formats we emit, to keep the dependency light.
+image         = { version = "0.25", default-features = false, features = ["png", "tiff", "jpeg"] }
