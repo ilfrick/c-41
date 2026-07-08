@@ -1405,6 +1405,11 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     content.append(&right_box);
 
+    // Wrap the content so export (and future) status can surface as a toast —
+    // the darkroom view previously logged export results only to stderr.
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&content));
+
     // ── Header bar with Export button ─────────────────────────────────────
     let header = adw::HeaderBar::new();
     let title_widget = adw::WindowTitle::new(&filename, "Darkroom");
@@ -1560,6 +1565,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     let path_for_export = file_path.to_string();
     let ex_ctx = ctx.clone();
     let ex_db = db_path.to_string();
+    let ex_overlay = toast_overlay.clone();
     export_btn.connect_clicked(move |btn| {
         if let Some(root) = btn.root().and_downcast::<gtk4::Window>() {
             // Bake the current darkroom-ui edit so a Rust-native export matches
@@ -1570,11 +1576,14 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
                 geometry: ex_ctx.geometry.get(),
                 params: *ex_ctx.params.borrow(),
             };
+            // Surface the export result as a toast (the callback runs back on the
+            // main thread after the export future resolves).
+            let tf_overlay = ex_overlay.clone();
             dialogs::show_export_dialog(
                 root.upcast_ref::<gtk4::Window>(),
                 vec![path_for_export.clone()],
                 Some(edit),
-                |msg| eprintln!("{msg}"), // darkroom view has no toast overlay yet
+                move |msg| tf_overlay.add_toast(adw::Toast::new(&msg)),
             );
         }
     });
@@ -1612,7 +1621,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&content));
+    toolbar_view.set_content(Some(&toast_overlay));
     // Page-root scope: covers header + content, scoped to this page.
     toolbar_view.add_controller(shortcuts);
 
