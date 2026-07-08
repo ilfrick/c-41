@@ -1357,8 +1357,37 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
                 });
             *g_debounce.borrow_mut() = Some(id);
         });
+        // Reset crop + straighten to identity — the only way to undo a geometry
+        // edit (the header Reset deliberately touches only the colour params).
+        let reset_geom_btn = gtk4::Button::builder()
+            .label("Reset crop & straighten")
+            .tooltip_text("Clear the crop and straighten (geometry only)")
+            .margin_start(10)
+            .margin_end(10)
+            .margin_bottom(6)
+            .build();
+        let rg_ctx = ctx.clone();
+        let rg_scale = straighten.scale.downgrade();
+        let rg_crop = crop_area.downgrade();
+        let rg_db = db_path.to_string();
+        let rg_path = file_path.to_string();
+        reset_geom_btn.connect_clicked(move |_| {
+            rg_ctx.geometry.set(Geometry::default());
+            // Reflect it on the slider (a no-op notify if already 0); the reset
+            // itself applies + persists below, so it doesn't rely on the handler.
+            if let Some(sc) = rg_scale.upgrade() {
+                sc.set_value(0.0);
+            }
+            crate::persist::save_geometry(&rg_db, &rg_path, &Geometry::default());
+            apply_geometry_to_base(&rg_ctx); // re-render the (now un-cropped) frame
+            if let Some(area) = rg_crop.upgrade() {
+                area.queue_draw(); // redraw the overlay's identity rect (if editing)
+            }
+        });
+
         right_box.append(&geom_header);
         right_box.append(&straighten.row);
+        right_box.append(&reset_geom_btn);
         right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     }
 
