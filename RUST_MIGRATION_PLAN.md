@@ -944,9 +944,10 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      verify the gdk-pixbuf TIFF saver is in the app Docker image; a toast in the
      darkroom view (the `toast_fn` hook exists, currently `eprintln!`); optionally
      let the lighttable multi-export also render per-image edits via Rust.
-   - **Geometry follow-ups:** aspect-ratio-locked crop; a reset-geometry control;
-     whether darktable's Reset should also reset geometry (m4-47 review noted
-     Reset currently leaves geometry — a UX decision).
+   - **Geometry follow-ups:** aspect-ratio-locked crop (Free/1:1/3:2/16:9/original).
+     (DONE m4-51 `f00c98d26f`: a "Reset crop & straighten" button in the Geometry
+     panel — geometry-only reset, since the header Reset deliberately leaves
+     geometry. Closes the m4-47 "no way to undo a crop" gap.)
    - **Perf:** rayon-parallelise `demosaic_rcd` (over tiles) and/or `demosaic_vng`
      (over rows, but the ring buffer serialises write-back — would need a
      per-row-independent restructure) if full-res load latency warrants it.
