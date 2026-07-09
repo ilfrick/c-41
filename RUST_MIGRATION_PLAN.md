@@ -936,21 +936,35 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      Opus review: no blockers; applied the should-fix ("TIFF 16-bit" label →
      "TIFF", since the Rust path is 8-bit gdk-pixbuf while darktable-cli is 16-bit).
 
-   **Candidate next increments after m4-50** (recorded so they survive a context
+   **m4-51..m4-55 — export/geometry/perf polish (all DONE):**
+   - **m4-51** (`f00c98d26f`): "Reset crop & straighten" button (geometry-only
+     reset; the header Reset deliberately leaves geometry). Closes the m4-47 gap.
+   - **m4-52** (`2b4334b0d9`): **16-bit PNG/TIFF export** via the `image` crate.
+     `render_linear_to_srgb8` refactored to a shared `srgb_encode_rgb` core +
+     `render_linear_to_srgb16`; `render_raw_export` rewritten from gdk-pixbuf to
+     `image` (JPEG 8-bit w/ quality, PNG/TIFF 16-bit, resize via imageops) — also
+     removes the off-thread GObject concern (pure Rust). Opus: no blockers.
+   - **m4-53** (`01778c194c`): **export toast** in the darkroom view (was
+     `eprintln!`) — content wrapped in `adw::ToastOverlay`, export `toast_fn`
+     routed to it.
+   - **m4-54** (`cc3538a9ee`): **rayon-parallelise `demosaic_rcd`** (per-worker
+     scratch via `for_each_init`, disjoint valid-region writes via a
+     `Send`+`Sync` raw-ptr wrapper — the C `DT_OMP` analog). Speeds up full-res
+     export. Opus: data-race-freedom PROVEN (`last_v(tv)==first_v(tv+1)`, tile
+     never reads `out`). VNG stays serial (ring buffer serialises write-back).
+   - **m4-55** (`9432ec9e5a`): **aspect-ratio-locked crop** (Free/1:1/3:2/2:3/
+     4:3/16:9). `apply_aspect` (edge-derive on drag) + `fit_aspect` (fit-inside on
+     selector change → immediate reshape). Opus: no blockers; math verified.
+
+   **Candidate next increments after m4-55** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
    the tag rename/delete popover is now leak-free + a11y-complete):
-   - **Export follow-ups (from m4-50 review):** 16-bit TIFF/PNG from the linear
-     f32 buffer (needs a `tiff`/`png` encoder crate — gdk-pixbuf caps at 8-bit);
-     verify the gdk-pixbuf TIFF saver is in the app Docker image; a toast in the
-     darkroom view (the `toast_fn` hook exists, currently `eprintln!`); optionally
-     let the lighttable multi-export also render per-image edits via Rust.
-   - **Geometry follow-ups:** aspect-ratio-locked crop (Free/1:1/3:2/16:9/original).
-     (DONE m4-51 `f00c98d26f`: a "Reset crop & straighten" button in the Geometry
-     panel — geometry-only reset, since the header Reset deliberately leaves
-     geometry. Closes the m4-47 "no way to undo a crop" gap.)
-   - **Perf:** rayon-parallelise `demosaic_rcd` (over tiles) and/or `demosaic_vng`
-     (over rows, but the ring buffer serialises write-back — would need a
-     per-row-independent restructure) if full-res load latency warrants it.
+   - **Export:** let the lighttable multi-export also render per-image edits via
+     Rust (currently only the single-image darkroom export does; lighttable stays
+     on darktable-cli — would need loading each image's params/geometry/method).
+   - **Perf:** parallelise `demosaic_vng` (needs a per-row-independent restructure
+     of its serial ring-buffer write-back) and/or the per-pixel `pipeline::process`
+     (embarrassingly parallel, no unsafe) for faster full-res export.
    - **Selector polish (deferred from m4-43 N3):** hide the demosaic DropDown for
      X-Trans files (needs the sensor kind surfaced from the decode up to the UI —
      currently just a tooltip caveat since detection needs a decode).
