@@ -419,6 +419,47 @@ pub fn demosaic_ppg(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
     out
 }
 
+/// Per-tile scratch for [`demosaic_rcd`], allocated once per rayon worker (via
+/// `for_each_init`) and cleared per tile. Sizes are the RCD tile
+/// (`DT_RCD_TILESIZE = 112`); the half-resolution buffers are TS²/2.
+struct RcdScratch {
+    cfa_b: Vec<f32>,
+    rgb: Vec<f32>,
+    vh_dir: Vec<f32>,
+    pq_dir: Vec<f32>,
+    lpf: Vec<f32>,
+    p_cdiff: Vec<f32>,
+    q_cdiff: Vec<f32>,
+    vsq: Vec<f32>,
+    hsq: Vec<f32>,
+}
+
+impl RcdScratch {
+    fn new() -> Self {
+        const TS: usize = 112;
+        Self {
+            cfa_b: vec![0.0; TS * TS],
+            rgb: vec![0.0; 3 * TS * TS],
+            vh_dir: vec![0.0; TS * TS],
+            pq_dir: vec![0.0; TS * TS / 2],
+            lpf: vec![0.0; TS * TS / 2],
+            p_cdiff: vec![0.0; TS * TS / 2],
+            q_cdiff: vec![0.0; TS * TS / 2],
+            vsq: vec![0.0; TS * TS],
+            hsq: vec![0.0; TS * TS],
+        }
+    }
+}
+
+/// A raw `*mut f32` promoted to `Send`+`Sync` so rayon tile tasks can write their
+/// output regions in parallel. Sound ONLY because the RCD tiles' valid write
+/// regions (`[first_v,last_v) × [first_h,last_h)` in image space) are pairwise
+/// disjoint — no two tiles ever write the same output element.
+#[derive(Clone, Copy)]
+struct SyncMutPtr(*mut f32);
+unsafe impl Send for SyncMutPtr {}
+unsafe impl Sync for SyncMutPtr {}
+
 /// Demosaic a normalised Bayer CFA mosaic to packed RGBA `f32` via the migrated
 /// **RCD** (Ratio Corrected Demosaicing) algorithm — darktable's default, with
 /// noticeably fewer maze/zipper artefacts on fine detail than [`demosaic_ppg`].
@@ -463,28 +504,27 @@ pub fn demosaic_rcd(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
     let num_vertical = (height - 2 * BORDER).saturating_sub(1) / TILEVALID + 1;
     let num_horizontal = (width - 2 * BORDER).saturating_sub(1) / TILEVALID + 1;
 
-    // Per-tile scratch, allocated once and cleared per tile (C calloc/memset).
-    let mut cfa_b = vec![0.0f32; TS * TS];
-    let mut rgb = vec![0.0f32; 3 * TS * TS]; // planes: rgb[c*TS*TS + indx]
-    let mut vh_dir = vec![0.0f32; TS * TS];
-    let mut pq_dir = vec![0.0f32; TS * TS / 2];
-    // Half-resolution low-pass filter. Stored one entry per *written* pixel
-    // (every other column) but indexed with the FULL stride `W1`/`±1`, so
-    // `lpf[lp ± W1]` steps two rows (to the same-colour Bayer neighbour) and
-    // `lpf[lp ± 1]` steps two columns — this half-stride encoding is why the
-    // `RCD_TILEVALID`-even parity guarantee matters (see the fn doc).
-    let mut lpf = vec![0.0f32; TS * TS / 2];
-    let mut p_cdiff = vec![0.0f32; TS * TS / 2];
-    let mut q_cdiff = vec![0.0f32; TS * TS / 2];
-    // Squared vertical/horizontal colour-difference HPF (step 1); computed into
-    // full-tile buffers instead of C's rolling three-row window — same result,
-    // clearer, and the extra 2·TS² floats are negligible at tile scale.
-    let mut vsq = vec![0.0f32; TS * TS];
-    let mut hsq = vec![0.0f32; TS * TS];
+    // Refine each tile in PARALLEL (rayon), restoring the C `DT_OMP` the port
+    // dropped: the scratch is per-worker (`for_each_init`), and every tile writes
+    // only its own disjoint valid region of `out` through a raw pointer. The
+    // half-resolution `lpf`/`pq_dir`/`p_cdiff`/`q_cdiff` buffers keep C's
+    // full-`W1`-stride indexing over a TS²/2 buffer (why `RCD_TILEVALID` is even);
+    // `vsq`/`hsq` replace C's rolling 3-row window with full-tile buffers.
+    use rayon::prelude::*;
     let plane = TS * TS; // green plane base = 1*plane
-
-    for tv in 0..num_vertical {
-        for th in 0..num_horizontal {
+    let out_ptr = SyncMutPtr(out.as_mut_ptr());
+    let tiles: Vec<(usize, usize)> = (0..num_vertical)
+        .flat_map(|tv| (0..num_horizontal).map(move |th| (tv, th)))
+        .collect();
+    tiles.par_iter().for_each_init(RcdScratch::new, |scratch, &(tv, th)| {
+        let RcdScratch { cfa_b, rgb, vh_dir, pq_dir, lpf, p_cdiff, q_cdiff, vsq, hsq } = scratch;
+        // Force the closure to capture the whole `SyncMutPtr` (Send+Sync), not
+        // the bare `*mut f32` field: Rust 2021 disjoint capture would otherwise
+        // capture `out_ptr.0`, which is not Sync. The rebind is deliberate.
+        #[allow(clippy::redundant_locals)]
+        let out_ptr = out_ptr;
+        let op_base = out_ptr.0;
+        {
             let row_start = tv * TILEVALID;
             let row_end = (row_start + TS).min(height);
             let col_start = th * TILEVALID;
@@ -492,12 +532,15 @@ pub fn demosaic_rcd(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
             let tile_rows = (row_end - row_start).min(TS) as i32;
             let tile_cols = (col_end - col_start).min(TS) as i32;
 
-            for b in [&mut cfa_b, &mut rgb, &mut vh_dir, &mut vsq, &mut hsq] {
-                b.fill(0.0);
-            }
-            for b in [&mut pq_dir, &mut lpf, &mut p_cdiff, &mut q_cdiff] {
-                b.fill(0.0);
-            }
+            cfa_b.fill(0.0);
+            rgb.fill(0.0);
+            vh_dir.fill(0.0);
+            vsq.fill(0.0);
+            hsq.fill(0.0);
+            pq_dir.fill(0.0);
+            lpf.fill(0.0);
+            p_cdiff.fill(0.0);
+            q_cdiff.fill(0.0);
 
             // Step 0: fill cfa; seed both in-row colour planes with the raw value.
             for row in row_start..row_end {
@@ -508,6 +551,8 @@ pub fn demosaic_rcd(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
                     let indx = base + k;
                     let v = mosaic[row * width + col].max(0.0); // _safe_in, scaler = 1
                     cfa_b[indx] = v;
+                    // Warm-start both of this CFA row's two colour planes with the
+                    // raw value; steps 3+4 overwrite them with interpolated values.
                     rgb[c0 * plane + indx] = v;
                     rgb[c1 * plane + indx] = v;
                 }
@@ -735,14 +780,22 @@ pub fn demosaic_rcd(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
                 for col in first_h..last_h {
                     let idx = (row - row_start) * TS + (col - col_start);
                     let o = (row * width + col) * 4;
-                    out[o] = rgb[idx].max(0.0);
-                    out[o + 1] = rgb[plane + idx].max(0.0);
-                    out[o + 2] = rgb[2 * plane + idx].max(0.0);
-                    out[o + 3] = 0.0;
+                    // SAFETY: `o..o+4` lies in this tile's valid region, which is
+                    // disjoint from every other tile's (see `SyncMutPtr`) and in
+                    // bounds (`out` is width*height*4 from `demosaic_ppg`). The
+                    // unchecked write has no bounds check, so fail fast in debug if
+                    // a future tiling-formula change ever breaks that invariant.
+                    debug_assert!(o + 3 < width * height * 4, "rcd write-back OOB: o={o}");
+                    unsafe {
+                        *op_base.add(o) = rgb[idx].max(0.0);
+                        *op_base.add(o + 1) = rgb[plane + idx].max(0.0);
+                        *op_base.add(o + 2) = rgb[2 * plane + idx].max(0.0);
+                        *op_base.add(o + 3) = 0.0;
+                    }
                 }
             }
         }
-    }
+    });
     out
 }
 
