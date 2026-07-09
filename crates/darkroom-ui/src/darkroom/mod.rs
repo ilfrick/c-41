@@ -528,6 +528,8 @@ struct CropOverlay {
     base: Rc<RefCell<Option<BaseImage>>>,
     /// In-flight drag: the grabbed handle + the crop and pointer at drag start.
     drag: Rc<RefCell<Option<CropDrag>>>,
+    /// Aspect-ratio lock applied to resize drags (`Free` = unconstrained).
+    aspect: Rc<std::cell::Cell<crate::crop_overlay::AspectRatio>>,
 }
 
 /// The state captured when a crop drag begins, so each update recomputes from the
@@ -648,7 +650,15 @@ fn crop_drag_update(ov: &CropOverlay, x: f64, y: f64) {
     let new_crop = if handle == crate::crop_overlay::CropHandle::Inside {
         crate::crop_overlay::translate(start_crop, fx - sfx, fy - sfy)
     } else {
-        crate::crop_overlay::resize_to(start_crop, handle, fx, fy)
+        let resized = crate::crop_overlay::resize_to(start_crop, handle, fx, fy);
+        // Lock the pixel aspect on resize (no-op for Free); needs the display
+        // dims to convert the fraction crop to a pixel ratio.
+        match base_dims(&ov.base.borrow()) {
+            Some((bw, bh)) => {
+                crate::crop_overlay::apply_aspect(resized, handle, ov.aspect.get(), bw, bh)
+            }
+            None => resized,
+        }
     };
     let mut g = ov.geometry.get();
     g.crop = new_crop;
@@ -1002,12 +1012,15 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     spawn_decode(&ctx, file_path.to_string(), demosaic);
 
     // ── Crop overlay wiring (draw func + drag gesture) ─────────────────────
+    // Aspect lock shared with the selector in the geometry panel below.
+    let crop_aspect = Rc::new(std::cell::Cell::new(crate::crop_overlay::AspectRatio::Free));
     let crop_overlay = CropOverlay {
         area: crop_area.downgrade(),
         geometry: ctx.geometry.clone(),
         editing: ctx.crop_editing.clone(),
         base: ctx.base.clone(),
         drag: Rc::new(RefCell::new(None)),
+        aspect: crop_aspect.clone(),
     };
     {
         let ov = crop_overlay.clone();
@@ -1385,8 +1398,51 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
             }
         });
 
+        // Crop aspect-ratio lock — applies to crop-handle resizes (crop mode).
+        let aspect_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(10)
+            .margin_end(10)
+            .margin_bottom(6)
+            .build();
+        let aspect_lbl = gtk4::Label::new(Some("Aspect"));
+        aspect_lbl.set_xalign(0.0);
+        let aspect_dd = gtk4::DropDown::from_strings(&crate::crop_overlay::aspect_labels());
+        aspect_dd.set_hexpand(true);
+        aspect_dd.set_tooltip_text(Some("Lock the crop aspect ratio (applies while dragging a crop handle)"));
+        // The lock is a session tool (not persisted → resets to Free on reopen),
+        // but selecting a ratio immediately reshapes the CURRENT crop to it (and
+        // that crop IS persisted) so the displayed/exported crop matches the
+        // selection without needing a drag — matching darktable/Lightroom.
+        let a_cell = crop_aspect.clone();
+        let as_ctx = ctx.clone();
+        let as_crop = crop_area.downgrade();
+        let as_db = db_path.to_string();
+        let as_path = file_path.to_string();
+        aspect_dd.connect_selected_notify(move |dd| {
+            let ratio = crate::crop_overlay::aspect_from_index(dd.selected());
+            a_cell.set(ratio);
+            if let Some((bw, bh)) = base_dims(&as_ctx.base.borrow()) {
+                let mut g = as_ctx.geometry.get();
+                // Fit the ratio inside the current crop, centred (Free = no-op).
+                g.crop = crate::crop_overlay::fit_aspect(g.crop, ratio, bw, bh);
+                as_ctx.geometry.set(g);
+                crate::persist::save_geometry(&as_db, &as_path, &g);
+                if let Some(area) = as_crop.upgrade() {
+                    area.queue_draw(); // redraw the overlay rect (crop-edit mode)
+                }
+                if !as_ctx.crop_editing.get() {
+                    apply_geometry_to_base(&as_ctx); // re-render the cropped result
+                }
+            }
+        });
+        aspect_row.append(&aspect_lbl);
+        aspect_row.append(&aspect_dd);
+
         right_box.append(&geom_header);
         right_box.append(&straighten.row);
+        right_box.append(&aspect_row);
         right_box.append(&reset_geom_btn);
         right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     }

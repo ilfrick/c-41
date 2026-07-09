@@ -138,6 +138,114 @@ pub fn translate(crop: Crop, dx: f32, dy: f32) -> Crop {
     }
 }
 
+/// Crop aspect-ratio constraint. `Free` allows any shape; `Fixed(w, h)` locks the
+/// crop's PIXEL aspect to `w:h` (e.g. `Fixed(16, 9)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AspectRatio {
+    Free,
+    Fixed(u32, u32),
+}
+
+/// Crop-mode aspect-selector labels, ordered to match [`aspect_from_index`].
+pub fn aspect_labels() -> [&'static str; 6] {
+    ["Free", "1:1", "3:2", "2:3", "4:3", "16:9"]
+}
+
+/// The [`AspectRatio`] for a selector index (out-of-range → [`AspectRatio::Free`]).
+pub fn aspect_from_index(i: u32) -> AspectRatio {
+    match i {
+        1 => AspectRatio::Fixed(1, 1),
+        2 => AspectRatio::Fixed(3, 2),
+        3 => AspectRatio::Fixed(2, 3),
+        4 => AspectRatio::Fixed(4, 3),
+        5 => AspectRatio::Fixed(16, 9),
+        _ => AspectRatio::Free,
+    }
+}
+
+/// Constrain `crop` so its **pixel** aspect matches `ratio` for an image of
+/// `img_w × img_h`, after a drag on `handle`. The axis the handle drives is kept
+/// and the other is derived: corners keep the fixed opposite edge; the left/right
+/// handles centre the derived (vertical) axis, top/bottom centre the horizontal.
+/// Edges are clamped to `[0, 1]`, so a crop dragged hard into an image border may
+/// deviate slightly from the exact ratio there. `Free` (or a degenerate ratio /
+/// a move/none handle) returns `crop` unchanged.
+pub fn apply_aspect(
+    crop: Crop,
+    handle: CropHandle,
+    ratio: AspectRatio,
+    img_w: usize,
+    img_h: usize,
+) -> Crop {
+    let (rw, rh) = match ratio {
+        AspectRatio::Fixed(w, h) if w > 0 && h > 0 && img_w > 0 && img_h > 0 => (w as f32, h as f32),
+        _ => return crop,
+    };
+    if matches!(handle, CropHandle::Inside | CropHandle::None) {
+        return crop; // a move preserves the (already-locked) shape
+    }
+    let (iw, ih) = (img_w as f32, img_h as f32);
+    let mut c = crop;
+    match handle {
+        CropHandle::Top | CropHandle::Bottom => {
+            // Height drives → derive width, centred horizontally.
+            let cw = (c.bottom - c.top) * ih * rw / (iw * rh);
+            let cx = (c.left + c.right) * 0.5;
+            c.left = cx - cw * 0.5;
+            c.right = cx + cw * 0.5;
+        }
+        _ => {
+            // Width drives (left/right/corners) → derive height.
+            let ch = (c.right - c.left) * iw * rh / (ih * rw);
+            match handle {
+                CropHandle::TopLeft | CropHandle::TopRight => c.top = c.bottom - ch, // bottom fixed
+                CropHandle::BottomLeft | CropHandle::BottomRight => c.bottom = c.top + ch, // top fixed
+                _ => {
+                    let cy = (c.top + c.bottom) * 0.5; // side edge → centre vertically
+                    c.top = cy - ch * 0.5;
+                    c.bottom = cy + ch * 0.5;
+                }
+            }
+        }
+    }
+    Crop {
+        left: c.left.clamp(0.0, 1.0),
+        top: c.top.clamp(0.0, 1.0),
+        right: c.right.clamp(0.0, 1.0),
+        bottom: c.bottom.clamp(0.0, 1.0),
+    }
+}
+
+/// Fit the largest `ratio`-shaped (pixel) rectangle **inside** `crop`, centred on
+/// its centroid — the reshape used when the aspect selector changes (vs
+/// [`apply_aspect`], which edge-derives during a drag). Because it only ever
+/// shrinks within the existing crop, the result stays inside `[0, 1]` and matches
+/// the ratio exactly (no boundary clamping). `Free` / degenerate → `crop`.
+pub fn fit_aspect(crop: Crop, ratio: AspectRatio, img_w: usize, img_h: usize) -> Crop {
+    let (rw, rh) = match ratio {
+        AspectRatio::Fixed(w, h) if w > 0 && h > 0 && img_w > 0 && img_h > 0 => (w as f32, h as f32),
+        _ => return crop,
+    };
+    let (iw, ih) = (img_w as f32, img_h as f32);
+    let pw = (crop.right - crop.left) * iw; // current crop pixel dims
+    let ph = (crop.bottom - crop.top) * ih;
+    if pw <= 0.0 || ph <= 0.0 {
+        return crop;
+    }
+    let target = rw / rh;
+    // Shrink the axis that makes the crop too wide/tall for the target ratio.
+    let (npw, nph) = if pw / ph > target { (ph * target, ph) } else { (pw, pw / target) };
+    let (ncw, nch) = (npw / iw, nph / ih); // back to fractions
+    let cx = (crop.left + crop.right) * 0.5;
+    let cy = (crop.top + crop.bottom) * 0.5;
+    Crop {
+        left: (cx - ncw * 0.5).clamp(0.0, 1.0),
+        top: (cy - nch * 0.5).clamp(0.0, 1.0),
+        right: (cx + ncw * 0.5).clamp(0.0, 1.0),
+        bottom: (cy + nch * 0.5).clamp(0.0, 1.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +310,73 @@ mod tests {
         assert_eq!(widget_to_fraction(&rect, 110.0, 220.0), (1.0, 1.0)); // bottom-right
         // Onto the letterbox bar (past the image) ⇒ pinned to the edge.
         assert_eq!(widget_to_fraction(&rect, -50.0, 500.0), (0.0, 1.0));
+    }
+
+    /// Pixel aspect (w:h) of a crop on a `w × h` image.
+    fn px_aspect(cr: Crop, w: usize, h: usize) -> f32 {
+        ((cr.right - cr.left) * w as f32) / ((cr.bottom - cr.top) * h as f32)
+    }
+
+    #[test]
+    fn aspect_from_index_maps_presets() {
+        assert_eq!(aspect_from_index(0), AspectRatio::Free);
+        assert_eq!(aspect_from_index(1), AspectRatio::Fixed(1, 1));
+        assert_eq!(aspect_from_index(5), AspectRatio::Fixed(16, 9));
+        assert_eq!(aspect_from_index(99), AspectRatio::Free); // out of range
+        assert_eq!(aspect_labels().len(), 6);
+    }
+
+    #[test]
+    fn apply_aspect_free_and_move_are_identity() {
+        let cr = c(0.1, 0.2, 0.5, 0.9);
+        assert_eq!(apply_aspect(cr, CropHandle::Right, AspectRatio::Free, 100, 100), cr);
+        // A move (Inside) preserves the already-locked shape.
+        assert_eq!(apply_aspect(cr, CropHandle::Inside, AspectRatio::Fixed(1, 1), 100, 100), cr);
+    }
+
+    #[test]
+    fn apply_aspect_locks_pixel_ratio_interior() {
+        // Square image, width-driven Right drag → equal-pixel height.
+        let cr = c(0.1, 0.2, 0.5, 0.9); // width .4
+        let out = apply_aspect(cr, CropHandle::Right, AspectRatio::Fixed(1, 1), 100, 100);
+        assert!((px_aspect(out, 100, 100) - 1.0).abs() < 1e-4, "1:1 {out:?}");
+        assert_eq!((out.left, out.right), (0.1, 0.5)); // driven axis kept
+        // 16:9 on a square image.
+        let out2 = apply_aspect(cr, CropHandle::Right, AspectRatio::Fixed(16, 9), 100, 100);
+        assert!((px_aspect(out2, 100, 100) - 16.0 / 9.0).abs() < 1e-4);
+        // Non-square image: 3:2 pixels (the fraction ratio differs from 3:2).
+        let out3 = apply_aspect(c(0.2, 0.4, 0.5, 0.55), CropHandle::Right, AspectRatio::Fixed(3, 2), 300, 200);
+        assert!((px_aspect(out3, 300, 200) - 1.5).abs() < 1e-3, "3:2 {out3:?}");
+    }
+
+    #[test]
+    fn fit_aspect_fits_ratio_inside_crop_centred() {
+        // Full frame on a 3:2 image, lock to 1:1 → a centred square, staying in
+        // bounds (unlike apply_aspect which would clamp the derived edge).
+        let out = fit_aspect(Crop::default(), AspectRatio::Fixed(1, 1), 300, 200);
+        assert!((px_aspect(out, 300, 200) - 1.0).abs() < 1e-4, "{out:?}");
+        assert!(out.left >= 0.0 && out.right <= 1.0 && out.top >= 0.0 && out.bottom <= 1.0);
+        // Centred: the crop centroid stays at (0.5, 0.5).
+        assert!(((out.left + out.right) * 0.5 - 0.5).abs() < 1e-5);
+        assert!(((out.top + out.bottom) * 0.5 - 0.5).abs() < 1e-5);
+        // 16:9 inside the full 3:2 frame → shrinks height, keeps full width.
+        let w16 = fit_aspect(Crop::default(), AspectRatio::Fixed(16, 9), 300, 200);
+        assert!((px_aspect(w16, 300, 200) - 16.0 / 9.0).abs() < 1e-4);
+        assert_eq!((w16.left, w16.right), (0.0, 1.0));
+        // Free is a no-op.
+        assert_eq!(fit_aspect(Crop::default(), AspectRatio::Free, 300, 200), Crop::default());
+    }
+
+    #[test]
+    fn apply_aspect_corner_anchors_opposite_edge() {
+        let cr = c(0.2, 0.2, 0.6, 0.8); // width .4, square image below
+        // TopLeft keeps the bottom edge; derives the top.
+        let out = apply_aspect(cr, CropHandle::TopLeft, AspectRatio::Fixed(1, 1), 100, 100);
+        assert_eq!(out.bottom, 0.8);
+        assert!((out.top - 0.4).abs() < 1e-4); // bottom - width
+        // BottomRight keeps the top edge.
+        let out2 = apply_aspect(cr, CropHandle::BottomRight, AspectRatio::Fixed(1, 1), 100, 100);
+        assert_eq!(out2.top, 0.2);
+        assert!((out2.bottom - 0.6).abs() < 1e-4); // top + width
     }
 }
