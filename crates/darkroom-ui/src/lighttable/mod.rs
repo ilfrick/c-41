@@ -890,7 +890,8 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
-        rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
+        // open_catalog attaches data.db, where tag names live (data.tags).
+        darkroom_db::schema::open_catalog(db_path).unwrap_or_else(|_| open_demo_db())
     };
     // `prefix` itself (the exact tag) OR `prefix|…` (any descendant). DISTINCT
     // because an image carrying several tags under `prefix` would otherwise
