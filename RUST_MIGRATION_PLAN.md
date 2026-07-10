@@ -956,18 +956,66 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      4:3/16:9). `apply_aspect` (edge-derive on drag) + `fit_aspect` (fit-inside on
      selector change → immediate reshape). Opus: no blockers; math verified.
 
-   **Candidate next increments after m4-55** (recorded so they survive a context
-   clear — the colour-label arc m4-19/20/21/23/24/25/26 is otherwise complete;
-   the tag rename/delete popover is now leak-free + a11y-complete):
+   **m4-56..m4-59 — containerise the Rust UI + make it self-sufficient (all DONE):**
+   - **m4-56** (`38c1d10b7d`): the full-app Docker image now BUILDS the Rust/GTK4
+     UI (`cargo build --release -p darkroom` → `darkroom-rs`) and the KasmVNC
+     autostart LAUNCHES it instead of the C darktable app (C `darkroom-cli`
+     retained for the export shell-out). Added GTK4/libadwaita build+runtime deps
+     (+ `adwaita-icon-theme`, `gsettings-desktop-schemas`), `GSK_RENDERER=cairo`
+     (KasmVNC's software X server black-windows GSK's default GL renderer), and
+     `DARKROOM_LIBRARY_DB`. Two review BLOCKERs fixed: (1) production `darkroom-rs`
+     never created the catalog schema (all `CREATE TABLE` were `#[cfg(test)]`
+     fixtures; the C app's `dt_init` used to) → new `darkroom_db::schema::
+     ensure_base_schema` (main-scoped) called at startup + before import, else a
+     fresh `/config` imports 0 images; (2) the black-window renderer fix. Plus a
+     SIGTERM/SIGINT handler in `run()` so the autostart's graceful-shutdown wait
+     isn't racing an OS-killed process. Validated by a full image build + in-image
+     checks (binary present, 0 missing libs).
+   - **m4-57** (`d59ea29667`): tags now work in the standalone UI. darktable keeps
+     tag NAMES in a separate `data.db` (attached as schema `data`) + an in-memory
+     `memory` schema; the UI opened bare `Connection::open(library.db)` with NO
+     attach, so every `data.tags`/`memory.darktable_tags` ref silently failed. New
+     `schema::open_catalog(db_path)` opens library.db, attaches the sibling
+     `data.db` + a per-connection `:memory:`, ensures the full schema, and sets a
+     3s `busy_timeout` (parity with the rating/colour conns). Routed the 7
+     tag-touching connection sites through it. Non-destructive on a real darktable
+     catalog (ATTACH + CREATE IF NOT EXISTS only). Opus 8/10, shipped after the
+     busy_timeout should-fix.
+   - **m4-58** (`c6066aaf3a`): `tag_new`/`tag_delete` made atomic across the
+     data/main/memory schemas via `conn.unchecked_transaction()` (atomic across
+     on-disk DBs via SQLite's super-journal in the default rollback-journal mode).
+     Fail-safe if ever nested under an outer txn (nested BEGIN rejected before any
+     write). Opus: SHIP.
+   - **m4-59** (`e2e45dcc17`): **rayon-parallelise `pipeline::process`.** Every
+     `Stage` is a position-independent per-pixel map, so the RGBA-f32 buffer is
+     split into pixel-aligned 64k-px bands run through the full stage sequence in
+     parallel; **bit-identical to serial** regardless of thread count (export
+     bit-matches preview). `process_band` shared ping-pong worker; `for_each_init`
+     reuses one scratch per worker (peak memory LOWER than the old 2-buffer
+     serial). Fail-safe guard: `Stage::is_pixel_local()` (exhaustive no-wildcard
+     match) gates the parallel branch → a future spatial stage won't compile until
+     classified, and non-local falls back to correct serial. Opus: SHIP, no
+     blockers. darkroom-core 549→552 tests.
+
+   **Candidate next increments after m4-59** (recorded so they survive a context
+   clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
+   rename/delete popover is leak-free + a11y-complete; the Rust UI now runs in the
+   container with working tags + a parallelised pipeline):
    - **Export:** let the lighttable multi-export also render per-image edits via
      Rust (currently only the single-image darkroom export does; lighttable stays
      on darktable-cli — would need loading each image's params/geometry/method).
    - **Perf:** parallelise `demosaic_vng` (needs a per-row-independent restructure
-     of its serial ring-buffer write-back) and/or the per-pixel `pipeline::process`
-     (embarrassingly parallel, no unsafe) for faster full-res export.
+     of its serial ring-buffer write-back). `pipeline::process` is now parallel
+     (m4-59); RCD already is (m4-54).
    - **Selector polish (deferred from m4-43 N3):** hide the demosaic DropDown for
      X-Trans files (needs the sensor kind surfaced from the decode up to the UI —
      currently just a tooltip caveat since detection needs a decode).
+   - **Container follow-ups (deferred, reviewed non-blocking):** S2 — `open_catalog`
+     runs `ensure_full_schema` on every open incl. the `load_tags` per-selection
+     hot path (correct split is persistent-once-at-startup + per-open memory-table
+     only; marginal — the ATTACH file-open dominates, not the DDL probes). Also a
+     live end-to-end KasmVNC session check of `darkroom-rs` (validated at build +
+     unit level so far, not a live GUI run).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
