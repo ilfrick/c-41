@@ -34,6 +34,23 @@ pub fn run() -> Result<glib::ExitCode> {
     app.set_accels_for_action("win.import", &["<Control>i"]);
     app.set_accels_for_action("win.export-selected", &["<Control>e"]);
     app.connect_activate(build_main_window);
+
+    // SIGTERM/SIGINT graceful shutdown. A GtkApplication installs no handler,
+    // so the default disposition terminates the process instantly — the
+    // container autostart trap that forwards SIGTERM and waits up to 15s would
+    // be waiting on an already-dead process, dropping any pending autosave. Call
+    // app.quit() so the main loop unwinds through the normal teardown path.
+    // 15 = SIGTERM, 2 = SIGINT (avoids pulling in libc for two constants).
+    for signum in [15, 2] {
+        let app = app.downgrade();
+        glib::unix_signal_add_local(signum, move || {
+            if let Some(app) = app.upgrade() {
+                app.quit();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
     Ok(app.run())
 }
 
@@ -46,6 +63,20 @@ fn build_main_window(app: &Application) {
         .build();
 
     let db_path = std::env::var("DARKROOM_LIBRARY_DB").unwrap_or_default();
+
+    // Bootstrap the base catalog schema on a real (non-demo) library.db so a
+    // fresh /config — where no C app ever ran to create the tables — has a
+    // working catalog before the lighttable query or an import touches it.
+    if !db_path.is_empty() {
+        match rusqlite::Connection::open(&db_path) {
+            Ok(conn) => {
+                if let Err(e) = darkroom_db::schema::ensure_base_schema(&conn) {
+                    tracing::warn!("failed to bootstrap catalog schema: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to open library db {db_path:?}: {e}"),
+        }
+    }
 
     // ── Toast overlay (wraps everything for in-app notifications) ──────────
     let toast_overlay = adw::ToastOverlay::new();

@@ -229,6 +229,12 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
         rusqlite::Connection::open(db_path).ok()?
     };
 
+    // A fresh library.db (e.g. a brand-new container /config) has no catalog
+    // tables — the C app used to create them on first launch. Bootstrap them
+    // here so the insert below lands in a real table instead of silently
+    // registering zero images.
+    darkroom_db::schema::ensure_base_schema(&conn).ok()?;
+
     let film_id = film::film_new(&conn, folder).ok()??;
     let mut count = 0usize;
 

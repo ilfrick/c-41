@@ -44,6 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev libxml2-utils zlib1g-dev libsdl2-dev \
     libsecret-1-dev po4a python3-jsonschema xsltproc perl \
     opencl-headers ocl-icd-opencl-dev \
+    pkg-config libgtk-4-dev libadwaita-1-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -74,6 +75,12 @@ RUN cmake -B build -G Ninja \
     && cmake --build build --parallel ${JOBS} \
     && cmake --install build
 
+# Build the Rust/GTK4 UI binary (darkroom-rs). CMake already invoked cargo to
+# build darkroom-core as a static lib for the C app, but the standalone GTK4
+# front-end is a separate workspace binary that must be built explicitly. It
+# lands at /src/target/release/darkroom-rs and is copied into the runtime stage.
+RUN cargo build --release -p darkroom --bin darkroom-rs
+
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
 # KasmVNC provides browser-accessible GUI (same approach as linuxserver/darktable)
 FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
@@ -96,6 +103,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpugixml1v5 libraw23 librsvg2-2 libsqlite3-0 libtiff6 \
     libwebp7 libx11-6 libxml2 zlib1g libsdl2-2.0-0 \
     libsecret-1-0 lua5.4 \
+    # GTK4 + libadwaita runtime for the Rust UI (darkroom-rs).
+    # adwaita-icon-theme: symbolic icons libadwaita widgets draw (else blank glyphs).
+    # gsettings-desktop-schemas: libadwaita reads org.gnome.desktop.interface; a
+    #   missing schema makes GLib abort, so ship it even though we force no theme.
+    libgtk-4-1 libadwaita-1-0 adwaita-icon-theme gsettings-desktop-schemas \
     # OpenCL runtime (CPU fallback via Portable CL)
     pocl-opencl-icd \
     # GTK pixbuf loaders + MIME database (fixes SVG theme icon loading)
@@ -114,7 +126,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy compiled Darkroom from build stage
 COPY --from=builder /opt/darkroom /opt/darkroom
 
-# Make darkroom binaries available system-wide
+# Copy the Rust/GTK4 UI binary (the front-end launched by the desktop session)
+COPY --from=builder /src/target/release/darkroom-rs /usr/local/bin/darkroom-rs
+
+# Make darkroom binaries available system-wide. darkroom-cli is retained (the
+# Rust UI shells out to it for export/format paths); the C darkroom GUI stays
+# installed too, though the desktop session now launches the Rust darkroom-rs.
 RUN ln -s /opt/darkroom/bin/darktable /usr/local/bin/darkroom \
     && ln -s /opt/darkroom/bin/darktable-cli /usr/local/bin/darkroom-cli \
     && ldconfig
@@ -134,6 +151,14 @@ ENV XDG_DATA_DIRS=/opt/darkroom/share:/usr/share:/usr/local/share
 ENV DARKROOM_DATADIR=/opt/darkroom/share/darktable
 ENV DARKROOM_CONFIGDIR=/config/darkroom
 ENV DARKROOM_CACHEDIR=/config/cache
+# The Rust UI (darkroom-rs) reads its catalog from this SQLite file — the same
+# library.db the C darktable writes under its configdir, so both share a catalog.
+ENV DARKROOM_LIBRARY_DB=/config/darkroom/library.db
+# Force GTK4's software (Cairo) renderer. KasmVNC provides only a software X
+# server with no real GPU; GSK's default GL renderer renders a black window (or
+# fails to create a context) under it — the same black-framebuffer failure the
+# C GTK3 app hit here. Cairo sidesteps the GL/EGL/llvmpipe path entirely.
+ENV GSK_RENDERER=cairo
 
 # Photos and config are mounted as volumes
 VOLUME ["/photos", "/config"]

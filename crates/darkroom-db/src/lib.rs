@@ -9,6 +9,7 @@ pub mod film;
 pub mod history;
 pub mod image;
 pub mod metadata;
+pub mod schema;
 pub mod tags;
 pub mod ffi;
 
