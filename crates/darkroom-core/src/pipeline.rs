@@ -65,6 +65,24 @@ impl Stage {
         }
     }
 
+    /// True iff this stage's output for a pixel depends only on that pixel's
+    /// input — the invariant that makes the band-parallel [`Pipeline::process`]
+    /// bit-identical to a serial run. Every current stage is pixel-local.
+    ///
+    /// The match is deliberately **exhaustive with no wildcard**: a future
+    /// `Stage` variant won't compile until its author classifies it here, and a
+    /// non-local stage makes `process` fall back to a correct serial run rather
+    /// than silently producing seams at band boundaries.
+    fn is_pixel_local(&self) -> bool {
+        match self {
+            Stage::Exposure { .. }
+            | Stage::Velvia { .. }
+            | Stage::Splittoning { .. }
+            | Stage::Monochrome { .. }
+            | Stage::Sigmoid { .. } => true,
+        }
+    }
+
     /// Process a packed RGBA `f32` buffer (`input`) into `output` (same length,
     /// a multiple of 4). Dispatches to the migrated IOP core loop.
     ///
@@ -148,9 +166,16 @@ impl Pipeline {
         self.stages.push(stage);
     }
 
-    /// Run all stages in order over a copy of `input` (packed RGBA `f32`,
-    /// length a multiple of 4) and return the result. An empty pipeline returns
-    /// the input unchanged. Uses two buffers ping-ponged across stages.
+    /// Run all stages in order over `input` (packed RGBA `f32`, length a multiple
+    /// of 4) and return the result. An empty pipeline returns the input unchanged.
+    ///
+    /// Every [`Stage`] is a position-independent per-pixel map (no stage reads a
+    /// neighbouring pixel — the same property that lets geometry commute with the
+    /// pipeline), so the buffer is split into pixel-aligned bands processed in
+    /// parallel; each band runs the full stage sequence through its own ping-pong
+    /// scratch. The result is **bit-identical** to a whole-buffer serial run
+    /// (bands never interact) — pinned by `parallel_result_is_split_invariant`.
+    /// Small buffers stay serial to avoid rayon overhead.
     pub fn process(&self, input: &[f32]) -> Vec<f32> {
         // Hard guard at the trust boundary (fires in release too): the
         // `chunks_exact(4)` stages would otherwise silently leave a stale tail.
@@ -162,13 +187,60 @@ impl Pipeline {
         if self.stages.is_empty() {
             return input.to_vec();
         }
-        let mut front = input.to_vec();
-        let mut back = vec![0.0f32; input.len()];
-        for stage in &self.stages {
-            stage.apply(&front, &mut back);
-            std::mem::swap(&mut front, &mut back);
+
+        let mut output = vec![0.0f32; input.len()];
+        // Band size in f32s (pixel-aligned: PIXELS_PER_BAND * 4 channels). 64k px
+        // ≈ a 1 MB band — cache-friendly and large enough to amortise rayon's
+        // per-task overhead. Total len is a multiple of 4 and BAND is a multiple
+        // of 4, so every chunk — including the shorter final one (len % BAND) —
+        // is pixel-aligned.
+        const PIXELS_PER_BAND: usize = 64 * 1024;
+        const BAND: usize = PIXELS_PER_BAND * 4;
+
+        // Band-parallelism is only valid if every stage is pixel-local; otherwise
+        // fall back to a single serial band (correct, just not parallel).
+        let pixel_local = self.stages.iter().all(Stage::is_pixel_local);
+        if input.len() <= BAND || !pixel_local {
+            // One band: no rayon overhead.
+            let mut scratch = vec![0.0f32; input.len()];
+            self.process_band(input, &mut output, &mut scratch);
+        } else {
+            use rayon::prelude::*;
+            // for_each_init reuses one scratch buffer per worker thread (sized to
+            // a full band, sliced to the current chunk length) — no per-band alloc.
+            input
+                .par_chunks(BAND)
+                .zip(output.par_chunks_mut(BAND))
+                .for_each_init(
+                    || vec![0.0f32; BAND],
+                    |scratch, (in_band, out_band)| {
+                        self.process_band(in_band, out_band, &mut scratch[..in_band.len()]);
+                    },
+                );
         }
-        front
+        output
+    }
+
+    /// Run every stage over one band `input` into `output` (equal lengths, both a
+    /// multiple of 4), ping-ponging between `output` and the caller-provided
+    /// `scratch` (also equal length) so no per-band allocation happens on the hot
+    /// path. Caller guarantees `self.stages` is non-empty.
+    fn process_band(&self, input: &[f32], output: &mut [f32], scratch: &mut [f32]) {
+        // First stage reads `input`; every later stage ping-pongs output<->scratch.
+        self.stages[0].apply(input, output);
+        let mut result_in_output = true;
+        for stage in &self.stages[1..] {
+            if result_in_output {
+                stage.apply(output, scratch);
+            } else {
+                stage.apply(scratch, output);
+            }
+            result_in_output = !result_in_output;
+        }
+        // If the last write landed in scratch, move it into output.
+        if !result_in_output {
+            output.copy_from_slice(scratch);
+        }
     }
 }
 
@@ -321,5 +393,67 @@ mod tests {
         // 6 elements is not a whole number of RGBA pixels.
         let bad = vec![0.0f32; 6];
         Pipeline::with_stages(vec![Stage::Velvia { strength: 1.0, bias: 1.0 }]).process(&bad);
+    }
+
+    /// A deterministic RGBA ramp of `pixels` pixels (values in [0,1)).
+    fn ramp(pixels: usize) -> Vec<f32> {
+        (0..pixels * 4).map(|i| (i % 97) as f32 / 97.0).collect()
+    }
+
+    #[test]
+    fn large_buffer_exercises_parallel_path() {
+        // > PIXELS_PER_BAND (64k) so process() takes the rayon branch. Exposure
+        // ×2 is a pure per-channel scale, so every element must be exactly *2 —
+        // proves the parallel path is correct end to end (incl. the final band).
+        let px = ramp(100_000);
+        let p = Pipeline::with_stages(vec![Stage::Exposure { black: 0.0, scale: 2.0 }]);
+        let out = p.process(&px);
+        assert_eq!(out.len(), px.len());
+        for (o, i) in out.iter().zip(px.iter()) {
+            assert!((o - i * 2.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn parallel_result_is_split_invariant() {
+        // The core correctness claim: bands never interact, so processing the
+        // whole buffer equals concatenating the results of processing each
+        // pixel-aligned half. A multi-stage pipeline exercises the ping-pong.
+        let px = ramp(100_000); // > one band → parallel
+        let p = Pipeline::with_stages(vec![
+            Stage::Exposure { black: 0.02, scale: 1.7 },
+            Stage::Velvia { strength: 0.5, bias: 1.0 },
+            Stage::Monochrome { r: 0.2, g: 0.7, b: 0.1 },
+        ]);
+
+        let full = p.process(&px);
+        let half = (px.len() / 2) & !3; // pixel-aligned split point
+        let mut split = p.process(&px[..half]);
+        split.extend_from_slice(&p.process(&px[half..]));
+
+        assert_eq!(full, split);
+    }
+
+    #[test]
+    fn all_current_stages_are_pixel_local() {
+        // The band-parallel path is only bit-identical to serial while every
+        // stage is pixel-local; pin that all shipping stages qualify so the
+        // parallel branch actually engages (and flag any future regression).
+        for s in [
+            Stage::Exposure { black: 0.0, scale: 1.0 },
+            Stage::Velvia { strength: 0.0, bias: 1.0 },
+            Stage::Splittoning {
+                shadow_hue: 0.0, shadow_sat: 0.0,
+                highlight_hue: 0.0, highlight_sat: 0.0,
+                balance: 0.5, compress: 0.0,
+            },
+            Stage::Monochrome { r: 0.3, g: 0.4, b: 0.3 },
+            Stage::Sigmoid {
+                white_target: 1.0, black_target: 0.0, paper_exp: 0.3,
+                film_fog: 0.0, film_power: 1.0, paper_power: 1.0,
+            },
+        ] {
+            assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
+        }
     }
 }
