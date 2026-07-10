@@ -80,12 +80,15 @@ pub fn tag_new(conn: &Connection, name: &str) -> rusqlite::Result<Option<TagId>>
         return Ok(Some(id));
     }
 
-    // Insert new
-    conn.execute(
+    // Insert new. The data.tags insert and the memory.darktable_tags marker span
+    // two schemas, so commit them atomically — a crash between them would leave
+    // an internal tag unmarked. unchecked_transaction because callers hold &Connection.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO data.tags (id, name) VALUES (NULL, ?1)",
         params![name],
     )?;
-    let id: TagId = conn
+    let id: TagId = tx
         .query_row(
             "SELECT id FROM data.tags WHERE name = ?1",
             params![name],
@@ -94,12 +97,13 @@ pub fn tag_new(conn: &Connection, name: &str) -> rusqlite::Result<Option<TagId>>
 
     // If it's an internal darktable tag, record it in the in-memory table
     if name.starts_with("darktable|") {
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO memory.darktable_tags (tagid) VALUES (?1)",
             params![id],
         )?;
     }
 
+    tx.commit()?;
     Ok(Some(id))
 }
 
@@ -249,17 +253,23 @@ pub fn tag_list_with_counts(conn: &Connection) -> rusqlite::Result<Vec<(TagId, S
 }
 
 /// Delete a tag and all its image associations.
+///
+/// The three deletes span the `main`, `memory`, and `data` schemas; wrap them in
+/// a single transaction so a crash mid-delete can't orphan `tagged_images` rows
+/// pointing at a now-gone tag (atomic across attached DBs in the default
+/// rollback-journal mode). `unchecked_transaction` because callers hold `&Connection`.
 pub fn tag_delete(conn: &Connection, tagid: TagId) -> rusqlite::Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM main.tagged_images WHERE tagid = ?1",
         params![tagid],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM memory.darktable_tags WHERE tagid = ?1",
         params![tagid],
     )?;
-    conn.execute("DELETE FROM data.tags WHERE id = ?1", params![tagid])?;
-    Ok(())
+    tx.execute("DELETE FROM data.tags WHERE id = ?1", params![tagid])?;
+    tx.commit()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -521,5 +531,51 @@ mod tests {
         tag_delete(&db, id).unwrap();
         assert_eq!(tag_exists(&db, "temp").unwrap(), None);
         assert_eq!(tag_count_attached(&db, 5, true).unwrap(), 0);
+    }
+
+    #[test]
+    fn internal_tag_marked_in_memory_and_cleared_on_delete() {
+        // Exercises the transactional data.tags + memory.darktable_tags writes in
+        // tag_new / tag_delete: an internal (`darktable|…`) tag is recorded in the
+        // memory table on create and removed on delete.
+        let db = open_test_db();
+        let id = tag_new(&db, "darktable|color|red").unwrap().unwrap();
+        let marked: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM memory.darktable_tags WHERE tagid = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, 1);
+
+        tag_delete(&db, id).unwrap();
+        let after: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM memory.darktable_tags WHERE tagid = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0);
+        assert_eq!(tag_exists(&db, "darktable|color|red").unwrap(), None);
+    }
+
+    #[test]
+    fn tag_delete_errors_inside_outer_transaction_without_mutating() {
+        // unchecked_transaction issues a nested BEGIN, which SQLite rejects
+        // BEFORE any statement runs — so a mis-integration under an outer
+        // transaction fails safe (clean Err, no partial write) rather than
+        // corrupting. Pin that fail-safe behaviour.
+        let db = open_test_db();
+        let id = tag_new(&db, "temp").unwrap().unwrap();
+        tag_attach(&db, id, 5).unwrap();
+
+        db.execute_batch("BEGIN").unwrap(); // caller already in a transaction
+        assert!(tag_delete(&db, id).is_err()); // nested BEGIN rejected
+        db.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(tag_exists(&db, "temp").unwrap(), Some(id)); // untouched
+        assert_eq!(tag_count_attached(&db, 5, true).unwrap(), 1);
     }
 }
