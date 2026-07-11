@@ -997,13 +997,28 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      classified, and non-local falls back to correct serial. Opus: SHIP, no
      blockers. darkroom-core 549→552 tests.
 
-   **Candidate next increments after m4-59** (recorded so they survive a context
+   **m4-60** (`1a82daaaab`) — lighttable batch export honours per-image edits.
+   Previously only the single-image darkroom export rendered through our pipeline;
+   lighttable multi-export always used `darktable-cli`, ignoring edits. New
+   `dialogs::load_export_edit(db, path)` returns `Some(ExportEdit)` only for a raw
+   the user actually edited (persisted params / non-identity crop-straighten /
+   non-default demosaic method); unedited raws + non-raws stay on `darktable-cli`
+   (fuller default stack until our subset pipeline reaches parity). Seeding matches
+   the preview via the now-`pub(crate)` `darkroom::initial_params`. `export_images_
+   async`/`show_export_dialog` gained a `db_path` param; the loop does
+   `edit.or_else(|| load_export_edit(...))`. `persist::load_edit_state` loads all
+   three pieces over ONE connection + ONE imgid resolution (architect S1). A
+   Rust-render failure is counted+logged, NOT silently fallen back to cli. Opus:
+   SHIP, no blockers. **Known (expected, not a bug):** single-image darkroom
+   export bakes LIVE (incl. unsaved) edits; lighttable export reads PERSISTED state
+   only — so the same raw can export differently from the two entry points.
+   darkroom-ui 135→136 tests.
+
+   **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
-   rename/delete popover is leak-free + a11y-complete; the Rust UI now runs in the
-   container with working tags + a parallelised pipeline):
-   - **Export:** let the lighttable multi-export also render per-image edits via
-     Rust (currently only the single-image darkroom export does; lighttable stays
-     on darktable-cli — would need loading each image's params/geometry/method).
+   rename/delete popover is leak-free + a11y-complete; the Rust UI runs in the
+   container with working tags, a parallelised pipeline, and edit-honouring batch
+   export):
    - **Perf:** parallelise `demosaic_vng` (needs a per-row-independent restructure
      of its serial ring-buffer write-back). `pipeline::process` is now parallel
      (m4-59); RCD already is (m4-54).
