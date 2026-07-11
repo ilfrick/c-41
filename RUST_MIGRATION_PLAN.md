@@ -1063,9 +1063,25 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `session_open_reads_durable_tags_without_re_ensuring`). Architect's forward
    note: if a third read path or a non-`build_main_window` entry point appears,
    migrate to a one-opener + process-global per-path "already-ensured" guard
-   (preserves read self-heal, drops the ordering coupling). Residual: the lone
-   bare `Connection::open` + `ensure_base_schema` in `dialogs/mod.rs:280` (import
-   path) could later fold into `open_catalog`.
+   (preserves read self-heal, drops the ordering coupling). (Residual bare
+   `Connection::open` + `ensure_base_schema` in the import path folded into
+   `open_catalog` in m4-64.)
+
+   **m4-64** (`4eebc4ab01`) — route folder import through `open_catalog` + stop
+   dropping insert errors (the residual bare-open from m4-63). `import_folder_
+   sync` (off-thread) used a bare `Connection::open` + `ensure_base_schema`;
+   switching to `open_catalog` consolidates on one opener AND gives it a 3s
+   `busy_timeout` so its writes wait out the rating/colour-label writers' brief
+   library.db lock instead of an immediate `SQLITE_BUSY`. The real fix (architect
+   M1): `image_insert`'s `Result` was ignored while `count` incremented
+   unconditionally — silently dropping failed rows and over-reporting the
+   "imported N" toast. Now count reflects only rows that landed; failures are
+   logged. New test seeds a fresh config (no library.db/data.db) with mixed
+   raw/non-raw files → asserts count == raw files, data.db materialised, empty
+   path is a no-op. Opus architect: APPROVE (Option C). darkroom-ui 136→137
+   tests. Follow-up left open by the architect (out of scope): wrap the import
+   loop in one transaction (N→1 lock acquisitions, faster) — but that trades
+   away today's best-effort per-image semantics for all-or-nothing.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
