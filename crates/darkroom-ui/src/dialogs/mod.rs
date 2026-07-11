@@ -267,17 +267,17 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
     use darkroom_db::film;
     use darkroom_db::image;
 
-    let conn = if db_path.is_empty() {
+    if db_path.is_empty() {
         return None; // can't import into in-memory demo
-    } else {
-        rusqlite::Connection::open(db_path).ok()?
-    };
-
-    // A fresh library.db (e.g. a brand-new container /config) has no catalog
-    // tables — the C app used to create them on first launch. Bootstrap them
-    // here so the insert below lands in a real table instead of silently
-    // registering zero images.
-    darkroom_db::schema::ensure_base_schema(&conn).ok()?;
+    }
+    // Route through open_catalog rather than a bare Connection::open: it
+    // bootstraps the catalog schema on a fresh /config (a brand-new container
+    // library.db has no tables — the C app used to create them on first launch)
+    // AND sets a 3s busy_timeout, so the writes below wait out the metadata
+    // writers' brief off-thread library.db write lock instead of taking an
+    // immediate SQLITE_BUSY. That matters here because image_insert's error is
+    // ignored (best-effort), so an un-waited lock would silently drop images.
+    let conn = darkroom_db::schema::open_catalog(db_path).ok()?;
 
     let film_id = film::film_new(&conn, folder).ok()??;
     let mut count = 0usize;
@@ -303,8 +303,14 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
             // Probe image dimensions (fall back to 0×0 if unreadable)
             let (w, h) = probe_dims(path).unwrap_or((0, 0));
 
-            let _ = image::image_insert(&conn, film_id, filename, w, h);
-            count += 1;
+            // Count only rows that actually landed, and log the rest — a
+            // swallowed insert error (not the lock wait) is what would otherwise
+            // let images silently vanish AND make the "imported N" toast over-
+            // report files that were walked but never written.
+            match image::image_insert(&conn, film_id, filename, w, h) {
+                Ok(_) => count += 1,
+                Err(e) => eprintln!("darkroom import: image_insert failed for {filename:?}: {e}"),
+            }
         }
     }
     Some(count)
@@ -381,5 +387,40 @@ mod tests {
         assert!(load_export_edit(&db, "/p/b.jpg").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_folder_bootstraps_fresh_config_and_counts_only_raws() {
+        // The container first-run case: a config dir with no library.db / data.db
+        // yet. import_folder_sync must bootstrap the catalog via open_catalog and
+        // register exactly the raw-extension files it walked (count reflects rows
+        // that landed, not files seen).
+        let base = std::env::temp_dir().join(format!(
+            "darkroom_import_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = base.join("config");
+        let photos = base.join("photos");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&photos).unwrap();
+        // Empty files: probe_dims fails gracefully → 0×0, the insert still lands.
+        for name in ["a.dng", "b.cr2", "c.NEF", "notes.txt"] {
+            std::fs::write(photos.join(name), b"").unwrap();
+        }
+        let db = cfg.join("library.db");
+        let dbs = db.to_str().unwrap();
+
+        // a.dng, b.cr2, c.NEF are raws (case-insensitive); notes.txt is not.
+        assert_eq!(import_folder_sync(photos.to_str().unwrap(), dbs), Some(3));
+        // open_catalog materialised the sibling data.db during the bootstrap.
+        assert!(cfg.join("data.db").exists(), "data.db not created by bootstrap");
+        // Empty db path stays a no-op (demo mode, no library).
+        assert_eq!(import_folder_sync(photos.to_str().unwrap(), ""), None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
