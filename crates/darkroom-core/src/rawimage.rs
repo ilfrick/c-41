@@ -999,49 +999,51 @@ pub fn demosaic_vng(mosaic: &[f32], width: usize, height: usize, cfa: [[usize; 2
         );
     }
 
-    // Gradient VNG: needs a 2-row interior and the ring buffer. The gradient
-    // kernel writes brow[2]; the copy of brow[0] into `out` is deferred by two
-    // rows so no gradient ever reads an already-refined row (C vng.c:199-213).
+    // Gradient VNG (C vng.c:199-213). The serial C keeps a 3-row ring buffer and
+    // defers each row's write-back by two rows so a gradient never reads an
+    // already-refined row: at the moment row R is computed, its ±2-row stencil
+    // (rows R-2..R+2) still holds the border+lookup `out`, since the deferred
+    // copy has only overwritten rows ≤ R-3. Freezing that border+lookup `out`
+    // into a read-only `src` therefore feeds every row the exact same inputs the
+    // serial sweep saw, making the per-row work embarrassingly parallel and
+    // bit-identical. The kernel reads `src` read-only and writes only the
+    // interior cols 2..width-2 of its own row, so the `par_chunks_mut` row
+    // slices are disjoint and the edge cols keep their border/lookup values —
+    // exactly the region the serial ring buffer left untouched (its copy started
+    // at float offset 8 = col 2).
     if width >= 6 && height >= 6 {
+        use rayon::prelude::*;
         let code = build_vng_code(prow, pcol, width, filters4);
         let row_len = width * 4;
-        let mut brow: [Vec<f32>; 3] =
-            [vec![0.0; row_len], vec![0.0; row_len], vec![0.0; row_len]];
-        let copy_len = (width - 4) * 4; // interior cols 2..width-2
-        // Ring-buffer rows are copied out from float offset 8 = col 2 (2 pixels
-        // × 4 channels), matching C's `(float *)(brow[.] + 2)`.
-        for row in 2..height - 2 {
-            let pr = (row % prow) * pcol;
-            // `code` is never mutated in this loop, so these raw pointers into
-            // its inner Vecs stay valid for the whole gradient call.
-            let cptrs: [*const i32; 2] = [code[pr].as_ptr(), code[pr + 1].as_ptr()];
-            // Safety: `out` is n*4 floats (read-only here), `brow[2]` is width*4,
-            // `xtb` 36 bytes, `cptrs` holds `pcol` valid INT_MAX-terminated
-            // streams; column reads are independent so serial == the C OMP sweep.
-            unsafe {
-                crate::iop::demosaic::darkroom_demosaic_vng_gradient_row(
-                    out.as_ptr(),
-                    brow[2].as_mut_ptr(),
-                    width,
-                    height,
-                    row as i32,
-                    filters4,
-                    xtb.as_ptr(),
-                    colors as i32,
-                    cptrs.as_ptr(),
-                    pcol as i32,
-                );
-            }
-            if row > 3 {
-                let dst = ((row - 2) * width + 2) * 4;
-                out[dst..dst + copy_len].copy_from_slice(&brow[0][8..8 + copy_len]);
-            }
-            brow.rotate_left(1);
-        }
-        let d0 = ((height - 4) * width + 2) * 4;
-        out[d0..d0 + copy_len].copy_from_slice(&brow[0][8..8 + copy_len]);
-        let d1 = ((height - 3) * width + 2) * 4;
-        out[d1..d1 + copy_len].copy_from_slice(&brow[1][8..8 + copy_len]);
+        let src = out.clone(); // border+lookup values, frozen for every row
+        out.par_chunks_mut(row_len)
+            .enumerate()
+            .filter(|&(row, _)| (2..height - 2).contains(&row))
+            .for_each(|(row, out_row)| {
+                let pr = (row % prow) * pcol;
+                // `code`/`src` are read-only for the whole sweep, so the raw
+                // pointers into their inner storage stay valid across threads.
+                let cptrs: [*const i32; 2] = [code[pr].as_ptr(), code[pr + 1].as_ptr()];
+                // Safety: `src` is n*4 floats (read-only), `out_row` is exactly
+                // width*4 (the kernel writes only interior cols 2..width-2, so
+                // the edge cols keep their border/lookup values), `xtb` 36 bytes,
+                // `cptrs` holds `pcol` valid INT_MAX-terminated streams; column
+                // reads are independent so this equals the C OMP sweep.
+                unsafe {
+                    crate::iop::demosaic::darkroom_demosaic_vng_gradient_row(
+                        src.as_ptr(),
+                        out_row.as_mut_ptr(),
+                        width,
+                        height,
+                        row as i32,
+                        filters4,
+                        xtb.as_ptr(),
+                        colors as i32,
+                        cptrs.as_ptr(),
+                        pcol as i32,
+                    );
+                }
+            });
     }
 
     // Finish: average G1/G2 back into the green channel + clip negatives.
