@@ -43,35 +43,54 @@ pub fn ensure_base_schema(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Ensure the full schema across `main` and the attached `data`/`memory`
-/// schemas — the base tables plus the tag catalog (`data.tags`,
-/// `memory.darktable_tags`; `main.tagged_images` comes from the base). The
-/// `data` and `memory` schemas MUST already be attached (see [`open_catalog`]),
-/// or the `data.tags` create errors with "unknown database data".
-pub fn ensure_full_schema(conn: &Connection) -> rusqlite::Result<()> {
-    ensure_base_schema(conn)?;
+/// Create the **durable** tag catalog in the on-disk `data` schema
+/// (`data.tags` + its unique-name index). `data` MUST be attached. This lives on
+/// disk, so it only needs creating ONCE per catalog, not per connection — see
+/// the [`open_catalog`] (full) vs [`open_catalog_session`] (session-only) split.
+fn ensure_data_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS data.tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name VARCHAR, synonyms VARCHAR, flags INTEGER
          );
-         CREATE UNIQUE INDEX IF NOT EXISTS data.tags_name_idx ON tags (name);
-         CREATE TABLE IF NOT EXISTS memory.darktable_tags (tagid INTEGER PRIMARY KEY);",
+         CREATE UNIQUE INDEX IF NOT EXISTS data.tags_name_idx ON tags (name);",
     )
 }
 
-/// Open a full catalog connection mirroring darktable's three-schema layout:
-/// the main `library.db` at `db_path`, its sibling `data.db` (same configdir)
-/// attached as `data`, and a fresh per-connection in-memory database attached as
-/// `memory`. All schemas the standalone UI touches are ensured via
-/// [`ensure_full_schema`], so tags work on a fresh `/config` where no C app ever
-/// created `data.db`.
-///
-/// `memory` is intentionally per-connection and empty on open: it holds
-/// darktable's ephemeral session scratch (e.g. `memory.darktable_tags` marks
-/// which tags are internal), which is rebuilt each session, so a fresh empty one
-/// per connection is correct — every tag then reads as a user tag.
-pub fn open_catalog(db_path: &str) -> rusqlite::Result<Connection> {
+/// Ensure the **durable** (on-disk) schema: the `main` base tables plus the
+/// `data.tags` catalog. Persists across connections, so a single bootstrap per
+/// catalog suffices (the per-connection `memory` scratch is separate — see
+/// [`ensure_session_schema`]). `data` MUST already be attached, or the
+/// `data.tags` create errors with "unknown database data".
+pub fn ensure_persistent_schema(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_base_schema(conn)?;
+    ensure_data_schema(conn)
+}
+
+/// Ensure the **ephemeral, per-connection** `memory.darktable_tags` scratch
+/// table. `memory` is a fresh in-memory database on every catalog open, so
+/// unlike the durable schema this MUST run on each connection. `memory` MUST be
+/// attached.
+pub fn ensure_session_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory.darktable_tags (tagid INTEGER PRIMARY KEY);",
+    )
+}
+
+/// Ensure the full schema across `main` and the attached `data`/`memory`
+/// schemas — the durable [`ensure_persistent_schema`] plus the per-connection
+/// [`ensure_session_schema`]. The `data` and `memory` schemas MUST already be
+/// attached (see [`open_catalog`]).
+pub fn ensure_full_schema(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_persistent_schema(conn)?;
+    ensure_session_schema(conn)
+}
+
+/// Open `library.db`, attach its sibling `data.db` (same configdir) as `data`
+/// and a fresh per-connection in-memory database as `memory`, and set the busy
+/// timeout — the shared connection setup behind [`open_catalog`] and
+/// [`open_catalog_session`]. No schema is ensured here; the callers layer that.
+fn attach_catalog(db_path: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     // Parity with the UI's open_rating_conn/open_colorlabels_conn: the metadata
     // writers (rating / colour labels) briefly hold library.db's write lock from
@@ -87,7 +106,38 @@ pub fn open_catalog(db_path: &str) -> rusqlite::Result<Connection> {
     // Bind the paths as parameters so a path with a quote can't break the SQL.
     conn.execute("ATTACH DATABASE ?1 AS data", [&*data_path.to_string_lossy()])?;
     conn.execute("ATTACH DATABASE ?1 AS memory", [":memory:"])?;
+    Ok(conn)
+}
+
+/// Open a full catalog connection mirroring darktable's three-schema layout:
+/// the main `library.db` at `db_path`, its sibling `data.db` (same configdir)
+/// attached as `data`, and a fresh per-connection in-memory database attached as
+/// `memory`. Ensures the FULL schema via [`ensure_full_schema`], so tags work on
+/// a fresh `/config` where no C app ever created `data.db`. Use this for writes
+/// and for the once-per-launch bootstrap; the read-hot path has the leaner
+/// [`open_catalog_session`].
+///
+/// `memory` is intentionally per-connection and empty on open: it holds
+/// darktable's ephemeral session scratch (e.g. `memory.darktable_tags` marks
+/// which tags are internal), which is rebuilt each session, so a fresh empty one
+/// per connection is correct — every tag then reads as a user tag.
+pub fn open_catalog(db_path: &str) -> rusqlite::Result<Connection> {
+    let conn = attach_catalog(db_path)?;
     ensure_full_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Like [`open_catalog`], but ensures ONLY the per-connection `memory` scratch
+/// ([`ensure_session_schema`]) — it skips the durable `main`/`data` DDL probes,
+/// which are assumed already bootstrapped by a prior [`open_catalog`] (the app
+/// does this once at startup). Use this for read-hot paths — e.g. reloading an
+/// image's tags on every lighttable selection — where re-probing the durable
+/// schema on every open is wasted work. A caller that could run before any
+/// [`open_catalog`] bootstrap must use the full [`open_catalog`] instead; a
+/// missing durable table here would surface as an empty read, not a repair.
+pub fn open_catalog_session(db_path: &str) -> rusqlite::Result<Connection> {
+    let conn = attach_catalog(db_path)?;
+    ensure_session_schema(&conn)?;
     Ok(conn)
 }
 
@@ -182,6 +232,48 @@ mod tests {
         assert!(dir.join("data.db").exists());
 
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_open_reads_durable_tags_without_re_ensuring() {
+        // The read-hot path (open_catalog_session) must skip the durable DDL yet
+        // still see tags a prior full open_catalog persisted to data.db.
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_schema_session_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("library.db");
+        let db = db_path.to_str().unwrap();
+
+        // Bootstrap once (full) and persist a tag to the on-disk data.tags.
+        let tid = {
+            let boot = open_catalog(db).unwrap();
+            let tid = tags::tag_new(&boot, "beach").unwrap().unwrap();
+            assert!(tags::tag_attach(&boot, tid, 7).unwrap());
+            tid
+        };
+
+        // A session open — which only ensures the memory scratch — still reads
+        // the durable tag back (proves the durable schema is not re-created and
+        // is correctly reused across connections).
+        let sess = open_catalog_session(db).unwrap();
+        assert_eq!(
+            tags::tag_list_with_counts(&sess).unwrap(),
+            vec![(tid, "beach".to_string(), 1)]
+        );
+        // The per-connection memory scratch exists on the session connection.
+        let n: i64 = sess
+            .query_row("SELECT count(*) FROM memory.darktable_tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+
+        drop(sess);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

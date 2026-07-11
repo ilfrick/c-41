@@ -619,6 +619,8 @@ impl TagPanel {
     /// (m4-32). An empty `db_path` (demo mode, no library) is a no-op `Ok`.
     fn write_tag_rename(&self, old_full: &str, new_full: &str) -> rusqlite::Result<()> {
         if self.db_path.is_empty() { return Ok(()); }
+        // Full open_catalog (not the session opener): a rare user-initiated write
+        // self-heals the durable schema if the startup bootstrap warned-and-continued.
         let conn = darkroom_db::schema::open_catalog(&self.db_path)?;
         darkroom_db::tags::tag_rename_subtree(&conn, old_full, new_full)?;
         Ok(())
@@ -658,6 +660,8 @@ impl TagPanel {
     /// leave it).
     fn delete_tag(&self, id: u32) {
         if self.db_path.is_empty() { return; }
+        // Full open_catalog: a rare write self-heals the durable schema (vs the
+        // session opener the read-hot paths use); see write_tag_rename.
         match darkroom_db::schema::open_catalog(&self.db_path) {
             Ok(conn) => {
                 if let Err(e) = darkroom_db::tags::tag_delete(&conn, id) {
@@ -815,8 +819,9 @@ fn load_tags_with_counts(db_path: &str) -> Vec<(u32, String, i64)> {
     }
     // Log faults so a corrupt/locked catalog reads differently from "no tags"
     // (the Tags section is simply hidden either way, but the cause is recoverable
-    // from the logs — the established read-path discipline).
-    match darkroom_db::schema::open_catalog(db_path) {
+    // from the logs — the established read-path discipline). Session-only open:
+    // this read-hot path skips the durable-schema DDL, bootstrapped at startup.
+    match darkroom_db::schema::open_catalog_session(db_path) {
         Ok(conn) => match darkroom_db::tags::tag_list_with_counts(&conn) {
             Ok(tags) => tags,
             Err(e) => {
@@ -1251,7 +1256,9 @@ fn rebuild_tags_flow(
 /// once per session rather than making this log quieter.
 fn load_tags(full_path: &str, db_path: &str) -> Vec<(u32, String)> {
     if db_path.is_empty() { return Vec::new(); }
-    let conn = match darkroom_db::schema::open_catalog(db_path) {
+    // Session-only open: reloading an image's tags fires on every lighttable
+    // selection, so skip the durable-schema DDL (bootstrapped once at startup).
+    let conn = match darkroom_db::schema::open_catalog_session(db_path) {
         Ok(c) => c,
         Err(e) => { eprintln!("darkroom: cannot open library db to load tags: {e}"); return Vec::new(); }
     };
@@ -1274,6 +1281,8 @@ fn load_tags(full_path: &str, db_path: &str) -> Vec<(u32, String)> {
 
 /// Detach a tag from the image at `full_path` (best-effort; logs faults).
 fn detach_tag_from_image(full_path: &str, db_path: &str, tag_id: u32) {
+    // Full open_catalog: a rare write self-heals the durable schema (vs the
+    // session opener the read-hot paths use); see write_tag_rename.
     let conn = match darkroom_db::schema::open_catalog(db_path) {
         Ok(c) => c,
         Err(e) => { eprintln!("darkroom: cannot open library db to detach tag: {e}"); return; }
@@ -1292,6 +1301,8 @@ fn detach_tag_from_image(full_path: &str, db_path: &str, tag_id: u32) {
 /// (best-effort; logs faults — parity with `detach_tag_from_image`). An
 /// uncatalogued image is a silent no-op (nothing to attach to).
 fn add_tag_to_image(full_path: &str, db_path: &str, tag_name: &str) {
+    // Full open_catalog: a rare write self-heals the durable schema (vs the
+    // session opener the read-hot paths use); see write_tag_rename.
     let conn = match darkroom_db::schema::open_catalog(db_path) {
         Ok(c) => c,
         Err(e) => { eprintln!("darkroom: cannot open library db to add tag: {e}"); return; }

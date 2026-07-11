@@ -64,17 +64,16 @@ fn build_main_window(app: &Application) {
 
     let db_path = std::env::var("DARKROOM_LIBRARY_DB").unwrap_or_default();
 
-    // Bootstrap the base catalog schema on a real (non-demo) library.db so a
-    // fresh /config — where no C app ever ran to create the tables — has a
-    // working catalog before the lighttable query or an import touches it.
+    // Bootstrap the DURABLE catalog schema once on a real (non-demo) library.db
+    // so a fresh /config — where no C app ever ran to create the tables — has a
+    // working catalog before the lighttable query, an import, or a session-only
+    // tag read (open_catalog_session) touches it. open_catalog attaches data.db +
+    // a throwaway in-memory `memory` db and ensures main.* + data.tags; only the
+    // durable part needs to persist, so the connection is immediately dropped.
     if !db_path.is_empty() {
-        match rusqlite::Connection::open(&db_path) {
-            Ok(conn) => {
-                if let Err(e) = darkroom_db::schema::ensure_base_schema(&conn) {
-                    tracing::warn!("failed to bootstrap catalog schema: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("failed to open library db {db_path:?}: {e}"),
+        match darkroom_db::schema::open_catalog(&db_path) {
+            Ok(_) => {}
+            Err(e) => tracing::warn!("failed to bootstrap catalog schema: {e}"),
         }
     }
 
