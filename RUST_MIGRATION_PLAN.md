@@ -1044,6 +1044,29 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    candidate below; `pipeline::process` (m4-59) and RCD (m4-54) were already
    parallel, so the per-pixel demosaic/pipeline path is now fully multi-threaded.
 
+   **m4-63** (`3b1268978e`) — split the catalog schema bootstrap from the
+   read-hot tag opener (the deferred "S2" item). `open_catalog` ran the full
+   CREATE-IF-NOT-EXISTS DDL on every open, incl. `load_tags` (fires on every
+   lighttable selection). Durable tables (`main.*`, `data.tags`) persist on disk
+   and need creating once per catalog; only `memory.darktable_tags` is
+   per-connection. Extracted `attach_catalog` (open + busy_timeout + ATTACH, no
+   DDL); split `ensure_full_schema` into `ensure_persistent_schema` +
+   `ensure_session_schema` (identical statements, same order); added
+   `open_catalog_session` (session scratch only). Startup bootstraps the durable
+   schema once via `open_catalog` (was a bare `ensure_base_schema` that never
+   made `data.tags`), synchronously before any panel/read. The two read-hot
+   paths use the session opener; the four rare writes stay full (self-heal the
+   durable schema if the bootstrap warned) — commented as intentional. Marginal
+   by design (the two ATTACHes dominate the probes); the value is the correct
+   once-vs-per-open split. Opus architect: SHIP, composition provably identical,
+   ordering holds on every current path. darkroom-db 92 tests pass (new
+   `session_open_reads_durable_tags_without_re_ensuring`). Architect's forward
+   note: if a third read path or a non-`build_main_window` entry point appears,
+   migrate to a one-opener + process-global per-path "already-ensured" guard
+   (preserves read self-heal, drops the ordering coupling). Residual: the lone
+   bare `Connection::open` + `ensure_base_schema` in `dialogs/mod.rs:280` (import
+   path) could later fold into `open_catalog`.
+
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
    rename/delete popover is leak-free + a11y-complete; the Rust UI runs in the
@@ -1054,12 +1077,11 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      `pipeline::process` (m4-59) and RCD (m4-54) were already parallel.
    - ~~**Selector polish (deferred from m4-43 N3):** hide the demosaic DropDown
      for X-Trans files.~~ **DONE — m4-61.**
-   - **Container follow-ups (deferred, reviewed non-blocking):** S2 — `open_catalog`
-     runs `ensure_full_schema` on every open incl. the `load_tags` per-selection
-     hot path (correct split is persistent-once-at-startup + per-open memory-table
-     only; marginal — the ATTACH file-open dominates, not the DDL probes). Also a
-     live end-to-end KasmVNC session check of `darkroom-rs` (validated at build +
-     unit level so far, not a live GUI run).
+   - **Container follow-ups (deferred, reviewed non-blocking):** ~~S2 —
+     `open_catalog` runs `ensure_full_schema` on every open.~~ **DONE — m4-63**
+     (persistent-once-at-startup + session opener for the read-hot paths). Still
+     open: a live end-to-end KasmVNC session check of `darkroom-rs` (validated at
+     build + unit level so far, not a live GUI run — needs a display).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
