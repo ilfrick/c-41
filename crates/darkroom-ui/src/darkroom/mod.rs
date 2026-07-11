@@ -125,6 +125,10 @@ struct PreviewCtx {
     history: Rc<RefCell<HistoryStack>>,
     /// Debounced recorder that snapshots a settled edit into `history`.
     history_rec: Rc<HistoryRecorder>,
+    /// The Bayer demosaic-method selector section (header + dropdown), hidden
+    /// once a decode reveals the sensor is X-Trans (where the method is a no-op).
+    /// Empty until the raw-only selector is built below.
+    demosaic_row: glib::WeakRef<gtk4::Box>,
 }
 
 /// Debounced recorder that appends one [`HistoryStack`] entry per *settled* edit
@@ -791,7 +795,7 @@ fn spawn_decode(ctx: &PreviewCtx, path: String, method: DemosaicMethod) {
                     crate::raw_preview::PREVIEW_MAX_DIM,
                     method,
                 )
-                .map(|rp| (rp.width, rp.height, rp.pixels))
+                .map(|rp| (rp.width, rp.height, rp.pixels, rp.is_xtrans))
             })
             .await
             .ok()
@@ -802,8 +806,15 @@ fn spawn_decode(ctx: &PreviewCtx, path: String, method: DemosaicMethod) {
                 return;
             }
             match decoded {
-                Some(pris) => {
-                    *ctx.pristine.borrow_mut() = Some(pris);
+                Some((w, h, px, is_xtrans)) => {
+                    // The Bayer demosaic selector is a no-op for X-Trans
+                    // (Markesteijn is fixed) — hide the section for those files.
+                    // Runs on every decode, including Bayer method-change
+                    // re-decodes; the redundant re-show there is intentional.
+                    if let Some(row) = ctx.demosaic_row.upgrade() {
+                        row.set_visible(!is_xtrans);
+                    }
+                    *ctx.pristine.borrow_mut() = Some((w, h, px));
                     apply_geometry_to_base(&ctx); // sets base + renders
                 }
                 // Don't make a failed decode an invisible blank — log it.
@@ -994,6 +1005,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         last_render: Rc::new(RefCell::new(None)),
         history,
         history_rec,
+        demosaic_row: glib::WeakRef::new(),
     };
     // Show the seed entry immediately.
     refresh_history_list(&history_list, &ctx.history.borrow());
@@ -1294,6 +1306,9 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // persists the choice per image. The DropDown's index is DemosaicMethod's
     // as_u8 code, so it round-trips through from_u8 with no extra mapping.
     if crate::raw_preview::is_raw_path(file_path) {
+        // Header + dropdown live in one box so the whole section can be hidden
+        // as a unit once a decode reveals an X-Trans sensor (Markesteijn-fixed).
+        let demosaic_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         let demosaic_header = gtk4::Label::builder()
             .label("Demosaic")
             .halign(gtk4::Align::Start)
@@ -1307,7 +1322,8 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         dropdown.set_margin_end(10);
         dropdown.set_margin_bottom(8);
         // The method only affects Bayer sensors; X-Trans (.raf) always uses
-        // Markesteijn, so switching it there re-decodes to identical pixels.
+        // Markesteijn, so the selector is hidden for X-Trans once decoded. The
+        // tooltip still notes the caveat for the pre-decode window.
         dropdown.set_tooltip_text(Some(
             "Bayer demosaic algorithm (X-Trans files always use Markesteijn)",
         ));
@@ -1323,9 +1339,12 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
             crate::persist::save_demosaic(&dd_db, &dd_path, method);
             spawn_decode(&dd_ctx, dd_path.clone(), method);
         });
-        right_box.append(&demosaic_header);
-        right_box.append(&dropdown);
-        right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        demosaic_box.append(&demosaic_header);
+        demosaic_box.append(&dropdown);
+        demosaic_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        // Let the first decode toggle visibility for X-Trans (see spawn_decode).
+        ctx.demosaic_row.set(Some(&demosaic_box));
+        right_box.append(&demosaic_box);
 
         // Straighten (rotate) — a per-image geometry edit re-applied to the
         // cached pristine buffer (not a re-decode). The heavy resample + DB write

@@ -34,6 +34,10 @@ pub struct RawPreview {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<f32>,
+    /// True if the source sensor is X-Trans (demosaiced with fixed Markesteijn).
+    /// The UI uses this to hide the Bayer demosaic-method selector, which is a
+    /// no-op for X-Trans files.
+    pub is_xtrans: bool,
 }
 
 /// File extensions we route through the raw decoder rather than gdk-pixbuf.
@@ -106,6 +110,7 @@ pub fn decode_raw_preview_with(
     method: darkroom_core::rawimage::DemosaicMethod,
 ) -> Option<RawPreview> {
     let img = darkroom_core::rawimage::load(path).ok()?;
+    let is_xtrans = img.xtrans.is_some();
     let (w, h, rgba) = img.to_linear_rgba_with(method);
     if w == 0 || h == 0 {
         return None;
@@ -117,6 +122,7 @@ pub fn decode_raw_preview_with(
         width: w2,
         height: h2,
         pixels: small,
+        is_xtrans,
     })
 }
 
