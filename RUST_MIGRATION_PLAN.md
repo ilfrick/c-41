@@ -1014,6 +1014,21 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    only — so the same raw can export differently from the two entry points.
    darkroom-ui 135→136 tests.
 
+   **m4-61** (`70d5013ae4`) — hide the demosaic-method selector for X-Trans.
+   The RCD/VNG/PPG dropdown only affects Bayer sensors; X-Trans (.raf) always
+   uses fixed Markesteijn, so the control was a no-op there (previously masked
+   by only a tooltip). `RawPreview` gains an `is_xtrans` flag (from
+   `img.xtrans.is_some()`); the darkroom page wraps header+dropdown+separator in
+   one `demosaic_box` held by a `glib::WeakRef` on `PreviewCtx`, and
+   `spawn_decode` hides the whole section once a decode reveals X-Trans. Hides
+   on first decode (flash stays on the rare X-Trans case, not common Bayer);
+   WeakRef empty for non-raw paths so the decode arm no-ops; visibility re-set
+   on every decode incl. Bayer method-change re-decodes is intentional. Placed
+   after the generation guard so a stale X-Trans decode can't hide the selector
+   under a newer Bayer one. Opus architect: SHIP, no blockers/majors. This
+   closes the "Selector polish (deferred from m4-43 N3)" candidate below.
+   darkroom-ui 136 tests pass.
+
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
    rename/delete popover is leak-free + a11y-complete; the Rust UI runs in the
@@ -1022,9 +1037,8 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    - **Perf:** parallelise `demosaic_vng` (needs a per-row-independent restructure
      of its serial ring-buffer write-back). `pipeline::process` is now parallel
      (m4-59); RCD already is (m4-54).
-   - **Selector polish (deferred from m4-43 N3):** hide the demosaic DropDown for
-     X-Trans files (needs the sensor kind surfaced from the decode up to the UI —
-     currently just a tooltip caveat since detection needs a decode).
+   - ~~**Selector polish (deferred from m4-43 N3):** hide the demosaic DropDown
+     for X-Trans files.~~ **DONE — m4-61.**
    - **Container follow-ups (deferred, reviewed non-blocking):** S2 — `open_catalog`
      runs `ensure_full_schema` on every open incl. the `load_tags` per-selection
      hot path (correct split is persistent-once-at-startup + per-open memory-table
