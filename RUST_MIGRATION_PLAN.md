@@ -1029,14 +1029,29 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    closes the "Selector polish (deferred from m4-43 N3)" candidate below.
    darkroom-ui 136 tests pass.
 
+   **m4-62** (`d6ac01b6ea`) — rayon-parallelise the VNG demosaic gradient phase,
+   the last serial hot loop in `demosaic_vng`. C's ring buffer defers each row's
+   write-back by two rows so a gradient never reads a refined row; freezing the
+   post-lookup `out` into a read-only `src = out.clone()` feeds every row the
+   same inputs the serial sweep saw, so `out.par_chunks_mut(row_len)` (disjoint
+   rows, kernel reads `src` / writes only interior cols) is bit-identical.
+   Written rows 2..=height-3 match the serial loop + its two tail copies exactly.
+   **Deliberate trade-off:** the snapshot reverses C's ring-buffer memory saving
+   — a transient n*4-float clone (~1 GB on a 60 MP frame) buys the parallelism;
+   the clone is load-bearing (a future memory-pressure tiling would need per-band
+   ring buffers to drop it). Opus architect: SHIP, bit-identical watertight.
+   darkroom-core 552 tests pass. This closes the "parallelise `demosaic_vng`"
+   candidate below; `pipeline::process` (m4-59) and RCD (m4-54) were already
+   parallel, so the per-pixel demosaic/pipeline path is now fully multi-threaded.
+
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
    rename/delete popover is leak-free + a11y-complete; the Rust UI runs in the
    container with working tags, a parallelised pipeline, and edit-honouring batch
    export):
-   - **Perf:** parallelise `demosaic_vng` (needs a per-row-independent restructure
-     of its serial ring-buffer write-back). `pipeline::process` is now parallel
-     (m4-59); RCD already is (m4-54).
+   - ~~**Perf:** parallelise `demosaic_vng`.~~ **DONE — m4-62** (frozen-snapshot
+     read of the border+lookup `out` makes the gradient rows independent).
+     `pipeline::process` (m4-59) and RCD (m4-54) were already parallel.
    - ~~**Selector polish (deferred from m4-43 N3):** hide the demosaic DropDown
      for X-Trans files.~~ **DONE — m4-61.**
    - **Container follow-ups (deferred, reviewed non-blocking):** S2 — `open_catalog`
