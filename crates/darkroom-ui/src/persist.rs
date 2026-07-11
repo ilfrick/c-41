@@ -255,6 +255,33 @@ pub fn load_geometry(db_path: &str, full_path: &str) -> Geometry {
     }
 }
 
+/// Load all persisted edit state for `full_path` over a **single** connection
+/// with a **single** imgid resolution — for batch export, where calling
+/// `load_saved` + `load_geometry` + `load_demosaic` separately would open three
+/// connections and resolve the path three times per image. Returns the raw
+/// pieces (saved colour params if any, geometry, demosaic method); the caller
+/// decides what counts as "edited". Falls back to defaults on any db/lookup miss.
+pub(crate) fn load_edit_state(
+    db_path: &str,
+    full_path: &str,
+) -> (Option<PreviewParams>, Geometry, DemosaicMethod) {
+    let fallback = || (None, Geometry::default(), DemosaicMethod::default());
+    if db_path.is_empty() {
+        return fallback();
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return fallback();
+    };
+    let Some(imgid) = imgid_for_path(&conn, full_path) else {
+        return fallback();
+    };
+    (
+        load_saved_conn(&conn, imgid),
+        load_geometry_conn(&conn, imgid).unwrap_or_default(),
+        load_demosaic_conn(&conn, imgid),
+    )
+}
+
 /// Persist the [`Geometry`] for the image at `full_path`. Best-effort: silently
 /// no-ops with no db or an uncatalogued image.
 pub fn save_geometry(db_path: &str, full_path: &str, geom: &Geometry) {

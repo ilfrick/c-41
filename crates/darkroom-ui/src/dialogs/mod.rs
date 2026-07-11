@@ -6,14 +6,51 @@
 use adw::prelude::*;
 use anyhow::Result;
 
+/// Build the per-image [`ExportEdit`] for a lighttable batch export by loading
+/// the image's persisted darkroom-ui state. Returns `Some` **only** for a raw
+/// the user has actually edited — persisted colour params, a non-identity
+/// crop/straighten, or a non-default demosaic method. An unedited raw (and every
+/// non-raw) returns `None` so it falls back to `darktable-cli`, whose full
+/// default module stack develops a better baseline than our subset pipeline.
+///
+/// The seeded params match the darkroom preview exactly (via
+/// [`crate::darkroom::initial_params`]): saved params if present, else the
+/// raw default (sigmoid on) — so exporting a raw the user only cropped still
+/// tone-maps the way the preview does.
+///
+/// Note the "export == preview" invariant holds only for **edited** raws: an
+/// unedited raw returns `None` and is developed by `darktable-cli`'s fuller
+/// default stack (highlight-recon, base curve, …) which our subset pipeline
+/// doesn't yet match — a better baseline than a WYSIWYG-but-weaker render, until
+/// the pipeline reaches parity.
+fn load_export_edit(db_path: &str, path: &str) -> Option<crate::export::ExportEdit> {
+    if db_path.is_empty() || !crate::raw_preview::is_raw_path(path) {
+        return None;
+    }
+    // One connection, one path→imgid resolution for all three pieces.
+    let (saved, geometry, method) = crate::persist::load_edit_state(db_path, path);
+
+    let edited = saved.is_some()
+        || !geometry.is_identity()
+        || method != darkroom_core::rawimage::DemosaicMethod::default();
+    if !edited {
+        return None;
+    }
+
+    let params = crate::darkroom::initial_params(saved, true);
+    Some(crate::export::ExportEdit { method, geometry, params })
+}
+
 /// Show the export dialog for a list of image paths.
 ///
-/// Presents format and quality choices, then calls `darkroom-cli` for each
-/// selected image. `toast_fn` is called with a summary string on completion.
+/// Presents format and quality choices, then renders each image — a raw with a
+/// darkroom-ui edit through our pipeline, everything else via `darkroom-cli`.
+/// `toast_fn` is called with a summary string on completion.
 pub fn show_export_dialog(
     parent: &gtk4::Window,
     paths: Vec<String>,
     edit: Option<crate::export::ExportEdit>,
+    db_path: Option<String>,
     toast_fn: impl Fn(String) + 'static,
 ) {
     if paths.is_empty() {
@@ -39,9 +76,10 @@ pub fn show_export_dialog(
         let out_paths = paths.clone();
         let n         = out_paths.len();
         let tf        = toast_fn.clone();
+        let db        = db_path.clone();
 
         glib::spawn_future_local(async move {
-            match export_images_async(out_paths, settings, template, edit).await {
+            match export_images_async(out_paths, settings, template, edit, db).await {
                 Ok(0)      => tf(format!("Exported {n} image(s)")),
                 Ok(failed) => tf(format!("Exported {} of {n} ({failed} failed)", n - failed)),
                 Err(e)     => tf(format!("Export failed: {e}")),
@@ -64,6 +102,7 @@ async fn export_images_async(
     settings: crate::export::ExportSettings,
     template: String,
     edit: Option<crate::export::ExportEdit>,
+    db_path: Option<String>,
 ) -> Result<usize> {
     let failed = gio::spawn_blocking(move || {
         let template = crate::export::batch_output_template(&template, paths.len());
@@ -82,9 +121,14 @@ async fn export_images_async(
 
             // Rust-native render for a raw WITH a darkroom-ui edit (so the export
             // matches the preview + applies geometry/params); everything else
-            // (JPEGs, or lighttable multi-export with no edit) via darktable-cli,
-            // which develops with darktable's own history.
-            if let Some(edit) = edit {
+            // (JPEGs, or an unedited raw) via darktable-cli, which develops with
+            // darktable's own default history. A fixed `edit` (single-image
+            // darkroom export) applies to its one path; otherwise each image's
+            // edit is loaded from the catalog (lighttable multi-export).
+            let img_edit = edit.or_else(|| {
+                db_path.as_deref().and_then(|db| load_export_edit(db, path))
+            });
+            if let Some(edit) = img_edit {
                 if crate::raw_preview::is_raw_path(path) {
                     if let Err(e) = render_raw_export(path, &dest, &settings, edit) {
                         eprintln!("darkroom export: Rust render failed for {path}: {e}");
@@ -283,4 +327,59 @@ fn probe_dims(path: &std::path::Path) -> Option<(i32, i32)> {
     let _ = loader.close();
     let pb = loader.pixbuf()?;
     Some((pb.width(), pb.height()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A unique temp library.db seeded so a raw path resolves to an image id.
+    fn seeded_db() -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_export_edit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("library.db");
+        let dbs = db.to_str().unwrap().to_string();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE main.film_rolls (id INTEGER, folder VARCHAR);
+             CREATE TABLE main.images (id INTEGER, film_id INTEGER, filename VARCHAR);
+             INSERT INTO main.film_rolls (id, folder) VALUES (1, '/p');
+             INSERT INTO main.images (id, film_id, filename) VALUES (7, 1, 'a.dng');
+             INSERT INTO main.images (id, film_id, filename) VALUES (8, 1, 'b.jpg');",
+        )
+        .unwrap();
+        (dir, dbs)
+    }
+
+    #[test]
+    fn export_edit_only_for_edited_raws() {
+        let (dir, db) = seeded_db();
+
+        // Unedited raw → None (falls back to darktable-cli).
+        assert!(load_export_edit(&db, "/p/a.dng").is_none());
+        // Empty db path → None.
+        assert!(load_export_edit("", "/p/a.dng").is_none());
+
+        // Persist an edit on the raw, then it must render via our pipeline.
+        let mut params = crate::preview::PreviewParams::default();
+        params.ev = -0.5;
+        crate::persist::save_params(&db, "/p/a.dng", &params);
+
+        let edit = load_export_edit(&db, "/p/a.dng").expect("edited raw exports via Rust");
+        assert_eq!(edit.params, params);
+        assert_eq!(edit.method, darkroom_core::rawimage::DemosaicMethod::default());
+
+        // A non-raw with the same persisted params still uses darktable-cli.
+        crate::persist::save_params(&db, "/p/b.jpg", &params);
+        assert!(load_export_edit(&db, "/p/b.jpg").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

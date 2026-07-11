@@ -232,6 +232,7 @@ fn build_main_window(app: &Application) {
             .tooltip_text("Export selected")
             .build();
         let toast_fn = make_toast.clone();
+        let export_db = db_path.clone();
         btn.connect_clicked(clone!(@weak lt_model, @weak lt_selection, @weak window => move |_| {
             let pos = lt_selection.selected();
             let paths: Vec<String> = if let Some(path) = lt_model.item(pos)
@@ -244,7 +245,8 @@ fn build_main_window(app: &Application) {
             dialogs::show_export_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 paths,
-                None, // lighttable multi-export: darktable-cli (no per-image edit)
+                None, // no fixed edit — each image's edit is loaded from the catalog
+                Some(export_db.clone()),
                 toast_fn.clone(),
             );
         }));
@@ -353,6 +355,7 @@ fn build_main_window(app: &Application) {
         // win.export-selected — Ctrl+E
         let toast_fn2   = make_toast.clone();
         let export_act  = gtk4::gio::SimpleAction::new("export-selected", None);
+        let export_db2  = db_path.clone();
         export_act.connect_activate(clone!(@weak lt_model, @weak lt_selection, @weak window => move |_, _| {
             let pos = lt_selection.selected();
             let paths: Vec<String> = lt_model.item(pos)
@@ -363,7 +366,8 @@ fn build_main_window(app: &Application) {
             dialogs::show_export_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 paths,
-                None, // lighttable multi-export: darktable-cli (no per-image edit)
+                None, // no fixed edit — each image's edit is loaded from the catalog
+                Some(export_db2.clone()),
                 toast_fn2.clone(),
             );
         }));

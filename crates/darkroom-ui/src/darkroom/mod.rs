@@ -1639,6 +1639,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
                 root.upcast_ref::<gtk4::Window>(),
                 vec![path_for_export.clone()],
                 Some(edit),
+                None, // fixed edit above; no per-image catalog lookup needed
                 move |msg| tf_overlay.add_toast(adw::Toast::new(&msg)),
             );
         }
@@ -1932,7 +1933,7 @@ fn monochrome_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
 /// that have **no saved edit** (scene-linear input; JPEGs are display-referred,
 /// and a user who saved sigmoid off keeps it off). Pure, so the seeding policy
 /// is unit-tested rather than buried in the GTK builder.
-fn initial_params(saved: Option<PreviewParams>, is_raw: bool) -> PreviewParams {
+pub(crate) fn initial_params(saved: Option<PreviewParams>, is_raw: bool) -> PreviewParams {
     let mut p = saved.unwrap_or_default();
     if saved.is_none() && is_raw {
         p.sigmoid_on = true;
