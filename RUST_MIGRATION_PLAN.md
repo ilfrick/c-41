@@ -1132,6 +1132,21 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    mid-write failure) — not worth hardening code milestone 5 deletes once the
    Rust pipeline covers non-raw formats. darkroom-ui 138→139 tests.
 
+   **m4-69** (`4ad67c5bc1`) — Rust-native non-raw (JPEG/PNG/TIFF) export
+   (milestone 5). `render_nonraw_export` decodes via the `image` crate → composites
+   alpha over white → runs the preview's non-raw `apply_pipeline` (colour params
+   only; geometry/demosaic are raw-only) → resize → encode via the atomic+fsync
+   `atomic_write`. Export loop now: raw → Rust; jpg/jpeg/png/tif/tiff
+   (`is_rust_image_path`) → Rust; heic/heif/avif → cli. Fixes the "non-raw edit
+   dropped" gap (a JPEG edited in the darkroom view now bakes its edit on export).
+   DRY: shared `write_jpeg_rgb8` (with the into_inner flush fix) across the raw +
+   non-raw JPEG arms. **NOT byte-WYSIWYG (documented):** preview decodes via
+   GdkPixbuf, export via `image` (JPEG ±1-2 LSB); 8-bit out truncates 16-bit
+   sources pre-pipeline (banding on edited gradients — 16-bit follow-up). Tests:
+   extension predicate, real-PNG passthrough (pixel-exact), +1 EV brightens. Opus
+   architect: APPROVE with minors, all applied before commit (alpha composite,
+   doc-comments, non-passthrough test). darkroom-ui 139→142 tests.
+
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
    rename/delete popover is leak-free + a11y-complete; the Rust UI runs in the
@@ -1166,14 +1181,17 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    **Remaining couplings before CMake can actually be retired** (both in the full
    `docker/Dockerfile`):
    - *Runtime:* `darkroom-rs` shells out to `darkroom-cli` (the C `darktable-cli`)
-     only for **non-raw formats** now. As of **m4-67** ALL raws (edited or not)
-     develop through the Rust pipeline — an unedited raw exports with
-     `default_raw_export_edit()` (the preview's freshly-opened-raw seed), so export
-     matches the darkroom view (WYSIWYG). The remaining cli users: non-raw formats
-     (no Rust input path yet) and, implicitly, exotic raws `rawloader` can't decode
-     (no cli fallback on decode failure — a decode error just counts as failed).
-     **Blocker to full cli removal:** a Rust-native non-raw (JPEG/TIFF/PNG) export
-     path + broad-enough raw decode coverage.
+     only for **heic/heif/avif** (and unknown extensions) now. **m4-67:** all raws
+     develop Rust-native (unedited → `default_raw_export_edit()`, the preview seed).
+     **m4-69:** the non-raw formats the `image` crate decodes (jpg/jpeg/png/tif/
+     tiff) also go Rust-native (`render_nonraw_export`, the preview's `apply_pipeline`
+     over an `image`-crate decode, alpha composited over white). Remaining cli
+     users: heic/heif/avif (no Rust decoder) + exotic raws `rawloader` can't decode
+     (no cli fallback on raw decode failure — counts as failed). Known parity gaps
+     (documented): non-raw export is 8-bit (16-bit TIFF/PNG source truncated
+     pre-pipeline); preview uses GdkPixbuf vs export's `image` crate (JPEG ±1-2 LSB).
+     **Blocker to full cli removal:** a Rust HEIF/AVIF decoder (or dropping those
+     formats) + 16-bit non-raw path + broad raw decode coverage.
    - *Build:* CMake drives a `cargo build` of `darkroom-core` as a static lib
      linked into the C app, and builds the C `darktable`/`darktable-cli` the
      runtime still needs. Once the export fallback is gone, the C build (and thus
