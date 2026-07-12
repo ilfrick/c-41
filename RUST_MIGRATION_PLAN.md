@@ -1099,6 +1099,23 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `image_count_all()==3` after re-open. Opus architect: MAJOR poison-guard +
    MINOR commit-log applied, two-phase design endorsed. darkroom-ui 137 tests.
 
+   **m4-67** (`33506a48f5`) — export unedited raws through the Rust pipeline
+   (milestone 5; drops the darktable-cli fallback for ALL raws). Previously only
+   edited raws rendered Rust-native; an unedited raw exported via cli's fuller
+   default look — different from the darkroom view, which already renders unedited
+   raws through this exact subset pipeline (a WYSIWYG violation). Now every raw
+   develops through `render_raw_export`; an unedited raw uses
+   `default_raw_export_edit()` (= the preview seed: `initial_params(None,true)`
+   → sigmoid on, default Rcd demosaic, identity geometry). Only non-raw formats
+   still use cli. **Accepted trade-off (explicit user design call):** the subset
+   is lighter than darktable's default stack (no highlight-recon / base curve),
+   so an unedited raw's export can look flatter; no cli fallback if `rawloader`
+   can't decode an exotic raw (counts as failed). Test
+   `unedited_raw_export_default_matches_preview_seed` pins export==preview.
+   **Review debt:** the fricktrade-architect review was blocked by an account
+   session limit; user directed proceeding — obtain the deferred review later.
+   darkroom-ui 137→138 tests.
+
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
    rename/delete popover is leak-free + a11y-complete; the Rust UI runs in the
@@ -1132,12 +1149,15 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
 
    **Remaining couplings before CMake can actually be retired** (both in the full
    `docker/Dockerfile`):
-   - *Runtime:* `darkroom-rs` still shells out to `darkroom-cli` (the C
-     `darktable-cli`) for the export paths our subset pipeline hasn't reached
-     parity on — unedited raws + non-raw formats (m4-60). The darkroom-view
-     single-image export is already Rust-native (m4-49/50). **Blocker:** export
-     pipeline parity for those fallback cases; until then the C `darktable-cli`
-     binary is a runtime dependency.
+   - *Runtime:* `darkroom-rs` shells out to `darkroom-cli` (the C `darktable-cli`)
+     only for **non-raw formats** now. As of **m4-67** ALL raws (edited or not)
+     develop through the Rust pipeline — an unedited raw exports with
+     `default_raw_export_edit()` (the preview's freshly-opened-raw seed), so export
+     matches the darkroom view (WYSIWYG). The remaining cli users: non-raw formats
+     (no Rust input path yet) and, implicitly, exotic raws `rawloader` can't decode
+     (no cli fallback on decode failure — a decode error just counts as failed).
+     **Blocker to full cli removal:** a Rust-native non-raw (JPEG/TIFF/PNG) export
+     path + broad-enough raw decode coverage.
    - *Build:* CMake drives a `cargo build` of `darkroom-core` as a static lib
      linked into the C app, and builds the C `darktable`/`darktable-cli` the
      runtime still needs. Once the export fallback is gone, the C build (and thus
