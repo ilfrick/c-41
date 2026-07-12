@@ -1079,9 +1079,25 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    logged. New test seeds a fresh config (no library.db/data.db) with mixed
    raw/non-raw files → asserts count == raw files, data.db materialised, empty
    path is a no-op. Opus architect: APPROVE (Option C). darkroom-ui 136→137
-   tests. Follow-up left open by the architect (out of scope): wrap the import
-   loop in one transaction (N→1 lock acquisitions, faster) — but that trades
-   away today's best-effort per-image semantics for all-or-nothing.
+   tests.
+
+   **m4-65** (`e7b148c6cb`) — make folder import transactional (the m4-64 N1
+   follow-up), in a two-phase, poison-guarded shape that resolves the tradeoffs
+   the architect flagged. Phase 1 walks + `probe_dims`-decodes every header with
+   NO db lock held; Phase 2 opens one transaction and does only the fast insert
+   burst — so `BEGIN DEFERRED` holds the write lock just for the burst→commit, not
+   across the slow probe I/O (a naive loop-wrap would have blocked the
+   rating/colour writers for the whole import). Collapses N fsyncs→1 and makes
+   roll+images atomic (no half-populated roll on crash). Count-integrity guard:
+   `image_insert` dedupes via SELECT (a name clash is `Ok`), so the only reachable
+   insert `Err` is an engine error (SQLITE_FULL/IOERR/NOMEM/BUSY) that
+   auto-rolls-back the whole tx → the loop checks `conn.is_autocommit()` and
+   aborts (`None`) if the tx vanished, instead of autocommitting later rows and
+   re-opening the m4-64 count-lie. `commit()` failure is logged then `None`
+   (truthful "Imported 0"). Best-effort per-image survives for any statement-level
+   error (none reachable today). Test proves the tx committed via
+   `image_count_all()==3` after re-open. Opus architect: MAJOR poison-guard +
+   MINOR commit-log applied, two-phase design endorsed. darkroom-ui 137 tests.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
