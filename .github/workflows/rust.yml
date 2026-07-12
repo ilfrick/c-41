@@ -73,3 +73,16 @@ jobs:
       # Tighten this once the bulk of the migration lands.
       - name: cargo clippy
         run: cargo clippy --workspace
+
+      # Cargo-native build of the standalone GTK4 app binary (milestone 5 —
+      # retire CMake): guarantees the real, shippable `darkroom-rs` links with
+      # pure cargo + system GTK4 (no CMake, no C darktable). `cargo check` only
+      # type-checks (no link), and `cargo test` links `main.rs` only as a
+      # zero-test harness under `--cfg test` — it never produces the real
+      # non-test executable. In the full container image the binary is only built
+      # after the heavy CMake C build, so this is the sole place the shippable
+      # artifact's final link is exercised. Placed LAST so it reuses the release
+      # dep rlibs `cargo test --release` already built (marginal cost ≈ the link,
+      # not a full release codegen).
+      - name: cargo-native app binary build
+        run: cargo build --release -p darkroom --bin darkroom-rs

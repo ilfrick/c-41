@@ -1118,6 +1118,53 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
+   **m4-66 (groundwork):** the standalone Rust app is already fully
+   cargo-native-buildable — `cargo build --release -p darkroom --bin darkroom-rs`
+   links the GTK4 binary against system GTK4/libadwaita with **no CMake and no C
+   darktable** (verified in the rust-dev image, ~2.5 min from clean). CI now
+   guards this: the `Rust` workflow gained a "cargo-native app binary build" step
+   (`cargo check` only type-checks; it does not *link* the bin — the full
+   container image only links it after the heavy CMake C build, so a linker
+   regression in the standalone app would otherwise escape until the Docker
+   build). `darkroom-sys` is a C-linkless bindings crate (committed `bindings.rs`,
+   just `dt_imgid_t = i32` etc.), so nothing in the Rust workspace needs the C
+   toolchain.
+
+   **Remaining couplings before CMake can actually be retired** (both in the full
+   `docker/Dockerfile`):
+   - *Runtime:* `darkroom-rs` still shells out to `darkroom-cli` (the C
+     `darktable-cli`) for the export paths our subset pipeline hasn't reached
+     parity on — unedited raws + non-raw formats (m4-60). The darkroom-view
+     single-image export is already Rust-native (m4-49/50). **Blocker:** export
+     pipeline parity for those fallback cases; until then the C `darktable-cli`
+     binary is a runtime dependency.
+   - *Build:* CMake drives a `cargo build` of `darkroom-core` as a static lib
+     linked into the C app, and builds the C `darktable`/`darktable-cli` the
+     runtime still needs. Once the export fallback is gone, the C build (and thus
+     CMake) can be dropped and the image becomes a pure-cargo build of
+     `darkroom-rs` + a GTK4 runtime.
+   Ordered retirement path: reach export parity → drop the `darktable-cli`
+   fallback in `dialogs::export_images_async` → strip the CMake C build from the
+   Dockerfile (cargo-only) → retire `CMakeLists.txt` + `build.sh`.
+
+   **Before the Dockerfile-strip step, confirm each thing the C `install`
+   currently provides to the runtime is Rust-side, not C-install-side** (checklist
+   so the strip isn't a surprise break):
+   - *DB schema* — must come from the Rust catalog bootstrap (`ensure_*_schema` /
+     `open_catalog`, m4-56/m4-63/m4-64), NOT a darktable-created schema. Believed
+     satisfied; verify no residual reliance.
+   - *GTK assets* — icons/CSS the UI renders under KasmVNC (`GSK_RENDERER=cairo`).
+     Confirm none resolve from darktable's installed icon theme under
+     `/opt/darkroom/share`, or the chrome breaks when the C install goes (the
+     runtime already installs `adwaita-icon-theme` — check that's sufficient).
+   - *Decode/preview path is already C-free* — `darkroom-core` decodes RAW via the
+     pure-Rust `rawloader = 0.37.1` and takes camera colour matrices from
+     rawloader's `xyz_to_cam`, not darktable's `share/` data (architect-confirmed),
+     so the runtime pixel path doesn't couple to the C install.
+   - *Future data dep* — `denoiseprofile` is a stub today (no coupling), but if it
+     is ever wired into the Rust subset it needs `noiseprofiles.json`; note it now
+     so it isn't a surprise data dependency later.
+
 The UI work is largely independent of the per-IOP loop ports and can proceed in
 parallel; milestone 2 is where the two streams converge.
 
