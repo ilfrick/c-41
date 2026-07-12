@@ -270,18 +270,12 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
     if db_path.is_empty() {
         return None; // can't import into in-memory demo
     }
-    // Route through open_catalog rather than a bare Connection::open: it
-    // bootstraps the catalog schema on a fresh /config (a brand-new container
-    // library.db has no tables — the C app used to create them on first launch)
-    // AND sets a 3s busy_timeout, so the writes below wait out the metadata
-    // writers' brief off-thread library.db write lock instead of taking an
-    // immediate SQLITE_BUSY. That matters here because image_insert's error is
-    // ignored (best-effort), so an un-waited lock would silently drop images.
-    let conn = darkroom_db::schema::open_catalog(db_path).ok()?;
 
-    let film_id = film::film_new(&conn, folder).ok()??;
-    let mut count = 0usize;
-
+    // Phase 1 — walk + probe every raw OFF any DB lock. probe_dims decodes each
+    // file's header (slow I/O), so it must run before we hold a write lock: doing
+    // it inside the insert transaction would pin library.db's write lock across
+    // all that I/O and block the rating/colour-label writers for the whole import.
+    let mut pending: Vec<(String, i32, i32)> = Vec::new();
     for entry in walkdir::WalkDir::new(folder)
         .max_depth(1)        // one level; use max_depth(usize::MAX) for recursive
         .into_iter()
@@ -293,25 +287,57 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
             .and_then(|e| e.to_str())
             .map(|e| e.to_lowercase())
             .unwrap_or_default();
+        if !RAW_EXTENSIONS.contains(&ext.as_str()) { continue; }
+        let filename = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        // Probe image dimensions (fall back to 0×0 if unreadable).
+        let (w, h) = probe_dims(path).unwrap_or((0, 0));
+        pending.push((filename, w, h));
+    }
 
-        if RAW_EXTENSIONS.contains(&ext.as_str()) {
-            let filename = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if filename.is_empty() { continue; }
+    // Route through open_catalog rather than a bare Connection::open: it
+    // bootstraps the catalog schema on a fresh /config (a brand-new container
+    // library.db has no tables — the C app used to create them on first launch)
+    // AND sets a 3s busy_timeout, so the insert burst waits out the metadata
+    // writers' brief off-thread library.db write lock instead of an immediate
+    // SQLITE_BUSY.
+    let conn = darkroom_db::schema::open_catalog(db_path).ok()?;
 
-            // Probe image dimensions (fall back to 0×0 if unreadable)
-            let (w, h) = probe_dims(path).unwrap_or((0, 0));
-
-            // Count only rows that actually landed, and log the rest — a
-            // swallowed insert error (not the lock wait) is what would otherwise
-            // let images silently vanish AND make the "imported N" toast over-
-            // report files that were walked but never written.
-            match image::image_insert(&conn, film_id, filename, w, h) {
-                Ok(_) => count += 1,
-                Err(e) => eprintln!("darkroom import: image_insert failed for {filename:?}: {e}"),
+    // Phase 2 — one transaction around film-roll creation + all inserts. N
+    // per-image autocommits would be N fsyncs + N lock acquisitions; a single
+    // transaction collapses that to one commit, and since probing already happened
+    // the write lock is held only for the fast insert burst (no I/O interleaved).
+    // Crash-safety improves too — the roll and its images commit atomically, so a
+    // mid-import crash leaves no half-populated film roll. `unchecked_transaction`
+    // (vs `transaction`) because the DAOs borrow `&Connection`, not `&mut`.
+    let tx = conn.unchecked_transaction().ok()?;
+    let film_id = film::film_new(&conn, folder).ok()??;
+    let mut count = 0usize;
+    for (filename, w, h) in &pending {
+        match image::image_insert(&conn, film_id, filename, *w, *h) {
+            Ok(_) => count += 1,
+            Err(e) => {
+                eprintln!("darkroom import: image_insert failed for {filename:?}: {e}");
+                // image_insert dedupes via SELECT (a name clash is an Ok), so the
+                // only reachable Err here is a genuine engine error (SQLITE_FULL/
+                // IOERR/NOMEM/BUSY) — and those auto-roll-back the WHOLE tx and
+                // drop us into autocommit. Continuing would then autocommit later
+                // rows against a film_id that no longer exists AND desync `count`
+                // from reality (the m4-64 count-lie). Bail on a vanished tx.
+                if conn.is_autocommit() {
+                    eprintln!("darkroom import: transaction poisoned mid-insert; aborting");
+                    return None; // tx already rolled back; nothing to commit
+                }
             }
         }
+    }
+    if let Err(e) = tx.commit() {
+        // A failed COMMIT rolls back → 0 rows persist, so "Imported 0" is honest;
+        // log the cause so a failed import isn't a silent bare zero.
+        eprintln!("darkroom import: commit failed, nothing persisted: {e}");
+        return None;
     }
     Some(count)
 }
@@ -418,6 +444,11 @@ mod tests {
         assert_eq!(import_folder_sync(photos.to_str().unwrap(), dbs), Some(3));
         // open_catalog materialised the sibling data.db during the bootstrap.
         assert!(cfg.join("data.db").exists(), "data.db not created by bootstrap");
+        // The returned count reflects rows the transaction actually committed —
+        // re-open and confirm the 3 images (and their film roll) persisted.
+        let check = darkroom_db::schema::open_catalog(dbs).unwrap();
+        assert_eq!(darkroom_db::image::image_count_all(&check).unwrap(), 3);
+        drop(check);
         // Empty db path stays a no-op (demo mode, no library).
         assert_eq!(import_folder_sync(photos.to_str().unwrap(), ""), None);
 
