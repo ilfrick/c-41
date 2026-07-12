@@ -120,6 +120,25 @@ async fn export_images_async(
     db_path: Option<String>,
 ) -> Result<usize> {
     let failed = gio::spawn_blocking(move || {
+        // A fixed `edit` is the single-image darkroom export (exactly one path);
+        // the lighttable multi-export passes `None` + a db_path and resolves each
+        // image's edit per-path. Baking one image's edit — especially its absolute
+        // crop rectangle — onto a whole batch would silently mis-crop, so lock the
+        // invariant here (call sites guarantee it; this catches a future regression).
+        debug_assert!(
+            edit.is_none() || paths.len() == 1,
+            "a fixed ExportEdit must apply to a single-image export"
+        );
+        // Runtime guard too (debug_assert compiles out in release): the violation
+        // is silent mis-crop of user files (one image's absolute crop baked onto
+        // all), not a crash — so fail the whole batch loudly rather than corrupt.
+        if edit.is_some() && paths.len() != 1 {
+            eprintln!(
+                "darkroom export: refusing to apply one fixed edit to {} images",
+                paths.len()
+            );
+            return paths.len(); // count all as failed; export nothing
+        }
         let template = crate::export::batch_output_template(&template, paths.len());
         let mut failed = 0usize;
         for (i, path) in paths.iter().enumerate() {
@@ -195,34 +214,90 @@ fn render_raw_export(
         settings.resize.as_ref().map(|r| crate::export::fit_within(w as u32, h as u32, r))
     };
 
-    match settings.format {
-        ExportFormat::Jpeg => {
-            let (w, h, rgb) =
-                crate::export::render_export_rgb8(&img, edit.method, edit.geometry, &edit.params);
-            let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
-                .ok_or_else(|| anyhow::anyhow!("empty render"))?;
-            if let Some((tw, th)) = target(w, h) {
-                buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+    // Encode to a temp file, then atomically rename onto `dest_ext` (see
+    // `atomic_write`): a mid-encode failure must never leave a truncated file
+    // that looks like a valid export, and a failed re-export must not clobber a
+    // prior good file (File::create / the encoder truncate up front). The decode
+    // above already fails before any file is touched, so a bad raw leaves nothing.
+    atomic_write(&dest_ext, |out| {
+        match settings.format {
+            ExportFormat::Jpeg => {
+                let (w, h, rgb) =
+                    crate::export::render_export_rgb8(&img, edit.method, edit.geometry, &edit.params);
+                let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
+                    .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+                if let Some((tw, th)) = target(w, h) {
+                    buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+                }
+                let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
+                let q = settings.quality.clamp(1, 100) as u8;
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, q)
+                    .write_image(buf.as_raw(), buf.width(), buf.height(), image::ExtendedColorType::Rgb8)
+                    .map_err(|e| anyhow::anyhow!("encode jpeg: {e}"))?;
+                // BufWriter's Drop silently swallows flush errors — flush it to
+                // the OS explicitly via into_inner (surfaces an immediate write
+                // error and ensures the buffer reaches the file before atomic_write
+                // fsyncs it). Durability/disk-full is atomic_write's fsync.
+                f.into_inner().map_err(|e| anyhow::anyhow!("flush jpeg: {e}"))?;
             }
-            let mut f = std::io::BufWriter::new(std::fs::File::create(&dest_ext)?);
-            let q = settings.quality.clamp(1, 100) as u8;
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, q)
-                .write_image(buf.as_raw(), buf.width(), buf.height(), image::ExtendedColorType::Rgb8)
-                .map_err(|e| anyhow::anyhow!("encode jpeg: {e}"))?;
-        }
-        ExportFormat::Png | ExportFormat::Tiff => {
-            let (w, h, rgb) =
-                crate::export::render_export_rgb16(&img, edit.method, edit.geometry, &edit.params);
-            let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
-                .ok_or_else(|| anyhow::anyhow!("empty render"))?;
-            if let Some((tw, th)) = target(w, h) {
-                buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+            ExportFormat::Png | ExportFormat::Tiff => {
+                let (w, h, rgb) =
+                    crate::export::render_export_rgb16(&img, edit.method, edit.geometry, &edit.params);
+                let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
+                    .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+                if let Some((tw, th)) = target(w, h) {
+                    buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+                }
+                // The temp path ends in `.part`, so `save`'s extension inference
+                // (which the dest-ext path relied on) can't pick the encoder —
+                // name the 16-bit format explicitly.
+                let fmt = match settings.format {
+                    ExportFormat::Png => image::ImageFormat::Png,
+                    _ => image::ImageFormat::Tiff,
+                };
+                buf.save_with_format(out, fmt).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
             }
-            // `save` infers the encoder from the extension (.png/.tif → 16-bit).
-            buf.save(&dest_ext).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         }
+        Ok(())
+    })
+}
+
+/// Write via a `<dest>.part` temp file and `rename` onto `dest` only on success,
+/// so a failed `write` never leaves a truncated file at `dest` nor clobbers a
+/// prior good one (image encoders truncate the destination up front). `rename`
+/// within a directory is atomic on POSIX. On a write error the temp file is
+/// removed so no `.part` turd survives.
+fn atomic_write(dest: &str, write: impl FnOnce(&str) -> Result<()>) -> Result<()> {
+    // Unique temp name (pid + process-local counter) in dest's own directory, so
+    // two concurrent exports to the same dest can't grab each other's half-written
+    // file, and the rename stays same-filesystem (atomic on POSIX).
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = format!(
+        "{dest}.{}.{}.part",
+        std::process::id(),
+        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    if let Err(e) = write(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    Ok(())
+    // fsync the finished temp BEFORE the rename can promote it. On delalloc
+    // filesystems (ext4/xfs/btrfs — every Linux target here) a plain write()
+    // returns Ok even when the volume is full; ENOSPC is deferred to writeback.
+    // Without this, a disk-full export would rename a truncated file over the
+    // prior good one. (fsync on a read-only handle still flushes the inode's
+    // dirty pages.) The parent-dir fsync for rename crash-durability is out of
+    // scope — the invariant defended here is "never promote a truncated file".
+    if let Err(e) = std::fs::File::open(&tmp).and_then(|f| f.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!("fsync {tmp}: {e}"));
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        // A complete temp but a failed rename (dest dir vanished, perms) — unlink
+        // it too so no orphaned `.part` survives.
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("finalize {dest}: {e}")
+    })
 }
 
 // ── Import folder dialog ──────────────────────────────────────────────────
@@ -443,6 +518,54 @@ mod tests {
         assert!(e.params.sigmoid_on, "raw default tone-maps (sigmoid on)");
         assert_eq!(e.method, darkroom_core::rawimage::DemosaicMethod::default());
         assert!(e.geometry.is_identity(), "no crop/straighten on an unedited raw");
+    }
+
+    #[test]
+    fn atomic_write_no_clobber_on_failure_and_replaces_on_success() {
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_atomic_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Temp names are unique (pid+nonce), so assert on "any `.part` in dir".
+        let no_part_left = |dir: &std::path::Path| -> bool {
+            std::fs::read_dir(dir).unwrap().all(|e| {
+                !e.unwrap().file_name().to_string_lossy().ends_with(".part")
+            })
+        };
+        let dest = dir.join("out.jpg");
+        let dests = dest.to_str().unwrap().to_string();
+
+        // A prior good export exists.
+        std::fs::write(&dest, b"GOOD").unwrap();
+
+        // A failing encode (even one that wrote a partial temp) must NOT clobber
+        // the prior file and must leave no `.part` behind.
+        let r = atomic_write(&dests, |tmp| {
+            std::fs::write(tmp, b"partial").unwrap();
+            Err(anyhow::anyhow!("simulated encode failure"))
+        });
+        assert!(r.is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"GOOD", "prior file was clobbered");
+        assert!(no_part_left(&dir), "temp .part left behind after write failure");
+
+        // A successful encode atomically replaces the file, no `.part` left.
+        atomic_write(&dests, |tmp| Ok(std::fs::write(tmp, b"NEW")?)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW");
+        assert!(no_part_left(&dir));
+
+        // A rename failure (dest is a directory) must also leave no `.part`.
+        let as_dir = dir.join("adir");
+        std::fs::create_dir(&as_dir).unwrap();
+        let r = atomic_write(as_dir.to_str().unwrap(), |tmp| Ok(std::fs::write(tmp, b"x")?));
+        assert!(r.is_err(), "rename onto a directory should fail");
+        assert!(no_part_left(&dir), "temp .part left behind after rename failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
