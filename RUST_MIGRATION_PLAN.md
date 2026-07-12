@@ -1114,7 +1114,23 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `unedited_raw_export_default_matches_preview_seed` pins export==preview.
    **Review debt:** the fricktrade-architect review was blocked by an account
    session limit; user directed proceeding — obtain the deferred review later.
-   darkroom-ui 137→138 tests.
+   darkroom-ui 137→138 tests. *(Review debt cleared — see m4-68.)*
+
+   **m4-68** (`34d48a60c1`) — the deferred m4-67 review, run in full (two rounds),
+   plus its fixes. `render_raw_export` created the destination then encoded into
+   it → a mid-encode failure left a truncated file that looked valid and a failed
+   re-export clobbered a prior good one (MAJOR). New `atomic_write` helper:
+   encode to a unique `<dest>.<pid>.<n>.part` temp, `fsync` it, then `rename` onto
+   dest only on success (both failure paths unlink the temp). Two subtleties the
+   review caught: (a) `BufWriter::Drop` swallows flush errors → explicit
+   `into_inner` on the JPEG arm; (b) on delalloc FSes (ext4/xfs/btrfs) `write()`
+   returns Ok when the disk is full → the pre-rename `fsync` is what actually
+   makes "never promote a truncated file" true. Also a release runtime guard
+   (not just `debug_assert`) refusing a batch that carries a fixed single-image
+   edit (would bake one crop onto all). **Known data-safety gap (deferred):** the
+   non-raw `darktable-cli` export branch is still non-atomic (clobbers on
+   mid-write failure) — not worth hardening code milestone 5 deletes once the
+   Rust pipeline covers non-raw formats. darkroom-ui 138→139 tests.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
