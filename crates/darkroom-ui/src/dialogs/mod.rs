@@ -160,14 +160,31 @@ async fn export_images_async(
             // default demosaic, identity geometry) rather than darktable-cli's
             // different default look. A fixed `edit` (single-image darkroom export)
             // applies to its one path; otherwise each raw's edit is loaded from the
-            // catalog (lighttable multi-export). Non-raw formats still develop via
-            // darktable-cli until the pipeline grows a non-raw input path (a
-            // separate milestone-5 parity follow-up).
+            // catalog (lighttable multi-export).
             if crate::raw_preview::is_raw_path(path) {
                 let img_edit = edit
                     .or_else(|| db_path.as_deref().and_then(|db| load_export_edit(db, path)))
                     .unwrap_or_else(default_raw_export_edit);
                 if let Err(e) = render_raw_export(path, &dest, &settings, img_edit) {
+                    eprintln!("darkroom export: Rust render failed for {path}: {e}");
+                    failed += 1;
+                }
+                continue;
+            }
+
+            // Non-raw formats the pure-Rust `image` crate can decode (JPEG/PNG/
+            // TIFF) also develop through the Rust pipeline — the SAME colour params
+            // as the preview (geometry/demosaic are raw-only), though not
+            // byte-identical to it (different decoder + 8-bit; see
+            // render_nonraw_export). Bakes a single-image darkroom edit if present,
+            // else the per-path persisted params seeded like the preview (sigmoid
+            // off). Only formats with no Rust decoder (heic/heif/avif) still use cli.
+            if is_rust_image_path(path) {
+                let params = edit.map(|e| e.params).unwrap_or_else(|| {
+                    let saved = db_path.as_deref().and_then(|db| crate::persist::load_saved(db, path));
+                    crate::darkroom::initial_params(saved, false)
+                });
+                if let Err(e) = render_nonraw_export(path, &dest, &settings, &params) {
                     eprintln!("darkroom export: Rust render failed for {path}: {e}");
                     failed += 1;
                 }
@@ -201,7 +218,7 @@ fn render_raw_export(
     edit: crate::export::ExportEdit,
 ) -> Result<()> {
     use crate::export::ExportFormat;
-    use image::{imageops::FilterType, ImageBuffer, ImageEncoder, Rgb};
+    use image::{imageops::FilterType, ImageBuffer, Rgb};
 
     let img = darkroom_core::rawimage::load(path).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
     let dest_ext = format!("{dest}.{}", settings.format.out_ext());
@@ -229,16 +246,7 @@ fn render_raw_export(
                 if let Some((tw, th)) = target(w, h) {
                     buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
                 }
-                let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
-                let q = settings.quality.clamp(1, 100) as u8;
-                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, q)
-                    .write_image(buf.as_raw(), buf.width(), buf.height(), image::ExtendedColorType::Rgb8)
-                    .map_err(|e| anyhow::anyhow!("encode jpeg: {e}"))?;
-                // BufWriter's Drop silently swallows flush errors — flush it to
-                // the OS explicitly via into_inner (surfaces an immediate write
-                // error and ensures the buffer reaches the file before atomic_write
-                // fsyncs it). Durability/disk-full is atomic_write's fsync.
-                f.into_inner().map_err(|e| anyhow::anyhow!("flush jpeg: {e}"))?;
+                write_jpeg_rgb8(&buf, settings.quality, out)?;
             }
             ExportFormat::Png | ExportFormat::Tiff => {
                 let (w, h, rgb) =
@@ -297,6 +305,113 @@ fn atomic_write(dest: &str, write: impl FnOnce(&str) -> Result<()>) -> Result<()
         // it too so no orphaned `.part` survives.
         let _ = std::fs::remove_file(&tmp);
         anyhow::anyhow!("finalize {dest}: {e}")
+    })
+}
+
+/// Encode an 8-bit RGB buffer as JPEG to `out`, flushing explicitly so a
+/// `BufWriter` drop can't swallow the final-chunk write error (durability of the
+/// bytes is `atomic_write`'s fsync). Shared by the raw and non-raw export paths.
+fn write_jpeg_rgb8(
+    buf: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    quality: u32,
+    out: &str,
+) -> Result<()> {
+    use image::ImageEncoder;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
+    let q = quality.clamp(1, 100) as u8;
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, q)
+        .write_image(buf.as_raw(), buf.width(), buf.height(), image::ExtendedColorType::Rgb8)
+        .map_err(|e| anyhow::anyhow!("encode jpeg: {e}"))?;
+    f.into_inner().map_err(|e| anyhow::anyhow!("flush jpeg: {e}"))?;
+    Ok(())
+}
+
+/// Non-raw formats the pure-Rust `image` crate can decode/encode (its enabled
+/// features: png/tiff/jpeg). These export through the Rust pipeline rather than
+/// darktable-cli; heic/heif/avif have no Rust decoder and still use the cli.
+const RUST_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff"];
+
+/// True if `path` is a non-raw image the `image` crate can decode (see
+/// [`RUST_IMAGE_EXTENSIONS`]). Disjoint from [`crate::raw_preview::is_raw_path`].
+fn is_rust_image_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| RUST_IMAGE_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Export a **non-raw** image (JPEG/PNG/TIFF) through the Rust pipeline, applying
+/// the same colour [`apply_pipeline`] as the darkroom preview's non-raw path
+/// (geometry/demosaic are raw-only, so ignored) → optional resize → encode.
+///
+/// NOT byte-identical WYSIWYG with the on-screen preview, for two honest reasons:
+/// - The *decoder* differs — the preview decodes via GdkPixbuf, this via the
+///   `image` crate — so for JPEG the base pixels can differ ±1-2 LSB (different
+///   IDCT/upsampling); PNG/TIFF are lossless and agree in practice.
+/// - Output is 8-bit and transparency is composited over white here. A 16-bit
+///   TIFF/PNG source is truncated to 8-bit *before* the pipeline, so an edited
+///   smooth gradient can band vs darktable-cli's end-to-end 16-bit path — a known
+///   parity gap (16-bit-in/out is a follow-up).
+///
+/// Atomic + fsync-durable write via [`atomic_write`], like the raw path.
+fn render_nonraw_export(
+    path: &str,
+    dest: &str,
+    settings: &crate::export::ExportSettings,
+    params: &crate::preview::PreviewParams,
+) -> Result<()> {
+    use crate::export::ExportFormat;
+    use image::{imageops::FilterType, ImageBuffer, Rgb};
+
+    let decoded = image::ImageReader::open(path)
+        .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?
+        .with_guessed_format()
+        .map_err(|e| anyhow::anyhow!("probe {path}: {e}"))?
+        .decode()
+        .map_err(|e| anyhow::anyhow!("decode {path}: {e}"))?
+        .to_rgba8();
+    let (w, h) = (decoded.width() as usize, decoded.height() as usize);
+
+    // Composite over white into packed RGB before the pipeline: a plain to_rgb8()
+    // would drop alpha and leave arbitrary under-pixels (often black) in
+    // transparent regions; white is the conventional export matte (JPEG can't hold
+    // alpha anyway). Opaque pixels (a=255) pass through byte-for-byte.
+    let mut rgb = vec![0u8; w * h * 3];
+    for (i, px) in decoded.pixels().enumerate() {
+        let a = px[3] as u32;
+        for c in 0..3 {
+            rgb[i * 3 + c] = ((px[c] as u32 * a + 255 * (255 - a)) / 255) as u8;
+        }
+    }
+
+    // Same colour pipeline the non-raw preview runs (packed RGB, rowstride w*3, 3
+    // channels). Empty pipeline (default non-raw params) is a byte-exact
+    // passthrough, so an unedited opaque non-raw is just decode → re-encode.
+    let processed = crate::preview::apply_pipeline(&rgb, w, h, w * 3, 3, params);
+    let dest_ext = format!("{dest}.{}", settings.format.out_ext());
+    let target = settings
+        .resize
+        .as_ref()
+        .map(|r| crate::export::fit_within(w as u32, h as u32, r));
+
+    atomic_write(&dest_ext, move |out| {
+        let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, processed)
+            .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+        if let Some((tw, th)) = target {
+            buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+        }
+        match settings.format {
+            ExportFormat::Jpeg => write_jpeg_rgb8(&buf, settings.quality, out)?,
+            ExportFormat::Png | ExportFormat::Tiff => {
+                let fmt = match settings.format {
+                    ExportFormat::Png => image::ImageFormat::Png,
+                    _ => image::ImageFormat::Tiff,
+                };
+                buf.save_with_format(out, fmt).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+            }
+        }
+        Ok(())
     })
 }
 
@@ -564,6 +679,108 @@ mod tests {
         let r = atomic_write(as_dir.to_str().unwrap(), |tmp| Ok(std::fs::write(tmp, b"x")?));
         assert!(r.is_err(), "rename onto a directory should fail");
         assert!(no_part_left(&dir), "temp .part left behind after rename failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_rust_image_path_matches_only_rust_decodable_nonraws() {
+        for p in ["a.jpg", "b.JPEG", "c.png", "d.tif", "e.TIFF"] {
+            assert!(is_rust_image_path(p), "{p} should be Rust-decodable");
+        }
+        // Raws go through the raw branch, not here; heic/avif have no Rust decoder.
+        for p in ["x.cr2", "y.dng", "z.heic", "w.avif", "noext"] {
+            assert!(!is_rust_image_path(p), "{p} must not take the Rust non-raw path");
+        }
+    }
+
+    #[test]
+    fn render_nonraw_export_roundtrips_a_png_passthrough() {
+        use image::{ImageBuffer, Rgb};
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_nonraw_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.png");
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(4, 3, |x, y| {
+            Rgb([(x * 60) as u8, (y * 80) as u8, ((x + y) * 30) as u8])
+        });
+        img.save(&src).unwrap();
+
+        let dest = dir.join("out"); // extension-less; the encoder appends `.png`
+        let settings = crate::export::ExportSettings {
+            format: crate::export::ExportFormat::Png,
+            quality: 90,
+            resize: None,
+        };
+        // Default (identity) params ⇒ empty pipeline ⇒ byte-exact passthrough, so
+        // a PNG (lossless) export must reproduce the source pixels exactly.
+        render_nonraw_export(
+            src.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            &settings,
+            &crate::preview::PreviewParams::default(),
+        )
+        .unwrap();
+
+        let out_png = format!("{}.png", dest.to_str().unwrap());
+        let out = image::ImageReader::open(&out_png).unwrap().decode().unwrap().to_rgb8();
+        assert_eq!((out.width(), out.height()), (4, 3));
+        assert_eq!(out.as_raw(), img.as_raw(), "passthrough export must be pixel-exact");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_nonraw_export_applies_a_nonidentity_edit() {
+        use image::{ImageBuffer, Rgb};
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_nonraw_edit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A flat mid-grey opaque PNG (lossless, so the pixel change is purely the
+        // pipeline, not re-encode).
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(4, 4, Rgb([128, 128, 128]));
+        let src = dir.join("in.png");
+        img.save(&src).unwrap();
+
+        // +1 EV must brighten every channel (exposure doubles scene-linear light).
+        let mut params = crate::preview::PreviewParams::default();
+        params.ev = 1.0;
+        let dest = dir.join("out");
+        let settings = crate::export::ExportSettings {
+            format: crate::export::ExportFormat::Png,
+            quality: 90,
+            resize: None,
+        };
+        render_nonraw_export(
+            src.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            &settings,
+            &params,
+        )
+        .unwrap();
+
+        let out = image::ImageReader::open(format!("{}.png", dest.to_str().unwrap()))
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_rgb8();
+        assert!(
+            out.get_pixel(0, 0)[0] > 130,
+            "exposure edit did not brighten the 128 input: got {}",
+            out.get_pixel(0, 0)[0]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
