@@ -18,11 +18,12 @@ use anyhow::Result;
 /// raw default (sigmoid on) — so exporting a raw the user only cropped still
 /// tone-maps the way the preview does.
 ///
-/// Note the "export == preview" invariant holds only for **edited** raws: an
-/// unedited raw returns `None` and is developed by `darktable-cli`'s fuller
-/// default stack (highlight-recon, base curve, …) which our subset pipeline
-/// doesn't yet match — a better baseline than a WYSIWYG-but-weaker render, until
-/// the pipeline reaches parity.
+/// Returns `None` for an unedited raw (or a non-raw / empty db). The export loop
+/// treats a `None` raw as [`default_raw_export_edit`] — the preview's seed for a
+/// freshly-opened raw — so **every** raw now exports through the Rust pipeline
+/// (WYSIWYG with the darkroom view); `Some` just carries the persisted edit for a
+/// raw the user actually touched. (Milestone 5: this removed the darktable-cli
+/// fallback for unedited raws; only non-raw formats still use the cli.)
 fn load_export_edit(db_path: &str, path: &str) -> Option<crate::export::ExportEdit> {
     if db_path.is_empty() || !crate::raw_preview::is_raw_path(path) {
         return None;
@@ -41,10 +42,24 @@ fn load_export_edit(db_path: &str, path: &str) -> Option<crate::export::ExportEd
     Some(crate::export::ExportEdit { method, geometry, params })
 }
 
+/// The export edit for an **unedited** raw: exactly the seed the darkroom preview
+/// shows for a freshly-opened raw — [`crate::darkroom::initial_params`] with no
+/// saved edit (sigmoid on), the default demosaic method, and identity geometry.
+/// Used by the export loop so an unedited raw develops through the Rust pipeline
+/// (matching the preview) instead of darktable-cli. Keeping this in lockstep with
+/// the preview's own seeding is the "export == preview" invariant for raws.
+fn default_raw_export_edit() -> crate::export::ExportEdit {
+    crate::export::ExportEdit {
+        method: darkroom_core::rawimage::DemosaicMethod::default(),
+        geometry: darkroom_core::geometry::Geometry::default(),
+        params: crate::darkroom::initial_params(None, true),
+    }
+}
+
 /// Show the export dialog for a list of image paths.
 ///
-/// Presents format and quality choices, then renders each image — a raw with a
-/// darkroom-ui edit through our pipeline, everything else via `darkroom-cli`.
+/// Presents format and quality choices, then renders each image — every raw
+/// (edited or not) through our Rust pipeline, non-raw formats via `darkroom-cli`.
 /// `toast_fn` is called with a summary string on completion.
 pub fn show_export_dialog(
     parent: &gtk4::Window,
@@ -119,23 +134,25 @@ async fn export_images_async(
                 }
             }
 
-            // Rust-native render for a raw WITH a darkroom-ui edit (so the export
-            // matches the preview + applies geometry/params); everything else
-            // (JPEGs, or an unedited raw) via darktable-cli, which develops with
-            // darktable's own default history. A fixed `edit` (single-image
-            // darkroom export) applies to its one path; otherwise each image's
-            // edit is loaded from the catalog (lighttable multi-export).
-            let img_edit = edit.or_else(|| {
-                db_path.as_deref().and_then(|db| load_export_edit(db, path))
-            });
-            if let Some(edit) = img_edit {
-                if crate::raw_preview::is_raw_path(path) {
-                    if let Err(e) = render_raw_export(path, &dest, &settings, edit) {
-                        eprintln!("darkroom export: Rust render failed for {path}: {e}");
-                        failed += 1;
-                    }
-                    continue;
+            // Raws ALWAYS develop through the Rust pipeline so the export matches
+            // the darkroom preview (WYSIWYG): an edited raw bakes its persisted
+            // edit; an unedited raw uses the same seed the preview shows for a
+            // freshly-opened file (`default_raw_export_edit` — initial_params,
+            // default demosaic, identity geometry) rather than darktable-cli's
+            // different default look. A fixed `edit` (single-image darkroom export)
+            // applies to its one path; otherwise each raw's edit is loaded from the
+            // catalog (lighttable multi-export). Non-raw formats still develop via
+            // darktable-cli until the pipeline grows a non-raw input path (a
+            // separate milestone-5 parity follow-up).
+            if crate::raw_preview::is_raw_path(path) {
+                let img_edit = edit
+                    .or_else(|| db_path.as_deref().and_then(|db| load_export_edit(db, path)))
+                    .unwrap_or_else(default_raw_export_edit);
+                if let Err(e) = render_raw_export(path, &dest, &settings, img_edit) {
+                    eprintln!("darkroom export: Rust render failed for {path}: {e}");
+                    failed += 1;
                 }
+                continue;
             }
 
             match std::process::Command::new("darkroom-cli")
@@ -413,6 +430,19 @@ mod tests {
         assert!(load_export_edit(&db, "/p/b.jpg").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unedited_raw_export_default_matches_preview_seed() {
+        // Milestone 5: an unedited raw exports through the Rust pipeline using the
+        // SAME seed the darkroom preview shows for a freshly-opened raw (no cli
+        // fallback). Pin that "export == preview default" invariant so a change to
+        // the preview's seeding can't silently desync the export look.
+        let e = default_raw_export_edit();
+        assert_eq!(e.params, crate::darkroom::initial_params(None, true));
+        assert!(e.params.sigmoid_on, "raw default tone-maps (sigmoid on)");
+        assert_eq!(e.method, darkroom_core::rawimage::DemosaicMethod::default());
+        assert!(e.geometry.is_identity(), "no crop/straighten on an unedited raw");
     }
 
     #[test]
