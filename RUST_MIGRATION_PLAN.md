@@ -1234,6 +1234,21 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      startup — a child appended while already parented; non-fatal, affects the
      full image too. Surface with `xvfb-run darkroom-rs` + grep Gtk-CRITICAL.
 
+   **m4-72** (`7661c6b5fe`) — **production is now CMake-free.** `git mv` promoted
+   the validated cargo-only image to `docker/Dockerfile` (the published `:latest`)
+   and preserved the full C+Rust recipe as opt-in `docker/Dockerfile.full-c`.
+   `docker.yml` drops the CMake build-args from `:latest` and gained an on-demand
+   (`workflow_dispatch`) job publishing the full image as `:full-c` (so the
+   heic/C-GUI capability stays in the registry + guards full-c from bit-rot).
+   `docker-compose.yml` fixed: default `darkroom` is cargo-only; the GPU profiles
+   (OpenCL is a C-core feature) build full-c. Build pinned to the exact CACHEBUST
+   commit (M1). Architect: approve, 3 before-merge fixes applied. So **milestone 5
+   is substantially DONE** — the shipped image and CI no longer use CMake; the C
+   `src/` + CMakeLists/build.sh remain only as the ongoing IOP-migration
+   reference (full C build available via `Dockerfile.full-c`). Remaining: live GUI
+   eyeball (needs a display), the heic/heif/avif decision (drop vs keep full-c),
+   and the deferred `--locked` (needs Cargo.lock committed — currently gitignored).
+
    **Before the Dockerfile-strip step, confirm each thing the C `install`
    currently provides to the runtime is Rust-side, not C-install-side** (checklist
    so the strip isn't a surprise break):
