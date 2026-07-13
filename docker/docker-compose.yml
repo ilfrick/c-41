@@ -1,18 +1,16 @@
 ---
-# Darkroom – docker-compose with all GPU profiles
+# Darkroom – docker-compose
 #
-# Usage:
-#   CPU only (default):
-#     docker compose up darkroom
-#
-#   NVIDIA GPU:
-#     docker compose --profile nvidia up darkroom-nvidia
-#
-#   AMD / Intel GPU (OpenCL via ROCm or Intel NEO):
-#     docker compose --profile opencl up darkroom-opencl
-#
-# First-time build (CPU):
+# Default (recommended) — the cargo-only Rust image (no CMake, no GPU compute):
 #   docker compose build darkroom
+#   docker compose up darkroom
+#
+# GPU-accelerated profiles use the FULL C+Rust image (docker/Dockerfile.full-c):
+# OpenCL/CUDA acceleration + heic/heif/avif export live in the C darktable core,
+# which the cargo-only image doesn't ship. These build via CMake.
+#   docker compose --profile nvidia up darkroom-nvidia   # NVIDIA
+#   docker compose --profile amd    up darkroom-amd      # AMD (ROCm/OpenCL)
+#   docker compose --profile intel  up darkroom-intel    # Intel (NEO/OpenCL)
 #
 # Environment variables (set in .env or inline):
 #   PUID        – host user ID for file ownership     (default: 1000)
@@ -21,17 +19,10 @@
 #   PHOTOS_DIR  – path to your photos on the host     (default: ~/Pictures)
 #   CONFIG_DIR  – path for persistent config/cache    (default: ~/.config/darkroom-docker)
 
-x-darkroom-base: &darkroom-base
-  build:
-    context: ..
-    dockerfile: docker/Dockerfile
-    args:
-      CMAKE_BUILD_TYPE: Release
-      USE_AI: "OFF"
-      JOBS: "4"
+x-common: &common
   environment:
-    PUID: ${PUID}
-    PGID: ${PGID}
+    PUID: ${PUID:-1000}
+    PGID: ${PGID:-1000}
     TZ: ${TZ:-Europe/Rome}
     DARKROOM_CONFIGDIR: /config/darkroom
     DARKROOM_CACHEDIR: /config/cache
@@ -42,28 +33,42 @@ x-darkroom-base: &darkroom-base
     - "3000:3000"   # KasmVNC HTTP  → open http://localhost:3000
     - "3001:3001"   # KasmVNC HTTPS → open https://localhost:3001
   restart: unless-stopped
+
+# The full C+Rust build (CMake). Only the GPU profiles need it — GPU compute and
+# heic/heif/avif export are C-darktable-core features absent from the cargo-only
+# default image.
+x-full-build: &full-build
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.full-c
+    args:
+      CMAKE_BUILD_TYPE: Release
+      USE_AI: "OFF"
+      JOBS: "4"
   security_opt:
-    - seccomp:unconfined   # required for ptrace inside container
+    - seccomp:unconfined   # required for ptrace inside the C container
   shm_size: "2gb"
 
 services:
 
-  # ── CPU-only (works everywhere, no GPU setup needed) ──────────────────────
+  # ── Default: cargo-only Rust image (works everywhere, no GPU/CMake) ────────
   darkroom:
-    <<: *darkroom-base
+    <<: *common
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     container_name: darkroom
     image: darkroom:latest
 
-  # ── NVIDIA GPU ────────────────────────────────────────────────────────────
+  # ── NVIDIA GPU (full C image) ─────────────────────────────────────────────
   # Prerequisites on host:
   #   1. NVIDIA driver installed
   #   2. nvidia-container-toolkit installed and configured
   #      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
   #   3. Docker daemon restarted after toolkit install
-  #
   # Verify: docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
   darkroom-nvidia:
-    <<: *darkroom-base
+    <<: [*common, *full-build]
     container_name: darkroom-nvidia
     image: darkroom:nvidia
     profiles: [nvidia]
@@ -84,14 +89,13 @@ services:
               count: all
               capabilities: [gpu, compute, utility, video]
 
-  # ── AMD GPU (ROCm / OpenCL) ───────────────────────────────────────────────
+  # ── AMD GPU (full C image, ROCm / OpenCL) ─────────────────────────────────
   # Prerequisites on host:
   #   1. ROCm installed: https://rocm.docs.amd.com/
   #   2. User in 'video' and 'render' groups: sudo usermod -aG video,render $USER
-  #
   # Verify: rocm-smi  (or clinfo | grep "Device Name")
   darkroom-amd:
-    <<: *darkroom-base
+    <<: [*common, *full-build]
     container_name: darkroom-amd
     image: darkroom:amd
     profiles: [amd]
@@ -102,14 +106,13 @@ services:
       - video
       - render
 
-  # ── Intel GPU (OpenCL via Intel NEO compute runtime) ──────────────────────
+  # ── Intel GPU (full C image, OpenCL via Intel NEO) ────────────────────────
   # Prerequisites on host:
   #   1. Intel OpenCL runtime: sudo apt install intel-opencl-icd
   #   2. User in 'video' and 'render' groups: sudo usermod -aG video,render $USER
-  #
   # Verify: clinfo | grep "Device Name"
   darkroom-intel:
-    <<: *darkroom-base
+    <<: [*common, *full-build]
     container_name: darkroom-intel
     image: darkroom:intel
     profiles: [intel]

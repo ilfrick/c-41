@@ -1,173 +1,118 @@
-# Darkroom – GPU-accelerated photo editor in a container
+# Darkroom — the production container image (cargo-native, CMake-free).
 #
-# This is the full image (CMake C build + darktable-cli + the Rust GUI). The
-# CMake-free cargo-only variant is docker/Dockerfile.cargo-native — keep the
-# runtime stages (scripts, ENV, HEALTHCHECK) in sync; milestone 5 collapses them.
+# Milestone 5 made this the default: it builds and ships ONLY the Rust/GTK4
+# front-end (darkroom-rs) — NO CMake and NO C darktable. There is no
+# `darktable-cli`, so exporting a heic/heif/avif SOURCE (the only cli user) is
+# unavailable and fails gracefully with a logged message; everything else (all
+# raws + JPEG/PNG/TIFF) develops through the pure-Rust pipeline. The former full
+# C+Rust image is preserved as docker/Dockerfile.full-c (opt-in; needs CMake and
+# the C toolchain) for anyone who wants the C darktable / darktable-cli.
 #
 # Build:
 #   docker build -t darkroom -f docker/Dockerfile .
-#
-# Build from a different fork/branch:
+# From a fork/branch:
 #   docker build -t darkroom -f docker/Dockerfile \
 #     --build-arg DARKROOM_REPO=https://github.com/yourfork/darkroom.git \
 #     --build-arg DARKROOM_BRANCH=mybranch .
-#
-# Run (CPU only):
-#   docker run -p 3000:3000 -v /photos:/photos -v /config:/config darkroom
-#
-# Run (NVIDIA GPU):
-#   docker run --gpus all -e PUID=1000 -e PGID=1000 \
-#     -p 3000:3000 -p 3001:3001 \
-#     -v /path/to/photos:/photos \
-#     -v /path/to/config:/config \
-#     darkroom
+# Run (CPU): docker run -p 3000:3000 -v /photos:/photos -v /config:/config darkroom
 
-# ─── Stage 1: Build ──────────────────────────────────────────────────────────
+# ─── Stage 1: Build (cargo only — no cmake, no C toolchain beyond cc) ─────────
 FROM ubuntu:24.04 AS builder
 
 ARG DARKROOM_REPO=https://github.com/ilfrick/darkroom.git
 ARG DARKROOM_BRANCH=master
-ARG CMAKE_BUILD_TYPE=Release
-ARG USE_AI=OFF
-ARG JOBS=4
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Only the Rust + GTK4 build deps. None of docker/Dockerfile's C-darktable dep
+# list (exiv2, lcms2, libraw, gmic, …) or cmake/ninja — the Rust workspace links
+# only system GTK4/libadwaita, and darkroom-sys uses committed bindings (no
+# libclang, no C source tree).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake ninja-build git intltool gettext \
-    appstream-util desktop-file-utils \
-    libarchive-dev libatk1.0-dev libavif-dev libcairo2-dev \
-    libcolord-dev libcolord-gtk-dev libcups2-dev libcurl4-gnutls-dev \
-    libexiv2-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libgmic-dev \
-    libgphoto2-dev libgraphicsmagick1-dev libgtk-3-dev libheif-dev \
-    libjpeg-dev libjson-glib-dev liblcms2-dev liblensfun-dev \
-    liblua5.4-dev libopenexr-dev libopenjp2-7-dev \
-    libosmgpsmap-1.0-dev libpango1.0-dev libpng-dev libportmidi-dev \
-    libpotrace-dev libpugixml-dev libraw-dev librsvg2-dev \
-    libsqlite3-dev libtiff5-dev libwebp-dev libx11-dev \
-    libxml2-dev libxml2-utils zlib1g-dev libsdl2-dev \
-    libsecret-1-dev po4a python3-jsonschema xsltproc perl \
-    opencl-headers ocl-icd-opencl-dev \
-    pkg-config libgtk-4-dev libadwaita-1-dev \
-    curl \
+    build-essential pkg-config git curl ca-certificates \
+    libgtk-4-dev libadwaita-1-dev libgraphene-1.0-dev \
+    libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust stable — needed so CMake can invoke cargo to build darkroom-core
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal \
     && rm -rf /root/.rustup/toolchains/*/share/doc
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# CACHEBUST invalidates the git-clone layer (and everything after it) whenever
-# the source changes. Without it, `RUN git clone -b master` is cached by command
-# string alone, so Docker keeps a stale checkout even after master advances —
-# the image would be silently rebuilt from old source. CI passes the commit SHA.
+# CACHEBUST invalidates the git-clone layer whenever the source changes (CI feeds
+# the commit SHA). No submodules: the C-only rawspeed/LibRaw submodules aren't
+# used by the cargo build (raw decode is the pure-Rust `rawloader` crate).
 ARG CACHEBUST=unknown
-RUN echo "source revision: ${CACHEBUST}" \
-    && git clone --recurse-submodules --depth 1 -b ${DARKROOM_BRANCH} ${DARKROOM_REPO} /src
+# Clone the branch then PIN to the exact CACHEBUST commit, so the image's
+# org.opencontainers.image.revision label can't diverge from the shipped bits if
+# master advances mid-build. Falls back to branch HEAD when CACHEBUST isn't a real
+# commit (e.g. a local build that leaves it "unknown").
+RUN git clone -b ${DARKROOM_BRANCH} ${DARKROOM_REPO} /src \
+    && (git -C /src checkout --quiet ${CACHEBUST} 2>/dev/null \
+        || echo "CACHEBUST=${CACHEBUST} is not a commit; using ${DARKROOM_BRANCH} HEAD")
 
 WORKDIR /src
-
-RUN cmake -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
-    -DCMAKE_INSTALL_PREFIX=/opt/darkroom \
-    -DUSE_AI=${USE_AI} \
-    -DUSE_OPENCL=ON \
-    -DDONT_USE_INTERNAL_LIBRAW=ON \
-    -DRAWSPEED_ENABLE_LTO=ON \
-    -DBINARY_PACKAGE_BUILD=ON \
-    && cmake --build build --parallel ${JOBS} \
-    && cmake --install build
-
-# Build the Rust/GTK4 UI binary (darkroom-rs). CMake already invoked cargo to
-# build darkroom-core as a static lib for the C app, but the standalone GTK4
-# front-end is a separate workspace binary that must be built explicitly. It
-# lands at /src/target/release/darkroom-rs and is copied into the runtime stage.
+# (Reproducibility follow-up: add `--locked` once Cargo.lock is committed — it's
+# currently gitignored, so --locked has no lockfile to honour and errors out.)
 RUN cargo build --release -p darkroom --bin darkroom-rs
 
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
-# KasmVNC provides browser-accessible GUI (same approach as linuxserver/darktable)
 FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
 
+# (No org.opencontainers.image.revision label: the KasmVNC base image sets its
+# OWN revision and overriding it here proved unreliable — a wrong value is worse
+# than none. The source is pinned at build time via the CACHEBUST checkout above;
+# add a non-colliding provenance label later if wanted.)
 LABEL maintainer="darkroom-project" \
       org.opencontainers.image.title="Darkroom" \
-      org.opencontainers.image.description="Lightroom-competitive photo editor with GPU acceleration" \
+      org.opencontainers.image.description="Rust/GTK4 photo editor — cargo-native (CMake-free) build" \
       org.opencontainers.image.source="https://github.com/ilfrick/darkroom"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime library dependencies
+# Runtime deps: GTK4 + libadwaita and the desktop bits the Rust UI needs. NONE of
+# the C darktable runtime libraries — the C app isn't built or shipped here.
+# adwaita-icon-theme: symbolic icons libadwaita widgets draw (else blank glyphs).
+# gsettings-desktop-schemas: libadwaita reads org.gnome.desktop.interface; a
+#   missing schema makes GLib abort, so ship it even though we force no theme.
+# librsvg2-common: registers the gdk-pixbuf SVG loader (libpixbufloader-svg.so)
+#   — the whole UI chrome is `*-symbolic.svg` icons, so without it they render
+#   blank. The old image only got librsvg2-2 (the lib, not the loader) transitively
+#   via the C deps; install the loader explicitly rather than rely on that.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libarchive13 libavif16 libcairo2 libcolord2 libcolord-gtk1 \
-    libcurl3-gnutls libexiv2-27 libglib2.0-0 libgmic1 \
-    libgphoto2-6 libgraphicsmagick-q16-3 libgtk-3-0 libheif1 \
-    libjpeg8 libjson-glib-1.0-0 liblcms2-2 liblensfun1 \
-    liblua5.4-0 libopenexr-3-1-30 libopenjp2-7 \
-    libosmgpsmap-1.0-1 libpng16-16 libportmidi0 libpotrace0 \
-    libpugixml1v5 libraw23 librsvg2-2 libsqlite3-0 libtiff6 \
-    libwebp7 libx11-6 libxml2 zlib1g libsdl2-2.0-0 \
-    libsecret-1-0 lua5.4 \
-    # GTK4 + libadwaita runtime for the Rust UI (darkroom-rs).
-    # adwaita-icon-theme: symbolic icons libadwaita widgets draw (else blank glyphs).
-    # gsettings-desktop-schemas: libadwaita reads org.gnome.desktop.interface; a
-    #   missing schema makes GLib abort, so ship it even though we force no theme.
     libgtk-4-1 libadwaita-1-0 adwaita-icon-theme gsettings-desktop-schemas \
-    # OpenCL runtime (CPU fallback via Portable CL)
-    pocl-opencl-icd \
-    # GTK pixbuf loaders + MIME database (fixes SVG theme icon loading)
-    libgdk-pixbuf2.0-bin shared-mime-info \
-    # openbox-xdg-autostart dependency
-    python3-xdg \
-    # newer xkb-data silences KasmVNC keysym warnings (XF86Camera*, XF86NextElement…)
-    xkb-data \
+    librsvg2-common \
+    libgdk-pixbuf2.0-bin shared-mime-info python3-xdg xkb-data \
     && rm -rf /var/lib/apt/lists/* \
-    # Regenerate GDK pixbuf loaders cache so SVG icons load correctly
-    # Binary is not in $PATH on Ubuntu 24.04 — use full path
+    # Regenerate the GDK pixbuf loader cache so SVG icons load (binary not in PATH)
     && (/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache || true) \
-    # Regenerate shared-mime-info database
     && update-mime-database /usr/share/mime
 
-# Copy compiled Darkroom from build stage
-COPY --from=builder /opt/darkroom /opt/darkroom
-
-# Copy the Rust/GTK4 UI binary (the front-end launched by the desktop session)
+# The only artifact from the build stage: the standalone Rust GUI binary. No
+# /opt/darkroom C install, no darktable / darktable-cli symlinks.
 COPY --from=builder /src/target/release/darkroom-rs /usr/local/bin/darkroom-rs
 
-# Make darkroom binaries available system-wide. darkroom-cli is retained (the
-# Rust UI shells out to it for export/format paths); the C darkroom GUI stays
-# installed too, though the desktop session now launches the Rust darkroom-rs.
-RUN ln -s /opt/darkroom/bin/darktable /usr/local/bin/darkroom \
-    && ln -s /opt/darkroom/bin/darktable-cli /usr/local/bin/darkroom-cli \
-    && ldconfig
-
-# cont-init: runs as root before the desktop session; creates config dirs
-# with the correct ownership so the container user (PUID/PGID) can write them
+# cont-init: create config dirs with the runtime user's ownership (runs as root).
 COPY docker/cont-init-darkroom.sh /etc/cont-init.d/50-darkroom-dirs
 RUN chmod +x /etc/cont-init.d/50-darkroom-dirs
 
-# KasmVNC autostart: launch darkroom on container start
-# /defaults/autostart is a script file in the base image, not a directory
+# KasmVNC autostart: launch darkroom-rs in the desktop session.
 COPY docker/kasmvnc-autostart.sh /defaults/autostart
 RUN chmod +x /defaults/autostart
 
-# XDG data dirs so darkroom finds its share files
-ENV XDG_DATA_DIRS=/opt/darkroom/share:/usr/share:/usr/local/share
-ENV DARKROOM_DATADIR=/opt/darkroom/share/darktable
 ENV DARKROOM_CONFIGDIR=/config/darkroom
 ENV DARKROOM_CACHEDIR=/config/cache
-# The Rust UI (darkroom-rs) reads its catalog from this SQLite file — the same
-# library.db the C darktable writes under its configdir, so both share a catalog.
+# darkroom-rs reads its catalog from this SQLite file.
 ENV DARKROOM_LIBRARY_DB=/config/darkroom/library.db
-# Force GTK4's software (Cairo) renderer. KasmVNC provides only a software X
-# server with no real GPU; GSK's default GL renderer renders a black window (or
-# fails to create a context) under it — the same black-framebuffer failure the
-# C GTK3 app hit here. Cairo sidesteps the GL/EGL/llvmpipe path entirely.
+# Force GTK4's software (Cairo) renderer — KasmVNC has no real GPU, and GSK's
+# default GL renderer draws a black window under it.
 ENV GSK_RENDERER=cairo
+# No accessibility bus in the container; disable a11y so GTK doesn't warn on every
+# launch about the missing org.a11y.Bus (GTK's own suggested remedy).
+ENV GTK_A11Y=none
 
-# Photos and config are mounted as volumes
 VOLUME ["/photos", "/config"]
 
-# KasmVNC ports (HTTP + HTTPS)
 EXPOSE 3000 3001
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
