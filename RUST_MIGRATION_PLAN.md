@@ -1217,6 +1217,23 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    fallback in `dialogs::export_images_async` → strip the CMake C build from the
    Dockerfile (cargo-only) → retire `CMakeLists.txt` + `build.sh`.
 
+   **m4-71** (`1d74f84407`) — **CMake-free container image** `docker/Dockerfile.
+   cargo-native`: builds/ships only `darkroom-rs` (no CMake, no C darktable, no
+   cli). Kept separate from the untouched production `docker/Dockerfile` to prove
+   the path A/B before flipping production. Shallow clone without submodules
+   (C-only); GTK4/adwaita runtime only. Added `librsvg2-common` (the SVG pixbuf
+   loader the `*-symbolic.svg` UI icons need — architect M1) + `GTK_A11Y=none`.
+   Validated headlessly: build ✓, `ldd` fully resolved, SVG loader registered,
+   container boots and darkroom-rs stays up 80s with **0 autostart restarts**.
+   heic/heif/avif export degrades gracefully (no cli). GUI rendering still needs a
+   display to eyeball. **Next m5 steps:** verify the GUI live (display), decide
+   heic/avif (drop vs keep cli optional), then flip production to cargo-only +
+   retire CMakeLists/build.sh.
+   - **Discovered bug (pre-existing, follow-up):** darkroom-rs logs one
+     `Gtk-CRITICAL gtk_box_append: gtk_widget_get_parent(child) == NULL` at
+     startup — a child appended while already parented; non-fatal, affects the
+     full image too. Surface with `xvfb-run darkroom-rs` + grep Gtk-CRITICAL.
+
    **Before the Dockerfile-strip step, confirm each thing the C `install`
    currently provides to the runtime is Rust-side, not C-install-side** (checklist
    so the strip isn't a surprise break):
