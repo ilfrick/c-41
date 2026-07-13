@@ -328,6 +328,48 @@ pub fn apply_pipeline(
     outbuf
 }
 
+/// 16-bit sibling of [`apply_pipeline`] for the non-raw **export** path: packed
+/// RGB `u16` sRGB in → packed RGB `u16` sRGB out, with the colour pipeline applied
+/// in linear `f32`. Unlike the 8-bit preview path this preserves a 16-bit source's
+/// precision and cuts requantisation banding on an edited gradient. Empty pipeline
+/// ⇒ **byte-exact passthrough**, so an unedited 16-bit source round-trips
+/// losslessly. Input is always tightly packed (rowstride = `width*3`, 3 channels;
+/// the export compositor flattens alpha over white before calling this).
+pub fn apply_pipeline_rgb16(
+    base: &[u16],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+) -> Vec<u16> {
+    let n = width.saturating_mul(height);
+    if width == 0 || height == 0 || base.len() < n * 3 {
+        return base.to_vec();
+    }
+    let pipeline = params.to_pipeline();
+    if pipeline.stages.is_empty() {
+        return base.to_vec(); // no edit ⇒ lossless 16-bit passthrough
+    }
+    // sRGB (16-bit) → linear f32 RGBA; 4th channel = 1.0 scratch (exposure scales
+    // all four), discarded on scatter.
+    let mut rgba = vec![0.0f32; n * 4];
+    for i in 0..n {
+        for c in 0..3 {
+            rgba[i * 4 + c] =
+                darkroom_core::color::srgb_to_linear(base[i * 3 + c] as f32 / 65535.0);
+        }
+        rgba[i * 4 + 3] = 1.0;
+    }
+    let processed = pipeline.process(&rgba);
+    let mut out = vec![0u16; n * 3];
+    for i in 0..n {
+        for c in 0..3 {
+            let enc = darkroom_core::color::linear_to_srgb(processed[i * 4 + c]);
+            out[i * 3 + c] = (enc.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+        }
+    }
+    out
+}
+
 /// Run the preview pipeline on a packed **linear Rec.2020** RGBA `f32` buffer
 /// (the raw path decodes to the Rec.2020 working space, values possibly >1.0),
 /// convert to sRGB, and encode to tightly-packed 8-bit sRGB **RGB** for display.

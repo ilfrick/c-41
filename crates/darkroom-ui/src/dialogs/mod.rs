@@ -341,18 +341,46 @@ fn is_rust_image_path(path: &str) -> bool {
         .is_some_and(|e| RUST_IMAGE_EXTENSIONS.contains(&e.as_str()))
 }
 
+/// Flatten an 8-bit RGBA `image` buffer over a white matte into packed RGB. A
+/// plain `to_rgb8()` would drop alpha and leave arbitrary under-pixels (often
+/// black) in transparent regions; white is the conventional export matte. Opaque
+/// pixels (a=255) pass through byte-for-byte.
+fn composite_rgba8_over_white(rgba: &image::RgbaImage) -> Vec<u8> {
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let mut rgb = vec![0u8; w * h * 3];
+    for (i, px) in rgba.pixels().enumerate() {
+        let a = px[3] as u32;
+        for c in 0..3 {
+            rgb[i * 3 + c] = ((px[c] as u32 * a + 255 * (255 - a)) / 255) as u8;
+        }
+    }
+    rgb
+}
+
+/// 16-bit sibling of [`composite_rgba8_over_white`] (channel max 65535). Opaque
+/// pixels (a=65535) pass through byte-for-byte, so a 16-bit source stays lossless.
+fn composite_rgba16_over_white(rgba: &image::ImageBuffer<image::Rgba<u16>, Vec<u16>>) -> Vec<u16> {
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let mut rgb = vec![0u16; w * h * 3];
+    for (i, px) in rgba.pixels().enumerate() {
+        let a = px[3] as u64;
+        for c in 0..3 {
+            rgb[i * 3 + c] = ((px[c] as u64 * a + 65535 * (65535 - a)) / 65535) as u16;
+        }
+    }
+    rgb
+}
+
 /// Export a **non-raw** image (JPEG/PNG/TIFF) through the Rust pipeline, applying
-/// the same colour [`apply_pipeline`] as the darkroom preview's non-raw path
-/// (geometry/demosaic are raw-only, so ignored) → optional resize → encode.
+/// the same colour pipeline as the darkroom preview's non-raw path (geometry/
+/// demosaic are raw-only, so ignored) → optional resize → encode. **JPEG is 8-bit**
+/// (its container is); **PNG/TIFF are 16-bit** (via [`crate::preview::
+/// apply_pipeline_rgb16`]) so a 16-bit source round-trips losslessly and an edited
+/// gradient doesn't band. Alpha is composited over white before the pipeline.
 ///
-/// NOT byte-identical WYSIWYG with the on-screen preview, for two honest reasons:
-/// - The *decoder* differs — the preview decodes via GdkPixbuf, this via the
-///   `image` crate — so for JPEG the base pixels can differ ±1-2 LSB (different
-///   IDCT/upsampling); PNG/TIFF are lossless and agree in practice.
-/// - Output is 8-bit and transparency is composited over white here. A 16-bit
-///   TIFF/PNG source is truncated to 8-bit *before* the pipeline, so an edited
-///   smooth gradient can band vs darktable-cli's end-to-end 16-bit path — a known
-///   parity gap (16-bit-in/out is a follow-up).
+/// NOT byte-identical WYSIWYG with the on-screen preview: the preview decodes via
+/// GdkPixbuf, this via the `image` crate (JPEG base pixels ±1-2 LSB; PNG/TIFF
+/// agree), and the preview is 8-bit whereas PNG/TIFF export is 16-bit.
 ///
 /// Atomic + fsync-durable write via [`atomic_write`], like the raw path.
 fn render_nonraw_export(
@@ -369,50 +397,50 @@ fn render_nonraw_export(
         .with_guessed_format()
         .map_err(|e| anyhow::anyhow!("probe {path}: {e}"))?
         .decode()
-        .map_err(|e| anyhow::anyhow!("decode {path}: {e}"))?
-        .to_rgba8();
+        .map_err(|e| anyhow::anyhow!("decode {path}: {e}"))?;
     let (w, h) = (decoded.width() as usize, decoded.height() as usize);
-
-    // Composite over white into packed RGB before the pipeline: a plain to_rgb8()
-    // would drop alpha and leave arbitrary under-pixels (often black) in
-    // transparent regions; white is the conventional export matte (JPEG can't hold
-    // alpha anyway). Opaque pixels (a=255) pass through byte-for-byte.
-    let mut rgb = vec![0u8; w * h * 3];
-    for (i, px) in decoded.pixels().enumerate() {
-        let a = px[3] as u32;
-        for c in 0..3 {
-            rgb[i * 3 + c] = ((px[c] as u32 * a + 255 * (255 - a)) / 255) as u8;
-        }
-    }
-
-    // Same colour pipeline the non-raw preview runs (packed RGB, rowstride w*3, 3
-    // channels). Empty pipeline (default non-raw params) is a byte-exact
-    // passthrough, so an unedited opaque non-raw is just decode → re-encode.
-    let processed = crate::preview::apply_pipeline(&rgb, w, h, w * 3, 3, params);
     let dest_ext = format!("{dest}.{}", settings.format.out_ext());
     let target = settings
         .resize
         .as_ref()
         .map(|r| crate::export::fit_within(w as u32, h as u32, r));
 
-    atomic_write(&dest_ext, move |out| {
-        let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, processed)
-            .ok_or_else(|| anyhow::anyhow!("empty render"))?;
-        if let Some((tw, th)) = target {
-            buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+    match settings.format {
+        // JPEG is an 8-bit container — decode + process at 8-bit.
+        ExportFormat::Jpeg => {
+            let rgb = composite_rgba8_over_white(&decoded.to_rgba8());
+            let processed = crate::preview::apply_pipeline(&rgb, w, h, w * 3, 3, params);
+            atomic_write(&dest_ext, move |out| {
+                let mut buf: ImageBuffer<Rgb<u8>, _> =
+                    ImageBuffer::from_raw(w as u32, h as u32, processed)
+                        .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+                if let Some((tw, th)) = target {
+                    buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+                }
+                write_jpeg_rgb8(&buf, settings.quality, out)
+            })
         }
-        match settings.format {
-            ExportFormat::Jpeg => write_jpeg_rgb8(&buf, settings.quality, out)?,
-            ExportFormat::Png | ExportFormat::Tiff => {
-                let fmt = match settings.format {
-                    ExportFormat::Png => image::ImageFormat::Png,
-                    _ => image::ImageFormat::Tiff,
-                };
-                buf.save_with_format(out, fmt).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-            }
+        // PNG/TIFF at 16-bit: preserve a 16-bit source's precision and cut
+        // requantisation banding on an edited gradient (an unedited 16-bit source
+        // is a lossless passthrough via apply_pipeline_rgb16).
+        ExportFormat::Png | ExportFormat::Tiff => {
+            let rgb = composite_rgba16_over_white(&decoded.to_rgba16());
+            let processed = crate::preview::apply_pipeline_rgb16(&rgb, w, h, params);
+            let fmt = match settings.format {
+                ExportFormat::Png => image::ImageFormat::Png,
+                _ => image::ImageFormat::Tiff,
+            };
+            atomic_write(&dest_ext, move |out| {
+                let mut buf: ImageBuffer<Rgb<u16>, _> =
+                    ImageBuffer::from_raw(w as u32, h as u32, processed)
+                        .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+                if let Some((tw, th)) = target {
+                    buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+                }
+                buf.save_with_format(out, fmt).map_err(|e| anyhow::anyhow!("encode: {e}"))
+            })
         }
-        Ok(())
-    })
+    }
 }
 
 // ── Import folder dialog ──────────────────────────────────────────────────
@@ -783,6 +811,75 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_nonraw_export_16bit_is_lossless_png_and_tiff() {
+        use image::{ImageBuffer, Rgb};
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_nonraw16_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 16-bit values whose low byte is non-zero — the old 8-bit path would
+        // have dropped it. from_fn keeps them distinct per pixel.
+        let img: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::from_fn(3, 2, |x, y| {
+            Rgb([0x1234 + x as u16, 0xABCD, 0x00FF + y as u16])
+        });
+        let src = dir.join("in16.png");
+        img.save(&src).unwrap();
+
+        // Default params ⇒ empty pipeline ⇒ the 16-bit source must round-trip
+        // EXACTLY through BOTH 16-bit encoders (PNG and TIFF are distinct branches
+        // of save_with_format — a silent 8-bit downconvert in either would fail).
+        for format in [
+            crate::export::ExportFormat::Png,
+            crate::export::ExportFormat::Tiff,
+        ] {
+            let ext = format.out_ext();
+            let dest = dir.join(format!("out_{ext}"));
+            let settings = crate::export::ExportSettings {
+                format,
+                quality: 90,
+                resize: None,
+            };
+            render_nonraw_export(
+                src.to_str().unwrap(),
+                dest.to_str().unwrap(),
+                &settings,
+                &crate::preview::PreviewParams::default(),
+            )
+            .unwrap();
+
+            let out = image::ImageReader::open(format!("{}.{ext}", dest.to_str().unwrap()))
+                .unwrap()
+                .decode()
+                .unwrap()
+                .to_rgb16();
+            assert_eq!(out.as_raw(), img.as_raw(), "16-bit {ext} passthrough must be lossless");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn composite_rgba16_over_white_blends_alpha() {
+        use image::{ImageBuffer, Rgba};
+        // opaque red | fully transparent | half-alpha black-over-white.
+        let rgba: ImageBuffer<Rgba<u16>, Vec<u16>> = ImageBuffer::from_fn(3, 1, |x, _| match x {
+            0 => Rgba([0x8000, 0, 0, 0xFFFF]),      // opaque ⇒ unchanged
+            1 => Rgba([0x1111, 0x2222, 0x3333, 0]), // transparent ⇒ white
+            _ => Rgba([0, 0, 0, 0x8000]),           // half alpha, black over white
+        });
+        let out = composite_rgba16_over_white(&rgba);
+        assert_eq!(&out[0..3], &[0x8000, 0, 0], "opaque must pass through");
+        assert_eq!(&out[3..6], &[0xFFFF, 0xFFFF, 0xFFFF], "transparent must be white");
+        // a=0x8000, src=0 ⇒ (0 + 65535*(65535-32768))/65535 = 32767 = 0x7FFF.
+        assert_eq!(&out[6..9], &[0x7FFF, 0x7FFF, 0x7FFF], "half-alpha black over white");
     }
 
     #[test]
