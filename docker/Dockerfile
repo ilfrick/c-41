@@ -1,5 +1,9 @@
 # Darkroom – GPU-accelerated photo editor in a container
 #
+# This is the full image (CMake C build + darktable-cli + the Rust GUI). The
+# CMake-free cargo-only variant is docker/Dockerfile.cargo-native — keep the
+# runtime stages (scripts, ENV, HEALTHCHECK) in sync; milestone 5 collapses them.
+#
 # Build:
 #   docker build -t darkroom -f docker/Dockerfile .
 #

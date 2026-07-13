@@ -1,0 +1,116 @@
+# Darkroom — CMake-free (cargo-native) container image.
+#
+# The milestone-5 target: build and ship the Rust/GTK4 front-end (darkroom-rs)
+# with NO CMake and NO C darktable. Unlike docker/Dockerfile, this does not build
+# the C app at all — so there is no `darktable-cli`, which means exporting a
+# heic/heif/avif SOURCE (the only remaining cli user) is unavailable here and
+# fails gracefully with a logged message. Everything else (all raws + JPEG/PNG/
+# TIFF) develops through the pure-Rust pipeline.
+#
+# Build:
+#   docker build -t darkroom-cargo -f docker/Dockerfile.cargo-native .
+# From a fork/branch:
+#   docker build -t darkroom-cargo -f docker/Dockerfile.cargo-native \
+#     --build-arg DARKROOM_REPO=https://github.com/yourfork/darkroom.git \
+#     --build-arg DARKROOM_BRANCH=mybranch .
+# Run: same as docker/Dockerfile (ports 3000/3001, /photos + /config volumes).
+#
+# NOTE: the runtime contract (scripts, ENV, loader-cache regen, VOLUME, EXPOSE,
+# HEALTHCHECK) is intentionally kept in sync with docker/Dockerfile's runtime
+# stage. When milestone 5 makes production cargo-only, collapse the two files.
+
+# ─── Stage 1: Build (cargo only — no cmake, no C toolchain beyond cc) ─────────
+FROM ubuntu:24.04 AS builder
+
+ARG DARKROOM_REPO=https://github.com/ilfrick/darkroom.git
+ARG DARKROOM_BRANCH=master
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Only the Rust + GTK4 build deps. None of docker/Dockerfile's C-darktable dep
+# list (exiv2, lcms2, libraw, gmic, …) or cmake/ninja — the Rust workspace links
+# only system GTK4/libadwaita, and darkroom-sys uses committed bindings (no
+# libclang, no C source tree).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config git curl ca-certificates \
+    libgtk-4-dev libadwaita-1-dev libgraphene-1.0-dev \
+    libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal \
+    && rm -rf /root/.rustup/toolchains/*/share/doc
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# CACHEBUST invalidates the git-clone layer whenever the source changes (CI feeds
+# the commit SHA). No submodules: the C-only rawspeed/LibRaw submodules aren't
+# used by the cargo build (raw decode is the pure-Rust `rawloader` crate).
+ARG CACHEBUST=unknown
+RUN echo "source revision: ${CACHEBUST}" \
+    && git clone --depth 1 -b ${DARKROOM_BRANCH} ${DARKROOM_REPO} /src
+
+WORKDIR /src
+RUN cargo build --release -p darkroom --bin darkroom-rs
+
+# ─── Stage 2: Runtime ────────────────────────────────────────────────────────
+FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
+
+# Re-declare in this stage (ARGs are stage-scoped) so the source revision is
+# recorded on the image for `docker inspect`.
+ARG CACHEBUST=unknown
+
+LABEL maintainer="darkroom-project" \
+      org.opencontainers.image.title="Darkroom (cargo-native)" \
+      org.opencontainers.image.description="Rust/GTK4 photo editor — CMake-free build" \
+      org.opencontainers.image.source="https://github.com/ilfrick/darkroom" \
+      org.opencontainers.image.revision="${CACHEBUST}"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime deps: GTK4 + libadwaita and the desktop bits the Rust UI needs. NONE of
+# the C darktable runtime libraries — the C app isn't built or shipped here.
+# adwaita-icon-theme: symbolic icons libadwaita widgets draw (else blank glyphs).
+# gsettings-desktop-schemas: libadwaita reads org.gnome.desktop.interface; a
+#   missing schema makes GLib abort, so ship it even though we force no theme.
+# librsvg2-common: registers the gdk-pixbuf SVG loader (libpixbufloader-svg.so)
+#   — the whole UI chrome is `*-symbolic.svg` icons, so without it they render
+#   blank. The old image only got librsvg2-2 (the lib, not the loader) transitively
+#   via the C deps; install the loader explicitly rather than rely on that.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgtk-4-1 libadwaita-1-0 adwaita-icon-theme gsettings-desktop-schemas \
+    librsvg2-common \
+    libgdk-pixbuf2.0-bin shared-mime-info python3-xdg xkb-data \
+    && rm -rf /var/lib/apt/lists/* \
+    # Regenerate the GDK pixbuf loader cache so SVG icons load (binary not in PATH)
+    && (/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache || true) \
+    && update-mime-database /usr/share/mime
+
+# The only artifact from the build stage: the standalone Rust GUI binary. No
+# /opt/darkroom C install, no darktable / darktable-cli symlinks.
+COPY --from=builder /src/target/release/darkroom-rs /usr/local/bin/darkroom-rs
+
+# cont-init: create config dirs with the runtime user's ownership (runs as root).
+COPY docker/cont-init-darkroom.sh /etc/cont-init.d/50-darkroom-dirs
+RUN chmod +x /etc/cont-init.d/50-darkroom-dirs
+
+# KasmVNC autostart: launch darkroom-rs in the desktop session.
+COPY docker/kasmvnc-autostart.sh /defaults/autostart
+RUN chmod +x /defaults/autostart
+
+ENV DARKROOM_CONFIGDIR=/config/darkroom
+ENV DARKROOM_CACHEDIR=/config/cache
+# darkroom-rs reads its catalog from this SQLite file.
+ENV DARKROOM_LIBRARY_DB=/config/darkroom/library.db
+# Force GTK4's software (Cairo) renderer — KasmVNC has no real GPU, and GSK's
+# default GL renderer draws a black window under it.
+ENV GSK_RENDERER=cairo
+# No accessibility bus in the container; disable a11y so GTK doesn't warn on every
+# launch about the missing org.a11y.Bus (GTK's own suggested remedy).
+ENV GTK_A11Y=none
+
+VOLUME ["/photos", "/config"]
+
+EXPOSE 3000 3001
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:3000/ || exit 1
