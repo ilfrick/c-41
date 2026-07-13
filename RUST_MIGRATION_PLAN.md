@@ -1147,6 +1147,21 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    architect: APPROVE with minors, all applied before commit (alpha composite,
    doc-comments, non-passthrough test). darkroom-ui 139→142 tests.
 
+   **m4-70** (`f213fb5834`) — 16-bit non-raw PNG/TIFF export (m4-69 follow-up).
+   New `preview::apply_pipeline_rgb16` (16-bit sibling of `apply_pipeline`, packed
+   RGB u16, pipeline in f32; empty ⇒ byte-exact passthrough) leaves the 8-bit
+   preview hot path untouched. `render_nonraw_export` branches: JPEG → 8-bit,
+   PNG/TIFF → 16-bit (`to_rgba16` → composite → `apply_pipeline_rgb16` →
+   `save_with_format`). So an unedited 16-bit source round-trips losslessly and an
+   edit quantises to 16 bits (bands less); an 8-bit JPEG source → 16-bit PNG is
+   strictly ≥ the old output. Composite extracted to `composite_rgba8/16_over_white`.
+   Tests: lossless round-trip over BOTH PNG+TIFF (non-zero low bytes), a 16-bit
+   composite unit test (opaque/transparent/half-alpha). Opus architect: no
+   blockers, SHIP after the two tests (added). **Backlog nit:** resize runs in
+   gamma space (both paths, pre-existing) — resampling error now exceeds the
+   quantisation m4-70 removed; do linear-light resize before tightening further.
+   darkroom-ui 142→144 tests.
+
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
    rename/delete popover is leak-free + a11y-complete; the Rust UI runs in the
@@ -1187,11 +1202,12 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      tiff) also go Rust-native (`render_nonraw_export`, the preview's `apply_pipeline`
      over an `image`-crate decode, alpha composited over white). Remaining cli
      users: heic/heif/avif (no Rust decoder) + exotic raws `rawloader` can't decode
-     (no cli fallback on raw decode failure — counts as failed). Known parity gaps
-     (documented): non-raw export is 8-bit (16-bit TIFF/PNG source truncated
-     pre-pipeline); preview uses GdkPixbuf vs export's `image` crate (JPEG ±1-2 LSB).
-     **Blocker to full cli removal:** a Rust HEIF/AVIF decoder (or dropping those
-     formats) + 16-bit non-raw path + broad raw decode coverage.
+     (no cli fallback on raw decode failure — counts as failed). **m4-70:** non-raw
+     PNG/TIFF export is now **16-bit** (JPEG stays 8-bit), so a 16-bit source
+     round-trips losslessly and edited gradients band less. Remaining parity notes:
+     preview uses GdkPixbuf vs export's `image` crate (JPEG ±1-2 LSB); resize runs
+     in gamma space (pre-existing, both paths). **Blocker to full cli removal:** a
+     Rust HEIF/AVIF decoder (or dropping those formats) + broad raw decode coverage.
    - *Build:* CMake drives a `cargo build` of `darkroom-core` as a static lib
      linked into the C app, and builds the C `darktable`/`darktable-cli` the
      runtime still needs. Once the export fallback is gone, the C build (and thus
