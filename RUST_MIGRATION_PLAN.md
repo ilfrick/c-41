@@ -1181,10 +1181,28 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    detail shifts chroma on saturated edges. No live caller yet (core stage only,
    like Sigmoid m2-5a before UI m2-5b). Opus architect: no blockers; MAJOR 1 (rad
    clamp) + MAJOR 2 (threshold domain) + stale-doc + test gaps all fixed before
-   commit. darkroom-core pipeline 15→21 tests. **Follow-ups:** wire a Sharpen UI
-   slider (mapping threshold /100); planar-luma kernel (drop 4× scratch);
-   ratio-preserving RGB detail once Lab lands; per-stage band strategy (parallel
-   the pixel-local prefix, spatial stages whole-buffer).
+   commit. darkroom-core pipeline 15→21 tests.
+
+   **m4-74** (`7a98fb2085`) — Rec.2020↔XYZ↔Lab color infra + **faithful Lab-`L`
+   Sharpen** (first slice of the color-space-infrastructure scope). `color.rs`
+   gains `rec2020_to_xyz_d65`/`xyz_d65_to_rec2020` (standard BT.2020 D65, the
+   missing primitive) + `rec2020_to_lab`/`lab_to_rec2020` (compose the existing
+   CAT16 + XYZ↔Lab, carrying alpha — `apply_transposed_color_matrix` sums ch 0..2
+   so CAT16 zeroes ch 3). Sharpen upgraded from the m4-73 luminance-USM to the
+   bit-faithful darktable path: Rec.2020→Lab, unsharp-mask **L only** (a/b
+   untouched ⇒ no chroma shift), threshold now Lab-`L` [0,100] (0..100 UI slider
+   maps straight through); `amount==0`/small images short-circuit byte-exact. Two
+   dev bugs caught+fixed (inverse matrix stored un-transposed; alpha dropped
+   through CAT16). Opus architect independently re-derived the matrices from
+   primaries — correct + genuine inverses to ~5e-8; SHIP, no blockers.
+   darkroom-core 549→563 tests. **HARD PREREQUISITES before Sharpen gets a live UI
+   caller** (both latent now — no caller): **(M1)** make the pipeline working space
+   an explicit stage/context contract — Sharpen assumes linear Rec.2020, so a
+   non-raw (linear-sRGB) caller would misread the primaries and reintroduce the
+   chroma shift; **(M2)** scale the Gaussian sigma by the pipeline `roi->scale`,
+   else a downscaled preview under-sharpens vs full-res export (a WYSIWYG gap of
+   the m4-49/50 class). Other follow-ups: planar-L kernel (perf); per-stage band
+   strategy.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
