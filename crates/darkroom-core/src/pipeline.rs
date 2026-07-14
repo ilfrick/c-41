@@ -30,10 +30,6 @@
 
 use crate::iop::{channelmixer, exposure, sharpen, sigmoid, splittoning, velvia};
 
-/// Rec.2020 luminance weights (the pipeline works in linear Rec.2020). Used by
-/// [`Stage::Sharpen`] to build the luma channel it sharpens.
-const REC2020_LUMA: [f32; 3] = [0.2627, 0.6780, 0.0593];
-
 /// One configured pipeline stage, backed by a migrated darkroom-core IOP.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stage {
@@ -63,22 +59,19 @@ pub enum Stage {
         paper_power: f32,
     },
     /// Unsharp-mask sharpening — the first **spatial** stage (reads a
-    /// neighbourhood, so [`Stage::apply`] needs `(width, height)`). Sharpens a
-    /// Rec.2020 **luma** channel via the migrated separable-Gaussian
-    /// [`sharpen::darkroom_sharpen_process`] kernel, then adds the luma detail
-    /// back to R/G/B. `radius` sets the Gaussian; `amount` scales the added detail.
+    /// neighbourhood, so [`Stage::apply`] needs `(width, height)`). The faithful
+    /// darktable path: convert Rec.2020→**Lab**, unsharp-mask the **L** channel
+    /// only via the migrated separable-Gaussian [`sharpen::darkroom_sharpen_process`]
+    /// kernel (a/b untouched ⇒ **no chroma shift**), convert back. `radius` sets
+    /// the Gaussian; `amount` scales the L detail; **`threshold` is in Lab-`L`
+    /// units [0, 100]** (identical to darktable, so a 0..100 UI slider maps
+    /// straight through). Requires the RGB↔Lab infra from
+    /// [`crate::color::rec2020_to_lab`].
     ///
-    /// **`threshold` is in LINEAR-luma units (~[0, 1])**, NOT darktable's Lab-`L`
-    /// [0, 100]: this pipeline sharpens scene-linear Rec.2020 luma, so a caller
-    /// mapping a 0..100 darktable slider must divide by ~100 — a raw 100 here
-    /// zeroes all detail (`apply` `debug_assert!`s `threshold <= 1.0` as a
-    /// tripwire).
-    ///
-    /// This is a luminance unsharp mask, NOT the bit-exact darktable Lab-`L`
-    /// sharpen (which needs the RGB↔Lab color-space infra — a separate
-    /// migration): adding one scalar detail to all of R/G/B shifts chroma on
-    /// saturated edges (desaturates on overshoot). A ratio-preserving variant is
-    /// the upgrade once Lab lands.
+    /// **Assumes the buffer is linear Rec.2020** (the raw working space). The
+    /// non-raw path currently works in linear sRGB; a working-space contract on
+    /// the pipeline will generalise this (until then Sharpen has no non-raw
+    /// caller).
     Sharpen { radius: f32, threshold: f32, amount: f32 },
 }
 
@@ -204,37 +197,34 @@ impl Stage {
                 }
             }
             Stage::Sharpen { radius, threshold, amount } => {
-                // threshold is linear-luma (~[0,1]), not darktable's Lab-L [0,100]
-                // — catch a mis-mapped 0..100 slider value loudly (see the doc).
-                debug_assert!(threshold <= 1.0, "Sharpen threshold is linear-luma (~[0,1]); got {threshold}");
-                let n = width * height;
-                // Sharpen the Rec.2020 luma: pack (luma,0,0,0), run the migrated
-                // separable-Gaussian unsharp kernel (it sharpens channel 0), then
-                // add the resulting luma detail back to R/G/B (luminance unsharp
-                // mask — shifts chroma on saturated edges; see the Stage doc).
-                // Alpha (ch 3) passes through.
-                // TODO(perf): luma_in/out are n*4 but only ch 0 is used — a
-                // planar-luma (stride-1) kernel would cut ~75% of this scratch and
-                // the wasted chroma/border work at export scale.
-                let mut luma_in = vec![0.0f32; n * 4];
-                for p in 0..n {
-                    let i = p * 4;
-                    luma_in[i] = REC2020_LUMA[0] * input[i]
-                        + REC2020_LUMA[1] * input[i + 1]
-                        + REC2020_LUMA[2] * input[i + 2];
-                }
                 let (rad, mat) = gaussian_kernel(radius);
-                let mut luma_out = vec![0.0f32; n * 4];
-                // Kernel needs width,height >= 2*rad+1; below that it can't form
-                // an interior, so copy through (no sharpening) — matches the C
-                // caller's small-image fast path.
-                if width > 2 * rad && height > 2 * rad {
-                    // Safety: luma_in/luma_out are exactly n*4 floats and `mat` is
+                if amount == 0.0 || width <= 2 * rad || height <= 2 * rad {
+                    // Disabled (amount 0) or too small for a kernel interior ⇒ no
+                    // sharpening. Copy through directly (skip the Lab round-trip) —
+                    // keeps a no-op / small image byte-exact.
+                    output.copy_from_slice(input);
+                } else {
+                    // Faithful darktable sharpen: unsharp-mask the Lab L channel
+                    // only. Rec.2020 → Lab (L,a,b,A), sharpen ch 0 (= L) via the
+                    // migrated kernel (a/b pass through), Lab → Rec.2020.
+                    // TODO(perf): only L is sharpened but we round-trip a/b too; a
+                    // planar-L kernel + reusing input a/b would cut the scratch.
+                    let n = width * height;
+                    let mut lab_in = vec![0.0f32; n * 4];
+                    for p in 0..n {
+                        let i = p * 4;
+                        let lab = crate::color::rec2020_to_lab([
+                            input[i], input[i + 1], input[i + 2], input[i + 3],
+                        ]);
+                        lab_in[i..i + 4].copy_from_slice(&lab);
+                    }
+                    let mut lab_out = vec![0.0f32; n * 4];
+                    // Safety: lab_in/lab_out are exactly n*4 floats and `mat` is
                     // 2*rad+1 taps — the kernel's documented contract.
                     unsafe {
                         sharpen::darkroom_sharpen_process(
-                            luma_in.as_ptr(),
-                            luma_out.as_mut_ptr(),
+                            lab_in.as_ptr(),
+                            lab_out.as_mut_ptr(),
                             mat.as_ptr(),
                             width,
                             height,
@@ -243,16 +233,15 @@ impl Stage {
                             amount,
                         );
                     }
-                } else {
-                    luma_out.copy_from_slice(&luma_in);
-                }
-                for p in 0..n {
-                    let i = p * 4;
-                    let detail = luma_out[i] - luma_in[i];
-                    output[i] = input[i] + detail;
-                    output[i + 1] = input[i + 1] + detail;
-                    output[i + 2] = input[i + 2] + detail;
-                    output[i + 3] = input[i + 3];
+                    for p in 0..n {
+                        let i = p * 4;
+                        // Sharpened L from lab_out; original a/b/alpha (read from
+                        // lab_in / input, independent of the kernel's passthrough).
+                        let rgb = crate::color::lab_to_rec2020([
+                            lab_out[i], lab_in[i + 1], lab_in[i + 2], input[i + 3],
+                        ]);
+                        output[i..i + 4].copy_from_slice(&rgb);
+                    }
                 }
             }
         }
@@ -619,8 +608,10 @@ mod tests {
             radius: 2.0, threshold: 0.0, amount: 1.0,
         }]);
         let out = p.process(&flat, w, h);
+        // Tolerance covers the Rec.2020→Lab→Rec.2020 round-trip (not bit-exact);
+        // the point is that a flat field gains no sharpening detail.
         for (o, i) in out.iter().zip(flat.iter()) {
-            assert!((o - i).abs() < 1e-5, "flat sharpen changed a pixel");
+            assert!((o - i).abs() < 1e-3, "flat sharpen changed a pixel: {o} vs {i}");
         }
     }
 
@@ -645,9 +636,10 @@ mod tests {
         // Interior pixel just right of the edge overshoots above 0.8.
         let right = (8 * w + w / 2) * 4;
         assert!(out[right] > 0.8 + 1e-3, "no overshoot at edge: {}", out[right]);
-        // A flat interior pixel far from the edge is unchanged.
+        // A flat interior pixel far from the edge is ~unchanged (Lab round-trip
+        // tolerance).
         let flat = (8 * w + 2) * 4;
-        assert!((out[flat] - 0.2).abs() < 1e-4, "flat region changed: {}", out[flat]);
+        assert!((out[flat] - 0.2).abs() < 1e-3, "flat region changed: {}", out[flat]);
     }
 
     #[test]

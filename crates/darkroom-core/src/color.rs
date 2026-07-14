@@ -154,6 +154,57 @@ pub fn xyz_d65_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], xyz[3]]
 }
 
+// ── Rec.2020 (D65) ↔ XYZ ─────────────────────────────────────────────────────
+// BT.2020 primaries, D65 white. Stored transposed (M[in][out]) like the sRGB
+// matrices above: out[o] = sum_c M[c][o] * in[c]. The Rec.2020 luma row
+// (0.2627, 0.6780, 0.0593) matches `pipeline::REC2020_LUMA`.
+
+const REC2020_TO_XYZ_D65_T: [[f32; 3]; 3] = [
+    [0.6369580, 0.2627002, 0.0000000],  // R → X,Y,Z
+    [0.1446169, 0.6779981, 0.0280727],  // G → X,Y,Z
+    [0.1688810, 0.0593017, 1.0609851],  // B → X,Y,Z
+];
+
+const XYZ_D65_TO_REC2020_T: [[f32; 3]; 3] = [
+    [ 1.7166512, -0.6666844,  0.0176399],  // X → R,G,B
+    [-0.3556708,  1.6164812, -0.0427706],  // Y → R,G,B
+    [-0.2533663,  0.0157685,  0.9421031],  // Z → R,G,B
+];
+
+/// Linear **Rec.2020** (D65) → XYZ (D65). Alpha (ch 3) passes through.
+pub fn rec2020_to_xyz_d65(rgb: [f32; 4]) -> [f32; 4] {
+    let xyz: [f32; 3] = std::array::from_fn(|o|
+        REC2020_TO_XYZ_D65_T[0][o]*rgb[0] + REC2020_TO_XYZ_D65_T[1][o]*rgb[1] + REC2020_TO_XYZ_D65_T[2][o]*rgb[2]
+    );
+    [xyz[0], xyz[1], xyz[2], rgb[3]]
+}
+
+/// XYZ (D65) → linear **Rec.2020** (D65). Alpha passes through.
+pub fn xyz_d65_to_rec2020(xyz: [f32; 4]) -> [f32; 4] {
+    let rgb: [f32; 3] = std::array::from_fn(|o|
+        XYZ_D65_TO_REC2020_T[0][o]*xyz[0] + XYZ_D65_TO_REC2020_T[1][o]*xyz[1] + XYZ_D65_TO_REC2020_T[2][o]*xyz[2]
+    );
+    [rgb[0], rgb[1], rgb[2], xyz[3]]
+}
+
+/// Linear **Rec.2020** (D65) → **Lab** (D50): Rec.2020→XYZ(D65)→XYZ(D50, CAT16)→
+/// Lab. The composition the pipeline's Rec.2020 working space needs to run Lab-
+/// domain IOPs (e.g. the sharpen L channel). Alpha passes through.
+pub fn rec2020_to_lab(rgb: [f32; 4]) -> [f32; 4] {
+    let xyz65 = rec2020_to_xyz_d65(rgb);
+    let mut lab = xyz_to_lab(xyz_d65_to_d50(&xyz65));
+    lab[3] = rgb[3]; // the CAT16 helper zeroes ch 3 — carry the original alpha
+    lab
+}
+
+/// **Lab** (D50) → linear **Rec.2020** (D65): the inverse of [`rec2020_to_lab`].
+pub fn lab_to_rec2020(lab: [f32; 4]) -> [f32; 4] {
+    let xyz50 = lab_to_xyz(lab);
+    let mut rgb = xyz_d65_to_rec2020(xyz_d50_to_d65(&xyz50));
+    rgb[3] = lab[3]; // carry alpha (CAT16 zeroes ch 3)
+    rgb
+}
+
 // ── sRGB transfer function (encoded ↔ linear) ────────────────────────────────
 // The matrices above operate on *linear* sRGB; these convert between the
 // gamma-encoded sRGB a display/8-bit image stores and linear light. Standard
@@ -1179,5 +1230,66 @@ mod gamut_tests {
     fn ych_max_chroma_matches_c_reference() {
         let got = ych_max_chroma(&MATRIX_OUT, 1.0, 0.5, 0.6, 0.8);
         assert!(close(got, 0.175473303, 1e-6), "got={got}");
+    }
+}
+
+#[cfg(test)]
+mod rec2020_tests {
+    use super::*;
+
+    fn close4(a: [f32; 4], b: [f32; 4], eps: f32) -> bool {
+        (0..4).all(|i| (a[i] - b[i]).abs() < eps)
+    }
+
+    #[test]
+    fn rec2020_xyz_round_trips() {
+        // Real f32 round-trip is ~5e-8; 1e-5 stays far below it yet ~600× under the
+        // transpose bug this caught (~6e-2), so it's a sensitive asymmetry guard.
+        for rgb in [[0.3, 0.5, 0.7, 1.0], [0.9, 0.1, 0.4, 0.5], [1.0, 1.0, 1.0, 1.0]] {
+            let back = xyz_d65_to_rec2020(rec2020_to_xyz_d65(rgb));
+            assert!(close4(rgb, back, 1e-5), "rgb={rgb:?} back={back:?}");
+        }
+    }
+
+    #[test]
+    fn rec2020_white_is_neutral_lab_l100() {
+        // Rec.2020 [1,1,1] is the D65 white; through CAT16→D50→Lab it must land on
+        // neutral a≈0, b≈0 (L=100 holds even WITHOUT adaptation — the a/b≈0 is what
+        // proves the CAT16 D65→D50 chain; without it b≈-19).
+        let lab = rec2020_to_lab([1.0, 1.0, 1.0, 1.0]);
+        assert!((lab[0] - 100.0).abs() < 0.05, "L={}", lab[0]);
+        assert!(lab[1].abs() < 0.05 && lab[2].abs() < 0.05, "a={} b={}", lab[1], lab[2]);
+    }
+
+    #[test]
+    fn rec2020_lab_round_trips() {
+        for rgb in [[0.2, 0.4, 0.6, 1.0], [0.8, 0.2, 0.5, 1.0], [0.05, 0.9, 0.3, 1.0]] {
+            let back = lab_to_rec2020(rec2020_to_lab(rgb));
+            assert!(close4(rgb, back, 1e-5), "rgb={rgb:?} back={back:?}");
+        }
+    }
+
+    #[test]
+    fn rec2020_and_srgb_lab_agree_on_neutral_grey() {
+        // Cross-check the two independent Lab entry points: a spectrally neutral
+        // grey must be neutral (a≈0,b≈0) in both, with equal L (both spaces
+        // normalise white to Y=1, so a grey's luminance — hence L — matches). Pins
+        // the Rec.2020 and sRGB matrix sets together against future drift.
+        for v in [0.1f32, 0.4, 0.8] {
+            let lab_rec = rec2020_to_lab([v, v, v, 1.0]);
+            let lab_srgb = xyz_to_lab(srgb_to_xyz_d50([v, v, v, 1.0]));
+            assert!(lab_rec[1].abs() < 0.1 && lab_rec[2].abs() < 0.1, "rec2020 grey: {lab_rec:?}");
+            assert!(lab_srgb[1].abs() < 0.1 && lab_srgb[2].abs() < 0.1, "srgb grey: {lab_srgb:?}");
+            assert!((lab_rec[0] - lab_srgb[0]).abs() < 0.2, "L mismatch: {} vs {}", lab_rec[0], lab_srgb[0]);
+        }
+    }
+
+    #[test]
+    fn rec2020_y_row_matches_luma_weights() {
+        // The Y (luminance) row of Rec.2020→XYZ must equal the luma weights the
+        // pipeline's Sharpen used (0.2627, 0.6780, 0.0593), to ~4 decimals.
+        assert!((REC2020_TO_XYZ_D65_T[0][1] - 0.2627).abs() < 1e-3);
+        assert!((REC2020_TO_XYZ_D65_T[1][1] - 0.6780).abs() < 1e-3);
+        assert!((REC2020_TO_XYZ_D65_T[2][1] - 0.0593).abs() < 1e-3);
     }
 }
