@@ -215,7 +215,8 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    real-image bug — shows as colour-swap/zippering). That is the headline item on
    the X-Trans verification ticket. Remaining: (a) the deferred X-Trans visual
    check; (b) higher-quality Bayer demosaic (PPG is the current baseline; RCD/VNG
-   migrated); (c) ROI/(w,h) signature + geometry-aware IOPs; (d) OpenCL.
+   migrated); (c) ~~ROI/(w,h) signature + geometry-aware IOPs~~ **STARTED — m4-73**
+   (the `(width,height)` signature + first spatial stage, Sharpen); (d) OpenCL.
 3. *Darkroom interactions* — zoom/pan, histogram (**done, ui-16**),
    before/after toggle (**done, ui-17**), reset-all (**done, ui-19**), colour
    picker (**done, ui-20**: click-to-sample the processed pixel; pure
@@ -1161,6 +1162,29 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    gamma space (both paths, pre-existing) — resampling error now exceeds the
    quantisation m4-70 removed; do linear-light resize before tightening further.
    darkroom-ui 142→144 tests.
+
+   **m4-73** (`f0b843e18f`) — **ROI/(width,height) pipeline signature + first
+   spatial stage (Sharpen)**; the biggest architectural step for the pixel
+   pipeline (previously strictly per-pixel / size-agnostic). `Stage::apply` /
+   `Pipeline::process` / `process_band` now carry `(w,h)`; per-pixel stages ignore
+   them, `process` hard-asserts `w*h*4==len`. Parallel safety reuses the m4-59
+   `is_pixel_local` gate: the band-parallel path only runs when every stage is
+   pixel-local (passing each band as `(band_px,1)`); a single spatial stage forces
+   the SERIAL whole-buffer path where it sees the true rectangle. **Sharpen**
+   (`is_pixel_local=false`): `gaussian_kernel` faithfully ports sharpen.c
+   `init_gaussian_kernel` (sigma2 on uncapped radius, rad=ceil clamped to MAXR=12),
+   sharpens a Rec.2020 luma via the migrated `darkroom_sharpen_process`, adds the
+   luma detail back to R/G/B (luminance unsharp mask). **Documented caveats:** not
+   the bit-exact darktable Lab-`L` sharpen (needs RGB↔Lab color-space infra — a
+   separate migration); `threshold` is LINEAR-luma (~[0,1]) not Lab-L [0,100] (a
+   100× footgun for a future UI, guarded by a debug_assert tripwire); equal RGB
+   detail shifts chroma on saturated edges. No live caller yet (core stage only,
+   like Sigmoid m2-5a before UI m2-5b). Opus architect: no blockers; MAJOR 1 (rad
+   clamp) + MAJOR 2 (threshold domain) + stale-doc + test gaps all fixed before
+   commit. darkroom-core pipeline 15→21 tests. **Follow-ups:** wire a Sharpen UI
+   slider (mapping threshold /100); planar-luma kernel (drop 4× scratch);
+   ratio-preserving RGB detail once Lab lands; per-stage band strategy (parallel
+   the pixel-local prefix, spatial stages whole-buffer).
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
