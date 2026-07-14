@@ -310,7 +310,7 @@ pub fn apply_pipeline(
         }
     }
 
-    let processed = pipeline.process(&rgba);
+    let processed = pipeline.process(&rgba, width, height);
 
     // ── scatter colour back (linear → sRGB), preserving alpha + padding ────
     let mut outbuf = base.to_vec();
@@ -359,7 +359,7 @@ pub fn apply_pipeline_rgb16(
         }
         rgba[i * 4 + 3] = 1.0;
     }
-    let processed = pipeline.process(&rgba);
+    let processed = pipeline.process(&rgba, width, height);
     let mut out = vec![0u16; n * 3];
     for i in 0..n {
         for c in 0..3 {
@@ -422,7 +422,7 @@ pub fn render_linear_to_srgb16(
 /// `width*height*4` (callers guard the short case).
 fn srgb_encode_rgb(linear: &[f32], width: usize, height: usize, params: &PreviewParams) -> Vec<f32> {
     let n = width.saturating_mul(height);
-    let mut processed = params.to_pipeline().process(&linear[..n * 4]);
+    let mut processed = params.to_pipeline().process(&linear[..n * 4], width, height);
     // Working space (Rec.2020) → sRGB before the display OETF (m4-35).
     darkroom_core::rawimage::apply_color_matrix(
         &mut processed,
@@ -895,8 +895,8 @@ mod tests {
         };
         let velvia = Stage::Velvia { strength: 0.8, bias: 1.0 };
 
-        let canonical = Pipeline::with_stages(vec![sigmoid, velvia]).process(&lin);
-        let reversed = Pipeline::with_stages(vec![velvia, sigmoid]).process(&lin);
+        let canonical = Pipeline::with_stages(vec![sigmoid, velvia]).process(&lin, lin.len() / 4, 1);
+        let reversed = Pipeline::with_stages(vec![velvia, sigmoid]).process(&lin, lin.len() / 4, 1);
 
         assert!(
             canonical[0] > reversed[0],
