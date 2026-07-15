@@ -30,6 +30,20 @@
 
 use crate::iop::{channelmixer, exposure, sharpen, sigmoid, splittoning, velvia};
 
+/// The working colour space of the buffer a colour-space-dependent (Lab-domain)
+/// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
+/// (JPEG/PNG/TIFF) pipeline works in linear **sRGB**. The caller building the
+/// pipeline sets it on each such stage (e.g. [`Stage::Sharpen`]) so the stage
+/// converts RGB↔Lab through the correct primaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorSpace {
+    Rec2020,
+    LinearSrgb,
+}
+
+/// A packed-RGBA colour transform (RGB↔Lab), selected by [`ColorSpace`].
+type LabConv = fn([f32; 4]) -> [f32; 4];
+
 /// One configured pipeline stage, backed by a migrated darkroom-core IOP.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stage {
@@ -65,14 +79,12 @@ pub enum Stage {
     /// kernel (a/b untouched ⇒ **no chroma shift**), convert back. `radius` sets
     /// the Gaussian; `amount` scales the L detail; **`threshold` is in Lab-`L`
     /// units [0, 100]** (identical to darktable, so a 0..100 UI slider maps
-    /// straight through). Requires the RGB↔Lab infra from
-    /// [`crate::color::rec2020_to_lab`].
+    /// straight through). Requires the RGB↔Lab infra from `crate::color`.
     ///
-    /// **Assumes the buffer is linear Rec.2020** (the raw working space). The
-    /// non-raw path currently works in linear sRGB; a working-space contract on
-    /// the pipeline will generalise this (until then Sharpen has no non-raw
-    /// caller).
-    Sharpen { radius: f32, threshold: f32, amount: f32 },
+    /// `space` is the buffer's working colour space ([`ColorSpace`]): the caller
+    /// sets it so the L conversion uses the right primaries (Rec.2020 for raws,
+    /// linear sRGB for non-raws). No assumed working space.
+    Sharpen { radius: f32, threshold: f32, amount: f32, space: ColorSpace },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -130,6 +142,16 @@ impl Stage {
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
             Stage::Sharpen { .. } => false,
+        }
+    }
+
+    /// The working colour space this stage requires, if it is colour-space-
+    /// dependent (only [`Stage::Sharpen`] so far). `process` checks all such
+    /// stages agree — a pipeline processes ONE buffer, so it has one working space.
+    fn working_space(&self) -> Option<ColorSpace> {
+        match self {
+            Stage::Sharpen { space, .. } => Some(*space),
+            _ => None,
         }
     }
 
@@ -196,7 +218,7 @@ impl Stage {
                     );
                 }
             }
-            Stage::Sharpen { radius, threshold, amount } => {
+            Stage::Sharpen { radius, threshold, amount, space } => {
                 let (rad, mat) = gaussian_kernel(radius);
                 if amount == 0.0 || width <= 2 * rad || height <= 2 * rad {
                     // Disabled (amount 0) or too small for a kernel interior ⇒ no
@@ -205,17 +227,26 @@ impl Stage {
                     output.copy_from_slice(input);
                 } else {
                     // Faithful darktable sharpen: unsharp-mask the Lab L channel
-                    // only. Rec.2020 → Lab (L,a,b,A), sharpen ch 0 (= L) via the
-                    // migrated kernel (a/b pass through), Lab → Rec.2020.
+                    // only. RGB → Lab (L,a,b,A), sharpen ch 0 (= L) via the migrated
+                    // kernel (a/b pass through), Lab → RGB. The RGB↔Lab pair is
+                    // chosen by the buffer's working space (raw Rec.2020 vs non-raw
+                    // linear sRGB) so the L/primaries are correct for both.
                     // TODO(perf): only L is sharpened but we round-trip a/b too; a
                     // planar-L kernel + reusing input a/b would cut the scratch.
+                    let (to_lab, from_lab): (LabConv, LabConv) =
+                        match space {
+                            ColorSpace::Rec2020 => {
+                                (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020)
+                            }
+                            ColorSpace::LinearSrgb => {
+                                (crate::color::srgb_to_lab, crate::color::lab_to_srgb)
+                            }
+                        };
                     let n = width * height;
                     let mut lab_in = vec![0.0f32; n * 4];
                     for p in 0..n {
                         let i = p * 4;
-                        let lab = crate::color::rec2020_to_lab([
-                            input[i], input[i + 1], input[i + 2], input[i + 3],
-                        ]);
+                        let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
                         lab_in[i..i + 4].copy_from_slice(&lab);
                     }
                     let mut lab_out = vec![0.0f32; n * 4];
@@ -237,7 +268,7 @@ impl Stage {
                         let i = p * 4;
                         // Sharpened L from lab_out; original a/b/alpha (read from
                         // lab_in / input, independent of the kernel's passthrough).
-                        let rgb = crate::color::lab_to_rec2020([
+                        let rgb = from_lab([
                             lab_out[i], lab_in[i + 1], lab_in[i + 2], input[i + 3],
                         ]);
                         output[i..i + 4].copy_from_slice(&rgb);
@@ -292,6 +323,17 @@ impl Pipeline {
             width * height * 4 == input.len(),
             "Pipeline::process: (w,h)={width}x{height} doesn't match buffer len {}",
             input.len()
+        );
+        // One buffer ⇒ one working space: every colour-space-dependent stage
+        // (Sharpen) must agree, or a caller has handed the pipeline a
+        // self-inconsistent chain. (Only Sharpen carries a space today, so this is
+        // a forward guard.)
+        debug_assert!(
+            {
+                let mut spaces = self.stages.iter().filter_map(Stage::working_space);
+                spaces.next().is_none_or(|first| spaces.all(|s| s == first))
+            },
+            "colour-space-dependent stages disagree on the working space"
         );
         if self.stages.is_empty() {
             return input.to_vec();
@@ -581,7 +623,8 @@ mod tests {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
         assert!(
-            !Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0 }.is_pixel_local(),
+            !Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020 }
+                .is_pixel_local(),
             "sharpen reads neighbours ⇒ NOT pixel-local"
         );
     }
@@ -605,7 +648,7 @@ mod tests {
         let (w, h) = (16usize, 16usize);
         let flat = vec![0.4f32; w * h * 4];
         let p = Pipeline::with_stages(vec![Stage::Sharpen {
-            radius: 2.0, threshold: 0.0, amount: 1.0,
+            radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020,
         }]);
         let out = p.process(&flat, w, h);
         // Tolerance covers the Rec.2020→Lab→Rec.2020 round-trip (not bit-exact);
@@ -630,7 +673,7 @@ mod tests {
             }
         }
         let p = Pipeline::with_stages(vec![Stage::Sharpen {
-            radius: 2.0, threshold: 0.0, amount: 1.0,
+            radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020,
         }]);
         let out = p.process(&img, w, h);
         // Interior pixel just right of the edge overshoots above 0.8.
@@ -651,7 +694,7 @@ mod tests {
         let flat = vec![0.3f32; w * h * 4];
         let p = Pipeline::with_stages(vec![
             Stage::Exposure { black: 0.0, scale: 1.5 },
-            Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0 },
+            Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020 },
             Stage::Monochrome { r: 0.2627, g: 0.6780, b: 0.0593 },
         ]);
         let out = p.process(&flat, w, h);
@@ -672,8 +715,38 @@ mod tests {
         let img: Vec<f32> = (0..w * h * 4).map(|i| (i % 7) as f32 / 7.0).collect();
         let p = Pipeline::with_stages(vec![Stage::Sharpen {
             radius: 5.0, threshold: 0.0, amount: 1.0, // rad=5 ⇒ needs w,h > 10
+            space: ColorSpace::Rec2020,
         }]);
         assert_eq!(p.process(&img, w, h), img, "small image must pass through");
+    }
+
+    #[test]
+    fn sharpen_routes_conversion_by_working_space() {
+        // A COLOURED edge: Y (hence Lab L) differs between Rec.2020 and sRGB
+        // primaries, so the two working spaces must give different sharpening —
+        // proving `space` selects the RGB↔Lab pair rather than a hard-coded one.
+        let (w, h) = (16usize, 16usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = if x >= w / 2 { (0.8, 0.3, 0.5) } else { (0.1, 0.4, 0.2) };
+                let i = (y * w + x) * 4;
+                // Non-trivial alpha exercises the ch-3 passthrough in both paths.
+                img[i] = r; img[i + 1] = g; img[i + 2] = b; img[i + 3] = 0.5;
+            }
+        }
+        let mk = |space| {
+            Pipeline::with_stages(vec![Stage::Sharpen {
+                radius: 2.0, threshold: 0.0, amount: 1.0, space,
+            }])
+        };
+        let srgb = mk(ColorSpace::LinearSrgb).process(&img, w, h);
+        let rec = mk(ColorSpace::Rec2020).process(&img, w, h);
+        let right = (8 * w + w / 2) * 4;
+        let diff: f32 = (0..3).map(|c| (srgb[right + c] - rec[right + c]).abs()).sum();
+        assert!(diff > 1e-4, "working space did not change the sharpen result: {diff}");
+        assert_eq!(srgb[right + 3], 0.5, "srgb alpha preserved");
+        assert_eq!(rec[right + 3], 0.5, "rec2020 alpha preserved");
     }
 
     #[test]

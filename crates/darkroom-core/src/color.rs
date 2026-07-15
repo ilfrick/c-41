@@ -141,6 +141,20 @@ pub fn xyz_d50_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], xyz[3]]
 }
 
+/// Linear **sRGB** → **Lab** (D50): sRGB→XYZ(D50)→Lab. `srgb_to_xyz_d50`'s matrix
+/// is Bradford-adapted to D50 **by design** (dt_Rec709_to_XYZ_D50), so — unlike
+/// the Rec.2020 path (D65 primaries → explicit CAT16) — no CAT16 step belongs
+/// here, and alpha survives (no CAT16 helper to zero ch 3). The linear-sRGB
+/// working-space twin of [`rec2020_to_lab`].
+pub fn srgb_to_lab(rgb: [f32; 4]) -> [f32; 4] {
+    xyz_to_lab(srgb_to_xyz_d50(rgb))
+}
+
+/// **Lab** (D50) → linear **sRGB**: the inverse of [`srgb_to_lab`].
+pub fn lab_to_srgb(lab: [f32; 4]) -> [f32; 4] {
+    xyz_d50_to_srgb(lab_to_xyz(lab))
+}
+
 /// XYZ D65 → linear sRGB (matches dt_XYZ_to_Rec709_D65).
 pub fn xyz_d65_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
     const M: [[f32; 3]; 3] = [
@@ -1291,5 +1305,16 @@ mod rec2020_tests {
         assert!((REC2020_TO_XYZ_D65_T[0][1] - 0.2627).abs() < 1e-3);
         assert!((REC2020_TO_XYZ_D65_T[1][1] - 0.6780).abs() < 1e-3);
         assert!((REC2020_TO_XYZ_D65_T[2][1] - 0.0593).abs() < 1e-3);
+    }
+
+    #[test]
+    fn srgb_lab_round_trips_and_white_is_neutral() {
+        for rgb in [[0.2, 0.4, 0.6, 1.0], [0.8, 0.2, 0.5, 1.0], [0.05, 0.9, 0.3, 1.0]] {
+            let back = lab_to_srgb(srgb_to_lab(rgb));
+            assert!(close4(rgb, back, 1e-4), "rgb={rgb:?} back={back:?}");
+        }
+        // sRGB white is already D50-referenced → neutral Lab, no CAT16 involved.
+        let w = srgb_to_lab([1.0, 1.0, 1.0, 1.0]);
+        assert!((w[0] - 100.0).abs() < 0.05 && w[1].abs() < 0.05 && w[2].abs() < 0.05, "{w:?}");
     }
 }
