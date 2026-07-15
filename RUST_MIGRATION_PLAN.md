@@ -84,9 +84,10 @@ previously listed here/as stubs are at 0 loops — fully migrated.)
 | Infrastructure | Unblocked IOPs |
 |---|---|
 | `dt_interpolation_*` | demosaicing cluster |
-| 3D bilateral grid | colorreconstruction |
+| ~~3D bilateral grid~~ **PORTED — m4-77** (`bilateral.rs`) | lowpass, shadhi, retouch, monochrome, globaltonemap, colormapping, ashift, bilat |
 | Filmlight Yrg / `work_profile` callbacks | colorbalancergb, colorin |
 | Per-pixel ICC / LCMS | colorin, colorout, retouch |
+| bespoke {L,a,b,weight} grid (own, not common/bilateral) | colorreconstruction |
 | GUI-only loops | colorequal, toneequal GUI LUT |
 
 Pattern note (Phase 2z+80, rawoverexposed): loops interleaved with C
@@ -1228,6 +1229,22 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    the conversion (coloured edge: Rec2020 ≠ LinearSrgb) + alpha (0.5) survives both
    paths. Opus architect: SHIP, no blockers. darkroom-core 563→565 tests.
    **Sharpen is now unblocked for a live UI caller once M2 (roi->scale) lands.**
+
+   **m4-77** (`d65d7bd60f`) — **3-D bilateral grid ported** (`darkroom-core/
+   bilateral.rs`, faithful port of `src/common/bilateral.c`): shared edge-aware-
+   filter infra for lowpass/shadhi/retouch/monochrome/globaltonemap/colormapping/
+   ashift/bilat. `Bilateral::new/splat/blur/slice` (+ `slice_to_output`); the
+   architect re-derived both load-bearing claims against the C (serial splat ≡
+   the C's per-thread-slice-then-merge up to float add order; per-line start
+   `k*offset1+j*offset2` ≡ the C's running accumulator, and avoids a usize
+   underflow that panics in Rust). **Rust-vs-C hardening:** a spatial axis can
+   collapse to size 2 on a narrow crop (4px → grid 2×301×6) where the C blur does
+   a benign OOB read but Rust panics — guarded to no-op below 4 grid points.
+   No consumer wired yet (algorithm+tests first, like interp.rs). Opus architect:
+   APPROVE after 3 fixes (premise/consumer correction, `slice_to_output`, the
+   panic guard — all applied). darkroom-core 566→573 tests. Follow-up: a
+   golden-vector test vs a C `buf` dump. **This is the first of the ~5 shared-infra
+   pieces gating the remaining ~230 C loops** (see the "what blocks" table above).
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
