@@ -1196,13 +1196,25 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    through CAT16). Opus architect independently re-derived the matrices from
    primaries — correct + genuine inverses to ~5e-8; SHIP, no blockers.
    darkroom-core 549→563 tests. **HARD PREREQUISITES before Sharpen gets a live UI
-   caller** (both latent now — no caller): **(M1)** make the pipeline working space
-   an explicit stage/context contract — Sharpen assumes linear Rec.2020, so a
-   non-raw (linear-sRGB) caller would misread the primaries and reintroduce the
-   chroma shift; **(M2)** scale the Gaussian sigma by the pipeline `roi->scale`,
-   else a downscaled preview under-sharpens vs full-res export (a WYSIWYG gap of
-   the m4-49/50 class). Other follow-ups: planar-L kernel (perf); per-stage band
-   strategy.
+   caller** (both latent now — no caller): ~~**(M1)** make the pipeline working
+   space an explicit contract~~ **DONE — m4-75**; **(M2)** scale the Gaussian
+   sigma by the pipeline `roi->scale`, else a downscaled preview under-sharpens vs
+   full-res export (a WYSIWYG gap of the m4-49/50 class) — still deferred (gated on
+   the first caller passing a SCALED ROI). Other follow-ups: planar-L kernel
+   (perf); per-stage band strategy.
+
+   **m4-75** (`ff8d50e93a`) — pipeline **working-space contract** (resolves M1).
+   `color.rs` gains `srgb_to_lab`/`lab_to_srgb` (linear-sRGB twins of the Rec.2020
+   pair; the sRGB matrix is Bradford-D50 by design → no CAT16, alpha survives).
+   `pipeline.rs` gains `pub enum ColorSpace { Rec2020, LinearSrgb }`; `Stage::
+   Sharpen` gains a `space` field and picks the RGB↔Lab pair per space, so the raw
+   (Rec.2020) and non-raw (linear-sRGB) paths both sharpen L with correct
+   primaries. Chose enum-on-the-stage over re-churning the m4-73 process()
+   signature; a `working_space()` helper + a debug_assert in process() enforces
+   "one buffer, one working space" as stages grow. New test proves `space` routes
+   the conversion (coloured edge: Rec2020 ≠ LinearSrgb) + alpha (0.5) survives both
+   paths. Opus architect: SHIP, no blockers. darkroom-core 563→565 tests.
+   **Sharpen is now unblocked for a live UI caller once M2 (roi->scale) lands.**
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
