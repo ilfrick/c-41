@@ -84,7 +84,13 @@ pub enum Stage {
     /// `space` is the buffer's working colour space ([`ColorSpace`]): the caller
     /// sets it so the L conversion uses the right primaries (Rec.2020 for raws,
     /// linear sRGB for non-raws). No assumed working space.
-    Sharpen { radius: f32, threshold: f32, amount: f32, space: ColorSpace },
+    ///
+    /// `scale` is the buffer's resolution relative to the full image (darktable's
+    /// `roi->scale`): `1.0` at full res (export), `< 1.0` on a downscaled preview.
+    /// The effective Gaussian radius is `radius * scale`, so sharpening is
+    /// image-relative — a downscaled preview matches the full-res export instead
+    /// of over-sharpening (WYSIWYG). The caller passes the ROI scale it renders at.
+    Sharpen { radius: f32, threshold: f32, amount: f32, space: ColorSpace, scale: f32 },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -218,12 +224,21 @@ impl Stage {
                     );
                 }
             }
-            Stage::Sharpen { radius, threshold, amount, space } => {
-                let (rad, mat) = gaussian_kernel(radius);
-                if amount == 0.0 || width <= 2 * rad || height <= 2 * rad {
-                    // Disabled (amount 0) or too small for a kernel interior ⇒ no
-                    // sharpening. Copy through directly (skip the Lab round-trip) —
-                    // keeps a no-op / small image byte-exact.
+            Stage::Sharpen { radius, threshold, amount, space, scale } => {
+                debug_assert!(
+                    scale.is_finite() && scale > 0.0,
+                    "Sharpen scale must be a positive finite ROI factor, got {scale}"
+                );
+                // Effective radius scales with the ROI (roi->scale): a downscaled
+                // preview uses a proportionally smaller kernel so its sharpening
+                // matches the full-res export. threshold/amount are value-domain
+                // (contrast) params — resolution-independent, so NOT scaled (matches
+                // sharpen.c).
+                let (rad, mat) = gaussian_kernel(radius * scale);
+                if amount == 0.0 || radius * scale == 0.0 || width <= 2 * rad || height <= 2 * rad {
+                    // Disabled (amount 0), zero effective radius, or too small for a
+                    // kernel interior ⇒ no sharpening. Byte-exact passthrough (skips
+                    // the Lab round-trip; matches sharpen.c's rad==0 early return).
                     output.copy_from_slice(input);
                 } else {
                     // Faithful darktable sharpen: unsharp-mask the Lab L channel
@@ -623,7 +638,7 @@ mod tests {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
         assert!(
-            !Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020 }
+            !Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020, scale: 1.0 }
                 .is_pixel_local(),
             "sharpen reads neighbours ⇒ NOT pixel-local"
         );
@@ -648,7 +663,7 @@ mod tests {
         let (w, h) = (16usize, 16usize);
         let flat = vec![0.4f32; w * h * 4];
         let p = Pipeline::with_stages(vec![Stage::Sharpen {
-            radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020,
+            radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020, scale: 1.0,
         }]);
         let out = p.process(&flat, w, h);
         // Tolerance covers the Rec.2020→Lab→Rec.2020 round-trip (not bit-exact);
@@ -673,7 +688,7 @@ mod tests {
             }
         }
         let p = Pipeline::with_stages(vec![Stage::Sharpen {
-            radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020,
+            radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020, scale: 1.0,
         }]);
         let out = p.process(&img, w, h);
         // Interior pixel just right of the edge overshoots above 0.8.
@@ -694,7 +709,7 @@ mod tests {
         let flat = vec![0.3f32; w * h * 4];
         let p = Pipeline::with_stages(vec![
             Stage::Exposure { black: 0.0, scale: 1.5 },
-            Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020 },
+            Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020, scale: 1.0 },
             Stage::Monochrome { r: 0.2627, g: 0.6780, b: 0.0593 },
         ]);
         let out = p.process(&flat, w, h);
@@ -715,7 +730,7 @@ mod tests {
         let img: Vec<f32> = (0..w * h * 4).map(|i| (i % 7) as f32 / 7.0).collect();
         let p = Pipeline::with_stages(vec![Stage::Sharpen {
             radius: 5.0, threshold: 0.0, amount: 1.0, // rad=5 ⇒ needs w,h > 10
-            space: ColorSpace::Rec2020,
+            space: ColorSpace::Rec2020, scale: 1.0,
         }]);
         assert_eq!(p.process(&img, w, h), img, "small image must pass through");
     }
@@ -737,7 +752,7 @@ mod tests {
         }
         let mk = |space| {
             Pipeline::with_stages(vec![Stage::Sharpen {
-                radius: 2.0, threshold: 0.0, amount: 1.0, space,
+                radius: 2.0, threshold: 0.0, amount: 1.0, space, scale: 1.0,
             }])
         };
         let srgb = mk(ColorSpace::LinearSrgb).process(&img, w, h);
@@ -747,6 +762,31 @@ mod tests {
         assert!(diff > 1e-4, "working space did not change the sharpen result: {diff}");
         assert_eq!(srgb[right + 3], 0.5, "srgb alpha preserved");
         assert_eq!(rec[right + 3], 0.5, "rec2020 alpha preserved");
+    }
+
+    #[test]
+    fn sharpen_scale_shrinks_the_effective_kernel() {
+        // roi->scale: at scale < 1 the effective radius (radius*scale) shrinks, so
+        // a downscaled preview sharpens with a proportionally smaller kernel — the
+        // result differs from the full-res (scale 1.0) render of the same buffer.
+        let (w, h) = (20usize, 20usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x >= w / 2 { 0.8 } else { 0.2 };
+                let i = (y * w + x) * 4;
+                img[i] = v; img[i + 1] = v; img[i + 2] = v; img[i + 3] = 1.0;
+            }
+        }
+        let mk = |scale| {
+            Pipeline::with_stages(vec![Stage::Sharpen {
+                radius: 4.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020, scale,
+            }])
+        };
+        let full = mk(1.0).process(&img, w, h);
+        let half = mk(0.5).process(&img, w, h);
+        let diff: f32 = full.iter().zip(half.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-3, "scale did not change the effective kernel: {diff}");
     }
 
     #[test]
