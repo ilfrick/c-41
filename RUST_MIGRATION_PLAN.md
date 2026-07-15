@@ -1197,11 +1197,24 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    primaries — correct + genuine inverses to ~5e-8; SHIP, no blockers.
    darkroom-core 549→563 tests. **HARD PREREQUISITES before Sharpen gets a live UI
    caller** (both latent now — no caller): ~~**(M1)** make the pipeline working
-   space an explicit contract~~ **DONE — m4-75**; **(M2)** scale the Gaussian
-   sigma by the pipeline `roi->scale`, else a downscaled preview under-sharpens vs
-   full-res export (a WYSIWYG gap of the m4-49/50 class) — still deferred (gated on
-   the first caller passing a SCALED ROI). Other follow-ups: planar-L kernel
-   (perf); per-stage band strategy.
+   space an explicit contract~~ **DONE — m4-75**; ~~**(M2)** scale the Gaussian
+   sigma by the pipeline `roi->scale`~~ **DONE — m4-76** (`Stage::Sharpen.scale`,
+   effective radius `radius*scale`, faithful to sharpen.c). Other follow-ups:
+   planar-L kernel (perf); per-stage band strategy.
+
+   **m4-76** (`c643c8c64b`) — **M2**: `Stage::Sharpen` gains a `scale: f32` (the
+   ROI resolution factor, 1.0 export / <1 downscaled preview); apply feeds
+   `gaussian_kernel(radius * scale)` so tap-count + sigma2 both scale with the
+   ROI (faithful to sharpen.c; darkroom's single-buffer model collapses `iscale`
+   to 1). threshold/amount stay unscaled (value-domain). `radius*scale==0`
+   early-out (sharpen.c rad==0 parity) + a `scale>0` debug_assert. Opus architect:
+   SHIP, faithful. pipeline 22→23 tests. **The Sharpen STAGE is now
+   feature-complete (radius/threshold/amount/space/scale)** — both M1 & M2 done,
+   so Sharpen is fully ready for a live caller. Remaining to expose it (a separate
+   increment): the delicate `PreviewParams` codec bump (v2→v3) + `to_pipeline`
+   (needs space+scale args) + `history` exhaustive-match/describe_change + export
+   wiring, then a UI slider (display-gated). This touches persistence, so it's
+   best done as its own focused increment.
 
    **m4-75** (`ff8d50e93a`) — pipeline **working-space contract** (resolves M1).
    `color.rs` gains `srgb_to_lab`/`lab_to_srgb` (linear-sRGB twins of the Rec.2020
