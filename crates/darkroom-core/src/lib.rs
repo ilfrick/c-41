@@ -6,6 +6,7 @@
 pub mod bilateral;
 pub mod color;
 pub mod error;
+pub mod gaussian;
 pub mod geometry;
 pub mod interp;
 pub mod iop;
