@@ -85,6 +85,7 @@ previously listed here/as stubs are at 0 loops — fully migrated.)
 |---|---|
 | `dt_interpolation_*` | demosaicing cluster |
 | ~~3D bilateral grid~~ **PORTED — m4-77** (`bilateral.rs`) | lowpass, shadhi, retouch, monochrome, globaltonemap, colormapping, ashift, bilat |
+| ~~Recursive Gaussian (`dt_gaussian`)~~ **PORTED — m4-78** (`gaussian.rs`, RGBA `blur_4c`) | bloom, highpass, lowpass, shadhi, hazeremoval |
 | Filmlight Yrg / `work_profile` callbacks | colorbalancergb, colorin |
 | Per-pixel ICC / LCMS | colorin, colorout, retouch |
 | bespoke {L,a,b,weight} grid (own, not common/bilateral) | colorreconstruction |
@@ -1245,6 +1246,26 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    panic guard — all applied). darkroom-core 566→573 tests. Follow-up: a
    golden-vector test vs a C `buf` dump. **This is the first of the ~5 shared-infra
    pieces gating the remaining ~230 C loops** (see the "what blocks" table above).
+
+   **m4-78** (`01d0568432`) — **recursive Gaussian ported** (`darkroom-core/
+   gaussian.rs`, faithful CPU-path port of `src/common/gaussian.c`): the second
+   shared-infra piece, unblocking bloom/highpass/lowpass/shadhi/hazeremoval.
+   `compute_params` ← `_compute_gauss_params` (Young–van Vliet IIR coefficients,
+   all three orders); `Gaussian::blur_4c` ← `dt_gaussian_blur_4c` (RGBA two-pass
+   separable IIR — vertical into a temp buffer, then horizontal into output; each
+   axis sums a forward causal + backward anti-causal pass, per-channel clamp on
+   read). Not ported: generic N-channel `dt_gaussian_blur`, the `_fast_9x9`
+   small-sigma direct-conv path, all OpenCL. Opus architect re-derived every
+   coefficient + recurrence against the C (exact, no transposed variables) and
+   found **one real Rust-vs-C divergence**: the naive `clampf` propagates a NaN
+   that the IIR then smears across the whole column/row, whereas C's asymmetric
+   `CLAMPF` scrubs NaN to `min` (local) — fixed to mirror the C branch order.
+   Also guards empty images. 10 module tests incl. an **analytic impulse-response
+   test** (blurred unit impulse ≈ `exp(-r²/2σ²)/(2πσ²)` within 1.5e-3 — the guard
+   a transposed recursion variable can't pass), NaN-to-min, all-orders-finite,
+   channel independence, degenerate-dims no-panic. 582 darkroom-core tests; clippy
+   clean. **Second of the ~5 shared-infra pieces; ~3 remain** (Filmlight-Yrg,
+   per-pixel ICC/LCMS, colorreconstruction bespoke grid; dwt.c also outstanding).
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
