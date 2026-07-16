@@ -86,6 +86,7 @@ previously listed here/as stubs are at 0 loops — fully migrated.)
 | `dt_interpolation_*` | demosaicing cluster |
 | ~~3D bilateral grid~~ **PORTED — m4-77** (`bilateral.rs`) | lowpass, shadhi, retouch, monochrome, globaltonemap, colormapping, ashift, bilat |
 | ~~Recursive Gaussian (`dt_gaussian`)~~ **PORTED — m4-78** (`gaussian.rs`, RGBA `blur_4c`) | bloom, highpass, lowpass, shadhi, hazeremoval |
+| ~~À-trous wavelet (`dwt.c`)~~ **PORTED — m4-79** (`dwt.rs`, `decompose` + `denoise`) | atrous, retouch, denoiseprofile (wavelet mode) |
 | Filmlight Yrg / `work_profile` callbacks | colorbalancergb, colorin |
 | Per-pixel ICC / LCMS | colorin, colorout, retouch |
 | bespoke {L,a,b,weight} grid (own, not common/bilateral) | colorreconstruction |
@@ -1266,6 +1267,38 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    channel independence, degenerate-dims no-panic. 582 darkroom-core tests; clippy
    clean. **Second of the ~5 shared-infra pieces; ~3 remain** (Filmlight-Yrg,
    per-pixel ICC/LCMS, colorreconstruction bespoke grid; dwt.c also outstanding).
+
+   **m4-79** (`396c8ab491`) — **à-trous wavelet decompose/denoise ported**
+   (`darkroom-core/dwt.rs`, faithful CPU-path port of `src/common/dwt.c` — the
+   GIMP "Wavelet Decompose" algorithm): the third shared-infra piece, unblocking
+   **atrous, retouch, denoiseprofile** (wavelet mode). Ported: `decompose` ←
+   `dwt_decompose` (RGBA `ch==4`, dilated 3×3 hat kernel per scale, per-scale
+   layer **callback** `FnMut(&mut [f32], &DwtParams, i32)` for the original /
+   each detail / residual / reconstruction) with the full `dwt_wavelet_decompose`
+   orchestration (buffer ping-pong, `merge_from_scale`, `return_layer`, layers /
+   merged_layers accumulation); `get_max_scale`/`first_scale_visible`; and the
+   1-channel `denoise` ← `dwt_denoise` (soft-thresholded wavelet denoise). Not
+   ported: all OpenCL (`dwt_*_cl`). **Design notes:** (1) C's aliased
+   `buffer[0]=p->image` pointer swap is replaced by an owned-Vec ping-pong that
+   `copy_from_slice`s the chosen result back at each `dwt_get_image_layer` site —
+   the architect walked all five write-back paths + the scale-0 in-place
+   semantics and confirmed result-identical. (2) The `dwt_interleave_rows`
+   cache reorder is **omitted** (each vertical-pass output row reads only *input*
+   rows never mutated during the pass, so visiting order can't change the result
+   — verified airtight). (3) **Rust-vs-C hardening:** every reflected edge tap is
+   clamped into range; `dwt_decompose` clamps `scales` to `get_max_scale()` so on
+   its path the clamp is a proven **no-op** (bit-identical to C), diverging only
+   where C reads OOB (benign UB) on degenerate inputs. **F1 for consumer
+   wire-up:** `denoise` does *not* clamp `bands` — clamp to `get_max_scale()` at
+   the denoiseprofile/retouch/atrous call site so production never enters the
+   OOB-in-C regime. Opus architect: **APPROVE** (10/10 faithfulness, re-derived
+   reflection-index parity + telescoping reconstruction + ping-pong selection vs
+   the C himself); applied F2 (negative-`return_layer` guard) + F3 (3 value-parity
+   tests: detail-scales+residual telescoping, zoom `max_scale` clamp, merged-scale
+   ≡ sum-of-details). 13 module tests, **595 darkroom-core tests**, clippy clean.
+   **Third of the ~5 shared-infra pieces; ~2 remain** (Filmlight-Yrg /
+   `work_profile`; per-pixel ICC/LCMS; colorreconstruction's own {L,a,b,weight}
+   grid is a separate bespoke port).
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
