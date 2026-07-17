@@ -970,6 +970,70 @@ pub fn xyz_to_jzazbz(xyz_d65: [f32; 4]) -> [f32; 4] {
     jab
 }
 
+/// Number of elements in the gamut LUT (`LUT_ELEM` in `src/common/math.h`). A
+/// power of two, so [`lookup_gamut`] can wrap the hue ring with a bitmask.
+pub const LUT_ELEM: usize = 512;
+
+/// Build a polar Ych pixel `[Y, c, cos(h), sin(h)]` from luminance `Y`,
+/// chroma `c`, and hue `h` (radians). Matches `make_Ych()`.
+#[inline(always)]
+pub fn make_ych(y: f32, c: f32, h: f32) -> [f32; 4] {
+    [y, c, h.cos(), h.sin()]
+}
+
+/// Filmlight Ych -> Filmlight grading-RGB (Ych → Yrg → LMS → grading-RGB).
+/// Matches `Ych_to_gradingRGB()`.
+#[inline(always)]
+pub fn ych_to_grading_rgb(ych: [f32; 4]) -> [f32; 4] {
+    lms_to_grading_rgb(yrg_to_lms(ych_to_yrg(ych)))
+}
+
+/// Sigmoidal shadow/highlight/midtone opacity masks for luma `x`, returning
+/// `(output, output_comp)` where `output = [alpha (shadows), gamma (midtones),
+/// beta (highlights), 0]` and `output_comp = 1 - output` (componentwise, slot 3
+/// left 0). Matches `opacity_masks()` (colorbalancergb.c:551).
+pub fn opacity_masks(
+    x: f32,
+    shadows_weight: f32,
+    highlights_weight: f32,
+    midtones_weight: f32,
+    mask_grey_fulcrum: f32,
+) -> ([f32; 4], [f32; 4]) {
+    let x_offset = x - mask_grey_fulcrum;
+    let x_offset_norm = x_offset / mask_grey_fulcrum;
+    let alpha = 1.0 / (1.0 + (x_offset_norm * shadows_weight).exp()); // shadows opacity
+    let beta = 1.0 / (1.0 + (-x_offset_norm * highlights_weight).exp()); // highlights opacity
+    let alpha_comp = 1.0 - alpha;
+    let beta_comp = 1.0 - beta;
+    // midtones opacity
+    let gamma = (-(x_offset * x_offset) * midtones_weight / 4.0).exp()
+        * (alpha_comp * alpha_comp)
+        * (beta_comp * beta_comp)
+        * 8.0;
+    let gamma_comp = 1.0 - gamma;
+    ([alpha, gamma, beta, 0.0], [alpha_comp, gamma_comp, beta_comp, 0.0])
+}
+
+/// Linearly interpolate the gamut LUT (`LUT_ELEM` entries indexed by hue) at
+/// `hue` (radians, `[-π, π)`), wrapping cyclically. Matches `lookup_gamut()`
+/// (darktable_ucs_22_helpers.h:132).
+#[inline(always)]
+pub fn lookup_gamut(gamut_lut: &[f32], hue: f32) -> f32 {
+    // hue -> fractional LUT index
+    let x_test = LUT_ELEM as f32 * (hue + core::f32::consts::PI) / core::f32::consts::TAU;
+    let x_prev = x_test.floor();
+    let x_next = x_test.ceil();
+    // two closest integer indices, wrapped on the hue ring (LUT_ELEM is 2^k)
+    let xi = (x_prev as i32) as usize & (LUT_ELEM - 1);
+    let xii = (x_next as i32) as usize & (LUT_ELEM - 1);
+    let y_prev = gamut_lut[xi];
+    if xi != xii {
+        y_prev + (x_test - x_prev) * (gamut_lut[xii] - y_prev)
+    } else {
+        y_prev
+    }
+}
+
 // ── filmicrgb v4 gamut mapping (src/common/gamut_mapping.h + gamut_check_Yrg) ──
 
 /// CIE Y 1931 -> CIE Y 2006 scale (achromatic). Matches the
@@ -1492,5 +1556,58 @@ mod rec2020_tests {
             let back = jzazbz_to_xyz_d65(jab);
             assert!(close4(xyz, back, 2e-3), "xyz={xyz:?} jab={jab:?} back={back:?}");
         }
+    }
+
+    // ── colorbalancergb per-pixel helpers (m4-82) ──
+
+    #[test]
+    fn make_ych_stores_polar_and_recovers_hue() {
+        let ych = make_ych(0.5, 0.3, 0.7);
+        assert!((ych[0] - 0.5).abs() < 1e-6 && (ych[1] - 0.3).abs() < 1e-6);
+        assert!((ych[2] - 0.7f32.cos()).abs() < 1e-6 && (ych[3] - 0.7f32.sin()).abs() < 1e-6);
+        // get_hue_angle_from_Ych == atan2(sin, cos)
+        assert!((ych[3].atan2(ych[2]) - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn opacity_masks_symmetric_at_fulcrum_and_complement() {
+        // at x == mask_grey_fulcrum the offset is 0 → alpha = beta = 0.5, and
+        // gamma = e^0 · 0.25 · 0.25 · 8 = 0.5.
+        let (out, comp) = opacity_masks(0.5, 3.0, 3.0, 2.0, 0.5);
+        assert!((out[0] - 0.5).abs() < 1e-5 && (out[1] - 0.5).abs() < 1e-5 && (out[2] - 0.5).abs() < 1e-5);
+        // output_comp is 1 - output on the three active slots
+        for c in 0..3 {
+            assert!((comp[c] - (1.0 - out[c])).abs() < 1e-6, "comp[{c}] not complement");
+        }
+        // opacities stay in [0, 1] for a sub/over-fulcrum sample
+        let (o2, _) = opacity_masks(0.9, 4.0, 4.0, 2.0, 0.5);
+        assert!(o2[0] >= 0.0 && o2[0] <= 1.0 && o2[2] >= 0.0 && o2[2] <= 1.0);
+    }
+
+    #[test]
+    fn ych_to_grading_rgb_is_hue_independent_when_achromatic() {
+        // chroma 0 → Yrg loses the hue, so grading RGB is the same for any hue.
+        let a = ych_to_grading_rgb(make_ych(0.6, 0.0, 0.3));
+        let b = ych_to_grading_rgb(make_ych(0.6, 0.0, 2.9));
+        assert!(close4(a, b, 1e-6), "achromatic Ych depended on hue: {a:?} vs {b:?}");
+        assert!(a.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn lookup_gamut_maps_index_and_interpolates() {
+        // a linear LUT: lut[k] = k. Linear interpolation of a linear function is
+        // exact, so lookup(hue) must equal the fractional index x_test =
+        // LUT_ELEM·(hue+π)/2π — away from the wrap boundary.
+        let lut: Vec<f32> = (0..LUT_ELEM).map(|k| k as f32).collect();
+        for hue in [-2.0f32, -1.0, 0.0, 1.0, 2.0] {
+            let x_test = LUT_ELEM as f32 * (hue + core::f32::consts::PI) / core::f32::consts::TAU;
+            let got = lookup_gamut(&lut, hue);
+            assert!((got - x_test).abs() < 1e-2, "hue={hue} got={got} want={x_test}");
+        }
+        // hue = 0 lands exactly on integer index 256 (π/2π = 0.5)
+        assert!((lookup_gamut(&lut, 0.0) - 256.0).abs() < 1e-3);
+        // a constant LUT returns the constant regardless of hue (incl. wrap)
+        let flat = vec![7.0f32; LUT_ELEM];
+        assert!((lookup_gamut(&flat, 3.0) - 7.0).abs() < 1e-6);
     }
 }
