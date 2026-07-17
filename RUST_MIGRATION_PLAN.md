@@ -87,7 +87,7 @@ previously listed here/as stubs are at 0 loops — fully migrated.)
 | ~~3D bilateral grid~~ **PORTED — m4-77** (`bilateral.rs`) | lowpass, shadhi, retouch, monochrome, globaltonemap, colormapping, ashift, bilat |
 | ~~Recursive Gaussian (`dt_gaussian`)~~ **PORTED — m4-78** (`gaussian.rs`, RGBA `blur_4c`) | bloom, highpass, lowpass, shadhi, hazeremoval |
 | ~~À-trous wavelet (`dwt.c`)~~ **PORTED — m4-79** (`dwt.rs`, `decompose` + `denoise`) | atrous, retouch, denoiseprofile (wavelet mode) |
-| Filmlight Yrg / `work_profile` callbacks | colorbalancergb, colorin |
+| Filmlight Yrg / `work_profile` callbacks — **Yrg/UCS/JzAzBz conversions DONE** (color.rs, thru m4-81); colorbalancergb loop port in progress (m4-82/83) | colorbalancergb, colorin |
 | Per-pixel ICC / LCMS | colorin, colorout, retouch |
 | ~~bespoke {L,a,b,weight} grid (own, not common/bilateral)~~ **PORTED — m4-80** (`colorreconstruct.rs`) | colorreconstruction |
 | GUI-only loops | colorequal, toneequal GUI LUT |
@@ -1332,6 +1332,40 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    → colorin/colorout/retouch — the biggest and needs a colour-management
    approach). Also unported but NOT gating any "what blocks" row:
    `guided_filter.c`/`eigf.h`/`fast_guided_filter.h`, `nlmeans_core.c`.
+
+   **m4-81** (`0b319b907e`) — **colorbalancergb colour helpers** (`color.rs`):
+   groundwork for porting `colorbalancergb` (darktable's most complex IOP — no
+   Rust process module yet, only a geometry stub). The Filmlight Yrg/Ych/LMS/UCS
+   conversions were already in `color.rs` (from filmic v4); this adds the 8
+   fixed-matrix / scalar helpers the process loop additionally needs: `lms_2006_↔
+   xyz` (`LMS_to_XYZ`/`XYZ_to_LMS`, CIE-2006-LMS↔XYZ D65), `lms_↔grading_rgb`
+   (reusing the existing `FILMLIGHT_*_T` constants — literally the same
+   matrices), `soft_clip`, `dt_ucs_jch_↔hcb`, and `xyz_to_jzazbz` (the JzAzBz
+   forward; the reverse `jzazbz_to_xyz_d65` already existed). Opus architect:
+   **APPROVE** — every constant/matrix-row/transposition/formula checked
+   bit-for-bit vs the C headers, 10/10 parity, no fixes. 5 round-trip tests incl.
+   the strong anchor (`xyz_to_jzazbz` ∘ the independently-written
+   `jzazbz_to_xyz_d65` recovers input within 2e-3). 608 darkroom-core tests.
+
+   **colorbalancergb port roadmap** (it's a multi-increment IOP; m4-81 was the
+   shared-conversion groundwork):
+   - **m4-82 (next):** `commit_params` — derive `d` from `p`: the RGB→LMS-2006 /
+     LMS→RGB input/output matrices (chain `XYZ_D50↔D65_CAT16` with the working
+     profile's RGB↔XYZ; for the Rust pipeline the working space is known
+     Rec.2020), the global/shadows/highlights/midtones colour vectors + weights,
+     fulcrums, contrast, and the **gamut LUT builder** (the `collapse` loop at
+     `colorbalancergb.c:1511`/`1555` — a hue→max-saturation LUT that `slice`'s
+     `lookup_gamut` reads). Plus the remaining per-pixel helpers not yet in
+     color.rs: `opacity_masks`, `lookup_gamut`. (The sampler reduction loop at
+     `:1197` is a GUI histogram builder — GUI-only, skip like toneequal/colorequal.)
+   - **m4-83 (next):** the main per-pixel **process loop** (`:662–943`) — clip →
+     LMS → Yrg/Ych (hue rotation, chroma/vibrance, `gamut_check_Yrg`) → grading
+     RGB colour balance (offset/slope/power) → Y power+contrast → the two
+     `saturation_formula` branches (**JzAzBz** and **dt UCS**, incl. the
+     gamut-mapping via the LUT) → back to pipeline RGB. Then wire it as a
+     `pipeline::Stage` so the preview/export actually apply it. This loop is where
+     the real parity risk lives (LUT indexing, hue masking, the sat/brilliance
+     curves) — bring the architect the diff.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
