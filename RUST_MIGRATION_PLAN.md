@@ -89,7 +89,7 @@ previously listed here/as stubs are at 0 loops — fully migrated.)
 | ~~À-trous wavelet (`dwt.c`)~~ **PORTED — m4-79** (`dwt.rs`, `decompose` + `denoise`) | atrous, retouch, denoiseprofile (wavelet mode) |
 | Filmlight Yrg / `work_profile` callbacks | colorbalancergb, colorin |
 | Per-pixel ICC / LCMS | colorin, colorout, retouch |
-| bespoke {L,a,b,weight} grid (own, not common/bilateral) | colorreconstruction |
+| ~~bespoke {L,a,b,weight} grid (own, not common/bilateral)~~ **PORTED — m4-80** (`colorreconstruct.rs`) | colorreconstruction |
 | GUI-only loops | colorequal, toneequal GUI LUT |
 
 Pattern note (Phase 2z+80, rawoverexposed): loops interleaved with C
@@ -1299,6 +1299,39 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    **Third of the ~5 shared-infra pieces; ~2 remain** (Filmlight-Yrg /
    `work_profile`; per-pixel ICC/LCMS; colorreconstruction's own {L,a,b,weight}
    grid is a separate bespoke port).
+
+   **m4-80** (`a1793b76ce`) — **colorreconstruction's bespoke 4-field bilateral
+   grid ported** (`darkroom-core/colorreconstruct.rs`, faithful port of the
+   private grid in `src/iop/colorreconstruction.c`): the fourth shared-infra
+   piece, unblocking **colorreconstruction**. Distinct from the shared 3-D
+   bilateral grid (m4-77): a full `{L,a,b,weight}` `Cell` per grid point, an
+   **x-fastest** index (`xi + size_x·(yi + size_y·zi)`), **nearest-integer**
+   splat (not trilinear), and a plain `[1 4 6 4 1]/16` Gaussian on all three
+   axes (no derivative-z pass). Ported: `new` ← `..._init` (grid sizing
+   `clamp(round(dim/σ),4,MAX)+1` → always ≥5, so no collapsed-axis OOB;
+   effective-σ recompute), `splat` ← `..._splat` (skips `L>threshold`;
+   `Precedence` none/chroma/hue weighting; serial ≡ the C's per-thread atomic
+   adds up to float add order), `blur`/`blur_line` ← `..._blur` (running-buffer
+   separable Gaussian on `Cell` via `Add`+`Mul<f32>`; per-line start recompute
+   avoids the usize underflow), `slice` ← `..._slice` (trilinear read-back,
+   `blend = CLAMPS(20/thr·L−19,0,1)`, `aout·Lin/lout` chroma reconstruction; **L
+   and alpha pass through untouched**). Not ported: pixelpipe grid freeze/thaw
+   caching (FULL-vs-preview grid stealing — plumbing), `hue_conversion` (caller
+   supplies the LCH hue via `Precedence::Hue`), all OpenCL. `CLAMPS` matches the
+   C branch order exactly (**NaN → low bound**), applying the m4-78 gaussian
+   `CLAMPF`-NaN lesson proactively. Opus architect: **APPROVE-WITH-FIXES** —
+   re-derived grid sizing, splat index convention, `blur_line` carry, the
+   trilinear max-index (`= len−1`, exactly tight, no OOB), and the CLAMPS NaN
+   choice; one **LOW** finding (`interp` factors the trilinear weight product,
+   ~1 ULP/tap vs the C's field-first grouping — immaterial since the splat's
+   atomic non-determinism dwarfs it), resolved by documenting per the reviewer's
+   preferred option. 8 module tests (incl. the behavioral
+   clipped-highlight-borrows-neighbour-colour); **603 darkroom-core tests**;
+   clippy clean. **Fourth of the ~5 shared-infra pieces; ~2 remain**
+   (Filmlight-Yrg / `work_profile` → colorbalancergb/colorin; per-pixel ICC/LCMS
+   → colorin/colorout/retouch — the biggest and needs a colour-management
+   approach). Also unported but NOT gating any "what blocks" row:
+   `guided_filter.c`/`eigf.h`/`fast_guided_filter.h`, `nlmeans_core.c`.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
