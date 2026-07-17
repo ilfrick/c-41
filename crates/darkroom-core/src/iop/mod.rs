@@ -18,6 +18,7 @@ pub mod invert;
 pub mod monochrome;
 pub mod channelmixer;
 pub mod colorbalance;
+pub mod colorbalancergb;
 pub mod colorout;
 pub mod filmic;
 pub mod lowpass;
