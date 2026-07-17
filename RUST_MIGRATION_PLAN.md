@@ -1381,17 +1381,22 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    OMP `reduction(+:)` whose FP add order is thread-count-dependent, so any golden
    dump must use `OMP_NUM_THREADS=1`. 5 property tests; 617 darkroom-core tests.
 
-   **colorbalancergb port roadmap** (multi-increment IOP; m4-81/82 = conversions +
-   per-pixel helpers, m4-83 = gamut LUTs):
-   - **m4-84 (next):** `commit_params` — derive `d` from `p`: the RGB→LMS-2006 /
-     LMS→RGB input/output matrices (chain `XYZ_D50↔D65_CAT16` with the working
-     profile's RGB↔XYZ; for the Rust pipeline the working space is known
-     Rec.2020) **AND the transposed RGB→XYZ-D65 matrix for the m4-83 LUT builders**
-     (mind `(A·B)ᵀ = Bᵀ·Aᵀ`), the global/shadows/highlights/midtones colour
-     vectors (via `make_ych`+`ych_to_grading_rgb`) + weights, fulcrums, contrast,
-     and the LUT selection by `saturation_formula`. Add a primary-hue-angle test
-     to pin the transpose contract.
-   - **m4-85:** the main per-pixel **process loop** (`:662–943`) — clip → LMS →
+   **m4-84** (`c200e4ae02`) — **colorbalancergb `commit_params`**
+   (`CbRgbData::from_params`): derives the process-ready data from `CbRgbParams`
+   (v5 params + darktable `$DEFAULT`s; GUI checker fields omitted) — the 4
+   colour-balance vectors (`make_ych`+`ych_to_grading_rgb` + offset/slope/reciprocal
+   formulas around the achromatic ref), weights/fulcrums (`white=2^p`,
+   `mask_grey=p^0.41012`, `midtones_weight=sqf·sqf/(sqf+sqf)`), `contrast=1+p`,
+   `midtones_Y=1/(1+p)`, and gamut-LUT selection by `saturation_formula`. Added pub
+   `color::REC2020_TO_XYZ_D65_T4` (the transposed RGB→XYZ-D65 matrix for the m4-83
+   builders; substituting the fixed Rec.2020 matrix for the C's
+   `CAT16·matrix_in` is the m4-75 fixed-working-space consequence). Opus architect:
+   **APPROVE** — every derivation bit-exact incl. the `chroma/saturation/brilliance`
+   data-slot order `[shadows,midtones,highlights]` (a param-vs-slot ordering trap)
+   and global's `·global_Y` vs shadows/highlights' `+*_Y`. 9 module tests (neutral
+   → no-op balance `global=[0;4]`, zones=`[1;4]`; formula-selects-builder;
+   LUT-depends-on-matrix). 621 darkroom-core tests.
+   - **m4-85 (next):** the main per-pixel **process loop** (`:662–943`) — clip → LMS →
      Yrg/Ych (hue rotation, chroma/vibrance, `gamut_check_Yrg`) → grading RGB
      colour balance (offset/slope/power) → Y power+contrast → the two
      `saturation_formula` branches (**JzAzBz** and **dt UCS**, incl. gamut-mapping
