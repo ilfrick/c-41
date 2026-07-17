@@ -18,8 +18,12 @@
 //! loop (m4-85) will be wired as a `pipeline::Stage`.
 
 use crate::color::{
-    apply_transposed_color_matrix, d65_xyz_to_xyy, make_ych, xyy_to_dt_ucs_uv, ych_to_grading_rgb,
-    xyz_to_jzazbz, LUT_ELEM,
+    apply_transposed_color_matrix, d65_xyz_to_xyy, dt_ucs_hcb_to_jch, dt_ucs_hsb_to_jch,
+    dt_ucs_jch_to_hcb, dt_ucs_jch_to_hsb, dt_ucs_jch_to_xyy, gamut_check_yrg, grading_rgb_to_lms,
+    jzazbz_to_xyz_d65, lms_2006_to_xyz, lms_to_grading_rgb, lms_to_yrg, lookup_gamut, make_ych,
+    opacity_masks, rec2020_to_xyz_d65, soft_clip, xyy_to_dt_ucs_jch, xyy_to_dt_ucs_uv, xyy_to_xyz,
+    xyz_d65_to_rec2020, xyz_to_jzazbz, xyz_to_lms_2006, y_to_dt_ucs_l_star, ych_to_grading_rgb,
+    ych_to_yrg, yrg_to_lms, yrg_to_ych, LUT_ELEM,
 };
 
 /// RGB-cube sampling resolution for the JzAzBz gamut LUT (`#define STEPS 92`).
@@ -356,6 +360,220 @@ pub fn build_gamut_lut_ucs(input_matrix_t: &[[f32; 4]; 4]) -> [f32; LUT_ELEM] {
     gamut
 }
 
+/// Dot product over the 4 lanes (`scalar_product`); the mask/zone vectors always
+/// carry 0 in lane 3, so this equals the C's 3-wide sum.
+#[inline]
+fn dot4(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+}
+
+/// The "center middle grey in 50 %" exponent shared by the opacity masks and the
+/// mask fulcrum (colorbalancergb.c:699, 1167).
+const GREY_CENTER_EXP: f32 = 0.4101205819200422;
+
+/// JzAzBz perceptual saturation/brilliance branch (colorbalancergb.c:768–850).
+/// Takes and returns XYZ D65.
+fn saturation_jzazbz(xyz_d65: [f32; 4], opacities: &[f32; 4], d: &CbRgbData) -> [f32; 4] {
+    use core::f32::consts::FRAC_PI_2;
+
+    let jab = xyz_to_jzazbz(xyz_d65);
+    // JCh: brightness/chroma vector + hue angle
+    let mut jc = [jab[0], (jab[1] * jab[1] + jab[2] * jab[2]).sqrt()]; // dt_fast_hypotf(Jab[1],Jab[2])
+    let h = jab[2].atan2(jab[1]);
+
+    // rotate onto the saturation eigenvector S (angle T over the hue plane)
+    let t = jc[1].atan2(jc[0]);
+    let (sin_t, cos_t) = (t.sin(), t.cos());
+    let boosts = [
+        1.0 + d.brilliance_global + dot4(opacities, &d.brilliance), // S direction
+        d.saturation_global + dot4(opacities, &d.saturation),       // O direction
+    ];
+    // M_rot_dir[0] = {cos_T, sin_T}
+    let so0 = jc[0] * cos_t + jc[1] * sin_t;
+    let so1 = so0 * (t * boosts[1]).clamp(-t, FRAC_PI_2 - t); // MIN(MAX(T·b,-T), π/2-T)
+    let so0 = (so0 * boosts[0]).max(0.0);
+    // rotate back by -T (M_rot_inv rows {cos_T,-sin_T},{sin_T,cos_T})
+    jc[0] = (so0 * cos_t - so1 * sin_t).max(0.0);
+    jc[1] = (so0 * sin_t + so1 * cos_t).max(0.0);
+
+    // gamut mapping toward the boundary at this hue
+    let out_max_sat_h = lookup_gamut(&d.gamut_lut, h);
+    let sat = if jc[0] > 0.0 {
+        soft_clip(jc[1] / jc[0], 0.8 * out_max_sat_h, out_max_sat_h)
+    } else {
+        out_max_sat_h
+    };
+    let max_c_at_sat = jc[0] * sat;
+    let max_j_at_sat = if sat > 0.0 { jc[1] / sat } else { jc[0] };
+    jc[0] = (jc[0] + max_j_at_sat) / 2.0;
+    jc[1] = (jc[1] + max_c_at_sat) / 2.0;
+
+    // gamut-clip in Jch at constant hue+lightness (avoid negative L'M'S')
+    let (cos_hh, sin_hh) = (h.cos(), h.sin());
+    let d0 = 1.6295499532821566e-11f32;
+    let dd = -0.56f32;
+    let mut iz = jc[0] + d0;
+    iz /= 1.0 + dd - dd * iz;
+    iz = iz.max(0.0);
+
+    // Izazbz → L'M'S' test matrix (transposed), colorbalancergb.c:824–827
+    const AI_TRANS: [[f32; 4]; 4] = [
+        [1.0, 1.0, 1.0, 0.0],
+        [0.1386050432715393, -0.1386050432715393, -0.0960192420263190, 0.0],
+        [0.0580473161561189, -0.0580473161561189, -0.8118918960560390, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+    let izazbz = [iz, jc[1] * cos_hh, jc[1] * sin_hh, 0.0];
+    let lms = apply_transposed_color_matrix(&izazbz, &AI_TRANS);
+
+    let mut max_c = jc[1];
+    if lms[0] < 0.0 {
+        max_c = (-iz / (AI_TRANS[1][0] * cos_hh + AI_TRANS[2][0] * sin_hh)).min(max_c);
+    }
+    if lms[1] < 0.0 {
+        max_c = (-iz / (AI_TRANS[1][1] * cos_hh + AI_TRANS[2][1] * sin_hh)).min(max_c);
+    }
+    if lms[2] < 0.0 {
+        max_c = (-iz / (AI_TRANS[1][2] * cos_hh + AI_TRANS[2][2] * sin_hh)).min(max_c);
+    }
+
+    let jab_out = [jc[0], max_c * cos_hh, max_c * sin_hh, 0.0];
+    jzazbz_to_xyz_d65(jab_out)
+}
+
+/// darktable-UCS perceptual saturation/brilliance branch (colorbalancergb.c:851–897).
+/// Takes and returns XYZ D65. `l_white` is `Y_to_dt_UCS_L_star(white_fulcrum)`.
+fn saturation_dtucs(xyz_d65: [f32; 4], opacities: &[f32; 4], d: &CbRgbData, l_white: f32) -> [f32; 4] {
+    let xyy = d65_xyz_to_xyy(&xyz_d65);
+    let jch = xyy_to_dt_ucs_jch(&xyy, l_white);
+    let mut hcb = dt_ucs_jch_to_hcb(jch);
+
+    let radius = (hcb[1] * hcb[1] + hcb[2] * hcb[2]).sqrt(); // dt_fast_hypotf(HCB[1],HCB[2])
+    let sin_t = if radius > 0.0 { hcb[1] / radius } else { 0.0 };
+    let cos_t = if radius > 0.0 { hcb[2] / radius } else { 0.0 };
+
+    let p = f32::MIN_POSITIVE.max(hcb[1]); // MAX(FLT_MIN, HCB[1])
+    let w = sin_t * hcb[1] + cos_t * hcb[2];
+
+    let mut a = (1.0 + d.saturation_global + dot4(opacities, &d.saturation)).max(0.0);
+    let b = (1.0 + d.brilliance_global + dot4(opacities, &d.brilliance)).max(0.0);
+    let max_a = (p * p + w * w).sqrt() / p; // dt_fast_hypotf(P,W)/P
+    a = soft_clip(a, 0.5 * max_a, max_a);
+
+    let p_prime = (a - 1.0) * p;
+    let w_prime = (p * p * (1.0 - a * a) + w * w).sqrt() * b;
+    // M_rot_inv rows {cos_T, sin_T}, {-sin_T, cos_T}
+    hcb[1] = (cos_t * p_prime + sin_t * w_prime).max(0.0);
+    hcb[2] = (-sin_t * p_prime + cos_t * w_prime).max(0.0);
+
+    let jch = dt_ucs_hcb_to_jch(hcb);
+
+    // gamut mapping (max_colorfulness is M²)
+    let max_colorfulness = lookup_gamut(&d.gamut_lut, jch[2]);
+    let max_chroma = 15.932993652962535
+        * (jch[0] * l_white).powf(0.6523997524738018)
+        * max_colorfulness.powf(0.6007557017508491)
+        / l_white;
+    let hsb_boundary = dt_ucs_jch_to_hsb(&[jch[0], max_chroma, jch[2], 0.0]);
+
+    // clip saturation at constant brightness
+    let mut hsb = [hcb[0], if hcb[2] > 0.0 { hcb[1] / hcb[2] } else { 0.0 }, hcb[2], 0.0];
+    hsb[1] = soft_clip(hsb[1], 0.8 * hsb_boundary[1], hsb_boundary[1]);
+
+    let jch = dt_ucs_hsb_to_jch(&hsb);
+    let xyy = dt_ucs_jch_to_xyy(&jch, l_white);
+    xyy_to_xyz(&xyy)
+}
+
+/// Apply colorbalancergb to a packed-RGBA scene-linear **Rec.2020** buffer
+/// (`input`/`output` are `n·4` floats). Faithful port of the process loop
+/// (colorbalancergb.c:662–943), sans the GUI mask-display checkerboard.
+///
+/// The C's premultiplied pipeline↔LMS matrices become direct compositions of the
+/// pipeline's fixed Rec.2020↔XYZ-D65 conversions. Alpha (lane 3) is preserved
+/// from the input (the color chain drops it via the matrices, as in the C, but the
+/// pipeline keeps it rather than emitting 0).
+pub fn process(input: &[f32], output: &mut [f32], d: &CbRgbData) {
+    let (hue_cos, hue_sin) = (d.hue_angle.cos(), d.hue_angle.sin());
+    let l_white = y_to_dt_ucs_l_star(d.white_fulcrum);
+
+    for (i_px, o_px) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+        // clip pipeline RGB
+        let mut rgb = [i_px[0].max(0.0), i_px[1].max(0.0), i_px[2].max(0.0), 0.0];
+
+        // → CIE 2006 LMS D65 → Filmlight Yrg → Ych
+        let mut lms = xyz_to_lms_2006(rec2020_to_xyz_d65(rgb));
+        let mut yrg = lms_to_yrg(lms);
+        let mut ych = yrg_to_ych(yrg);
+        ych[0] = ych[0].max(0.0); // no negative luminance
+
+        // luma opacity masks
+        let (opacities, opacities_comp) = opacity_masks(
+            ych[0].powf(GREY_CENTER_EXP),
+            d.shadows_weight,
+            d.highlights_weight,
+            d.midtones_weight,
+            d.mask_grey_fulcrum,
+        );
+
+        // hue shift (2×2 rotation of the (cos h, sin h) vector)
+        let (cos_h, sin_h) = (ych[2], ych[3]);
+        ych[2] = hue_cos * cos_h - hue_sin * sin_h;
+        ych[3] = hue_sin * cos_h + hue_cos * sin_h;
+
+        // linear chroma: boost + vibrance at constant luminance
+        let chroma_boost = d.chroma_global + dot4(&opacities, &d.chroma);
+        let vibrance = d.vibrance * (1.0 - ych[1].powf(d.vibrance.abs()));
+        let chroma_factor = (1.0 + chroma_boost + vibrance).max(0.0);
+        ych[1] *= chroma_factor;
+
+        // clip chroma to the Yrg/LMS cone, then → Filmlight grading RGB
+        ych = gamut_check_yrg(ych);
+        yrg = ych_to_yrg(ych);
+        lms = yrg_to_lms(yrg);
+        rgb = lms_to_grading_rgb(lms);
+
+        // colour balance: global offset
+        for (v, g) in rgb.iter_mut().zip(d.global.iter()) {
+            *v += g;
+        }
+        // shadows/highlights: 2 masked slopes
+        for c in 0..4 {
+            rgb[c] *= opacities_comp[2] * (opacities_comp[0] + opacities[0] * d.shadows[c])
+                + opacities[2] * d.highlights[c];
+        }
+        // midtones power (per-channel), sign-preserving around the white fulcrum
+        for c in 0..4 {
+            let sign = if rgb[c] < 0.0 { -1.0 } else { 1.0 };
+            let scaled = rgb[c].abs() / d.white_fulcrum;
+            rgb[c] = scaled.powf(d.midtones[c]) * sign * d.white_fulcrum;
+        }
+
+        // back to Yrg for the non-linear luma ops (RGB doesn't preserve colour)
+        lms = grading_rgb_to_lms(rgb);
+        yrg = lms_to_yrg(lms);
+        // Y midtones power (gamma)
+        yrg[0] = (yrg[0] / d.white_fulcrum).max(0.0).powf(d.midtones_y) * d.white_fulcrum;
+        // Y fulcrumed contrast
+        yrg[0] = d.grey_fulcrum * (yrg[0] / d.grey_fulcrum).powf(d.contrast);
+
+        // → XYZ D65 → perceptual saturation adjustments
+        lms = yrg_to_lms(yrg);
+        let xyz_d65 = lms_2006_to_xyz(lms);
+        let xyz_d65 = match d.saturation_formula {
+            SaturationFormula::Jzazbz => saturation_jzazbz(xyz_d65, &opacities, d),
+            SaturationFormula::DtUcs => saturation_dtucs(xyz_d65, &opacities, d, l_white),
+        };
+
+        // back to pipeline RGB, clip negatives, preserve alpha
+        let pix = xyz_d65_to_rec2020(xyz_d65);
+        o_px[0] = pix[0].max(0.0);
+        o_px[1] = pix[1].max(0.0);
+        o_px[2] = pix[2].max(0.0);
+        o_px[3] = i_px[3];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +707,95 @@ mod tests {
         let srgb = CbRgbData::from_params(&p, &SRGB_TO_XYZ_D65_T);
         let differ = rec.gamut_lut.iter().zip(srgb.gamut_lut.iter()).any(|(a, b)| (a - b).abs() > 1e-4);
         assert!(differ, "LUT ignored the input matrix (Rec.2020 vs sRGB identical)");
+    }
+
+    // ── process loop (m4-85) ──
+
+    fn neutral() -> CbRgbData {
+        CbRgbData::from_params(&CbRgbParams::default(), &REC2020_TO_XYZ_D65_T4)
+    }
+
+    fn run_one(rgb: [f32; 3], d: &CbRgbData) -> [f32; 4] {
+        let inp = [rgb[0], rgb[1], rgb[2], 1.0];
+        let mut out = [0.0f32; 4];
+        process(&inp, &mut out, d);
+        out
+    }
+
+    #[test]
+    fn neutral_preserves_grey_both_formulas() {
+        // colorbalancergb always gamut-maps, but a neutral edit on an achromatic
+        // pixel must keep it achromatic and (very nearly) the same luminance.
+        for formula in [SaturationFormula::DtUcs, SaturationFormula::Jzazbz] {
+            let mut p = CbRgbParams::default();
+            p.saturation_formula = formula;
+            let d = CbRgbData::from_params(&p, &REC2020_TO_XYZ_D65_T4);
+            for &v in &[0.05f32, 0.18, 0.5, 0.9] {
+                let o = run_one([v, v, v], &d);
+                assert!(
+                    (o[0] - o[1]).abs() < 1e-3 && (o[1] - o[2]).abs() < 1e-3,
+                    "{formula:?}: grey drifted to colour: {o:?}"
+                );
+                assert!((o[0] - v).abs() < 3e-2, "{formula:?}: grey {v} -> {}", o[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn output_finite_nonneg_for_colours() {
+        let du = neutral();
+        let mut pj = CbRgbParams::default();
+        pj.saturation_formula = SaturationFormula::Jzazbz;
+        let dj = CbRgbData::from_params(&pj, &REC2020_TO_XYZ_D65_T4);
+        for rgb in [[0.6, 0.2, 0.1], [0.1, 0.5, 0.3], [0.02, 0.03, 0.4], [0.9, 0.85, 0.1]] {
+            for d in [&du, &dj] {
+                let o = run_one(rgb, d);
+                assert!(o.iter().all(|v| v.is_finite() && *v >= 0.0), "bad output {o:?} for {rgb:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_is_preserved() {
+        let inp = [0.3, 0.4, 0.5, 0.42];
+        let mut out = [0.0f32; 4];
+        process(&inp, &mut out, &neutral());
+        assert_eq!(out[3], 0.42);
+    }
+
+    #[test]
+    fn parameters_change_the_output() {
+        let base = run_one([0.3, 0.25, 0.2], &neutral());
+        // brighten via global luminance
+        let mut p = CbRgbParams::default();
+        p.global_y = 0.5;
+        let bright = run_one([0.3, 0.25, 0.2], &CbRgbData::from_params(&p, &REC2020_TO_XYZ_D65_T4));
+        assert!(
+            base.iter().zip(bright.iter()).any(|(a, b)| (a - b).abs() > 1e-3),
+            "global_Y had no effect"
+        );
+        // add global saturation
+        let mut p2 = CbRgbParams::default();
+        p2.saturation_global = 0.5;
+        let sat = run_one([0.3, 0.25, 0.2], &CbRgbData::from_params(&p2, &REC2020_TO_XYZ_D65_T4));
+        assert!(
+            base.iter().zip(sat.iter()).any(|(a, b)| (a - b).abs() > 1e-3),
+            "saturation_global had no effect"
+        );
+    }
+
+    #[test]
+    fn processes_a_multi_pixel_buffer() {
+        let d = neutral();
+        let inp: Vec<f32> = (0..16)
+            .flat_map(|i| {
+                let v = i as f32 / 16.0;
+                [v, v * 0.8, v * 0.6, 1.0]
+            })
+            .collect();
+        let mut out = vec![0.0f32; inp.len()];
+        process(&inp, &mut out, &d);
+        assert_eq!(out.len(), inp.len());
+        assert!(out.iter().all(|v| v.is_finite() && *v >= 0.0));
     }
 }
