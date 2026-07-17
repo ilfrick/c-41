@@ -1363,26 +1363,42 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    slot/compose orders). Optional deferred hardening: type `lookup_gamut`'s LUT as
    `&[f32; LUT_ELEM]` once the m4-84 process-loop caller lands.
 
-   **colorbalancergb port roadmap** (multi-increment IOP; m4-81/82 were the
-   shared-conversion + per-pixel-helper groundwork):
-   - **m4-83 (next):** `commit_params` — derive `d` from `p`: the RGB→LMS-2006 /
+   **m4-83** (`f2de894e44`) — **colorbalancergb gamut-boundary LUT builders**
+   (new module `crates/darkroom-core/src/iop/colorbalancergb.rs`): the two
+   `hue → max-saturation/colourfulness` LUT builders the process loop's
+   `lookup_gamut` reads. `build_gamut_lut_jzazbz` (the `STEPS³`=92³ RGB-cube →
+   JzAzBz → max-sat-per-hue + 5-tap box AA, ← `commit_params` JzAzBz branch) and
+   `build_gamut_lut_ucs` (marches the RGB gamut boundary in xyY, accumulating
+   dt-UCS colourfulness² per hue bin, ← `dt_UCS_22_build_gamut_LUT`), plus
+   `hue_index`/`delta_h`. **Matrix contract:** both take the **transposed**
+   RGB→XYZ-D65 matrix (C uses non-transposed `dot_product`; these use
+   `apply_transposed_color_matrix`) — **the m4-84 caller MUST pass the transpose
+   of the C `input_matrix` = `(XYZ_D50→D65_CAT16 · matrix_in)ᵀ`**; getting it
+   wrong yields a silent wrong LUT (test via primary-hue-angle sanity). Opus
+   architect: **APPROVE** — bit-faithful to the *serial* C, derived line-by-line
+   (both AA boundary sets, all 3 UCS edge-intersection formulas, `t==clamp` NaN
+   parity). Caveat (documented in code): the C marches the UCS builder with an
+   OMP `reduction(+:)` whose FP add order is thread-count-dependent, so any golden
+   dump must use `OMP_NUM_THREADS=1`. 5 property tests; 617 darkroom-core tests.
+
+   **colorbalancergb port roadmap** (multi-increment IOP; m4-81/82 = conversions +
+   per-pixel helpers, m4-83 = gamut LUTs):
+   - **m4-84 (next):** `commit_params` — derive `d` from `p`: the RGB→LMS-2006 /
      LMS→RGB input/output matrices (chain `XYZ_D50↔D65_CAT16` with the working
      profile's RGB↔XYZ; for the Rust pipeline the working space is known
-     Rec.2020), the global/shadows/highlights/midtones colour vectors (via
-     `make_ych`+`ych_to_grading_rgb`) + weights, fulcrums, contrast, and the
-     **gamut LUT builder** (`colorbalancergb.c:1194–1238`): the JzAzBz sampler
-     `STEPS³`=92³ loop **or** `dt_UCS_22_build_gamut_LUT` (darktable_ucs_22_helpers.h),
-     selected by `saturation_formula`, then the 5-tap box AA. (The sampler
-     reduction loop at `:1197` is that JzAzBz builder — NOT GUI-only as an earlier
-     note said; only the graph-drawing loop at `:1576` is GUI. Also needs
-     `dt_UCS_22_build_gamut_LUT` ported.)
-   - **m4-84:** the main per-pixel **process loop** (`:662–943`) — clip → LMS →
+     Rec.2020) **AND the transposed RGB→XYZ-D65 matrix for the m4-83 LUT builders**
+     (mind `(A·B)ᵀ = Bᵀ·Aᵀ`), the global/shadows/highlights/midtones colour
+     vectors (via `make_ych`+`ych_to_grading_rgb`) + weights, fulcrums, contrast,
+     and the LUT selection by `saturation_formula`. Add a primary-hue-angle test
+     to pin the transpose contract.
+   - **m4-85:** the main per-pixel **process loop** (`:662–943`) — clip → LMS →
      Yrg/Ych (hue rotation, chroma/vibrance, `gamut_check_Yrg`) → grading RGB
      colour balance (offset/slope/power) → Y power+contrast → the two
      `saturation_formula` branches (**JzAzBz** and **dt UCS**, incl. gamut-mapping
      via the LUT) → back to pipeline RGB. Then wire it as a `pipeline::Stage`.
      This loop is where the real parity risk lives (LUT indexing, hue masking, the
-     sat/brilliance curves) — bring the architect the diff.
+     sat/brilliance curves) — bring the architect the diff. (Also apply the
+     deferred m4-82 hardening: type `lookup_gamut`'s LUT as `&[f32; LUT_ELEM]`.)
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
