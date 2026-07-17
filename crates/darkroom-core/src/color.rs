@@ -846,6 +846,130 @@ pub fn ych_to_rgb(ych: [f32; 4], matrix_trans: &[[f32; 4]; 4]) -> [f32; 4] {
     apply_transposed_color_matrix(&lms, matrix_trans)
 }
 
+// ── colorbalancergb helpers (Filmlight grading-RGB, CIE-2006 LMS<->XYZ, UCS HCB, ──
+// ── JzAzBz forward, soft_clip). Fixed-matrix conversions from
+// colorspaces_inline_conversions.h + darktable_ucs_22_helpers.h. Infra for the
+// colorbalancergb process loop (its own conversions are all fixed matrices).
+
+/// CIE 2006 LMS D65 -> CIE 1931 XYZ D65 (transposed), `LMS_2006_D65_to_XYZ_D65_trans`.
+const LMS_2006_TO_XYZ_D65_T: [[f32; 4]; 4] = [
+    [1.80794659, 0.61783960, -0.12546960, 0.0],
+    [-1.29971660, 0.39595453, 0.20478038, 0.0],
+    [0.34785879, -0.04104687, 1.74274183, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
+/// CIE 1931 XYZ D65 -> CIE 2006 LMS D65 (transposed), `XYZ_D65_to_LMS_2006_D65_trans`.
+const XYZ_D65_TO_LMS_2006_T: [[f32; 4]; 4] = [
+    [0.257085, -0.394427, 0.064856, 0.0],
+    [0.859943, 1.175800, -0.076250, 0.0],
+    [-0.031061, 0.106423, 0.559067, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
+/// CIE 2006 LMS D65 -> CIE 1931 XYZ D65. Matches `LMS_to_XYZ()`.
+#[inline(always)]
+pub fn lms_2006_to_xyz(lms: [f32; 4]) -> [f32; 4] {
+    apply_transposed_color_matrix(&lms, &LMS_2006_TO_XYZ_D65_T)
+}
+
+/// CIE 1931 XYZ D65 -> CIE 2006 LMS D65. Matches `XYZ_to_LMS()`.
+#[inline(always)]
+pub fn xyz_to_lms_2006(xyz: [f32; 4]) -> [f32; 4] {
+    apply_transposed_color_matrix(&xyz, &XYZ_D65_TO_LMS_2006_T)
+}
+
+/// CIE 2006 LMS D65 -> Filmlight grading-RGB. Matches `LMS_to_gradingRGB()`.
+#[inline(always)]
+pub fn lms_to_grading_rgb(lms: [f32; 4]) -> [f32; 4] {
+    apply_transposed_color_matrix(&lms, &LMS_TO_FILMLIGHT_RGB_T)
+}
+
+/// Filmlight grading-RGB -> CIE 2006 LMS D65. Matches `gradingRGB_to_LMS()`.
+#[inline(always)]
+pub fn grading_rgb_to_lms(rgb: [f32; 4]) -> [f32; 4] {
+    apply_transposed_color_matrix(&rgb, &FILMLIGHT_RGB_TO_LMS_T)
+}
+
+/// Exponential soft clip above `soft`, hard-limited toward `hard` (must be
+/// `> soft`); below `soft` it is the identity. Matches `soft_clip()`.
+#[inline(always)]
+pub fn soft_clip(x: f32, soft: f32, hard: f32) -> f32 {
+    let norm = hard - soft;
+    if x > soft {
+        soft + (1.0 - (-(x - soft) / norm).exp()) * norm
+    } else {
+        x
+    }
+}
+
+/// The dt-UCS JCH<->HCB brightness exponent (`darktable_ucs_22_helpers.h`).
+const UCS_HCB_EXP: f32 = 1.33654221029386;
+
+/// dt UCS 22 JCH -> HCB (hue / colourfulness / brightness). Matches
+/// `dt_UCS_JCH_to_HCB()`. `HCB = [J·(C^k+1) as brightness in slot 2, C, H]` →
+/// stored `[H, C, B, 0]`.
+#[inline(always)]
+pub fn dt_ucs_jch_to_hcb(jch: [f32; 4]) -> [f32; 4] {
+    [jch[2], jch[1], jch[0] * (jch[1].powf(UCS_HCB_EXP) + 1.0), 0.0]
+}
+
+/// dt UCS 22 HCB -> JCH. Matches `dt_UCS_HCB_to_JCH()`.
+#[inline(always)]
+pub fn dt_ucs_hcb_to_jch(hcb: [f32; 4]) -> [f32; 4] {
+    [hcb[2] / (hcb[1].powf(UCS_HCB_EXP) + 1.0), hcb[1], hcb[0], 0.0]
+}
+
+/// CIE 1931 XYZ D65 -> JzAzBz. Faithful port of `dt_XYZ_2_JzAzBz()` (the reverse
+/// [`jzazbz_to_xyz_d65`] already exists). Self-contained: an X'Y'Z pre-adaptation,
+/// a fixed matrix, the PQ (SMPTE ST 2084) forward transfer, a fixed matrix, and
+/// the Iz->Jz correction.
+pub fn xyz_to_jzazbz(xyz_d65: [f32; 4]) -> [f32; 4] {
+    const B: f32 = 1.15;
+    const G: f32 = 0.66;
+    const C1: f32 = 0.8359375;
+    const C2: f32 = 18.8515625;
+    const C3: f32 = 18.6875;
+    const N: f32 = 0.159301758;
+    const P: f32 = 134.034375;
+    const D: f32 = -0.56;
+    const D0: f32 = 1.6295499532821566e-11;
+    // XYZ' -> L'M'S' (transposed), `M_transposed`.
+    const M_T: [[f32; 4]; 4] = [
+        [0.41478972, -0.2015100, -0.0166008, 0.0],
+        [0.57999900, 1.1206490, 0.2648000, 0.0],
+        [0.01464800, 0.0531008, 0.6684799, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+    // L'M'S' -> Izazbz (transposed), `A_transposed`.
+    const A_T: [[f32; 4]; 4] = [
+        [0.5, 3.524000, 0.199076, 0.0],
+        [0.5, -4.066708, 1.096799, 0.0],
+        [0.0, 0.542708, -1.295875, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+
+    // XYZ -> X'Y'Z (pre-adaptation)
+    let xyz = [
+        B * xyz_d65[0] - (B - 1.0) * xyz_d65[2],
+        G * xyz_d65[1] - (G - 1.0) * xyz_d65[0],
+        xyz_d65[2],
+        0.0,
+    ];
+
+    // X'Y'Z -> L'M'S' then PQ forward
+    let mut lms = apply_transposed_color_matrix(&xyz, &M_T);
+    for v in lms.iter_mut().take(3) {
+        let t = (*v / 10000.0).max(0.0).powf(N);
+        *v = ((C1 + C2 * t) / (1.0 + C3 * t)).powf(P);
+    }
+
+    // L'M'S' -> Izazbz, then Iz -> Jz
+    let mut jab = apply_transposed_color_matrix(&lms, &A_T);
+    jab[0] = (((1.0 + D) * jab[0]) / (1.0 + D * jab[0]) - D0).max(0.0);
+    jab
+}
+
 // ── filmicrgb v4 gamut mapping (src/common/gamut_mapping.h + gamut_check_Yrg) ──
 
 /// CIE Y 1931 -> CIE Y 2006 scale (achromatic). Matches the
@@ -1316,5 +1440,57 @@ mod rec2020_tests {
         // sRGB white is already D50-referenced → neutral Lab, no CAT16 involved.
         let w = srgb_to_lab([1.0, 1.0, 1.0, 1.0]);
         assert!((w[0] - 100.0).abs() < 0.05 && w[1].abs() < 0.05 && w[2].abs() < 0.05, "{w:?}");
+    }
+
+    // ── colorbalancergb helpers (m4-81) ──
+
+    #[test]
+    fn lms_2006_xyz_round_trips() {
+        // the two matrices are documented exact inverses.
+        for xyz in [[0.3, 0.35, 0.4, 0.0], [0.9, 0.8, 0.7, 0.0], [0.1, 0.05, 0.2, 0.0]] {
+            let back = lms_2006_to_xyz(xyz_to_lms_2006(xyz));
+            assert!(close4(xyz, back, 1e-4), "xyz={xyz:?} back={back:?}");
+        }
+    }
+
+    #[test]
+    fn grading_rgb_lms_round_trips() {
+        for rgb in [[0.3, 0.35, 0.4, 0.0], [0.9, 0.1, 0.5, 0.0]] {
+            let back = lms_to_grading_rgb(grading_rgb_to_lms(rgb));
+            assert!(close4(rgb, back, 1e-4), "rgb={rgb:?} back={back:?}");
+        }
+    }
+
+    #[test]
+    fn soft_clip_identity_below_and_bounded_above() {
+        // below the soft threshold: identity
+        assert_eq!(soft_clip(0.3, 0.5, 1.0), 0.3);
+        // above: strictly between soft and hard, monotone increasing toward hard
+        // (inputs chosen below the f32-saturation-to-hard region).
+        let a = soft_clip(0.7, 0.5, 1.0);
+        let b = soft_clip(1.0, 0.5, 1.0);
+        let c = soft_clip(1.5, 0.5, 1.0);
+        assert!(0.5 < a && a < b && b < c && c < 1.0, "a={a} b={b} c={c}");
+        // and it does saturate to the hard limit for very large inputs
+        assert!((soft_clip(1e6, 0.5, 1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ucs_jch_hcb_round_trips() {
+        for jch in [[0.5, 0.2, 1.3, 0.0], [0.8, 0.0, 0.1, 0.0], [0.2, 0.4, -2.0, 0.0]] {
+            let back = dt_ucs_hcb_to_jch(dt_ucs_jch_to_hcb(jch));
+            assert!(close4(jch, back, 1e-5), "jch={jch:?} back={back:?}");
+        }
+    }
+
+    #[test]
+    fn xyz_jzazbz_round_trips_against_reverse() {
+        // strong faithfulness anchor: forward (new) then the existing reverse must
+        // recover the input XYZ for realistic positive tristimulus values.
+        for xyz in [[0.3, 0.35, 0.4, 0.0], [0.6, 0.5, 0.45, 0.0], [0.05, 0.06, 0.07, 0.0]] {
+            let jab = xyz_to_jzazbz(xyz);
+            let back = jzazbz_to_xyz_d65(jab);
+            assert!(close4(xyz, back, 2e-3), "xyz={xyz:?} jab={jab:?} back={back:?}");
+        }
     }
 }
