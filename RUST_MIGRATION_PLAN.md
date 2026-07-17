@@ -65,7 +65,7 @@ Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --inc
 
 | IOP | C loops remaining | Blocking dependency |
 |-----|------------------|---------------------|
-| `colorbalancergb` | 4 | Filmlight Yrg / `work_profile` |
+| ~~`colorbalancergb`~~ **DONE — m4-81..85** (`iop/colorbalancergb.rs`) | 0 (process + gamut-LUT builders ported; the 2 GUI graph loops @1511/1555 are GUI-only) | ~~Filmlight Yrg / `work_profile`~~ |
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |
 | `channelmixerrgb` | 2 | B-spline local avg reduction (illuminant detection) |
@@ -1396,14 +1396,30 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    and global's `·global_Y` vs shadows/highlights' `+*_Y`. 9 module tests (neutral
    → no-op balance `global=[0;4]`, zones=`[1;4]`; formula-selects-builder;
    LUT-depends-on-matrix). 621 darkroom-core tests.
-   - **m4-85 (next):** the main per-pixel **process loop** (`:662–943`) — clip → LMS →
-     Yrg/Ych (hue rotation, chroma/vibrance, `gamut_check_Yrg`) → grading RGB
-     colour balance (offset/slope/power) → Y power+contrast → the two
-     `saturation_formula` branches (**JzAzBz** and **dt UCS**, incl. gamut-mapping
-     via the LUT) → back to pipeline RGB. Then wire it as a `pipeline::Stage`.
-     This loop is where the real parity risk lives (LUT indexing, hue masking, the
-     sat/brilliance curves) — bring the architect the diff. (Also apply the
-     deferred m4-82 hardening: type `lookup_gamut`'s LUT as `&[f32; LUT_ELEM]`.)
+   **m4-85** (`2f75180f0b`) — **colorbalancergb main process loop** (`process()` +
+   `saturation_jzazbz` + `saturation_dtucs`), port of `:662–943`. Completes the
+   **colorbalancergb ALGORITHM** (m4-81 conversions → m4-82 helpers → m4-83 gamut
+   LUTs → m4-84 commit_params → m4-85 process loop, all Opus-**APPROVE**). Chain:
+   clip → CIE-2006 LMS → Yrg/Ych (opacity masks, 2×2 hue rotation, chroma+vibrance,
+   `gamut_check_yrg`) → grading-RGB colour balance (offset / 2 masked slopes /
+   sign-preserving midtones power) → Y gamma+fulcrumed contrast → XYZ-D65 → the two
+   saturation branches (JzAzBz eigenvector-rotation + Iz/`AI_trans` gamut-clip; dt-UCS
+   HCB-rotation + M²-LUT gamut-map) → pipeline Rec.2020. **Pipeline-vs-C:** the C's
+   premultiplied pipeline↔LMS matrices become direct compositions of the fixed
+   Rec.2020↔XYZ-D65 conversions (m4-75 contract); **alpha preserved from input**
+   (C's matrices zero it — documented, no colour impact); GUI checker omitted. Opus
+   architect: **APPROVE** — both saturation branches derived line-by-line (rotation
+   signs, `SO[1]` clamp order + original-`SO[0]` use, `AI_trans` cols, HCB rotation,
+   `max_chroma` powers). 14 module tests (neutral-preserves-grey both formulas
+   within 3e-2 — colorbalancergb always gamut-maps so not bit-identity;
+   finite/non-neg; alpha; param effects; multi-pixel). 626 darkroom-core tests.
+
+   - **m4-86 (optional, remaining):** wire `colorbalancergb::process` as a live
+     `pipeline::Stage` (enum variant carrying `CbRgbData`, `is_pixel_local()=true`,
+     applied in `Pipeline::process`) so preview/export actually run it — needs
+     params plumbing from the edit/history layer (the algorithm is ported at the
+     darkroom-core level like the other IOP modules until then). Deferred m4-82
+     hardening to apply here: type `lookup_gamut`'s LUT as `&[f32; LUT_ELEM]`.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
