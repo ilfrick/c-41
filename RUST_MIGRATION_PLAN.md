@@ -1347,25 +1347,40 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    the strong anchor (`xyz_to_jzazbz` ∘ the independently-written
    `jzazbz_to_xyz_d65` recovers input within 2e-3). 608 darkroom-core tests.
 
-   **colorbalancergb port roadmap** (it's a multi-increment IOP; m4-81 was the
-   shared-conversion groundwork):
-   - **m4-82 (next):** `commit_params` — derive `d` from `p`: the RGB→LMS-2006 /
+   **m4-82** (`89d42e2ef7`) — **colorbalancergb per-pixel helpers** (`color.rs`):
+   the 4 remaining small conversions both `commit_params` and the process loop
+   need — `make_ych` (`make_Ych`), `ych_to_grading_rgb` (`Ych_to_gradingRGB`,
+   Ych→Yrg→LMS→grading-RGB), `opacity_masks` (sigmoidal shadow/midtone/highlight
+   masks + complement), `lookup_gamut` (cyclic hue→LUT linear interp) + the
+   `LUT_ELEM = 512` const. 4 tests (fulcrum-symmetry 0.5/0.5/0.5, complement,
+   linear-LUT index/interp exactness, hue=0→index 256, constant-LUT wrap). 612
+   darkroom-core tests; clippy clean. **REVIEW DEBT:** the fricktrade-architect
+   review was **quota-blocked** (account session limit, resets 08:50 Europe/Rome);
+   committed on a rigorous line-by-line self-review vs the C (opacity_masks
+   formula/signs/grouping, lookup_gamut wrap incl. `ceil==512→0` and negative
+   two's-complement, slot/compose order — all bit-exact). Formal architect review
+   to be run when quota resets.
+
+   **colorbalancergb port roadmap** (multi-increment IOP; m4-81/82 were the
+   shared-conversion + per-pixel-helper groundwork):
+   - **m4-83 (next):** `commit_params` — derive `d` from `p`: the RGB→LMS-2006 /
      LMS→RGB input/output matrices (chain `XYZ_D50↔D65_CAT16` with the working
      profile's RGB↔XYZ; for the Rust pipeline the working space is known
-     Rec.2020), the global/shadows/highlights/midtones colour vectors + weights,
-     fulcrums, contrast, and the **gamut LUT builder** (the `collapse` loop at
-     `colorbalancergb.c:1511`/`1555` — a hue→max-saturation LUT that `slice`'s
-     `lookup_gamut` reads). Plus the remaining per-pixel helpers not yet in
-     color.rs: `opacity_masks`, `lookup_gamut`. (The sampler reduction loop at
-     `:1197` is a GUI histogram builder — GUI-only, skip like toneequal/colorequal.)
-   - **m4-83 (next):** the main per-pixel **process loop** (`:662–943`) — clip →
-     LMS → Yrg/Ych (hue rotation, chroma/vibrance, `gamut_check_Yrg`) → grading
-     RGB colour balance (offset/slope/power) → Y power+contrast → the two
-     `saturation_formula` branches (**JzAzBz** and **dt UCS**, incl. the
-     gamut-mapping via the LUT) → back to pipeline RGB. Then wire it as a
-     `pipeline::Stage` so the preview/export actually apply it. This loop is where
-     the real parity risk lives (LUT indexing, hue masking, the sat/brilliance
-     curves) — bring the architect the diff.
+     Rec.2020), the global/shadows/highlights/midtones colour vectors (via
+     `make_ych`+`ych_to_grading_rgb`) + weights, fulcrums, contrast, and the
+     **gamut LUT builder** (`colorbalancergb.c:1194–1238`): the JzAzBz sampler
+     `STEPS³`=92³ loop **or** `dt_UCS_22_build_gamut_LUT` (darktable_ucs_22_helpers.h),
+     selected by `saturation_formula`, then the 5-tap box AA. (The sampler
+     reduction loop at `:1197` is that JzAzBz builder — NOT GUI-only as an earlier
+     note said; only the graph-drawing loop at `:1576` is GUI. Also needs
+     `dt_UCS_22_build_gamut_LUT` ported.)
+   - **m4-84:** the main per-pixel **process loop** (`:662–943`) — clip → LMS →
+     Yrg/Ych (hue rotation, chroma/vibrance, `gamut_check_Yrg`) → grading RGB
+     colour balance (offset/slope/power) → Y power+contrast → the two
+     `saturation_formula` branches (**JzAzBz** and **dt UCS**, incl. gamut-mapping
+     via the LUT) → back to pipeline RGB. Then wire it as a `pipeline::Stage`.
+     This loop is where the real parity risk lives (LUT indexing, hue masking, the
+     sat/brilliance curves) — bring the architect the diff.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
    clear — the colour-label arc m4-19/20/21/23/24/25/26 is complete; the tag
