@@ -1354,12 +1354,14 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    masks + complement), `lookup_gamut` (cyclic hue→LUT linear interp) + the
    `LUT_ELEM = 512` const. 4 tests (fulcrum-symmetry 0.5/0.5/0.5, complement,
    linear-LUT index/interp exactness, hue=0→index 256, constant-LUT wrap). 612
-   darkroom-core tests; clippy clean. **REVIEW DEBT:** the fricktrade-architect
-   review was **quota-blocked** (account session limit, resets 08:50 Europe/Rome);
-   committed on a rigorous line-by-line self-review vs the C (opacity_masks
-   formula/signs/grouping, lookup_gamut wrap incl. `ceil==512→0` and negative
-   two's-complement, slot/compose order — all bit-exact). Formal architect review
-   to be run when quota resets.
+   darkroom-core tests; clippy clean. **Review debt CLEARED** — the
+   fricktrade-architect review was first quota-blocked (account session limit) so
+   the commit went in on a bit-exact self-review; the formal Opus review was
+   re-run after the 08:50 reset and returned **APPROVE** (all 5 ports bit-exact:
+   opacity_masks signs/grouping, lookup_gamut wrap incl. `ceil==512→0` & negative
+   two's-complement, `floor`/`ceil` double-vs-f32 immaterial for |x|<512,
+   slot/compose orders). Optional deferred hardening: type `lookup_gamut`'s LUT as
+   `&[f32; LUT_ELEM]` once the m4-84 process-loop caller lands.
 
    **colorbalancergb port roadmap** (multi-increment IOP; m4-81/82 were the
    shared-conversion + per-pixel-helper groundwork):
