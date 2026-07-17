@@ -185,6 +185,18 @@ const XYZ_D65_TO_REC2020_T: [[f32; 3]; 3] = [
     [-0.2533663,  0.0157685,  0.9421031],  // Z → R,G,B
 ];
 
+/// [`REC2020_TO_XYZ_D65_T`] padded to `[[f32; 4]; 4]` for
+/// [`apply_transposed_color_matrix`] — the RGB→XYZ-D65 input matrix the
+/// `colorbalancergb` gamut-LUT builders expect (the pipeline's fixed Rec.2020
+/// working space is what darktable would reach via `CAT16 · matrix_in`). Derived
+/// from the 3×3 so the two can't drift.
+pub const REC2020_TO_XYZ_D65_T4: [[f32; 4]; 4] = [
+    [REC2020_TO_XYZ_D65_T[0][0], REC2020_TO_XYZ_D65_T[0][1], REC2020_TO_XYZ_D65_T[0][2], 0.0],
+    [REC2020_TO_XYZ_D65_T[1][0], REC2020_TO_XYZ_D65_T[1][1], REC2020_TO_XYZ_D65_T[1][2], 0.0],
+    [REC2020_TO_XYZ_D65_T[2][0], REC2020_TO_XYZ_D65_T[2][1], REC2020_TO_XYZ_D65_T[2][2], 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
 /// Linear **Rec.2020** (D65) → XYZ (D65). Alpha (ch 3) passes through.
 pub fn rec2020_to_xyz_d65(rgb: [f32; 4]) -> [f32; 4] {
     let xyz: [f32; 3] = std::array::from_fn(|o|

@@ -18,11 +18,209 @@
 //! loop (m4-85) will be wired as a `pipeline::Stage`.
 
 use crate::color::{
-    apply_transposed_color_matrix, d65_xyz_to_xyy, xyy_to_dt_ucs_uv, xyz_to_jzazbz, LUT_ELEM,
+    apply_transposed_color_matrix, d65_xyz_to_xyy, make_ych, xyy_to_dt_ucs_uv, ych_to_grading_rgb,
+    xyz_to_jzazbz, LUT_ELEM,
 };
 
 /// RGB-cube sampling resolution for the JzAzBz gamut LUT (`#define STEPS 92`).
 const STEPS: usize = 92;
+
+/// Hue-wheel shift: Filmlight Yrg puts red at 330° vs the usual 360/0°
+/// (`#define ANGLE_SHIFT -30.f`).
+const ANGLE_SHIFT: f32 = -30.0;
+
+/// `deg2radf`.
+#[inline]
+fn deg2rad(x: f32) -> f32 {
+    x * core::f32::consts::PI / 180.0
+}
+
+/// `CONVENTIONAL_DEG_TO_YRG_RAD`: shift a conventional-wheel hue (degrees) onto
+/// the Filmlight Yrg wheel and convert to radians.
+#[inline]
+fn conv_deg_to_yrg_rad(x: f32) -> f32 {
+    deg2rad(x + ANGLE_SHIFT)
+}
+
+/// The saturation/gamut-mapping formula (`dt_iop_colorbalancrgb_saturation_t`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaturationFormula {
+    /// JzAzBz (2021).
+    Jzazbz,
+    /// darktable UCS (2022) — the default.
+    DtUcs,
+}
+
+/// User-facing colorbalancergb parameters (`dt_iop_colorbalancergb_params_t`,
+/// v5). Hue fields are in degrees `[0, 360)`, chroma `[0, 1]`, the ±1 sliders as
+/// stored. GUI-only fields (checker colours/size) are omitted.
+#[derive(Clone, Copy, Debug)]
+pub struct CbRgbParams {
+    pub shadows_y: f32,
+    pub shadows_c: f32,
+    pub shadows_h: f32,
+    pub midtones_y: f32,
+    pub midtones_c: f32,
+    pub midtones_h: f32,
+    pub highlights_y: f32,
+    pub highlights_c: f32,
+    pub highlights_h: f32,
+    pub global_y: f32,
+    pub global_c: f32,
+    pub global_h: f32,
+    pub shadows_weight: f32,
+    pub white_fulcrum: f32,
+    pub highlights_weight: f32,
+    pub chroma_shadows: f32,
+    pub chroma_highlights: f32,
+    pub chroma_global: f32,
+    pub chroma_midtones: f32,
+    pub saturation_global: f32,
+    pub saturation_highlights: f32,
+    pub saturation_midtones: f32,
+    pub saturation_shadows: f32,
+    pub hue_angle: f32,
+    pub brilliance_global: f32,
+    pub brilliance_highlights: f32,
+    pub brilliance_midtones: f32,
+    pub brilliance_shadows: f32,
+    pub mask_grey_fulcrum: f32,
+    pub vibrance: f32,
+    pub grey_fulcrum: f32,
+    pub contrast: f32,
+    pub saturation_formula: SaturationFormula,
+}
+
+impl Default for CbRgbParams {
+    /// The darktable `$DEFAULT`s (a neutral, no-op edit).
+    fn default() -> Self {
+        Self {
+            shadows_y: 0.0, shadows_c: 0.0, shadows_h: 0.0,
+            midtones_y: 0.0, midtones_c: 0.0, midtones_h: 0.0,
+            highlights_y: 0.0, highlights_c: 0.0, highlights_h: 0.0,
+            global_y: 0.0, global_c: 0.0, global_h: 0.0,
+            shadows_weight: 1.0, white_fulcrum: 0.0, highlights_weight: 1.0,
+            chroma_shadows: 0.0, chroma_highlights: 0.0, chroma_global: 0.0, chroma_midtones: 0.0,
+            saturation_global: 0.0, saturation_highlights: 0.0, saturation_midtones: 0.0,
+            saturation_shadows: 0.0,
+            hue_angle: 0.0,
+            brilliance_global: 0.0, brilliance_highlights: 0.0, brilliance_midtones: 0.0,
+            brilliance_shadows: 0.0,
+            mask_grey_fulcrum: 0.1845,
+            vibrance: 0.0, grey_fulcrum: 0.1845, contrast: 0.0,
+            saturation_formula: SaturationFormula::DtUcs,
+        }
+    }
+}
+
+/// Derived per-commit data (`dt_iop_colorbalancergb_data_t`), ready for the
+/// per-pixel process loop. GUI-only fields (checker, `lut_inited`, `work_profile`)
+/// are omitted; `max_chroma` is unused by the process loop.
+#[derive(Clone)]
+pub struct CbRgbData {
+    pub global: [f32; 4],
+    pub shadows: [f32; 4],
+    pub highlights: [f32; 4],
+    pub midtones: [f32; 4],
+    pub midtones_y: f32,
+    pub chroma_global: f32,
+    pub chroma: [f32; 4],
+    pub vibrance: f32,
+    pub contrast: f32,
+    pub saturation_global: f32,
+    pub saturation: [f32; 4],
+    pub brilliance_global: f32,
+    pub brilliance: [f32; 4],
+    pub hue_angle: f32,
+    pub shadows_weight: f32,
+    pub highlights_weight: f32,
+    pub midtones_weight: f32,
+    pub mask_grey_fulcrum: f32,
+    pub white_fulcrum: f32,
+    pub grey_fulcrum: f32,
+    pub gamut_lut: [f32; LUT_ELEM],
+    pub saturation_formula: SaturationFormula,
+}
+
+#[inline]
+fn sqf(x: f32) -> f32 {
+    x * x
+}
+
+impl CbRgbData {
+    /// Derive the process-ready data from user params (port of `commit_params`,
+    /// colorbalancergb.c:1087). `rgb_to_xyz_d65_t` is the working profile's
+    /// **transposed** RGB→XYZ-D65 matrix (pass `color::REC2020_TO_XYZ_D65_T4` for
+    /// the pipeline's Rec.2020 working space) — used only to build the gamut LUT.
+    pub fn from_params(p: &CbRgbParams, rgb_to_xyz_d65_t: &[[f32; 4]; 4]) -> Self {
+        // measure the grading RGB of a pure white (achromatic reference)
+        let rgb_norm = ych_to_grading_rgb([1.0, 0.0, 1.0, 0.0]);
+
+        // global: offset around the achromatic reference, scaled by global_Y
+        let mut global = ych_to_grading_rgb(make_ych(1.0, p.global_c, conv_deg_to_yrg_rad(p.global_h)));
+        for (g, n) in global.iter_mut().zip(rgb_norm.iter()) {
+            *g = (*g - n) + n * p.global_y;
+        }
+
+        // shadows / highlights: 1 + offset + luminance; weight = 2 + w·2
+        let mut shadows =
+            ych_to_grading_rgb(make_ych(1.0, p.shadows_c, conv_deg_to_yrg_rad(p.shadows_h)));
+        for (s, n) in shadows.iter_mut().zip(rgb_norm.iter()) {
+            *s = 1.0 + (*s - n) + p.shadows_y;
+        }
+        let shadows_weight = 2.0 + p.shadows_weight * 2.0;
+
+        let mut highlights =
+            ych_to_grading_rgb(make_ych(1.0, p.highlights_c, conv_deg_to_yrg_rad(p.highlights_h)));
+        for (h, n) in highlights.iter_mut().zip(rgb_norm.iter()) {
+            *h = 1.0 + (*h - n) + p.highlights_y;
+        }
+        let highlights_weight = 2.0 + p.highlights_weight * 2.0;
+
+        // midtones: reciprocal power base 1/(1+offset)
+        let mut midtones =
+            ych_to_grading_rgb(make_ych(1.0, p.midtones_c, conv_deg_to_yrg_rad(p.midtones_h)));
+        for (m, n) in midtones.iter_mut().zip(rgb_norm.iter()) {
+            *m = 1.0 / (1.0 + (*m - n));
+        }
+        let midtones_y = 1.0 / (1.0 + p.midtones_y);
+        let white_fulcrum = p.white_fulcrum.exp2();
+        let midtones_weight = sqf(shadows_weight) * sqf(highlights_weight)
+            / (sqf(shadows_weight) + sqf(highlights_weight));
+        let mask_grey_fulcrum = p.mask_grey_fulcrum.powf(0.4101205819200422);
+
+        // gamut LUT, per the selected saturation formula
+        let gamut_lut = match p.saturation_formula {
+            SaturationFormula::Jzazbz => build_gamut_lut_jzazbz(rgb_to_xyz_d65_t),
+            SaturationFormula::DtUcs => build_gamut_lut_ucs(rgb_to_xyz_d65_t),
+        };
+
+        Self {
+            global,
+            shadows,
+            highlights,
+            midtones,
+            midtones_y,
+            chroma_global: p.chroma_global,
+            chroma: [p.chroma_shadows, p.chroma_midtones, p.chroma_highlights, 0.0],
+            vibrance: p.vibrance,
+            contrast: 1.0 + p.contrast,
+            saturation_global: p.saturation_global,
+            saturation: [p.saturation_shadows, p.saturation_midtones, p.saturation_highlights, 0.0],
+            brilliance_global: p.brilliance_global,
+            brilliance: [p.brilliance_shadows, p.brilliance_midtones, p.brilliance_highlights, 0.0],
+            hue_angle: deg2rad(p.hue_angle),
+            shadows_weight,
+            highlights_weight,
+            midtones_weight,
+            mask_grey_fulcrum,
+            white_fulcrum,
+            grey_fulcrum: p.grey_fulcrum,
+            gamut_lut,
+            saturation_formula: p.saturation_formula,
+        }
+    }
+}
 
 /// D65 white point in xyY (`D65xyY = {0.31271, 0.32902, 1.0}`, colorspaces.h:38).
 const D65_X: f32 = 0.31271;
@@ -224,5 +422,72 @@ mod tests {
             let d = delta_h(a, b);
             assert!(d >= -PI - 1e-6 && d <= PI + 1e-6, "delta_h({a},{b})={d} out of range");
         }
+    }
+
+    // ── commit_params (m4-84) ──
+
+    use crate::color::REC2020_TO_XYZ_D65_T4;
+
+    #[test]
+    fn neutral_params_derive_a_no_op_balance() {
+        // default params = a no-op edit: offset 0, slope 1, power 1 on all zones.
+        let d = CbRgbData::from_params(&CbRgbParams::default(), &REC2020_TO_XYZ_D65_T4);
+        for c in 0..4 {
+            assert!(d.global[c].abs() < 1e-5, "global[{c}]={} != 0", d.global[c]);
+            assert!((d.shadows[c] - 1.0).abs() < 1e-5, "shadows[{c}]={}", d.shadows[c]);
+            assert!((d.highlights[c] - 1.0).abs() < 1e-5, "highlights[{c}]={}", d.highlights[c]);
+            assert!((d.midtones[c] - 1.0).abs() < 1e-5, "midtones[{c}]={}", d.midtones[c]);
+        }
+        // scalar derivations for the defaults
+        assert!((d.contrast - 1.0).abs() < 1e-6); // 1 + 0
+        assert!((d.midtones_y - 1.0).abs() < 1e-6); // 1/(1+0)
+        assert!((d.white_fulcrum - 1.0).abs() < 1e-6); // 2^0
+        assert!((d.shadows_weight - 4.0).abs() < 1e-6); // 2 + 1·2
+        assert!((d.highlights_weight - 4.0).abs() < 1e-6);
+        assert!((d.midtones_weight - 8.0).abs() < 1e-5); // 16·16/(16+16)
+        assert!(d.gamut_lut.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn scalar_derivations_track_params() {
+        let mut p = CbRgbParams::default();
+        p.contrast = 0.5;
+        p.midtones_y = 0.25;
+        p.white_fulcrum = 2.0;
+        p.shadows_weight = 0.5;
+        p.highlights_weight = 3.0;
+        let d = CbRgbData::from_params(&p, &REC2020_TO_XYZ_D65_T4);
+        assert!((d.contrast - 1.5).abs() < 1e-6);
+        assert!((d.midtones_y - 1.0 / 1.25).abs() < 1e-6);
+        assert!((d.white_fulcrum - 4.0).abs() < 1e-6); // 2^2
+        assert!((d.shadows_weight - 3.0).abs() < 1e-6); // 2 + 0.5·2
+        assert!((d.highlights_weight - 8.0).abs() < 1e-6); // 2 + 3·2
+        let sw2 = 3.0f32 * 3.0;
+        let hw2 = 8.0f32 * 8.0;
+        assert!((d.midtones_weight - sw2 * hw2 / (sw2 + hw2)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn saturation_formula_selects_the_builder() {
+        let mut pj = CbRgbParams::default();
+        pj.saturation_formula = SaturationFormula::Jzazbz;
+        let dj = CbRgbData::from_params(&pj, &REC2020_TO_XYZ_D65_T4);
+        let du = CbRgbData::from_params(&CbRgbParams::default(), &REC2020_TO_XYZ_D65_T4);
+        // the two formulas build genuinely different LUTs
+        let differ = dj.gamut_lut.iter().zip(du.gamut_lut.iter()).any(|(a, b)| (a - b).abs() > 1e-3);
+        assert!(differ, "JzAzBz and dt-UCS produced identical LUTs");
+    }
+
+    #[test]
+    fn gamut_lut_actually_uses_the_input_matrix() {
+        // a genuinely different gamut (sRGB primaries) must change the LUT — proves
+        // the matrix argument is honoured (guards the transpose-contract wiring).
+        // NB: the dt-UCS builder is chromaticity-based, so a *uniform scale* of the
+        // matrix would NOT change it (same xyY) — the primaries must actually move.
+        let p = CbRgbParams::default();
+        let rec = CbRgbData::from_params(&p, &REC2020_TO_XYZ_D65_T4);
+        let srgb = CbRgbData::from_params(&p, &SRGB_TO_XYZ_D65_T);
+        let differ = rec.gamut_lut.iter().zip(srgb.gamut_lut.iter()).any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(differ, "LUT ignored the input matrix (Rec.2020 vs sRGB identical)");
     }
 }
