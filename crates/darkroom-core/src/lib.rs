@@ -10,6 +10,7 @@ pub mod dwt;
 pub mod error;
 pub mod gaussian;
 pub mod geometry;
+pub mod icc;
 pub mod interp;
 pub mod iop;
 pub mod math;
