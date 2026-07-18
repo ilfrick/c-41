@@ -1375,6 +1375,32 @@ void darkroom_diffuse_inpaint_mask(float *inpainted_buf,
                                    size_t height);
 
 /*
+ * Diffuse IOP -- anisotropic heat-transfer diffusion over one wavelet HF/LF
+ * layer pair. Replaces the DT_OMP_FOR pixel loop in heat_PDE_diffusion().
+ *
+ * high_freq/low_freq/output: RGBA, width*height*4 floats (distinct buffers).
+ * mask: width*height bytes (used iff has_mask != 0). anisotropy/abcd: 4 floats;
+ * isotropy_type: 4 ints (0 isotrope, 1 isophote, 2 gradient). Writes
+ * clamp(HF*strength + sum_k derivatives_k*ABCD_k / variance + LF, >=0), or HF+LF
+ * where the mask is 0.
+ */
+void darkroom_diffuse_heat_pde(const float *high_freq,
+                               const float *low_freq,
+                               const unsigned char *mask,
+                               int has_mask,
+                               float *output,
+                               size_t width,
+                               size_t height,
+                               const float *anisotropy,
+                               const int *isotropy_type,
+                               float regularization,
+                               float variance_threshold,
+                               float current_radius_square,
+                               int mult,
+                               const float *abcd,
+                               float strength);
+
+/*
  * Colortransfer IOP -- L-histogram-matching pass.
  *
  * Per pixel:
