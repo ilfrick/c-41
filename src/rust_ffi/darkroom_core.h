@@ -1426,6 +1426,25 @@ void darkroom_colortransfer_apply_l_histogram(const float *in_buf,
                                               size_t histn);
 
 /*
+ * Colortransfer IOP -- a/b cluster-transfer pass (fuzzy weighting). Replaces the
+ * second DT_OMP_FOR loop of the APPLY branch. Leaves L untouched (set by the
+ * L-histogram pass); writes a/b and copies alpha. mean/var are this image's n
+ * input clusters (n*2 floats each); data_mean/data_var the target clusters;
+ * mapio maps each input cluster to a target (n ints). n <= MAXN (5).
+ */
+void darkroom_colortransfer_apply_ab(const float *in_buf,
+                                     float *out_buf,
+                                     size_t width,
+                                     size_t height,
+                                     size_t ch,
+                                     int n,
+                                     const float *mean,
+                                     const float *var,
+                                     const float *data_mean,
+                                     const float *data_var,
+                                     const int *mapio);
+
+/*
  * Cacorrectrgb IOP -- per-pixel manifold normalisation.
  * For each pixel k (with confidence weight stored in the alpha channel):
  *   weighth = max(higher[k*4+3], 1e-2)

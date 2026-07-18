@@ -181,24 +181,6 @@ static void get_cluster_mapping(const int n, float2 *mi, float2 *mo, int *mapio)
   }
 }
 
-static void get_clusters(const float *col, const int n, float2 *mean, float *weight)
-{
-  float Mdist = 0.0f, mdist = FLT_MAX;
-  for(int k = 0; k < n; k++)
-  {
-    const float dist = (col[1] - mean[k][0]) * (col[1] - mean[k][0])
-                       + (col[2] - mean[k][1]) * (col[2] - mean[k][1]);
-    weight[k] = dist;
-    if(dist < mdist) mdist = dist;
-    if(dist > Mdist) Mdist = dist;
-  }
-  if(Mdist - mdist > 0)
-    for(int k = 0; k < n; k++) weight[k] = (weight[k] - mdist) / (Mdist - mdist);
-  float sum = 0.0f;
-  for(int k = 0; k < n; k++) sum += weight[k];
-  if(sum > 0)
-    for(int k = 0; k < n; k++) weight[k] /= sum;
-}
 
 static int get_cluster(const float *col, const int n, float2 *mean)
 {
@@ -344,36 +326,11 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 
     get_cluster_mapping(data->n, mean, data->mean, mapio);
 
-// for all pixels: find input cluster, transfer to mapped target cluster
-    DT_OMP_FOR()
-    for(int k = 0; k < roi_out->height; k++)
-    {
-      float weight[MAXN];
-      size_t j = (size_t)ch * roi_out->width * k;
-      for(int i = 0; i < roi_out->width; i++)
-      {
-        const float L = in[j];
-        const dt_aligned_pixel_t Lab = { L, in[j + 1], in[j + 2] };
-// a, b: subtract mean, scale nvar/var, add nmean
-#if 0 // single cluster, gives color banding
-        const int ki = get_cluster(in + j, data->n, mean);
-        out[j+1] = 100.0/out[j] * ((Lab[1] - mean[ki][0])*data->var[mapio[ki]][0]/var[ki][0] + data->mean[mapio[ki]][0]);
-        out[j+2] = 100.0/out[j] * ((Lab[2] - mean[ki][1])*data->var[mapio[ki]][1]/var[ki][1] + data->mean[mapio[ki]][1]);
-#else // fuzzy weighting
-        get_clusters(in + j, data->n, mean, weight);
-        out[j + 1] = out[j + 2] = 0.0f;
-        for(int c = 0; c < data->n; c++)
-        {
-          out[j + 1] += weight[c] * ((Lab[1] - mean[c][0]) * data->var[mapio[c]][0] / var[c][0]
-                                     + data->mean[mapio[c]][0]);
-          out[j + 2] += weight[c] * ((Lab[2] - mean[c][1]) * data->var[mapio[c]][1] / var[c][1]
-                                     + data->mean[mapio[c]][1]);
-        }
-#endif
-        out[j + 3] = in[j + 3];
-        j += ch;
-      }
-    }
+    // a/b cluster transfer -- ported to Rust (darkroom_colortransfer_apply_ab).
+    darkroom_colortransfer_apply_ab((const float *)in, (float *)out,
+                                    (size_t)roi_out->width, (size_t)roi_out->height, (size_t)ch,
+                                    data->n, (const float *)mean, (const float *)var,
+                                    (const float *)data->mean, (const float *)data->var, mapio);
 
     free(mapio);
     free(var);
