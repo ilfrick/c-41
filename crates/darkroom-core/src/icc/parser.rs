@@ -102,13 +102,15 @@ impl Curve {
 fn eval_parametric(func: u16, p: &[f32], x: f32) -> f32 {
     // helper for safe param access (missing → 0, defensive)
     let g = |i: usize| p.get(i).copied().unwrap_or(0.0);
+    // clamp the power base at 0 (matches LCMS/darktable): a non-integer power of a
+    // negative base is NaN, which would silently corrupt colour downstream.
     match func {
-        0 => x.powf(g(0)), // Y = X^g
+        0 => x.max(0.0).powf(g(0)), // Y = X^g
         1 => {
             // g, a, b : Y = (aX+b)^g for X >= -b/a, else 0
             let (gg, a, b) = (g(0), g(1), g(2));
             if a != 0.0 && x >= -b / a {
-                (a * x + b).powf(gg)
+                (a * x + b).max(0.0).powf(gg)
             } else {
                 0.0
             }
@@ -117,7 +119,7 @@ fn eval_parametric(func: u16, p: &[f32], x: f32) -> f32 {
             // g, a, b, c : Y = (aX+b)^g + c for X >= -b/a, else c
             let (gg, a, b, c) = (g(0), g(1), g(2), g(3));
             if a != 0.0 && x >= -b / a {
-                (a * x + b).powf(gg) + c
+                (a * x + b).max(0.0).powf(gg) + c
             } else {
                 c
             }
@@ -126,7 +128,7 @@ fn eval_parametric(func: u16, p: &[f32], x: f32) -> f32 {
             // g, a, b, c, d : Y = (aX+b)^g for X>=d, else cX
             let (gg, a, b, c, d) = (g(0), g(1), g(2), g(3), g(4));
             if x >= d {
-                (a * x + b).powf(gg)
+                (a * x + b).max(0.0).powf(gg)
             } else {
                 c * x
             }
@@ -135,7 +137,7 @@ fn eval_parametric(func: u16, p: &[f32], x: f32) -> f32 {
             // g, a, b, c, d, e, f : Y = (aX+b)^g + e for X>=d, else cX + f
             let (gg, a, b, c, d, e, ff) = (g(0), g(1), g(2), g(3), g(4), g(5), g(6));
             if x >= d {
-                (a * x + b).powf(gg) + e
+                (a * x + b).max(0.0).powf(gg) + e
             } else {
                 c * x + ff
             }
@@ -177,10 +179,17 @@ impl Profile {
         let device_class = sig4(bytes, 12)?;
         let data_space = sig4(bytes, 16)?;
         let pcs = sig4(bytes, 20)?;
-        let rendering_intent = be_u32(bytes, 64)?;
+        // intent lives in the low 16 bits; high 16 are reserved (must be 0).
+        let rendering_intent = be_u32(bytes, 64)? & 0xFFFF;
 
         // tag table at offset 128
         let count = be_u32(bytes, 128)? as usize;
+        // Validate the declared tag count against the bytes actually available
+        // BEFORE reserving, so a hostile 32-bit count can't force a huge alloc
+        // (these are untrusted profile bytes, embedded in user-opened images).
+        if count > (bytes.len() - 132) / 12 {
+            return Err(IccError::Truncated);
+        }
         let mut tags = HashMap::with_capacity(count);
         for i in 0..count {
             let base = 132 + i * 12;
@@ -215,7 +224,7 @@ impl Profile {
     /// first XYZ triple.
     pub fn read_xyz(&self, sig: &[u8; 4]) -> Result<Xyz, IccError> {
         let d = self.tag(sig).ok_or(IccError::Truncated)?;
-        if &d[0..4.min(d.len())] != b"XYZ " {
+        if sig4(d, 0)? != *b"XYZ " {
             return Err(IccError::WrongTagType);
         }
         // 8-byte header (type + reserved), then s15Fixed16 x,y,z
@@ -241,6 +250,11 @@ impl Profile {
                         Ok(Curve::Gamma(g))
                     }
                     _ => {
+                        // reject a declared count that can't fit in the tag before
+                        // reserving (untrusted length → validate-before-reserve).
+                        if (d.len().saturating_sub(12)) / 2 < n {
+                            return Err(IccError::Truncated);
+                        }
                         let mut t = Vec::with_capacity(n);
                         for i in 0..n {
                             t.push(be_u16(d, 12 + i * 2)?);
@@ -407,6 +421,29 @@ mod tests {
         assert!((t.eval(0.0) - 0.0).abs() < 1e-4);
         assert!((t.eval(1.0) - 1.0).abs() < 1e-4);
         assert!((t.eval(0.5) - 0.5).abs() < 1e-2);
+    }
+
+    #[test]
+    fn rejects_oversized_counts_without_ooming() {
+        // absurd tag count must be rejected before any huge allocation.
+        let mut p = build_profile(b"mntr", b"RGB ", b"XYZ ", &[]);
+        p[128..132].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        assert_eq!(Profile::parse(&p).unwrap_err(), IccError::Truncated);
+
+        // a curv tag declaring more entries than it can hold is likewise rejected.
+        let mut bad_curv = vec![0u8; 16];
+        bad_curv[0..4].copy_from_slice(b"curv");
+        bad_curv[8..12].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // count
+        let tags: Vec<(&[u8; 4], Vec<u8>)> = vec![(b"rTRC", bad_curv)];
+        let prof = Profile::parse(&build_profile(b"mntr", b"RGB ", b"XYZ ", &tags)).unwrap();
+        assert_eq!(prof.read_curve(b"rTRC").unwrap_err(), IccError::Truncated);
+    }
+
+    #[test]
+    fn parametric_negative_base_is_not_nan() {
+        // func 1 with a negative base in the power segment must clamp, not NaN.
+        let y = eval_parametric(1, &[2.4, -1.0, 0.2], 0.9); // a·x+b = -0.7 < 0
+        assert!(y.is_finite(), "got {y}");
     }
 
     #[test]
