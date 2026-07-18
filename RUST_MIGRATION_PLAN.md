@@ -69,7 +69,7 @@ Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --inc
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |
 | ~~`channelmixerrgb`~~ **DEAD CODE** — both loops (`:753`/`:822`, `_auto_detect_WB`) are inside `#ifdef AI_ACTIVATED` which is only a commented-out `// #define` (never defined) → **never compiled**, not in the binary. Grep-count only; nothing to port. | 2 (dead) | — |
-| `colortransfer` | 2 | k-means (`:243`) + fuzzy-cluster transfer (`:348`) |
+| `colortransfer` | 1 | ~~fuzzy-cluster transfer `:348`~~ **PORTED — m4-88** (`771bd5b6ad`, `darkroom_colortransfer_apply_ab`; architect APPROVE bit-exact; full-c validating). Remaining `:243` **k-means** is **non-deterministic** (`dt_points_get` xorshift128+ PRNG over global/per-thread state + atomic accumulation) — no bit-exact port possible; a serial Rust port would cluster differently than any C run. Best-effort only. |
 | ~~`retouch`~~ **GUI-only** (`:3082`/`:3135` = wavelet-scale-preview auto-levels; see ICC row) | 2 (GUI) | — |
 | `colorequal` | 1 | GUI background renderer (intentionally deferred) |
 | `colorout` | 1 | LCMS `cmsDoTransform` |
