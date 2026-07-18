@@ -68,12 +68,12 @@ Loop counts verified 2026-06-12 (`grep -rcE 'DT_OMP_FOR(_SIMD)?\(' src/iop --inc
 | ~~`colorbalancergb`~~ **DONE — m4-81..85** (`iop/colorbalancergb.rs`) | 0 (process + gamut-LUT builders ported; the 2 GUI graph loops @1511/1555 are GUI-only) | ~~Filmlight Yrg / `work_profile`~~ |
 | `colorreconstruction` | 3 | 3D bilateral grid |
 | `colorin` | 3 | ICC matrix + LCMS |
-| `channelmixerrgb` | 2 | B-spline local avg reduction (illuminant detection) |
-| `colortransfer` | 2 | k-means with atomic accumulators |
-| `retouch` | 2 | `dt_linearRGB_to_XYZ` / `dt_XYZ_to_Lab` ICC paths |
+| ~~`channelmixerrgb`~~ **DEAD CODE** — both loops (`:753`/`:822`, `_auto_detect_WB`) are inside `#ifdef AI_ACTIVATED` which is only a commented-out `// #define` (never defined) → **never compiled**, not in the binary. Grep-count only; nothing to port. | 2 (dead) | — |
+| `colortransfer` | 2 | k-means (`:243`) + fuzzy-cluster transfer (`:348`) |
+| ~~`retouch`~~ **GUI-only** (`:3082`/`:3135` = wavelet-scale-preview auto-levels; see ICC row) | 2 (GUI) | — |
 | `colorequal` | 1 | GUI background renderer (intentionally deferred) |
 | `colorout` | 1 | LCMS `cmsDoTransform` |
-| `diffuse` | 1 | anisotropic PDE solver (very complex) |
+| ~~`diffuse`~~ **PORTED — m4-87** (`072fec679b`, `darkroom_diffuse_heat_pde`; `heat_PDE_diffusion` anisotropic-diffusion kernel; architect **APPROVE** bit-exact after quota-reset re-run — vector_exp bit-hack, isophote-vs-gradient not swapped, deriv↔HF/LF 4-way pairing all verified; full-c `-Werror` validating) | 0 | ~~anisotropic PDE~~ |
 | `toneequal` | 1 | GUI LUT |
 
 (`ashift`, `clipping`, `denoiseprofile`, `gamma`, `liquify`, `rawoverexposed`
