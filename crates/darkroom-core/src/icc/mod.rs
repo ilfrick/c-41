@@ -18,6 +18,8 @@
 //! - m4-91: transform assembly (device→PCS→device, PCS Lab/XYZ, rendering
 //!   intents, chromatic adaptation) and wiring colorin/colorout's LUT path.
 
+mod clut;
 mod parser;
 
+pub use clut::Clut;
 pub use parser::{Curve, IccError, Profile, Xyz};
