@@ -764,64 +764,17 @@ static void _process_cmatrix_bm(dt_iop_module_t *self,
   const dt_iop_colorin_data_t *const d = piece->data;
   const int clipping = (d->nrgb != NULL);
 
-  dt_colormatrix_t cmatrix;
-  transpose_3xSSE(d->cmatrix, cmatrix);
-  dt_colormatrix_t nmatrix;
-  transpose_3xSSE(d->nmatrix, nmatrix);
-  dt_colormatrix_t lmatrix;
-  transpose_3xSSE(d->lmatrix, lmatrix);
-
   const size_t npixels = (size_t)roi_out->height * roi_out->width;
-  // dt_print(DT_DEBUG_ALWAYS, "Using cmatrix codepath");
-  // only color matrix. use our optimized fast path!
-  DT_OMP_FOR(shared(cmatrix, nmatrix, lmatrix))
-  for(int j = 0; j < npixels; j++)
-  {
-    const float *const restrict in = (const float *)ivoid + 4*j;
-    float *const restrict out = (float *)ovoid + 4*j;
-    dt_aligned_pixel_t cam;
-
-    // memcpy(cam, buf_in, sizeof(float)*3);
-    // avoid calling this for linear profiles (marked with negative
-    // entries), assures unbounded color management without
-    // extrapolation.
-    for(int c = 0; c < 3; c++)
-      cam[c] = (d->lut[c][0] >= 0.0f)
-        ? ((in[c] < 1.0f)
-           ? _lerp_lut(d->lut[c], in[c])
-           : dt_iop_eval_exp(d->unbounded_coeffs[c], in[c]))
-        : in[c];
-    cam[3] = 0.0f; // avoid uninitialized-variable warning
-
-    _apply_blue_mapping(cam, cam);
-
-    if(!clipping)
-    {
-      dt_aligned_pixel_t _xyz;
-      dt_apply_transposed_color_matrix(cam, cmatrix, _xyz);
-      dt_aligned_pixel_t res;
-      dt_XYZ_to_Lab(_xyz, res);
-      copy_pixel_nontemporal(out, res);
-    }
-    else
-    {
-      dt_aligned_pixel_t nRGB;
-      dt_apply_transposed_color_matrix(cam, nmatrix, nRGB);
-
-      dt_aligned_pixel_t cRGB;
-      for_each_channel(c)
-      {
-        cRGB[c] = CLAMP(nRGB[c], 0.0f, 1.0f);
-      }
-
-      dt_aligned_pixel_t XYZ;
-      dt_apply_transposed_color_matrix(cRGB, lmatrix, XYZ);
-      dt_aligned_pixel_t res;
-      dt_XYZ_to_Lab(XYZ, res);
-      copy_pixel_nontemporal(out, res);
-    }
-  }
-  dt_omploop_sfence();
+  // only color matrix -- use the Rust fast path (tone-curve "shaper" variant).
+  // The Rust helper does the transpose internally, so we pass the matrices
+  // untransposed as stored.
+  darkroom_colorin_cmatrix_bm((const float *)ivoid, (float *)ovoid, npixels,
+                              (const float *)d->cmatrix,
+                              (const float *)d->nmatrix,
+                              (const float *)d->lmatrix,
+                              (const float *)d->lut,
+                              (const float *)d->unbounded_coeffs,
+                              clipping);
 }
 
 static void _cmatrix_fastpath_simple(float *const restrict out,

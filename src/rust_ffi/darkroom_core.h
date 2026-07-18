@@ -832,6 +832,26 @@ void darkroom_colorin_cmatrix_fastpath_simple(const float *in_buf,
                                               const float *cmatrix);
 
 /*
+ * colorin IOP -- camera-RGB -> Lab via the input colour matrix, tone-curve
+ * ("shaper") path. Replaces the per-pixel loop in _process_cmatrix_bm().
+ *
+ * Applies the input profile's tone curves (lut/unbounded_coeffs; per-channel,
+ * skipped for linear profiles where lut[c][0] < 0), the blue mapping, then
+ * cmatrix->XYZ->Lab, or when clipping != 0 nmatrix->clamp[0,1]->lmatrix->XYZ->Lab.
+ * cmatrix/nmatrix/lmatrix: 16 floats each (dt_colormatrix_t, untransposed).
+ * lut: 3 x 0x10000 floats; unbounded_coeffs: 3 x 3 floats. Output alpha is 0.
+ */
+void darkroom_colorin_cmatrix_bm(const float *in_buf,
+                                 float *out_buf,
+                                 size_t npixels,
+                                 const float *cmatrix,
+                                 const float *nmatrix,
+                                 const float *lmatrix,
+                                 const float *lut,
+                                 const float *unbounded_coeffs,
+                                 int clipping);
+
+/*
  * ChannelMixerRGB IOP -- per-pixel chromatic adaptation + mix + luma/chroma.
  *
  * Replaces the DT_OMP_FOR pixel loop inside _loop_switch() in channelmixerrgb.c.
