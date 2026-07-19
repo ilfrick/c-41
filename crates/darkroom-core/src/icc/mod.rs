@@ -19,7 +19,9 @@
 //!   intents, chromatic adaptation) and wiring colorin/colorout's LUT path.
 
 mod clut;
+mod lut;
 mod parser;
 
 pub use clut::Clut;
+pub use lut::{parse_lut_v2, Pipeline, Stage};
 pub use parser::{Curve, IccError, Profile, Xyz};
