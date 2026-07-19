@@ -99,7 +99,10 @@ fn ematrix_stage(d: &[u8]) -> Result<Option<Stage>, IccError> {
 /// `u16_entries` true → u16 (÷65535); false → u8 (÷255, stored as u16·257).
 fn read_table_curve(d: &[u8], off: usize, count: usize, u16_entries: bool) -> Result<Curve, IccError> {
     let bytes = if u16_entries { 2 } else { 1 };
-    let end = off.checked_add(count * bytes).ok_or(IccError::Truncated)?;
+    // checked (same fragile pattern as the CLUT sizing; robust for reuse by the
+    // v4 mAB/mBA parser where `count` comes from other fields).
+    let span = count.checked_mul(bytes).ok_or(IccError::Truncated)?;
+    let end = off.checked_add(span).ok_or(IccError::Truncated)?;
     if end > d.len() {
         return Err(IccError::Truncated);
     }
@@ -130,7 +133,9 @@ pub fn parse_lut_v2(d: &[u8]) -> Result<Pipeline, IccError> {
     let in_ch = d[8] as usize;
     let out_ch = d[9] as usize;
     let grid = d[10] as usize;
-    if in_ch == 0 || out_ch == 0 || grid < 2 {
+    // Cap channel counts (LCMS cmsMAXCHANNELS = 16) to kill the `grid^in_ch`
+    // overflow class at the source, on top of the checked arithmetic below.
+    if in_ch == 0 || out_ch == 0 || grid < 2 || in_ch > 16 || out_ch > 16 {
         return Err(IccError::Truncated);
     }
     let entry_bytes = if is16 { 2 } else { 1 };
@@ -163,7 +168,10 @@ pub fn parse_lut_v2(d: &[u8]) -> Result<Pipeline, IccError> {
     // CLUT: grid^in_ch nodes × out_ch entries
     let nodes = clut_nodes(grid, in_ch).ok_or(IccError::Truncated)?;
     let clut_vals = nodes.checked_mul(out_ch).ok_or(IccError::Truncated)?;
-    let clut_end = off.checked_add(clut_vals * entry_bytes).ok_or(IccError::Truncated)?;
+    // checked multiply: a crafted in_ch could make clut_vals·entry_bytes wrap and
+    // slip past the length guard (→ huge with_capacity abort). See regression test.
+    let clut_bytes = clut_vals.checked_mul(entry_bytes).ok_or(IccError::Truncated)?;
+    let clut_end = off.checked_add(clut_bytes).ok_or(IccError::Truncated)?;
     if clut_end > d.len() {
         return Err(IccError::Truncated);
     }
@@ -264,6 +272,34 @@ mod tests {
         let mut d2 = identity_mft2(9, 8);
         d2[10] = 255; // grid 255 → 255^3·3 values, far exceeds the tag bytes
         assert_eq!(parse_lut_v2(&d2).unwrap_err(), IccError::Truncated);
+    }
+
+    #[test]
+    fn rejects_input_channel_count_overflow() {
+        // grid=2, in_ch=63 → 2^63 nodes; ×entry_bytes(2) = 2^64 wraps usize and
+        // would slip past the CLUT bounds check without checked math / the cap.
+        let (in_ch, n) = (63usize, 2usize);
+        let mut d = Vec::new();
+        d.extend_from_slice(b"mft2");
+        d.extend_from_slice(&[0, 0, 0, 0]);
+        d.push(in_ch as u8);
+        d.push(1);
+        d.push(2);
+        d.push(0);
+        for i in 0..3 {
+            for j in 0..3 {
+                let v: i32 = if i == j { 65536 } else { 0 };
+                d.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        push_be_u16(&mut d, n as u16);
+        push_be_u16(&mut d, n as u16);
+        for _ in 0..in_ch {
+            for e in 0..n {
+                push_be_u16(&mut d, ((e * 65535) / (n - 1)) as u16);
+            }
+        }
+        assert_eq!(parse_lut_v2(&d).unwrap_err(), IccError::Truncated);
     }
 
     #[test]
