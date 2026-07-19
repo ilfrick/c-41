@@ -23,5 +23,5 @@ mod lut;
 mod parser;
 
 pub use clut::Clut;
-pub use lut::{parse_lut_v2, Pipeline, Stage};
+pub use lut::{parse_lut_v2, parse_lut_v4, Pipeline, Stage};
 pub use parser::{Curve, IccError, Profile, Xyz};

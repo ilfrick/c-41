@@ -197,6 +197,140 @@ pub fn parse_lut_v2(d: &[u8]) -> Result<Pipeline, IccError> {
     Ok(Pipeline { stages })
 }
 
+#[inline]
+fn be_u32(b: &[u8], o: usize) -> Result<usize, IccError> {
+    b.get(o..o + 4)
+        .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
+        .ok_or(IccError::Truncated)
+}
+
+/// Parse `count` consecutive inline tone curves starting at `off`, each padded to
+/// a 4-byte boundary (the v4 `mAB `/`mBA ` curve-set layout).
+fn parse_curves(d: &[u8], off: usize, count: usize) -> Result<Vec<Curve>, IccError> {
+    let mut curves = Vec::with_capacity(count);
+    let mut p = off;
+    for _ in 0..count {
+        let slice = d.get(p..).ok_or(IccError::Truncated)?;
+        let (c, len) = super::parser::parse_curve(slice)?;
+        curves.push(c);
+        let padded = (len + 3) & !3; // 4-byte aligned
+        p = p.checked_add(padded).ok_or(IccError::Truncated)?;
+    }
+    Ok(curves)
+}
+
+/// The v4 matrix element: 12 s15Fixed16 (3×3 `e00..e22` then offset `e30 e31 e32`).
+fn parse_matrix_v4(d: &[u8], off: usize) -> Result<[[f32; 4]; 3], IccError> {
+    let v = |i: usize| s15f16(d, off + i * 4);
+    Ok([
+        [v(0)?, v(1)?, v(2)?, v(9)?],
+        [v(3)?, v(4)?, v(5)?, v(10)?],
+        [v(6)?, v(7)?, v(8)?, v(11)?],
+    ])
+}
+
+/// The v4 CLUT element: 16 grid-point bytes (one per input channel), precision
+/// byte @16 (1=u8, 2=u16), reserved 3, then the data. Grids may differ per axis.
+fn parse_clut_v4(d: &[u8], off: usize, in_ch: usize, out_ch: usize) -> Result<Clut, IccError> {
+    if off.checked_add(20).ok_or(IccError::Truncated)? > d.len() {
+        return Err(IccError::Truncated);
+    }
+    let mut grid = Vec::with_capacity(in_ch);
+    let mut nodes = 1usize;
+    for c in 0..in_ch {
+        let g = d[off + c] as usize;
+        if g < 2 {
+            return Err(IccError::Truncated);
+        }
+        grid.push(g);
+        nodes = nodes.checked_mul(g).ok_or(IccError::Truncated)?;
+    }
+    let entry_bytes = match d[off + 16] {
+        1 => 1usize,
+        2 => 2,
+        _ => return Err(IccError::Truncated),
+    };
+    let vals = nodes.checked_mul(out_ch).ok_or(IccError::Truncated)?;
+    let span = vals.checked_mul(entry_bytes).ok_or(IccError::Truncated)?;
+    let data_off = off + 20;
+    let end = data_off.checked_add(span).ok_or(IccError::Truncated)?;
+    if end > d.len() {
+        return Err(IccError::Truncated);
+    }
+    let mut data = Vec::with_capacity(vals);
+    for i in 0..vals {
+        if entry_bytes == 2 {
+            data.push(be_u16(d, data_off + i * 2)? as f32 / 65535.0);
+        } else {
+            data.push(d[data_off + i] as f32 / 255.0);
+        }
+    }
+    Ok(Clut { grid, output_channels: out_ch, data })
+}
+
+/// Parse a v4 LUT tag (`mAB ` lutAtoBType or `mBA ` lutBtoAType) into a
+/// [`Pipeline`]. Elements are located via the offset table (offset 0 = absent):
+/// - `mAB ` (device→PCS): A curves → CLUT → M curves → matrix → B curves.
+/// - `mBA ` (PCS→device): B curves → matrix → M curves → CLUT → A curves.
+///
+/// Curve-set channel counts follow the dimensional flow (mAB: A=in, M/B=out;
+/// mBA: B/M=in, A=out).
+pub fn parse_lut_v4(d: &[u8]) -> Result<Pipeline, IccError> {
+    if d.len() < 32 {
+        return Err(IccError::Truncated);
+    }
+    let is_ab = match &d[0..4] {
+        b"mAB " => true,
+        b"mBA " => false,
+        _ => return Err(IccError::WrongTagType),
+    };
+    let in_ch = d[8] as usize;
+    let out_ch = d[9] as usize;
+    if in_ch == 0 || out_ch == 0 || in_ch > 16 || out_ch > 16 {
+        return Err(IccError::Truncated);
+    }
+    let (off_b, off_mat, off_m, off_clut, off_a) =
+        (be_u32(d, 12)?, be_u32(d, 16)?, be_u32(d, 20)?, be_u32(d, 24)?, be_u32(d, 28)?);
+
+    let mut stages = Vec::new();
+    if is_ab {
+        // mAB: A(in) → CLUT → M(out) → Matrix → B(out)
+        if off_a != 0 {
+            stages.push(Stage::Curves(parse_curves(d, off_a, in_ch)?));
+        }
+        if off_clut != 0 {
+            stages.push(Stage::Clut(parse_clut_v4(d, off_clut, in_ch, out_ch)?));
+        }
+        if off_m != 0 {
+            stages.push(Stage::Curves(parse_curves(d, off_m, out_ch)?));
+        }
+        if off_mat != 0 {
+            stages.push(Stage::Matrix(parse_matrix_v4(d, off_mat)?));
+        }
+        if off_b != 0 {
+            stages.push(Stage::Curves(parse_curves(d, off_b, out_ch)?));
+        }
+    } else {
+        // mBA: B(in) → Matrix → M(in) → CLUT → A(out)
+        if off_b != 0 {
+            stages.push(Stage::Curves(parse_curves(d, off_b, in_ch)?));
+        }
+        if off_mat != 0 {
+            stages.push(Stage::Matrix(parse_matrix_v4(d, off_mat)?));
+        }
+        if off_m != 0 {
+            stages.push(Stage::Curves(parse_curves(d, off_m, in_ch)?));
+        }
+        if off_clut != 0 {
+            stages.push(Stage::Clut(parse_clut_v4(d, off_clut, in_ch, out_ch)?));
+        }
+        if off_a != 0 {
+            stages.push(Stage::Curves(parse_curves(d, off_a, out_ch)?));
+        }
+    }
+    Ok(Pipeline { stages })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +434,75 @@ mod tests {
             }
         }
         assert_eq!(parse_lut_v2(&d).unwrap_err(), IccError::Truncated);
+    }
+
+    /// Three identity `curv` curves (count 0), 12 bytes each.
+    fn identity_curves3() -> Vec<u8> {
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.extend_from_slice(b"curv");
+            v.extend_from_slice(&[0, 0, 0, 0]); // reserved
+            v.extend_from_slice(&0u32.to_be_bytes()); // count = 0 → identity
+        }
+        v
+    }
+
+    #[test]
+    fn parses_and_evaluates_identity_mab() {
+        // mAB, 3→3, A curves (identity) → CLUT (identity, grid 2³) → B curves.
+        let a_curves = identity_curves3(); // 36 bytes
+        // CLUT: 16 grid bytes + precision(2=u16) + 3 reserved + 48 data bytes
+        let mut clut = Vec::new();
+        clut.extend_from_slice(&[2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // grids
+        clut.push(2); // precision = u16
+        clut.extend_from_slice(&[0, 0, 0]); // reserved
+        for i in 0..2u16 {
+            for j in 0..2u16 {
+                for k in 0..2u16 {
+                    push_be_u16(&mut clut, i * 65535);
+                    push_be_u16(&mut clut, j * 65535);
+                    push_be_u16(&mut clut, k * 65535);
+                }
+            }
+        }
+        let b_curves = identity_curves3();
+
+        let off_a = 32usize;
+        let off_clut = off_a + a_curves.len();
+        let off_b = off_clut + clut.len();
+
+        let mut d = Vec::new();
+        d.extend_from_slice(b"mAB ");
+        d.extend_from_slice(&[0, 0, 0, 0]);
+        d.push(3); // in
+        d.push(3); // out
+        d.extend_from_slice(&[0, 0]); // reserved
+        d.extend_from_slice(&(off_b as u32).to_be_bytes()); // B curves offset
+        d.extend_from_slice(&0u32.to_be_bytes()); // matrix (none)
+        d.extend_from_slice(&0u32.to_be_bytes()); // M curves (none)
+        d.extend_from_slice(&(off_clut as u32).to_be_bytes()); // CLUT
+        d.extend_from_slice(&(off_a as u32).to_be_bytes()); // A curves
+        d.extend_from_slice(&a_curves);
+        d.extend_from_slice(&clut);
+        d.extend_from_slice(&b_curves);
+
+        let p = parse_lut_v4(&d).unwrap();
+        assert_eq!(p.stages.len(), 3); // A curves, CLUT, B curves
+        for &(r, g, b) in &[(0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (0.2, 0.7, 0.45)] {
+            let out = p.eval(&[r, g, b]);
+            assert!((out[0] - r).abs() < 1e-3 && (out[1] - g).abs() < 1e-3 && (out[2] - b).abs() < 1e-3,
+                    "in=({r},{g},{b}) out={out:?}");
+        }
+    }
+
+    #[test]
+    fn v4_rejects_bad_type_and_truncation() {
+        assert_eq!(parse_lut_v4(&[0u8; 20]).unwrap_err(), IccError::Truncated);
+        let mut d = vec![0u8; 40];
+        d[0..4].copy_from_slice(b"mft2");
+        d[8] = 3;
+        d[9] = 3;
+        assert_eq!(parse_lut_v4(&d).unwrap_err(), IccError::WrongTagType);
     }
 
     #[test]

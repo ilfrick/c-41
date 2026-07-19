@@ -238,50 +238,7 @@ impl Profile {
     /// Read a tone-curve tag (`curv` or `para`).
     pub fn read_curve(&self, sig: &[u8; 4]) -> Result<Curve, IccError> {
         let d = self.tag(sig).ok_or(IccError::Truncated)?;
-        let ty = sig4(d, 0)?;
-        match &ty {
-            b"curv" => {
-                let n = be_u32(d, 8)? as usize;
-                match n {
-                    0 => Ok(Curve::Identity),
-                    1 => {
-                        // single u8Fixed8 gamma
-                        let g = be_u16(d, 12)? as f32 / 256.0;
-                        Ok(Curve::Gamma(g))
-                    }
-                    _ => {
-                        // reject a declared count that can't fit in the tag before
-                        // reserving (untrusted length → validate-before-reserve).
-                        if (d.len().saturating_sub(12)) / 2 < n {
-                            return Err(IccError::Truncated);
-                        }
-                        let mut t = Vec::with_capacity(n);
-                        for i in 0..n {
-                            t.push(be_u16(d, 12 + i * 2)?);
-                        }
-                        Ok(Curve::Table(t))
-                    }
-                }
-            }
-            b"para" => {
-                let func = be_u16(d, 8)?;
-                // number of parameters per function type
-                let nparams = match func {
-                    0 => 1,
-                    1 => 3,
-                    2 => 4,
-                    3 => 5,
-                    4 => 7,
-                    _ => 0,
-                };
-                let mut params = Vec::with_capacity(nparams);
-                for i in 0..nparams {
-                    params.push(s15f16(d, 12 + i * 4)?);
-                }
-                Ok(Curve::Parametric { func, params })
-            }
-            _ => Err(IccError::WrongTagType),
-        }
+        Ok(parse_curve(d)?.0)
     }
 
     /// The RGB → XYZ (PCS) matrix from the `rXYZ`/`gXYZ`/`bXYZ` colorant tags,
@@ -305,6 +262,54 @@ impl Profile {
             self.read_curve(b"gTRC").ok()?,
             self.read_curve(b"bTRC").ok()?,
         ])
+    }
+}
+
+/// Parse a single tone curve (`curv` or `para`) from the start of `d`, returning
+/// the curve and the number of bytes it occupies (unpadded). Shared by tag reads
+/// and the v4 `mAB `/`mBA ` inline-curve parsing.
+pub(super) fn parse_curve(d: &[u8]) -> Result<(Curve, usize), IccError> {
+    let ty = sig4(d, 0)?;
+    match &ty {
+        b"curv" => {
+            let n = be_u32(d, 8)? as usize;
+            // curveType length = 12-byte header + `n` u16 entries (unpadded).
+            let consumed = 12 + n * 2; // usize is 64-bit; n ≤ u32::MAX so no overflow
+            let curve = match n {
+                0 => Curve::Identity,
+                1 => Curve::Gamma(be_u16(d, 12)? as f32 / 256.0),
+                _ => {
+                    // validate-before-reserve (untrusted length).
+                    if (d.len().saturating_sub(12)) / 2 < n {
+                        return Err(IccError::Truncated);
+                    }
+                    let mut t = Vec::with_capacity(n);
+                    for i in 0..n {
+                        t.push(be_u16(d, 12 + i * 2)?);
+                    }
+                    Curve::Table(t)
+                }
+            };
+            Ok((curve, consumed))
+        }
+        b"para" => {
+            let func = be_u16(d, 8)?;
+            let nparams = match func {
+                0 => 1,
+                1 => 3,
+                2 => 4,
+                3 => 5,
+                4 => 7,
+                _ => 0,
+            };
+            let mut params = Vec::with_capacity(nparams);
+            for i in 0..nparams {
+                params.push(s15f16(d, 12 + i * 4)?);
+            }
+            // parametricCurveType length = 12-byte header + params (unpadded).
+            Ok((Curve::Parametric { func, params }, 12 + nparams * 4))
+        }
+        _ => Err(IccError::WrongTagType),
     }
 }
 
