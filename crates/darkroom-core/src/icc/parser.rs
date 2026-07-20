@@ -273,14 +273,26 @@ impl Profile {
     /// The device→PCS transform for a rendering `intent` (0 perceptual, 1
     /// rel-colorimetric, 2 saturation, 3 abs-colorimetric). Prefers the
     /// `A2B{intent}` LUT tag, falls back to `A2B0`, then to the matrix-shaper
-    /// (RGB TRC curves → colorant matrix → XYZ). The output PCS is [`Self::pcs`].
+    /// (RGB TRC curves → colorant matrix → XYZ). The output colour space is
+    /// [`Self::pcs`].
+    ///
+    /// **PCS numeric ENCODING differs by branch** (the caller's PCS decode must
+    /// account for this — the m4-93b decode increment normalises it):
+    /// - the **A2B (LUT) branch** emits *ICC-encoded* PCS in `[0, 1]` (XYZ scaled
+    ///   by the 1.0↔0x8000 convention ≈ ÷2; Lab as `L*/100`, `(a*,b*)+128` offsets);
+    /// - the **matrix-shaper branch** emits *raw, unencoded* XYZ D50 in `[0, 1]`
+    ///   (white Y ≈ 1) — the colorant tags are already D50-adapted, so no CAT here.
     pub fn a2b_pipeline(&self, intent: u32) -> Result<Pipeline, IccError> {
         for sig in a2b_tag_sigs(intent) {
             if let Some(tag) = self.tag(&sig) {
                 return parse_lut_tag(tag);
             }
         }
-        // matrix-shaper fallback (RGB matrix profiles → XYZ D50)
+        // matrix-shaper fallback (RGB matrix profiles → raw XYZ D50). The shaper
+        // path is XYZ-only; a Lab-PCS profile with only colorants is malformed.
+        if self.pcs_is_lab() {
+            return Err(IccError::WrongTagType);
+        }
         let m = self.rgb_to_xyz_matrix().ok_or(IccError::WrongTagType)?;
         let trc = self.rgb_trc().ok_or(IccError::WrongTagType)?;
         Ok(Pipeline {
