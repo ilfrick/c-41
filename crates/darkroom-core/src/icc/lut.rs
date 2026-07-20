@@ -305,6 +305,10 @@ pub fn parse_lut_v4(d: &[u8]) -> Result<Pipeline, IccError> {
             stages.push(Stage::Curves(parse_curves(d, off_m, out_ch)?));
         }
         if off_mat != 0 {
+            // the 3×3 matrix only applies to a 3-channel (XYZ/Lab) PCS
+            if out_ch != 3 {
+                return Err(IccError::WrongTagType);
+            }
             stages.push(Stage::Matrix(parse_matrix_v4(d, off_mat)?));
         }
         if off_b != 0 {
@@ -316,6 +320,10 @@ pub fn parse_lut_v4(d: &[u8]) -> Result<Pipeline, IccError> {
             stages.push(Stage::Curves(parse_curves(d, off_b, in_ch)?));
         }
         if off_mat != 0 {
+            // the 3×3 matrix only applies to a 3-channel (XYZ/Lab) PCS
+            if in_ch != 3 {
+                return Err(IccError::WrongTagType);
+            }
             stages.push(Stage::Matrix(parse_matrix_v4(d, off_mat)?));
         }
         if off_m != 0 {
@@ -493,6 +501,126 @@ mod tests {
             assert!((out[0] - r).abs() < 1e-3 && (out[1] - g).abs() < 1e-3 && (out[2] - b).abs() < 1e-3,
                     "in=({r},{g},{b}) out={out:?}");
         }
+    }
+
+    /// Three gamma `curv` curves (count 1, u8Fixed8), each padded to 16 bytes.
+    fn gamma_curves3(gamma: f32) -> Vec<u8> {
+        let fixed = (gamma * 256.0).round() as u16;
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.extend_from_slice(b"curv");
+            v.extend_from_slice(&[0, 0, 0, 0]);
+            v.extend_from_slice(&1u32.to_be_bytes()); // count = 1 → gamma
+            push_be_u16(&mut v, fixed);
+            v.extend_from_slice(&[0, 0]); // pad 14 → 16 (4-byte align)
+        }
+        v
+    }
+
+    fn build_mab(sig: &[u8; 4], a: &[u8], clut: &[u8], b: &[u8]) -> Vec<u8> {
+        let off_a = 32usize;
+        let off_clut = off_a + a.len();
+        let off_b = off_clut + clut.len();
+        let mut d = Vec::new();
+        d.extend_from_slice(sig);
+        d.extend_from_slice(&[0, 0, 0, 0]);
+        d.push(3); // in
+        d.push(3); // out
+        d.extend_from_slice(&[0, 0]);
+        // For mAB: off_b@12, mat@16, m@20, clut@24, a@28.
+        d.extend_from_slice(&(off_b as u32).to_be_bytes());
+        d.extend_from_slice(&0u32.to_be_bytes()); // matrix
+        d.extend_from_slice(&0u32.to_be_bytes()); // M curves
+        d.extend_from_slice(&(off_clut as u32).to_be_bytes());
+        d.extend_from_slice(&(off_a as u32).to_be_bytes());
+        d.extend_from_slice(a);
+        d.extend_from_slice(clut);
+        d.extend_from_slice(b);
+        d
+    }
+
+    fn identity_clut_2x2x2() -> Vec<u8> {
+        let mut clut = Vec::new();
+        clut.extend_from_slice(&[2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        clut.push(2); // u16
+        clut.extend_from_slice(&[0, 0, 0]);
+        for i in 0..2u16 {
+            for j in 0..2u16 {
+                for k in 0..2u16 {
+                    push_be_u16(&mut clut, i * 65535);
+                    push_be_u16(&mut clut, j * 65535);
+                    push_be_u16(&mut clut, k * 65535);
+                }
+            }
+        }
+        clut
+    }
+
+    #[test]
+    fn mab_stage_order_pins_a_before_b() {
+        // Asymmetric A (gamma 2.0) vs B (gamma 3.0): the parse must place A first
+        // and B last — an A/B swap would flip the gammas and fail this.
+        let d = build_mab(b"mAB ", &gamma_curves3(2.0), &identity_clut_2x2x2(), &gamma_curves3(3.0));
+        let p = parse_lut_v4(&d).unwrap();
+        assert_eq!(p.stages.len(), 3, "A curves, CLUT, B curves");
+        match &p.stages[0] {
+            Stage::Curves(cs) => assert!(matches!(cs[0], Curve::Gamma(g) if (g - 2.0).abs() < 1e-2),
+                "stage0 (A) should be gamma 2.0, got {:?}", cs[0]),
+            s => panic!("stage 0 not curves: {s:?}"),
+        }
+        assert!(matches!(&p.stages[1], Stage::Clut(_)), "stage 1 should be the CLUT");
+        match &p.stages[2] {
+            Stage::Curves(cs) => assert!(matches!(cs[0], Curve::Gamma(g) if (g - 3.0).abs() < 1e-2),
+                "stage2 (B) should be gamma 3.0, got {:?}", cs[0]),
+            s => panic!("stage 2 not curves: {s:?}"),
+        }
+    }
+
+    #[test]
+    fn mba_identity_roundtrip_and_order() {
+        // mBA (B → matrix → M → CLUT → A): identity B, CLUT, A (no matrix/M).
+        // Offsets differ from mAB (B@12 ... A@28) — build directly.
+        let b_curves = identity_curves3();
+        let clut = identity_clut_2x2x2();
+        let a_curves = identity_curves3();
+        let off_b = 32usize;
+        let off_clut = off_b + b_curves.len();
+        let off_a = off_clut + clut.len();
+        let mut d = Vec::new();
+        d.extend_from_slice(b"mBA ");
+        d.extend_from_slice(&[0, 0, 0, 0]);
+        d.push(3);
+        d.push(3);
+        d.extend_from_slice(&[0, 0]);
+        d.extend_from_slice(&(off_b as u32).to_be_bytes()); // B @12
+        d.extend_from_slice(&0u32.to_be_bytes()); // matrix @16
+        d.extend_from_slice(&0u32.to_be_bytes()); // M @20
+        d.extend_from_slice(&(off_clut as u32).to_be_bytes()); // CLUT @24
+        d.extend_from_slice(&(off_a as u32).to_be_bytes()); // A @28
+        d.extend_from_slice(&b_curves);
+        d.extend_from_slice(&clut);
+        d.extend_from_slice(&a_curves);
+
+        let p = parse_lut_v4(&d).unwrap();
+        assert_eq!(p.stages.len(), 3);
+        assert!(matches!(&p.stages[1], Stage::Clut(_)), "matrix/M absent → CLUT is the middle stage");
+        for &(r, g, b) in &[(0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (0.4, 0.15, 0.85)] {
+            let out = p.eval(&[r, g, b]);
+            assert!((out[0] - r).abs() < 1e-3 && (out[1] - g).abs() < 1e-3 && (out[2] - b).abs() < 1e-3,
+                    "mBA out={out:?}");
+        }
+    }
+
+    #[test]
+    fn v4_matrix_requires_three_channel_pcs() {
+        // an mAB with ONLY a matrix but out_ch != 3 (matrix defined only for a
+        // 3-channel PCS) must be rejected before building the stage.
+        let mut d = vec![0u8; 80];
+        d[0..4].copy_from_slice(b"mAB ");
+        d[8] = 3; // in
+        d[9] = 4; // out != 3
+        d[16..20].copy_from_slice(&32u32.to_be_bytes()); // matrix offset (A/CLUT/M/B = 0)
+        assert_eq!(parse_lut_v4(&d).unwrap_err(), IccError::WrongTagType);
     }
 
     #[test]

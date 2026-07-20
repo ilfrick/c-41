@@ -294,13 +294,15 @@ pub(super) fn parse_curve(d: &[u8]) -> Result<(Curve, usize), IccError> {
         }
         b"para" => {
             let func = be_u16(d, 8)?;
+            // ICC defines only funcs 0–4; reject unknown types (an unknown func in
+            // a v4 curve set would otherwise misalign the following curves).
             let nparams = match func {
                 0 => 1,
                 1 => 3,
                 2 => 4,
                 3 => 5,
                 4 => 7,
-                _ => 0,
+                _ => return Err(IccError::WrongTagType),
             };
             let mut params = Vec::with_capacity(nparams);
             for i in 0..nparams {
