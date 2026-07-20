@@ -22,3 +22,18 @@ chown -R "${CONT_UID}:${CONT_GID}" /config/darkroom /config/cache
 chmod 750 /config/darkroom /config/cache
 
 echo "[darkroom-init] /config owned by $(stat -c '%u:%g' /config), darkroom by $(stat -c '%u:%g' /config/darkroom)"
+
+# Refresh the openbox autostart from the image's /defaults copy on EVERY start.
+# The KasmVNC base image seeds /config/.config/openbox/autostart from /defaults
+# only when it is missing; since /config is a persisted volume, an image update
+# (e.g. the binary rename darkroom -> darkroom-rs) would otherwise keep running a
+# stale copy and fail with "/usr/local/bin/darkroom: not found" (exit 127).
+# Force-overwriting here makes image updates always propagate.
+if [ -f /defaults/autostart ]; then
+  OPENBOX_DIR=/config/.config/openbox
+  mkdir -p "${OPENBOX_DIR}"
+  cp -f /defaults/autostart "${OPENBOX_DIR}/autostart"
+  chmod +x "${OPENBOX_DIR}/autostart"
+  chown -R "${CONT_UID}:${CONT_GID}" /config/.config
+  echo "[darkroom-init] refreshed openbox autostart from /defaults"
+fi
