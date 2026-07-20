@@ -197,6 +197,16 @@ pub fn parse_lut_v2(d: &[u8]) -> Result<Pipeline, IccError> {
     Ok(Pipeline { stages })
 }
 
+/// Parse any LUT-type tag into a [`Pipeline`], dispatching on its type signature:
+/// `mft1`/`mft2` (v2) or `mAB `/`mBA ` (v4).
+pub fn parse_lut_tag(d: &[u8]) -> Result<Pipeline, IccError> {
+    match d.get(0..4).ok_or(IccError::Truncated)? {
+        b"mft1" | b"mft2" => parse_lut_v2(d),
+        b"mAB " | b"mBA " => parse_lut_v4(d),
+        _ => Err(IccError::WrongTagType),
+    }
+}
+
 #[inline]
 fn be_u32(b: &[u8], o: usize) -> Result<usize, IccError> {
     b.get(o..o + 4)

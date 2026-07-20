@@ -4,6 +4,7 @@
 //! matrix-shaper profiles: `XYZ ` (colorants / white point) and the tone-curve
 //! types `curv` / `para`. cLUT tag types land in the next increment.
 
+use super::lut::{parse_lut_tag, Pipeline, Stage};
 use std::collections::HashMap;
 
 /// ICC parse failure.
@@ -263,6 +264,51 @@ impl Profile {
             self.read_curve(b"bTRC").ok()?,
         ])
     }
+
+    /// True iff the profile connection space is Lab (`Lab `); otherwise XYZ.
+    pub fn pcs_is_lab(&self) -> bool {
+        &self.pcs == b"Lab "
+    }
+
+    /// The device→PCS transform for a rendering `intent` (0 perceptual, 1
+    /// rel-colorimetric, 2 saturation, 3 abs-colorimetric). Prefers the
+    /// `A2B{intent}` LUT tag, falls back to `A2B0`, then to the matrix-shaper
+    /// (RGB TRC curves → colorant matrix → XYZ). The output PCS is [`Self::pcs`].
+    pub fn a2b_pipeline(&self, intent: u32) -> Result<Pipeline, IccError> {
+        for sig in a2b_tag_sigs(intent) {
+            if let Some(tag) = self.tag(&sig) {
+                return parse_lut_tag(tag);
+            }
+        }
+        // matrix-shaper fallback (RGB matrix profiles → XYZ D50)
+        let m = self.rgb_to_xyz_matrix().ok_or(IccError::WrongTagType)?;
+        let trc = self.rgb_trc().ok_or(IccError::WrongTagType)?;
+        Ok(Pipeline {
+            stages: vec![
+                Stage::Curves(trc.to_vec()),
+                Stage::Matrix([
+                    [m[0][0], m[0][1], m[0][2], 0.0],
+                    [m[1][0], m[1][1], m[1][2], 0.0],
+                    [m[2][0], m[2][1], m[2][2], 0.0],
+                ]),
+            ],
+        })
+    }
+}
+
+/// The `A2B{intent}` tag signatures to try, in preference order (abs-colorimetric
+/// intent 3 uses the rel-colorimetric `A2B1` table; all fall back to `A2B0`).
+fn a2b_tag_sigs(intent: u32) -> Vec<[u8; 4]> {
+    let specific = match intent {
+        1 | 3 => *b"A2B1",
+        2 => *b"A2B2",
+        _ => *b"A2B0",
+    };
+    if specific == *b"A2B0" {
+        vec![*b"A2B0"]
+    } else {
+        vec![specific, *b"A2B0"]
+    }
 }
 
 /// Parse a single tone curve (`curv` or `para`) from the start of `d`, returning
@@ -405,6 +451,34 @@ mod tests {
         // white (RGB 1,1,1) → summed colorants ≈ D50/D65 white Y ~1.0
         let wy = m[1][0] + m[1][1] + m[1][2];
         assert!((wy - 1.0).abs() < 5e-3, "white Y = {wy}");
+    }
+
+    #[test]
+    fn a2b_pipeline_matrix_shaper_produces_xyz() {
+        // A matrix-shaper RGB→XYZ profile: gamma-2.2 TRCs + sRGB-ish colorants.
+        // a2b_pipeline should linearise then apply the colorant matrix, so white
+        // (1,1,1) → the summed colorants (≈ D50/D65 white, Y≈1).
+        let tags = vec![
+            (b"rXYZ", xyz_tag(0.4361, 0.2225, 0.0139)),
+            (b"gXYZ", xyz_tag(0.3851, 0.7169, 0.0971)),
+            (b"bXYZ", xyz_tag(0.1431, 0.0606, 0.7141)),
+            (b"rTRC", curv_gamma_tag(2.2)),
+            (b"gTRC", curv_gamma_tag(2.2)),
+            (b"bTRC", curv_gamma_tag(2.2)),
+        ];
+        let tref: Vec<(&[u8; 4], Vec<u8>)> = tags.iter().map(|(s, d)| (*s, d.clone())).collect();
+        let prof = Profile::parse(&build_profile(b"mntr", b"RGB ", b"XYZ ", &tref)).unwrap();
+        assert!(!prof.pcs_is_lab());
+        let p = prof.a2b_pipeline(0).unwrap();
+        assert_eq!(p.stages.len(), 2); // TRC curves + colorant matrix
+
+        // white → Y ≈ 1 (TRC(1)=1, then summed colorant Y)
+        let w = p.eval(&[1.0, 1.0, 1.0]);
+        assert!((w[1] - (0.2225 + 0.7169 + 0.0606)).abs() < 2e-3, "white XYZ = {w:?}");
+        // a mid-grey linearises through the gamma before the matrix
+        let g = p.eval(&[0.5, 0.5, 0.5]);
+        let lin = 0.5f32.powf(2.1992); // u8Fixed8-quantised 2.2
+        assert!((g[1] / w[1] - lin).abs() < 2e-3, "grey Y ratio {} vs {lin}", g[1] / w[1]);
     }
 
     #[test]
