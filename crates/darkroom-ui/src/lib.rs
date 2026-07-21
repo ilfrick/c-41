@@ -87,7 +87,7 @@ fn build_main_window(app: &Application) {
     };
 
     // ── Lighttable ─────────────────────────────────────────────────────────
-    let (lt_grid, lt_model, lt_selection) =
+    let (scroll, lt_model, lt_selection) =
         lighttable::lighttable_page(db_path.clone());
     lighttable::lighttable_load_from_db(&lt_model, &db_path);
 
@@ -162,7 +162,6 @@ fn build_main_window(app: &Application) {
     }
 
     // ── Lighttable page layout ─────────────────────────────────────────────
-    let scroll = lt_grid.child().unwrap();
     scroll.set_hexpand(true);
 
     let hbox = gtk4::Box::builder()
@@ -268,8 +267,7 @@ fn build_main_window(app: &Application) {
 
     // Double-click → darkroom page; F1–F5 → toggle colour label on selection.
     {
-        let scroll_ref = scroll.downcast_ref::<gtk4::ScrolledWindow>().unwrap();
-        if let Some(grid) = scroll_ref.child().and_downcast::<gtk4::GridView>() {
+        if let Some(grid) = scroll.child().and_downcast::<gtk4::GridView>() {
             grid.connect_activate(clone!(@weak nav, @weak lt_model, @strong db_path => move |_, pos| {
                 if let Some(path) = lt_model.item(pos)
                     .and_downcast::<gtk4::StringObject>()

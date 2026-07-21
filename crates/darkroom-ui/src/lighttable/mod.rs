@@ -19,7 +19,7 @@ pub type LighttableModel = gtk4::StringList;
 /// Build the lighttable widget. Returns (NavigationPage, model, selection).
 ///
 /// `db_path` is stored in each cell's gesture handler for rating updates.
-pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel, SingleSelection) {
+pub fn lighttable_page(db_path: String) -> (ScrolledWindow, LighttableModel, SingleSelection) {
     let model     = gtk4::StringList::new(&[]);
     let selection = SingleSelection::new(Some(model.clone()));
     let factory   = SignalListItemFactory::new();
@@ -181,12 +181,7 @@ pub fn lighttable_page(db_path: String) -> (adw::NavigationPage, LighttableModel
         .vexpand(true)
         .build();
 
-    let page = adw::NavigationPage::builder()
-        .title("Lighttable")
-        .child(&scroll)
-        .build();
-
-    (page, model, selection)
+    (scroll, model, selection)
 }
 
 // ── Rating helpers ────────────────────────────────────────────────────────
