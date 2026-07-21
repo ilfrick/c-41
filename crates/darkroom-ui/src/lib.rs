@@ -376,5 +376,13 @@ fn build_main_window(app: &Application) {
     // ── Wire toast overlay + present ───────────────────────────────────────
     toast_overlay.set_child(Some(&nav));
     window.set_child(Some(&toast_overlay));
+    // Maximize so the window always fills the display. In the KasmVNC container
+    // the framebuffer is resized dynamically to the connecting browser's
+    // viewport; without maximizing, the window keeps its fixed default size in
+    // the top-left corner surrounded by black, which reads as "no main screen".
+    // openbox (and any EWMH WM) honours the maximized hint and re-fits the
+    // window when the framebuffer is later resized. The default_width/height
+    // above remain the fallback for WMs that don't honour maximize.
+    window.maximize();
     window.present();
 }
