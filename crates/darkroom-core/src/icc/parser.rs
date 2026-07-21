@@ -276,16 +276,20 @@ impl Profile {
     /// (RGB TRC curves → colorant matrix → XYZ). The output colour space is
     /// [`Self::pcs`].
     ///
-    /// **PCS numeric ENCODING differs by branch** (the caller's PCS decode must
-    /// account for this — the m4-93b decode increment normalises it):
-    /// - the **A2B (LUT) branch** emits *ICC-encoded* PCS in `[0, 1]` (XYZ scaled
-    ///   by the 1.0↔0x8000 convention ≈ ÷2; Lab as `L*/100`, `(a*,b*)+128` offsets);
-    /// - the **matrix-shaper branch** emits *raw, unencoded* XYZ D50 in `[0, 1]`
-    ///   (white Y ≈ 1) — the colorant tags are already D50-adapted, so no CAT here.
+    /// Both branches return the PCS in **raw (un-encoded) values, uniformly**: raw
+    /// XYZ D50 (`Y ≈ 1` for white) when [`Self::pcs`] is `XYZ `, or Lab
+    /// (`L∈[0,100]`, `a,b∈[-128,127]`) when it is `Lab `. The A2B (LUT) branch
+    /// emits ICC-encoded PCS which is decoded to raw here (appended
+    /// [`pcs_decode_stage`]); the matrix-shaper branch is already raw XYZ D50 (the
+    /// colorant tags are D50-adapted, so no CAT). The caller uses [`Self::pcs_is_lab`]
+    /// only to know the *space*, not the encoding.
     pub fn a2b_pipeline(&self, intent: u32) -> Result<Pipeline, IccError> {
         for sig in a2b_tag_sigs(intent) {
             if let Some(tag) = self.tag(&sig) {
-                return parse_lut_tag(tag);
+                let mut p = parse_lut_tag(tag)?;
+                // decode ICC-encoded PCS → raw values (uniform with the shaper branch)
+                p.stages.push(pcs_decode_stage(self.pcs_is_lab(), self.version_major));
+                return Ok(p);
             }
         }
         // matrix-shaper fallback (RGB matrix profiles → raw XYZ D50). The shaper
@@ -305,6 +309,30 @@ impl Profile {
                 ]),
             ],
         })
+    }
+}
+
+/// The affine PCS-decode stage that maps ICC-encoded LUT output (`[0,1]` per
+/// channel) to raw PCS values, so the A2B branch matches the raw matrix-shaper
+/// branch. XYZ: `×(65535/32768)` (the 1.0↔0x8000 convention). Lab: `L=n·100`,
+/// `a,b=n·255−128`, with the legacy v2 scale `65535/65280` on L/a/b.
+fn pcs_decode_stage(is_lab: bool, version_major: u8) -> Stage {
+    if is_lab {
+        // v2 Lab encodes 100 at 0xFF00 (not 0xFFFF); v4 at 0xFFFF.
+        let v2 = 65535.0 / 65280.0;
+        let (s_l, s_ab) = if version_major >= 4 {
+            (100.0, 255.0)
+        } else {
+            (100.0 * v2, 255.0 * v2)
+        };
+        Stage::Matrix([
+            [s_l, 0.0, 0.0, 0.0],
+            [0.0, s_ab, 0.0, -128.0],
+            [0.0, 0.0, s_ab, -128.0],
+        ])
+    } else {
+        let k = 65535.0 / 32768.0; // ≈ 1.99997
+        Stage::Matrix([[k, 0.0, 0.0, 0.0], [0.0, k, 0.0, 0.0], [0.0, 0.0, k, 0.0]])
     }
 }
 
@@ -463,6 +491,59 @@ mod tests {
         // white (RGB 1,1,1) → summed colorants ≈ D50/D65 white Y ~1.0
         let wy = m[1][0] + m[1][1] + m[1][2];
         assert!((wy - 1.0).abs() < 5e-3, "white Y = {wy}");
+    }
+
+    /// Minimal identity `mft2` (3→3, grid `g`, ramp tables + identity CLUT).
+    fn build_identity_mft2(g: usize) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(b"mft2");
+        d.extend_from_slice(&[0, 0, 0, 0]);
+        d.push(3);
+        d.push(3);
+        d.push(g as u8);
+        d.push(0);
+        for i in 0..3 {
+            for j in 0..3 {
+                let v: i32 = if i == j { 65536 } else { 0 };
+                d.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        d.extend_from_slice(&2u16.to_be_bytes()); // n_in
+        d.extend_from_slice(&2u16.to_be_bytes()); // n_out
+        for _ in 0..3 {
+            d.extend_from_slice(&0u16.to_be_bytes());
+            d.extend_from_slice(&65535u16.to_be_bytes());
+        }
+        for i in 0..g {
+            for j in 0..g {
+                for k in 0..g {
+                    d.extend_from_slice(&(((i * 65535) / (g - 1)) as u16).to_be_bytes());
+                    d.extend_from_slice(&(((j * 65535) / (g - 1)) as u16).to_be_bytes());
+                    d.extend_from_slice(&(((k * 65535) / (g - 1)) as u16).to_be_bytes());
+                }
+            }
+        }
+        for _ in 0..3 {
+            d.extend_from_slice(&0u16.to_be_bytes());
+            d.extend_from_slice(&65535u16.to_be_bytes());
+        }
+        d
+    }
+
+    #[test]
+    fn a2b_lut_branch_decodes_pcs_to_raw_xyz() {
+        // Profile with A2B0 = identity mft2 (XYZ PCS): a2b_pipeline parses the LUT
+        // and appends the XYZ decode, so a normalised 0.5 → raw ~1.0 (×65535/32768).
+        let tags: Vec<(&[u8; 4], Vec<u8>)> = vec![(b"A2B0", build_identity_mft2(2))];
+        let prof = Profile::parse(&build_profile(b"prtr", b"RGB ", b"XYZ ", &tags)).unwrap();
+        let p = prof.a2b_pipeline(0).unwrap();
+        let k = 65535.0f32 / 32768.0;
+        let out = p.eval(&[0.5, 0.5, 0.5]);
+        for c in 0..3 {
+            assert!((out[c] - 0.5 * k).abs() < 5e-3, "decoded {out:?}, want ~{}", 0.5 * k);
+        }
+        let w = p.eval(&[1.0, 1.0, 1.0]);
+        assert!((w[1] - k).abs() < 5e-3, "white {w:?} want ~{k}");
     }
 
     #[test]
