@@ -318,7 +318,9 @@ impl Profile {
 /// `a,b=n·255−128`, with the legacy v2 scale `65535/65280` on L/a/b.
 fn pcs_decode_stage(is_lab: bool, version_major: u8) -> Stage {
     if is_lab {
-        // v2 Lab encodes 100 at 0xFF00 (not 0xFFFF); v4 at 0xFFFF.
+        // v2 Lab encodes 100 at 0xFF00 (=65280), not 0xFFFF; v4 at 0xFFFF. The
+        // legacy scale `255·(65535/65280)` is *exactly* `65535/256` (255·256=65280),
+        // which is why it reduces to LCMS's `E/256 − 128`; don't "simplify" it away.
         let v2 = 65535.0 / 65280.0;
         let (s_l, s_ab) = if version_major >= 4 {
             (100.0, 255.0)
