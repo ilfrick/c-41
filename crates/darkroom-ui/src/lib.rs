@@ -55,6 +55,12 @@ pub fn run() -> Result<glib::ExitCode> {
 }
 
 fn build_main_window(app: &Application) {
+    // darktable ships a dark grey theme; match that first impression by forcing
+    // libadwaita's dark colour scheme (the default follows the desktop setting,
+    // which is light in the KasmVNC container). A custom CSS provider matching
+    // darktable's exact greys is a later refinement (see RUST_MIGRATION_PLAN.md).
+    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Darkroom")

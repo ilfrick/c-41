@@ -118,6 +118,27 @@ C FFI trampolines for tags. 61 DB tests passing.
 - **Lighttable** (functional): DB-backed `GridView` of thumbnails, collections
   left panel, metadata right panel, name search/filter, star ratings, import &
   export dialogs, `adw::ToastOverlay` notifications, Ctrl+I / Ctrl+E shortcuts.
+  - **m4-95 (fix):** the thumbnail grid never actually rendered in the packaged
+    GUI — `lighttable_page()` returned the grid's `ScrolledWindow` wrapped in a
+    throwaway `adw::NavigationPage`, and the caller appended the still-parented
+    ScrolledWindow to the layout `hbox`, so `gtk_box_append` (asserts parent ==
+    NULL) silently no-oped and dropped the grid. Users saw `[Collections |
+    Metadata]` with no photos. Latent since ui-4; missed by display-free tests.
+    Fixed by returning the `ScrolledWindow` directly (bug class deleted).
+- **Lighttable ↔ darktable parity gaps (planned, user-requested 2026-07-21).**
+  Current lighttable is a functional *subset*; the "feels like darktable" gaps,
+  in priority order:
+  - **m4-96 — dark theme.** darktable ships a dark grey theme; we use adwaita's
+    default light. First pass: `adw::StyleManager::set_color_scheme(ForceDark)`.
+    Follow-up: a custom CSS provider matching darktable's exact greys.
+  - **m4-97 — view switcher + filter/sort bar.** Top-bar `lighttable | darkroom
+    | other` switcher; filter by rating/colour/status + sort-by + live image
+    count (darktable's top toolbar). We currently expose only a search box.
+  - **m4-98 — bottom toolbar.** Quick rating/colour strip, view-mode switcher
+    (file-manager / zoomable / culling), thumbnail-size control, overlay toggles.
+  - Later: left-panel modules (import as a module, hierarchical collections,
+    image-information, Lua scripts), right-panel modules (history stack, styles,
+    metadata editor, geotagging, export as a panel), and the date timeline.
 - **Navigation**: `adw::NavigationView` lighttable ⇄ darkroom (double-click).
 - **Darkroom view**: grouped IOP **module panel** sourced from a real module
   catalog, Export, and a **live multi-IOP preview pipeline** (`preview.rs`,
