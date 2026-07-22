@@ -134,6 +134,17 @@ C FFI trampolines for tags. 61 DB tests passing.
   - **m4-97 — view switcher + filter/sort bar.** Top-bar `lighttable | darkroom
     | other` switcher; filter by rating/colour/status + sort-by + live image
     count (darktable's top toolbar). We currently expose only a search box.
+    - **m4-97a (done):** live image-count indicator in the lighttable top bar,
+      bound to the grid model's `items-changed` (no per-call-site plumbing).
+      Counts only real-image rows (contain `/`), excluding the model's sentinel
+      rows (empty-state / truncation notice) so an empty view reads "0 images".
+    - **Follow-up (perf):** `lighttable` `fill_grid`/clear currently do
+      `append()` in a loop + `while n_items()>0 { remove(0) }` — O(N²) clear and
+      ~4000 `items-changed` emissions per 2000-image load. Convert to
+      `StringList::splice()`: one emission, O(N), and one count-label update.
+    - **Follow-up (CI reproducibility):** `rust-toolchain.toml` pins
+      `channel = "stable"` (floating) — a new stable can fail `clippy` with zero
+      commits from us. Pin to an explicit `1.XX.0`, bumped deliberately.
   - **m4-98 — bottom toolbar.** Quick rating/colour strip, view-mode switcher
     (file-manager / zoomable / culling), thumbnail-size control, overlay toggles.
   - Later: left-panel modules (import as a module, hierarchical collections,

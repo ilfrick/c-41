@@ -257,6 +257,31 @@ fn build_main_window(app: &Application) {
         lt_header.pack_end(&btn);
     }
 
+    // Image-count indicator (m4-97a) — darktable shows the current view's image
+    // count in the top bar. Bound to the model's items-changed signal so it
+    // tracks every load / filter / import / tag-filter without touching each
+    // load call site. Capped views (GRID_CAP) read as e.g. "2000 images".
+    {
+        // The grid model also carries non-image sentinel rows (a "(No results)"
+        // / empty-state placeholder, or a truncation notice) — the codebase's
+        // convention is that real image rows contain '/', sentinels don't. Count
+        // only real images so an empty collection reads "0 images", not "1".
+        fn image_count(m: &gtk4::StringList) -> u32 {
+            (0..m.n_items())
+                .filter(|&i| m.string(i).is_some_and(|s| s.contains('/')))
+                .count() as u32
+        }
+        fn fmt(n: u32) -> String {
+            format!("{n} image{}", if n == 1 { "" } else { "s" })
+        }
+        let count_label = gtk4::Label::new(Some(&fmt(image_count(&lt_model))));
+        count_label.add_css_class("dim-label");
+        lt_model.connect_items_changed(clone!(@weak count_label => move |m, _, _, _| {
+            count_label.set_label(&fmt(image_count(m)));
+        }));
+        lt_header.pack_end(&count_label);
+    }
+
     let lt_toolbar = adw::ToolbarView::new();
     lt_toolbar.add_top_bar(&lt_header);
     lt_toolbar.set_content(Some(&hbox));
