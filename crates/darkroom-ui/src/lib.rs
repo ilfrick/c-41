@@ -355,6 +355,61 @@ fn build_main_window(app: &Application) {
         }
     }
 
+    // ── View switcher (m4-97d) ─────────────────────────────────────────────
+    // darktable-style Lighttable | Darkroom | Other toggle, as the lighttable
+    // header's title widget. "Darkroom" opens the currently-selected image in
+    // the editor (same push as a double-click); "Other" (map/print/tethering)
+    // is disabled — those views aren't ported. The switcher shows only in the
+    // lighttable header for now; mirroring it into the darkroom page header is a
+    // follow-up (see RUST_MIGRATION_PLAN.md).
+    {
+        // Manual linked ToggleButton group rather than adw::ViewSwitcher: the
+        // latter binds to an adw::ViewStack, but our views are a NavigationView
+        // (push/pop), so a hand-rolled switcher is the right fit — don't "fix" it
+        // into a ViewSwitcher without also changing the navigation model.
+        let switcher = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        switcher.add_css_class("linked");
+
+        let lt_btn = gtk4::ToggleButton::with_label("Lighttable");
+        lt_btn.set_active(true);
+        let dr_btn = gtk4::ToggleButton::with_label("Darkroom");
+        dr_btn.set_group(Some(&lt_btn));
+        let other_btn = gtk4::ToggleButton::with_label("Other");
+        other_btn.set_group(Some(&lt_btn));
+        other_btn.set_sensitive(false);
+        other_btn.set_tooltip_text(Some("Map / print / tethering — not yet ported"));
+
+        switcher.append(&lt_btn);
+        switcher.append(&dr_btn);
+        switcher.append(&other_btn);
+        lt_header.set_title_widget(Some(&switcher));
+
+        // The buttons only *request* navigation on a real user click. GTK4
+        // emits `clicked` for user activation only (programmatic `set_active`
+        // emits `toggled`), so the nav-driven state sync below can't echo back
+        // into another push. "Darkroom" opens the selected image; with no valid
+        // selection (empty view / sentinel row) it snaps back to Lighttable.
+        dr_btn.connect_clicked(clone!(
+            @weak nav, @weak lt_selection, @weak lt_btn, @strong db_path => move |b| {
+            if !b.is_active() { return; }
+            if let Some(path) = lighttable::selected_path(&lt_selection) {
+                let page = darkroom::darkroom_page(&path, &db_path);
+                page.set_tag(Some(&path));
+                nav.push(&page);
+            } else {
+                lt_btn.set_active(true);
+            }
+        }));
+
+        // `nav` is the single source of truth for the current view; mirror it in
+        // the switcher regardless of entry point (switcher / double-click /
+        // keyboard push), so the toggle never lies about which view is active.
+        // These fire only for pushes AFTER this point — the initial lighttable
+        // root was pushed earlier, so startup keeps Lighttable active.
+        nav.connect_pushed(clone!(@weak dr_btn => move |_| dr_btn.set_active(true)));
+        nav.connect_popped(clone!(@weak lt_btn => move |_, _| lt_btn.set_active(true)));
+    }
+
     // ── Window actions for keyboard shortcuts ──────────────────────────────
     {
         // win.import — Ctrl+I

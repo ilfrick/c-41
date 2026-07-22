@@ -138,6 +138,13 @@ C FFI trampolines for tags. 61 DB tests passing.
       bound to the grid model's `items-changed` (no per-call-site plumbing).
       Counts only real-image rows (contain `/`), excluding the model's sentinel
       rows (empty-state / truncation notice) so an empty view reads "0 images".
+    - **m4-97d (done):** darktable-style `Lighttable | Darkroom | Other` view
+      switcher as the lighttable header title widget. "Darkroom" opens the
+      selected image in the editor (same push as double-click); "Other"
+      (map/print/tethering) is disabled — unported. `NavigationView::popped`
+      resets the toggle to Lighttable on return. Verified end-to-end in the
+      container. **Follow-up:** mirror the switcher into the darkroom page header
+      (currently only shows in the lighttable view), and add the "Other" views.
     - **Follow-up (perf):** `lighttable` `fill_grid`/clear currently do
       `append()` in a loop + `while n_items()>0 { remove(0) }` — O(N²) clear and
       ~4000 `items-changed` emissions per 2000-image load. Convert to
