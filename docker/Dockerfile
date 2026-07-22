@@ -34,9 +34,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Install the toolchain WITH the components rust-toolchain.toml pins (rustfmt,
+# clippy) so the first `cargo` invocation in /src doesn't trigger a build-time
+# component reconcile. That reconcile previously combined with the old
+# `rm -rf .../share/doc` (which deleted files rustup still tracked) to corrupt
+# the component manifest and fail with "failure removing component 'cargo…',
+# directory does not exist: 'share/doc/cargo/README.md'" — reproducible only on a
+# fresh rustup install (i.e. CI, not a cached local layer), which is why the
+# Docker publish job failed on every run. The builder stage is discarded by the
+# multi-stage build, so keeping the docs costs nothing in the shipped image.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal \
-    && rm -rf /root/.rustup/toolchains/*/share/doc
+    | sh -s -- -y --default-toolchain stable --profile minimal -c rustfmt -c clippy
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # CACHEBUST invalidates the git-clone layer whenever the source changes (CI feeds

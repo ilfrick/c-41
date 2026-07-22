@@ -34,20 +34,6 @@ jobs:
         with:
           submodules: false
 
-      # The images are large (cargo-only ~2.2 GB; full-c larger) and the Rust
-      # builder stage adds several GB more; the default ubuntu-latest runner
-      # (~14 GB free) runs out of disk during the build, which is why these jobs
-      # have failed on every run. Reclaim ~25 GB by dropping preinstalled
-      # toolchains we don't use.
-      - name: Free up disk space
-        run: |
-          echo "Before:"; df -h /
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force || true
-          echo "After:"; df -h /
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -100,20 +86,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: false
-
-      # The images are large (cargo-only ~2.2 GB; full-c larger) and the Rust
-      # builder stage adds several GB more; the default ubuntu-latest runner
-      # (~14 GB free) runs out of disk during the build, which is why these jobs
-      # have failed on every run. Reclaim ~25 GB by dropping preinstalled
-      # toolchains we don't use.
-      - name: Free up disk space
-        run: |
-          echo "Before:"; df -h /
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force || true
-          echo "After:"; df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
