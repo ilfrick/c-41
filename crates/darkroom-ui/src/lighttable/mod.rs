@@ -772,20 +772,26 @@ fn cap_rows(mut rows: Vec<String>) -> (Vec<String>, Option<String>) {
     }
 }
 
-/// Append a loader's rows to the (freshly-cleared) grid model: cap them, add the
+/// Replace the grid model's contents with a loader's rows: cap them, add the
 /// truncation notice if any, and fall back to `empty_placeholder` when nothing
-/// matched. The single place the cap/notice tail lives, shared by every loader.
+/// matched. The single place the cap/notice tail lives, shared by every loader,
+/// and the single place the model is (re)filled — callers no longer clear first.
+///
+/// Uses one `splice()` to swap old contents for new: O(N) and a *single*
+/// `items-changed` emission, versus the old O(N^2) `remove(0)` loop plus per-row
+/// `append` (~2N emissions). This matters because the header's image-count label
+/// (and any future model observer) is bound to `items-changed` — one update per
+/// load instead of thousands.
 fn fill_grid(model: &LighttableModel, rows: Vec<String>, empty_placeholder: &str) {
-    let (rows, notice) = cap_rows(rows);
-    for path in rows {
-        model.append(&path);
-    }
+    let (mut rows, notice) = cap_rows(rows);
     if let Some(notice) = notice {
-        model.append(&notice);
+        rows.push(notice);
     }
-    if model.n_items() == 0 {
-        model.append(empty_placeholder);
+    if rows.is_empty() {
+        rows.push(empty_placeholder.to_string());
     }
+    let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+    model.splice(0, model.n_items(), &refs);
 }
 
 pub fn lighttable_load_from_db(model: &LighttableModel, db_path: &str) {
@@ -793,10 +799,6 @@ pub fn lighttable_load_from_db(model: &LighttableModel, db_path: &str) {
 }
 
 pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder: Option<&str>) {
-    while model.n_items() > 0 {
-        model.remove(0);
-    }
-
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
@@ -839,9 +841,6 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
         lighttable_load_by_folder(model, db_path, None);
         return;
     }
-    while model.n_items() > 0 {
-        model.remove(0);
-    }
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
@@ -879,9 +878,6 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
 /// matched literally: its LIKE metacharacters are escaped (see [`escape_like`])
 /// so a tag containing `%`/`_` can't widen the descendant match.
 pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, prefix: &str) {
-    while model.n_items() > 0 {
-        model.remove(0);
-    }
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
@@ -980,9 +976,6 @@ pub fn lighttable_load_by_color_mask(
         lighttable_load_from_db(model, db_path);
         return;
     };
-    while model.n_items() > 0 {
-        model.remove(0);
-    }
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {

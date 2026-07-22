@@ -145,10 +145,13 @@ C FFI trampolines for tags. 61 DB tests passing.
       resets the toggle to Lighttable on return. Verified end-to-end in the
       container. **Follow-up:** mirror the switcher into the darkroom page header
       (currently only shows in the lighttable view), and add the "Other" views.
-    - **Follow-up (perf):** `lighttable` `fill_grid`/clear currently do
-      `append()` in a loop + `while n_items()>0 { remove(0) }` — O(N²) clear and
-      ~4000 `items-changed` emissions per 2000-image load. Convert to
-      `StringList::splice()`: one emission, O(N), and one count-label update.
+    - **Follow-up (perf) — DONE:** `lighttable` `fill_grid` now replaces the model
+      in one `StringList::splice(0, n_items, &rows)` instead of an O(N²)
+      `remove(0)` clear loop + per-row `append` (~2N `items-changed` emissions).
+      The 4 loaders no longer clear first (fill_grid owns clear+fill atomically —
+      no transient empty-model window). One `items-changed` per load → one
+      count-label update. All 144 UI tests pass; verified live (2000→89 on a
+      folder click). Selection/scroll reset on reload is unchanged from before.
     - **Follow-up (CI reproducibility):** `rust-toolchain.toml` pins
       `channel = "stable"` (floating) — a new stable can fail `clippy` with zero
       commits from us. Pin to an explicit `1.XX.0`, bumped deliberately.
