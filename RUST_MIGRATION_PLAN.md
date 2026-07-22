@@ -143,8 +143,13 @@ C FFI trampolines for tags. 61 DB tests passing.
       selected image in the editor (same push as double-click); "Other"
       (map/print/tethering) is disabled — unported. `NavigationView::popped`
       resets the toggle to Lighttable on return. Verified end-to-end in the
-      container. **Follow-up:** mirror the switcher into the darkroom page header
-      (currently only shows in the lighttable view), and add the "Other" views.
+      container. The switcher builder is shared (`build_view_switcher()`) so both
+      headers stay identical.
+    - **m4-97d follow-up (done):** the switcher now also appears in the darkroom
+      view's header — "Darkroom" active, filename shown below it (kept, not
+      dropped), "Lighttable" pops back to the grid via the NavigationView's
+      built-in `navigation.pop` action. Verified both directions in the container.
+      Remaining: add the actual "Other" views (map/print/tethering).
     - **Follow-up (perf) — DONE:** `lighttable` `fill_grid` now replaces the model
       in one `StringList::splice(0, n_items, &rows)` instead of an O(N²)
       `remove(0)` clear loop + per-row `append` (~2N `items-changed` emissions).

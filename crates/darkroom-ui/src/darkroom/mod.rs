@@ -1487,8 +1487,25 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
 
     // ── Header bar with Export button ─────────────────────────────────────
     let header = adw::HeaderBar::new();
-    let title_widget = adw::WindowTitle::new(&filename, "Darkroom");
-    header.set_title_widget(Some(&title_widget));
+    // View switcher (shared with the lighttable header) as the title, with the
+    // filename below so the editor still shows which image is open. "Darkroom" is
+    // the active view; "Lighttable" pops back to the grid via the NavigationView's
+    // built-in `navigation.pop` action (installed on the page's descendants), so
+    // no NavigationView handle is needed here.
+    let sw = crate::build_view_switcher();
+    sw.darkroom.set_active(true);
+    sw.lighttable.connect_clicked(|b| {
+        if b.is_active() {
+            // Pop back to the lighttable via the NavigationView's built-in action
+            // (this page holds no NavigationView handle). Only reachable while the
+            // page is in the nav, so an Err would mean a future reparent broke that
+            // invariant — log it rather than fail silently.
+            if let Err(e) = b.activate_action("navigation.pop", None) {
+                eprintln!("darkroom: view-switcher pop failed (page not in a NavigationView?): {e}");
+            }
+        }
+    });
+    header.set_title_widget(Some(&crate::view_switcher_title(&sw.container, &filename)));
 
     // Before/after toggle was created above (so the history restore can clear
     // its state); just place it in the header here.

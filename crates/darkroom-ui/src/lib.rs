@@ -54,6 +54,65 @@ pub fn run() -> Result<glib::ExitCode> {
     Ok(app.run())
 }
 
+/// Build the darktable-style `Lighttable | Darkroom | Other` linked view switcher.
+/// Returns the container plus the Lighttable and Darkroom toggles so the caller
+/// can set the active view and wire navigation. "Other" (map/print/tethering) is
+/// always disabled — those views aren't ported. Shared by the lighttable header
+/// (Lighttable active; Darkroom pushes the selected image) and the darkroom
+/// header (Darkroom active; Lighttable pops back to the grid), so the control
+/// looks and behaves identically in both views.
+///
+/// Hand-rolled linked ToggleButton group rather than adw::ViewSwitcher: the
+/// latter binds to an adw::ViewStack, but our views are a NavigationView
+/// (push/pop), so this is the right fit — don't "upgrade" it to a ViewSwitcher
+/// without also changing the navigation model.
+pub(crate) struct ViewSwitcher {
+    pub container: gtk4::Box,
+    pub lighttable: gtk4::ToggleButton,
+    pub darkroom: gtk4::ToggleButton,
+}
+
+pub(crate) fn build_view_switcher() -> ViewSwitcher {
+    let container = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    container.add_css_class("linked");
+
+    let lighttable = gtk4::ToggleButton::with_label("Lighttable");
+    let darkroom = gtk4::ToggleButton::with_label("Darkroom");
+    darkroom.set_group(Some(&lighttable));
+    // "Other" (map / print / tethering) is a disabled placeholder — those views
+    // aren't ported. Insensitive so it can't break the toggle-group's
+    // single-active invariant; the greyed appearance signals "unavailable". (No
+    // tooltip: an insensitive widget never emits query-tooltip, so one here would
+    // never show — the greying is the affordance.)
+    let other = gtk4::ToggleButton::with_label("Other");
+    other.set_group(Some(&lighttable));
+    other.set_sensitive(false);
+
+    container.append(&lighttable);
+    container.append(&darkroom);
+    container.append(&other);
+    ViewSwitcher { container, lighttable, darkroom }
+}
+
+/// Wrap a view-switcher container in the standard header title: the switcher on
+/// top with a dim caption below it (the app name in the lighttable, the open
+/// filename in the darkroom). Shared so both view headers are the same height and
+/// layout — the switcher is identical and always sits over a one-line caption.
+pub(crate) fn view_switcher_title(container: &gtk4::Box, subtitle: &str) -> gtk4::Box {
+    container.set_halign(gtk4::Align::Center);
+    let subtitle_label = gtk4::Label::new(Some(subtitle));
+    subtitle_label.add_css_class("caption");
+    subtitle_label.add_css_class("dim-label");
+    subtitle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    subtitle_label.set_max_width_chars(30);
+    let title_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    title_box.set_valign(gtk4::Align::Center);
+    title_box.set_halign(gtk4::Align::Center);
+    title_box.append(container);
+    title_box.append(&subtitle_label);
+    title_box
+}
+
 fn build_main_window(app: &Application) {
     // darktable ships a dark grey theme; match that first impression by forcing
     // libadwaita's dark colour scheme (the default follows the desktop setting,
@@ -363,26 +422,11 @@ fn build_main_window(app: &Application) {
     // lighttable header for now; mirroring it into the darkroom page header is a
     // follow-up (see RUST_MIGRATION_PLAN.md).
     {
-        // Manual linked ToggleButton group rather than adw::ViewSwitcher: the
-        // latter binds to an adw::ViewStack, but our views are a NavigationView
-        // (push/pop), so a hand-rolled switcher is the right fit — don't "fix" it
-        // into a ViewSwitcher without also changing the navigation model.
-        let switcher = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        switcher.add_css_class("linked");
-
-        let lt_btn = gtk4::ToggleButton::with_label("Lighttable");
-        lt_btn.set_active(true);
-        let dr_btn = gtk4::ToggleButton::with_label("Darkroom");
-        dr_btn.set_group(Some(&lt_btn));
-        let other_btn = gtk4::ToggleButton::with_label("Other");
-        other_btn.set_group(Some(&lt_btn));
-        other_btn.set_sensitive(false);
-        other_btn.set_tooltip_text(Some("Map / print / tethering — not yet ported"));
-
-        switcher.append(&lt_btn);
-        switcher.append(&dr_btn);
-        switcher.append(&other_btn);
-        lt_header.set_title_widget(Some(&switcher));
+        let sw = build_view_switcher();
+        let lt_btn = sw.lighttable.clone();
+        let dr_btn = sw.darkroom.clone();
+        lt_btn.set_active(true); // the lighttable is the root view
+        lt_header.set_title_widget(Some(&view_switcher_title(&sw.container, "Darkroom")));
 
         // The buttons only *request* navigation on a real user click. GTK4
         // emits `clicked` for user activation only (programmatic `set_active`
