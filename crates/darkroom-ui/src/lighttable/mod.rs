@@ -9,7 +9,9 @@
 use adw::prelude::*;
 use gtk4::{GridView, ListItem, ScrolledWindow, SignalListItemFactory, SingleSelection};
 use glib::clone;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const THUMB_SIZE: i32 = 160;
@@ -758,6 +760,83 @@ fn toggle_color_label(full_path: &str, db_path: &str, color: u8) -> u8 {
 /// and flagged, rather than silently truncating.
 const GRID_CAP: usize = 2000;
 
+/// Grid sort order, chosen from the lighttable's "sort by" dropdown. Applied
+/// uniformly by every loader's `ORDER BY` (see [`SortOrder::order_clause`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SortOrder {
+    #[default]
+    Filename,
+    DateTaken,
+    Rating,
+}
+
+impl SortOrder {
+    /// The `ORDER BY` expression (without the `ORDER BY` keyword). Static text —
+    /// never user input — so it's injection-safe to interpolate. All loaders
+    /// alias the images table as `i`, so these column refs are valid everywhere.
+    fn order_clause(self) -> &'static str {
+        match self {
+            // Filename groups naturally by folder (dates are foldered YYYY_MM_DD).
+            SortOrder::Filename => "f.folder, i.filename",
+            // Undated images (NULL or 0) sort LAST: the leading boolean is 0 for
+            // dated, 1 for undated, so ASC keeps dated photos in date order up top
+            // and dumps undated at the end. Tie-break by name for a stable order.
+            SortOrder::DateTaken => {
+                "(i.datetime_taken IS NULL OR i.datetime_taken = 0), i.datetime_taken, i.filename"
+            }
+            // darktable packs the star rating in the low 3 bits of flags (0..5,
+            // 6 = rejected). Highest rating first, but rejected is the *bottom*,
+            // not the top — map it below 0 so DESC doesn't rank it above 5 stars.
+            SortOrder::Rating => {
+                "CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC, i.filename"
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The current grid sort order (main-thread-only UI state).
+    static SORT_ORDER: Cell<SortOrder> = const { Cell::new(SortOrder::Filename) };
+    /// A closure that re-runs the *current* view's loader. Each loader registers
+    /// itself here on every call (capturing its own args), so the sort dropdown
+    /// can re-apply the view under a new order without the trigger sites (folder
+    /// clicks, search, tag/colour filters) knowing anything about sorting.
+    static RELOAD_CURRENT: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// The order every loader should apply right now.
+fn current_sort() -> SortOrder {
+    SORT_ORDER.with(|s| s.get())
+}
+
+/// Record how to re-run the current view (called by each loader with a closure
+/// that re-invokes it with the same args). Stored as `Rc` so [`set_sort_order`]
+/// can clone it out and call it *without* holding the `RefCell` borrow — the
+/// loader it invokes re-registers here (`borrow_mut`), which would otherwise
+/// panic on the outstanding borrow.
+fn register_reload(f: impl Fn() + 'static) {
+    RELOAD_CURRENT.with(|r| *r.borrow_mut() = Some(Rc::new(f)));
+}
+
+/// Change the grid sort order and re-render the current view under it. No-op if
+/// nothing has been loaded yet (no registered reload). Main-thread only (reads
+/// thread-local state and touches the GTK model).
+pub fn set_sort_order(order: SortOrder) {
+    SORT_ORDER.with(|s| s.set(order));
+    // Clone the Rc OUT of the cell before invoking it — this is load-bearing for
+    // two independent reasons, so don't "optimize" it into a direct call:
+    //  1. the reload closure re-enters `register_reload` (`borrow_mut`); holding
+    //     a `borrow()` across the call would panic;
+    //  2. `register_reload` overwrites the slot, dropping the very closure that's
+    //     currently executing on the stack — the extra refcount here keeps its
+    //     environment (incl. the grid model) alive until this returns, so it's
+    //     not a use-after-free.
+    let reload = RELOAD_CURRENT.with(|r| r.borrow().clone());
+    if let Some(reload) = reload {
+        reload();
+    }
+}
+
 /// Split a loader's fetched rows (queried with `LIMIT GRID_CAP + 1`) into the
 /// rows to display (capped at `GRID_CAP`) and an optional trailing notice shown
 /// when the result was truncated. The notice carries no `/`, so the grid's
@@ -799,12 +878,20 @@ pub fn lighttable_load_from_db(model: &LighttableModel, db_path: &str) {
 }
 
 pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder: Option<&str>) {
+    register_reload({
+        let m = model.clone();
+        let db = db_path.to_string();
+        let f = folder.map(str::to_string);
+        move || lighttable_load_by_folder(&m, &db, f.as_deref())
+    });
+
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
 
+    let order = current_sort().order_clause();
     let rows: Vec<String> = match folder {
         Some(f) => {
             conn.prepare(&format!(
@@ -812,7 +899,7 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
                  FROM main.images i \
                  JOIN main.film_rolls f ON f.id = i.film_id \
                  WHERE f.folder = ?1 \
-                 ORDER BY i.filename LIMIT {}", GRID_CAP + 1),
+                 ORDER BY {order} LIMIT {}", GRID_CAP + 1),
             )
             .and_then(|mut s| s.query_map([f], |r| r.get::<_, String>(0))
                 .map(|it| it.flatten().collect()))
@@ -823,7 +910,7 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
                 "SELECT f.folder || '/' || i.filename \
                  FROM main.images i \
                  JOIN main.film_rolls f ON f.id = i.film_id \
-                 ORDER BY f.folder, i.filename LIMIT {}", GRID_CAP + 1),
+                 ORDER BY {order} LIMIT {}", GRID_CAP + 1),
             )
             .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(0))
                 .map(|it| it.flatten().collect()))
@@ -841,18 +928,25 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
         lighttable_load_by_folder(model, db_path, None);
         return;
     }
+    register_reload({
+        let m = model.clone();
+        let db = db_path.to_string();
+        let q = query.to_string();
+        move || lighttable_filter_by_name(&m, &db, &q)
+    });
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
+    let order = current_sort().order_clause();
     let pattern = format!("%{query}%");
     let rows: Vec<String> = conn
         .prepare(&format!(
             "SELECT f.folder || '/' || i.filename \
              FROM main.images i JOIN main.film_rolls f ON f.id = i.film_id \
              WHERE i.filename LIKE ?1 \
-             ORDER BY f.folder, i.filename LIMIT {}", GRID_CAP + 1),
+             ORDER BY {order} LIMIT {}", GRID_CAP + 1),
         )
         .and_then(|mut s| {
             s.query_map([pattern.as_str()], |r| r.get::<_, String>(0))
@@ -878,12 +972,19 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
 /// matched literally: its LIKE metacharacters are escaped (see [`escape_like`])
 /// so a tag containing `%`/`_` can't widen the descendant match.
 pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, prefix: &str) {
+    register_reload({
+        let m = model.clone();
+        let db = db_path.to_string();
+        let p = prefix.to_string();
+        move || lighttable_load_by_tag_prefix(&m, &db, &p)
+    });
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
         // open_catalog attaches data.db, where tag names live (data.tags).
         darkroom_db::schema::open_catalog(db_path).unwrap_or_else(|_| open_demo_db())
     };
+    let order = current_sort().order_clause();
     // `prefix` itself (the exact tag) OR `prefix|…` (any descendant). DISTINCT
     // because an image carrying several tags under `prefix` would otherwise
     // appear once per matching tag.
@@ -896,7 +997,7 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
              JOIN main.tagged_images ti ON ti.imgid = i.id \
              JOIN data.tags t ON t.id = ti.tagid \
              WHERE t.name = ?1 OR t.name LIKE ?2 ESCAPE '\\' \
-             ORDER BY f.folder, i.filename LIMIT {}", GRID_CAP + 1),
+             ORDER BY {order} LIMIT {}", GRID_CAP + 1),
         )
         .and_then(|mut s| {
             s.query_map(rusqlite::params![prefix, descendants], |r| r.get::<_, String>(0))
@@ -929,13 +1030,14 @@ fn colors_from_mask(mask: u8) -> Vec<u8> {
 /// DISTINCT` (an image with several selected colours would otherwise repeat).
 /// `ORDER BY`/`LIMIT` mirror the other loaders. Pure (returns a string) so the
 /// AND/OR shape is unit-testable under the display-free discipline.
-fn build_color_mask_query(mask: u8, match_all: bool) -> Option<String> {
+fn build_color_mask_query(mask: u8, match_all: bool, sort: SortOrder) -> Option<String> {
     let colors = colors_from_mask(mask);
     if colors.is_empty() {
         return None;
     }
     let in_list = colors.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
     let limit = GRID_CAP + 1;
+    let order = sort.order_clause();
     let sql = if match_all {
         format!(
             "SELECT f.folder || '/' || i.filename \
@@ -944,7 +1046,7 @@ fn build_color_mask_query(mask: u8, match_all: bool) -> Option<String> {
              JOIN main.color_labels cl ON cl.imgid = i.id \
              WHERE cl.color IN ({in_list}) \
              GROUP BY i.id HAVING COUNT(DISTINCT cl.color) = {n} \
-             ORDER BY f.folder, i.filename LIMIT {limit}",
+             ORDER BY {order} LIMIT {limit}",
             n = colors.len(),
         )
     } else {
@@ -954,7 +1056,7 @@ fn build_color_mask_query(mask: u8, match_all: bool) -> Option<String> {
              JOIN main.film_rolls f ON f.id = i.film_id \
              JOIN main.color_labels cl ON cl.imgid = i.id \
              WHERE cl.color IN ({in_list}) \
-             ORDER BY f.folder, i.filename LIMIT {limit}",
+             ORDER BY {order} LIMIT {limit}",
         )
     };
     Some(sql)
@@ -972,7 +1074,12 @@ pub fn lighttable_load_by_color_mask(
     mask: u8,
     match_all: bool,
 ) {
-    let Some(sql) = build_color_mask_query(mask, match_all) else {
+    register_reload({
+        let m = model.clone();
+        let db = db_path.to_string();
+        move || lighttable_load_by_color_mask(&m, &db, mask, match_all)
+    });
+    let Some(sql) = build_color_mask_query(mask, match_all, current_sort()) else {
         lighttable_load_from_db(model, db_path);
         return;
     };
@@ -1049,11 +1156,11 @@ fn open_demo_db() -> rusqlite::Connection {
     conn.execute_batch(
         "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder VARCHAR, access_timestamp INTEGER);
          CREATE TABLE images    (id INTEGER PRIMARY KEY, film_id INTEGER, filename VARCHAR,
-                                 width INTEGER, height INTEGER, flags INTEGER);
+                                 width INTEGER, height INTEGER, flags INTEGER, datetime_taken INTEGER);
          INSERT INTO film_rolls VALUES (1, '/photos/demo', 0);
-         INSERT INTO images VALUES (1, 1, 'DSC_0001.jpg', 6000, 4000, 0);
-         INSERT INTO images VALUES (2, 1, 'DSC_0002.jpg', 6000, 4000, 0);
-         INSERT INTO images VALUES (3, 1, 'DSC_0003.jpg', 6000, 4000, 0);",
+         INSERT INTO images VALUES (1, 1, 'DSC_0001.jpg', 6000, 4000, 0, 100);
+         INSERT INTO images VALUES (2, 1, 'DSC_0002.jpg', 6000, 4000, 0, 200);
+         INSERT INTO images VALUES (3, 1, 'DSC_0003.jpg', 6000, 4000, 0, 300);",
     )
     .expect("demo data");
     conn
@@ -1063,7 +1170,7 @@ fn open_demo_db() -> rusqlite::Connection {
 mod tests {
     use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
                 digit_to_rating, escape_like, fkey_to_color, index_of_path, path_write_lock,
-                COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
+                SortOrder, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
     use std::sync::Arc;
 
     fn n_rows(n: usize) -> Vec<String> {
@@ -1098,13 +1205,13 @@ mod tests {
 
     #[test]
     fn build_color_mask_query_none_for_empty_mask() {
-        assert!(build_color_mask_query(0, false).is_none());
-        assert!(build_color_mask_query(0, true).is_none());
+        assert!(build_color_mask_query(0, false, SortOrder::Filename).is_none());
+        assert!(build_color_mask_query(0, true, SortOrder::Filename).is_none());
     }
 
     #[test]
     fn build_color_mask_query_or_uses_distinct_no_having() {
-        let sql = build_color_mask_query(0b10101, false).expect("non-empty mask");
+        let sql = build_color_mask_query(0b10101, false, SortOrder::Filename).expect("non-empty mask");
         assert!(sql.contains("SELECT DISTINCT"), "{sql}");
         assert!(sql.contains("cl.color IN (0,2,4)"), "{sql}");
         assert!(!sql.contains("HAVING"), "OR must not group/having: {sql}");
@@ -1113,7 +1220,7 @@ mod tests {
 
     #[test]
     fn build_color_mask_query_and_groups_and_counts_selected() {
-        let sql = build_color_mask_query(0b01010, true).expect("non-empty mask");
+        let sql = build_color_mask_query(0b01010, true, SortOrder::Filename).expect("non-empty mask");
         assert!(sql.contains("cl.color IN (1,3)"), "{sql}");
         // AND => image must carry both selected colours; N = popcount(mask).
         assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 2"), "{sql}");
@@ -1123,9 +1230,71 @@ mod tests {
     #[test]
     fn build_color_mask_query_single_colour_counts_one() {
         // The single-colour case (one-bit mask) collapses to N=1 under AND.
-        let sql = build_color_mask_query(0b00100, true).expect("non-empty mask");
+        let sql = build_color_mask_query(0b00100, true, SortOrder::Filename).expect("non-empty mask");
         assert!(sql.contains("cl.color IN (2)"), "{sql}");
         assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 1"), "{sql}");
+    }
+
+    #[test]
+    fn sort_order_clauses_are_stable() {
+        assert_eq!(SortOrder::Filename.order_clause(), "f.folder, i.filename");
+        // Undated (NULL/0) sorts last via the leading boolean key.
+        assert_eq!(
+            SortOrder::DateTaken.order_clause(),
+            "(i.datetime_taken IS NULL OR i.datetime_taken = 0), i.datetime_taken, i.filename"
+        );
+        // Rejected (rating 6) is remapped below 0 so it sorts under 5-star.
+        assert_eq!(
+            SortOrder::Rating.order_clause(),
+            "CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC, i.filename"
+        );
+    }
+
+    #[test]
+    fn color_mask_query_applies_sort_order() {
+        let sql = build_color_mask_query(0b00100, false, SortOrder::Rating).expect("mask");
+        assert!(
+            sql.contains("ORDER BY CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn order_clause_valid_sql_with_undated_and_rejected() {
+        // Run every SortOrder's clause end-to-end against a realistic fixture
+        // (the columns/alias the loaders reference). Catches a clause that names
+        // a column a loader's query doesn't provide, and locks the undated-last
+        // (Q3) and rejected-bottom (Q4) placement. StringList can't be built
+        // headlessly, so this exercises the shared clause directly via rusqlite.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder TEXT);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT,
+                                  datetime_taken INTEGER, flags INTEGER);
+             INSERT INTO film_rolls VALUES (1, '/f');
+             INSERT INTO images VALUES (1, 1, 'a.raw', 100, 6);  -- dated,   rejected
+             INSERT INTO images VALUES (2, 1, 'b.raw', 200, 5);  -- dated,   5-star
+             INSERT INTO images VALUES (3, 1, 'c.raw', 0,   3);  -- undated, 3-star",
+        )
+        .unwrap();
+        let run = |order: SortOrder| -> Vec<String> {
+            let sql = format!(
+                "SELECT i.filename FROM images i JOIN film_rolls f ON f.id = i.film_id \
+                 ORDER BY {}",
+                order.order_clause()
+            );
+            conn.prepare(&sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        assert_eq!(run(SortOrder::Filename), ["a.raw", "b.raw", "c.raw"]);
+        // Ascending date order for dated images, undated (c) pushed last.
+        assert_eq!(run(SortOrder::DateTaken), ["a.raw", "b.raw", "c.raw"]);
+        // Highest rating first; rejected (a) sorts below the 3-star (c).
+        assert_eq!(run(SortOrder::Rating), ["b.raw", "c.raw", "a.raw"]);
     }
 
     #[test]

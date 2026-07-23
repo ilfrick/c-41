@@ -341,6 +341,23 @@ fn build_main_window(app: &Application) {
         lt_header.pack_end(&count_label);
     }
 
+    // Sort-by dropdown (m4-97b) — darktable's top-bar "sort by". Changing it
+    // re-renders the *current* view under the new order; the loaders self-register
+    // a reload closure, so this doesn't need to know which view is showing.
+    {
+        let sort_dd = gtk4::DropDown::from_strings(&["Filename", "Date taken", "Rating"]);
+        sort_dd.set_tooltip_text(Some("Sort images by"));
+        sort_dd.connect_selected_notify(|dd| {
+            let order = match dd.selected() {
+                1 => lighttable::SortOrder::DateTaken,
+                2 => lighttable::SortOrder::Rating,
+                _ => lighttable::SortOrder::Filename,
+            };
+            lighttable::set_sort_order(order);
+        });
+        lt_header.pack_end(&sort_dd);
+    }
+
     let lt_toolbar = adw::ToolbarView::new();
     lt_toolbar.add_top_bar(&lt_header);
     lt_toolbar.set_content(Some(&hbox));
@@ -426,7 +443,13 @@ fn build_main_window(app: &Application) {
         let lt_btn = sw.lighttable.clone();
         let dr_btn = sw.darkroom.clone();
         lt_btn.set_active(true); // the lighttable is the root view
-        lt_header.set_title_widget(Some(&view_switcher_title(&sw.container, "Darkroom")));
+        // Switcher alone as the title (no caption): the app is named "Darkroom",
+        // but so is darktable's editing *view* — a "Darkroom" branding caption
+        // right under the "Darkroom" switcher button reads as a confusing
+        // duplicate. The darkroom view keeps a caption because there it's the
+        // filename (real per-image context), not a redundant app name.
+        sw.container.set_halign(gtk4::Align::Center);
+        lt_header.set_title_widget(Some(&sw.container));
 
         // The buttons only *request* navigation on a real user click. GTK4
         // emits `clicked` for user activation only (programmatic `set_active`

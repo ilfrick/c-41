@@ -138,6 +138,20 @@ C FFI trampolines for tags. 61 DB tests passing.
       bound to the grid model's `items-changed` (no per-call-site plumbing).
       Counts only real-image rows (contain `/`), excluding the model's sentinel
       rows (empty-state / truncation notice) so an empty view reads "0 images".
+    - **m4-97b (done):** "sort by" dropdown (Filename / Date taken / Rating).
+      A thread-local `SortOrder` + a self-registering reload closure: every
+      loader records how to re-run itself, so changing the sort re-applies the
+      *current* view (folder / search / tag / colour) with zero changes to the
+      ~9 trigger sites. `order_clause()` is static (injection-safe); undated
+      images sort last, rejected sorts below 0 (per review). Integration test
+      runs all 3 orders against a seeded DB. **Follow-up (responsive header):**
+      at narrow widths (~540px browser) the header overflows and clips the
+      right-side controls (sort dropdown, image count, export) — pre-existing,
+      now more visible. Needs `adw::Breakpoint`-based collapse/rearrange.
+    - **caption fix (done):** the lighttable switcher is single-row again (no
+      "Darkroom" app-name caption): the app is named "Darkroom" but so is the
+      editing *view*, so the caption duplicated the switcher button. The darkroom
+      header keeps its caption (there it's the filename — real per-image context).
     - **m4-97d (done):** darktable-style `Lighttable | Darkroom | Other` view
       switcher as the lighttable header title widget. "Darkroom" opens the
       selected image in the editor (same push as double-click); "Other"
