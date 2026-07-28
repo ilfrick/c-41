@@ -341,10 +341,15 @@ fn build_main_window(app: &Application) {
         lt_header.pack_end(&count_label);
     }
 
-    // Sort-by dropdown (m4-97b) — darktable's top-bar "sort by". Changing it
+    // Sort-by dropdown (m4-97b) + direction toggle (m4-97e) — darktable's top-bar
+    // "sort by" with the ascending/descending arrow beside it. Changing either
     // re-renders the *current* view under the new order; the loaders self-register
-    // a reload closure, so this doesn't need to know which view is showing.
+    // a reload closure, so this doesn't need to know which view is showing. The
+    // two controls share a `.linked` box so the arrow stays glued to the dropdown.
     {
+        let sort_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        sort_box.add_css_class("linked");
+
         let sort_dd = gtk4::DropDown::from_strings(&["Filename", "Date taken", "Rating"]);
         sort_dd.set_tooltip_text(Some("Sort images by"));
         sort_dd.connect_selected_notify(|dd| {
@@ -355,7 +360,26 @@ fn build_main_window(app: &Application) {
             };
             lighttable::set_sort_order(order);
         });
-        lt_header.pack_end(&sort_dd);
+        sort_box.append(&sort_dd);
+
+        // Direction toggle: unpressed = ascending (natural), pressed = descending
+        // (reversed). Swap the icon so the arrow always reflects the active state.
+        let dir_btn = gtk4::ToggleButton::builder()
+            .icon_name("view-sort-ascending-symbolic")
+            .tooltip_text("Reverse sort order")
+            .build();
+        dir_btn.connect_toggled(|b| {
+            let reverse = b.is_active();
+            b.set_icon_name(if reverse {
+                "view-sort-descending-symbolic"
+            } else {
+                "view-sort-ascending-symbolic"
+            });
+            lighttable::set_sort_reverse(reverse);
+        });
+        sort_box.append(&dir_btn);
+
+        lt_header.pack_end(&sort_box);
     }
 
     let lt_toolbar = adw::ToolbarView::new();

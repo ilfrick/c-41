@@ -148,6 +148,16 @@ C FFI trampolines for tags. 61 DB tests passing.
       at narrow widths (~540px browser) the header overflows and clips the
       right-side controls (sort dropdown, image count, export) — pre-existing,
       now more visible. Needs `adw::Breakpoint`-based collapse/rearrange.
+    - **m4-97e (done):** sort direction toggle (ascending/descending) beside the
+      "sort by" dropdown, in a shared `.linked` box. `SortOrder::terms()` returns
+      `(expr, ascending, reversible)` triples and `order_clause(reverse)` flips
+      only the *reversible* terms — the DateTaken undated-last guard is marked
+      non-reversible so undated images stay at the bottom in both directions. New
+      thread-local `SORT_REVERSE` + `set_sort_reverse()`; the `set_sort_order`
+      reload logic was extracted into a shared `reload_current_view()`. The
+      `ToggleButton` swaps its up/down arrow icon to reflect state. Tests lock the
+      exact reversed clauses and the reversed row order (incl. undated-still-last
+      and rejected-now-top) via the seeded rusqlite fixture. Architect: "ship it".
     - **caption fix (done):** the lighttable switcher is single-row again (no
       "Darkroom" app-name caption): the app is named "Darkroom" but so is the
       editing *view*, so the caption duplicated the switcher button. The darkroom

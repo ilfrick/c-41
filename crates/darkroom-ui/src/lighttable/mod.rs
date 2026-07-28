@@ -771,32 +771,55 @@ pub enum SortOrder {
 }
 
 impl SortOrder {
-    /// The `ORDER BY` expression (without the `ORDER BY` keyword). Static text —
-    /// never user input — so it's injection-safe to interpolate. All loaders
-    /// alias the images table as `i`, so these column refs are valid everywhere.
-    fn order_clause(self) -> &'static str {
+    /// The ordered `(expr, ascending, reversible)` terms of this sort's *natural*
+    /// order. `expr` is static text — never user input — so it's injection-safe to
+    /// interpolate; all loaders alias the images table as `i`, so these column refs
+    /// are valid everywhere. `ascending` is the term's natural direction;
+    /// `reversible` marks whether the "reverse sort" toggle flips it (an
+    /// undated-last guard stays put so undated images never bubble to the top).
+    fn terms(self) -> &'static [(&'static str, bool, bool)] {
         match self {
             // Filename groups naturally by folder (dates are foldered YYYY_MM_DD).
-            SortOrder::Filename => "f.folder, i.filename",
+            SortOrder::Filename => &[("f.folder", true, true), ("i.filename", true, true)],
             // Undated images (NULL or 0) sort LAST: the leading boolean is 0 for
             // dated, 1 for undated, so ASC keeps dated photos in date order up top
-            // and dumps undated at the end. Tie-break by name for a stable order.
-            SortOrder::DateTaken => {
-                "(i.datetime_taken IS NULL OR i.datetime_taken = 0), i.datetime_taken, i.filename"
-            }
+            // and dumps undated at the end. It's NON-reversible so undated stays at
+            // the bottom in both directions; only the datetime/name terms flip.
+            SortOrder::DateTaken => &[
+                ("(i.datetime_taken IS NULL OR i.datetime_taken = 0)", true, false),
+                ("i.datetime_taken", true, true),
+                ("i.filename", true, true),
+            ],
             // darktable packs the star rating in the low 3 bits of flags (0..5,
-            // 6 = rejected). Highest rating first, but rejected is the *bottom*,
-            // not the top — map it below 0 so DESC doesn't rank it above 5 stars.
-            SortOrder::Rating => {
-                "CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC, i.filename"
-            }
+            // 6 = rejected). Highest rating first (DESC), but rejected is the
+            // *bottom*, not the top — map it below 0 so DESC doesn't rank it above
+            // 5 stars. Reversed, ascending puts rejected/unrated first.
+            SortOrder::Rating => &[
+                ("CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END", false, true),
+                ("i.filename", true, true),
+            ],
         }
+    }
+
+    /// The `ORDER BY` expression (without the `ORDER BY` keyword) for this sort,
+    /// optionally reversed. Reversing flips every *reversible* term's direction.
+    fn order_clause(self, reverse: bool) -> String {
+        self.terms()
+            .iter()
+            .map(|&(expr, ascending, reversible)| {
+                let ascending = if reversible && reverse { !ascending } else { ascending };
+                format!("{expr} {}", if ascending { "ASC" } else { "DESC" })
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
 thread_local! {
     /// The current grid sort order (main-thread-only UI state).
     static SORT_ORDER: Cell<SortOrder> = const { Cell::new(SortOrder::Filename) };
+    /// Whether the current sort is reversed (the "sort direction" toggle).
+    static SORT_REVERSE: Cell<bool> = const { Cell::new(false) };
     /// A closure that re-runs the *current* view's loader. Each loader registers
     /// itself here on every call (capturing its own args), so the sort dropdown
     /// can re-apply the view under a new order without the trigger sites (folder
@@ -807,6 +830,11 @@ thread_local! {
 /// The order every loader should apply right now.
 fn current_sort() -> SortOrder {
     SORT_ORDER.with(|s| s.get())
+}
+
+/// Whether the current view should be sorted in reverse right now.
+fn current_reverse() -> bool {
+    SORT_REVERSE.with(|r| r.get())
 }
 
 /// Record how to re-run the current view (called by each loader with a closure
@@ -823,6 +851,19 @@ fn register_reload(f: impl Fn() + 'static) {
 /// thread-local state and touches the GTK model).
 pub fn set_sort_order(order: SortOrder) {
     SORT_ORDER.with(|s| s.set(order));
+    reload_current_view();
+}
+
+/// Change the sort direction (reversed or natural) and re-render the current
+/// view under it. No-op if nothing has been loaded yet. Main-thread only.
+pub fn set_sort_reverse(reverse: bool) {
+    SORT_REVERSE.with(|r| r.set(reverse));
+    reload_current_view();
+}
+
+/// Re-run the currently-registered view loader (used after a sort-order or
+/// sort-direction change).
+fn reload_current_view() {
     // Clone the Rc OUT of the cell before invoking it — this is load-bearing for
     // two independent reasons, so don't "optimize" it into a direct call:
     //  1. the reload closure re-enters `register_reload` (`borrow_mut`); holding
@@ -891,7 +932,7 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
 
-    let order = current_sort().order_clause();
+    let order = current_sort().order_clause(current_reverse());
     let rows: Vec<String> = match folder {
         Some(f) => {
             conn.prepare(&format!(
@@ -939,7 +980,7 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
     } else {
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
-    let order = current_sort().order_clause();
+    let order = current_sort().order_clause(current_reverse());
     let pattern = format!("%{query}%");
     let rows: Vec<String> = conn
         .prepare(&format!(
@@ -984,7 +1025,7 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
         // open_catalog attaches data.db, where tag names live (data.tags).
         darkroom_db::schema::open_catalog(db_path).unwrap_or_else(|_| open_demo_db())
     };
-    let order = current_sort().order_clause();
+    let order = current_sort().order_clause(current_reverse());
     // `prefix` itself (the exact tag) OR `prefix|…` (any descendant). DISTINCT
     // because an image carrying several tags under `prefix` would otherwise
     // appear once per matching tag.
@@ -1030,14 +1071,14 @@ fn colors_from_mask(mask: u8) -> Vec<u8> {
 /// DISTINCT` (an image with several selected colours would otherwise repeat).
 /// `ORDER BY`/`LIMIT` mirror the other loaders. Pure (returns a string) so the
 /// AND/OR shape is unit-testable under the display-free discipline.
-fn build_color_mask_query(mask: u8, match_all: bool, sort: SortOrder) -> Option<String> {
+fn build_color_mask_query(mask: u8, match_all: bool, sort: SortOrder, reverse: bool) -> Option<String> {
     let colors = colors_from_mask(mask);
     if colors.is_empty() {
         return None;
     }
     let in_list = colors.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
     let limit = GRID_CAP + 1;
-    let order = sort.order_clause();
+    let order = sort.order_clause(reverse);
     let sql = if match_all {
         format!(
             "SELECT f.folder || '/' || i.filename \
@@ -1079,7 +1120,7 @@ pub fn lighttable_load_by_color_mask(
         let db = db_path.to_string();
         move || lighttable_load_by_color_mask(&m, &db, mask, match_all)
     });
-    let Some(sql) = build_color_mask_query(mask, match_all, current_sort()) else {
+    let Some(sql) = build_color_mask_query(mask, match_all, current_sort(), current_reverse()) else {
         lighttable_load_from_db(model, db_path);
         return;
     };
@@ -1205,13 +1246,13 @@ mod tests {
 
     #[test]
     fn build_color_mask_query_none_for_empty_mask() {
-        assert!(build_color_mask_query(0, false, SortOrder::Filename).is_none());
-        assert!(build_color_mask_query(0, true, SortOrder::Filename).is_none());
+        assert!(build_color_mask_query(0, false, SortOrder::Filename, false).is_none());
+        assert!(build_color_mask_query(0, true, SortOrder::Filename, false).is_none());
     }
 
     #[test]
     fn build_color_mask_query_or_uses_distinct_no_having() {
-        let sql = build_color_mask_query(0b10101, false, SortOrder::Filename).expect("non-empty mask");
+        let sql = build_color_mask_query(0b10101, false, SortOrder::Filename, false).expect("non-empty mask");
         assert!(sql.contains("SELECT DISTINCT"), "{sql}");
         assert!(sql.contains("cl.color IN (0,2,4)"), "{sql}");
         assert!(!sql.contains("HAVING"), "OR must not group/having: {sql}");
@@ -1220,7 +1261,7 @@ mod tests {
 
     #[test]
     fn build_color_mask_query_and_groups_and_counts_selected() {
-        let sql = build_color_mask_query(0b01010, true, SortOrder::Filename).expect("non-empty mask");
+        let sql = build_color_mask_query(0b01010, true, SortOrder::Filename, false).expect("non-empty mask");
         assert!(sql.contains("cl.color IN (1,3)"), "{sql}");
         // AND => image must carry both selected colours; N = popcount(mask).
         assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 2"), "{sql}");
@@ -1230,29 +1271,45 @@ mod tests {
     #[test]
     fn build_color_mask_query_single_colour_counts_one() {
         // The single-colour case (one-bit mask) collapses to N=1 under AND.
-        let sql = build_color_mask_query(0b00100, true, SortOrder::Filename).expect("non-empty mask");
+        let sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false).expect("non-empty mask");
         assert!(sql.contains("cl.color IN (2)"), "{sql}");
         assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 1"), "{sql}");
     }
 
     #[test]
     fn sort_order_clauses_are_stable() {
-        assert_eq!(SortOrder::Filename.order_clause(), "f.folder, i.filename");
+        assert_eq!(SortOrder::Filename.order_clause(false), "f.folder ASC, i.filename ASC");
         // Undated (NULL/0) sorts last via the leading boolean key.
         assert_eq!(
-            SortOrder::DateTaken.order_clause(),
-            "(i.datetime_taken IS NULL OR i.datetime_taken = 0), i.datetime_taken, i.filename"
+            SortOrder::DateTaken.order_clause(false),
+            "(i.datetime_taken IS NULL OR i.datetime_taken = 0) ASC, i.datetime_taken ASC, i.filename ASC"
         );
         // Rejected (rating 6) is remapped below 0 so it sorts under 5-star.
         assert_eq!(
-            SortOrder::Rating.order_clause(),
-            "CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC, i.filename"
+            SortOrder::Rating.order_clause(false),
+            "CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC, i.filename ASC"
+        );
+    }
+
+    #[test]
+    fn reversing_flips_reversible_terms_only() {
+        // Every reversible term flips ASC<->DESC.
+        assert_eq!(SortOrder::Filename.order_clause(true), "f.folder DESC, i.filename DESC");
+        assert_eq!(
+            SortOrder::Rating.order_clause(true),
+            "CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END ASC, i.filename DESC"
+        );
+        // The undated-last guard is NON-reversible: it stays ASC so undated images
+        // remain at the bottom even when the date sort is reversed.
+        assert_eq!(
+            SortOrder::DateTaken.order_clause(true),
+            "(i.datetime_taken IS NULL OR i.datetime_taken = 0) ASC, i.datetime_taken DESC, i.filename DESC"
         );
     }
 
     #[test]
     fn color_mask_query_applies_sort_order() {
-        let sql = build_color_mask_query(0b00100, false, SortOrder::Rating).expect("mask");
+        let sql = build_color_mask_query(0b00100, false, SortOrder::Rating, false).expect("mask");
         assert!(
             sql.contains("ORDER BY CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC"),
             "{sql}"
@@ -1277,11 +1334,11 @@ mod tests {
              INSERT INTO images VALUES (3, 1, 'c.raw', 0,   3);  -- undated, 3-star",
         )
         .unwrap();
-        let run = |order: SortOrder| -> Vec<String> {
+        let run = |order: SortOrder, reverse: bool| -> Vec<String> {
             let sql = format!(
                 "SELECT i.filename FROM images i JOIN film_rolls f ON f.id = i.film_id \
                  ORDER BY {}",
-                order.order_clause()
+                order.order_clause(reverse)
             );
             conn.prepare(&sql)
                 .unwrap()
@@ -1290,11 +1347,18 @@ mod tests {
                 .flatten()
                 .collect()
         };
-        assert_eq!(run(SortOrder::Filename), ["a.raw", "b.raw", "c.raw"]);
+        assert_eq!(run(SortOrder::Filename, false), ["a.raw", "b.raw", "c.raw"]);
         // Ascending date order for dated images, undated (c) pushed last.
-        assert_eq!(run(SortOrder::DateTaken), ["a.raw", "b.raw", "c.raw"]);
+        assert_eq!(run(SortOrder::DateTaken, false), ["a.raw", "b.raw", "c.raw"]);
         // Highest rating first; rejected (a) sorts below the 3-star (c).
-        assert_eq!(run(SortOrder::Rating), ["b.raw", "c.raw", "a.raw"]);
+        assert_eq!(run(SortOrder::Rating, false), ["b.raw", "c.raw", "a.raw"]);
+
+        // Reversed: filename Z→A; date newest-first for dated images but undated
+        // (c) STILL last (non-reversible guard); rating lowest-first with rejected
+        // (a) now at the very top.
+        assert_eq!(run(SortOrder::Filename, true), ["c.raw", "b.raw", "a.raw"]);
+        assert_eq!(run(SortOrder::DateTaken, true), ["b.raw", "a.raw", "c.raw"]);
+        assert_eq!(run(SortOrder::Rating, true), ["a.raw", "c.raw", "b.raw"]);
     }
 
     #[test]
