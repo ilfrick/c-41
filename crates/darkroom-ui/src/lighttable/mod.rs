@@ -171,7 +171,10 @@ pub fn lighttable_page(db_path: String) -> (ScrolledWindow, LighttableModel, Sin
     let grid = GridView::builder()
         .model(&selection)
         .factory(&factory)
-        .max_columns(12)
+        // The *max*-column bound (thumbnail size) is owned by the bottom toolbar's
+        // thumb-size stepper (see lib.rs THUMB_COLS_*); it calls set_max_columns
+        // on this grid at startup and on every ± click. Only the min bound lives
+        // here. `min_columns(2)` keeps a narrow framebuffer from clipping the row.
         .min_columns(2)
         .build();
     grid.add_css_class("lighttable-grid");

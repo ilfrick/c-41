@@ -26,6 +26,14 @@ pub const APP_ID:        &str = "org.darkroom.Darkroom";
 pub const DEFAULT_WIDTH:  i32 = 1280;
 pub const DEFAULT_HEIGHT: i32 = 800;
 
+/// Lighttable thumb-size control (bottom toolbar, m4-98a): the value is the grid's
+/// *upper* column bound — fewer columns ⇒ larger thumbnails. It caps columns rather
+/// than fixing them (`min_columns` stays low) so a narrow framebuffer still fits
+/// the row instead of clipping. `DEFAULT` mirrors darktable's ~mid density.
+const THUMB_COLS_MIN:     u32 = 2;
+const THUMB_COLS_MAX:     u32 = 12;
+const THUMB_COLS_DEFAULT: u32 = 6;
+
 pub fn run() -> Result<glib::ExitCode> {
     let app = Application::builder()
         .application_id(APP_ID)
@@ -385,6 +393,77 @@ fn build_main_window(app: &Application) {
     let lt_toolbar = adw::ToolbarView::new();
     lt_toolbar.add_top_bar(&lt_header);
     lt_toolbar.set_content(Some(&hbox));
+
+    // ── Bottom toolbar (m4-98a) ────────────────────────────────────────────
+    // darktable's lighttable has a bottom bar; the first piece is the thumb-size
+    // stepper (its "images per row" ± control) at the right. It drives the grid's
+    // max-column bound live: fewer columns ⇒ bigger thumbnails. Later increments
+    // add the rating/colour filters and view-mode switcher to this same bar.
+    {
+        let bottom = gtk4::CenterBox::new();
+        bottom.add_css_class("toolbar");
+
+        if let Some(grid) = scroll.child().and_downcast::<gtk4::GridView>() {
+            // The grid's own `max-columns` property is the single source of truth
+            // for the current thumb size — no separate counter to keep in sync.
+            grid.set_max_columns(THUMB_COLS_DEFAULT);
+
+            let zoom_out = gtk4::Button::builder()
+                .icon_name("zoom-out-symbolic")
+                .tooltip_text("Larger thumbnails (fewer per row)")
+                .build();
+            let count = gtk4::Label::new(Some(&THUMB_COLS_DEFAULT.to_string()));
+            count.set_width_chars(2);
+            let zoom_in = gtk4::Button::builder()
+                .icon_name("zoom-in-symbolic")
+                .tooltip_text("Smaller thumbnails (more per row)")
+                .build();
+
+            // Sync the label + button sensitivity to the grid's current bound, and
+            // grey out a button once its end of the range is reached so the control
+            // can't run past [THUMB_COLS_MIN, THUMB_COLS_MAX].
+            let refresh = {
+                let grid = grid.clone();
+                let count = count.clone();
+                let zoom_out = zoom_out.clone();
+                let zoom_in = zoom_in.clone();
+                std::rc::Rc::new(move || {
+                    let n = grid.max_columns();
+                    count.set_label(&n.to_string());
+                    zoom_out.set_sensitive(n > THUMB_COLS_MIN);
+                    zoom_in.set_sensitive(n < THUMB_COLS_MAX);
+                })
+            };
+            refresh(); // sync initial button sensitivity to the default
+
+            zoom_out.connect_clicked({
+                let grid = grid.clone();
+                let refresh = refresh.clone();
+                move |_| {
+                    grid.set_max_columns(grid.max_columns().saturating_sub(1).max(THUMB_COLS_MIN));
+                    refresh();
+                }
+            });
+            zoom_in.connect_clicked({
+                let grid = grid.clone();
+                let refresh = refresh.clone();
+                move |_| {
+                    grid.set_max_columns((grid.max_columns() + 1).min(THUMB_COLS_MAX));
+                    refresh();
+                }
+            });
+
+            let zoom_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            zoom_box.set_margin_start(6);
+            zoom_box.set_margin_end(6);
+            zoom_box.append(&zoom_out);
+            zoom_box.append(&count);
+            zoom_box.append(&zoom_in);
+            bottom.set_end_widget(Some(&zoom_box));
+        }
+
+        lt_toolbar.add_bottom_bar(&bottom);
+    }
 
     let lt_page = adw::NavigationPage::builder()
         .title("Lighttable")

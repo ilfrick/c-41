@@ -186,6 +186,15 @@ C FFI trampolines for tags. 61 DB tests passing.
       commits from us. Pin to an explicit `1.XX.0`, bumped deliberately.
   - **m4-98 — bottom toolbar.** Quick rating/colour strip, view-mode switcher
     (file-manager / zoomable / culling), thumbnail-size control, overlay toggles.
+    - **m4-98a (done):** the bottom bar itself (`adw::ToolbarView::add_bottom_bar`
+      of a `.toolbar` `CenterBox`) + the thumb-size stepper (`[−] N [+]`) at the
+      right, mirroring darktable's "images per row" control. It drives the grid's
+      *max*-column bound (`THUMB_COLS_MIN=2 .. MAX=12`, `DEFAULT=6`) — capping,
+      not fixing, columns so a narrow framebuffer still fits the row instead of
+      clipping. `min_columns` stays 2. Buttons grey out at the range ends. Bottom
+      bar + stepper verified rendering in-container.
+    - **m4-98b/c (next):** rating/colour quick-filter strip and the view-mode
+      switcher into the same bar.
   - Later: left-panel modules (import as a module, hierarchical collections,
     image-information, Lua scripts), right-panel modules (history stack, styles,
     metadata editor, geotagging, export as a panel), and the date timeline.
