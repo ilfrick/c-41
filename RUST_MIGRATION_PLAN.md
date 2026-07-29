@@ -193,8 +193,33 @@ C FFI trampolines for tags. 61 DB tests passing.
       not fixing, columns so a narrow framebuffer still fits the row instead of
       clipping. `min_columns` stays 2. Buttons grey out at the range ends. Bottom
       bar + stepper verified rendering in-container.
-    - **m4-98b/c (next):** rating/colour quick-filter strip and the view-mode
-      switcher into the same bar.
+    - **m4-98b (done):** star-rating filter at the left of the bottom bar (five
+      star buttons; click star N ⇒ show images rated ≥ N, re-click the floor to
+      clear). Unlike the mutually-exclusive left-panel filters it **composes** with
+      whatever collection is active (folder / tag / colour / search), mirroring the
+      sort infra: a thread-local `MIN_RATING` + pure `rating_and(min)` → a
+      ` AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN min AND 5` fragment spliced
+      into every loader's WHERE (drops rejected images, then keeps only real N..5
+      stars — excludes unrated 0 too). The no-filter/load-all branch uses
+      `WHERE 1=1{rating}` for uniform splicing; the tag-prefix OR is now
+      parenthesised so the rating AND applies to both disjuncts (latent-bug fix).
+      Stars track `current_min_rating()` (single source of truth). **Bundled
+      correctness fix:** aligned the whole rating path to darktable's real
+      `images.flags` layout — the 0..5 star value in bits 0–2 (`flags & 7`) and
+      "rejected" in the *separate* bit 3 (`= 8`). The prior Rust code stored/read
+      stars in bits 1–3 (`(flags>>1)&7`), so it was **misreading darktable's own
+      ratings** (a native 3-star `flags & 7 == 3` came back as 1 star; a native
+      6/7 read as rejected). `query_rating`/`save_rating`/`SortOrder::Rating` all
+      moved onto the correct convention (with `flags_star_rating`/
+      `flags_with_star_rating` helpers), and the sort sinks any legacy `>5` value
+      below 0-star so it can't out-rank a real 5-star. Verified against Nicola's
+      real 11k-image catalog: all ratings are darktable-native (bit-0 population of
+      11,274 is impossible under the old scheme), so no data migration is needed.
+      6 new pure/seeded tests (fragment shape+clamp, bit round-trip preserving
+      reject/high bits, colour-query composition, N..5 end-to-end).
+    - **m4-98c (next):** view-mode switcher (file-manager / zoom / culling) +
+      colour quick-filter into the same bar. Follow-ups: rejected-only filter,
+      exact-vs-min rating comparator, persist the floor across sessions.
   - Later: left-panel modules (import as a module, hierarchical collections,
     image-information, Lua scripts), right-panel modules (history stack, styles,
     metadata editor, geotagging, export as a panel), and the date timeline.

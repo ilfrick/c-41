@@ -296,7 +296,34 @@ pub(crate) fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path
     }
 }
 
-/// Read an image's 0–5 star rating (from `images.flags` bits 1–3) by path, or
+/// darktable's `images.flags` bit layout for ratings (src/common/ratings.h +
+/// src/common/image.c `dt_image_get_xmp_rating_from_flags`): the 0–5 star rating
+/// lives in bits 0–2 (`DT_VIEW_RATINGS_MASK = 0x7`); "rejected" is a *separate*
+/// bit 3 (`DT_IMAGE_REJECTED = 8`), orthogonal to the star value. Keeping every
+/// Rust read/write on this exact convention means a rating set here is read
+/// identically by the C app AND by our own grid sort/filter ([`SortOrder::Rating`],
+/// [`rating_and`]). (An earlier bits-1..3 scheme here silently disagreed with both
+/// — a 3-star image landed on `flags & 7 == 6`, i.e. read as *rejected*.)
+const DT_VIEW_RATINGS_MASK: i64 = 0x7;
+const DT_IMAGE_REJECTED: i64 = 0x8;
+
+/// The 0–5 star value stored in `flags` (bits 0–2), clamped for safety (a legacy
+/// `flags & 7` of 6/7 from pre-migration darktable can't over-fill the star row).
+fn flags_star_rating(flags: i64) -> u8 {
+    (flags & DT_VIEW_RATINGS_MASK).min(5) as u8
+}
+
+/// `flags` with its star rating replaced by `rating` (0–5), preserving every other
+/// bit — the reject bit, LDR/RAW/HDR, local-copy, etc. A Rust mirror of
+/// `save_rating`'s `(flags & ~7) | r` SQL, so the write bit-maths (and its
+/// composition with the filter reader) is unit-testable under the display-free
+/// discipline. Test-only — production writes go through `save_rating`'s SQL.
+#[cfg(test)]
+fn flags_with_star_rating(flags: i64, rating: u8) -> i64 {
+    (flags & !DT_VIEW_RATINGS_MASK) | (rating as i64 & DT_VIEW_RATINGS_MASK)
+}
+
+/// Read an image's 0–5 star rating (from `images.flags` bits 0–2) by path, or
 /// `None` for the empty/absent db or an unresolvable path. `pub(crate)` so the
 /// darkroom header (m4-28) seeds its star row on image open.
 /// Open the rating DB connection with a 3s `busy_timeout` so a rating read/write
@@ -325,7 +352,7 @@ pub(crate) fn query_rating(full_path: &str, db_path: &str) -> Option<u8> {
         rusqlite::params![folder, filename],
         |row| row.get(0),
     ).ok()?;
-    Some(((flags >> 1) & 7) as u8)
+    Some(flags_star_rating(flags))
 }
 
 fn save_rating(full_path: &str, db_path: &str, rating: u8) -> rusqlite::Result<()> {
@@ -334,9 +361,11 @@ fn save_rating(full_path: &str, db_path: &str, rating: u8) -> rusqlite::Result<(
     let p        = std::path::Path::new(full_path);
     let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let folder   = p.parent().and_then(|d| d.to_str()).unwrap_or("");
-    let bits     = (rating as i64 & 7) << 1;
+    // Write the star value into bits 0–2 only (`& ~7`), preserving the reject bit
+    // and every other flag — matches `flags_with_star_rating` and darktable.
+    let bits     = rating as i64 & DT_VIEW_RATINGS_MASK;
     conn.execute(
-        "UPDATE main.images SET flags = (flags & ~14) | ?1 \
+        "UPDATE main.images SET flags = (flags & ~7) | ?1 \
          WHERE id = (SELECT i.id FROM main.images i \
                      JOIN main.film_rolls f ON f.id = i.film_id \
                      WHERE f.folder = ?2 AND i.filename = ?3 LIMIT 1)",
@@ -793,12 +822,17 @@ impl SortOrder {
                 ("i.datetime_taken", true, true),
                 ("i.filename", true, true),
             ],
-            // darktable packs the star rating in the low 3 bits of flags (0..5,
-            // 6 = rejected). Highest rating first (DESC), but rejected is the
-            // *bottom*, not the top — map it below 0 so DESC doesn't rank it above
-            // 5 stars. Reversed, ascending puts rejected/unrated first.
+            // darktable packs the 0..5 star rating in bits 0–2 of flags and the
+            // "rejected" state in the SEPARATE bit 3 (= 8), orthogonal to the
+            // stars (src/common/collection.c: `CASE WHEN flags & 8 = 8 THEN -1
+            // ELSE flags & 7 END`). Highest rating first (DESC); rejected maps to
+            // -1 so it sinks below 0-star. Reversed, ascending puts rejected first.
+            // A legacy `flags & 7` of 6/7 (a pre-migration bits-1..3 value) is also
+            // sunk to -1 so it can't out-rank a real 5-star under DESC — mirroring
+            // the >5 clamp in [`flags_star_rating`] and the `BETWEEN … AND 5` in
+            // [`rating_and`], so all three sites agree on the 0..5 domain.
             SortOrder::Rating => &[
-                ("CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END", false, true),
+                ("CASE WHEN (i.flags & 8) = 8 OR (i.flags & 7) > 5 THEN -1 ELSE (i.flags & 7) END", false, true),
                 ("i.filename", true, true),
             ],
         }
@@ -823,6 +857,11 @@ thread_local! {
     static SORT_ORDER: Cell<SortOrder> = const { Cell::new(SortOrder::Filename) };
     /// Whether the current sort is reversed (the "sort direction" toggle).
     static SORT_REVERSE: Cell<bool> = const { Cell::new(false) };
+    /// Minimum star rating the grid should show (the bottom-bar rating filter):
+    /// 0 = no filter, 1..=5 = only images rated at least N stars. Applied on top
+    /// of whatever collection is active (folder / tag / colour / search), like the
+    /// sort — see [`rating_and`].
+    static MIN_RATING: Cell<u8> = const { Cell::new(0) };
     /// A closure that re-runs the *current* view's loader. Each loader registers
     /// itself here on every call (capturing its own args), so the sort dropdown
     /// can re-apply the view under a new order without the trigger sites (folder
@@ -838,6 +877,34 @@ fn current_sort() -> SortOrder {
 /// Whether the current view should be sorted in reverse right now.
 fn current_reverse() -> bool {
     SORT_REVERSE.with(|r| r.get())
+}
+
+/// The minimum star rating the grid should show right now (0 = no filter).
+pub fn current_min_rating() -> u8 {
+    MIN_RATING.with(|r| r.get())
+}
+
+/// A trailing ` AND (...)` SQL fragment restricting rows to at least `min` stars,
+/// or `""` when `min == 0` (no filter). darktable keeps the 0..5 star value in
+/// bits 0–2 of `flags` and the reject state in the separate bit 3 (= 8). This
+/// mirrors darktable's own rating filter (src/common/collection.c: `(flags & 8)
+/// == 0 AND flags & 7 >= N …`): exclude rejected images, then keep only real
+/// N..5-star ones (`BETWEEN min AND 5` drops unrated 0 too). `min` is clamped to
+/// 1..=5 so the interpolated integer is never user text (injection-safe); every
+/// loader aliases images as `i`, so `i.flags` is valid wherever this splices in.
+fn rating_and(min: u8) -> String {
+    if min == 0 {
+        String::new()
+    } else {
+        let min = min.clamp(1, 5);
+        // Derive the two masks from the named layout constants (they render as the
+        // literals 8 and 7) so the SQL can't drift from the documented bit scheme.
+        format!(
+            " AND (i.flags & {rej}) = 0 AND (i.flags & {mask}) BETWEEN {min} AND 5",
+            rej = DT_IMAGE_REJECTED,
+            mask = DT_VIEW_RATINGS_MASK,
+        )
+    }
 }
 
 /// Record how to re-run the current view (called by each loader with a closure
@@ -861,6 +928,14 @@ pub fn set_sort_order(order: SortOrder) {
 /// view under it. No-op if nothing has been loaded yet. Main-thread only.
 pub fn set_sort_reverse(reverse: bool) {
     SORT_REVERSE.with(|r| r.set(reverse));
+    reload_current_view();
+}
+
+/// Set the minimum-star-rating filter (0 = show all) and re-render the current
+/// view under it. Composes with whatever collection is active. No-op if nothing
+/// has been loaded yet. Main-thread only.
+pub fn set_min_rating(min: u8) {
+    MIN_RATING.with(|r| r.set(min.min(5)));
     reload_current_view();
 }
 
@@ -936,13 +1011,17 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
     };
 
     let order = current_sort().order_clause(current_reverse());
+    // Rating filter (bottom bar) composes on top of the folder selection. The
+    // no-folder branch uses `WHERE 1=1` so the ` AND (...)` fragment splices in
+    // uniformly (SQLite folds the constant away); empty when no rating filter.
+    let rating = rating_and(current_min_rating());
     let rows: Vec<String> = match folder {
         Some(f) => {
             conn.prepare(&format!(
                 "SELECT f.folder || '/' || i.filename \
                  FROM main.images i \
                  JOIN main.film_rolls f ON f.id = i.film_id \
-                 WHERE f.folder = ?1 \
+                 WHERE f.folder = ?1{rating} \
                  ORDER BY {order} LIMIT {}", GRID_CAP + 1),
             )
             .and_then(|mut s| s.query_map([f], |r| r.get::<_, String>(0))
@@ -954,6 +1033,7 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
                 "SELECT f.folder || '/' || i.filename \
                  FROM main.images i \
                  JOIN main.film_rolls f ON f.id = i.film_id \
+                 WHERE 1=1{rating} \
                  ORDER BY {order} LIMIT {}", GRID_CAP + 1),
             )
             .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(0))
@@ -984,12 +1064,13 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
     let order = current_sort().order_clause(current_reverse());
+    let rating = rating_and(current_min_rating());
     let pattern = format!("%{query}%");
     let rows: Vec<String> = conn
         .prepare(&format!(
             "SELECT f.folder || '/' || i.filename \
              FROM main.images i JOIN main.film_rolls f ON f.id = i.film_id \
-             WHERE i.filename LIKE ?1 \
+             WHERE i.filename LIKE ?1{rating} \
              ORDER BY {order} LIMIT {}", GRID_CAP + 1),
         )
         .and_then(|mut s| {
@@ -1029,9 +1110,12 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
         darkroom_db::schema::open_catalog(db_path).unwrap_or_else(|_| open_demo_db())
     };
     let order = current_sort().order_clause(current_reverse());
+    let rating = rating_and(current_min_rating());
     // `prefix` itself (the exact tag) OR `prefix|…` (any descendant). DISTINCT
     // because an image carrying several tags under `prefix` would otherwise
-    // appear once per matching tag.
+    // appear once per matching tag. The OR is parenthesised so the rating filter
+    // (` AND …`) applies to BOTH the exact and descendant branches, not just the
+    // last one (AND binds tighter than OR).
     let descendants = format!("{}|%", escape_like(prefix));
     let rows: Vec<String> = match conn
         .prepare(&format!(
@@ -1040,7 +1124,7 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
              JOIN main.film_rolls f ON f.id = i.film_id \
              JOIN main.tagged_images ti ON ti.imgid = i.id \
              JOIN data.tags t ON t.id = ti.tagid \
-             WHERE t.name = ?1 OR t.name LIKE ?2 ESCAPE '\\' \
+             WHERE (t.name = ?1 OR t.name LIKE ?2 ESCAPE '\\'){rating} \
              ORDER BY {order} LIMIT {}", GRID_CAP + 1),
         )
         .and_then(|mut s| {
@@ -1074,7 +1158,13 @@ fn colors_from_mask(mask: u8) -> Vec<u8> {
 /// DISTINCT` (an image with several selected colours would otherwise repeat).
 /// `ORDER BY`/`LIMIT` mirror the other loaders. Pure (returns a string) so the
 /// AND/OR shape is unit-testable under the display-free discipline.
-fn build_color_mask_query(mask: u8, match_all: bool, sort: SortOrder, reverse: bool) -> Option<String> {
+fn build_color_mask_query(
+    mask: u8,
+    match_all: bool,
+    sort: SortOrder,
+    reverse: bool,
+    min_rating: u8,
+) -> Option<String> {
     let colors = colors_from_mask(mask);
     if colors.is_empty() {
         return None;
@@ -1082,13 +1172,15 @@ fn build_color_mask_query(mask: u8, match_all: bool, sort: SortOrder, reverse: b
     let in_list = colors.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
     let limit = GRID_CAP + 1;
     let order = sort.order_clause(reverse);
+    // Rating filter composes with the colour selection (in the pre-GROUP WHERE).
+    let rating = rating_and(min_rating);
     let sql = if match_all {
         format!(
             "SELECT f.folder || '/' || i.filename \
              FROM main.images i \
              JOIN main.film_rolls f ON f.id = i.film_id \
              JOIN main.color_labels cl ON cl.imgid = i.id \
-             WHERE cl.color IN ({in_list}) \
+             WHERE cl.color IN ({in_list}){rating} \
              GROUP BY i.id HAVING COUNT(DISTINCT cl.color) = {n} \
              ORDER BY {order} LIMIT {limit}",
             n = colors.len(),
@@ -1099,7 +1191,7 @@ fn build_color_mask_query(mask: u8, match_all: bool, sort: SortOrder, reverse: b
              FROM main.images i \
              JOIN main.film_rolls f ON f.id = i.film_id \
              JOIN main.color_labels cl ON cl.imgid = i.id \
-             WHERE cl.color IN ({in_list}) \
+             WHERE cl.color IN ({in_list}){rating} \
              ORDER BY {order} LIMIT {limit}",
         )
     };
@@ -1123,7 +1215,9 @@ pub fn lighttable_load_by_color_mask(
         let db = db_path.to_string();
         move || lighttable_load_by_color_mask(&m, &db, mask, match_all)
     });
-    let Some(sql) = build_color_mask_query(mask, match_all, current_sort(), current_reverse()) else {
+    let Some(sql) = build_color_mask_query(
+        mask, match_all, current_sort(), current_reverse(), current_min_rating(),
+    ) else {
         lighttable_load_from_db(model, db_path);
         return;
     };
@@ -1213,7 +1307,8 @@ fn open_demo_db() -> rusqlite::Connection {
 #[cfg(test)]
 mod tests {
     use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
-                digit_to_rating, escape_like, fkey_to_color, index_of_path, path_write_lock,
+                digit_to_rating, escape_like, fkey_to_color, flags_star_rating,
+                flags_with_star_rating, index_of_path, path_write_lock, rating_and,
                 SortOrder, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
     use std::sync::Arc;
 
@@ -1249,13 +1344,13 @@ mod tests {
 
     #[test]
     fn build_color_mask_query_none_for_empty_mask() {
-        assert!(build_color_mask_query(0, false, SortOrder::Filename, false).is_none());
-        assert!(build_color_mask_query(0, true, SortOrder::Filename, false).is_none());
+        assert!(build_color_mask_query(0, false, SortOrder::Filename, false, 0).is_none());
+        assert!(build_color_mask_query(0, true, SortOrder::Filename, false, 0).is_none());
     }
 
     #[test]
     fn build_color_mask_query_or_uses_distinct_no_having() {
-        let sql = build_color_mask_query(0b10101, false, SortOrder::Filename, false).expect("non-empty mask");
+        let sql = build_color_mask_query(0b10101, false, SortOrder::Filename, false, 0).expect("non-empty mask");
         assert!(sql.contains("SELECT DISTINCT"), "{sql}");
         assert!(sql.contains("cl.color IN (0,2,4)"), "{sql}");
         assert!(!sql.contains("HAVING"), "OR must not group/having: {sql}");
@@ -1264,7 +1359,7 @@ mod tests {
 
     #[test]
     fn build_color_mask_query_and_groups_and_counts_selected() {
-        let sql = build_color_mask_query(0b01010, true, SortOrder::Filename, false).expect("non-empty mask");
+        let sql = build_color_mask_query(0b01010, true, SortOrder::Filename, false, 0).expect("non-empty mask");
         assert!(sql.contains("cl.color IN (1,3)"), "{sql}");
         // AND => image must carry both selected colours; N = popcount(mask).
         assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 2"), "{sql}");
@@ -1274,7 +1369,7 @@ mod tests {
     #[test]
     fn build_color_mask_query_single_colour_counts_one() {
         // The single-colour case (one-bit mask) collapses to N=1 under AND.
-        let sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false).expect("non-empty mask");
+        let sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, 0).expect("non-empty mask");
         assert!(sql.contains("cl.color IN (2)"), "{sql}");
         assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 1"), "{sql}");
     }
@@ -1287,10 +1382,11 @@ mod tests {
             SortOrder::DateTaken.order_clause(false),
             "(i.datetime_taken IS NULL OR i.datetime_taken = 0) ASC, i.datetime_taken ASC, i.filename ASC"
         );
-        // Rejected (rating 6) is remapped below 0 so it sorts under 5-star.
+        // Rejected (flags bit 3 = 8) or a legacy >5 star value is remapped below 0
+        // so it sorts under 0-star.
         assert_eq!(
             SortOrder::Rating.order_clause(false),
-            "CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC, i.filename ASC"
+            "CASE WHEN (i.flags & 8) = 8 OR (i.flags & 7) > 5 THEN -1 ELSE (i.flags & 7) END DESC, i.filename ASC"
         );
     }
 
@@ -1300,7 +1396,7 @@ mod tests {
         assert_eq!(SortOrder::Filename.order_clause(true), "f.folder DESC, i.filename DESC");
         assert_eq!(
             SortOrder::Rating.order_clause(true),
-            "CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END ASC, i.filename DESC"
+            "CASE WHEN (i.flags & 8) = 8 OR (i.flags & 7) > 5 THEN -1 ELSE (i.flags & 7) END ASC, i.filename DESC"
         );
         // The undated-last guard is NON-reversible: it stays ASC so undated images
         // remain at the bottom even when the date sort is reversed.
@@ -1312,11 +1408,114 @@ mod tests {
 
     #[test]
     fn color_mask_query_applies_sort_order() {
-        let sql = build_color_mask_query(0b00100, false, SortOrder::Rating, false).expect("mask");
+        let sql = build_color_mask_query(0b00100, false, SortOrder::Rating, false, 0).expect("mask");
         assert!(
-            sql.contains("ORDER BY CASE (i.flags & 7) WHEN 6 THEN -1 ELSE (i.flags & 7) END DESC"),
+            sql.contains("ORDER BY CASE WHEN (i.flags & 8) = 8 OR (i.flags & 7) > 5 THEN -1 ELSE (i.flags & 7) END DESC"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn rating_and_fragment_shape_and_clamp() {
+        // 0 = no filter → empty fragment (nothing spliced into any WHERE).
+        assert_eq!(rating_and(0), "");
+        // 1..=5 → exclude rejected (bit 3) THEN keep N..5 stars (bits 0–2).
+        assert_eq!(rating_and(1), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 1 AND 5");
+        assert_eq!(rating_and(5), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 5 AND 5");
+        // Out-of-range clamps to 5 (never emits a >5 bound that would match nothing).
+        assert_eq!(rating_and(9), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 5 AND 5");
+    }
+
+    #[test]
+    fn flags_rating_bits_roundtrip_and_preserve_other_bits() {
+        // Star value lives in bits 0–2; write/read must round-trip and NEVER touch
+        // the reject bit (8) or any high flag (e.g. RAW/LDR at bits 6/10/16 — the
+        // shape of Nicola's real darktable-written catalog).
+        let base = 0x10440; // bits 6, 10, 16 set (no rating, no reject)
+        for r in 0..=5u8 {
+            let f = flags_with_star_rating(base, r);
+            assert_eq!(flags_star_rating(f), r, "roundtrip r={r}");
+            assert_eq!(f & !0x7, base, "high/reject bits preserved r={r}");
+        }
+        // Re-rating an image that carries the reject bit keeps reject set.
+        let rejected = base | 0x8;
+        let re = flags_with_star_rating(rejected, 4);
+        assert_eq!(flags_star_rating(re), 4);
+        assert_eq!(re & 0x8, 0x8, "reject bit survives a re-rate");
+        // A legacy `flags & 7` of 6/7 clamps to 5 stars, never over-fills the row.
+        assert_eq!(flags_star_rating(6), 5);
+        assert_eq!(flags_star_rating(7), 5);
+    }
+
+    #[test]
+    fn color_mask_query_composes_rating_in_where() {
+        // The rating guard sits in the pre-GROUP WHERE of BOTH AND/OR colour paths.
+        let and_sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, 3).expect("mask");
+        assert!(
+            and_sql.contains("WHERE cl.color IN (2) AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 3 AND 5 GROUP BY"),
+            "{and_sql}"
+        );
+        let or_sql = build_color_mask_query(0b10100, false, SortOrder::Filename, false, 2).expect("mask");
+        assert!(
+            or_sql.contains("WHERE cl.color IN (2,4) AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 2 AND 5 ORDER BY"),
+            "{or_sql}"
+        );
+        // No rating filter → no rating guard at all.
+        let none_sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, 0).expect("mask");
+        assert!(!none_sql.contains("BETWEEN"), "{none_sql}");
+    }
+
+    #[test]
+    fn rating_filter_keeps_only_n_to_5_stars() {
+        // End-to-end over the DARKTABLE bit convention (rating in bits 0–2, reject
+        // in bit 3): the filter excludes unrated(0) and rejected — INCLUDING a
+        // rejected image that still carries stars — while keeping N..5-star images.
+        // Seeded via the exact write bit-maths save_rating uses (`(flags & ~7)|r`)
+        // plus the reject bit, so this chains the writer to the filter reader (the
+        // seam the bit-offset bug lived in). StringList can't be built headlessly.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder TEXT);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT, flags INTEGER);
+             INSERT INTO film_rolls VALUES (1, '/f');",
+        )
+        .unwrap();
+        // (filename, star rating, rejected?) written the way the app writes them.
+        let seed = [
+            ("unrated.raw", 0u8, false),
+            ("two.raw", 2, false),
+            ("five.raw", 5, false),
+            ("rejected.raw", 0, true),
+            ("rej_five.raw", 5, true), // rejected AND 5-star — reject must win
+        ];
+        for (id, (name, rating, rejected)) in seed.iter().enumerate() {
+            let base: i64 = 0x10440 | if *rejected { 0x8 } else { 0 }; // high bits + maybe reject
+            let flags = flags_with_star_rating(base, *rating);
+            conn.execute(
+                "INSERT INTO images VALUES (?1, 1, ?2, ?3)",
+                rusqlite::params![id as i64 + 1, name, flags],
+            )
+            .unwrap();
+        }
+        let run = |min: u8| -> Vec<String> {
+            let sql = format!(
+                "SELECT i.filename FROM images i JOIN film_rolls f ON f.id = i.film_id \
+                 WHERE 1=1{} ORDER BY i.filename",
+                rating_and(min)
+            );
+            conn.prepare(&sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        // No filter: all five (unrated, rejected, rejected-5-star included).
+        assert_eq!(run(0), ["five.raw", "rej_five.raw", "rejected.raw", "two.raw", "unrated.raw"]);
+        // >=3 stars: only the non-rejected 5-star (rej_five is excluded by reject).
+        assert_eq!(run(3), ["five.raw"]);
+        // >=1 star: 2- and 5-star; excludes unrated AND both rejected images.
+        assert_eq!(run(1), ["five.raw", "two.raw"]);
     }
 
     #[test]
@@ -1332,7 +1531,7 @@ mod tests {
              CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT,
                                   datetime_taken INTEGER, flags INTEGER);
              INSERT INTO film_rolls VALUES (1, '/f');
-             INSERT INTO images VALUES (1, 1, 'a.raw', 100, 6);  -- dated,   rejected
+             INSERT INTO images VALUES (1, 1, 'a.raw', 100, 8);  -- dated,   rejected (bit 3)
              INSERT INTO images VALUES (2, 1, 'b.raw', 200, 5);  -- dated,   5-star
              INSERT INTO images VALUES (3, 1, 'c.raw', 0,   3);  -- undated, 3-star",
         )

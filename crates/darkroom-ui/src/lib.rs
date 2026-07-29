@@ -394,14 +394,63 @@ fn build_main_window(app: &Application) {
     lt_toolbar.add_top_bar(&lt_header);
     lt_toolbar.set_content(Some(&hbox));
 
-    // ── Bottom toolbar (m4-98a) ────────────────────────────────────────────
-    // darktable's lighttable has a bottom bar; the first piece is the thumb-size
-    // stepper (its "images per row" ± control) at the right. It drives the grid's
-    // max-column bound live: fewer columns ⇒ bigger thumbnails. Later increments
-    // add the rating/colour filters and view-mode switcher to this same bar.
+    // ── Bottom toolbar (m4-98a/b) ──────────────────────────────────────────
+    // darktable's lighttable bottom bar. Right (m4-98a): the thumb-size stepper
+    // (its "images per row" ± control) driving the grid's max-column bound live —
+    // fewer columns ⇒ bigger thumbnails. Left (m4-98b): a star-rating filter that
+    // shows only images rated ≥ N; it composes with whatever collection is active
+    // (folder / tag / colour / search). Later: colour filter + view-mode switcher.
     {
         let bottom = gtk4::CenterBox::new();
         bottom.add_css_class("toolbar");
+
+        // Rating filter (m4-98b): five star buttons; clicking star N filters the
+        // grid to images rated at least N, clicking the active floor again clears
+        // it. The lit/unlit icons track `current_min_rating()` (the single source
+        // of truth — no separate mirror), so the display can't drift from the DB
+        // query the filter actually runs.
+        {
+            let star_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            star_box.add_css_class("linked");
+            star_box.set_margin_start(6);
+            star_box.set_tooltip_text(Some("Filter by minimum star rating"));
+
+            let stars: std::rc::Rc<Vec<gtk4::Button>> = std::rc::Rc::new(
+                (1..=5u8)
+                    .map(|_| {
+                        gtk4::Button::builder().icon_name("non-starred-symbolic").build()
+                    })
+                    .collect(),
+            );
+            for b in stars.iter() {
+                star_box.append(b);
+            }
+
+            // Repaint the five stars so 1..=floor are lit and the rest are hollow.
+            let refresh_stars: std::rc::Rc<dyn Fn()> = {
+                let stars = stars.clone();
+                std::rc::Rc::new(move || {
+                    let floor = lighttable::current_min_rating();
+                    for (i, b) in stars.iter().enumerate() {
+                        let lit = (i as u8) < floor; // star i+1 lit iff i+1 <= floor
+                        b.set_icon_name(if lit { "starred-symbolic" } else { "non-starred-symbolic" });
+                    }
+                })
+            };
+            refresh_stars();
+
+            for (i, b) in stars.iter().enumerate() {
+                let n = (i + 1) as u8;
+                let refresh_stars = refresh_stars.clone();
+                b.connect_clicked(move |_| {
+                    // Toggle: re-clicking the current floor clears the filter.
+                    let new = if lighttable::current_min_rating() == n { 0 } else { n };
+                    lighttable::set_min_rating(new);
+                    refresh_stars();
+                });
+            }
+            bottom.set_start_widget(Some(&star_box));
+        }
 
         if let Some(grid) = scroll.child().and_downcast::<gtk4::GridView>() {
             // The grid's own `max-columns` property is the single source of truth
