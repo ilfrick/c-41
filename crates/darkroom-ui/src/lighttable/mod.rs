@@ -95,12 +95,29 @@ pub fn lighttable_page(db_path: String) -> (ScrolledWindow, LighttableModel, Sin
         stars_box.set_widget_name(&full_path);
         colors_box.set_widget_name(&full_path);
 
-        if !full_path.contains('/') {
+        // Honour the overlay mode (m4-98e) on EVERY bind path, before any early
+        // return: cells are recycled, so a mode changed while this cell was
+        // off-screen (or while it showed a placeholder) must take effect as it
+        // comes back. `set_overlay_mode` only covers the cells realized at the time
+        // it ran, so this unconditional call is what makes the pair exhaustive.
+        let is_placeholder = !full_path.contains('/');
+        apply_overlay_visibility(
+            &vbox,
+            effective_overlay_visibility(is_placeholder, current_overlay_mode()),
+        );
+
+        if is_placeholder {
             set_stars(&stars_box, 0);
             set_color_dots(&colors_box, 0);
             return;
         }
 
+        // The rating/colour-label reads below run REGARDLESS of the overlay mode,
+        // and that is load-bearing: [`set_overlay_mode`] only toggles `visible`, it
+        // never populates. Skipping the queries in `Hidden`/`Normal` as an
+        // "optimisation" would make a later switch back to `Extended` reveal
+        // permanently empty rows on every already-bound cell.
+        //
         // Async thumbnail load
         glib::spawn_future_local(clone!(@weak thumb => async move {
             let path = full_path.clone();
@@ -153,6 +170,10 @@ pub fn lighttable_page(db_path: String) -> (ScrolledWindow, LighttableModel, Sin
     });
 
     // ── Unbind ─────────────────────────────────────────────────────────────
+    // Deliberately does NOT reset row visibility (m4-98e): bind re-establishes it
+    // on every path, and leaving it (plus the stamped widget names) means an
+    // unbound-but-still-parented cell is still classified correctly by
+    // [`set_overlay_mode`]'s walk.
     factory.connect_unbind(|_, list_item| {
         let item = list_item.downcast_ref::<ListItem>().unwrap();
         if let Some(vbox) = item.child().and_downcast::<gtk4::Box>() {
@@ -886,6 +907,118 @@ impl RatingCompare {
     }
 }
 
+/// Which per-thumbnail overlays the grid draws (m4-98e) — our port of darktable's
+/// thumbnail "overlays" setting. Ordered as the bottom-bar dropdown lists them.
+/// `Hidden` is darktable's "no overlays"; named so it can't be confused with
+/// `Option::None` at a match site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OverlayMode {
+    /// Thumbnail only — no filename, no stars, no colour dots.
+    Hidden,
+    /// Stars + colour labels, but no filename (darktable's "normal" overlays).
+    Normal,
+    /// Filename + stars + colour labels — the original cell layout, and the
+    /// default so the out-of-box look is unchanged.
+    Extended,
+}
+
+impl OverlayMode {
+    /// Modes in dropdown-row order, so the UI index ↔ variant mapping and the
+    /// persisted-token order have one source of truth. [`OverlayMode::LABELS`] is
+    /// built from this, so the dropdown can't drift out of sync with the variants.
+    pub const ALL: [OverlayMode; 3] = [Self::Hidden, Self::Normal, Self::Extended];
+
+    /// Map a DropDown selection index back to a mode (out-of-range ⇒ `Extended`,
+    /// the default, so a corrupt index can never panic).
+    pub fn from_index(i: u32) -> OverlayMode {
+        *Self::ALL.get(i as usize).unwrap_or(&Self::Extended)
+    }
+
+    /// The mode's dropdown-row index (for seeding the DropDown selection). An
+    /// exhaustive match rather than a lookup in [`Self::ALL`]: the compiler then
+    /// forces this to be updated when a variant is added, and there's no silent
+    /// `unwrap_or(0)` fallback that would disagree with [`Self::from_index`].
+    pub fn to_index(self) -> u32 {
+        match self {
+            Self::Hidden => 0,
+            Self::Normal => 1,
+            Self::Extended => 2,
+        }
+    }
+
+    /// The mode's dropdown row label. Kept next to the variants (not in `lib.rs`)
+    /// so the control is built from [`Self::ALL`] and the two can't diverge. Kept
+    /// terse — the bottom bar's minimum width is contended (see the ~915px
+    /// lighttable overflow note in the plan).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hidden => "None",
+            Self::Normal => "Stars",
+            Self::Extended => "Full",
+        }
+    }
+}
+
+/// Which of a cell's three metadata rows a mode shows: `(filename, stars,
+/// colours)`. Pure, so the mapping is unit-testable under the display-free
+/// discipline.
+fn overlay_visibility(mode: OverlayMode) -> (bool, bool, bool) {
+    match mode {
+        OverlayMode::Hidden => (false, false, false),
+        OverlayMode::Normal => (false, true, true),
+        OverlayMode::Extended => (true, true, true),
+    }
+}
+
+/// Row visibility for a cell, accounting for **placeholder** rows ("(No images…)",
+/// the truncation notice). A placeholder speaks through its label, so it always
+/// shows it whatever the mode — hiding it would leave an unexplained empty grid —
+/// but never its stars/colour dots, which are meaningless there. The single
+/// decision point for both appliers (bind and [`set_overlay_mode`]'s walk), so the
+/// carve-out can't be implemented two subtly different ways.
+fn effective_overlay_visibility(is_placeholder: bool, mode: OverlayMode) -> (bool, bool, bool) {
+    if is_placeholder {
+        (true, false, false)
+    } else {
+        overlay_visibility(mode)
+    }
+}
+
+/// Persisted overlay-mode token pieces — shared by the encoder and decoder so
+/// they can't silently disagree (same discipline as the rating-filter token).
+const OVERLAY_TOK_HIDDEN: &str = "none";
+const OVERLAY_TOK_NORMAL: &str = "normal";
+const OVERLAY_TOK_EXTENDED: &str = "extended";
+
+/// Pure encoder for the persisted overlay-mode token. `pub` so the bottom bar can
+/// persist exactly the mode it just applied, rather than re-reading the global.
+pub fn overlay_mode_token_for(mode: OverlayMode) -> &'static str {
+    match mode {
+        OverlayMode::Hidden => OVERLAY_TOK_HIDDEN,
+        OverlayMode::Normal => OVERLAY_TOK_NORMAL,
+        OverlayMode::Extended => OVERLAY_TOK_EXTENDED,
+    }
+}
+
+/// Parse a persisted overlay-mode token, falling back to `Extended` (the default
+/// look) on anything unrecognised. Derived by *inverting the encoder* over
+/// [`OverlayMode::ALL`] rather than restating the mapping, so encoder and decoder
+/// cannot drift apart. Pure, so it's unit-testable.
+fn parse_overlay_mode_token(tok: &str) -> OverlayMode {
+    OverlayMode::ALL
+        .iter()
+        .find(|&&m| overlay_mode_token_for(m) == tok)
+        .copied()
+        .unwrap_or(OverlayMode::Extended)
+}
+
+/// Seed the overlay mode from a persisted token *without* touching any widget —
+/// called at startup before the grid has realized cells, so the first bind
+/// already applies it. Main-thread only.
+pub fn apply_overlay_mode_token(tok: &str) {
+    OVERLAY_MODE.with(|m| m.set(parse_overlay_mode_token(tok)));
+}
+
 thread_local! {
     /// The current grid sort order (main-thread-only UI state).
     static SORT_ORDER: Cell<SortOrder> = const { Cell::new(SortOrder::Filename) };
@@ -899,6 +1032,9 @@ thread_local! {
     /// How [`MIN_RATING`] is compared (the comparator dropdown). Default `AtLeast`
     /// so the out-of-box state (`AtLeast` + 0 stars) is "show everything".
     static RATING_COMPARE: Cell<RatingCompare> = const { Cell::new(RatingCompare::AtLeast) };
+    /// Which per-thumbnail overlays the grid draws. Default `Extended` (filename +
+    /// stars + colour dots) so the out-of-box look matches the pre-m4-98e cell.
+    static OVERLAY_MODE: Cell<OverlayMode> = const { Cell::new(OverlayMode::Extended) };
     /// A closure that re-runs the *current* view's loader. Each loader registers
     /// itself here on every call (capturing its own args), so the sort dropdown
     /// can re-apply the view under a new order without the trigger sites (folder
@@ -928,6 +1064,75 @@ pub fn current_min_rating() -> u8 {
 /// `Rejected` mode where they're irrelevant.
 pub fn current_rating_compare() -> RatingCompare {
     RATING_COMPARE.with(|c| c.get())
+}
+
+/// The overlay mode the grid should draw right now. `pub` so the bottom bar can
+/// seed its dropdown from the restored value.
+pub fn current_overlay_mode() -> OverlayMode {
+    OVERLAY_MODE.with(|m| m.get())
+}
+
+/// Show/hide a cell's three metadata rows — `(filename, stars, colours)`, as
+/// returned by [`effective_overlay_visibility`]. The thumbnail (child 0) is never
+/// touched. Applied at bind time so every newly-bound *and* recycled cell honours
+/// the mode, and by [`set_overlay_mode`] to the cells already on screen.
+fn apply_overlay_visibility(vbox: &gtk4::Box, (filename, stars, colors): (bool, bool, bool)) {
+    for (idx, visible) in [(1usize, filename), (2, stars), (3, colors)] {
+        if let Some(w) = nth_child(vbox, idx) {
+            w.set_visible(visible);
+        }
+    }
+}
+
+/// If `w` is a realized grid cell, its vbox. A cell is recognised the same way
+/// [`find_cell_row_for_path`] does it — its first child is the thumbnail
+/// `Picture` — which also can't match the cell's own metadata rows (those are
+/// `Box`es leading with `Label`s).
+fn cell_vbox_of(w: &gtk4::Widget) -> Option<gtk4::Box> {
+    let vbox = w.downcast_ref::<gtk4::Box>()?;
+    vbox.first_child().and_downcast::<gtk4::Picture>()?;
+    Some(vbox.clone())
+}
+
+/// Depth-first walk of `root`'s descendants applying `f` to every realized cell
+/// vbox. Identified cells are not descended into — their children are the
+/// metadata rows, never nested cells.
+fn for_each_cell_vbox(root: &gtk4::Widget, f: &mut dyn FnMut(&gtk4::Box)) {
+    let mut child = root.first_child();
+    while let Some(w) = child {
+        // NOTE: the call to `f` is the point of this walk — keep it in a plain
+        // `if let` so it stays visibly load-bearing. (An `Option` combinator chain
+        // here reads as a no-op and invites a "simplification" that would silently
+        // turn `set_overlay_mode` into a state-setter that repaints nothing.)
+        if let Some(vbox) = cell_vbox_of(&w) {
+            f(&vbox);
+        } else {
+            for_each_cell_vbox(&w, f);
+        }
+        child = w.next_sibling();
+    }
+}
+
+/// Whether a realized cell is showing a placeholder row, judged by the path
+/// stamped on its thumbnail at bind time (placeholders carry no `/`). A cell that
+/// has never been bound reports GTK's type-name fallback (`"GtkPicture"`), which
+/// likewise has no `/` — so it too counts as a placeholder and keeps its label
+/// until its first bind. That's the fail-open direction.
+fn cell_is_placeholder(vbox: &gtk4::Box) -> bool {
+    vbox.first_child()
+        .and_downcast::<gtk4::Picture>()
+        .is_some_and(|t| !t.widget_name().contains('/'))
+}
+
+/// Set the thumbnail overlay mode and apply it immediately to the cells already
+/// realized in `grid` (new/recycled cells pick it up at bind time). Main-thread
+/// only.
+pub fn set_overlay_mode(grid: &GridView, mode: OverlayMode) {
+    OVERLAY_MODE.with(|m| m.set(mode));
+    for_each_cell_vbox(grid.upcast_ref::<gtk4::Widget>(), &mut |vbox| {
+        let vis = effective_overlay_visibility(cell_is_placeholder(vbox), mode);
+        apply_overlay_visibility(vbox, vis);
+    });
 }
 
 /// A trailing ` AND (...)` SQL fragment implementing the rating filter, or `""`
@@ -1438,9 +1643,11 @@ fn open_demo_db() -> rusqlite::Connection {
 mod tests {
     use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
                 digit_to_rating, escape_like, fkey_to_color, flags_star_rating,
-                flags_with_star_rating, index_of_path, parse_rating_filter_token,
-                path_write_lock, rating_filter_token_for, rating_predicate, RatingCompare,
-                SortOrder, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
+                apply_overlay_mode_token, current_overlay_mode, effective_overlay_visibility,
+                flags_with_star_rating, index_of_path, overlay_mode_token_for,
+                overlay_visibility, parse_overlay_mode_token, parse_rating_filter_token,
+                path_write_lock, rating_filter_token_for, rating_predicate, OverlayMode,
+                RatingCompare, SortOrder, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
     use std::sync::Arc;
 
     fn n_rows(n: usize) -> Vec<String> {
@@ -1585,6 +1792,63 @@ mod tests {
         assert_eq!(parse_rating_filter_token("ge:99"), (AtLeast, 5), "clamp to 5");
         assert_eq!(parse_rating_filter_token("xx:2"), (AtLeast, 0), "unknown prefix");
         assert_eq!(parse_rating_filter_token("ge:x"), (AtLeast, 0), "non-numeric");
+    }
+
+    #[test]
+    fn overlay_visibility_maps_each_mode_to_its_rows() {
+        // (filename, stars, colours) — Extended is the default/original layout.
+        assert_eq!(overlay_visibility(OverlayMode::Hidden), (false, false, false));
+        assert_eq!(overlay_visibility(OverlayMode::Normal), (false, true, true));
+        assert_eq!(overlay_visibility(OverlayMode::Extended), (true, true, true));
+    }
+
+    #[test]
+    fn placeholder_cells_keep_their_label_in_every_mode() {
+        // The user-hostile failure this carve-out exists to prevent: a placeholder
+        // ("(No images…)") whose label is hidden leaves an unexplained empty grid.
+        // Its stars/dots stay hidden — they're meaningless on a sentinel row.
+        for mode in OverlayMode::ALL {
+            assert_eq!(
+                effective_overlay_visibility(true, mode),
+                (true, false, false),
+                "placeholder under {mode:?}"
+            );
+        }
+        // Real image cells are unaffected by the carve-out.
+        for mode in OverlayMode::ALL {
+            assert_eq!(effective_overlay_visibility(false, mode), overlay_visibility(mode));
+        }
+    }
+
+    #[test]
+    fn overlay_mode_index_and_token_roundtrip() {
+        // Iterate ALL (not a hardcoded list) so adding a variant forces a test touch.
+        assert_eq!(OverlayMode::ALL.len(), 3);
+        for (i, mode) in OverlayMode::ALL.into_iter().enumerate() {
+            // Dropdown index ↔ variant is a bijection over the rows...
+            assert_eq!(OverlayMode::from_index(i as u32), mode, "index {i}");
+            assert_eq!(mode.to_index(), i as u32, "to_index {mode:?}");
+            // ...and encode∘decode is identity (guards encoder AND decoder).
+            assert_eq!(parse_overlay_mode_token(overlay_mode_token_for(mode)), mode);
+            // Every row has a non-empty label, so the dropdown can't render blanks.
+            assert!(!mode.label().is_empty(), "label {mode:?}");
+        }
+        // Out-of-range index and corrupt tokens fall back to the default look.
+        assert_eq!(OverlayMode::from_index(99), OverlayMode::Extended);
+        assert_eq!(parse_overlay_mode_token("garbage"), OverlayMode::Extended);
+        assert_eq!(parse_overlay_mode_token(""), OverlayMode::Extended);
+    }
+
+    #[test]
+    fn apply_overlay_mode_token_seeds_the_current_mode() {
+        // The startup restore path end-to-end (thread-locals are per-test-thread).
+        for mode in OverlayMode::ALL {
+            apply_overlay_mode_token(overlay_mode_token_for(mode));
+            assert_eq!(current_overlay_mode(), mode);
+        }
+        // A corrupt persisted value restores the default look rather than panicking.
+        apply_overlay_mode_token("nonsense");
+        assert_eq!(current_overlay_mode(), OverlayMode::Extended);
     }
 
     #[test]

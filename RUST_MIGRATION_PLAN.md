@@ -232,6 +232,23 @@ C FFI trampolines for tags. 61 DB tests passing.
       (decoupled from the enum). In `Rejected` mode the star row greys out. 4 new
       tests (predicate shape across all comparators, token round-trip+fallback,
       pref-table upsert/missing-table, comparator end-to-end over seeded flags).
+    - **m4-98e (done):** thumbnail **overlay modes** — the "overlay toggles" half
+      of this milestone. A centre dropdown (`No overlays` / `Stars + labels` /
+      `Full info`) maps to `OverlayMode {Hidden, Normal, Extended}`, controlling
+      which of a cell's three metadata rows show: `overlay_visibility(mode) ->
+      (filename, stars, colours)` — pure, so the mapping is display-free testable.
+      `Extended` is the default, so the out-of-box look is unchanged. Applied in
+      two places, which together cover GTK's cell recycling: `connect_bind` (every
+      newly-bound/recycled cell) and `set_overlay_mode(grid, mode)`, which walks
+      the realized cells via `for_each_cell_vbox` (recognising a cell the way
+      `find_cell_row_for_path` does — first child is the thumbnail `Picture`).
+      **Placeholder rows carve-out:** "(No images…)" / the truncation notice speak
+      through the label, so they always render `Extended` — hiding it would leave
+      an unexplained empty grid. Persists via the m4-98d `darkroom_ui_prefs` table
+      under `overlay_mode` (token `none`/`normal`/`extended`, shared prefix consts
+      so encoder/decoder can't drift), restored **before** the first bind so cells
+      are laid out right the first time. 2 new tests (row mapping per mode; index
+      ↔ variant bijection + encode∘decode round-trip + corrupt-token fallback).
     - **m4-98c (next):** view-mode switcher (file-manager / zoom / culling) +
       colour quick-filter into the same bar. (Colour compose-on-top would overlap
       the existing left-panel colour selector — reconcile first.) Follow-ups:

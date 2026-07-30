@@ -40,6 +40,11 @@ const THUMB_COLS_DEFAULT: u32 = 6;
 /// `rej`).
 const RATING_FILTER_PREF_KEY: &str = "rating_filter";
 
+/// `darkroom_ui_prefs` key under which the thumbnail overlay mode is persisted
+/// across sessions (m4-98e). The value is the token from
+/// [`lighttable::overlay_mode_token`] (`none` / `normal` / `extended`).
+const OVERLAY_MODE_PREF_KEY: &str = "overlay_mode";
+
 pub fn run() -> Result<glib::ExitCode> {
     let app = Application::builder()
         .application_id(APP_ID)
@@ -162,6 +167,11 @@ fn build_main_window(app: &Application) {
     // yet); the bottom bar reads it back when it builds its stars + dropdown.
     if let Some(tok) = persist::load_ui_pref(&db_path, RATING_FILTER_PREF_KEY) {
         lighttable::apply_rating_filter_token(&tok);
+    }
+    // Likewise restore the thumbnail overlay mode (m4-98e) before the grid binds
+    // its first cells, so they're laid out right the first time (no visible flip).
+    if let Some(tok) = persist::load_ui_pref(&db_path, OVERLAY_MODE_PREF_KEY) {
+        lighttable::apply_overlay_mode_token(&tok);
     }
 
     // ── Toast overlay (wraps everything for in-app notifications) ──────────
@@ -514,6 +524,38 @@ fn build_main_window(app: &Application) {
             // The grid's own `max-columns` property is the single source of truth
             // for the current thumb size — no separate counter to keep in sync.
             grid.set_max_columns(THUMB_COLS_DEFAULT);
+
+            // Thumbnail overlay mode (m4-98e), centre of the bar: how much metadata
+            // each cell shows. Seeded from the restored pref BEFORE the handler is
+            // connected, so seeding can't fire a spurious re-apply.
+            {
+                // Rows come from OverlayMode::ALL so the control can never drift
+                // from the variants (labels live next to the enum). They're terse
+                // on purpose: this CenterBox already carries the rating filter at
+                // the start and the thumb stepper at the end, and its minimum width
+                // is the sum of all three — the ~915px lighttable overflow gotcha.
+                let labels: Vec<&str> =
+                    lighttable::OverlayMode::ALL.iter().map(|m| m.label()).collect();
+                let overlays = gtk4::DropDown::from_strings(&labels);
+                overlays.set_valign(gtk4::Align::Center);
+                overlays.set_tooltip_text(Some("Thumbnail overlays: none / stars + labels / full"));
+                overlays.set_selected(lighttable::current_overlay_mode().to_index());
+                overlays.connect_selected_notify({
+                    let grid = grid.clone();
+                    let db = db_path.clone();
+                    move |d| {
+                        let mode = lighttable::OverlayMode::from_index(d.selected());
+                        lighttable::set_overlay_mode(&grid, mode);
+                        // Persist the mode just applied (not a re-read of the global).
+                        persist::save_ui_pref(
+                            &db,
+                            OVERLAY_MODE_PREF_KEY,
+                            lighttable::overlay_mode_token_for(mode),
+                        );
+                    }
+                });
+                bottom.set_center_widget(Some(&overlays));
+            }
 
             let zoom_out = gtk4::Button::builder()
                 .icon_name("zoom-out-symbolic")
