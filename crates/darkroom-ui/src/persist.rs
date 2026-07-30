@@ -54,6 +54,15 @@ const GEOMETRY_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS main.darkroom_geometry \
      (imgid INTEGER PRIMARY KEY, geom BLOB NOT NULL)";
 
+/// DDL for a small global (not per-image) UI-preference key/value store — same
+/// private-table, best-effort rationale as the others. Used to persist lighttable
+/// chrome state across sessions (m4-98d: the rating-filter comparator + floor).
+/// `TEXT` keys/values keep it schema-light: each pref owns a stable key and codes
+/// its own compact value string (e.g. the rating filter's `ge:3` / `rej` token).
+const UI_PREFS_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS main.darkroom_ui_prefs \
+     (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
+
 /// Resolve a file path to its `images.id` via folder + filename (mirrors the
 /// lighttable's lookup). `None` if the image isn't in the catalogue.
 fn imgid_for_path(conn: &Connection, full_path: &str) -> Option<i32> {
@@ -322,6 +331,49 @@ fn save_geometry_conn(conn: &Connection, imgid: i32, geom: &Geometry) -> rusqlit
     Ok(())
 }
 
+/// Read a global UI preference by `key`, or `None` if there's no db, no table
+/// (old/rebuilt catalog), or no row. Best-effort: any error ⇒ `None` ⇒ the call
+/// site's default.
+pub fn load_ui_pref(db_path: &str, key: &str) -> Option<String> {
+    if db_path.is_empty() {
+        return None;
+    }
+    let conn = Connection::open(db_path).ok()?;
+    load_ui_pref_conn(&conn, key)
+}
+
+/// Write a global UI preference (`key` ⇒ `value`), creating the table on demand.
+/// Best-effort: a failed open/write is swallowed (a lost UI pref is cosmetic).
+pub fn save_ui_pref(db_path: &str, key: &str, value: &str) {
+    if db_path.is_empty() {
+        return;
+    }
+    if let Ok(conn) = Connection::open(db_path) {
+        let _ = save_ui_pref_conn(&conn, key, value);
+    }
+}
+
+/// Testable core of [`load_ui_pref`]: `None` on a missing table or absent key.
+fn load_ui_pref_conn(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM main.darkroom_ui_prefs WHERE key = ?1",
+        rusqlite::params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Testable core of [`save_ui_pref`]: upsert one key/value row (PK on `key`).
+fn save_ui_pref_conn(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(UI_PREFS_TABLE_DDL, [])?;
+    conn.execute(
+        "INSERT INTO main.darkroom_ui_prefs (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +408,25 @@ mod tests {
         assert_eq!(imgid_for_path(&db, "/photos/img.jpg"), Some(42));
         assert_eq!(imgid_for_path(&db, "/photos/missing.jpg"), None);
         assert_eq!(imgid_for_path(&db, "/elsewhere/img.jpg"), None);
+    }
+
+    #[test]
+    fn ui_pref_missing_table_reads_none_then_save_creates_and_upserts() {
+        let db = open_db();
+        // A fresh catalog has no prefs table → best-effort read is None, not an error.
+        assert_eq!(load_ui_pref_conn(&db, "rating_filter"), None);
+        // First save creates the table on demand; read-back round-trips.
+        save_ui_pref_conn(&db, "rating_filter", "ge:3").unwrap();
+        assert_eq!(load_ui_pref_conn(&db, "rating_filter").as_deref(), Some("ge:3"));
+        // Second save on the same key updates in place (PK on key ⇒ single row).
+        save_ui_pref_conn(&db, "rating_filter", "rej").unwrap();
+        assert_eq!(load_ui_pref_conn(&db, "rating_filter").as_deref(), Some("rej"));
+        let n: i64 = db
+            .query_row("SELECT COUNT(*) FROM main.darkroom_ui_prefs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "upsert must not accumulate rows");
+        // An unknown key still reads None even once the table exists.
+        assert_eq!(load_ui_pref_conn(&db, "no_such_key"), None);
     }
 
     #[test]

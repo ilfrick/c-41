@@ -217,9 +217,25 @@ C FFI trampolines for tags. 61 DB tests passing.
       11,274 is impossible under the old scheme), so no data migration is needed.
       6 new pure/seeded tests (fragment shape+clamp, bit round-trip preserving
       reject/high bits, colour-query composition, N..5 end-to-end).
+    - **m4-98d (done):** rating-filter depth — a comparator dropdown (`≥` / `=` /
+      `≤` / rejected-only, `RatingCompare`) to the left of the stars, and the
+      filter now **persists across sessions**. `MIN_RATING` (star count) pairs with
+      a new `RATING_COMPARE` thread-local; `rating_predicate(stars, cmp)` replaces
+      `rating_and` and emits `= N` / `BETWEEN 0 AND N` / `BETWEEN N AND 5` /
+      `(flags & 8) = 8` (rejected ignores the count). `AtLeast` + 0 stars stays the
+      canonical no-filter state. Persistence rides a new global key/value table
+      `main.darkroom_ui_prefs` (persist.rs, same best-effort private-table pattern)
+      keyed `rating_filter`; the value is a compact token (`off`/`ge:N`/`eq:N`/
+      `le:N`/`rej`) encoded by `rating_filter_token()` and restored at startup via
+      `apply_rating_filter_token()` **before** the first load (no reload — no loader
+      registered yet). `build_color_mask_query` now takes a prebuilt rating `&str`
+      (decoupled from the enum). In `Rejected` mode the star row greys out. 4 new
+      tests (predicate shape across all comparators, token round-trip+fallback,
+      pref-table upsert/missing-table, comparator end-to-end over seeded flags).
     - **m4-98c (next):** view-mode switcher (file-manager / zoom / culling) +
-      colour quick-filter into the same bar. Follow-ups: rejected-only filter,
-      exact-vs-min rating comparator, persist the floor across sessions.
+      colour quick-filter into the same bar. (Colour compose-on-top would overlap
+      the existing left-panel colour selector — reconcile first.) Follow-ups:
+      colour quick-filter reconciliation; a "clear all filters" reset.
   - Later: left-panel modules (import as a module, hierarchical collections,
     image-information, Lua scripts), right-panel modules (history stack, styles,
     metadata editor, geotagging, export as a panel), and the date timeline.

@@ -302,7 +302,7 @@ pub(crate) fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path
 /// bit 3 (`DT_IMAGE_REJECTED = 8`), orthogonal to the star value. Keeping every
 /// Rust read/write on this exact convention means a rating set here is read
 /// identically by the C app AND by our own grid sort/filter ([`SortOrder::Rating`],
-/// [`rating_and`]). (An earlier bits-1..3 scheme here silently disagreed with both
+/// [`rating_predicate`]). (An earlier bits-1..3 scheme here silently disagreed with both
 /// — a 3-star image landed on `flags & 7 == 6`, i.e. read as *rejected*.)
 const DT_VIEW_RATINGS_MASK: i64 = 0x7;
 const DT_IMAGE_REJECTED: i64 = 0x8;
@@ -830,7 +830,7 @@ impl SortOrder {
             // A legacy `flags & 7` of 6/7 (a pre-migration bits-1..3 value) is also
             // sunk to -1 so it can't out-rank a real 5-star under DESC — mirroring
             // the >5 clamp in [`flags_star_rating`] and the `BETWEEN … AND 5` in
-            // [`rating_and`], so all three sites agree on the 0..5 domain.
+            // [`rating_predicate`], so all three sites agree on the 0..5 domain.
             SortOrder::Rating => &[
                 ("CASE WHEN (i.flags & 8) = 8 OR (i.flags & 7) > 5 THEN -1 ELSE (i.flags & 7) END", false, true),
                 ("i.filename", true, true),
@@ -852,16 +852,53 @@ impl SortOrder {
     }
 }
 
+/// How the bottom-bar rating filter compares an image's star value against the
+/// chosen star count (m4-98d) — darktable's rating-filter comparator dropdown.
+/// `AtLeast(0)` is the canonical "no filter" state (≥ 0 stars = everything).
+/// `Rejected` matches darktable's reject bit and ignores the star count entirely.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RatingCompare {
+    /// `≥ N` stars (excludes rejected). `N == 0` ⇒ no filter.
+    AtLeast,
+    /// `= N` stars exactly (excludes rejected; `= 0` ⇒ unrated only).
+    Exactly,
+    /// `≤ N` stars (excludes rejected; `≤ 0` ⇒ unrated only).
+    AtMost,
+    /// Rejected images only (the star count is irrelevant in this mode).
+    Rejected,
+}
+
+impl RatingCompare {
+    /// Comparators in dropdown-row order, so the UI index ↔ variant mapping and
+    /// the persisted-token order have one source of truth.
+    const ALL: [RatingCompare; 4] =
+        [Self::AtLeast, Self::Exactly, Self::AtMost, Self::Rejected];
+
+    /// Map a DropDown selection index back to a comparator (out-of-range ⇒ the
+    /// default `AtLeast`, so a corrupt index can never panic).
+    pub fn from_index(i: u32) -> RatingCompare {
+        *Self::ALL.get(i as usize).unwrap_or(&Self::AtLeast)
+    }
+
+    /// The comparator's dropdown-row index (for seeding the DropDown selection).
+    pub fn to_index(self) -> u32 {
+        Self::ALL.iter().position(|&c| c == self).unwrap_or(0) as u32
+    }
+}
+
 thread_local! {
     /// The current grid sort order (main-thread-only UI state).
     static SORT_ORDER: Cell<SortOrder> = const { Cell::new(SortOrder::Filename) };
     /// Whether the current sort is reversed (the "sort direction" toggle).
     static SORT_REVERSE: Cell<bool> = const { Cell::new(false) };
-    /// Minimum star rating the grid should show (the bottom-bar rating filter):
-    /// 0 = no filter, 1..=5 = only images rated at least N stars. Applied on top
-    /// of whatever collection is active (folder / tag / colour / search), like the
-    /// sort — see [`rating_and`].
+    /// The star count the bottom-bar rating filter compares against (0..=5). Its
+    /// meaning depends on [`RATING_COMPARE`]; with the default `AtLeast` a value of
+    /// 0 means "no filter". Applied on top of whatever collection is active (folder
+    /// / tag / colour / search), like the sort — see [`rating_predicate`].
     static MIN_RATING: Cell<u8> = const { Cell::new(0) };
+    /// How [`MIN_RATING`] is compared (the comparator dropdown). Default `AtLeast`
+    /// so the out-of-box state (`AtLeast` + 0 stars) is "show everything".
+    static RATING_COMPARE: Cell<RatingCompare> = const { Cell::new(RatingCompare::AtLeast) };
     /// A closure that re-runs the *current* view's loader. Each loader registers
     /// itself here on every call (capturing its own args), so the sort dropdown
     /// can re-apply the view under a new order without the trigger sites (folder
@@ -879,32 +916,118 @@ fn current_reverse() -> bool {
     SORT_REVERSE.with(|r| r.get())
 }
 
-/// The minimum star rating the grid should show right now (0 = no filter).
+/// The star count the rating filter is comparing against right now (0..=5). Its
+/// meaning depends on [`current_rating_compare`]. `pub` so the bottom bar can lit
+/// the right number of stars.
 pub fn current_min_rating() -> u8 {
     MIN_RATING.with(|r| r.get())
 }
 
-/// A trailing ` AND (...)` SQL fragment restricting rows to at least `min` stars,
-/// or `""` when `min == 0` (no filter). darktable keeps the 0..5 star value in
-/// bits 0–2 of `flags` and the reject state in the separate bit 3 (= 8). This
-/// mirrors darktable's own rating filter (src/common/collection.c: `(flags & 8)
-/// == 0 AND flags & 7 >= N …`): exclude rejected images, then keep only real
-/// N..5-star ones (`BETWEEN min AND 5` drops unrated 0 too). `min` is clamped to
-/// 1..=5 so the interpolated integer is never user text (injection-safe); every
-/// loader aliases images as `i`, so `i.flags` is valid wherever this splices in.
-fn rating_and(min: u8) -> String {
-    if min == 0 {
-        String::new()
-    } else {
-        let min = min.clamp(1, 5);
-        // Derive the two masks from the named layout constants (they render as the
-        // literals 8 and 7) so the SQL can't drift from the documented bit scheme.
-        format!(
-            " AND (i.flags & {rej}) = 0 AND (i.flags & {mask}) BETWEEN {min} AND 5",
-            rej = DT_IMAGE_REJECTED,
-            mask = DT_VIEW_RATINGS_MASK,
-        )
+/// How the rating filter compares [`current_min_rating`] right now. `pub` so the
+/// bottom bar can seed its comparator dropdown and grey the stars out in the
+/// `Rejected` mode where they're irrelevant.
+pub fn current_rating_compare() -> RatingCompare {
+    RATING_COMPARE.with(|c| c.get())
+}
+
+/// A trailing ` AND (...)` SQL fragment implementing the rating filter, or `""`
+/// when no filter is active (`AtLeast` + 0 stars). darktable keeps the 0..5 star
+/// value in bits 0–2 of `flags` and the reject state in the separate bit 3 (= 8),
+/// so each non-`Rejected` comparator excludes rejected images first, then bounds
+/// the star value; `Rejected` matches the reject bit and ignores the star count.
+/// `stars` is clamped to 0..=5 so the interpolated integer is never user text
+/// (injection-safe); every loader aliases images as `i`, so `i.flags` is valid
+/// wherever this splices in. The `= N`/`BETWEEN 0 AND N` bounds (N ≤ 5) also drop
+/// any legacy `flags & 7` of 6/7, keeping the whole path on the 0..5 domain.
+fn rating_predicate(stars: u8, cmp: RatingCompare) -> String {
+    // Derive the masks from the named layout constants (they render as the literals
+    // 8 and 7) so the SQL can't drift from the documented bit scheme.
+    let rej = DT_IMAGE_REJECTED;
+    let mask = DT_VIEW_RATINGS_MASK;
+    let s = stars.min(5);
+    match cmp {
+        RatingCompare::Rejected => format!(" AND (i.flags & {rej}) = {rej}"),
+        // ≥ 0 stars is "everything" — the canonical no-filter state.
+        RatingCompare::AtLeast if s == 0 => String::new(),
+        RatingCompare::AtLeast => {
+            format!(" AND (i.flags & {rej}) = 0 AND (i.flags & {mask}) BETWEEN {s} AND 5")
+        }
+        RatingCompare::Exactly => {
+            format!(" AND (i.flags & {rej}) = 0 AND (i.flags & {mask}) = {s}")
+        }
+        RatingCompare::AtMost => {
+            format!(" AND (i.flags & {rej}) = 0 AND (i.flags & {mask}) BETWEEN 0 AND {s}")
+        }
     }
+}
+
+/// The rating-filter SQL fragment for the *current* comparator + star count —
+/// what the loaders splice into their WHERE.
+fn current_rating_sql() -> String {
+    rating_predicate(current_min_rating(), current_rating_compare())
+}
+
+/// Persisted rating-filter token pieces — one source of truth shared by the
+/// encoder ([`rating_filter_token_for`]) and decoder ([`parse_rating_filter_token`])
+/// so a prefix typo can't make them silently disagree.
+const RATING_TOK_OFF: &str = "off";
+const RATING_TOK_REJ: &str = "rej";
+const RATING_TOK_GE: &str = "ge";
+const RATING_TOK_EQ: &str = "eq";
+const RATING_TOK_LE: &str = "le";
+
+/// Pure encoder: a compact, stable token for `(comparator, star count)` — `off`,
+/// `ge:N`, `eq:N`, `le:N`, or `rej`. `Rejected` encodes to `rej` and **drops** the
+/// star count (it's irrelevant in that mode); consequently a session left in
+/// `Rejected` restores as no-filter (`off`) rather than restoring the pre-reject
+/// count — the retained in-session count is intentionally not persisted.
+fn rating_filter_token_for(cmp: RatingCompare, stars: u8) -> String {
+    let s = stars.min(5);
+    match cmp {
+        RatingCompare::Rejected => RATING_TOK_REJ.to_string(),
+        RatingCompare::AtLeast if s == 0 => RATING_TOK_OFF.to_string(),
+        RatingCompare::AtLeast => format!("{RATING_TOK_GE}:{s}"),
+        RatingCompare::Exactly => format!("{RATING_TOK_EQ}:{s}"),
+        RatingCompare::AtMost => format!("{RATING_TOK_LE}:{s}"),
+    }
+}
+
+/// Encode the *current* rating filter as a persistence token (see
+/// [`apply_rating_filter_token`]). `pub` so `lib.rs` — which holds the db path —
+/// can store it.
+pub fn rating_filter_token() -> String {
+    rating_filter_token_for(current_rating_compare(), current_min_rating())
+}
+
+/// Parse a persisted rating-filter token back into `(comparator, star count)`,
+/// clamping the count to 0..=5 and falling back to the no-filter state on any
+/// unrecognised/corrupt token. Pure, so it's unit-testable.
+fn parse_rating_filter_token(tok: &str) -> (RatingCompare, u8) {
+    if tok == RATING_TOK_REJ {
+        return (RatingCompare::Rejected, 0);
+    }
+    if let Some((pfx, val)) = tok.split_once(':') {
+        if let Ok(n) = val.parse::<u8>() {
+            let n = n.min(5);
+            if pfx == RATING_TOK_GE {
+                return (RatingCompare::AtLeast, n);
+            } else if pfx == RATING_TOK_EQ {
+                return (RatingCompare::Exactly, n);
+            } else if pfx == RATING_TOK_LE {
+                return (RatingCompare::AtMost, n);
+            }
+        }
+    }
+    (RatingCompare::AtLeast, 0) // "off" and anything unrecognised ⇒ no filter
+}
+
+/// Seed the rating filter from a persisted token *without* reloading — called at
+/// startup before any view loader has registered (so the first load already
+/// reflects the restored filter). Main-thread only.
+pub fn apply_rating_filter_token(tok: &str) {
+    let (cmp, stars) = parse_rating_filter_token(tok);
+    MIN_RATING.with(|r| r.set(stars));
+    RATING_COMPARE.with(|c| c.set(cmp));
 }
 
 /// Record how to re-run the current view (called by each loader with a closure
@@ -931,11 +1054,18 @@ pub fn set_sort_reverse(reverse: bool) {
     reload_current_view();
 }
 
-/// Set the minimum-star-rating filter (0 = show all) and re-render the current
-/// view under it. Composes with whatever collection is active. No-op if nothing
-/// has been loaded yet. Main-thread only.
+/// Set the rating filter's star count (0..=5) and re-render the current view
+/// under it, interpreted through the active comparator. Composes with whatever
+/// collection is active. No-op if nothing has been loaded yet. Main-thread only.
 pub fn set_min_rating(min: u8) {
     MIN_RATING.with(|r| r.set(min.min(5)));
+    reload_current_view();
+}
+
+/// Set the rating filter's comparator (the dropdown) and re-render the current
+/// view under it. No-op if nothing has been loaded yet. Main-thread only.
+pub fn set_rating_compare(cmp: RatingCompare) {
+    RATING_COMPARE.with(|c| c.set(cmp));
     reload_current_view();
 }
 
@@ -1014,7 +1144,7 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
     // Rating filter (bottom bar) composes on top of the folder selection. The
     // no-folder branch uses `WHERE 1=1` so the ` AND (...)` fragment splices in
     // uniformly (SQLite folds the constant away); empty when no rating filter.
-    let rating = rating_and(current_min_rating());
+    let rating = current_rating_sql();
     let rows: Vec<String> = match folder {
         Some(f) => {
             conn.prepare(&format!(
@@ -1064,7 +1194,7 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
     let order = current_sort().order_clause(current_reverse());
-    let rating = rating_and(current_min_rating());
+    let rating = current_rating_sql();
     let pattern = format!("%{query}%");
     let rows: Vec<String> = conn
         .prepare(&format!(
@@ -1110,7 +1240,7 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
         darkroom_db::schema::open_catalog(db_path).unwrap_or_else(|_| open_demo_db())
     };
     let order = current_sort().order_clause(current_reverse());
-    let rating = rating_and(current_min_rating());
+    let rating = current_rating_sql();
     // `prefix` itself (the exact tag) OR `prefix|…` (any descendant). DISTINCT
     // because an image carrying several tags under `prefix` would otherwise
     // appear once per matching tag. The OR is parenthesised so the rating filter
@@ -1163,7 +1293,7 @@ fn build_color_mask_query(
     match_all: bool,
     sort: SortOrder,
     reverse: bool,
-    min_rating: u8,
+    rating: &str,
 ) -> Option<String> {
     let colors = colors_from_mask(mask);
     if colors.is_empty() {
@@ -1172,8 +1302,8 @@ fn build_color_mask_query(
     let in_list = colors.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
     let limit = GRID_CAP + 1;
     let order = sort.order_clause(reverse);
-    // Rating filter composes with the colour selection (in the pre-GROUP WHERE).
-    let rating = rating_and(min_rating);
+    // The rating filter fragment (built by the caller from the current comparator)
+    // composes with the colour selection in the pre-GROUP WHERE.
     let sql = if match_all {
         format!(
             "SELECT f.folder || '/' || i.filename \
@@ -1216,7 +1346,7 @@ pub fn lighttable_load_by_color_mask(
         move || lighttable_load_by_color_mask(&m, &db, mask, match_all)
     });
     let Some(sql) = build_color_mask_query(
-        mask, match_all, current_sort(), current_reverse(), current_min_rating(),
+        mask, match_all, current_sort(), current_reverse(), &current_rating_sql(),
     ) else {
         lighttable_load_from_db(model, db_path);
         return;
@@ -1308,7 +1438,8 @@ fn open_demo_db() -> rusqlite::Connection {
 mod tests {
     use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
                 digit_to_rating, escape_like, fkey_to_color, flags_star_rating,
-                flags_with_star_rating, index_of_path, path_write_lock, rating_and,
+                flags_with_star_rating, index_of_path, parse_rating_filter_token,
+                path_write_lock, rating_filter_token_for, rating_predicate, RatingCompare,
                 SortOrder, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
     use std::sync::Arc;
 
@@ -1344,13 +1475,13 @@ mod tests {
 
     #[test]
     fn build_color_mask_query_none_for_empty_mask() {
-        assert!(build_color_mask_query(0, false, SortOrder::Filename, false, 0).is_none());
-        assert!(build_color_mask_query(0, true, SortOrder::Filename, false, 0).is_none());
+        assert!(build_color_mask_query(0, false, SortOrder::Filename, false, "").is_none());
+        assert!(build_color_mask_query(0, true, SortOrder::Filename, false, "").is_none());
     }
 
     #[test]
     fn build_color_mask_query_or_uses_distinct_no_having() {
-        let sql = build_color_mask_query(0b10101, false, SortOrder::Filename, false, 0).expect("non-empty mask");
+        let sql = build_color_mask_query(0b10101, false, SortOrder::Filename, false, "").expect("non-empty mask");
         assert!(sql.contains("SELECT DISTINCT"), "{sql}");
         assert!(sql.contains("cl.color IN (0,2,4)"), "{sql}");
         assert!(!sql.contains("HAVING"), "OR must not group/having: {sql}");
@@ -1359,7 +1490,7 @@ mod tests {
 
     #[test]
     fn build_color_mask_query_and_groups_and_counts_selected() {
-        let sql = build_color_mask_query(0b01010, true, SortOrder::Filename, false, 0).expect("non-empty mask");
+        let sql = build_color_mask_query(0b01010, true, SortOrder::Filename, false, "").expect("non-empty mask");
         assert!(sql.contains("cl.color IN (1,3)"), "{sql}");
         // AND => image must carry both selected colours; N = popcount(mask).
         assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 2"), "{sql}");
@@ -1369,7 +1500,7 @@ mod tests {
     #[test]
     fn build_color_mask_query_single_colour_counts_one() {
         // The single-colour case (one-bit mask) collapses to N=1 under AND.
-        let sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, 0).expect("non-empty mask");
+        let sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, "").expect("non-empty mask");
         assert!(sql.contains("cl.color IN (2)"), "{sql}");
         assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 1"), "{sql}");
     }
@@ -1408,7 +1539,7 @@ mod tests {
 
     #[test]
     fn color_mask_query_applies_sort_order() {
-        let sql = build_color_mask_query(0b00100, false, SortOrder::Rating, false, 0).expect("mask");
+        let sql = build_color_mask_query(0b00100, false, SortOrder::Rating, false, "").expect("mask");
         assert!(
             sql.contains("ORDER BY CASE WHEN (i.flags & 8) = 8 OR (i.flags & 7) > 5 THEN -1 ELSE (i.flags & 7) END DESC"),
             "{sql}"
@@ -1416,14 +1547,63 @@ mod tests {
     }
 
     #[test]
-    fn rating_and_fragment_shape_and_clamp() {
-        // 0 = no filter → empty fragment (nothing spliced into any WHERE).
-        assert_eq!(rating_and(0), "");
-        // 1..=5 → exclude rejected (bit 3) THEN keep N..5 stars (bits 0–2).
-        assert_eq!(rating_and(1), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 1 AND 5");
-        assert_eq!(rating_and(5), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 5 AND 5");
+    fn rating_predicate_fragment_shape_and_clamp() {
+        use RatingCompare::*;
+        // AtLeast 0 = no filter → empty fragment (nothing spliced into any WHERE).
+        assert_eq!(rating_predicate(0, AtLeast), "");
+        // AtLeast N (N≥1) → exclude rejected (bit 3) THEN keep N..5 stars (bits 0–2).
+        assert_eq!(rating_predicate(1, AtLeast), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 1 AND 5");
+        assert_eq!(rating_predicate(5, AtLeast), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 5 AND 5");
         // Out-of-range clamps to 5 (never emits a >5 bound that would match nothing).
-        assert_eq!(rating_and(9), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 5 AND 5");
+        assert_eq!(rating_predicate(9, AtLeast), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 5 AND 5");
+        // Exactly N → `= N` (Exactly 0 is a real filter: unrated only).
+        assert_eq!(rating_predicate(0, Exactly), " AND (i.flags & 8) = 0 AND (i.flags & 7) = 0");
+        assert_eq!(rating_predicate(3, Exactly), " AND (i.flags & 8) = 0 AND (i.flags & 7) = 3");
+        // AtMost N → `BETWEEN 0 AND N` (AtMost 0 is a real filter: unrated only).
+        assert_eq!(rating_predicate(0, AtMost), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 0 AND 0");
+        assert_eq!(rating_predicate(2, AtMost), " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 0 AND 2");
+        // Rejected → the reject bit only, star count ignored (even a nonzero one).
+        assert_eq!(rating_predicate(4, Rejected), " AND (i.flags & 8) = 8");
+    }
+
+    #[test]
+    fn rating_filter_token_roundtrips_and_falls_back() {
+        use RatingCompare::*;
+        // Every (comparator, stars) the UI can produce round-trips through the token.
+        for (cmp, stars, tok) in [
+            (AtLeast, 0u8, "off"),
+            (AtLeast, 3, "ge:3"),
+            (Exactly, 0, "eq:0"),
+            (Exactly, 5, "eq:5"),
+            (AtMost, 2, "le:2"),
+            (Rejected, 0, "rej"),
+        ] {
+            assert_eq!(parse_rating_filter_token(tok), (cmp, stars), "decode {tok}");
+        }
+        // Corrupt/unknown tokens and out-of-range stars fall back safely.
+        assert_eq!(parse_rating_filter_token("garbage"), (AtLeast, 0));
+        assert_eq!(parse_rating_filter_token("ge:99"), (AtLeast, 5), "clamp to 5");
+        assert_eq!(parse_rating_filter_token("xx:2"), (AtLeast, 0), "unknown prefix");
+        assert_eq!(parse_rating_filter_token("ge:x"), (AtLeast, 0), "non-numeric");
+    }
+
+    #[test]
+    fn rating_filter_token_encode_decode_roundtrips_full_matrix() {
+        use RatingCompare::*;
+        // Guard the ENCODER too (not just the decoder): encode∘decode is identity
+        // for every (comparator, star) the UI can produce, modulo the codec's two
+        // intentional canonicalisations — AtLeast 0 ⇒ "off", and Rejected drops the
+        // star count. A prefix typo on either side would break this.
+        for cmp in [AtLeast, Exactly, AtMost, Rejected] {
+            for s in 0..=5u8 {
+                let tok = rating_filter_token_for(cmp, s);
+                let want = match cmp {
+                    Rejected => (Rejected, 0),
+                    _ => (cmp, s),
+                };
+                assert_eq!(parse_rating_filter_token(&tok), want, "tok={tok}");
+            }
+        }
     }
 
     #[test]
@@ -1450,18 +1630,22 @@ mod tests {
     #[test]
     fn color_mask_query_composes_rating_in_where() {
         // The rating guard sits in the pre-GROUP WHERE of BOTH AND/OR colour paths.
-        let and_sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, 3).expect("mask");
+        let and_sql = build_color_mask_query(
+            0b00100, true, SortOrder::Filename, false, &rating_predicate(3, RatingCompare::AtLeast),
+        ).expect("mask");
         assert!(
             and_sql.contains("WHERE cl.color IN (2) AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 3 AND 5 GROUP BY"),
             "{and_sql}"
         );
-        let or_sql = build_color_mask_query(0b10100, false, SortOrder::Filename, false, 2).expect("mask");
+        let or_sql = build_color_mask_query(
+            0b10100, false, SortOrder::Filename, false, &rating_predicate(2, RatingCompare::AtLeast),
+        ).expect("mask");
         assert!(
             or_sql.contains("WHERE cl.color IN (2,4) AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 2 AND 5 ORDER BY"),
             "{or_sql}"
         );
         // No rating filter → no rating guard at all.
-        let none_sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, 0).expect("mask");
+        let none_sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, "").expect("mask");
         assert!(!none_sql.contains("BETWEEN"), "{none_sql}");
     }
 
@@ -1497,11 +1681,11 @@ mod tests {
             )
             .unwrap();
         }
-        let run = |min: u8| -> Vec<String> {
+        let run = |stars: u8, cmp: RatingCompare| -> Vec<String> {
             let sql = format!(
                 "SELECT i.filename FROM images i JOIN film_rolls f ON f.id = i.film_id \
                  WHERE 1=1{} ORDER BY i.filename",
-                rating_and(min)
+                rating_predicate(stars, cmp)
             );
             conn.prepare(&sql)
                 .unwrap()
@@ -1510,12 +1694,21 @@ mod tests {
                 .flatten()
                 .collect()
         };
-        // No filter: all five (unrated, rejected, rejected-5-star included).
-        assert_eq!(run(0), ["five.raw", "rej_five.raw", "rejected.raw", "two.raw", "unrated.raw"]);
-        // >=3 stars: only the non-rejected 5-star (rej_five is excluded by reject).
-        assert_eq!(run(3), ["five.raw"]);
-        // >=1 star: 2- and 5-star; excludes unrated AND both rejected images.
-        assert_eq!(run(1), ["five.raw", "two.raw"]);
+        use RatingCompare::*;
+        // No filter (AtLeast 0): all five (unrated, rejected, rejected-5-star included).
+        assert_eq!(run(0, AtLeast), ["five.raw", "rej_five.raw", "rejected.raw", "two.raw", "unrated.raw"]);
+        // ≥3 stars: only the non-rejected 5-star (rej_five is excluded by reject).
+        assert_eq!(run(3, AtLeast), ["five.raw"]);
+        // ≥1 star: 2- and 5-star; excludes unrated AND both rejected images.
+        assert_eq!(run(1, AtLeast), ["five.raw", "two.raw"]);
+        // = 5 stars: only the non-rejected five (reject wins over the rejected 5-star).
+        assert_eq!(run(5, Exactly), ["five.raw"]);
+        // = 0 stars: the unrated one only (rejected images are excluded, not "0-star").
+        assert_eq!(run(0, Exactly), ["unrated.raw"]);
+        // ≤ 2 stars: unrated + 2-star (excludes 5-star and both rejected).
+        assert_eq!(run(2, AtMost), ["two.raw", "unrated.raw"]);
+        // Rejected: both rejected images regardless of their star value; nothing else.
+        assert_eq!(run(0, Rejected), ["rej_five.raw", "rejected.raw"]);
     }
 
     #[test]

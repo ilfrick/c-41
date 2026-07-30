@@ -34,6 +34,12 @@ const THUMB_COLS_MIN:     u32 = 2;
 const THUMB_COLS_MAX:     u32 = 12;
 const THUMB_COLS_DEFAULT: u32 = 6;
 
+/// `darkroom_ui_prefs` key under which the lighttable rating filter (comparator +
+/// floor) is persisted across sessions (m4-98d). The value is the compact token
+/// from [`lighttable::rating_filter_token`] (`off` / `ge:N` / `eq:N` / `le:N` /
+/// `rej`).
+const RATING_FILTER_PREF_KEY: &str = "rating_filter";
+
 pub fn run() -> Result<glib::ExitCode> {
     let app = Application::builder()
         .application_id(APP_ID)
@@ -148,6 +154,14 @@ fn build_main_window(app: &Application) {
             Ok(_) => {}
             Err(e) => tracing::warn!("failed to bootstrap catalog schema: {e}"),
         }
+    }
+
+    // Restore the persisted lighttable rating filter (m4-98d) BEFORE the first
+    // load below, so the initial grid already reflects the saved comparator +
+    // floor. Seeds thread-local state only (no reload — no loader is registered
+    // yet); the bottom bar reads it back when it builds its stars + dropdown.
+    if let Some(tok) = persist::load_ui_pref(&db_path, RATING_FILTER_PREF_KEY) {
+        lighttable::apply_rating_filter_token(&tok);
     }
 
     // ── Toast overlay (wraps everything for in-app notifications) ──────────
@@ -394,26 +408,30 @@ fn build_main_window(app: &Application) {
     lt_toolbar.add_top_bar(&lt_header);
     lt_toolbar.set_content(Some(&hbox));
 
-    // ── Bottom toolbar (m4-98a/b) ──────────────────────────────────────────
+    // ── Bottom toolbar (m4-98a/b/d) ────────────────────────────────────────
     // darktable's lighttable bottom bar. Right (m4-98a): the thumb-size stepper
     // (its "images per row" ± control) driving the grid's max-column bound live —
-    // fewer columns ⇒ bigger thumbnails. Left (m4-98b): a star-rating filter that
-    // shows only images rated ≥ N; it composes with whatever collection is active
-    // (folder / tag / colour / search). Later: colour filter + view-mode switcher.
+    // fewer columns ⇒ bigger thumbnails. Left (m4-98b/d): a star-rating filter —
+    // a comparator dropdown (≥ / = / ≤ / rejected) plus five star buttons — that
+    // composes with whatever collection is active (folder / tag / colour / search)
+    // and persists across sessions. Later: colour filter + view-mode switcher.
     {
         let bottom = gtk4::CenterBox::new();
         bottom.add_css_class("toolbar");
 
-        // Rating filter (m4-98b): five star buttons; clicking star N filters the
-        // grid to images rated at least N, clicking the active floor again clears
-        // it. The lit/unlit icons track `current_min_rating()` (the single source
-        // of truth — no separate mirror), so the display can't drift from the DB
-        // query the filter actually runs.
+        // Rating filter (m4-98b/d). The comparator dropdown picks how the star
+        // count is applied; clicking star N sets the count (re-clicking the current
+        // floor drops it to 0). Both the lit stars and the dropdown selection read
+        // `current_min_rating()`/`current_rating_compare()` — the single source of
+        // truth — so the display can't drift from the DB query, and every change
+        // persists the compact filter token so it survives a restart.
         {
+            let filter_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            filter_box.set_margin_start(6);
+
             let star_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
             star_box.add_css_class("linked");
-            star_box.set_margin_start(6);
-            star_box.set_tooltip_text(Some("Filter by minimum star rating"));
+            star_box.set_tooltip_text(Some("Filter by star rating"));
 
             let stars: std::rc::Rc<Vec<gtk4::Button>> = std::rc::Rc::new(
                 (1..=5u8)
@@ -426,30 +444,70 @@ fn build_main_window(app: &Application) {
                 star_box.append(b);
             }
 
-            // Repaint the five stars so 1..=floor are lit and the rest are hollow.
+            // Persist the current filter (comparator + floor) as its compact token.
+            let persist_filter: std::rc::Rc<dyn Fn()> = {
+                let db = db_path.clone();
+                std::rc::Rc::new(move || {
+                    persist::save_ui_pref(
+                        &db,
+                        RATING_FILTER_PREF_KEY,
+                        &lighttable::rating_filter_token(),
+                    );
+                })
+            };
+
+            // Repaint the stars so 1..=floor are lit and the rest hollow; in the
+            // `Rejected` mode the star count is irrelevant, so grey the whole row
+            // out (and light none) to signal the dropdown alone drives the filter.
             let refresh_stars: std::rc::Rc<dyn Fn()> = {
                 let stars = stars.clone();
+                let star_box = star_box.clone();
                 std::rc::Rc::new(move || {
+                    let rejected =
+                        lighttable::current_rating_compare() == lighttable::RatingCompare::Rejected;
+                    star_box.set_sensitive(!rejected);
                     let floor = lighttable::current_min_rating();
                     for (i, b) in stars.iter().enumerate() {
-                        let lit = (i as u8) < floor; // star i+1 lit iff i+1 <= floor
+                        let lit = !rejected && (i as u8) < floor; // star i+1 lit iff i+1 <= floor
                         b.set_icon_name(if lit { "starred-symbolic" } else { "non-starred-symbolic" });
                     }
                 })
             };
-            refresh_stars();
+
+            // Comparator dropdown, seeded from the restored filter BEFORE the
+            // handler is connected so the seeding doesn't fire a spurious reload.
+            let compare = gtk4::DropDown::from_strings(&["≥", "=", "≤", "⚑"]);
+            compare.set_valign(gtk4::Align::Center);
+            compare.set_tooltip_text(Some("Rating comparator: ≥ / = / ≤ / rejected only"));
+            compare.set_selected(lighttable::current_rating_compare().to_index());
+            compare.connect_selected_notify({
+                let refresh_stars = refresh_stars.clone();
+                let persist_filter = persist_filter.clone();
+                move |d| {
+                    lighttable::set_rating_compare(lighttable::RatingCompare::from_index(d.selected()));
+                    refresh_stars();
+                    persist_filter();
+                }
+            });
+
+            refresh_stars(); // sync stars to the restored filter
 
             for (i, b) in stars.iter().enumerate() {
                 let n = (i + 1) as u8;
                 let refresh_stars = refresh_stars.clone();
+                let persist_filter = persist_filter.clone();
                 b.connect_clicked(move |_| {
-                    // Toggle: re-clicking the current floor clears the filter.
+                    // Toggle: re-clicking the current floor drops the count to 0.
                     let new = if lighttable::current_min_rating() == n { 0 } else { n };
                     lighttable::set_min_rating(new);
                     refresh_stars();
+                    persist_filter();
                 });
             }
-            bottom.set_start_widget(Some(&star_box));
+
+            filter_box.append(&compare);
+            filter_box.append(&star_box);
+            bottom.set_start_widget(Some(&filter_box));
         }
 
         if let Some(grid) = scroll.child().and_downcast::<gtk4::GridView>() {
