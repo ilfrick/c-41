@@ -373,6 +373,64 @@ fn build_main_window(app: &Application) {
         lt_header.pack_end(&count_label);
     }
 
+    // Quick-filter preset dropdown (m4-97c) — darktable's top-bar
+    // `filter [all images ▾]`. Rows come from FilterPreset::ALL (labels live beside
+    // the variants) plus a trailing "custom" row that is only *shown*, never
+    // chosen: it's what the dropdown displays when the bottom bar has set a filter
+    // no preset names (e.g. `≤ 3`). Presets don't implement filtering themselves —
+    // each is a named (comparator, stars) pair applied to the same state the bottom
+    // bar drives, and an observer keeps the two in sync in both directions.
+    {
+        const CUSTOM_ROW: &str = "custom";
+        let mut labels: Vec<String> =
+            lighttable::FilterPreset::ALL.iter().map(|p| p.label()).collect();
+        labels.push(CUSTOM_ROW.to_string());
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+
+        let filter_dd = gtk4::DropDown::from_strings(&label_refs);
+        filter_dd.set_tooltip_text(Some("Quick filter the collection"));
+
+        // Reflect the live filter state into the row selection. Registered as a
+        // filter observer so a change made in the BOTTOM bar moves this dropdown
+        // too, landing on "custom" when the state isn't a named preset.
+        let sync_from_state = {
+            let filter_dd = filter_dd.clone();
+            move || {
+                let idx = lighttable::current_filter_preset()
+                    .map_or(lighttable::FilterPreset::CUSTOM_INDEX, |p| p.to_index());
+                // (Belt-and-braces: GTK already no-ops an unchanged position, and
+                // the sync guard covers the emission either way.)
+                if filter_dd.selected() != idx {
+                    filter_dd.set_selected(idx);
+                }
+            }
+        };
+        // Seeding BEFORE the handler is connected is load-bearing: it mirrors the
+        // filter restored at startup without the write being taken for a user edit
+        // (same ordering the bottom bar's comparator relies on).
+        sync_from_state();
+        lighttable::add_filter_observer(sync_from_state);
+
+        filter_dd.connect_selected_notify(move |dd| {
+            // Ignore the programmatic write an observer just made (it's a mirror of
+            // the state, not a user edit) — otherwise this would recurse.
+            if lighttable::filter_sync_in_progress() {
+                return;
+            }
+            // "custom" is display-only. `>=` (not `==`) also catches GTK's
+            // INVALID_LIST_POSITION (u32::MAX), which `from_index` would otherwise
+            // map to `AllImages` and *apply*. Snap the control back to the real
+            // state via the observer bus rather than calling our own sync closure —
+            // that would re-enter this handler unguarded.
+            if dd.selected() >= lighttable::FilterPreset::CUSTOM_INDEX {
+                lighttable::sync_filter_controls();
+                return;
+            }
+            lighttable::set_filter_preset(lighttable::FilterPreset::from_index(dd.selected()));
+        });
+        lt_header.pack_start(&filter_dd);
+    }
+
     // Sort-by dropdown (m4-97b) + direction toggle (m4-97e) — darktable's top-bar
     // "sort by" with the ascending/descending arrow beside it. Changing either
     // re-renders the *current* view under the new order; the loaders self-register
@@ -490,28 +548,48 @@ fn build_main_window(app: &Application) {
             compare.set_valign(gtk4::Align::Center);
             compare.set_tooltip_text(Some("Rating comparator: ≥ / = / ≤ / rejected only"));
             compare.set_selected(lighttable::current_rating_compare().to_index());
-            compare.connect_selected_notify({
+            compare.connect_selected_notify(move |d| {
+                // Skip the programmatic write an observer just made (see below).
+                if lighttable::filter_sync_in_progress() {
+                    return;
+                }
+                lighttable::set_rating_compare(lighttable::RatingCompare::from_index(d.selected()));
+            });
+
+            // One observer owns re-syncing this bar's display and persisting the
+            // filter, for changes from ANY control (these stars, the comparator, or
+            // the top bar's preset dropdown). The click handlers below therefore
+            // only set state — `set_*` runs this via `filter_changed()`.
+            {
+                let compare = compare.clone();
                 let refresh_stars = refresh_stars.clone();
                 let persist_filter = persist_filter.clone();
-                move |d| {
-                    lighttable::set_rating_compare(lighttable::RatingCompare::from_index(d.selected()));
+                lighttable::add_filter_observer(move || {
+                    let idx = lighttable::current_rating_compare().to_index();
+                    if compare.selected() != idx {
+                        compare.set_selected(idx);
+                    }
                     refresh_stars();
                     persist_filter();
-                }
-            });
+                });
+            }
 
             refresh_stars(); // sync stars to the restored filter
 
             for (i, b) in stars.iter().enumerate() {
                 let n = (i + 1) as u8;
-                let refresh_stars = refresh_stars.clone();
-                let persist_filter = persist_filter.clone();
                 b.connect_clicked(move |_| {
+                    // Consult the sync guard like every other filter control. A
+                    // plain Button emits `clicked` only on real input today, so this
+                    // is inert — but it stops being inert the moment these become
+                    // toggles an observer sets (darktable's stars are toggles), and
+                    // "safe by accident" is not a property worth relying on.
+                    if lighttable::filter_sync_in_progress() {
+                        return;
+                    }
                     // Toggle: re-clicking the current floor drops the count to 0.
                     let new = if lighttable::current_min_rating() == n { 0 } else { n };
                     lighttable::set_min_rating(new);
-                    refresh_stars();
-                    persist_filter();
                 });
             }
 

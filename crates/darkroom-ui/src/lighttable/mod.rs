@@ -907,6 +907,98 @@ impl RatingCompare {
     }
 }
 
+/// A one-click quick-filter preset for the top bar's `filter [all images ▾]`
+/// dropdown (m4-97c) — darktable's collection quick-filter. A preset is **not** a
+/// parallel filter implementation: each one is just a named `(comparator, stars)`
+/// pair applied to the *same* rating-filter state the bottom bar drives, so the
+/// two controls can never disagree about what the grid is showing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FilterPreset {
+    /// No filter at all (`≥ 0`).
+    AllImages,
+    /// Unrated images only (`= 0`).
+    UnstarredOnly,
+    /// `≥ N` stars, for N in 1..=5.
+    AtLeastStars(u8),
+    /// Rejected images only.
+    RejectedOnly,
+}
+
+impl FilterPreset {
+    /// Presets in dropdown-row order. One source of truth for the row labels, the
+    /// index ↔ variant mapping, and [`FilterPreset::for_state`]'s reverse lookup.
+    pub const ALL: [FilterPreset; 8] = [
+        Self::AllImages,
+        Self::UnstarredOnly,
+        Self::AtLeastStars(1),
+        Self::AtLeastStars(2),
+        Self::AtLeastStars(3),
+        Self::AtLeastStars(4),
+        Self::AtLeastStars(5),
+        Self::RejectedOnly,
+    ];
+
+    /// The rating-filter state this preset stands for. The single mapping point
+    /// between a preset and the filter primitives, so a preset can never express
+    /// something the bottom bar can't also show.
+    pub fn state(self) -> (RatingCompare, u8) {
+        match self {
+            Self::AllImages => (RatingCompare::AtLeast, 0),
+            Self::UnstarredOnly => (RatingCompare::Exactly, 0),
+            Self::AtLeastStars(n) => (RatingCompare::AtLeast, n.clamp(1, 5)),
+            Self::RejectedOnly => (RatingCompare::Rejected, 0),
+        }
+    }
+
+    /// The preset matching a `(comparator, stars)` state, or `None` when the state
+    /// isn't expressible as one (e.g. `≤ 3`, which only the bottom bar can set).
+    /// Lets the dropdown reflect filter changes made elsewhere instead of lying.
+    ///
+    /// The state is **canonicalised first**, exactly as [`rating_predicate`] and
+    /// [`rating_filter_token_for`] do, so equal filters compare equal: `Rejected`
+    /// ignores the star count (so `(Rejected, 3)` *is* "rejected only" — reachable
+    /// by picking 3 stars then switching the comparator to ⚑, since the bottom bar
+    /// deliberately retains the count), and counts are clamped to the 0..=5 domain.
+    /// Skipping this would report `custom` for a state a preset does name.
+    ///
+    /// Not canonicalised: `(AtMost, 0)` yields the same rows as `UnstarredOnly`
+    /// (`BETWEEN 0 AND 0` ≡ `= 0`) but stays `custom` on purpose — `≤` is a
+    /// deliberate bottom-bar choice, so echoing it back as `=` would misreport
+    /// which control the user is driving.
+    pub fn for_state(cmp: RatingCompare, stars: u8) -> Option<FilterPreset> {
+        let stars = if cmp == RatingCompare::Rejected { 0 } else { stars.min(5) };
+        Self::ALL.into_iter().find(|p| p.state() == (cmp, stars))
+    }
+
+    /// Map a DropDown selection index back to a preset (out-of-range ⇒ `AllImages`,
+    /// so a corrupt index can never panic).
+    pub fn from_index(i: u32) -> FilterPreset {
+        *Self::ALL.get(i as usize).unwrap_or(&Self::AllImages)
+    }
+
+    /// The preset's dropdown row index — the inverse of [`Self::from_index`], so
+    /// `lib.rs` doesn't open-code the reverse lookup over [`Self::ALL`].
+    pub fn to_index(self) -> u32 {
+        Self::ALL.iter().position(|&p| p == self).unwrap_or(0) as u32
+    }
+
+    /// Row index of the dropdown's trailing **display-only** `custom` row, shown
+    /// when the live filter isn't expressible as a preset. Never applied as a
+    /// filter — selecting it snaps the control back to the real state.
+    pub const CUSTOM_INDEX: u32 = Self::ALL.len() as u32;
+
+    /// The preset's dropdown row label, kept beside the variants so the control
+    /// built from [`Self::ALL`] can't drift out of sync with them.
+    pub fn label(self) -> String {
+        match self {
+            Self::AllImages => "all images".to_string(),
+            Self::UnstarredOnly => "unstarred only".to_string(),
+            Self::AtLeastStars(n) => format!("★ {n} and higher"),
+            Self::RejectedOnly => "rejected only".to_string(),
+        }
+    }
+}
+
 /// Which per-thumbnail overlays the grid draws (m4-98e) — our port of darktable's
 /// thumbnail "overlays" setting. Ordered as the bottom-bar dropdown lists them.
 /// `Hidden` is darktable's "no overlays"; named so it can't be confused with
@@ -1035,6 +1127,14 @@ thread_local! {
     /// Which per-thumbnail overlays the grid draws. Default `Extended` (filename +
     /// stars + colour dots) so the out-of-box look matches the pre-m4-98e cell.
     static OVERLAY_MODE: Cell<OverlayMode> = const { Cell::new(OverlayMode::Extended) };
+    /// Display-refresh closures for the filter controls (m4-97c) — see
+    /// [`add_filter_observer`]. Several controls now drive one filter state, so
+    /// each change has to push back out to all of them.
+    static FILTER_OBSERVERS: RefCell<Vec<Rc<dyn Fn()>>> = const { RefCell::new(Vec::new()) };
+    /// Nesting depth of the observer pass ([`sync_filter_controls`]), so the widget
+    /// writes those observers make aren't mistaken for user edits — see
+    /// [`filter_sync_in_progress`] and [`FilterSyncGuard`].
+    static FILTER_SYNC_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// A closure that re-runs the *current* view's loader. Each loader registers
     /// itself here on every call (capturing its own args), so the sort dropdown
     /// can re-apply the view under a new order without the trigger sites (folder
@@ -1264,14 +1364,94 @@ pub fn set_sort_reverse(reverse: bool) {
 /// collection is active. No-op if nothing has been loaded yet. Main-thread only.
 pub fn set_min_rating(min: u8) {
     MIN_RATING.with(|r| r.set(min.min(5)));
-    reload_current_view();
+    filter_changed();
 }
 
 /// Set the rating filter's comparator (the dropdown) and re-render the current
 /// view under it. No-op if nothing has been loaded yet. Main-thread only.
 pub fn set_rating_compare(cmp: RatingCompare) {
     RATING_COMPARE.with(|c| c.set(cmp));
+    filter_changed();
+}
+
+/// Apply a quick-filter [`FilterPreset`] — comparator *and* star count in one
+/// step, so the intermediate state never reaches a loader (one reload, not two).
+/// Main-thread only.
+pub fn set_filter_preset(preset: FilterPreset) {
+    let (cmp, stars) = preset.state();
+    RATING_COMPARE.with(|c| c.set(cmp));
+    MIN_RATING.with(|r| r.set(stars));
+    filter_changed();
+}
+
+/// The preset matching the live filter state, or `None` if the state isn't
+/// expressible as one (so a dropdown can show "custom" rather than lie).
+pub fn current_filter_preset() -> Option<FilterPreset> {
+    FilterPreset::for_state(current_rating_compare(), current_min_rating())
+}
+
+/// Register a closure that re-syncs a filter control's *display* from the live
+/// filter state. Every control that both reads and writes the filter (the top-bar
+/// preset dropdown, the bottom bar's comparator + stars) registers one, so a
+/// change made through any of them refreshes all the others — without any control
+/// knowing the others exist. Main-thread only.
+pub fn add_filter_observer(f: impl Fn() + 'static) {
+    FILTER_OBSERVERS.with(|o| o.borrow_mut().push(Rc::new(f)));
+}
+
+/// Whether we're currently inside an observer pass ([`sync_filter_controls`]). UI
+/// handlers consult this to distinguish a *user* edit from the programmatic widget
+/// update an observer is making, and skip re-applying the latter (which would
+/// recurse and could clobber state mid-sync — e.g. a `DropDown::set_selected` from
+/// an observer re-emits `selected-notify`). `pub` because the handlers live in
+/// `lib.rs`. Every filter control's handler must consult this, including ones that
+/// look inert today: a control that gains a programmatic setter later (e.g. the
+/// stars becoming toggles) turns "safe by accident" into a state clobber.
+pub fn filter_sync_in_progress() -> bool {
+    FILTER_SYNC_DEPTH.with(|d| d.get()) > 0
+}
+
+/// RAII depth counter for the observer pass. A **depth counter, not a flag**: if an
+/// observer triggers a further filter change, the inner pass's exit must not
+/// release the guard while the outer pass is still running — every observer after
+/// that point would mistake its own widget write for a user edit. `Drop` releases
+/// it, so a panicking observer can't wedge the guard on either.
+struct FilterSyncGuard;
+
+impl FilterSyncGuard {
+    fn enter() -> Self {
+        FILTER_SYNC_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        FilterSyncGuard
+    }
+}
+
+impl Drop for FilterSyncGuard {
+    fn drop(&mut self) {
+        FILTER_SYNC_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Re-sync every registered filter control's display from the live filter state,
+/// **without** reloading the grid. Used by a control that has to snap back after
+/// rejecting its own input (the top bar's display-only `custom` row) — calling its
+/// own sync closure directly from a signal handler would instead re-enter and
+/// apply a filter the user never picked. `pub` for that call site.
+pub fn sync_filter_controls() {
+    // Clone the observers OUT of the RefCell before invoking them: an observer may
+    // register another (or otherwise re-enter), and holding the borrow across the
+    // calls would panic — the same discipline `reload_current_view` documents.
+    let observers = FILTER_OBSERVERS.with(|o| o.borrow().clone());
+    let _guard = FilterSyncGuard::enter();
+    for f in observers {
+        f();
+    }
+}
+
+/// Re-render the current view for a filter change, then re-sync every registered
+/// filter control so they all agree on what's showing.
+fn filter_changed() {
     reload_current_view();
+    sync_filter_controls();
 }
 
 /// Re-run the currently-registered view loader (used after a sort-order or
@@ -1643,7 +1823,9 @@ fn open_demo_db() -> rusqlite::Connection {
 mod tests {
     use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
                 digit_to_rating, escape_like, fkey_to_color, flags_star_rating,
-                apply_overlay_mode_token, current_overlay_mode, effective_overlay_visibility,
+                add_filter_observer, apply_overlay_mode_token, current_overlay_mode,
+                current_rating_compare, effective_overlay_visibility, filter_sync_in_progress,
+                set_filter_preset, set_min_rating, set_rating_compare, FilterPreset,
                 flags_with_star_rating, index_of_path, overlay_mode_token_for,
                 overlay_visibility, parse_overlay_mode_token, parse_rating_filter_token,
                 path_write_lock, rating_filter_token_for, rating_predicate, OverlayMode,
@@ -1792,6 +1974,114 @@ mod tests {
         assert_eq!(parse_rating_filter_token("ge:99"), (AtLeast, 5), "clamp to 5");
         assert_eq!(parse_rating_filter_token("xx:2"), (AtLeast, 0), "unknown prefix");
         assert_eq!(parse_rating_filter_token("ge:x"), (AtLeast, 0), "non-numeric");
+    }
+
+    #[test]
+    fn filter_presets_map_to_states_and_back() {
+        use RatingCompare::*;
+        // Each preset names a state the bottom bar can also express...
+        assert_eq!(FilterPreset::AllImages.state(), (AtLeast, 0));
+        assert_eq!(FilterPreset::UnstarredOnly.state(), (Exactly, 0));
+        assert_eq!(FilterPreset::AtLeastStars(3).state(), (AtLeast, 3));
+        assert_eq!(FilterPreset::RejectedOnly.state(), (Rejected, 0));
+        // ...and the reverse lookup round-trips every row, so a preset applied by
+        // the top bar always reads back as that same row (never "custom").
+        for (i, p) in FilterPreset::ALL.into_iter().enumerate() {
+            let (cmp, stars) = p.state();
+            assert_eq!(FilterPreset::for_state(cmp, stars), Some(p), "roundtrip {p:?}");
+            assert_eq!(FilterPreset::from_index(i as u32), p, "index {i}");
+            assert!(!p.label().is_empty(), "label {p:?}");
+        }
+        // Out-of-range index falls back to the no-filter preset, never panics.
+        assert_eq!(FilterPreset::from_index(99), FilterPreset::AllImages);
+        // Star clamping keeps a preset inside the 1..=5 domain.
+        assert_eq!(FilterPreset::AtLeastStars(9).state(), (AtLeast, 5));
+    }
+
+    #[test]
+    fn rejected_state_canonicalises_to_the_rejected_preset() {
+        use RatingCompare::*;
+        // `rating_predicate` ignores the star count in Rejected mode, so (Rejected, N)
+        // IS "rejected only" — reachable by picking N stars then switching to ⚑ (the
+        // bottom bar retains the count). Reporting "custom" there would be a display
+        // lie about a filter a preset does name.
+        for n in 0..=5u8 {
+            assert_eq!(
+                FilterPreset::for_state(Rejected, n),
+                Some(FilterPreset::RejectedOnly),
+                "(Rejected, {n})"
+            );
+        }
+        // Counts are clamped into the 0..=5 domain the predicate uses, so an
+        // out-of-range count still resolves to its preset instead of "custom".
+        assert_eq!(
+            FilterPreset::for_state(AtLeast, 9),
+            Some(FilterPreset::AtLeastStars(5))
+        );
+    }
+
+    #[test]
+    fn filter_observers_run_under_a_guard_that_survives_nesting() {
+        use std::cell::Cell as StdCell;
+        use std::rc::Rc;
+        // The observer bus is the risky part of m4-97c and is display-free testable:
+        // the thread-locals need no GTK, and reload_current_view no-ops with no
+        // loader registered. (Each #[test] gets its own thread ⇒ its own locals.)
+        let runs: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
+        let guarded_inside: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+        {
+            let runs = runs.clone();
+            let guarded_inside = guarded_inside.clone();
+            add_filter_observer(move || {
+                runs.set(runs.get() + 1);
+                // Must read `true` INSIDE the pass — that's what stops an observer's
+                // widget write being re-applied as a user edit.
+                guarded_inside.set(filter_sync_in_progress());
+            });
+        }
+        set_min_rating(3);
+        assert_eq!(runs.get(), 1, "observer ran once");
+        assert!(guarded_inside.get(), "guard set during the pass");
+        assert!(!filter_sync_in_progress(), "guard cleared after the pass");
+
+        // Every filter setter must notify, not just set_min_rating.
+        set_rating_compare(RatingCompare::Exactly);
+        assert_eq!(runs.get(), 2);
+        set_filter_preset(FilterPreset::RejectedOnly);
+        assert_eq!(runs.get(), 3);
+        assert_eq!(current_rating_compare(), RatingCompare::Rejected);
+
+        // A nested change from inside an observer must NOT release the outer pass's
+        // guard (the reason the guard is a depth counter, not a bool).
+        let nested_saw_guard: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+        {
+            let nested_saw_guard = nested_saw_guard.clone();
+            let armed = Rc::new(StdCell::new(true));
+            add_filter_observer(move || {
+                if armed.replace(false) {
+                    set_min_rating(1); // re-entrant filter change
+                }
+                // After the inner pass returns, the outer pass is still running.
+                nested_saw_guard.set(filter_sync_in_progress());
+            });
+        }
+        set_min_rating(2);
+        assert!(nested_saw_guard.get(), "outer pass still guarded after a nested change");
+        assert!(!filter_sync_in_progress(), "guard fully released at the end");
+    }
+
+    #[test]
+    fn filter_states_outside_the_presets_have_no_preset() {
+        use RatingCompare::*;
+        // The bottom bar can express filters no preset names — `for_state` must
+        // return None for those so the dropdown shows "custom" instead of lying.
+        assert_eq!(FilterPreset::for_state(AtMost, 3), None, "≤ 3 is not a preset");
+        assert_eq!(FilterPreset::for_state(Exactly, 4), None, "= 4 is not a preset");
+        // But every preset's own state must be recognised (guards a stale ALL).
+        for p in FilterPreset::ALL {
+            let (cmp, stars) = p.state();
+            assert!(FilterPreset::for_state(cmp, stars).is_some(), "{p:?}");
+        }
     }
 
     #[test]

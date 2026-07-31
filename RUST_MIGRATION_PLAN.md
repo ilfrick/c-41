@@ -148,6 +148,27 @@ C FFI trampolines for tags. 61 DB tests passing.
       at narrow widths (~540px browser) the header overflows and clips the
       right-side controls (sort dropdown, image count, export) — pre-existing,
       now more visible. Needs `adw::Breakpoint`-based collapse/rearrange.
+    - **m4-97c (done):** top-bar quick-filter dropdown — darktable's
+      `filter [all images ▾]`. `FilterPreset {AllImages, UnstarredOnly,
+      AtLeastStars(1..=5), RejectedOnly}` where each preset is **not** a parallel
+      filter implementation but a named `(RatingCompare, stars)` pair applied via
+      `set_filter_preset()` to the *same* state the m4-98b/d bottom bar drives —
+      so the two controls can't disagree about what the grid shows. Rows (and
+      labels) come from `FilterPreset::ALL`, plus a display-only trailing `custom`
+      row for states no preset names (e.g. `≤ 3`), so the dropdown reflects rather
+      than lies. **Two controls, one state** is made safe by a new observer bus:
+      `add_filter_observer()` + `filter_changed()` (called by every `set_*`) push
+      each change back out to all filter controls, with a `filter_sync_in_progress()`
+      re-entrancy guard so an observer's programmatic `set_selected` isn't mistaken
+      for a user edit and can't recurse. Observers clone out of the `RefCell`
+      before running — the discipline `reload_current_view` documents. This also
+      pays off the m4-98d review's flagged debt (a filter set outside the bottom
+      bar used to leave its stars lying). The bottom bar's persistence + display
+      refresh now live in one observer, so *any* control's change is persisted.
+      Verified live: `ge:3` ⇒ top reads "★ 3 and higher", bottom shows ≥ with 3 lit
+      stars, count 2000→95; `le:2` ⇒ top honestly reads "custom", bottom shows ≤ 2.
+      4 new tests (preset↔state round-trip over ALL, index/label guards, clamping,
+      and non-preset states correctly yielding `None`).
     - **m4-97e (done):** sort direction toggle (ascending/descending) beside the
       "sort by" dropdown, in a shared `.linked` box. `SortOrder::terms()` returns
       `(expr, ascending, reversible)` triples and `order_clause(reverse)` flips
