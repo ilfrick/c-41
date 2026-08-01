@@ -692,6 +692,13 @@ fn build_main_window(app: &Application) {
         lt_toolbar.add_bottom_bar(&bottom);
     }
 
+    // ── Date timeline (m4-99) ──────────────────────────────────────────────
+    // darktable's bottom date-histogram strip: one bar per year, click to filter.
+    // Added as a SECOND bottom bar so it sits below the toolbar, as it does there
+    // (ToolbarView stacks bottom bars in the order they're added). It composes
+    // with the rating/preset filters through the same observer bus.
+    lt_toolbar.add_bottom_bar(&lighttable::timeline::timeline_strip(&db_path));
+
     let lt_page = adw::NavigationPage::builder()
         .title("Lighttable")
         .tag("lighttable")

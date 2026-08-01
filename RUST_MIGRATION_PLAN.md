@@ -274,6 +274,35 @@ C FFI trampolines for tags. 61 DB tests passing.
       colour quick-filter into the same bar. (Colour compose-on-top would overlap
       the existing left-panel colour selector — reconcile first.) Follow-ups:
       colour quick-filter reconciliation; a "clear all filters" reset.
+  - **m4-99 — date timeline (done).** darktable's bottom date-histogram strip:
+    one bar per year sized by image count, year labels, click a bar to filter to
+    that year, click it again to clear. New `lighttable/timeline.rs`.
+    - **Date decoding:** `images.datetime_taken` is **µs since 0001-01-01** (a
+      GLib `GDateTime`/`GTimeSpan` origin), *not* a Unix timestamp —
+      `DT_EPOCH_OFFSET_SECS = 62_135_596_800`. Pinned empirically against the real
+      catalog: `P7280008.ORF` in film roll `…/2018_07_28` decodes to 2018-07-28
+      (the year-0 origin variant is a year off), and a test drives that value
+      through SQLite itself.
+    - **One expression, two uses:** `year_sql_expr()` (SQLite `strftime` over the
+      converted seconds) is the single source of truth — the histogram groups by
+      it and the filter compares against it, so the bar you click can't disagree
+      with the rows you get. Undated rows (`datetime_taken <= 0`) are excluded
+      from both; SQLite would otherwise decode 0 as year 1 and bucket them.
+    - **Continuous axis:** `fill_year_gaps()` inserts zero-count years, so a gap
+      (the real catalog has no 2017) doesn't render as if 2016 and 2018 were
+      adjacent. Capped at `MAX_TIMELINE_SPAN_YEARS` so one corrupt date can't
+      allocate thousands of bars and squash the real data flat.
+    - **Filter plumbing:** new `YEAR_RANGE` thread-local + `set_year_range()`
+      routed through the m4-97c observer bus (so the strip's highlight tracks
+      clears made elsewhere). The loaders' spliced fragment is now
+      `current_filters_sql()` = rating + year, so adding a compose-on-top filter
+      never means touching the four loaders again.
+    - Verified live: strip renders 2015–2026 with 2017 empty; clicking 2026 gives
+      exactly 72 images (matching the histogram) and highlights that bar while
+      dimming the rest; clicking again restores 2000. 8 new tests.
+    - Follow-ups: drag to select a multi-year span (the range is already
+      `(lo, hi)` and the SQL handles inverted drags); month/day zoom levels;
+      rebuild the histogram after an import.
   - Later: left-panel modules (import as a module, hierarchical collections,
     image-information, Lua scripts), right-panel modules (history stack, styles,
     metadata editor, geotagging, export as a panel), and the date timeline.

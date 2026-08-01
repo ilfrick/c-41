@@ -6,6 +6,8 @@
 //! green/blue/purple); clicking a dot toggles that label via the
 //! `darkroom_db::colorlabels` DAO, resolving the image id by path.
 
+pub mod timeline;
+
 use adw::prelude::*;
 use gtk4::{GridView, ListItem, ScrolledWindow, SignalListItemFactory, SingleSelection};
 use glib::clone;
@@ -1131,6 +1133,10 @@ thread_local! {
     /// [`add_filter_observer`]. Several controls now drive one filter state, so
     /// each change has to push back out to all of them.
     static FILTER_OBSERVERS: RefCell<Vec<Rc<dyn Fn()>>> = const { RefCell::new(Vec::new()) };
+    /// Inclusive year range the timeline is filtering to (m4-99), or `None` for all
+    /// years. Composes with the rating filter and the active collection — see
+    /// [`current_filters_sql`].
+    static YEAR_RANGE: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// Nesting depth of the observer pass ([`sync_filter_controls`]), so the widget
     /// writes those observers make aren't mistaken for user edits — see
     /// [`filter_sync_in_progress`] and [`FilterSyncGuard`].
@@ -1270,6 +1276,31 @@ fn rating_predicate(stars: u8, cmp: RatingCompare) -> String {
 /// what the loaders splice into their WHERE.
 fn current_rating_sql() -> String {
     rating_predicate(current_min_rating(), current_rating_compare())
+}
+
+/// The year range the timeline is filtering to right now (`None` = all years).
+pub fn current_year_range() -> Option<(i32, i32)> {
+    YEAR_RANGE.with(|r| r.get())
+}
+
+/// **Every** compose-on-top quick filter as one trailing ` AND …` fragment: the
+/// rating filter (m4-98b/d) plus the timeline's year range (m4-99). Loaders splice
+/// this single string, so adding a filter never means touching them again — and
+/// they can't accidentally apply one but not another.
+fn current_filters_sql() -> String {
+    format!(
+        "{}{}",
+        current_rating_sql(),
+        timeline::year_range_and(current_year_range()),
+    )
+}
+
+/// Set the timeline's year-range filter (`None` clears it) and re-render the
+/// current view. Goes through the same observer bus as the rating filter, so the
+/// timeline's own highlight and any other control stay in sync. Main-thread only.
+pub fn set_year_range(range: Option<(i32, i32)>) {
+    YEAR_RANGE.with(|r| r.set(range));
+    filter_changed();
 }
 
 /// Persisted rating-filter token pieces — one source of truth shared by the
@@ -1529,7 +1560,7 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
     // Rating filter (bottom bar) composes on top of the folder selection. The
     // no-folder branch uses `WHERE 1=1` so the ` AND (...)` fragment splices in
     // uniformly (SQLite folds the constant away); empty when no rating filter.
-    let rating = current_rating_sql();
+    let rating = current_filters_sql();
     let rows: Vec<String> = match folder {
         Some(f) => {
             conn.prepare(&format!(
@@ -1579,7 +1610,7 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
         rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
     };
     let order = current_sort().order_clause(current_reverse());
-    let rating = current_rating_sql();
+    let rating = current_filters_sql();
     let pattern = format!("%{query}%");
     let rows: Vec<String> = conn
         .prepare(&format!(
@@ -1625,7 +1656,7 @@ pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, pre
         darkroom_db::schema::open_catalog(db_path).unwrap_or_else(|_| open_demo_db())
     };
     let order = current_sort().order_clause(current_reverse());
-    let rating = current_rating_sql();
+    let rating = current_filters_sql();
     // `prefix` itself (the exact tag) OR `prefix|…` (any descendant). DISTINCT
     // because an image carrying several tags under `prefix` would otherwise
     // appear once per matching tag. The OR is parenthesised so the rating filter
@@ -1731,7 +1762,7 @@ pub fn lighttable_load_by_color_mask(
         move || lighttable_load_by_color_mask(&m, &db, mask, match_all)
     });
     let Some(sql) = build_color_mask_query(
-        mask, match_all, current_sort(), current_reverse(), &current_rating_sql(),
+        mask, match_all, current_sort(), current_reverse(), &current_filters_sql(),
     ) else {
         lighttable_load_from_db(model, db_path);
         return;
@@ -1825,7 +1856,8 @@ mod tests {
                 digit_to_rating, escape_like, fkey_to_color, flags_star_rating,
                 add_filter_observer, apply_overlay_mode_token, current_overlay_mode,
                 current_rating_compare, effective_overlay_visibility, filter_sync_in_progress,
-                set_filter_preset, set_min_rating, set_rating_compare, FilterPreset,
+                current_filters_sql, set_filter_preset, set_min_rating, set_rating_compare,
+                set_year_range, FilterPreset,
                 flags_with_star_rating, index_of_path, overlay_mode_token_for,
                 overlay_visibility, parse_overlay_mode_token, parse_rating_filter_token,
                 path_write_lock, rating_filter_token_for, rating_predicate, OverlayMode,
@@ -1999,6 +2031,42 @@ mod tests {
     }
 
     #[test]
+    fn quick_filters_compose_into_one_fragment() {
+        // The loaders splice exactly one string, so the rating filter and the
+        // timeline's year range must both land in it — a regression here would
+        // silently drop one filter from every view at once.
+        set_filter_preset(FilterPreset::AllImages);
+        set_year_range(None);
+        assert_eq!(current_filters_sql(), "", "no filters ⇒ nothing spliced");
+
+        set_filter_preset(FilterPreset::AtLeastStars(2));
+        let rating_only = current_filters_sql();
+        assert!(rating_only.contains("(i.flags & 7) BETWEEN 2 AND 5"), "{rating_only}");
+        assert!(!rating_only.contains("strftime"), "{rating_only}");
+
+        set_year_range(Some((2018, 2020)));
+        // Assert the EXACT composed string, not just `contains`: the loaders splice
+        // this straight after a WHERE term, so a stray leading `WHERE`/`AND` or a
+        // missing leading space would produce invalid SQL that `contains` misses.
+        assert_eq!(
+            current_filters_sql(),
+            concat!(
+                " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 2 AND 5",
+                " AND i.datetime_taken > 0 AND CAST(strftime('%Y',",
+                " (i.datetime_taken / 1000000 - 62135596800), 'unixepoch') AS INTEGER)",
+                " BETWEEN 2018 AND 2020",
+            )
+        );
+
+        // Clearing one leaves the other intact (they're independent).
+        set_filter_preset(FilterPreset::AllImages);
+        let year_only = current_filters_sql();
+        assert!(!year_only.contains("i.flags"), "{year_only}");
+        assert!(year_only.contains("BETWEEN 2018 AND 2020"), "{year_only}");
+        set_year_range(None);
+    }
+
+    #[test]
     fn rejected_state_canonicalises_to_the_rejected_preset() {
         use RatingCompare::*;
         // `rating_predicate` ignores the star count in Rejected mode, so (Rejected, N)
@@ -2050,6 +2118,12 @@ mod tests {
         set_filter_preset(FilterPreset::RejectedOnly);
         assert_eq!(runs.get(), 3);
         assert_eq!(current_rating_compare(), RatingCompare::Rejected);
+        // The timeline's year range rides the same bus — that's what keeps its
+        // highlight in step with a filter cleared from another control.
+        set_year_range(Some((2019, 2019)));
+        assert_eq!(runs.get(), 4);
+        set_year_range(None);
+        assert_eq!(runs.get(), 5);
 
         // A nested change from inside an observer must NOT release the outer pass's
         // guard (the reason the guard is a depth counter, not a bool).
