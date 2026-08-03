@@ -300,9 +300,43 @@ C FFI trampolines for tags. 61 DB tests passing.
     - Verified live: strip renders 2015–2026 with 2017 empty; clicking 2026 gives
       exactly 72 images (matching the histogram) and highlights that bar while
       dimming the rest; clicking again restores 2000. 8 new tests.
-    - Follow-ups: drag to select a multi-year span (the range is already
-      `(lo, hi)` and the SQL handles inverted drags); month/day zoom levels;
-      rebuild the histogram after an import.
+    - **m4-99b (done):** drag across bars to select a **multi-year span**, with a
+      live preview of the span under the cursor before it commits. A *single*
+      `GestureDrag` serves click and drag — a release within `DRAG_CLICK_SLOP_PX`
+      of the press is a click — rather than two gestures fighting to claim the
+      sequence. `bar_span()` clamps both endpoints into the strip (a drag off the
+      edge selects out to it) and orders them, so a right-to-left drag selects the
+      same span; `span_has_images()` extends the click's dead-end guard to a whole
+      span of gap years. **Runtime-only bug found by probing the container logs:**
+      `GestureDrag::start_point()` is valid during `drag-update` but returns `None`
+      by `drag-end` (the gesture has reset), so the end handler bailed and no span
+      was ever applied — the click path masked it. Fixed by latching the press x in
+      `drag-begin`. No unit test could have caught this (pure helpers were already
+      green); only reading the logs did. Verified live: dragging 2025→2026 yields
+      exactly 180 images (108 + 72) and highlights both bars.
+      Review fixes (Opus): the branchy commit logic is now a pure, tested
+      `drag_intent()` (slop classification, gap-year dead-end guard, toggle,
+      span→years) — the leaves were tested but the *combination* was where a
+      regression hid; `bar_span` clamps in **index** space (the old
+      `width - f64::EPSILON.max(1e-9)` had a dead `EPSILON` term, panicked for
+      sub-pixel widths and no-op'd for huge ones); re-dragging an applied span now
+      clears it, so span and click are symmetric; and a `cancel` handler stops a
+      killed sequence latching the preview forever (it would show a span that was
+      never applied *and hide* the filter that is).
+      **Two runtime-only lessons, both from log probes:**
+      (1) unifying `GestureClick` into `GestureDrag` silently dropped the
+      `n_press > 1` double-click guard a previous review had added — the second
+      press arrived as an independent click and toggled the first straight back
+      off, so the strip looked inert. `GestureDrag` has no `n_press`, so it's
+      reconstructed by time via a pure `is_repeat_click()` against GTK's own
+      `gtk-double-click-time`.
+      (2) GTK emits **`cancel` BEFORE `drag-end`** on an ordinary button release
+      here, so the first `cancel` handler — which also cleared the start latch —
+      made every completed drag bail out of `drag-end`. Cancel must clear only the
+      preview; the latch is self-healing because `drag-begin` always precedes the
+      next read. Verified live after the fixes: drag ⇒ 180, re-drag ⇒ cleared
+      (2000), double-click ⇒ stays on (72).
+    - Follow-ups: month/day zoom levels; rebuild the histogram after an import.
   - Later: left-panel modules (import as a module, hierarchical collections,
     image-information, Lua scripts), right-panel modules (history stack, styles,
     metadata editor, geotagging, export as a panel), and the date timeline.
