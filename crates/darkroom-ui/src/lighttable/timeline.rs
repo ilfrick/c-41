@@ -35,14 +35,21 @@
 /// `GDateTime` epoch) to the Unix epoch (1970-01-01) — 719162 days.
 pub(crate) const DT_EPOCH_OFFSET_SECS: i64 = 62_135_596_800;
 
+/// SQL expression converting a `datetime_taken` column (µs since 0001-01-01) to
+/// **Unix seconds**, ready to hand to SQLite's date functions with `'unixepoch'`.
+/// The one place the epoch shift is written, so every consumer (the histogram, the
+/// year filter, the image-information panel) decodes dates identically. `col` is a
+/// literal column reference from our own code, never user input.
+pub(crate) fn unix_secs_sql_expr(col: &str) -> String {
+    format!("({col} / 1000000 - {off})", off = DT_EPOCH_OFFSET_SECS)
+}
+
 /// SQL integer expression yielding the 4-digit year of a `datetime_taken` column
-/// (µs since 0001-01-01), via SQLite's own date functions. `col` is a literal
-/// column reference from our own code (e.g. `"i.datetime_taken"`), never user
-/// input.
+/// (µs since 0001-01-01), via SQLite's own date functions.
 pub(crate) fn year_sql_expr(col: &str) -> String {
     format!(
-        "CAST(strftime('%Y', ({col} / 1000000 - {off}), 'unixepoch') AS INTEGER)",
-        off = DT_EPOCH_OFFSET_SECS,
+        "CAST(strftime('%Y', {secs}, 'unixepoch') AS INTEGER)",
+        secs = unix_secs_sql_expr(col),
     )
 }
 

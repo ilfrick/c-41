@@ -1001,6 +1001,14 @@ pub struct MetadataPanel {
     folder_lbl:   gtk4::Label,
     dims_lbl:     gtk4::Label,
     size_lbl:     gtk4::Label,
+    // EXIF rows (m4-100), mirroring darktable's "image information" module.
+    camera_lbl:   gtk4::Label,
+    lens_lbl:     gtk4::Label,
+    exposure_lbl: gtk4::Label,
+    aperture_lbl: gtk4::Label,
+    iso_lbl:      gtk4::Label,
+    focal_lbl:    gtk4::Label,
+    taken_lbl:    gtk4::Label,
     tags_flow:    gtk4::FlowBox,
     tag_entry:    gtk4::Entry,
     /// Shared (path, db_path) for the add-tag handler
@@ -1044,14 +1052,27 @@ impl MetadataPanel {
         let folder_lbl   = mk_val();
         let dims_lbl     = mk_val();
         let size_lbl     = mk_val();
+        let camera_lbl   = mk_val();
+        let lens_lbl     = mk_val();
+        let exposure_lbl = mk_val();
+        let aperture_lbl = mk_val();
+        let iso_lbl      = mk_val();
+        let focal_lbl    = mk_val();
+        let taken_lbl    = mk_val();
 
         let grid = gtk4::Grid::builder()
             .row_spacing(4).column_spacing(8)
             .margin_start(12).margin_end(12).margin_top(10)
             .build();
+        // Ordered as darktable's "image information": file identity first, then the
+        // capture facts (camera → lens → exposure triangle → date).
         for (i, (key, val)) in [
-            ("File", &filename_lbl), ("Folder", &folder_lbl),
-            ("Size", &dims_lbl),    ("Disk",   &size_lbl),
+            ("File",     &filename_lbl), ("Folder",   &folder_lbl),
+            ("Size",     &dims_lbl),     ("Disk",     &size_lbl),
+            ("Camera",   &camera_lbl),   ("Lens",     &lens_lbl),
+            ("Exposure", &exposure_lbl), ("Aperture", &aperture_lbl),
+            ("ISO",      &iso_lbl),      ("Focal",    &focal_lbl),
+            ("Taken",    &taken_lbl),
         ].iter().enumerate() {
             grid.attach(&mk_key(key), 0, i as i32, 1, 1);
             grid.attach(*val, 1, i as i32, 1, 1);
@@ -1120,6 +1141,8 @@ impl MetadataPanel {
         }
 
         Self { widget: panel, filename_lbl, folder_lbl, dims_lbl, size_lbl,
+               camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
+               focal_lbl, taken_lbl,
                tags_flow, tag_entry, ctx, on_tags_changed }
     }
 
@@ -1154,14 +1177,36 @@ impl MetadataPanel {
         self.filename_lbl.set_label(filename);
         self.folder_lbl.set_label(folder.rsplit('/').next().unwrap_or(folder));
 
-        let dims = query_dims(full_path, db_path)
-            .map(|(w, h)| format!("{w} \u{00d7} {h}"))
-            .unwrap_or_else(|| "\u{2014}".into());
-        self.dims_lbl.set_label(&dims);
+        // One query for every catalog-sourced field (m4-100) — dimensions used to
+        // need their own connection; they now ride along with the EXIF row.
+        let exif = query_exif(full_path, db_path).unwrap_or_default();
+        let camera = format_camera(exif.maker.as_deref(), exif.model.as_deref());
+        let lens = format_opt(exif.lens.as_deref());
+        let taken = format_opt(exif.datetime.as_deref());
+        self.dims_lbl.set_label(&format_dims(exif.width, exif.height));
+        self.camera_lbl.set_label(&camera);
+        self.lens_lbl.set_label(&lens);
+        self.exposure_lbl.set_label(&format_exposure(exif.exposure));
+        self.aperture_lbl.set_label(&format_aperture(exif.aperture));
+        self.iso_lbl.set_label(&format_iso(exif.iso));
+        self.focal_lbl.set_label(&format_focal(exif.focal_length));
+        self.taken_lbl.set_label(&taken);
+        // Every label ellipsizes at 20 chars, so each value that can exceed that
+        // carries the full text in a tooltip — set from the formatted string, not
+        // read back off the widget. A placeholder gets no tooltip: hovering to be
+        // told "—" is noise.
+        let tip = |l: &gtk4::Label, v: &str| {
+            l.set_tooltip_text(if v == NO_VALUE { None } else { Some(v) });
+        };
+        tip(&self.camera_lbl, &camera);
+        tip(&self.lens_lbl, &lens);
+        tip(&self.taken_lbl, &taken);
+        tip(&self.filename_lbl, filename);
+        tip(&self.folder_lbl, folder);
 
         let disk = std::fs::metadata(full_path)
             .map(|m| format_bytes(m.len()))
-            .unwrap_or_else(|_| "\u{2014}".into());
+            .unwrap_or_else(|_| NO_VALUE.into());
         self.size_lbl.set_label(&disk);
 
         // Store context for the tag-entry / detach handlers
@@ -1324,24 +1369,424 @@ fn add_tag_to_image(full_path: &str, db_path: &str, tag_name: &str) {
     }
 }
 
-fn query_dims(full_path: &str, db_path: &str) -> Option<(i64, i64)> {
+/// The EXIF facts darktable's "image information" module shows, as read from the
+/// catalog (m4-100). Every field is optional because darktable leaves them NULL
+/// for images it couldn't read EXIF from.
+///
+/// Reading each column with `.ok().flatten()` also contains a per-column type
+/// error to that one field, so an oddly-typed value blanks one row rather than the
+/// whole panel. It does **not** cover a missing *table* — that fails at prepare
+/// time and is handled separately in [`query_exif_conn`].
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ExifInfo {
+    pub maker: Option<String>,
+    pub model: Option<String>,
+    pub lens: Option<String>,
+    /// Shutter time in seconds.
+    pub exposure: Option<f64>,
+    /// f-number.
+    pub aperture: Option<f64>,
+    pub iso: Option<f64>,
+    /// Focal length in mm.
+    pub focal_length: Option<f64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// `YYYY-MM-DD HH:MM:SS`, already decoded by SQLite.
+    pub datetime: Option<String>,
+}
+
+/// Read the EXIF row for an image in ONE query (rather than a connection per
+/// field). Best-effort: a missing db, an uncatalogued image, or a catalog without
+/// the maker/model/lens tables all yield `None`, and the panel then shows dashes.
+fn query_exif(full_path: &str, db_path: &str) -> Option<ExifInfo> {
+    if db_path.is_empty() {
+        return None;
+    }
     let conn = rusqlite::Connection::open(db_path).ok()?;
+    // Brief wait, NOT the 3s used elsewhere: this runs on the GTK main thread on
+    // every selection change, and library.db is in rollback-journal mode (no WAL),
+    // so a reader really does block on an in-flight rating/colour write. A dash for
+    // one frame beats freezing the window while arrow-keying through images.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(250));
     let p = std::path::Path::new(full_path);
     let filename = p.file_name()?.to_str()?;
-    let folder   = p.parent()?.to_str()?;
-    conn.query_row(
-        "SELECT i.width, i.height \
-         FROM main.images i JOIN main.film_rolls f ON f.id = i.film_id \
-         WHERE f.folder = ?1 AND i.filename = ?2",
-        rusqlite::params![folder, filename],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    ).ok()
+    let folder = p.parent()?.to_str()?;
+    query_exif_conn(&conn, folder, filename)
 }
+
+/// Testable core of [`query_exif`] (same split as `persist.rs`'s `_conn` helpers),
+/// so the SQL can be exercised against an in-memory catalog with no temp files.
+fn query_exif_conn(conn: &rusqlite::Connection, folder: &str, filename: &str) -> Option<ExifInfo> {
+    // A catalog predating the maker/model/lens lookup tables would fail this
+    // statement at PREPARE time — losing every field, including the dimensions
+    // that worked before this query absorbed them. So probe once and drop those
+    // three columns (and their joins) when the tables aren't there: camera/lens
+    // degrade to "unknown" while the rest of the row still populates. Per-column
+    // NULL handling can't cover this, because the failure isn't per-column.
+    let have_lookups = conn
+        .query_row(
+            "SELECT COUNT(*) FROM main.sqlite_master \
+             WHERE type = 'table' AND name IN ('makers', 'models', 'lens')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        == 3;
+    let (cols, joins) = if have_lookups {
+        (
+            "mk.name, md.name, l.name",
+            "LEFT JOIN main.makers mk ON mk.id = i.maker_id \
+             LEFT JOIN main.models md ON md.id = i.model_id \
+             LEFT JOIN main.lens   l  ON l.id  = i.lens_id ",
+        )
+    } else {
+        ("NULL, NULL, NULL", "")
+    };
+    // Date decoding reuses the timeline's epoch expression so the panel can't
+    // disagree with the timeline about when a photo was taken.
+    let sql = format!(
+        "SELECT {cols}, i.exposure, i.aperture, i.iso, \
+                i.focal_length, i.width, i.height, \
+                CASE WHEN i.datetime_taken > 0 \
+                     THEN datetime({secs}, 'unixepoch') ELSE NULL END \
+         FROM main.images i \
+         JOIN main.film_rolls f ON f.id = i.film_id \
+         {joins}WHERE f.folder = ?1 AND i.filename = ?2",
+        secs = crate::lighttable::timeline::unix_secs_sql_expr("i.datetime_taken"),
+    );
+    conn.query_row(&sql, rusqlite::params![folder, filename], |r| {
+        Ok(ExifInfo {
+            maker: r.get(0).ok().flatten(),
+            model: r.get(1).ok().flatten(),
+            lens: r.get(2).ok().flatten(),
+            exposure: r.get(3).ok().flatten(),
+            aperture: r.get(4).ok().flatten(),
+            iso: r.get(5).ok().flatten(),
+            focal_length: r.get(6).ok().flatten(),
+            width: r.get(7).ok().flatten(),
+            height: r.get(8).ok().flatten(),
+            datetime: r.get(9).ok().flatten(),
+        })
+    })
+    .ok()
+}
+
+/// Placeholder for a metadata value the catalog doesn't have (an em dash).
+const NO_VALUE: &str = "\u{2014}";
+
+/// Camera name from maker + model, as darktable presents it. The model often
+/// already repeats the maker (`Canon` / `Canon EOS 5D`), so the prefix is dropped
+/// to avoid "Canon Canon EOS 5D". Pure.
+pub(crate) fn format_camera(maker: Option<&str>, model: Option<&str>) -> String {
+    let maker = maker.unwrap_or("").trim();
+    let model = model.unwrap_or("").trim();
+    if model.is_empty() {
+        return if maker.is_empty() { NO_VALUE.into() } else { maker.into() };
+    }
+    if maker.is_empty() {
+        return model.into();
+    }
+    // Compare against the maker's FIRST WORD, case-insensitively. Makers are often
+    // stored with a corporate suffix the model omits ("NIKON CORPORATION" vs
+    // "NIKON D850"), so matching the whole maker string would miss the duplication
+    // it's meant to catch. An empty remainder counts too, for maker == model
+    // ("DJI"/"DJI" would otherwise render "DJI DJI").
+    let m_low = model.to_lowercase();
+    let mk_low = maker.to_lowercase();
+    let first_word = mk_low.split_whitespace().next().unwrap_or("");
+    if !first_word.is_empty() {
+        if let Some(rest) = m_low.strip_prefix(first_word) {
+            // Require a non-alphanumeric boundary so "Canonball" isn't treated as
+            // "Canon" + "ball".
+            if rest.is_empty() || rest.starts_with(|c: char| !c.is_alphanumeric()) {
+                return model.into(); // the model already carries the maker
+            }
+        }
+    }
+    format!("{maker} {model}")
+}
+
+/// Shutter time the way photographers read it: `1/60 s` below a second (darktable
+/// shows the reciprocal), `2.5 s` above. Pure.
+pub(crate) fn format_exposure(secs: Option<f64>) -> String {
+    match secs {
+        Some(s) if s > 0.0 && s.is_finite() => {
+            if s >= 1.0 {
+                // Trim a trailing `.0` so 2 s doesn't read "2.0 s".
+                let t = format!("{s:.1}");
+                format!("{} s", t.strip_suffix(".0").unwrap_or(&t))
+            } else {
+                // Guard the reciprocal explicitly: `is_finite` above allows
+                // denormals, whose 1/s overflows and saturates `as i64` to
+                // i64::MAX — a nonsense "1/9223372036854775807 s".
+                let denom = (1.0 / s).round();
+                if denom.is_finite() && denom <= i64::MAX as f64 {
+                    format!("1/{} s", denom as i64)
+                } else {
+                    NO_VALUE.into()
+                }
+            }
+        }
+        _ => NO_VALUE.into(),
+    }
+}
+
+/// f-number as `f/2.8`, dropping a trailing `.0` (`f/8`, not `f/8.0`). Pure.
+pub(crate) fn format_aperture(f: Option<f64>) -> String {
+    match f {
+        Some(v) if v > 0.0 && v.is_finite() => {
+            let t = format!("{v:.1}");
+            format!("f/{}", t.strip_suffix(".0").unwrap_or(&t))
+        }
+        _ => NO_VALUE.into(),
+    }
+}
+
+/// ISO as a whole number (the catalog stores it as REAL). Pure.
+pub(crate) fn format_iso(iso: Option<f64>) -> String {
+    match iso {
+        Some(v) if v > 0.0 && v.is_finite() => format!("{}", v.round() as i64),
+        _ => NO_VALUE.into(),
+    }
+}
+
+/// Focal length as `45 mm`, dropping a trailing `.0`. Pure.
+pub(crate) fn format_focal(mm: Option<f64>) -> String {
+    match mm {
+        Some(v) if v > 0.0 && v.is_finite() => {
+            let t = format!("{v:.1}");
+            format!("{} mm", t.strip_suffix(".0").unwrap_or(&t))
+        }
+        _ => NO_VALUE.into(),
+    }
+}
+
+/// Pixel dimensions as `4640 × 3472`. Pure.
+pub(crate) fn format_dims(w: Option<i64>, h: Option<i64>) -> String {
+    match (w, h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => format!("{w} \u{00d7} {h}"),
+        _ => NO_VALUE.into(),
+    }
+}
+
+/// A value or the em-dash placeholder, for the plain string fields. Pure.
+pub(crate) fn format_opt(v: Option<&str>) -> String {
+    match v.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => NO_VALUE.into(),
+    }
+}
+
+// (`query_dims` was retired in m4-100: dimensions now ride along with the rest of
+// the EXIF row in `query_exif`'s single query, instead of opening their own
+// connection for two columns.)
 
 fn format_bytes(n: u64) -> String {
     if n < 1024 { format!("{n} B") }
     else if n < 1024 * 1024 { format!("{:.1} KB", n as f64 / 1024.0) }
     else { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) }
+}
+
+#[cfg(test)]
+mod exif_format_tests {
+    use super::*;
+
+    #[test]
+    fn camera_drops_a_maker_the_model_already_repeats() {
+        // darktable's models often already carry the maker; naively concatenating
+        // gives "Canon Canon EOS 5D".
+        assert_eq!(format_camera(Some("Canon"), Some("Canon EOS 5D")), "Canon EOS 5D");
+        assert_eq!(format_camera(Some("CANON"), Some("Canon EOS 5D")), "Canon EOS 5D");
+        // The real catalog's shape: the model does NOT repeat the maker.
+        assert_eq!(
+            format_camera(Some("OLYMPUS CORPORATION"), Some("E-M10 Mark III")),
+            "OLYMPUS CORPORATION E-M10 Mark III"
+        );
+        // Only a word-boundary prefix counts, so a model isn't mangled mid-word.
+        assert_eq!(format_camera(Some("Canon"), Some("Canonball")), "Canon Canonball");
+        // maker == model (DJI stores both the same) must collapse, not double up.
+        assert_eq!(format_camera(Some("DJI"), Some("DJI")), "DJI");
+        // The corporate-suffix shape: the model repeats only the maker's first
+        // word, so matching the whole maker string would miss the duplication.
+        assert_eq!(
+            format_camera(Some("NIKON CORPORATION"), Some("NIKON D850")),
+            "NIKON D850"
+        );
+        assert_eq!(
+            format_camera(Some("SONY"), Some("SONY ILCE-7M3")),
+            "SONY ILCE-7M3"
+        );
+        // Either side missing degrades to the other, never to a stray space.
+        assert_eq!(format_camera(None, Some("E-M10")), "E-M10");
+        assert_eq!(format_camera(Some("Nikon"), None), "Nikon");
+        assert_eq!(format_camera(None, None), NO_VALUE);
+        assert_eq!(format_camera(Some("  "), Some("")), NO_VALUE, "blank is not a value");
+    }
+
+    #[test]
+    fn exposure_reads_as_a_shutter_speed() {
+        // Sub-second times read as a reciprocal, the way a photographer says them.
+        // 0.016666… is the real catalog's value for 1/60.
+        assert_eq!(format_exposure(Some(0.0166666675359011)), "1/60 s");
+        assert_eq!(format_exposure(Some(0.005)), "1/200 s");
+        // A second or longer reads as a decimal, with a bare integer when exact.
+        assert_eq!(format_exposure(Some(2.5)), "2.5 s");
+        assert_eq!(format_exposure(Some(2.0)), "2 s");
+        assert_eq!(format_exposure(Some(1.0)), "1 s");
+        // Absent/degenerate values show the placeholder, never "1/inf" or NaN.
+        assert_eq!(format_exposure(None), NO_VALUE);
+        assert_eq!(format_exposure(Some(0.0)), NO_VALUE);
+        assert_eq!(format_exposure(Some(-1.0)), NO_VALUE);
+        assert_eq!(format_exposure(Some(f64::NAN)), NO_VALUE);
+        assert_eq!(format_exposure(Some(f64::INFINITY)), NO_VALUE);
+        // A denormal is finite, so the reciprocal needs its own guard or it
+        // saturates `as i64` into "1/9223372036854775807 s".
+        assert_eq!(format_exposure(Some(f64::MIN_POSITIVE / 2.0)), NO_VALUE);
+    }
+
+    #[test]
+    fn aperture_iso_and_focal_drop_trailing_zeros() {
+        // Real catalog values carry float noise (2.79999995…) — round, don't truncate.
+        assert_eq!(format_aperture(Some(2.79999995231628)), "f/2.8");
+        assert_eq!(format_aperture(Some(9.0)), "f/9");
+        assert_eq!(format_aperture(None), NO_VALUE);
+        assert_eq!(format_aperture(Some(0.0)), NO_VALUE);
+
+        assert_eq!(format_iso(Some(640.0)), "640");
+        assert_eq!(format_iso(Some(199.6)), "200");
+        assert_eq!(format_iso(None), NO_VALUE);
+        assert_eq!(format_iso(Some(f64::NAN)), NO_VALUE);
+
+        assert_eq!(format_focal(Some(45.0)), "45 mm");
+        assert_eq!(format_focal(Some(10.5)), "10.5 mm");
+        assert_eq!(format_focal(None), NO_VALUE);
+    }
+
+    #[test]
+    fn dims_and_opt_render_or_placeholder() {
+        assert_eq!(format_dims(Some(4640), Some(3472)), "4640 × 3472");
+        // A half-known or zero size is not a size.
+        assert_eq!(format_dims(Some(4640), None), NO_VALUE);
+        assert_eq!(format_dims(Some(0), Some(3472)), NO_VALUE);
+        assert_eq!(format_dims(None, None), NO_VALUE);
+
+        assert_eq!(format_opt(Some("Olympus M.Zuiko 45mm")), "Olympus M.Zuiko 45mm");
+        assert_eq!(format_opt(Some("  padded  ")), "padded");
+        assert_eq!(format_opt(Some("   ")), NO_VALUE, "whitespace is not a value");
+        assert_eq!(format_opt(None), NO_VALUE);
+    }
+
+    #[test]
+    fn query_exif_reads_a_seeded_catalog_end_to_end() {
+        // Exercises the real SQL — the joins, the LEFT JOINs for a lens-less image,
+        // and the shared date decode — against the schema shape darktable writes.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder TEXT);
+             CREATE TABLE makers (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE models (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE lens   (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT,
+                                  maker_id INTEGER, model_id INTEGER, lens_id INTEGER,
+                                  exposure REAL, aperture REAL, iso REAL,
+                                  focal_length REAL, width INTEGER, height INTEGER,
+                                  datetime_taken INTEGER);
+             INSERT INTO film_rolls VALUES (1, '/photos');
+             INSERT INTO makers VALUES (1, 'OLYMPUS CORPORATION');
+             INSERT INTO models VALUES (1, 'E-M10 Mark III');
+             INSERT INTO lens   VALUES (1, 'Olympus M.Zuiko Digital 45mm F1.8');
+             -- Real values lifted from the catalog, incl. the 2018-07-28 timestamp.
+             INSERT INTO images VALUES (1, 1, 'P1010153.ORF', 1, 1, 1,
+                 0.0166666675359011, 2.79999995231628, 640.0, 45.0, 4640, 3472,
+                 63668412473000000);
+             -- An image with no EXIF at all: every LEFT JOIN misses, date is 0.
+             INSERT INTO images VALUES (2, 1, 'bare.ORF', NULL, NULL, NULL,
+                 NULL, NULL, NULL, NULL, NULL, NULL, 0);",
+        )
+        .unwrap();
+
+        let e = query_exif_conn(&conn, "/photos", "P1010153.ORF").expect("row");
+        assert_eq!(e.maker.as_deref(), Some("OLYMPUS CORPORATION"));
+        assert_eq!(e.model.as_deref(), Some("E-M10 Mark III"));
+        assert_eq!(e.lens.as_deref(), Some("Olympus M.Zuiko Digital 45mm F1.8"));
+        assert_eq!(format_exposure(e.exposure), "1/60 s");
+        assert_eq!(format_aperture(e.aperture), "f/2.8");
+        assert_eq!(format_iso(e.iso), "640");
+        assert_eq!(format_focal(e.focal_length), "45 mm");
+        assert_eq!(format_dims(e.width, e.height), "4640 × 3472");
+        // Decoded through the timeline's shared epoch expression.
+        assert_eq!(e.datetime.as_deref(), Some("2018-07-28 22:07:53"));
+
+        // A row with no EXIF yields Some(all-None) — the panel then shows dashes
+        // rather than blanks, and never mistakes "no EXIF" for "no such image".
+        let bare = query_exif_conn(&conn, "/photos", "bare.ORF").expect("row exists");
+        assert_eq!(bare, ExifInfo::default());
+        assert_eq!(format_camera(bare.maker.as_deref(), bare.model.as_deref()), NO_VALUE);
+
+        // An uncatalogued image is None; an empty db path short-circuits before
+        // any connection is opened.
+        assert_eq!(query_exif_conn(&conn, "/photos", "missing.ORF"), None);
+        assert_eq!(query_exif("/photos/P1010153.ORF", ""), None);
+    }
+
+    #[test]
+    fn null_datetime_taken_reads_as_absent_not_year_one() {
+        // The real catalog has NULL (not just 0) datetimes. `NULL > 0` is NULL, so
+        // the CASE takes its ELSE branch — but that path was untested.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder TEXT);
+             CREATE TABLE makers (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE models (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE lens   (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT,
+                                  maker_id INTEGER, model_id INTEGER, lens_id INTEGER,
+                                  exposure REAL, aperture REAL, iso REAL,
+                                  focal_length REAL, width INTEGER, height INTEGER,
+                                  datetime_taken INTEGER);
+             INSERT INTO film_rolls VALUES (1, '/photos');
+             INSERT INTO images VALUES (1, 1, 'n.ORF', NULL, NULL, NULL,
+                 NULL, NULL, NULL, NULL, 100, 50, NULL);",
+        )
+        .unwrap();
+        let e = query_exif_conn(&conn, "/photos", "n.ORF").expect("row");
+        assert_eq!(e.datetime, None);
+        assert_eq!(format_opt(e.datetime.as_deref()), NO_VALUE);
+        // The rest of the row still populates.
+        assert_eq!(format_dims(e.width, e.height), "100 × 50");
+    }
+
+    #[test]
+    fn a_catalog_without_the_lookup_tables_still_yields_the_other_fields() {
+        // Pre-lookup-table catalogs would fail the joined statement at PREPARE
+        // time, blanking EVERY field — including the dimensions that worked before
+        // this query absorbed them. Camera/lens must degrade alone.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder TEXT);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT,
+                                  maker_id INTEGER, model_id INTEGER, lens_id INTEGER,
+                                  exposure REAL, aperture REAL, iso REAL,
+                                  focal_length REAL, width INTEGER, height INTEGER,
+                                  datetime_taken INTEGER);
+             INSERT INTO film_rolls VALUES (1, '/photos');
+             INSERT INTO images VALUES (1, 1, 'old.ORF', 1, 1, 1,
+                 0.0166666675359011, 2.79999995231628, 640.0, 45.0, 4640, 3472,
+                 63668412473000000);",
+        )
+        .unwrap();
+        let e = query_exif_conn(&conn, "/photos", "old.ORF").expect("row despite no lookups");
+        assert_eq!(e.maker, None);
+        assert_eq!(e.model, None);
+        assert_eq!(e.lens, None);
+        assert_eq!(format_camera(e.maker.as_deref(), e.model.as_deref()), NO_VALUE);
+        // Everything not sourced from a lookup table survives.
+        assert_eq!(format_exposure(e.exposure), "1/60 s");
+        assert_eq!(format_aperture(e.aperture), "f/2.8");
+        assert_eq!(format_iso(e.iso), "640");
+        assert_eq!(format_dims(e.width, e.height), "4640 × 3472");
+        assert_eq!(e.datetime.as_deref(), Some("2018-07-28 22:07:53"));
+    }
 }
 
 #[cfg(test)]

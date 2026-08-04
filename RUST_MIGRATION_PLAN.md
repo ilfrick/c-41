@@ -337,6 +337,52 @@ C FFI trampolines for tags. 61 DB tests passing.
       next read. Verified live after the fixes: drag ⇒ 180, re-drag ⇒ cleared
       (2000), double-click ⇒ stays on (72).
     - Follow-ups: month/day zoom levels; rebuild the histogram after an import.
+  - **m4-100 — image information (done).** The right panel showed only File /
+    Folder / Size / Disk; it now carries darktable's "image information" EXIF:
+    **Camera, Lens, Exposure, Aperture, ISO, Focal, Taken**, read from the
+    catalog's `makers`/`models`/`lens` lookup tables and the `exposure`/`aperture`/
+    `iso`/`focal_length`/`width`/`height`/`datetime_taken` columns.
+    - **One query, one connection:** `query_exif` replaces the old `query_dims`
+      (which opened its own connection for two columns); dimensions now ride along
+      with the rest. Split `query_exif` / `query_exif_conn` per `persist.rs`'s
+      `_conn` idiom, so the SQL is testable against an in-memory catalog with no
+      temp files or new dev-dependency.
+    - **Shared date decode:** the epoch shift moved into
+      `timeline::unix_secs_sql_expr()`, now the single place it's written — the
+      panel and the timeline cannot disagree about when a photo was taken.
+    - Pure, tested formatters: `format_exposure` (reciprocal below 1 s — `1/60 s`
+      — decimal above), `format_aperture`/`format_focal`/`format_iso` (round real
+      values like `2.79999995` → `f/2.8`, drop a trailing `.0`), `format_camera`
+      (drops a maker the model already repeats, on a word boundary, so
+      `Canon` + `Canon EOS 5D` isn't `Canon Canon EOS 5D` while `Canonball`
+      survives), and an em-dash placeholder everywhere a value is absent — so a
+      missing field reads as "unknown", never as a blank the user must interpret.
+      Long values (lens names) get a tooltip, since the labels ellipsize at 20 ch.
+    - Review fixes (Opus), two of them blocking:
+      (a) a catalog predating the `makers`/`models`/`lens` tables failed the
+      statement at **prepare** time, blanking *every* field — including the
+      dimensions that worked before this query absorbed them (a regression vs the
+      deleted `query_dims`). Per-column NULL handling can't cover that, so the
+      tables are probed once via `sqlite_master` and the three columns/joins are
+      dropped when absent: camera/lens degrade alone. Regression-tested.
+      (b) `format_camera` doubled up on the two duplications that actually occur —
+      `maker == model` ("DJI"/"DJI" ⇒ "DJI DJI") and the corporate-suffix shape
+      ("NIKON CORPORATION"/"NIKON D850"), because it matched the *whole* maker
+      string. Now matches the maker's first word and accepts an empty remainder,
+      while "Canonball" still survives.
+      Also: the read's `busy_timeout` dropped 3s → 250ms because this runs on the
+      GTK main thread on every selection change and `library.db` is in
+      rollback-journal mode (no WAL), so a reader really blocks on an in-flight
+      rating write — a dash for one frame beats a frozen window; tooltips are set
+      from the formatted string (not read back off the widget) and suppressed for
+      placeholders; `format_exposure` guards the reciprocal against denormals
+      saturating `as i64`; `ExifInfo` is `pub(crate)`.
+    - Verified live against the real catalog: `Camera OnePlus One A0001`,
+      `Exposure 1/60 s`, `Aperture f/2`, `ISO 211`, `Focal 3.8 mm`,
+      `Taken 2016-04-16 17:37:19` — the date independently corroborated by the
+      file's own name (`IMG_20160416_173714`) — and an Olympus ORF reading
+      `4640 × 3472`, `Olympus M.Zuiko … 45mm F1.8`, `f/2.8`, `ISO 640`, `45 mm`,
+      with `Taken —` correctly shown for its NULL `datetime_taken`. 8 new tests.
   - Later: left-panel modules (import as a module, hierarchical collections,
     image-information, Lua scripts), right-panel modules (history stack, styles,
     metadata editor, geotagging, export as a panel), and the date timeline.
