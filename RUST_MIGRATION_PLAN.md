@@ -270,10 +270,50 @@ C FFI trampolines for tags. 61 DB tests passing.
       so encoder/decoder can't drift), restored **before** the first bind so cells
       are laid out right the first time. 2 new tests (row mapping per mode; index
       ↔ variant bijection + encode∘decode round-trip + corrupt-token fallback).
-    - **m4-98c (next):** view-mode switcher (file-manager / zoom / culling) +
-      colour quick-filter into the same bar. (Colour compose-on-top would overlap
-      the existing left-panel colour selector — reconcile first.) Follow-ups:
-      colour quick-filter reconciliation; a "clear all filters" reset.
+    - **m4-98c (next) — view-mode switcher. DESIGNED, not yet built.** darktable's
+      file-manager / zoomable / culling layouts. This is a multi-increment arc, so
+      the design is recorded here before any code:
+      - **HARD CONSTRAINT — never swap the `ScrolledWindow`'s child.** Two call
+        sites reach *through* the scroller for the grid
+        (`lib.rs:601` thumb-size stepper, `lib.rs:714` overlay dropdown, both
+        `scroll.child().and_downcast::<GridView>()`). Replacing the child makes
+        those downcasts silently return `None` and both controls go inert with no
+        error — the same "silent no-op" failure class that has bitten this repo
+        repeatedly. **Modes therefore reconfigure the SAME `GridView`** (its model,
+        column bounds and scroll policy); they never restructure the widget tree.
+        If a mode ever genuinely needs a different widget, fix the coupling first
+        by returning the `GridView` from `lighttable_page` instead of re-deriving
+        it.
+      - **Culling** = the same `GridView` with its model swapped for a
+        `gtk4::SliceListModel(model, offset, n)`, `min_columns == max_columns == n`
+        and scrolling disabled; arrow keys move `offset` by `n`. This reuses the
+        entire cell factory (thumbnail, filename, stars, colour dots, overlay
+        modes) for free, and keeps the rating/colour gestures working — which a
+        hand-rolled comparison widget would not.
+      - **Zoomable** is the awkward one: `GridView` cannot do an infinite zoom
+        plane. Defer it; evaluate approximating it as file-manager with a wider
+        column range driven by ctrl+scroll, and prefer shipping **full preview**
+        (single image, darktable's `w`/`f`) first — more useful per unit of work.
+      - Persist the mode in `darkroom_ui_prefs` under `view_mode`, reusing the
+        m4-98e token pattern (`ALL`-derived rows + encoder/decoder inversion).
+      - **Layout:** the bottom `CenterBox` has only three slots and they are all
+        taken (rating filter / overlays / thumb stepper), so the centre slot
+        becomes a `Box` holding `[view-mode switcher | overlays]`. Use icon-only
+        `ToggleButton`s in a `.linked` box — the bar's minimum width feeds the
+        known ~915px overflow, and terse labels were already needed once (m4-98e).
+      - **Increments:** (a) `ViewMode` enum + persisted state + the switcher
+        control, with only file-manager live and the rest disabled — plumbing
+        first, zero behaviour change; (b) culling via `SliceListModel` + arrow-key
+        navigation; (c) full preview; (d) zoomable, only if (c) proves it's worth
+        it.
+      - **Live checks** (xdotool synthetic input is unreliable here — see the
+        m4-99b lessons): switch each mode and confirm the thumb stepper AND
+        overlay dropdown still work afterwards (that is the regression the hard
+        constraint above guards); culling with fewer images than `n`; culling at
+        the collection's last page; a mode restored from the pref at startup.
+    - Also queued for this bar: colour quick-filter (compose-on-top would overlap
+      the existing left-panel colour selector — reconcile first) and a
+      "clear all filters" reset.
   - **m4-99 — date timeline (done).** darktable's bottom date-histogram strip:
     one bar per year sized by image count, year labels, click a bar to filter to
     that year, click it again to clear. New `lighttable/timeline.rs`.
