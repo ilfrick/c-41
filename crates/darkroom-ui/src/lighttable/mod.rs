@@ -20,10 +20,24 @@ pub const THUMB_SIZE: i32 = 160;
 
 pub type LighttableModel = gtk4::StringList;
 
-/// Build the lighttable widget. Returns (NavigationPage, model, selection).
+/// The lighttable's widgets, as built by [`lighttable_page`].
+///
+/// The `grid` is handed out rather than left to be re-derived with
+/// `scroll.child().and_downcast::<GridView>()`: every such downcast is a control
+/// that silently goes inert (no error, no log) the day the scroller's child
+/// changes. Returning it makes "the bottom-bar controls always find the grid" hold
+/// by construction — see the m4-98c constraint on [`ViewMode`].
+pub struct LighttablePage {
+    pub scroll: ScrolledWindow,
+    pub grid: GridView,
+    pub model: LighttableModel,
+    pub selection: SingleSelection,
+}
+
+/// Build the lighttable widget — see [`LighttablePage`] for what comes back.
 ///
 /// `db_path` is stored in each cell's gesture handler for rating updates.
-pub fn lighttable_page(db_path: String) -> (ScrolledWindow, LighttableModel, SingleSelection) {
+pub fn lighttable_page(db_path: String) -> LighttablePage {
     let model     = gtk4::StringList::new(&[]);
     let selection = SingleSelection::new(Some(model.clone()));
     let factory   = SignalListItemFactory::new();
@@ -209,7 +223,7 @@ pub fn lighttable_page(db_path: String) -> (ScrolledWindow, LighttableModel, Sin
         .vexpand(true)
         .build();
 
-    (scroll, model, selection)
+    LighttablePage { scroll, grid, model, selection }
 }
 
 // ── Rating helpers ────────────────────────────────────────────────────────
@@ -1113,6 +1127,139 @@ pub fn apply_overlay_mode_token(tok: &str) {
     OVERLAY_MODE.with(|m| m.set(parse_overlay_mode_token(tok)));
 }
 
+/// Which lighttable layout the grid is drawn in (m4-98c) — our port of darktable's
+/// file manager / zoomable / culling layouts. Ordered as darktable's switcher lists
+/// them.
+///
+/// **Modes will reconfigure the one `GridView`** (its model, column bounds and
+/// scroll policy) — see [`reconfigure_grid_for`], empty so far because the only
+/// available mode is the one the grid is built in. They must never swap the
+/// `ScrolledWindow`'s child: a control that re-derives the grid from the scroller
+/// would silently go inert (no error, no log) the moment the child changed, which
+/// is why [`lighttable_page`] hands the grid out instead. See the m4-98c design
+/// note in `RUST_MIGRATION_PLAN.md`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewMode {
+    /// Scrolling grid of thumbnails — the layout the lighttable has always had,
+    /// and the default.
+    FileManager,
+    /// darktable's infinite zoom plane. Not ported: a `GridView` cannot express it
+    /// (see [`ViewMode::is_available`]).
+    Zoomable,
+    /// A fixed window of N images filling the viewport, for side-by-side
+    /// comparison. Not yet built (increment b).
+    Culling,
+}
+
+impl ViewMode {
+    /// Modes in switcher-button order — the switcher and the token table are both
+    /// built by iterating this, so neither can drift from the other. Note the
+    /// completeness of this list is **convention, not compiler-checked**: a variant
+    /// added to the enum and forgotten here would have no button and no token, and
+    /// nothing would say so. Adding a variant means touching this line.
+    pub const ALL: [ViewMode; 3] = [Self::FileManager, Self::Zoomable, Self::Culling];
+
+    /// Whether *this build* can actually render the mode. The switcher greys out
+    /// the rest, and [`apply_view_mode_token`] refuses to restore one — so a pref
+    /// written by a later build (or hand-edited) can never leave the lighttable in
+    /// a mode that draws nothing. Flip a variant to `true` in the increment that
+    /// implements it; that single edit lights up the button and the restore path
+    /// together.
+    ///
+    /// `const` on purpose: availability is a property of the build, not runtime
+    /// state — nothing should ever make a mode available conditionally at runtime.
+    pub const fn is_available(self) -> bool {
+        match self {
+            Self::FileManager => true,
+            Self::Zoomable | Self::Culling => false,
+        }
+    }
+
+    /// Icon for the mode's switcher button. The bar is icon-only here: the bottom
+    /// `CenterBox`'s minimum width is contended (the ~915px lighttable overflow
+    /// gotcha), and this control shares the centre slot with the overlay dropdown.
+    /// All three are core Adwaita symbolics — a name absent from the theme renders
+    /// as the broken-image glyph rather than failing loudly, so they were checked
+    /// against the container's icon theme
+    /// (`/usr/share/icons/Adwaita/symbolic/actions/`).
+    pub const fn icon_name(self) -> &'static str {
+        match self {
+            Self::FileManager => "view-grid-symbolic",
+            Self::Zoomable => "view-paged-symbolic",
+            Self::Culling => "view-dual-symbolic",
+        }
+    }
+
+    /// One line describing the mode — the only place it is spelled out, since its
+    /// button carries just an icon. Rendered into the switcher's *container*
+    /// tooltip, never onto the buttons: see [`view_mode_switcher_tooltip`].
+    pub const fn tooltip(self) -> &'static str {
+        match self {
+            Self::FileManager => "File manager: scrolling grid of thumbnails",
+            Self::Zoomable => "Zoomable lighttable (not available yet)",
+            Self::Culling => "Culling: compare a fixed set side by side (not available yet)",
+        }
+    }
+}
+
+/// Tooltip for the switcher **container**, listing every mode.
+///
+/// It goes on the container and not on the buttons because **GTK4 never emits
+/// `query-tooltip` for an insensitive widget** — this repo already learned that on
+/// the header's disabled "Other" view (see `build_view_switcher`), where the fix
+/// was to drop the tooltip entirely. Here the modes that aren't ported yet are
+/// precisely the ones needing explanation, so instead the sensitive parent carries
+/// one string covering all of them; a greyed icon then has somewhere to explain
+/// itself. Built from [`ViewMode::ALL`] and pure, so it's unit-testable and can't
+/// list a mode the switcher doesn't show.
+pub fn view_mode_switcher_tooltip() -> String {
+    let mut s = String::from("Lighttable layout:");
+    for mode in ViewMode::ALL {
+        s.push_str("\n• ");
+        s.push_str(mode.tooltip());
+    }
+    s
+}
+
+/// Persisted view-mode token pieces — shared by the encoder and decoder so they
+/// can't silently disagree (same discipline as the overlay-mode token).
+const VIEW_TOK_FILEMANAGER: &str = "filemanager";
+const VIEW_TOK_ZOOMABLE: &str = "zoomable";
+const VIEW_TOK_CULLING: &str = "culling";
+
+/// Pure encoder for the persisted view-mode token. `pub` so the bottom bar can
+/// persist exactly the mode it just applied, rather than re-reading the global.
+pub const fn view_mode_token_for(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::FileManager => VIEW_TOK_FILEMANAGER,
+        ViewMode::Zoomable => VIEW_TOK_ZOOMABLE,
+        ViewMode::Culling => VIEW_TOK_CULLING,
+    }
+}
+
+/// Parse a persisted view-mode token, falling back to `FileManager` on anything
+/// unrecognised **or not available in this build** — restoring a mode that draws
+/// nothing would look like a hung lighttable. Derived by *inverting the encoder*
+/// over [`ViewMode::ALL`] rather than restating the mapping, so encoder and decoder
+/// cannot drift apart. Pure, so it's unit-testable.
+fn parse_view_mode_token(tok: &str) -> ViewMode {
+    ViewMode::ALL
+        .iter()
+        .find(|&&m| view_mode_token_for(m) == tok && m.is_available())
+        .copied()
+        .unwrap_or(ViewMode::FileManager)
+}
+
+/// Seed the view mode from a persisted token *without* touching any widget —
+/// called at startup before the grid is configured. Main-thread only.
+pub fn apply_view_mode_token(tok: &str) {
+    // Through the single writer, so the "current mode is always one we can render"
+    // rule lives in exactly one place. The parser already filters unavailable
+    // modes, so the write cannot be refused here — and if it ever were, the mode
+    // would stay at the renderable default rather than at something blank.
+    store_view_mode(parse_view_mode_token(tok));
+}
+
 thread_local! {
     /// The current grid sort order (main-thread-only UI state).
     static SORT_ORDER: Cell<SortOrder> = const { Cell::new(SortOrder::Filename) };
@@ -1129,6 +1276,9 @@ thread_local! {
     /// Which per-thumbnail overlays the grid draws. Default `Extended` (filename +
     /// stars + colour dots) so the out-of-box look matches the pre-m4-98e cell.
     static OVERLAY_MODE: Cell<OverlayMode> = const { Cell::new(OverlayMode::Extended) };
+    /// Which layout the grid is drawn in (m4-98c). Default `FileManager` — the
+    /// scrolling grid the lighttable has always shown.
+    static VIEW_MODE: Cell<ViewMode> = const { Cell::new(ViewMode::FileManager) };
     /// Display-refresh closures for the filter controls (m4-97c) — see
     /// [`add_filter_observer`]. Several controls now drive one filter state, so
     /// each change has to push back out to all of them.
@@ -1176,6 +1326,55 @@ pub fn current_rating_compare() -> RatingCompare {
 /// seed its dropdown from the restored value.
 pub fn current_overlay_mode() -> OverlayMode {
     OVERLAY_MODE.with(|m| m.get())
+}
+
+/// The layout the grid is drawn in right now. `pub` so the bottom bar can seed its
+/// switcher from the restored value.
+pub fn current_view_mode() -> ViewMode {
+    VIEW_MODE.with(|m| m.get())
+}
+
+/// The one writer of [`VIEW_MODE`], so "the current mode is always one this build
+/// can render" is enforced in a single place rather than re-checked by every
+/// caller. Returns `false` — leaving the current mode **untouched** — if the mode
+/// is unavailable. Private and widget-free: it is the availability gate the persist
+/// path depends on, so it stays testable with no display. Main-thread only.
+fn store_view_mode(mode: ViewMode) -> bool {
+    if !mode.is_available() {
+        return false;
+    }
+    VIEW_MODE.with(|m| m.set(mode));
+    true
+}
+
+/// Apply `mode` to `grid` — reconfiguring it in place, never swapping the
+/// `ScrolledWindow`'s child (see [`ViewMode`]). Separate from the state write so
+/// the startup path can re-apply the restored mode to a freshly built grid without
+/// going through the switcher's handlers.
+///
+/// Empty for `FileManager`: the grid is built in that configuration, so entering it
+/// means undoing nothing *yet* — the per-mode reconfiguration lands with the mode
+/// that needs it (culling swaps in a `SliceListModel` and pins the column bounds).
+fn reconfigure_grid_for(_grid: &GridView, mode: ViewMode) {
+    match mode {
+        ViewMode::FileManager => {}
+        // Unreachable while `is_available` is false for these; the match is
+        // exhaustive so implementing a mode can't forget to land its layout here.
+        ViewMode::Zoomable | ViewMode::Culling => {}
+    }
+}
+
+/// Switch the lighttable layout: write the mode, then reconfigure `grid` for it. An
+/// unavailable mode is refused rather than half-applied — and the caller learns
+/// that from the `false` return, so it neither persists nor keeps displaying a mode
+/// that was never entered. Main-thread only.
+#[must_use]
+pub fn set_view_mode(grid: &GridView, mode: ViewMode) -> bool {
+    if !store_view_mode(mode) {
+        return false;
+    }
+    reconfigure_grid_for(grid, mode);
+    true
 }
 
 /// Show/hide a cell's three metadata rows — `(filename, stars, colours)`, as
@@ -1861,6 +2060,8 @@ mod tests {
                 flags_with_star_rating, index_of_path, overlay_mode_token_for,
                 overlay_visibility, parse_overlay_mode_token, parse_rating_filter_token,
                 path_write_lock, rating_filter_token_for, rating_predicate, OverlayMode,
+                apply_view_mode_token, current_view_mode, parse_view_mode_token,
+                store_view_mode, view_mode_switcher_tooltip, view_mode_token_for, ViewMode,
                 RatingCompare, SortOrder, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
     use std::sync::Arc;
 
@@ -2213,6 +2414,109 @@ mod tests {
         // A corrupt persisted value restores the default look rather than panicking.
         apply_overlay_mode_token("nonsense");
         assert_eq!(current_overlay_mode(), OverlayMode::Extended);
+    }
+
+    #[test]
+    fn view_mode_buttons_are_labelled_and_tokens_are_distinct() {
+        // Iterate ALL (not a hardcoded list) so adding a variant forces a test touch.
+        assert_eq!(ViewMode::ALL.len(), 3);
+        let mut tokens: Vec<&str> = Vec::new();
+        for mode in ViewMode::ALL {
+            // Every button has an icon and a description, since it carries no label:
+            // an empty icon name would render as the broken-image glyph, and an
+            // empty description would leave the mode entirely unnamed in the UI.
+            assert!(!mode.icon_name().is_empty(), "icon {mode:?}");
+            assert!(!mode.tooltip().is_empty(), "tooltip {mode:?}");
+            // The switcher's one tooltip is the only place a greyed-out mode can
+            // explain itself, so every mode must actually appear in it.
+            assert!(
+                view_mode_switcher_tooltip().contains(mode.tooltip()),
+                "switcher tooltip omits {mode:?}"
+            );
+            tokens.push(view_mode_token_for(mode));
+        }
+        // Tokens are distinct, so no two modes can collide in the prefs table (the
+        // decoder inverts the encoder, so a duplicate would silently alias a mode).
+        tokens.sort_unstable();
+        let distinct = tokens.len();
+        tokens.dedup();
+        assert_eq!(tokens.len(), distinct, "view-mode tokens must be distinct");
+        // Corrupt tokens fall back to the default layout rather than panicking.
+        assert_eq!(parse_view_mode_token("garbage"), ViewMode::FileManager);
+        assert_eq!(parse_view_mode_token(""), ViewMode::FileManager);
+    }
+
+    #[test]
+    fn view_mode_token_decodes_only_available_modes() {
+        // encode∘decode is identity for a mode this build can render; a mode it
+        // cannot render decodes to FileManager even though its token is perfectly
+        // well-formed — restoring it would open the lighttable onto a layout that
+        // draws nothing. Both halves iterate ALL, so implementing a mode (flipping
+        // `is_available`) moves it from one arm to the other with no test edit.
+        for mode in ViewMode::ALL {
+            let decoded = parse_view_mode_token(view_mode_token_for(mode));
+            if mode.is_available() {
+                assert_eq!(decoded, mode, "available mode must round-trip: {mode:?}");
+            } else {
+                assert_eq!(
+                    decoded,
+                    ViewMode::FileManager,
+                    "unavailable mode must not restore: {mode:?}"
+                );
+            }
+        }
+        // The default layout is always available — otherwise the fallback above
+        // would itself be unrenderable.
+        assert!(ViewMode::FileManager.is_available());
+    }
+
+    #[test]
+    fn apply_view_mode_token_seeds_the_current_mode() {
+        // The startup restore path end-to-end (thread-locals are per-test-thread).
+        for mode in ViewMode::ALL.into_iter().filter(|m| m.is_available()) {
+            apply_view_mode_token(view_mode_token_for(mode));
+            assert_eq!(current_view_mode(), mode);
+        }
+        // A corrupt persisted value restores the default layout rather than
+        // panicking. Deliberately last: it also leaves VIEW_MODE back at the
+        // default for anything else sharing this test thread.
+        apply_view_mode_token("nonsense");
+        assert_eq!(current_view_mode(), ViewMode::FileManager);
+    }
+
+    #[test]
+    fn refused_view_mode_leaves_the_current_mode_untouched() {
+        // The property the switcher's persist path depends on: a refused switch is
+        // a no-op, not a half-applied one. `store_view_mode` is the pure half of
+        // `set_view_mode` precisely so this needs no display.
+        apply_view_mode_token(view_mode_token_for(ViewMode::FileManager));
+        for mode in ViewMode::ALL.into_iter().filter(|m| !m.is_available()) {
+            assert!(!store_view_mode(mode), "unavailable mode must be refused: {mode:?}");
+            assert_eq!(
+                current_view_mode(),
+                ViewMode::FileManager,
+                "a refused switch must not mutate the current mode: {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_view_mode_is_always_renderable() {
+        // The invariant the switcher silently depends on when it seeds its buttons:
+        // GTK's `set_active` ignores sensitivity, so a current mode whose button is
+        // insensitive would pin the group on a button the user can never click off.
+        // Every writer of VIEW_MODE must preserve this.
+        for tok in ["", "garbage", "culling", "zoomable", "filemanager", "FileManager"] {
+            apply_view_mode_token(tok);
+            assert!(
+                current_view_mode().is_available(),
+                "token {tok:?} left the lighttable in an unrenderable mode"
+            );
+        }
+        for mode in ViewMode::ALL {
+            store_view_mode(mode);
+            assert!(current_view_mode().is_available(), "after storing {mode:?}");
+        }
     }
 
     #[test]

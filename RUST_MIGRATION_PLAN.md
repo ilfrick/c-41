@@ -306,11 +306,75 @@ C FFI trampolines for tags. 61 DB tests passing.
         first, zero behaviour change; (b) culling via `SliceListModel` + arrow-key
         navigation; (c) full preview; (d) zoomable, only if (c) proves it's worth
         it.
+      - **m4-98c(a) — done.** `ViewMode` (`FileManager`/`Zoomable`/`Culling`) +
+        `view_mode` pref + the switcher, only file-manager live.
+        - **The coupling was fixed rather than documented.** The design said to
+          return the `GridView` from `lighttable_page` "if a mode ever genuinely
+          needs a different widget"; the switcher made it a *third* consumer of
+          `scroll.child().and_downcast::<GridView>()`, so it was done now, on
+          plumbing, instead of mid-culling. `lighttable_page` returns a
+          `LighttablePage { scroll, grid, model, selection }` and nothing
+          re-derives the grid — "the bottom-bar controls always find the grid" is
+          now true by construction, not by comment. That also removed a bare
+          `if let Some(grid) = …` with no `else`, which would have silently
+          dropped the rating filter, switcher, overlay dropdown *and* stepper.
+        - **`is_available()` gates both ends.** Unported modes are insensitive in
+          the switcher *and* refused by `parse_view_mode_token`, so a `view_mode`
+          pref written by a later build can't open the lighttable onto a layout
+          that draws nothing. Implementing a mode is one edit (flip the arm),
+          which lights up the button and the restore path together. The refusal is
+          **non-destructive**: a stale `culling` pref is downgraded on read but
+          never rewritten, so it will resurrect when culling lands — deliberate
+          (it honours what the user asked for), and worth remembering.
+        - `store_view_mode` is the single writer of the state, so "the current
+          mode is always one this build can render" is enforced in one place; it's
+          widget-free, so the gate the persist path depends on is testable with no
+          display. `set_view_mode` = that write + `reconfigure_grid_for` (empty
+          for file-manager, exhaustive so a new mode can't forget its layout).
+        - **The restored mode is applied to the grid explicitly**, once, outside
+          the toggle handlers — seeding a button only lights it. Inert today;
+          without it, restoring culling would show a lit culling button over a
+          file-manager grid with nothing to say so. Handlers are connected in
+          phases (build+group → seed → connect → apply) because joining a group
+          clears the joiner's active flag, and a `resync()` closure (behind a
+          re-entrancy `Cell`, since `set_active` re-emits `toggled`) rolls the
+          buttons back if a switch is ever refused — refusing to *persist* while
+          leaving the button lit would display a mode never entered.
+        - **Tooltips live on the box, not the buttons:** GTK4 never emits
+          `query-tooltip` for an insensitive widget (the same finding as the
+          header's disabled "Other" view), so per-button text on exactly the modes
+          that need explaining would be unreadable. `view_mode_switcher_tooltip()`
+          builds one string from `ALL` — pure, and tested to mention every mode.
+        - Cost recorded honestly: increment (a) is behaviour-neutral but **not**
+          layout-neutral — three icon toggles add ~110px to the bottom bar's
+          minimum width, against the known ~915px overflow. No slot arrangement is
+          cheaper (`CenterBox`'s minimum is start+centre+end regardless); the real
+          fix is an `adw::Breakpoint` hiding the switcher on narrow windows, and
+          this control is its first good client.
+        - 4 new tests, chosen for what would actually regress: a refused switch
+          must not mutate state; `current_view_mode()` is renderable after *any*
+          token (GTK's `set_active` ignores sensitivity, so a mode whose button is
+          insensitive would pin the group on a button nobody can click off);
+          available modes round-trip while unavailable ones decode to file-manager;
+          tokens are distinct and every mode is named in the tooltip.
+        - Verified live in the container: switcher renders (icons checked against
+          the container's Adwaita theme — a missing name draws the broken-image
+          glyph, it doesn't fail), file-manager active with the other two greyed;
+          **the thumb stepper still steps (6→8) and grid keys/activation still
+          work after the plumbing change** — that is the regression the constraint
+          guards; and a hand-planted `view_mode=culling` pref restarts into
+          file-manager with the grid rendering normally. The overlay dropdown
+          renders but its popover can't be driven by synthetic input — GTK
+          popovers don't reach the KasmVNC framebuffer capture (same class as the
+          black-dialog gotcha); it shares the exact grid binding the stepper
+          exercised.
       - **Live checks** (xdotool synthetic input is unreliable here — see the
         m4-99b lessons): switch each mode and confirm the thumb stepper AND
         overlay dropdown still work afterwards (that is the regression the hard
         constraint above guards); culling with fewer images than `n`; culling at
-        the collection's last page; a mode restored from the pref at startup.
+        the collection's last page; a mode restored from the pref at startup —
+        and specifically that the restored mode **reconfigures the grid**, not
+        just lights its button.
     - Also queued for this bar: colour quick-filter (compose-on-top would overlap
       the existing left-panel colour selector — reconcile first) and a
       "clear all filters" reset.

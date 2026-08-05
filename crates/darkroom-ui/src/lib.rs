@@ -45,6 +45,11 @@ const RATING_FILTER_PREF_KEY: &str = "rating_filter";
 /// [`lighttable::overlay_mode_token`] (`none` / `normal` / `extended`).
 const OVERLAY_MODE_PREF_KEY: &str = "overlay_mode";
 
+/// `darkroom_ui_prefs` key under which the lighttable view mode is persisted across
+/// sessions (m4-98c). The value is the token from
+/// [`lighttable::view_mode_token_for`] (`filemanager` / `zoomable` / `culling`).
+const VIEW_MODE_PREF_KEY: &str = "view_mode";
+
 pub fn run() -> Result<glib::ExitCode> {
     let app = Application::builder()
         .application_id(APP_ID)
@@ -173,6 +178,12 @@ fn build_main_window(app: &Application) {
     if let Some(tok) = persist::load_ui_pref(&db_path, OVERLAY_MODE_PREF_KEY) {
         lighttable::apply_overlay_mode_token(&tok);
     }
+    // And the lighttable view mode (m4-98c), before the bottom bar seeds its
+    // switcher from it. A mode this build can't render is refused by the parser,
+    // so a stale/hand-edited pref can't open onto an empty lighttable.
+    if let Some(tok) = persist::load_ui_pref(&db_path, VIEW_MODE_PREF_KEY) {
+        lighttable::apply_view_mode_token(&tok);
+    }
 
     // ── Toast overlay (wraps everything for in-app notifications) ──────────
     let toast_overlay = adw::ToastOverlay::new();
@@ -184,8 +195,16 @@ fn build_main_window(app: &Application) {
     };
 
     // ── Lighttable ─────────────────────────────────────────────────────────
-    let (scroll, lt_model, lt_selection) =
-        lighttable::lighttable_page(db_path.clone());
+    // Destructured rather than re-derived: the bottom-bar controls and the
+    // navigation wiring below all need the GridView, and fishing it back out with
+    // `scroll.child().and_downcast()` would make every one of them silently go
+    // inert the day a view mode changes the scroller's child (m4-98c).
+    let lighttable::LighttablePage {
+        scroll,
+        grid: lt_grid,
+        model: lt_model,
+        selection: lt_selection,
+    } = lighttable::lighttable_page(db_path.clone());
     lighttable::lighttable_load_from_db(&lt_model, &db_path);
 
     // ── Panels ─────────────────────────────────────────────────────────────
@@ -598,10 +617,126 @@ fn build_main_window(app: &Application) {
             bottom.set_start_widget(Some(&filter_box));
         }
 
-        if let Some(grid) = scroll.child().and_downcast::<gtk4::GridView>() {
+        {
+            let grid = lt_grid.clone();
             // The grid's own `max-columns` property is the single source of truth
             // for the current thumb size — no separate counter to keep in sync.
             grid.set_max_columns(THUMB_COLS_DEFAULT);
+
+            // Centre of the bar carries two controls, so it is a Box rather than a
+            // bare widget: the CenterBox has exactly three slots and the rating
+            // filter (start) and thumb stepper (end) hold the other two.
+            let center_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+
+            // View-mode switcher (m4-98c): darktable's file manager / zoomable /
+            // culling layouts as a linked group of icon-only toggles, built from
+            // `ViewMode::ALL` so the control can't drift from the variants. Modes
+            // this build can't render are insensitive — like the header's "Other"
+            // view — so they can't break the group's single-active invariant, and
+            // the greying is the "unavailable" affordance. The explanation lives on
+            // the box, not the buttons: GTK4 never emits query-tooltip for an
+            // insensitive widget, so a per-button tooltip on exactly the modes that
+            // need explaining would be text nobody can read.
+            {
+                let mode_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+                mode_box.add_css_class("linked");
+                mode_box.set_valign(gtk4::Align::Center);
+                mode_box.set_tooltip_text(Some(&lighttable::view_mode_switcher_tooltip()));
+
+                // Phase 1 — build and group every button, activating none. Joining a
+                // group clears the joiner's active flag, so seeding is a separate
+                // pass rather than something interleaved with group construction.
+                let buttons: Vec<(lighttable::ViewMode, gtk4::ToggleButton)> =
+                    lighttable::ViewMode::ALL
+                        .into_iter()
+                        .map(|mode| {
+                            let btn = gtk4::ToggleButton::builder()
+                                .icon_name(mode.icon_name())
+                                .sensitive(mode.is_available())
+                                .build();
+                            mode_box.append(&btn);
+                            (mode, btn)
+                        })
+                        .collect();
+                if let Some((_, first)) = buttons.first() {
+                    for (_, btn) in buttons.iter().skip(1) {
+                        btn.set_group(Some(first));
+                    }
+                }
+
+                // Push the live mode back onto the buttons. Used to seed them, and
+                // to roll the display back if a switch is ever refused — refusing to
+                // *persist* a mode while leaving its button lit would show a mode
+                // that was never entered. `set_active` re-enters `toggled`, so the
+                // guard is what keeps that from recursing.
+                let syncing = std::rc::Rc::new(std::cell::Cell::new(false));
+                let resync: std::rc::Rc<dyn Fn()> = {
+                    let buttons = buttons.clone();
+                    let syncing = syncing.clone();
+                    std::rc::Rc::new(move || {
+                        syncing.set(true);
+                        let live = lighttable::current_view_mode();
+                        for (mode, btn) in &buttons {
+                            btn.set_active(*mode == live);
+                        }
+                        syncing.set(false);
+                    })
+                };
+
+                // Phase 2 — seed from the restored mode BEFORE any handler exists,
+                // so seeding can't fire a spurious re-apply + re-persist.
+                debug_assert!(
+                    lighttable::current_view_mode().is_available(),
+                    "the current view mode must always be one this build can render",
+                );
+                resync();
+
+                // Phase 3 — connect the handlers.
+                for (mode, btn) in &buttons {
+                    let mode = *mode;
+                    btn.connect_toggled({
+                        let grid = grid.clone();
+                        let db = db_path.clone();
+                        let resync = resync.clone();
+                        let syncing = syncing.clone();
+                        move |b| {
+                            // Skip the writes `resync` itself makes, and the `toggled`
+                            // a radio group emits on the button going OFF — only the
+                            // button turning ON is a mode change.
+                            if syncing.get() || !b.is_active() {
+                                return;
+                            }
+                            if lighttable::set_view_mode(&grid, mode) {
+                                persist::save_ui_pref(
+                                    &db,
+                                    VIEW_MODE_PREF_KEY,
+                                    lighttable::view_mode_token_for(mode),
+                                );
+                            } else {
+                                // Refused (a mode this build can't render): put the
+                                // buttons back on the mode actually in effect rather
+                                // than leaving the UI claiming one that isn't.
+                                resync();
+                            }
+                        }
+                    });
+                }
+                // Phase 4 — the restored mode has so far only lit a button; the grid
+                // still has to be told, once, outside the handlers (going through
+                // them would re-persist a pref that never changed). A no-op for
+                // FileManager today, load-bearing from the culling increment on:
+                // without it, restoring culling would show a lit culling button over
+                // a file-manager grid, with nothing to say so.
+                if !lighttable::set_view_mode(&grid, lighttable::current_view_mode()) {
+                    tracing::warn!(
+                        "restored view mode is not renderable by this build; \
+                         lighttable stays in the file-manager layout"
+                    );
+                    resync();
+                }
+
+                center_box.append(&mode_box);
+            }
 
             // Thumbnail overlay mode (m4-98e), centre of the bar: how much metadata
             // each cell shows. Seeded from the restored pref BEFORE the handler is
@@ -632,8 +767,10 @@ fn build_main_window(app: &Application) {
                         );
                     }
                 });
-                bottom.set_center_widget(Some(&overlays));
+                center_box.append(&overlays);
             }
+
+            bottom.set_center_widget(Some(&center_box));
 
             let zoom_out = gtk4::Button::builder()
                 .icon_name("zoom-out-symbolic")
@@ -711,61 +848,60 @@ fn build_main_window(app: &Application) {
 
     // Double-click → darkroom page; F1–F5 → toggle colour label on selection.
     {
-        if let Some(grid) = scroll.child().and_downcast::<gtk4::GridView>() {
-            grid.connect_activate(clone!(@weak nav, @weak lt_model, @strong db_path => move |_, pos| {
-                if let Some(path) = lt_model.item(pos)
-                    .and_downcast::<gtk4::StringObject>()
-                    .map(|o| o.string().to_string())
-                    .filter(|p| p.contains('/'))
-                {
-                    let page = darkroom::darkroom_page(&path, &db_path);
-                    // Tag the page with its image path so the pop handler below can
-                    // recover which cell to re-sync (m4-25), regardless of how the
-                    // page was dismissed (back button / Escape / swipe gesture).
-                    page.set_tag(Some(&path));
-                    nav.push(&page);
-                }
-            }));
+        let grid = lt_grid.clone();
+        grid.connect_activate(clone!(@weak nav, @weak lt_model, @strong db_path => move |_, pos| {
+            if let Some(path) = lt_model.item(pos)
+                .and_downcast::<gtk4::StringObject>()
+                .map(|o| o.string().to_string())
+                .filter(|p| p.contains('/'))
+            {
+                let page = darkroom::darkroom_page(&path, &db_path);
+                // Tag the page with its image path so the pop handler below can
+                // recover which cell to re-sync (m4-25), regardless of how the
+                // page was dismissed (back button / Escape / swipe gesture).
+                page.set_tag(Some(&path));
+                nav.push(&page);
+            }
+        }));
 
-            // m4-25/m4-28: when a darkroom page is popped, its colour labels and/or
-            // star rating may have been changed in that view; re-query the DB and
-            // repaint the returning grid cell's dot + star rows so the lighttable
-            // doesn't show stale metadata until it rebinds. Every page pushed past
-            // the lighttable root IS a darkroom page, and its tag carries the image
-            // path; we guard on the `/` just like the loaders.
-            nav.connect_popped(clone!(@weak grid, @strong db_path => move |_, page| {
-                if let Some(path) = page.tag().map(|s| s.to_string()).filter(|p| p.contains('/')) {
-                    lighttable::refresh_color_dots_for_path(&grid, &db_path, &path);
-                    lighttable::refresh_stars_for_path(&grid, &db_path, &path);
-                }
-            }));
+        // m4-25/m4-28: when a darkroom page is popped, its colour labels and/or
+        // star rating may have been changed in that view; re-query the DB and
+        // repaint the returning grid cell's dot + star rows so the lighttable
+        // doesn't show stale metadata until it rebinds. Every page pushed past
+        // the lighttable root IS a darkroom page, and its tag carries the image
+        // path; we guard on the `/` just like the loaders.
+        nav.connect_popped(clone!(@weak grid, @strong db_path => move |_, page| {
+            if let Some(path) = page.tag().map(|s| s.to_string()).filter(|p| p.contains('/')) {
+                lighttable::refresh_color_dots_for_path(&grid, &db_path, &path);
+                lighttable::refresh_stars_for_path(&grid, &db_path, &path);
+            }
+        }));
 
-            // Metadata keyboard shortcuts on the selected grid image (darktable):
-            // plain F1..F5 toggle colour label 0..4; plain 0..5 set the star rating.
-            // Both repaint just that cell's row in place. The controller lives on the
-            // grid, so it only fires when the lighttable has focus — not the darkroom
-            // page, and not while the user is typing in the search entry. Modifier
-            // combos (Ctrl/Alt + key) are left to propagate so they can't be mistaken
-            // for a metadata shortcut.
-            let key = gtk4::EventControllerKey::new();
-            let sel = lt_selection.clone();
-            let db  = db_path.clone();
-            key.connect_key_pressed(clone!(@weak grid => @default-return glib::Propagation::Proceed, move |_, keyval, _, state| {
-                if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK) {
-                    return glib::Propagation::Proceed;
-                }
-                if let Some(color) = lighttable::fkey_to_color(keyval) {
-                    lighttable::toggle_selected_color(&grid, &sel, &db, color);
-                    return glib::Propagation::Stop;
-                }
-                if let Some(rating) = lighttable::digit_to_rating(keyval) {
-                    lighttable::set_selected_rating(&grid, &sel, &db, rating);
-                    return glib::Propagation::Stop;
-                }
-                glib::Propagation::Proceed
-            }));
-            grid.add_controller(key);
-        }
+        // Metadata keyboard shortcuts on the selected grid image (darktable):
+        // plain F1..F5 toggle colour label 0..4; plain 0..5 set the star rating.
+        // Both repaint just that cell's row in place. The controller lives on the
+        // grid, so it only fires when the lighttable has focus — not the darkroom
+        // page, and not while the user is typing in the search entry. Modifier
+        // combos (Ctrl/Alt + key) are left to propagate so they can't be mistaken
+        // for a metadata shortcut.
+        let key = gtk4::EventControllerKey::new();
+        let sel = lt_selection.clone();
+        let db  = db_path.clone();
+        key.connect_key_pressed(clone!(@weak grid => @default-return glib::Propagation::Proceed, move |_, keyval, _, state| {
+            if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(color) = lighttable::fkey_to_color(keyval) {
+                lighttable::toggle_selected_color(&grid, &sel, &db, color);
+                return glib::Propagation::Stop;
+            }
+            if let Some(rating) = lighttable::digit_to_rating(keyval) {
+                lighttable::set_selected_rating(&grid, &sel, &db, rating);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }));
+        grid.add_controller(key);
     }
 
     // ── View switcher (m4-97d) ─────────────────────────────────────────────
