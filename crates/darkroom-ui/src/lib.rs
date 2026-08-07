@@ -264,15 +264,13 @@ fn build_main_window(app: &Application) {
     {
         let meta = right.clone();
         let db   = db_path.clone();
-        let mdl  = lt_model.clone();
+        // Through `selected_path`, never through the full model: `selected()` is an
+        // index into whatever the grid is *showing*, which culling narrows to a
+        // window (m4-98c b). Indexing the full collection with it would show the
+        // metadata of a different image, silently and plausibly.
         lt_selection.connect_selection_changed(move |sel, _, _| {
-            if let Some(path) = mdl.item(sel.selected())
-                .and_downcast::<gtk4::StringObject>()
-                .map(|o| o.string().to_string())
-            {
-                if path.contains('/') {
-                    meta.update(&path, &db);
-                }
+            if let Some(path) = lighttable::selected_path(sel) {
+                meta.update(&path, &db);
             }
         });
     }
@@ -347,15 +345,13 @@ fn build_main_window(app: &Application) {
             .build();
         let toast_fn = make_toast.clone();
         let export_db = db_path.clone();
-        btn.connect_clicked(clone!(@weak lt_model, @weak lt_selection, @weak window => move |_| {
-            let pos = lt_selection.selected();
-            let paths: Vec<String> = if let Some(path) = lt_model.item(pos)
-                .and_downcast::<gtk4::StringObject>()
-                .map(|o| o.string().to_string())
-                .filter(|p| p.contains('/'))
-            {
-                vec![path]
-            } else { vec![] };
+        // `selected_path` resolves against the model the grid is showing, so this
+        // exports the image the user is looking at in every layout. Indexing the
+        // full collection with a window-relative `selected()` would export a
+        // DIFFERENT FILE under culling, with nothing to signal it (m4-98c b).
+        btn.connect_clicked(clone!(@weak lt_selection, @weak window => move |_| {
+            let paths: Vec<String> =
+                lighttable::selected_path(&lt_selection).into_iter().collect();
             dialogs::show_export_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 paths,
@@ -623,6 +619,61 @@ fn build_main_window(app: &Application) {
             // for the current thumb size — no separate counter to keep in sync.
             grid.set_max_columns(THUMB_COLS_DEFAULT);
 
+            // Thumb-size stepper (m4-98a). Built here, ahead of the controls that
+            // sit to its left, because the view-mode switcher has to refresh it:
+            // in culling this same control sets how many images are compared, so
+            // its range, label and sensitivity all change with the mode.
+            let zoom_out = gtk4::Button::builder()
+                .icon_name("zoom-out-symbolic")
+                .tooltip_text("Larger thumbnails (fewer per row)")
+                .build();
+            let count = gtk4::Label::new(Some(&THUMB_COLS_DEFAULT.to_string()));
+            count.set_width_chars(2);
+            let zoom_in = gtk4::Button::builder()
+                .icon_name("zoom-in-symbolic")
+                .tooltip_text("Smaller thumbnails (more per row)")
+                .build();
+
+            // Sync the label + button sensitivity to the grid's current bound, and
+            // grey out a button once its end of the range is reached so the control
+            // can't run past it. The range is the stepper's own in the file manager
+            // and culling's comparison-set range in culling: without that, steps
+            // past the culling maximum would count up on the label while nothing on
+            // screen moved — a control that looks live and isn't.
+            let refresh: std::rc::Rc<dyn Fn()> = {
+                let grid = grid.clone();
+                let count = count.clone();
+                let zoom_out = zoom_out.clone();
+                let zoom_in = zoom_in.clone();
+                std::rc::Rc::new(move || {
+                    // Re-fit the culling window first — it depends on the viewport
+                    // width, so this is what fits culling after the first
+                    // allocation and after a resize. Returns immediately when the
+                    // size is already right, and is a no-op in the file manager.
+                    lighttable::cull_resync(&grid);
+                    // In culling the label is the number of images ACTUALLY on
+                    // screen, which a narrow viewport can hold below what the
+                    // stepper asks for; `max_columns` is left alone so the chosen
+                    // thumb size comes back when there is room again.
+                    let (n, lo, hi) = lighttable::cull_stepper_state(&grid)
+                        .unwrap_or((grid.max_columns(), THUMB_COLS_MIN, THUMB_COLS_MAX));
+                    count.set_label(&n.to_string());
+                    zoom_out.set_sensitive(n > lo);
+                    zoom_in.set_sensitive(n < hi);
+                })
+            };
+            refresh(); // sync initial label + sensitivity to the default
+
+            // Re-fit when the viewport width changes. At startup the view mode is
+            // restored before the grid is allocated, so culling's window has no
+            // width to fit to yet; the scroller's horizontal page-size is the
+            // viewport width and notifies on allocation as well as on every later
+            // resize, which covers both cases with one signal.
+            scroll.hadjustment().connect_page_size_notify({
+                let refresh = refresh.clone();
+                move |_| refresh()
+            });
+
             // Centre of the bar carries two controls, so it is a Box rather than a
             // bare widget: the CenterBox has exactly three slots and the rating
             // filter (start) and thumb stepper (end) hold the other two.
@@ -699,6 +750,7 @@ fn build_main_window(app: &Application) {
                         let db = db_path.clone();
                         let resync = resync.clone();
                         let syncing = syncing.clone();
+                        let refresh = refresh.clone();
                         move |b| {
                             // Skip the writes `resync` itself makes, and the `toggled`
                             // a radio group emits on the button going OFF — only the
@@ -712,6 +764,10 @@ fn build_main_window(app: &Application) {
                                     VIEW_MODE_PREF_KEY,
                                     lighttable::view_mode_token_for(mode),
                                 );
+                                // The stepper's range differs per mode (in culling
+                                // it sets the comparison-set size), so re-clamp and
+                                // relabel it for the mode just entered.
+                                refresh();
                             } else {
                                 // Refused (a mode this build can't render): put the
                                 // buttons back on the mode actually in effect rather
@@ -734,6 +790,7 @@ fn build_main_window(app: &Application) {
                     );
                     resync();
                 }
+                refresh(); // the restored mode may narrow the stepper's range
 
                 center_box.append(&mode_box);
             }
@@ -772,50 +829,24 @@ fn build_main_window(app: &Application) {
 
             bottom.set_center_widget(Some(&center_box));
 
-            let zoom_out = gtk4::Button::builder()
-                .icon_name("zoom-out-symbolic")
-                .tooltip_text("Larger thumbnails (fewer per row)")
-                .build();
-            let count = gtk4::Label::new(Some(&THUMB_COLS_DEFAULT.to_string()));
-            count.set_width_chars(2);
-            let zoom_in = gtk4::Button::builder()
-                .icon_name("zoom-in-symbolic")
-                .tooltip_text("Smaller thumbnails (more per row)")
-                .build();
-
-            // Sync the label + button sensitivity to the grid's current bound, and
-            // grey out a button once its end of the range is reached so the control
-            // can't run past [THUMB_COLS_MIN, THUMB_COLS_MAX].
-            let refresh = {
-                let grid = grid.clone();
-                let count = count.clone();
-                let zoom_out = zoom_out.clone();
-                let zoom_in = zoom_in.clone();
-                std::rc::Rc::new(move || {
-                    let n = grid.max_columns();
-                    count.set_label(&n.to_string());
-                    zoom_out.set_sensitive(n > THUMB_COLS_MIN);
-                    zoom_in.set_sensitive(n < THUMB_COLS_MAX);
-                })
+            // Each step also re-applies the culling window (a no-op in the file
+            // manager), and clamps into whichever range the current mode uses.
+            let step = |grid: gtk4::GridView, refresh: std::rc::Rc<dyn Fn()>, up: bool| {
+                move |_: &gtk4::Button| {
+                    // Step from what is on screen, not from the raw property: in
+                    // culling a narrow viewport can hold the window below
+                    // `max_columns`, and stepping from the property would then need
+                    // several clicks before anything visibly changed.
+                    let (cur, lo, hi) = lighttable::cull_stepper_state(&grid)
+                        .unwrap_or((grid.max_columns(), THUMB_COLS_MIN, THUMB_COLS_MAX));
+                    let n = if up { cur.saturating_add(1) } else { cur.saturating_sub(1) };
+                    grid.set_max_columns(n.clamp(lo, hi));
+                    lighttable::cull_resync(&grid);
+                    refresh();
+                }
             };
-            refresh(); // sync initial button sensitivity to the default
-
-            zoom_out.connect_clicked({
-                let grid = grid.clone();
-                let refresh = refresh.clone();
-                move |_| {
-                    grid.set_max_columns(grid.max_columns().saturating_sub(1).max(THUMB_COLS_MIN));
-                    refresh();
-                }
-            });
-            zoom_in.connect_clicked({
-                let grid = grid.clone();
-                let refresh = refresh.clone();
-                move |_| {
-                    grid.set_max_columns((grid.max_columns() + 1).min(THUMB_COLS_MAX));
-                    refresh();
-                }
-            });
+            zoom_out.connect_clicked(step(grid.clone(), refresh.clone(), false));
+            zoom_in.connect_clicked(step(grid.clone(), refresh.clone(), true));
 
             let zoom_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
             zoom_box.set_margin_start(6);
@@ -849,8 +880,14 @@ fn build_main_window(app: &Application) {
     // Double-click → darkroom page; F1–F5 → toggle colour label on selection.
     {
         let grid = lt_grid.clone();
-        grid.connect_activate(clone!(@weak nav, @weak lt_model, @strong db_path => move |_, pos| {
-            if let Some(path) = lt_model.item(pos)
+        // `pos` is an index into the model the GRID is showing, which is not the
+        // full collection in every layout — culling installs a window over it
+        // (m4-98c b). Resolving through `gv.model()` keeps this handler correct in
+        // both; resolving through the full model would silently open the wrong
+        // image, off by the culling offset.
+        grid.connect_activate(clone!(@weak nav, @strong db_path => move |gv, pos| {
+            if let Some(path) = gv.model()
+                .and_then(|m| m.item(pos))
                 .and_downcast::<gtk4::StringObject>()
                 .map(|o| o.string().to_string())
                 .filter(|p| p.contains('/'))
@@ -890,6 +927,15 @@ fn build_main_window(app: &Application) {
         key.connect_key_pressed(clone!(@weak grid => @default-return glib::Propagation::Proceed, move |_, keyval, _, state| {
             if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK) {
                 return glib::Propagation::Proceed;
+            }
+            // Culling pages a whole screenful with ← / → (m4-98c b). `cull_step`
+            // reports whether the key was culling's at all, so arrow keys keep
+            // moving the cursor normally in the file manager instead of being
+            // swallowed by a mode that isn't active.
+            if let Some(forward) = lighttable::cull_key_direction(keyval) {
+                if lighttable::cull_step(&grid, forward) {
+                    return glib::Propagation::Stop;
+                }
             }
             if let Some(color) = lighttable::fkey_to_color(keyval) {
                 lighttable::toggle_selected_color(&grid, &sel, &db, color);
@@ -979,13 +1025,11 @@ fn build_main_window(app: &Application) {
         let toast_fn2   = make_toast.clone();
         let export_act  = gtk4::gio::SimpleAction::new("export-selected", None);
         let export_db2  = db_path.clone();
-        export_act.connect_activate(clone!(@weak lt_model, @weak lt_selection, @weak window => move |_, _| {
-            let pos = lt_selection.selected();
-            let paths: Vec<String> = lt_model.item(pos)
-                .and_downcast::<gtk4::StringObject>()
-                .map(|o| o.string().to_string())
-                .filter(|p| p.contains('/'))
-                .into_iter().collect();
+        // Same as the toolbar button: resolve through the shown model, or Ctrl+E
+        // exports the wrong file under culling.
+        export_act.connect_activate(clone!(@weak lt_selection, @weak window => move |_, _| {
+            let paths: Vec<String> =
+                lighttable::selected_path(&lt_selection).into_iter().collect();
             dialogs::show_export_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 paths,

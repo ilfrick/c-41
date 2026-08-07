@@ -18,6 +18,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub const THUMB_SIZE: i32 = 160;
 
+/// The grid's lower column bound in the file-manager layout — low enough that a
+/// narrow framebuffer fits a row instead of clipping it. Culling raises it to pin
+/// exactly one row of the comparison window, and restores this on the way out, so
+/// both places name the same constant rather than repeating a literal.
+const GRID_MIN_COLUMNS: u32 = 2;
+
 pub type LighttableModel = gtk4::StringList;
 
 /// The lighttable's widgets, as built by [`lighttable_page`].
@@ -211,8 +217,9 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
         // The *max*-column bound (thumbnail size) is owned by the bottom toolbar's
         // thumb-size stepper (see lib.rs THUMB_COLS_*); it calls set_max_columns
         // on this grid at startup and on every ± click. Only the min bound lives
-        // here. `min_columns(2)` keeps a narrow framebuffer from clipping the row.
-        .min_columns(2)
+        // here, and culling raises it to pin one row (see `enter_culling`).
+        // `GRID_MIN_COLUMNS` keeps a narrow framebuffer from clipping the row.
+        .min_columns(GRID_MIN_COLUMNS)
         .build();
     grid.add_css_class("lighttable-grid");
 
@@ -1131,9 +1138,9 @@ pub fn apply_overlay_mode_token(tok: &str) {
 /// file manager / zoomable / culling layouts. Ordered as darktable's switcher lists
 /// them.
 ///
-/// **Modes will reconfigure the one `GridView`** (its model, column bounds and
-/// scroll policy) — see [`reconfigure_grid_for`], empty so far because the only
-/// available mode is the one the grid is built in. They must never swap the
+/// **Modes reconfigure the one `GridView`** (its model and column bounds) — see
+/// [`reconfigure_grid_for`], which windows the model for culling and unwinds it
+/// again for the file manager. They must never swap the
 /// `ScrolledWindow`'s child: a control that re-derives the grid from the scroller
 /// would silently go inert (no error, no log) the moment the child changed, which
 /// is why [`lighttable_page`] hands the grid out instead. See the m4-98c design
@@ -1146,8 +1153,8 @@ pub enum ViewMode {
     /// darktable's infinite zoom plane. Not ported: a `GridView` cannot express it
     /// (see [`ViewMode::is_available`]).
     Zoomable,
-    /// A fixed window of N images filling the viewport, for side-by-side
-    /// comparison. Not yet built (increment b).
+    /// A fixed window of N images at a time, paged with ← / →, for side-by-side
+    /// comparison — the same grid with a `SliceListModel` over its model.
     Culling,
 }
 
@@ -1170,8 +1177,8 @@ impl ViewMode {
     /// state — nothing should ever make a mode available conditionally at runtime.
     pub const fn is_available(self) -> bool {
         match self {
-            Self::FileManager => true,
-            Self::Zoomable | Self::Culling => false,
+            Self::FileManager | Self::Culling => true,
+            Self::Zoomable => false,
         }
     }
 
@@ -1197,7 +1204,10 @@ impl ViewMode {
         match self {
             Self::FileManager => "File manager: scrolling grid of thumbnails",
             Self::Zoomable => "Zoomable lighttable (not available yet)",
-            Self::Culling => "Culling: compare a fixed set side by side (not available yet)",
+            // Deliberately modest: the cells are still THUMB_SIZE, so this pages
+            // through a fixed set rather than filling the viewport the way
+            // darktable's culling does. Don't promise what the layout doesn't do.
+            Self::Culling => "Culling: page through a fixed set (← →)",
         }
     }
 }
@@ -1279,6 +1289,13 @@ thread_local! {
     /// Which layout the grid is drawn in (m4-98c). Default `FileManager` — the
     /// scrolling grid the lighttable has always shown.
     static VIEW_MODE: Cell<ViewMode> = const { Cell::new(ViewMode::FileManager) };
+    /// Index of the first image in the culling window. Kept across mode switches so
+    /// leaving culling and coming back resumes where the user was, not at image 0.
+    static CULL_OFFSET: Cell<u32> = const { Cell::new(0) };
+    /// The base model whose `items-changed` re-clamps the culling offset, and the
+    /// handler doing it — held so it can be disconnected instead of stacking.
+    static CULL_BASE_WATCH: RefCell<Option<(gtk4::gio::ListModel, glib::SignalHandlerId)>> =
+        const { RefCell::new(None) };
     /// Display-refresh closures for the filter controls (m4-97c) — see
     /// [`add_filter_observer`]. Several controls now drive one filter state, so
     /// each change has to push back out to all of them.
@@ -1352,16 +1369,322 @@ fn store_view_mode(mode: ViewMode) -> bool {
 /// the startup path can re-apply the restored mode to a freshly built grid without
 /// going through the switcher's handlers.
 ///
-/// Empty for `FileManager`: the grid is built in that configuration, so entering it
-/// means undoing nothing *yet* — the per-mode reconfiguration lands with the mode
-/// that needs it (culling swaps in a `SliceListModel` and pins the column bounds).
-fn reconfigure_grid_for(_grid: &GridView, mode: ViewMode) {
+/// `FileManager` is how the grid is built, so entering it means undoing culling.
+/// Returns whether the layout was actually applied — a mode that can't configure
+/// the grid must be *refused*, not half-applied with its button lit (see
+/// [`set_view_mode`]).
+fn reconfigure_grid_for(grid: &GridView, mode: ViewMode) -> bool {
     match mode {
-        ViewMode::FileManager => {}
-        // Unreachable while `is_available` is false for these; the match is
+        // Zoomable is unreachable while `is_available` says so; the match stays
         // exhaustive so implementing a mode can't forget to land its layout here.
-        ViewMode::Zoomable | ViewMode::Culling => {}
+        ViewMode::FileManager | ViewMode::Zoomable => leave_culling(grid),
+        ViewMode::Culling => enter_culling(grid),
     }
+}
+
+// ── Culling (m4-98c b) ─────────────────────────────────────────────────────
+//
+// darktable's culling layout: instead of scrolling thumbnails, one screenful of
+// images at a time, paged with ← / →. Implemented as **the same `GridView` with a
+// `SliceListModel` window over the same base model** — so the entire cell factory
+// (thumbnail, filename, stars, colour dots, overlay modes) and every gesture on it
+// keep working, which a hand-rolled comparison widget would not.
+//
+// The window is swapped *inside the existing `SingleSelection`* rather than by
+// installing a new selection model on the grid. That matters: `selected_path` /
+// `reselect_path` and the keyboard shortcuts all read `selection.model()`, so they
+// follow the window automatically and keep acting on the image the user can
+// actually see. Installing a second selection object would leave every one of them
+// reading a stale one — silently, and only for culling.
+
+/// How many images culling shows at once, as a function of the thumb-size stepper
+/// (`max_columns`) — so the control the user already has for thumbnail size also
+/// sets the comparison-set size, as in darktable. Clamped: below `MIN` there is
+/// nothing to compare, and above `MAX` the cells fall under their natural width and
+/// the row overflows.
+const CULL_MIN_IMAGES: u32 = 2;
+const CULL_MAX_IMAGES: u32 = 8;
+
+fn cull_window_size(max_columns: u32) -> u32 {
+    max_columns.clamp(CULL_MIN_IMAGES, CULL_MAX_IMAGES)
+}
+
+/// A cell's natural width: the thumbnail plus the padding GTK puts around it.
+/// Empirical, and checked in the container — a 909px viewport lays out 5 columns,
+/// which is what this predicts. Only ever used to *cap* the culling window, and it
+/// errs on the wide side, so a bad estimate costs one image rather than a wrapped
+/// row.
+const CULL_CELL_WIDTH_PX: i32 = THUMB_SIZE + 20;
+
+/// How many cells fit across `viewport_width`, or `None` when the width isn't
+/// known yet (the grid hasn't been allocated — at startup the mode is restored
+/// before the first layout). `None` means "don't cap", which is why the caller
+/// re-runs once the viewport has a width; capping at that moment would instead pin
+/// the window to the minimum and leave it there.
+///
+/// This caps the culling window because a window bigger than the viewport wraps to
+/// a second row — and two rows is not "one screenful side by side", it is just the
+/// grid again. Pinning `min_columns` instead would force one row and *clip* it (the
+/// scroller has no horizontal bar), which is worse. Never returns less than
+/// [`CULL_MIN_IMAGES`]: below two images there is nothing to compare, so a viewport
+/// that narrow gets a wrapped row rather than a degenerate mode. Pure.
+fn cull_capacity(viewport_width: i32) -> Option<u32> {
+    (viewport_width > 0)
+        .then(|| ((viewport_width / CULL_CELL_WIDTH_PX) as u32).max(CULL_MIN_IMAGES))
+}
+
+/// The culling window for `grid` right now: what the stepper asks for, capped by
+/// what the viewport can actually show in one row.
+fn cull_effective_window(grid: &GridView) -> u32 {
+    let requested = cull_window_size(grid.max_columns());
+    match cull_capacity(grid.width()) {
+        Some(cap) => requested.min(cap),
+        None => requested,
+    }
+}
+
+/// Where a page step lands. Paging forward stops on the last whole page rather than
+/// walking off the end: an offset at or past `n_items` renders as an **empty grid**
+/// with no error, which is the failure this repo keeps meeting. Pure.
+fn cull_page_offset(offset: u32, n_items: u32, window: u32, forward: bool) -> u32 {
+    let window = window.max(1);
+    if forward {
+        let next = offset.saturating_add(window);
+        // Only step if the next page has something in it; otherwise stay put.
+        if next < n_items {
+            next
+        } else {
+            offset
+        }
+    } else {
+        offset.saturating_sub(window)
+    }
+}
+
+/// Pull an offset back into a collection that may have shrunk under it (a filter,
+/// a folder switch, an import). An offset still inside the collection is passed
+/// through untouched — the window slides, it is not re-aligned to a page grid —
+/// and only one that fell off the end snaps back to the last whole page start.
+/// Pure.
+fn cull_clamp_offset(offset: u32, n_items: u32, window: u32) -> u32 {
+    if n_items == 0 || offset < n_items {
+        return if n_items == 0 { 0 } else { offset };
+    }
+    let window = window.max(1);
+    ((n_items - 1) / window) * window
+}
+
+/// The grid's *unwindowed* model: the slice's base while culling, the selection's
+/// own model otherwise. Entering culling twice must not stack a window on a window.
+fn cull_base_model(selection: &SingleSelection) -> Option<gtk4::gio::ListModel> {
+    let model = selection.model()?;
+    match model.downcast::<gtk4::SliceListModel>() {
+        Ok(slice) => slice.model(),
+        Err(model) => Some(model),
+    }
+}
+
+/// The page start that brings image `index` on screen — culling enters on the page
+/// holding the selected image, as darktable does, rather than wherever the user
+/// last left the window. Pure.
+fn cull_entry_offset(index: u32, window: u32) -> u32 {
+    let window = window.max(1);
+    (index / window) * window
+}
+
+/// Every path in `model`, in order. Used to locate an image by path when the index
+/// spaces differ (the window's vs the collection's).
+fn model_paths(model: &gtk4::gio::ListModel) -> Vec<String> {
+    (0..model.n_items())
+        .filter_map(|i| {
+            model.item(i).and_downcast::<gtk4::StringObject>().map(|o| o.string().to_string())
+        })
+        .collect()
+}
+
+fn enter_culling(grid: &GridView) -> bool {
+    let Some(selection) = grid.model().and_downcast::<SingleSelection>() else {
+        tracing::warn!("culling: grid has no SingleSelection; staying in file manager");
+        return false;
+    };
+    let Some(base) = cull_base_model(&selection) else {
+        tracing::warn!("culling: grid selection has no model; staying in file manager");
+        return false;
+    };
+
+    // Carry the selection across the model swap: `set_model` resets a
+    // SingleSelection to index 0, so without this, entering culling would silently
+    // drop whatever the user had picked.
+    let previous = selected_path(&selection);
+
+    let window = cull_effective_window(grid);
+    // Open on the selected image's page when there is one; otherwise resume where
+    // the user last left the window.
+    let offset = match previous
+        .as_deref()
+        .and_then(|p| index_of_path(&model_paths(&base), p))
+    {
+        Some(idx) => cull_entry_offset(idx, window),
+        None => cull_clamp_offset(CULL_OFFSET.with(|o| o.get()), base.n_items(), window),
+    };
+    CULL_OFFSET.with(|o| o.set(offset));
+
+    let slice = gtk4::SliceListModel::new(Some(base), offset, window);
+    // A reload under the window (filter, folder, import) can leave the offset past
+    // the end, which renders as an empty grid and looks like a hung lighttable.
+    // Re-clamp on every change of the base model; the handler is tracked so
+    // re-entering culling can't stack a second one.
+    watch_base_for_cull_clamp(&slice);
+
+    selection.set_model(Some(&slice));
+    reselect_path(&selection, previous.as_deref());
+    // NOTE: `min_columns` is deliberately NOT pinned to the window. The slice holds
+    // at most `window` items, so the grid already lays them out in one row wherever
+    // the width allows — and pinning would instead turn "wrap to a second row" into
+    // "clip", because the scroller's horizontal policy is Never and each cell
+    // requests THUMB_SIZE. The stepper's clamp (see `cull_column_bounds`) is what
+    // keeps `max_columns` and the window agreeing.
+    true
+}
+
+fn leave_culling(grid: &GridView) -> bool {
+    // Unconditionally, and first: a watch left connected would clamp an offset for
+    // a base nobody is showing and keep it alive in a thread-local forever.
+    unwatch_base_for_cull_clamp();
+    let Some(selection) = grid.model().and_downcast::<SingleSelection>() else {
+        return true; // nothing windowed, so nothing to unwind
+    };
+    if let Some(slice) = selection.model().and_downcast::<gtk4::SliceListModel>() {
+        if let Some(base) = slice.model() {
+            let previous = selected_path(&selection);
+            selection.set_model(Some(&base));
+            reselect_path(&selection, previous.as_deref());
+        }
+    }
+    grid.set_min_columns(GRID_MIN_COLUMNS);
+    true
+}
+
+/// Keep the culling window inside the collection as the collection changes under
+/// it. Replaces any previous watch, so entering culling repeatedly can't leave a
+/// pile of handlers clamping the same offset.
+fn watch_base_for_cull_clamp(slice: &gtk4::SliceListModel) {
+    unwatch_base_for_cull_clamp();
+    let Some(base) = slice.model() else { return };
+    let id = base.connect_items_changed({
+        let slice = slice.clone();
+        move |base, _, _, _| {
+            let window = slice.size();
+            let clamped = cull_clamp_offset(slice.offset(), base.n_items(), window);
+            if clamped != slice.offset() {
+                slice.set_offset(clamped);
+            }
+            CULL_OFFSET.with(|o| o.set(clamped));
+        }
+    });
+    CULL_BASE_WATCH.with(|w| *w.borrow_mut() = Some((base, id)));
+}
+
+fn unwatch_base_for_cull_clamp() {
+    if let Some((base, id)) = CULL_BASE_WATCH.with(|w| w.borrow_mut().take()) {
+        base.disconnect(id);
+    }
+}
+
+/// Page the culling window by one screenful. Returns whether the key belonged to
+/// culling at all — `false` means "not culling, handle this normally", so the
+/// caller must not swallow arrow keys in the file manager.
+pub fn cull_step(grid: &GridView, forward: bool) -> bool {
+    if current_view_mode() != ViewMode::Culling {
+        return false;
+    }
+    let Some(slice) = grid
+        .model()
+        .and_downcast::<SingleSelection>()
+        .and_then(|s| s.model())
+        .and_downcast::<gtk4::SliceListModel>()
+    else {
+        // Culling is the current mode but no window is installed: paging would be a
+        // silent no-op, so say so rather than swallowing the key.
+        tracing::warn!("culling: no window installed; arrow keys left to the grid");
+        return false;
+    };
+    let n_items = slice.model().map_or(0, |m| m.n_items());
+    let next = cull_page_offset(slice.offset(), n_items, slice.size(), forward);
+    if next != slice.offset() {
+        slice.set_offset(next);
+        CULL_OFFSET.with(|o| o.set(next));
+    }
+    true
+}
+
+/// Which way (if either) a key pages the culling window. Pure, so the key mapping
+/// is testable without a display. Both the arrows and Page Up/Down page by a whole
+/// screenful — there is no within-page cursor in culling.
+pub fn cull_key_direction(keyval: gtk4::gdk::Key) -> Option<bool> {
+    use gtk4::gdk::Key;
+    match keyval {
+        Key::Right | Key::Page_Down => Some(true),
+        Key::Left | Key::Page_Up => Some(false),
+        _ => None,
+    }
+}
+
+/// Re-apply the culling window after the thumb-size stepper changed `max_columns`
+/// (the stepper doubles as the "how many images to compare" control). A no-op
+/// outside culling, and a no-op *inside* it when the window size hasn't actually
+/// changed.
+///
+/// Resizes the installed `SliceListModel` in place rather than building a new one:
+/// `SingleSelection::set_model` resets the selection to index 0, so rebuilding on
+/// every ± click would throw away the user's pick — including on the clicks that
+/// change nothing because the stepper is past the culling bounds.
+pub fn cull_resync(grid: &GridView) {
+    if current_view_mode() != ViewMode::Culling {
+        return;
+    }
+    let Some(slice) = grid
+        .model()
+        .and_downcast::<SingleSelection>()
+        .and_then(|s| s.model())
+        .and_downcast::<gtk4::SliceListModel>()
+    else {
+        // Culling with no window installed: enter properly rather than no-op.
+        enter_culling(grid);
+        return;
+    };
+    let window = cull_effective_window(grid);
+    if window == slice.size() {
+        return;
+    }
+    slice.set_size(window);
+    let n_items = slice.model().map_or(0, |m| m.n_items());
+    let offset = cull_clamp_offset(slice.offset(), n_items, window);
+    if offset != slice.offset() {
+        slice.set_offset(offset);
+    }
+    CULL_OFFSET.with(|o| o.set(offset));
+}
+
+/// What the thumb-size stepper should show and allow while culling:
+/// `(images on screen, lowest, highest)`. `None` outside culling, meaning "use the
+/// stepper's own range".
+///
+/// The first element is the window **actually on screen**, not what `max_columns`
+/// asks for, and the last is capped by what the viewport fits. Both matter: with
+/// the raw property the stepper would have a dead zone — steps past the culling
+/// maximum, or past what fits, would count up on the label while nothing on screen
+/// moved. A control that looks live and isn't is this repo's recurring bug shape.
+///
+/// Note this deliberately does *not* rewrite `max_columns` to the capped value:
+/// a temporarily narrow window would then permanently overwrite the user's chosen
+/// thumb size, instead of it coming back when there is room again.
+pub fn cull_stepper_state(grid: &GridView) -> Option<(u32, u32, u32)> {
+    (current_view_mode() == ViewMode::Culling).then(|| {
+        let cap = cull_capacity(grid.width()).unwrap_or(CULL_MAX_IMAGES);
+        let highest = CULL_MAX_IMAGES.min(cap).max(CULL_MIN_IMAGES);
+        (cull_effective_window(grid), CULL_MIN_IMAGES, highest)
+    })
 }
 
 /// Switch the lighttable layout: write the mode, then reconfigure `grid` for it. An
@@ -1370,10 +1693,17 @@ fn reconfigure_grid_for(_grid: &GridView, mode: ViewMode) {
 /// that was never entered. Main-thread only.
 #[must_use]
 pub fn set_view_mode(grid: &GridView, mode: ViewMode) -> bool {
+    let previous = current_view_mode();
     if !store_view_mode(mode) {
         return false;
     }
-    reconfigure_grid_for(grid, mode);
+    if !reconfigure_grid_for(grid, mode) {
+        // The layout didn't take (a grid we can't reconfigure). Put the mode back
+        // rather than leaving the state claiming a layout that isn't on screen —
+        // the caller then rolls its button back and persists nothing.
+        store_view_mode(previous);
+        return false;
+    }
     true
 }
 
@@ -2012,16 +2342,31 @@ pub fn selected_path(selection: &SingleSelection) -> Option<String> {
 
 /// Re-select `prev` in the grid if it survived a reload; otherwise leave the
 /// model's default (autoselected index 0) in place. No-op when `prev` is `None`.
+/// Under culling the selection's model is only a *window* over the collection, so
+/// the lookup runs against the base and the window is moved to the image's page —
+/// otherwise a reload would silently lose the selection whenever the image sits off
+/// the current page.
 pub fn reselect_path(selection: &SingleSelection, prev: Option<&str>) {
     let Some(prev) = prev else { return };
     let Some(model) = selection.model() else { return };
-    let paths: Vec<String> = (0..model.n_items())
-        .filter_map(|i| {
-            model.item(i).and_downcast::<gtk4::StringObject>().map(|o| o.string().to_string())
-        })
-        .collect();
-    if let Some(idx) = index_of_path(&paths, prev) {
-        selection.set_selected(idx);
+    let slice = model.clone().downcast::<gtk4::SliceListModel>().ok();
+    let Some(base) = (match &slice {
+        Some(s) => s.model(),
+        None => Some(model),
+    }) else {
+        return;
+    };
+    let Some(idx) = index_of_path(&model_paths(&base), prev) else { return };
+    match &slice {
+        Some(slice) => {
+            let offset = cull_entry_offset(idx, slice.size());
+            if offset != slice.offset() {
+                slice.set_offset(offset);
+                CULL_OFFSET.with(|o| o.set(offset));
+            }
+            selection.set_selected(idx - offset);
+        }
+        None => selection.set_selected(idx),
     }
 }
 
@@ -2062,6 +2407,9 @@ mod tests {
                 path_write_lock, rating_filter_token_for, rating_predicate, OverlayMode,
                 apply_view_mode_token, current_view_mode, parse_view_mode_token,
                 store_view_mode, view_mode_switcher_tooltip, view_mode_token_for, ViewMode,
+                cull_capacity, cull_clamp_offset, cull_entry_offset, cull_key_direction,
+                cull_page_offset, cull_window_size, CULL_CELL_WIDTH_PX,
+                CULL_MAX_IMAGES, CULL_MIN_IMAGES,
                 RatingCompare, SortOrder, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
     use std::sync::Arc;
 
@@ -2482,6 +2830,119 @@ mod tests {
         // default for anything else sharing this test thread.
         apply_view_mode_token("nonsense");
         assert_eq!(current_view_mode(), ViewMode::FileManager);
+    }
+
+    #[test]
+    fn cull_window_size_tracks_the_stepper_within_bounds() {
+        // The thumb stepper's whole range maps into the comparison-set bounds.
+        assert_eq!(cull_window_size(1), CULL_MIN_IMAGES);
+        assert_eq!(cull_window_size(0), CULL_MIN_IMAGES);
+        assert_eq!(cull_window_size(4), 4);
+        assert_eq!(cull_window_size(u32::MAX), CULL_MAX_IMAGES);
+        // Culling needs at least two images to compare, and a range to move in.
+        const _: () = assert!(CULL_MIN_IMAGES >= 2 && CULL_MAX_IMAGES > CULL_MIN_IMAGES);
+    }
+
+    #[test]
+    fn cull_paging_never_walks_off_the_end() {
+        // 10 images, 4 per page ⇒ pages start at 0, 4, 8; the last is short (2).
+        assert_eq!(cull_page_offset(0, 10, 4, true), 4);
+        assert_eq!(cull_page_offset(4, 10, 4, true), 8);
+        // The property that matters: an offset at/past n_items shows NOTHING, with
+        // no error — so forward must stop rather than produce an empty grid.
+        assert_eq!(cull_page_offset(8, 10, 4, true), 8);
+        assert_eq!(cull_page_offset(8, 10, 4, false), 4);
+        assert_eq!(cull_page_offset(0, 10, 4, false), 0);
+        // Degenerate inputs can't panic or hang the window: fewer images than a
+        // page, an empty collection, a zero window (would divide/step by nothing).
+        assert_eq!(cull_page_offset(0, 3, 4, true), 0);
+        assert_eq!(cull_page_offset(0, 0, 4, true), 0);
+        assert_eq!(cull_page_offset(0, 10, 0, true), 1);
+        // An offset already past the end can only be produced by skipping the
+        // clamp, and paging forward from there must not invent a further step;
+        // `cull_clamp_offset` is what brings it back into view.
+        assert_eq!(cull_page_offset(u32::MAX, 10, 4, true), u32::MAX);
+        assert!(cull_clamp_offset(u32::MAX, 10, 4) < 10);
+    }
+
+    #[test]
+    fn cull_capacity_caps_the_window_to_one_row() {
+        // An unallocated grid reports width 0: the cap is *unknown*, not minimal —
+        // capping there would pin the window to two images and leave it pinned,
+        // since the mode is restored before the first layout.
+        assert_eq!(cull_capacity(0), None);
+        assert_eq!(cull_capacity(-1), None);
+        // The real container viewport (909px) fits 5 columns, which is what the
+        // grid itself lays out at that width.
+        assert_eq!(cull_capacity(909), Some(5));
+        // Narrower than one cell still asks for two: culling one image is not
+        // culling, so a viewport that small wraps rather than degenerating.
+        assert_eq!(cull_capacity(10), Some(CULL_MIN_IMAGES));
+        // Whatever it returns fits: `cap * cell width` never exceeds the viewport
+        // (except at the two-image floor, which is deliberate).
+        for w in [200i32, 400, 909, 1600, 3840] {
+            let cap = cull_capacity(w).expect("allocated");
+            assert!(
+                cap == CULL_MIN_IMAGES || (cap as i32) * CULL_CELL_WIDTH_PX <= w,
+                "capacity {cap} does not fit in {w}px"
+            );
+        }
+    }
+
+    #[test]
+    fn cull_entry_offset_opens_on_the_selected_image_page() {
+        // Entering culling shows the page holding the selection, not page 1 —
+        // the offset is always a page start, and the image is inside that page.
+        for window in [1u32, 2, 4, 8] {
+            for index in [0u32, 1, 7, 8, 9, 1000] {
+                let offset = cull_entry_offset(index, window);
+                assert_eq!(offset % window, 0, "not page-aligned: {index}/{window}");
+                assert!(offset <= index, "page start past the image: {index}/{window}");
+                assert!(index - offset < window, "image outside its page: {index}/{window}");
+            }
+        }
+        // A zero window would divide by zero; it is treated as one image per page.
+        assert_eq!(cull_entry_offset(5, 0), 5);
+    }
+
+    #[test]
+    fn cull_clamp_pulls_a_shrunken_collection_back_into_view() {
+        // A filter cutting 100 images to 10 must not leave the window past the end
+        // (an empty grid that looks like a hang). It lands on a whole-page start.
+        assert_eq!(cull_clamp_offset(96, 10, 4), 8);
+        assert_eq!(cull_clamp_offset(10, 10, 4), 8);
+        // Offsets already inside the collection are left exactly where they are.
+        assert_eq!(cull_clamp_offset(4, 10, 4), 4);
+        assert_eq!(cull_clamp_offset(0, 10, 4), 0);
+        // Empty collection and zero window are both defined, not panics.
+        assert_eq!(cull_clamp_offset(96, 0, 4), 0);
+        assert_eq!(cull_clamp_offset(96, 10, 0), 9);
+        // Whatever it returns is always a *visible* index (or 0 when nothing is).
+        for n_items in [0u32, 1, 3, 10, 97] {
+            for offset in [0u32, 1, 9, 96, u32::MAX] {
+                for window in [1u32, 2, 4, 8] {
+                    let c = cull_clamp_offset(offset, n_items, window);
+                    assert!(
+                        c < n_items || n_items == 0,
+                        "clamp({offset},{n_items},{window}) = {c} is not visible"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cull_key_direction_maps_only_paging_keys() {
+        use gtk4::gdk::Key;
+        assert_eq!(cull_key_direction(Key::Right), Some(true));
+        assert_eq!(cull_key_direction(Key::Page_Down), Some(true));
+        assert_eq!(cull_key_direction(Key::Left), Some(false));
+        assert_eq!(cull_key_direction(Key::Page_Up), Some(false));
+        // Keys the grid and the metadata shortcuts own must fall through: mapping
+        // one here would swallow it in culling and break that shortcut silently.
+        for key in [Key::Up, Key::Down, Key::Return, Key::F1, Key::_0, Key::_5, Key::Escape] {
+            assert_eq!(cull_key_direction(key), None, "{key:?} must not page");
+        }
     }
 
     #[test]

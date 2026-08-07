@@ -368,6 +368,67 @@ C FFI trampolines for tags. 61 DB tests passing.
           popovers don't reach the KasmVNC framebuffer capture (same class as the
           black-dialog gotcha); it shares the exact grid binding the stepper
           exercised.
+      - **m4-98c(b) — done.** Culling: the same `GridView` with a
+        `gtk4::SliceListModel` window over the same base model, paged with ← / →.
+        The whole cell factory (thumbnail, filename, stars, colour dots, overlay
+        modes) and its gestures keep working, which a hand-rolled comparison
+        widget would not.
+        - **The window is swapped *inside* the existing `SingleSelection`**, not by
+          installing a second selection model on the grid. `selected_path` /
+          `reselect_path` and everything built on them then follow the window for
+          free; a second selection object would have left every one of them reading
+          a stale one, silently and only in culling.
+        - **The blocking bug this exposed:** three call sites resolved the
+          selection as `lt_model.item(selection.selected())` — the *full* model
+          indexed by a **window-relative** index. Two of them were the export
+          button and Ctrl+E, so culling into page 5 and exporting would have
+          written **a different image from page 1** to disk, with nothing to
+          signal it. All three now go through `selected_path`, and no
+          selection-reading closure captures `lt_model` any more, which makes the
+          bug class unrepresentable rather than fixed. `connect_activate` resolves
+          through `gv.model()` for the same reason.
+        - **The window is capped by what the viewport can show** in one row
+          (`cull_capacity`), because a window wider than the viewport wraps — and
+          two rows is not "one screenful side by side", it is the grid again.
+          Pinning `min_columns` to force one row was tried and rejected: with the
+          scroller's horizontal policy `Never` it converts wrapping into
+          *clipping*. Capacity is `None` while the grid is unallocated (the mode is
+          restored before the first layout), and the scroller's horizontal
+          page-size notify re-fits on allocation and on every resize.
+        - **The thumb stepper doubles as the "how many images" control**, and shows
+          the count **actually on screen** rather than `max_columns` — a narrow
+          viewport holds fewer than asked, and a label counting past what changed
+          would be exactly the inert-control shape this repo keeps hitting. It
+          deliberately does *not* write the capped value back, so a temporarily
+          narrow window doesn't permanently overwrite the chosen thumb size.
+        - Selection is carried across every model swap (enter, leave), the entry
+          offset is derived from the selected image's page (darktable's behaviour),
+          `cull_resync` mutates the installed slice instead of rebuilding it (a
+          rebuild resets `SingleSelection` to index 0), `reselect_path` resolves
+          against the *base* and moves the window to the image's page, and
+          `set_view_mode` now rolls the mode back if `reconfigure_grid_for` fails
+          rather than lighting a button over an unchanged layout.
+        - Offset safety: paging **stops on the last whole page** (an offset past
+          the end renders as an empty grid with no error), and an `items-changed`
+          watch on the base re-clamps after any reload that shrinks the collection.
+          The watch is tracked and disconnected unconditionally, so it can neither
+          stack nor outlive the mode.
+        - 6 new pure tests (window size, paging, clamping, capacity, entry offset,
+          key mapping) — 194 total. The review's point stands and is recorded here:
+          the helpers are arithmetic that was never in doubt, and what actually
+          broke lived in GTK wiring that can't be tested without a display. That is
+          an argument for deleting untestable surface (which the `selected_path`
+          fix does), not for more helpers.
+        - Verified live: culling shows one row of 5 at full width and re-fits to 4
+          when the metadata panel widens; → pages by exactly one window; the
+          metadata panel follows the window (index 4 after paging, not index 0 —
+          the export bug's signature); leaving culling restores the scrolling grid
+          **with the selection intact**; `view_mode` round-trips through the pref.
+        - Known gaps, for (c)/(d): cells stay `THUMB_SIZE`, so this pages a fixed
+          set rather than filling the viewport the way darktable does (the tooltip
+          says so rather than promising otherwise); and selecting an image can
+          re-fit the window when the metadata panel's width changes, which shifts
+          the row under the cursor.
       - **Live checks** (xdotool synthetic input is unreliable here — see the
         m4-99b lessons): switch each mode and confirm the thumb stepper AND
         overlay dropdown still work afterwards (that is the regression the hard
