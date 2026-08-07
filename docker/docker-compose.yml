@@ -20,6 +20,14 @@
 #   CONFIG_DIR  – path for persistent config/cache    (default: ~/.config/darkroom-docker)
 
 x-common: &common
+  labels:
+    # Keep watchtower's auto-update away from this container. It monitors every
+    # container by default, and pulling a new base image recreates this one —
+    # which wipes anything installed into the running container (the X tooling
+    # the visual-verification loop needs) and reverts a hot-copied darkroom-rs
+    # binary to whatever the image ships, mid-session and with no warning.
+    # Updates here are a rebuild (`docker compose build darkroom`), not a pull.
+    com.centurylinklabs.watchtower.enable: "false"
   environment:
     PUID: ${PUID:-1000}
     PGID: ${PGID:-1000}
