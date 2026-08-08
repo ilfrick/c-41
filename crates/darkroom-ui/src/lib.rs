@@ -281,9 +281,16 @@ fn build_main_window(app: &Application) {
     let hbox = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
+    // Full preview (m4-98c c) shares the centre slot with the grid: the scroller
+    // goes on one page of a Stack and the preview on the other, so the GridView,
+    // its model and every bottom-bar control stay live underneath it. The side
+    // panels are outside the stack, as in darktable, where `f` covers the centre
+    // view and leaves the panels up.
+    let (preview_overlay, preview) = lighttable::full_preview::FullPreview::wrap(&scroll);
+
     hbox.append(&left.widget);
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
-    hbox.append(&scroll);
+    hbox.append(&preview_overlay);
     hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     hbox.append(&right.widget);
 
@@ -885,6 +892,7 @@ fn build_main_window(app: &Application) {
         // (m4-98c b). Resolving through `gv.model()` keeps this handler correct in
         // both; resolving through the full model would silently open the wrong
         // image, off by the culling offset.
+        let preview_for_activate = preview.clone();
         grid.connect_activate(clone!(@weak nav, @strong db_path => move |gv, pos| {
             if let Some(path) = gv.model()
                 .and_then(|m| m.item(pos))
@@ -892,6 +900,10 @@ fn build_main_window(app: &Application) {
                 .map(|o| o.string().to_string())
                 .filter(|p| p.contains('/'))
             {
+                // Leaving the lighttable closes the preview, or coming back from
+                // the editor would land on a full-screen image of whatever was up
+                // before — over a grid that has since moved on.
+                preview_for_activate.close();
                 let page = darkroom::darkroom_page(&path, &db_path);
                 // Tag the page with its image path so the pop handler below can
                 // recover which cell to re-sync (m4-25), regardless of how the
@@ -921,12 +933,80 @@ fn build_main_window(app: &Application) {
         // page, and not while the user is typing in the search entry. Modifier
         // combos (Ctrl/Alt + key) are left to propagate so they can't be mistaken
         // for a metadata shortcut.
+        // Full-preview keys, factored out of the controller body below. The
+        // preview is an Overlay child rather than a Stack page precisely so this
+        // keeps working: a Stack unmaps the hidden page, GTK drops focus from an
+        // unmapped widget, and this controller lives on the grid — which made the
+        // preview a keyboard trap (`f`, Escape and the arrows all landing
+        // elsewhere). Found by pressing the keys in the container.
+        let handle_preview_key: std::rc::Rc<dyn Fn(gtk4::gdk::Key) -> bool> = {
+            let preview = preview.clone();
+            let sel = lt_selection.clone();
+            let grid = lt_grid.clone();
+            std::rc::Rc::new(move |keyval| {
+                use lighttable::full_preview::PreviewAction;
+                let Some(action) =
+                    lighttable::full_preview::preview_key_action(keyval, preview.is_open())
+                else {
+                    return false;
+                };
+                match action {
+                    // Swallowed: these would move the collection under the preview.
+                    PreviewAction::Ignore => {}
+                    PreviewAction::Close => preview.close(),
+                    PreviewAction::Toggle if preview.is_open() => preview.close(),
+                    PreviewAction::Toggle => {
+                        // Nothing selected means nothing to preview; leave the grid
+                        // up rather than opening onto an empty page.
+                        if let Some(path) = lighttable::selected_path(&sel) {
+                            preview.open(&path);
+                        }
+                    }
+                    PreviewAction::Next | PreviewAction::Prev => {
+                        let forward = action == PreviewAction::Next;
+                        let n = sel.model().map_or(0, |m| m.n_items());
+                        // Moving the selection is what drives the preview — the
+                        // observer below repaints it — so the metadata panel and
+                        // the grid underneath always follow the same image, and
+                        // closing lands on it.
+                        match lighttable::full_preview::preview_step_index(
+                            sel.selected(),
+                            n,
+                            forward,
+                        ) {
+                            Some(next) => sel.set_selected(next),
+                            // At the window's edge under culling, page the window
+                            // and land on its near edge: the window is only 2..8
+                            // images, so stopping there would look like a freeze
+                            // a few presses in. `cull_step` is false outside
+                            // culling, where the end of the collection is real.
+                            None if lighttable::cull_step(&grid, forward) => {
+                                let n = sel.model().map_or(0, |m| m.n_items());
+                                if n > 0 {
+                                    sel.set_selected(if forward { 0 } else { n - 1 });
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                true
+            })
+        };
+
         let key = gtk4::EventControllerKey::new();
         let sel = lt_selection.clone();
         let db  = db_path.clone();
         key.connect_key_pressed(clone!(@weak grid => @default-return glib::Propagation::Proceed, move |_, keyval, _, state| {
             if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK) {
                 return glib::Propagation::Proceed;
+            }
+            // Full preview (m4-98c c) is checked FIRST: while it is up, ← / →
+            // step through images rather than paging the culling window
+            // underneath it, and every one of its keys except the toggle is inert
+            // when it is closed, so nothing else loses a shortcut.
+            if handle_preview_key(keyval) {
+                return glib::Propagation::Stop;
             }
             // Culling pages a whole screenful with ← / → (m4-98c b). `cull_step`
             // reports whether the key was culling's at all, so arrow keys keep
@@ -975,10 +1055,12 @@ fn build_main_window(app: &Application) {
         // emits `toggled`), so the nav-driven state sync below can't echo back
         // into another push. "Darkroom" opens the selected image; with no valid
         // selection (empty view / sentinel row) it snaps back to Lighttable.
+        let preview_for_switch = preview.clone();
         dr_btn.connect_clicked(clone!(
             @weak nav, @weak lt_selection, @weak lt_btn, @strong db_path => move |b| {
             if !b.is_active() { return; }
             if let Some(path) = lighttable::selected_path(&lt_selection) {
+                preview_for_switch.close(); // same reason as the double-click path
                 let page = darkroom::darkroom_page(&path, &db_path);
                 page.set_tag(Some(&path));
                 nav.push(&page);

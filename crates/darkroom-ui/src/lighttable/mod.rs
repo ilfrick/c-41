@@ -6,6 +6,7 @@
 //! green/blue/purple); clicking a dot toggles that label via the
 //! `darkroom_db::colorlabels` DAO, resolving the image id by path.
 
+pub mod full_preview;
 pub mod timeline;
 
 use adw::prelude::*;

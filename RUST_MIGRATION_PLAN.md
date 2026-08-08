@@ -429,6 +429,58 @@ C FFI trampolines for tags. 61 DB tests passing.
           says so rather than promising otherwise); and selecting an image can
           re-fit the window when the metadata panel's width changes, which shifts
           the row under the cursor.
+      - **m4-98c(c) — done.** Full preview (darktable's `f`): the selected image
+        fills the centre view, ← / → step, `f`/Escape dismiss. New
+        `lighttable/full_preview.rs`. **Not** a fourth `ViewMode` — it is
+        orthogonal to the layout (works from the file manager and from culling),
+        and persisting it would mean sessions that open onto a single image.
+        - **The runtime-only bug this increment existed to find:** the preview was
+          first built as a `gtk4::Stack` page beside the grid. A `Stack` **unmaps**
+          the hidden page, GTK drops focus from an unmapped widget, and the
+          lighttable's key controller lives on the `GridView` — so opening the
+          preview made it a **keyboard trap**: `f`, Escape and the arrows all
+          landed on whatever else took focus (the tag entry), with no way out but
+          restarting. Every unit test passed throughout. Fixed by making it an
+          `Overlay` child *over* the grid, which keeps the grid mapped, focused and
+          driving its own controller — no focus juggling and no second controller.
+          The layer needs `.background`: `ContentFit::Contain` letterboxes, and a
+          transparent letterbox shows the grid ghosting through.
+        - **The preview follows the SELECTION**, not just its own keys — the same
+          observer shape the metadata panel uses. Otherwise a tag/folder/colour
+          click, the timeline, or any reload that drops the previewed image leaves
+          a full-screen image beside another image's metadata. `preview_target()`
+          is the pure rule (`None` selection ⇒ close, not "hold the old image",
+          which is indistinguishable from a hang).
+        - Keys that would move the collection *under* the preview are **swallowed**
+          rather than forwarded (`PreviewAction::Ignore` for ↑/↓/Home/End; Page
+          Up/Down page the preview, not the culling window). At a culling window's
+          edge, ← / → **page the window** and land on its near edge — the window is
+          only 2..8 images, so stopping there would look like a freeze.
+        - `FullPreview` holds only its own child widgets, never the containing
+          `Overlay`: the key handler captures it and the grid owns that handler, so
+          storing an ancestor would close a reference cycle keeping the whole
+          centre subtree (grid, model, every cached texture) alive for the process.
+        - Decode size comes from the widget allocation × scale factor (bounded
+          512..4096), not a constant — full preview exists to judge focus, and a
+          fixed 2048 has the user inspecting resampling artefacts on a 4K display.
+          `PixbufLoader::connect_size_prepared` scales *during* decode; `write` and
+          `close` are both unconditional, since a loader finalized without `close`
+          emits a `g_warning` on every keypress that lands on a rejected file.
+        - **Coverage limit, stated rather than hidden:** gdk-pixbuf decoding, so
+          the preview shows exactly what the grid's thumbnails show. Raws it can't
+          read (`.ORF`) get a centred "No preview available for …" instead of a
+          blank page. Follow-up: lift the darkroom view's `BaseImage`/`render()`
+          out of `darkroom/mod.rs` into something both views call, decoded
+          off-thread (`gdk::Texture` is `Send`, `Pixbuf` is not), then add
+          darktable's 100 % zoom/pan.
+        - 4 pure tests (key gating, the swallow set, the target rule, step bounds
+          incl. `INVALID_LIST_POSITION` — clamping that sentinel would silently
+          select the second-to-last image). 198 total.
+        - Verified live, by pressing the keys: `f` opens on the clicked image with
+          the metadata panel in step; → moves to the next image and the panel
+          follows; Escape closes and the grid returns with the selection on the
+          previewed image; an `.ORF` shows the centred message with no pixbuf
+          warnings in the container log.
       - **Live checks** (xdotool synthetic input is unreliable here — see the
         m4-99b lessons): switch each mode and confirm the thumb stepper AND
         overlay dropdown still work afterwards (that is the regression the hard
