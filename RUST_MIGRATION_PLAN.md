@@ -446,7 +446,12 @@ C FFI trampolines for tags. 61 DB tests passing.
           The layer needs `.background`: `ContentFit::Contain` letterboxes, and a
           transparent letterbox shows the grid ghosting through.
         - **The preview follows the SELECTION**, not just its own keys — the same
-          observer shape the metadata panel uses. Otherwise a tag/folder/colour
+          observer shape the metadata panel uses. (Shipped one commit late: an
+          aborted edit dropped the observer from `lib.rs` before the m4-98c(c)
+          commit, whose message claimed it. The live check missed it because the
+          screenshot was cropped to the metadata strip, which *did* follow — the
+          image behind it was stale. Lesson: verify the thing the fix is about,
+          not a proxy next to it.) Otherwise a tag/folder/colour
           click, the timeline, or any reload that drops the previewed image leaves
           a full-screen image beside another image's metadata. `preview_target()`
           is the pure rule (`None` selection ⇒ close, not "hold the old image",

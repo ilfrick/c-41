@@ -50,6 +50,25 @@ const OVERLAY_MODE_PREF_KEY: &str = "overlay_mode";
 /// [`lighttable::view_mode_token_for`] (`filemanager` / `zoomable` / `culling`).
 const VIEW_MODE_PREF_KEY: &str = "view_mode";
 
+/// `darkroom_ui_prefs` keys for the draggable side-panel widths (parity audit
+/// 1.1). Stored as the panels' **widths in pixels**, not as the `Paned` handle
+/// positions: the right panel's handle position is measured from the left of the
+/// centre area, so it means a different width in a different window size, and
+/// restoring it into a resized window would move the panel.
+const LEFT_PANEL_WIDTH_PREF_KEY: &str = "left_panel_width";
+const RIGHT_PANEL_WIDTH_PREF_KEY: &str = "right_panel_width";
+
+/// Bounds a restored panel width is clamped into. The lower bound keeps a corrupt
+/// or hostile pref from restoring a panel too narrow to grab and drag back out;
+/// the upper bound keeps one from eating the whole window.
+const PANEL_WIDTH_MIN: i32 = 140;
+const PANEL_WIDTH_MAX: i32 = 700;
+
+/// How long to wait after the last drag before writing a panel width. `position`
+/// notifies on every pixel of a drag, and each write is an SQLite transaction on
+/// the GTK main thread.
+const PANEL_WIDTH_SAVE_DEBOUNCE_MS: u32 = 400;
+
 pub fn run() -> Result<glib::ExitCode> {
     let app = Application::builder()
         .application_id(APP_ID)
@@ -135,6 +154,98 @@ pub(crate) fn view_switcher_title(container: &gtk4::Box, subtitle: &str) -> gtk4
     title_box.append(container);
     title_box.append(&subtitle_label);
     title_box
+}
+
+/// Restore the persisted side-panel widths onto the two `Paned`s.
+///
+/// The left panel is the outer `Paned`'s start child, so its width *is* the handle
+/// position and can be set immediately. The right panel is an *end* child, so its
+/// position depends on the centre's allocated width — which is 0 until the first
+/// layout. That one is applied on the first map, on an idle so the allocation has
+/// happened, and only once: re-applying on every map would undo the user's drag
+/// the next time the window is shown.
+fn restore_panel_widths(db_path: &str, outer: &gtk4::Paned, inner: &gtk4::Paned) {
+    let width_pref = |key: &str| {
+        persist::load_ui_pref(db_path, key)
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|w| w.clamp(PANEL_WIDTH_MIN, PANEL_WIDTH_MAX))
+    };
+
+    if let Some(left) = width_pref(LEFT_PANEL_WIDTH_PREF_KEY) {
+        outer.set_position(left);
+    }
+
+    if let Some(right) = width_pref(RIGHT_PANEL_WIDTH_PREF_KEY) {
+        let applied = std::rc::Rc::new(std::cell::Cell::new(false));
+        inner.connect_map(move |paned| {
+            if applied.get() {
+                return;
+            }
+            let paned = paned.clone();
+            let applied = applied.clone();
+            glib::idle_add_local_once(move || {
+                let total = paned.width();
+                // Still unallocated: leave the default rather than computing a
+                // position from a zero width, which would slam the panel shut.
+                if total <= 0 {
+                    return;
+                }
+                applied.set(true);
+                paned.set_position((total - right).max(0));
+            });
+        });
+    }
+}
+
+/// Write panel widths back as the user drags, debounced.
+fn persist_panel_widths(db_path: &str, outer: &gtk4::Paned, inner: &gtk4::Paned) {
+    // One pending timeout shared by both handles: whichever moved last wins the
+    // timer, and both widths are written together when it fires.
+    let pending: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+
+    let schedule = {
+        let db = db_path.to_string();
+        let outer = outer.clone();
+        let inner = inner.clone();
+        let pending = pending.clone();
+        std::rc::Rc::new(move || {
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+            let db = db.clone();
+            let outer = outer.clone();
+            let inner = inner.clone();
+            let pending_inner = pending.clone();
+            let id = glib::timeout_add_local_once(
+                std::time::Duration::from_millis(u64::from(PANEL_WIDTH_SAVE_DEBOUNCE_MS)),
+                move || {
+                    pending_inner.replace(None);
+                    persist::save_ui_pref(
+                        &db,
+                        LEFT_PANEL_WIDTH_PREF_KEY,
+                        &outer.position().to_string(),
+                    );
+                    // The right panel's width, not its handle position — see the
+                    // pref-key doc.
+                    let right = (inner.width() - inner.position()).max(0);
+                    if right > 0 {
+                        persist::save_ui_pref(
+                            &db,
+                            RIGHT_PANEL_WIDTH_PREF_KEY,
+                            &right.to_string(),
+                        );
+                    }
+                },
+            );
+            pending.replace(Some(id));
+        })
+    };
+
+    for paned in [outer, inner] {
+        let schedule = schedule.clone();
+        paned.connect_position_notify(move |_| schedule());
+    }
 }
 
 fn build_main_window(app: &Application) {
@@ -288,11 +399,67 @@ fn build_main_window(app: &Application) {
     // view and leaves the panels up.
     let (preview_overlay, preview) = lighttable::full_preview::FullPreview::wrap(&scroll);
 
-    hbox.append(&left.widget);
-    hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
-    hbox.append(&preview_overlay);
-    hbox.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
-    hbox.append(&right.widget);
+    // Panels are DRAGGABLE, not fixed (parity audit 1.1). Two nested `Paned`s:
+    // [left | [centre | right]]. Separators come from the Paned handles, so the
+    // explicit ones are gone. `resize` is false on both panels and true on the
+    // centre, so growing the window grows the image area rather than the chrome —
+    // and `shrink` is false everywhere, so a drag can't collapse a panel to a
+    // sliver the user then can't grab. Collapsing entirely is the panel toggles
+    // (audit 1.2), not an accidental drag.
+    let inner_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+    inner_paned.set_start_child(Some(&preview_overlay));
+    inner_paned.set_end_child(Some(&right.widget));
+    inner_paned.set_resize_start_child(true);
+    inner_paned.set_resize_end_child(false);
+    inner_paned.set_shrink_start_child(false);
+    inner_paned.set_shrink_end_child(false);
+
+    let outer_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+    outer_paned.set_start_child(Some(&left.widget));
+    outer_paned.set_end_child(Some(&inner_paned));
+    outer_paned.set_resize_start_child(false);
+    outer_paned.set_resize_end_child(true);
+    outer_paned.set_shrink_start_child(false);
+    outer_paned.set_shrink_end_child(false);
+    outer_paned.set_hexpand(true);
+
+    // Wide handles: the default is a ~1px line that is hard to hit and reads as a
+    // border rather than a control. The complaint that started this ("the side
+    // panels cannot be resized") is as much about discoverability as capability.
+    outer_paned.set_wide_handle(true);
+    inner_paned.set_wide_handle(true);
+
+    // Restore the widths from the last session, then persist every drag. The
+    // handle position is what the user set, so it is the thing to store — not a
+    // width computed from it, which would drift with the window size.
+    restore_panel_widths(&db_path, &outer_paned, &inner_paned);
+    persist_panel_widths(&db_path, &outer_paned, &inner_paned);
+
+    hbox.append(&outer_paned);
+
+    // Paint the metadata for whatever is selected right now (parity audit 1.4).
+    // `SingleSelection` auto-selects index 0 when the model is filled, and that
+    // fires no `selection-changed` — so without this the panel sits on "Select an
+    // image to view metadata" over a grid that plainly has an image selected,
+    // until the user clicks a *different* cell.
+    if let Some(path) = lighttable::selected_path(&lt_selection) {
+        right.update(&path, &db_path);
+    }
+
+    // The full preview follows the SELECTION, not just its own keys — the same
+    // observer shape the metadata panel uses. Without this the ← / → step moves
+    // the selection and the metadata panel while the preview keeps showing the
+    // OLD image, and any reload that drops the previewed image leaves a
+    // full-screen photo the app no longer considers selected.
+    {
+        let preview = preview.clone();
+        lt_selection.connect_selection_changed(move |sel, _, _| {
+            let target = lighttable::full_preview::preview_target(
+                lighttable::selected_path(sel).as_deref(),
+            );
+            preview.follow_selection(&target);
+        });
+    }
 
     // ── Header bar ─────────────────────────────────────────────────────────
     let lt_header = adw::HeaderBar::new();
