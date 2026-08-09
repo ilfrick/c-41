@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, exposure, sharpen, sigmoid, splittoning, velvia, vibrance};
+use crate::iop::{channelmixer, colorcontrast, exposure, sharpen, sigmoid, splittoning, velvia, vibrance};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -97,6 +97,13 @@ pub enum Stage {
     /// space for the RGB↔Lab pair — unlike Sharpen it is **pixel-local** (no
     /// neighbourhood read), so the band-parallel `process` path stays available.
     Vibrance { amount: f32, space: ColorSpace },
+    /// Green-magenta / blue-yellow contrast boost in Lab (colorcontrast.c).
+    /// `a_steepness`/`b_steepness` are the contrast multipliers on the a/b
+    /// channels (default 1.0 = no-op). Like Sharpen and Vibrance it converts
+    /// RGB↔Lab, so it needs the buffer's working colour space. It is
+    /// **pixel-local** (no neighbour reads), so the band-parallel path stays
+    /// available.
+    ColorContrast { a_steepness: f32, b_steepness: f32, space: ColorSpace },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -133,6 +140,7 @@ impl Stage {
             Stage::Sigmoid { .. } => "sigmoid",
             Stage::Sharpen { .. } => "sharpen",
             Stage::Vibrance { .. } => "vibrance",
+            Stage::ColorContrast { .. } => "colorcontrast",
         }
     }
 
@@ -154,6 +162,9 @@ impl Stage {
             // Vibrance is pixel-local: each output pixel depends only on its
             // own input pixel (the Lab conversion is per-pixel, no neighbours).
             Stage::Vibrance { .. } => true,
+            // ColorContrast is pixel-local: each output pixel depends only on
+            // its own input pixel (Lab conversion is per-pixel, no neighbours).
+            Stage::ColorContrast { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -170,6 +181,8 @@ impl Stage {
             // Vibrance converts RGB↔Lab for its chroma-boost, so it also needs the
             // working space — and must agree with any Sharpen in the same pipeline.
             Stage::Vibrance { space, .. } => Some(*space),
+            // ColorContrast also converts RGB↔Lab and must agree with Sharpen/Vibrance.
+            Stage::ColorContrast { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -334,6 +347,38 @@ impl Stage {
                     // Use the original alpha from the source, not the round-tripped
                     // one (both should be identical, but the pattern matches Sharpen's
                     // `input[i + 3]` to be explicit about not trusting the 4th channel).
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Color contrast (colorcontrast.c) ────────────────────────
+            // Lab affine scale/offset on a/b channels. Like Vibrance it round-trips
+            // RGB↔Lab, but it touches a/b (not L), so the source a/b can't be reused.
+            Stage::ColorContrast { a_steepness, b_steepness, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => {
+                            (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020)
+                        }
+                        ColorSpace::LinearSrgb => {
+                            (crate::color::srgb_to_lab, crate::color::lab_to_srgb)
+                        }
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                colorcontrast::process_pixels(
+                    &lab_in, &mut lab_out,
+                    a_steepness, 0.0, b_steepness, 0.0, /* unbound */ true,
+                );
+                for p in 0..n {
+                    let i = p * 4;
+                    // Alpha from the source, matching Sharpen/Vibrance.
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
                     output[i..i + 4].copy_from_slice(&rgb);
                 }
@@ -683,6 +728,7 @@ mod tests {
                 film_fog: 0.0, film_power: 1.0, paper_power: 1.0,
             },
             Stage::Vibrance { amount: 0.0, space: ColorSpace::LinearSrgb },
+            Stage::ColorContrast { a_steepness: 1.0, b_steepness: 1.0, space: ColorSpace::LinearSrgb },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
@@ -735,6 +781,38 @@ mod tests {
         assert!((out[4] - 0.5).abs() < 0.02, "grey drifted too far: {}", out[4]);
         assert!((out[5] - 0.5).abs() < 0.02, "grey drifted too far: {}", out[5]);
         assert!((out[6] - 0.5).abs() < 0.02, "grey drifted too far: {}", out[6]);
+    }
+
+    #[test]
+    fn colorcontrast_unit_steepness_is_identity() {
+        // steepness == 1.0, offset == 0.0 ⇒ a*b unchanged (identity transform
+        // in the Lab round-trip; tolerance covers float error).
+        let px = vec![0.5f32, 0.3, 0.8, 1.0, 0.2, 0.6, 0.9, 1.0, 0.1, 0.4, 0.7, 1.0];
+        let p = Pipeline::with_stages(vec![Stage::ColorContrast {
+            a_steepness: 1.0, b_steepness: 1.0, space: ColorSpace::LinearSrgb,
+        }]);
+        let out = p.process(&px, px.len() / 4, 1);
+        for (o, i) in out.iter().zip(px.iter()) {
+            assert!((o - i).abs() < 1e-4, "unit colorcontrast changed a pixel: {o} != {i}");
+        }
+    }
+
+    #[test]
+    fn colorcontrast_boosts_chromatic_ab() {
+        // A steepness > 1.0 should push the a/b channels away from zero.
+        let px = vec![0.8f32, 0.2, 0.1, 1.0]; // saturated red → a*b ≠ 0 in Lab
+        let p = Pipeline::with_stages(vec![Stage::ColorContrast {
+            a_steepness: 2.0, b_steepness: 2.0, space: ColorSpace::LinearSrgb,
+        }]);
+        let out = p.process(&px, 1, 1);
+        // In Lab, red has a* > 0 and b* > 0. Doubling steepness should push
+        // the output further along the a*/b* axes — the Lab values should
+        // differ from the input (the RGB values must change after round-trip).
+        assert!(
+            (out[0] - px[0]).abs() > 1e-5 || (out[1] - px[1]).abs() > 1e-5,
+            "colorcontrast should alter chroma: r={} g={} b={} vs original r={} g={} b={}",
+            out[0], out[1], out[2], px[0], px[1], px[2]
+        );
     }
 
     #[test]

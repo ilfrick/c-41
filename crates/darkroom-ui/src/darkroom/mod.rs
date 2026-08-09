@@ -1820,6 +1820,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Sigmoid" => pg.add(&sigmoid_module_row(ctx)),
                 "Sharpen" => pg.add(&sharpen_module_row(ctx)),
                 "Vibrance" => pg.add(&vibrance_module_row(ctx)),
+                "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -1845,7 +1846,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Color contrast"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2025,6 +2026,19 @@ fn vibrance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         |e, ctx| {
             add_param_slider(e, ctx, "Amount", 0.0, 100.0, 1.0, p0.vibrance_amount as f64,
                 |p, v| p.vibrance_amount = v);
+        })
+}
+
+fn colorcontrast_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Color contrast", "chroma non-linearity", p0.color_contrast_on,
+        |p, on| p.color_contrast_on = on,
+        |e, ctx| {
+            // Steepness 1.0 is identity (no chroma change); slider range 0.0..=5.0.
+            add_param_slider(e, ctx, "A steepness", 0.0, 5.0, 1.0, p0.color_contrast_a_steepness as f64,
+                |p, v| p.color_contrast_a_steepness = v);
+            add_param_slider(e, ctx, "B steepness", 0.0, 5.0, 1.0, p0.color_contrast_b_steepness as f64,
+                |p, v| p.color_contrast_b_steepness = v);
         })
 }
 

@@ -78,6 +78,12 @@ pub struct PreviewParams {
     /// Vibrance strength on the C 0..100 slider (already ×0.01 by encode/decode;
     /// `to_pipeline` passes it divided by 100 to the core).
     pub vibrance_amount: f32,
+    /// Color contrast (green-magenta / blue-yellow) stage on/off.
+    pub color_contrast_on: bool,
+    /// Green-magenta contrast steepness [0, 5] (default 1.0 = no-op).
+    pub color_contrast_a_steepness: f32,
+    /// Blue-yellow contrast steepness [0, 5] (default 1.0 = no-op).
+    pub color_contrast_b_steepness: f32,
 }
 
 impl Default for PreviewParams {
@@ -113,6 +119,10 @@ impl Default for PreviewParams {
             // Darktable default: off. 0..100 slider (amount).
             vibrance_on: false,
             vibrance_amount: 0.0,
+            // Darktable default: off. Steepness 1.0 = identity (no contrast change).
+            color_contrast_on: false,
+            color_contrast_a_steepness: 1.0,
+            color_contrast_b_steepness: 1.0,
         }
     }
 }
@@ -134,7 +144,12 @@ impl PreviewParams {
         let sigmoid_identity = !self.sigmoid_on; // a tone curve is never a no-op
         let sharpen_identity = !self.sharpen_on || self.sharpen_amount <= 0.0 || self.sharpen_radius <= 0.0;
         let vibrance_identity = !self.vibrance_on || self.vibrance_amount <= 0.0;
-        exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity && sharpen_identity && vibrance_identity
+        // Color contrast (a_steepness == 1.0 && b_steepness == 1.0) is an affine
+        // no-op on Lab a/b; any deviation from 1.0 changes chroma.
+        let cc_identity = !self.color_contrast_on
+            || (self.color_contrast_a_steepness == 1.0 && self.color_contrast_b_steepness == 1.0);
+        exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
+            && sharpen_identity && vibrance_identity && cc_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -149,6 +164,7 @@ impl PreviewParams {
             sigmoid_on: false,
             sharpen_on: false,
             vibrance_on: false,
+            color_contrast_on: false,
             ..*self
         }
     }
@@ -160,7 +176,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on] {
             v.push(b as u8);
         }
         for f in [
@@ -173,6 +189,7 @@ impl PreviewParams {
             self.sigmoid_contrast, self.sigmoid_skew,
             self.sharpen_radius, self.sharpen_amount, self.sharpen_threshold,
             self.vibrance_amount,
+            self.color_contrast_a_steepness, self.color_contrast_b_steepness,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -186,9 +203,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..8];
-        // length is checked above, so exactly 19 f32 chunks follow
-        let f: Vec<f32> = bytes[8..]
+        let bools = &bytes[1..9];
+        // length is checked above, so exactly 21 f32 chunks follow
+        let f: Vec<f32> = bytes[9..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -200,6 +217,7 @@ impl PreviewParams {
             sigmoid_on: bools[4] != 0,
             sharpen_on: bools[5] != 0,
             vibrance_on: bools[6] != 0,
+            color_contrast_on: bools[7] != 0,
             black: f[0], ev: f[1],
             velvia_strength: f[2], velvia_bias: f[3],
             split_shadow_hue: f[4], split_shadow_sat: f[5],
@@ -209,6 +227,7 @@ impl PreviewParams {
             sigmoid_contrast: f[13], sigmoid_skew: f[14],
             sharpen_radius: f[15], sharpen_amount: f[16], sharpen_threshold: f[17],
             vibrance_amount: f[18],
+            color_contrast_a_steepness: f[19], color_contrast_b_steepness: f[20],
         })
     }
 
@@ -269,6 +288,18 @@ impl PreviewParams {
                 space,
             });
         }
+        // Color contrast (iop_order.c pos 56-57, after sharpen 55) — operates in
+        // Lab, altering chroma via a_steepness/b_steepness about the mid-slope.
+        // 1.0/1.0 is identity; slider range is 0..=5.
+        if self.color_contrast_on
+            && (self.color_contrast_a_steepness != 1.0 || self.color_contrast_b_steepness != 1.0)
+        {
+            p.push(Stage::ColorContrast {
+                a_steepness: self.color_contrast_a_steepness,
+                b_steepness: self.color_contrast_b_steepness,
+                space,
+            });
+        }
         // Sigmoid is the scene-linear → display tone map. White (100%) / black
         // (0.0152%) targets are fixed at the darktable defaults (both > 0 ⇒ no
         // NaN); only contrast & skew are user-facing here.
@@ -300,10 +331,10 @@ impl PreviewParams {
 
 /// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
 /// to `None` → defaults, rather than mis-parsing). v2 added the sigmoid stage.
-/// v3 added the sharpen stage. v4 adds vibrance.
-const ENCODE_VERSION: u8 = 4;
-/// 1 version byte + 7 bool bytes + 19 little-endian f32.
-const ENCODED_LEN: usize = 1 + 7 + 19 * 4;
+/// v3 added the sharpen stage. v4 added vibrance. v5 adds color contrast.
+const ENCODE_VERSION: u8 = 5;
+/// 1 version byte + 8 bool bytes + 21 little-endian f32.
+const ENCODED_LEN: usize = 1 + 8 + 21 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1002,6 +1033,7 @@ mod tests {
             sigmoid_on: true, sigmoid_contrast: 1.8, sigmoid_skew: -0.3,
             sharpen_on: true, sharpen_radius: 4.0, sharpen_amount: 1.0, sharpen_threshold: 0.05,
             vibrance_on: true, vibrance_amount: 33.0,
+            color_contrast_on: true, color_contrast_a_steepness: 2.0, color_contrast_b_steepness: 1.5,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
