@@ -18,7 +18,7 @@
 //! display-referred 8-bit image, not true scene-referred raw: a stepping-stone
 //! until a raw-decode/demosaic front end feeds `core::pipeline` directly.
 
-use darkroom_core::pipeline::{Pipeline, Stage};
+use darkroom_core::pipeline::{ColorSpace, Pipeline, Stage};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `darkroom-core` IOP, in pixelpipe order
@@ -65,6 +65,14 @@ pub struct PreviewParams {
     pub sigmoid_contrast: f32,
     /// Sigmoid skew (contrast_skewness), -1..1, default 0.
     pub sigmoid_skew: f32,
+    /// Sharpen (unsharp mask) stage on/off.
+    pub sharpen_on: bool,
+    /// Gaussian radius on the C 0..100 slider (0 = no-op, 100 = max radius).
+    pub sharpen_radius: f32,
+    /// Sharpening strength on the C 0..5 slider (0 = no-op, 1 = default, 5 = extreme).
+    pub sharpen_amount: f32,
+    /// Detail threshold in Lab-L units [0, 100] (darktable default 0.5). 0 = sharpen all.
+    pub sharpen_threshold: f32,
 }
 
 impl Default for PreviewParams {
@@ -93,6 +101,10 @@ impl Default for PreviewParams {
             sigmoid_on: false,
             sigmoid_contrast: 1.5,
             sigmoid_skew: 0.0,
+            sharpen_on: false,
+            sharpen_radius: 2.0,
+            sharpen_amount: 0.5,
+            sharpen_threshold: 0.5,
         }
     }
 }
@@ -112,7 +124,8 @@ impl PreviewParams {
         let split_identity = !self.split_on;
         let mono_identity = !self.mono_on; // grayscale conversion is never a no-op
         let sigmoid_identity = !self.sigmoid_on; // a tone curve is never a no-op
-        exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
+        let sharpen_identity = !self.sharpen_on || self.sharpen_amount <= 0.0 || self.sharpen_radius <= 0.0;
+        exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity && sharpen_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -125,6 +138,7 @@ impl PreviewParams {
             split_on: false,
             mono_on: false,
             sigmoid_on: false,
+            sharpen_on: false,
             ..*self
         }
     }
@@ -136,7 +150,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on] {
             v.push(b as u8);
         }
         for f in [
@@ -147,6 +161,7 @@ impl PreviewParams {
             self.split_balance, self.split_compress,
             self.mono_r, self.mono_g, self.mono_b,
             self.sigmoid_contrast, self.sigmoid_skew,
+            self.sharpen_radius, self.sharpen_amount, self.sharpen_threshold,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -160,9 +175,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..6];
-        // length is checked above, so exactly 15 f32 chunks follow
-        let f: Vec<f32> = bytes[6..]
+        let bools = &bytes[1..7];
+        // length is checked above, so exactly 18 f32 chunks follow
+        let f: Vec<f32> = bytes[7..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -172,6 +187,7 @@ impl PreviewParams {
             split_on: bools[2] != 0,
             mono_on: bools[3] != 0,
             sigmoid_on: bools[4] != 0,
+            sharpen_on: bools[5] != 0,
             black: f[0], ev: f[1],
             velvia_strength: f[2], velvia_bias: f[3],
             split_shadow_hue: f[4], split_shadow_sat: f[5],
@@ -179,6 +195,7 @@ impl PreviewParams {
             split_balance: f[8], split_compress: f[9],
             mono_r: f[10], mono_g: f[11], mono_b: f[12],
             sigmoid_contrast: f[13], sigmoid_skew: f[14],
+            sharpen_radius: f[15], sharpen_amount: f[16], sharpen_threshold: f[17],
         })
     }
 
@@ -210,13 +227,26 @@ impl PreviewParams {
     /// >1.0), velvia and splittoning still assume [0,1] display-referred input
     /// and clamp — sigmoid is off for already-display-referred JPEGs, where that
     /// assumption holds, and on for raws, where it is what saves the highlights.
-    pub fn to_pipeline(&self) -> Pipeline {
+    pub fn to_pipeline(&self, space: ColorSpace, scale: f32) -> Pipeline {
         let mut p = Pipeline::new();
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
         }
         if self.mono_on {
             p.push(Stage::Monochrome { r: self.mono_r, g: self.mono_g, b: self.mono_b });
+        }
+        // Sharpen (scene-referred spatial stage, between channelmixer and sigmoid
+        // per darktable iop_order.c). `space`/`scale` come from the render context:
+        // the non-raw preview is sRGB at full res; the raw preview is Rec.2020,
+        // scale 1.0 (WYSIWYG scale-tracking is a follow-up — see pipeline.rs docs).
+        if self.sharpen_on && self.sharpen_amount > 0.0 && self.sharpen_radius > 0.0 {
+            p.push(Stage::Sharpen {
+                radius: self.sharpen_radius,
+                amount: self.sharpen_amount,
+                threshold: self.sharpen_threshold,
+                space,
+                scale,
+            });
         }
         // Sigmoid is the scene-linear → display tone map. White (100%) / black
         // (0.0152%) targets are fixed at the darktable defaults (both > 0 ⇒ no
@@ -249,9 +279,9 @@ impl PreviewParams {
 
 /// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
 /// to `None` → defaults, rather than mis-parsing). v2 added the sigmoid stage.
-const ENCODE_VERSION: u8 = 2;
-/// 1 version byte + 5 bool bytes + 15 little-endian f32.
-const ENCODED_LEN: usize = 1 + 5 + 15 * 4;
+const ENCODE_VERSION: u8 = 3;
+/// 1 version byte + 6 bool bytes + 18 little-endian f32.
+const ENCODED_LEN: usize = 1 + 6 + 18 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -282,7 +312,7 @@ pub fn apply_pipeline(
     }
     // No active stage ⇒ return the source untouched (byte-exact; also avoids a
     // pointless sRGB linearise/encode round-trip that could drift ±1 LSB).
-    let pipeline = params.to_pipeline();
+    let pipeline = params.to_pipeline(ColorSpace::LinearSrgb, 1.0);
     if pipeline.stages.is_empty() {
         return base.to_vec();
     }
@@ -345,7 +375,7 @@ pub fn apply_pipeline_rgb16(
     if width == 0 || height == 0 || base.len() < n * 3 {
         return base.to_vec();
     }
-    let pipeline = params.to_pipeline();
+    let pipeline = params.to_pipeline(ColorSpace::LinearSrgb, 1.0);
     if pipeline.stages.is_empty() {
         return base.to_vec(); // no edit ⇒ lossless 16-bit passthrough
     }
@@ -422,7 +452,7 @@ pub fn render_linear_to_srgb16(
 /// `width*height*4` (callers guard the short case).
 fn srgb_encode_rgb(linear: &[f32], width: usize, height: usize, params: &PreviewParams) -> Vec<f32> {
     let n = width.saturating_mul(height);
-    let mut processed = params.to_pipeline().process(&linear[..n * 4], width, height);
+    let mut processed = params.to_pipeline(ColorSpace::Rec2020, 1.0).process(&linear[..n * 4], width, height);
     // Working space (Rec.2020) → sRGB before the display OETF (m4-35).
     darkroom_core::rawimage::apply_color_matrix(
         &mut processed,
@@ -803,10 +833,26 @@ mod tests {
         v0.velvia_on = true;
         v0.velvia_strength = 0.0;
         cfgs.push(v0);
+        // sharpen enabled but amount=0 ⇒ still identity
+        let mut sh0 = PreviewParams::default();
+        sh0.sharpen_on = true;
+        sh0.sharpen_amount = 0.0;
+        cfgs.push(sh0);
+        // sharpen enabled but radius=0 ⇒ still identity (Stage early-returns)
+        let mut shr0 = PreviewParams::default();
+        shr0.sharpen_on = true;
+        shr0.sharpen_amount = 1.0;
+        shr0.sharpen_radius = 0.0;
+        cfgs.push(shr0);
+        // sharpen enabled with positive amount+radius ⇒ non-identity
+        let mut sh = PreviewParams::default();
+        sh.sharpen_on = true;
+        sh.sharpen_amount = 1.0;
+        cfgs.push(sh);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
-                c.to_pipeline().stages.is_empty(),
+                c.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
                 "is_identity vs empty-pipeline disagree for {c:?}"
             );
         }
@@ -846,10 +892,12 @@ mod tests {
         p.velvia_on = true;
         p.velvia_strength = 50.0;
         p.split_on = true;
-        let names: Vec<&str> = p.to_pipeline().stages.iter().map(|s| s.name()).collect();
+        p.sharpen_on = true;
+        p.sharpen_amount = 1.0;
+        let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
-            ["exposure", "channelmixer", "sigmoid", "velvia", "splittoning"]
+            ["exposure", "channelmixer", "sharpen", "sigmoid", "velvia", "splittoning"]
         );
     }
 
@@ -930,9 +978,10 @@ mod tests {
             split_balance: 0.4, split_compress: 60.0,
             mono_on: true, mono_r: -0.2, mono_g: 1.5, mono_b: 0.33,
             sigmoid_on: true, sigmoid_contrast: 1.8, sigmoid_skew: -0.3,
+            sharpen_on: true, sharpen_radius: 4.0, sharpen_amount: 1.0, sharpen_threshold: 0.05,
         };
         let blob = p.encode();
-        assert_eq!(blob.len(), 1 + 5 + 15 * 4);
+        assert_eq!(blob.len(), ENCODED_LEN);
         assert_eq!(PreviewParams::decode(&blob), Some(p));
         // default round-trips too
         let d = PreviewParams::default();

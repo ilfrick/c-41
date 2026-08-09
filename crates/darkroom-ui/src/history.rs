@@ -200,7 +200,7 @@ impl HistoryStack {
 }
 
 /// Version byte for [`HistoryStack::encode`]; bump on any layout change.
-const HISTORY_ENCODE_VERSION: u8 = 1;
+const HISTORY_ENCODE_VERSION: u8 = 2;
 
 fn read_u32(bytes: &[u8], p: &mut usize) -> Option<u32> {
     let end = p.checked_add(4)?;
@@ -256,6 +256,13 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
         || old.sigmoid_skew != new.sigmoid_skew;
     if sigmoid {
         return "Sigmoid";
+    }
+    let sharpen = old.sharpen_on != new.sharpen_on
+        || old.sharpen_radius != new.sharpen_radius
+        || old.sharpen_amount != new.sharpen_amount
+        || old.sharpen_threshold != new.sharpen_threshold;
+    if sharpen {
+        return "Sharpen";
     }
     "Edit"
 }
@@ -370,6 +377,10 @@ mod tests {
             describe_change(&base, &PreviewParams { sigmoid_contrast: 2.0, ..d() }),
             "Sigmoid"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { sharpen_amount: 2.0, ..d() }),
+            "Sharpen"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -401,6 +412,10 @@ mod tests {
             sigmoid_on: _,
             sigmoid_contrast: _,
             sigmoid_skew: _,
+            sharpen_on: _,
+            sharpen_radius: _,
+            sharpen_amount: _,
+            sharpen_threshold: _,
         } = PreviewParams::default();
     }
 
@@ -480,7 +495,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 66);
+        assert_eq!(PreviewParams::default().encode().len(), 79);
     }
 
     #[test]

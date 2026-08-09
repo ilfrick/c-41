@@ -1818,6 +1818,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Split-toning" => pg.add(&splittoning_module_row(ctx)),
                 "Monochrome" => pg.add(&monochrome_module_row(ctx)),
                 "Sigmoid" => pg.add(&sigmoid_module_row(ctx)),
+                "Sharpen" => pg.add(&sharpen_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -1843,7 +1844,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -1988,6 +1989,28 @@ fn sigmoid_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.sigmoid_contrast = v);
             add_param_slider(e, ctx, "Skew", -1.0, 1.0, 0.01, p0.sigmoid_skew as f64,
                 |p, v| p.sigmoid_skew = v);
+        })
+}
+
+/// Sharpen module: enable switch gates `sharpen_on`; radius (0..100), amount
+/// (0..5), and threshold (0..100) sliders. Runs scene-referred between channelmixer
+/// and sigmoid (darktable iop_order.c); the Stage handles RGB↔Lab internally.
+///
+/// Radius is capped at 12 kernel taps (MAXR), matching darktable's sharpen.c —
+/// values above ~12 produce diminishing returns because the Gaussian widens
+/// while the kernel window stays fixed at 2·12+1 taps (see
+/// `darkroom_core::pipeline::gaussian_kernel`).
+fn sharpen_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Sharpen", "edge sharpening", p0.sharpen_on,
+        |p, on| p.sharpen_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Radius", 0.0, 100.0, 0.5, p0.sharpen_radius as f64,
+                |p, v| p.sharpen_radius = v);
+            add_param_slider(e, ctx, "Amount", 0.0, 5.0, 0.01, p0.sharpen_amount as f64,
+                |p, v| p.sharpen_amount = v);
+            add_param_slider(e, ctx, "Threshold", 0.0, 100.0, 0.1, p0.sharpen_threshold as f64,
+                |p, v| p.sharpen_threshold = v);
         })
 }
 

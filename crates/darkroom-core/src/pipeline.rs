@@ -90,7 +90,7 @@ pub enum Stage {
     /// The effective Gaussian radius is `radius * scale`, so sharpening is
     /// image-relative — a downscaled preview matches the full-res export instead
     /// of over-sharpening (WYSIWYG). The caller passes the ROI scale it renders at.
-    Sharpen { radius: f32, threshold: f32, amount: f32, space: ColorSpace, scale: f32 },
+    Sharpen { radius: f32, amount: f32, threshold: f32, space: ColorSpace, scale: f32 },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
