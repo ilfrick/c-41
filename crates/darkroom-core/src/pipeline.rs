@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, exposure, sharpen, sigmoid, splittoning, velvia};
+use crate::iop::{channelmixer, exposure, sharpen, sigmoid, splittoning, velvia, vibrance};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -91,6 +91,12 @@ pub enum Stage {
     /// image-relative — a downscaled preview matches the full-res export instead
     /// of over-sharpening (WYSIWYG). The caller passes the ROI scale it renders at.
     Sharpen { radius: f32, amount: f32, threshold: f32, space: ColorSpace, scale: f32 },
+    /// Saturation-weighted chroma boost in Lab (vibrance.c). `amount` is
+    /// pre-scaled by 0.01 (matching darktable's commit_params step). Like Sharpen
+    /// it reads/writes Lab channels, so it needs the buffer's working colour
+    /// space for the RGB↔Lab pair — unlike Sharpen it is **pixel-local** (no
+    /// neighbourhood read), so the band-parallel `process` path stays available.
+    Vibrance { amount: f32, space: ColorSpace },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -126,6 +132,7 @@ impl Stage {
             Stage::Monochrome { .. } => "channelmixer",
             Stage::Sigmoid { .. } => "sigmoid",
             Stage::Sharpen { .. } => "sharpen",
+            Stage::Vibrance { .. } => "vibrance",
         }
     }
 
@@ -144,6 +151,9 @@ impl Stage {
             | Stage::Splittoning { .. }
             | Stage::Monochrome { .. }
             | Stage::Sigmoid { .. } => true,
+            // Vibrance is pixel-local: each output pixel depends only on its
+            // own input pixel (the Lab conversion is per-pixel, no neighbours).
+            Stage::Vibrance { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -157,6 +167,9 @@ impl Stage {
     fn working_space(&self) -> Option<ColorSpace> {
         match self {
             Stage::Sharpen { space, .. } => Some(*space),
+            // Vibrance converts RGB↔Lab for its chroma-boost, so it also needs the
+            // working space — and must agree with any Sharpen in the same pipeline.
+            Stage::Vibrance { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -288,6 +301,41 @@ impl Stage {
                         ]);
                         output[i..i + 4].copy_from_slice(&rgb);
                     }
+                }
+            }
+            // ── Vibrance (vibrance.c) ──────────────────────────────────────────
+            // Operates in Lab: convert RGB→Lab, apply the chroma-boost to a/b (and
+            // dim L), convert back. All channels change, so the input a/b can't be
+            // reused from the source RGB (unlike Sharpen, which only touched L).
+            Stage::Vibrance { amount, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => {
+                            (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020)
+                        }
+                        ColorSpace::LinearSrgb => {
+                            (crate::color::srgb_to_lab, crate::color::lab_to_srgb)
+                        }
+                    };
+                let n = width * height;
+                // Convert to Lab, apply the chroma-boost (a/b change, so all Lab
+                // channels may differ), convert back. Two scratch buffers avoid the
+                // borrow conflict that `process_pixels(&lab, &mut lab)` would raise.
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                vibrance::process_pixels(&lab_in, &mut lab_out, amount);
+                for p in 0..n {
+                    let i = p * 4;
+                    // Use the original alpha from the source, not the round-tripped
+                    // one (both should be identical, but the pattern matches Sharpen's
+                    // `input[i + 3]` to be explicit about not trusting the 4th channel).
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
                 }
             }
         }
@@ -634,6 +682,7 @@ mod tests {
                 white_target: 1.0, black_target: 0.0, paper_exp: 0.3,
                 film_fog: 0.0, film_power: 1.0, paper_power: 1.0,
             },
+            Stage::Vibrance { amount: 0.0, space: ColorSpace::LinearSrgb },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
@@ -642,6 +691,50 @@ mod tests {
                 .is_pixel_local(),
             "sharpen reads neighbours ⇒ NOT pixel-local"
         );
+    }
+
+    #[test]
+    fn vibrance_zero_amount_is_identity() {
+        // amount == 0 ⇒ sw = 0, ls = 1, ss = 1 for every pixel ⇒ no change.
+        // (After the Lab round-trip; tolerance covers float error.)
+        let px = vec![0.5f32, 0.3, 0.8, 1.0, 0.2, 0.6, 0.9, 1.0, 0.1, 0.4, 0.7, 1.0];
+        let p = Pipeline::with_stages(vec![Stage::Vibrance {
+            amount: 0.0, space: ColorSpace::LinearSrgb,
+        }]);
+        let out = p.process(&px, px.len() / 4, 1);
+        for (o, i) in out.iter().zip(px.iter()) {
+            assert!((o - i).abs() < 1e-4, "zero vibrance changed a pixel: {o} != {i}");
+        }
+    }
+
+    #[test]
+    fn vibrance_boosts_chromatic_saturation() {
+        // A saturated red pixel (a >> 0 in Lab) should get its chroma channels
+        // amplified (a/b grow in magnitude) when amount > 0, while a neutral
+        // grey pixel (a ≈ b ≈ 0) should be largely unaffected.
+        let (w, h) = (4usize, 1usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        // Pixel 0: saturated red. Pixel 1: mid grey.
+        img[0] = 0.8; img[1] = 0.2; img[2] = 0.1; img[3] = 1.0; // red
+        img[4] = 0.5; img[5] = 0.5; img[6] = 0.5; img[7] = 1.0; // grey
+        let p = Pipeline::with_stages(vec![Stage::Vibrance {
+            amount: 1.5, space: ColorSpace::LinearSrgb,
+        }]);
+        let out = p.process(&img, w, h);
+        // The red pixel's chroma (a/b in Lab) should be amplified — its RGB values
+        // should shift away from grey (the channels diverge more).
+        let red_r = out[0];
+        let red_g = out[1];
+        let red_b = out[2];
+        assert!(
+            (red_r - red_g).abs() > (0.8f32 - 0.2f32).abs() - 0.01,
+            "red saturation should increase: r={} g={} b={}",
+            red_r, red_g, red_b
+        );
+        // Grey should be nearly unchanged (small chroma ⇒ small boost).
+        assert!((out[4] - 0.5).abs() < 0.02, "grey drifted too far: {}", out[4]);
+        assert!((out[5] - 0.5).abs() < 0.02, "grey drifted too far: {}", out[5]);
+        assert!((out[6] - 0.5).abs() < 0.02, "grey drifted too far: {}", out[6]);
     }
 
     #[test]

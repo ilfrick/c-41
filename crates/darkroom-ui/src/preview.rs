@@ -73,6 +73,11 @@ pub struct PreviewParams {
     pub sharpen_amount: f32,
     /// Detail threshold in Lab-L units [0, 100] (darktable default 0.5). 0 = sharpen all.
     pub sharpen_threshold: f32,
+    /// Vibrance (saturation-weighted chroma boost) stage on/off.
+    pub vibrance_on: bool,
+    /// Vibrance strength on the C 0..100 slider (already ×0.01 by encode/decode;
+    /// `to_pipeline` passes it divided by 100 to the core).
+    pub vibrance_amount: f32,
 }
 
 impl Default for PreviewParams {
@@ -105,6 +110,9 @@ impl Default for PreviewParams {
             sharpen_radius: 2.0,
             sharpen_amount: 0.5,
             sharpen_threshold: 0.5,
+            // Darktable default: off. 0..100 slider (amount).
+            vibrance_on: false,
+            vibrance_amount: 0.0,
         }
     }
 }
@@ -125,7 +133,8 @@ impl PreviewParams {
         let mono_identity = !self.mono_on; // grayscale conversion is never a no-op
         let sigmoid_identity = !self.sigmoid_on; // a tone curve is never a no-op
         let sharpen_identity = !self.sharpen_on || self.sharpen_amount <= 0.0 || self.sharpen_radius <= 0.0;
-        exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity && sharpen_identity
+        let vibrance_identity = !self.vibrance_on || self.vibrance_amount <= 0.0;
+        exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity && sharpen_identity && vibrance_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -139,6 +148,7 @@ impl PreviewParams {
             mono_on: false,
             sigmoid_on: false,
             sharpen_on: false,
+            vibrance_on: false,
             ..*self
         }
     }
@@ -150,7 +160,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on] {
             v.push(b as u8);
         }
         for f in [
@@ -162,6 +172,7 @@ impl PreviewParams {
             self.mono_r, self.mono_g, self.mono_b,
             self.sigmoid_contrast, self.sigmoid_skew,
             self.sharpen_radius, self.sharpen_amount, self.sharpen_threshold,
+            self.vibrance_amount,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -175,9 +186,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..7];
-        // length is checked above, so exactly 18 f32 chunks follow
-        let f: Vec<f32> = bytes[7..]
+        let bools = &bytes[1..8];
+        // length is checked above, so exactly 19 f32 chunks follow
+        let f: Vec<f32> = bytes[8..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -188,6 +199,7 @@ impl PreviewParams {
             mono_on: bools[3] != 0,
             sigmoid_on: bools[4] != 0,
             sharpen_on: bools[5] != 0,
+            vibrance_on: bools[6] != 0,
             black: f[0], ev: f[1],
             velvia_strength: f[2], velvia_bias: f[3],
             split_shadow_hue: f[4], split_shadow_sat: f[5],
@@ -196,6 +208,7 @@ impl PreviewParams {
             mono_r: f[10], mono_g: f[11], mono_b: f[12],
             sigmoid_contrast: f[13], sigmoid_skew: f[14],
             sharpen_radius: f[15], sharpen_amount: f[16], sharpen_threshold: f[17],
+            vibrance_amount: f[18],
         })
     }
 
@@ -248,6 +261,14 @@ impl PreviewParams {
                 scale,
             });
         }
+        // Vibrance (scene-referred, iop_order.c pos 39.1) — runs after sharpen but
+        // before the tone map so it boosts chroma in the wide-gamut linear domain.
+        if self.vibrance_on && self.vibrance_amount > 0.0 {
+            p.push(Stage::Vibrance {
+                amount: self.vibrance_amount / 100.0,
+                space,
+            });
+        }
         // Sigmoid is the scene-linear → display tone map. White (100%) / black
         // (0.0152%) targets are fixed at the darktable defaults (both > 0 ⇒ no
         // NaN); only contrast & skew are user-facing here.
@@ -279,9 +300,10 @@ impl PreviewParams {
 
 /// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
 /// to `None` → defaults, rather than mis-parsing). v2 added the sigmoid stage.
-const ENCODE_VERSION: u8 = 3;
-/// 1 version byte + 6 bool bytes + 18 little-endian f32.
-const ENCODED_LEN: usize = 1 + 6 + 18 * 4;
+/// v3 added the sharpen stage. v4 adds vibrance.
+const ENCODE_VERSION: u8 = 4;
+/// 1 version byte + 7 bool bytes + 19 little-endian f32.
+const ENCODED_LEN: usize = 1 + 7 + 19 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -979,6 +1001,7 @@ mod tests {
             mono_on: true, mono_r: -0.2, mono_g: 1.5, mono_b: 0.33,
             sigmoid_on: true, sigmoid_contrast: 1.8, sigmoid_skew: -0.3,
             sharpen_on: true, sharpen_radius: 4.0, sharpen_amount: 1.0, sharpen_threshold: 0.05,
+            vibrance_on: true, vibrance_amount: 33.0,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);

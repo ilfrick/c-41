@@ -264,6 +264,11 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if sharpen {
         return "Sharpen";
     }
+    let vibrance = old.vibrance_on != new.vibrance_on
+        || old.vibrance_amount != new.vibrance_amount;
+    if vibrance {
+        return "Vibrance";
+    }
     "Edit"
 }
 
@@ -381,6 +386,10 @@ mod tests {
             describe_change(&base, &PreviewParams { sharpen_amount: 2.0, ..d() }),
             "Sharpen"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { vibrance_amount: 15.0, ..d() }),
+            "Vibrance"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -416,6 +425,8 @@ mod tests {
             sharpen_radius: _,
             sharpen_amount: _,
             sharpen_threshold: _,
+            vibrance_on: _,
+            vibrance_amount: _,
         } = PreviewParams::default();
     }
 
@@ -495,7 +506,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 79);
+        assert_eq!(PreviewParams::default().encode().len(), 84);
     }
 
     #[test]

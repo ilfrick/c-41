@@ -1819,6 +1819,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Monochrome" => pg.add(&monochrome_module_row(ctx)),
                 "Sigmoid" => pg.add(&sigmoid_module_row(ctx)),
                 "Sharpen" => pg.add(&sharpen_module_row(ctx)),
+                "Vibrance" => pg.add(&vibrance_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -1844,7 +1845,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2011,6 +2012,19 @@ fn sharpen_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.sharpen_amount = v);
             add_param_slider(e, ctx, "Threshold", 0.0, 100.0, 0.1, p0.sharpen_threshold as f64,
                 |p, v| p.sharpen_threshold = v);
+        })
+}
+
+/// Vibrance module: enable switch gates `vibrance_on`; an Amount slider (0..100).
+/// Runs scene-referred between sharpen and sigmoid (darktable iop_order.c pos 39.1);
+/// the Stage handles RGB↔Lab internally, using the same ColorSpace as Sharpen.
+fn vibrance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Vibrance", "saturation boost", p0.vibrance_on,
+        |p, on| p.vibrance_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Amount", 0.0, 100.0, 1.0, p0.vibrance_amount as f64,
+                |p, v| p.vibrance_amount = v);
         })
 }
 
