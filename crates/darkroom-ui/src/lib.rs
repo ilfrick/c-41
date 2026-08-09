@@ -58,11 +58,24 @@ const VIEW_MODE_PREF_KEY: &str = "view_mode";
 const LEFT_PANEL_WIDTH_PREF_KEY: &str = "left_panel_width";
 const RIGHT_PANEL_WIDTH_PREF_KEY: &str = "right_panel_width";
 
+/// `darkroom_ui_prefs` keys under which each side panel's **collapsed** state is
+/// persisted (parity audit 1.2). darktable collapses either panel with the
+/// triangles at the screen edges and remembers the choice; a panel the user hid to
+/// get screen back should stay hidden next session rather than coming back
+/// uninvited.
+const LEFT_PANEL_COLLAPSED_PREF_KEY: &str = "left_panel_collapsed";
+const RIGHT_PANEL_COLLAPSED_PREF_KEY: &str = "right_panel_collapsed";
+
 /// Bounds a restored panel width is clamped into. The lower bound keeps a corrupt
 /// or hostile pref from restoring a panel too narrow to grab and drag back out;
 /// the upper bound keeps one from eating the whole window.
 const PANEL_WIDTH_MIN: i32 = 140;
 const PANEL_WIDTH_MAX: i32 = 700;
+
+/// Width to expand a panel to when there is no remembered one — a panel collapsed
+/// across a restart before it was ever dragged. Matches the panels' own
+/// `width_request` so the first expand looks like the default layout.
+const PANEL_WIDTH_DEFAULT: i32 = 210;
 
 /// How long to wait after the last drag before writing a panel width. `position`
 /// notifies on every pixel of a drag, and each write is an SQLite transaction on
@@ -156,49 +169,225 @@ pub(crate) fn view_switcher_title(container: &gtk4::Box, subtitle: &str) -> gtk4
     title_box
 }
 
+/// Encode a panel's collapsed state for `darkroom_ui_prefs`.
+///
+/// Words rather than `1`/`0` so the row means something in a sqlite shell, and
+/// decoded strictly by [`parse_collapsed_token`]: anything unrecognised is *no
+/// opinion*, which leaves the panel **shown**. A corrupt or hand-edited pref must
+/// never hide chrome the user then has to guess how to get back.
+pub(crate) fn collapsed_token(collapsed: bool) -> &'static str {
+    if collapsed { "hidden" } else { "shown" }
+}
+
+pub(crate) fn parse_collapsed_token(tok: &str) -> Option<bool> {
+    match tok.trim() {
+        "hidden" => Some(true),
+        "shown" => Some(false),
+        _ => None,
+    }
+}
+
+/// Which side panel a key toggles, if any (parity audit 1.2). darktable uses
+/// `Ctrl+Shift+L` / `Ctrl+Shift+R`; bare `L` / `R` are free in our lighttable
+/// (ratings are digits, colour labels F1–F5) and are what darktable's own
+/// documentation calls the panel shortcuts in the shortcut-mapping default set.
+///
+/// Pure, so the mapping is testable with no display.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PanelSide {
+    Left,
+    Right,
+}
+
+pub(crate) fn panel_toggle_key(keyval: gtk4::gdk::Key) -> Option<PanelSide> {
+    use gtk4::gdk::Key;
+    match keyval {
+        Key::l | Key::L => Some(PanelSide::Left),
+        Key::r | Key::R => Some(PanelSide::Right),
+        _ => None,
+    }
+}
+
+/// A side panel's persisted width, clamped into the grabbable range. `None` when
+/// unset or unparseable — callers leave the layout default alone in that case.
+fn stored_panel_width(db_path: &str, key: &str) -> Option<i32> {
+    persist::load_ui_pref(db_path, key)
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|w| w.clamp(PANEL_WIDTH_MIN, PANEL_WIDTH_MAX))
+}
+
+/// Put the LEFT panel at `width`. It is the outer `Paned`'s start child, so its
+/// width *is* the handle position.
+fn apply_left_panel_width(outer: &gtk4::Paned, width: i32) {
+    outer.set_position(width);
+}
+
+/// Put the RIGHT panel at `width`. It is an *end* child, so its handle position is
+/// `centre_width - width` and depends on an allocation that hasn't happened yet at
+/// build time — and hasn't happened again right after the panel is re-shown. Both
+/// callers therefore go through an idle, and a still-unallocated `Paned` is left
+/// alone rather than handed a position computed from a zero width, which would slam
+/// the panel shut.
+/// `applied` (when given) is latched **only if the position was really set**, so a
+/// caller using it as a once-guard retries on the next map instead of giving up on
+/// a window that hadn't been allocated yet.
+fn apply_right_panel_width(
+    inner: &gtk4::Paned,
+    width: i32,
+    applied: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+) {
+    let inner = inner.clone();
+    glib::idle_add_local_once(move || {
+        let total = inner.width();
+        if total <= 0 {
+            return;
+        }
+        if let Some(applied) = applied {
+            applied.set(true);
+        }
+        inner.set_position((total - width).max(0));
+    });
+}
+
 /// Restore the persisted side-panel widths onto the two `Paned`s.
 ///
-/// The left panel is the outer `Paned`'s start child, so its width *is* the handle
-/// position and can be set immediately. The right panel is an *end* child, so its
-/// position depends on the centre's allocated width — which is 0 until the first
-/// layout. That one is applied on the first map, on an idle so the allocation has
-/// happened, and only once: re-applying on every map would undo the user's drag
-/// the next time the window is shown.
+/// The left panel's position can be set immediately; the right panel's waits for
+/// the first map (see [`apply_right_panel_width`]), and only once — re-applying on
+/// every map would undo the user's drag the next time the window is shown.
 fn restore_panel_widths(db_path: &str, outer: &gtk4::Paned, inner: &gtk4::Paned) {
-    let width_pref = |key: &str| {
-        persist::load_ui_pref(db_path, key)
-            .and_then(|v| v.parse::<i32>().ok())
-            .map(|w| w.clamp(PANEL_WIDTH_MIN, PANEL_WIDTH_MAX))
-    };
-
-    if let Some(left) = width_pref(LEFT_PANEL_WIDTH_PREF_KEY) {
-        outer.set_position(left);
+    if let Some(left) = stored_panel_width(db_path, LEFT_PANEL_WIDTH_PREF_KEY) {
+        apply_left_panel_width(outer, left);
     }
 
-    if let Some(right) = width_pref(RIGHT_PANEL_WIDTH_PREF_KEY) {
+    if let Some(right) = stored_panel_width(db_path, RIGHT_PANEL_WIDTH_PREF_KEY) {
         let applied = std::rc::Rc::new(std::cell::Cell::new(false));
         inner.connect_map(move |paned| {
             if applied.get() {
                 return;
             }
-            let paned = paned.clone();
-            let applied = applied.clone();
-            glib::idle_add_local_once(move || {
-                let total = paned.width();
-                // Still unallocated: leave the default rather than computing a
-                // position from a zero width, which would slam the panel shut.
-                if total <= 0 {
-                    return;
-                }
-                applied.set(true);
-                paned.set_position((total - right).max(0));
-            });
+            apply_right_panel_width(paned, right, Some(applied.clone()));
         });
     }
 }
 
-/// Write panel widths back as the user drags, debounced.
-fn persist_panel_widths(db_path: &str, outer: &gtk4::Paned, inner: &gtk4::Paned) {
+/// Collapse/expand controller for the two side panels (parity audit 1.2).
+///
+/// Collapsing **hides the panel widget**, so the `Paned` hands the whole area to the
+/// other child and the image area really grows — setting the handle to the edge
+/// instead would leave the panel squeezed to a sliver, still drawing, and (with
+/// `shrink=false`) wouldn't go all the way anyway.
+///
+/// The width is remembered before hiding and re-applied on expand. A `Paned`'s
+/// position doesn't survive a child's visibility change intact — the end child's
+/// position is a function of an allocation that changes while the child is gone —
+/// and a panel that comes back narrower than it left reads as a bug, so the width is
+/// carried explicitly rather than left to GTK.
+#[derive(Clone)]
+struct PanelCollapse {
+    outer: gtk4::Paned,
+    inner: gtk4::Paned,
+    left_widget: gtk4::Widget,
+    right_widget: gtk4::Widget,
+    db_path: String,
+    /// Widths to restore on expand. Seeded from the persisted widths so the very
+    /// first expand of a panel that started collapsed still lands somewhere sensible.
+    left_width: std::rc::Rc<std::cell::Cell<i32>>,
+    right_width: std::rc::Rc<std::cell::Cell<i32>>,
+    /// Collapsed state, shared with [`persist_panel_widths`]: a collapsed panel's
+    /// measured width is not a width the user chose, and writing it would overwrite
+    /// the real one.
+    left_collapsed: std::rc::Rc<std::cell::Cell<bool>>,
+    right_collapsed: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl PanelCollapse {
+    fn new(
+        db_path: &str,
+        outer: &gtk4::Paned,
+        inner: &gtk4::Paned,
+        left_widget: &impl IsA<gtk4::Widget>,
+        right_widget: &impl IsA<gtk4::Widget>,
+    ) -> Self {
+        let seed = |key: &str| {
+            std::rc::Rc::new(std::cell::Cell::new(
+                stored_panel_width(db_path, key).unwrap_or(PANEL_WIDTH_DEFAULT),
+            ))
+        };
+        Self {
+            outer: outer.clone(),
+            inner: inner.clone(),
+            left_widget: left_widget.clone().upcast(),
+            right_widget: right_widget.clone().upcast(),
+            db_path: db_path.to_string(),
+            left_width: seed(LEFT_PANEL_WIDTH_PREF_KEY),
+            right_width: seed(RIGHT_PANEL_WIDTH_PREF_KEY),
+            left_collapsed: std::rc::Rc::new(std::cell::Cell::new(false)),
+            right_collapsed: std::rc::Rc::new(std::cell::Cell::new(false)),
+        }
+    }
+
+    /// The width to remember for a panel about to be hidden: what it is actually
+    /// showing now, or — if that isn't a believable width, which is the case before
+    /// the first allocation (restoring a collapsed panel at startup) — whatever we
+    /// were already going to restore it to.
+    fn remember(cell: &std::cell::Cell<i32>, measured: i32) {
+        if measured >= PANEL_WIDTH_MIN {
+            cell.set(measured.min(PANEL_WIDTH_MAX));
+        }
+    }
+
+    fn set_left_collapsed(&self, collapsed: bool) {
+        if collapsed {
+            Self::remember(&self.left_width, self.outer.position());
+        }
+        // Order matters on expand: give the `Paned` its position before the child
+        // becomes visible, so the panel doesn't appear at the wrong width for a frame.
+        self.left_collapsed.set(collapsed);
+        if !collapsed {
+            apply_left_panel_width(&self.outer, self.left_width.get());
+        }
+        self.left_widget.set_visible(!collapsed);
+        persist::save_ui_pref(
+            &self.db_path,
+            LEFT_PANEL_COLLAPSED_PREF_KEY,
+            collapsed_token(collapsed),
+        );
+    }
+
+    fn set_right_collapsed(&self, collapsed: bool) {
+        if collapsed {
+            Self::remember(
+                &self.right_width,
+                (self.inner.width() - self.inner.position()).max(0),
+            );
+        }
+        self.right_collapsed.set(collapsed);
+        self.right_widget.set_visible(!collapsed);
+        if !collapsed {
+            // The end child's position depends on the centre's width, which only
+            // settles after the re-shown child is allocated — hence the idle, and
+            // hence (unlike the left) after making it visible rather than before.
+            //
+            // Ordering assumption: set_visible(true) queues a resize; the actual
+            // layout/paint runs in the next allocation phase. idle_add_local_once
+            // fires after pending events are drained but before layout processes the
+            // queued resize, so the position is set before the panel paints. If this
+            // one-frame-glitches on a particular compositor/driver, use a higher-
+            // priority idle or a frame-clock callback instead.
+            apply_right_panel_width(&self.inner, self.right_width.get(), None);
+        }
+        persist::save_ui_pref(
+            &self.db_path,
+            RIGHT_PANEL_COLLAPSED_PREF_KEY,
+            collapsed_token(collapsed),
+        );
+    }
+}
+
+/// Write panel widths back as the user drags, debounced. A panel that is currently
+/// collapsed is skipped: its measured width is an artefact of being hidden, and
+/// persisting it would lose the width the user actually chose.
+fn persist_panel_widths(db_path: &str, outer: &gtk4::Paned, inner: &gtk4::Paned, collapse: &PanelCollapse) {
     // One pending timeout shared by both handles: whichever moved last wins the
     // timer, and both widths are written together when it fires.
     let pending: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
@@ -209,6 +398,8 @@ fn persist_panel_widths(db_path: &str, outer: &gtk4::Paned, inner: &gtk4::Paned)
         let outer = outer.clone();
         let inner = inner.clone();
         let pending = pending.clone();
+        let left_collapsed = collapse.left_collapsed.clone();
+        let right_collapsed = collapse.right_collapsed.clone();
         std::rc::Rc::new(move || {
             if let Some(id) = pending.borrow_mut().take() {
                 id.remove();
@@ -217,19 +408,23 @@ fn persist_panel_widths(db_path: &str, outer: &gtk4::Paned, inner: &gtk4::Paned)
             let outer = outer.clone();
             let inner = inner.clone();
             let pending_inner = pending.clone();
+            let left_collapsed = left_collapsed.clone();
+            let right_collapsed = right_collapsed.clone();
             let id = glib::timeout_add_local_once(
                 std::time::Duration::from_millis(u64::from(PANEL_WIDTH_SAVE_DEBOUNCE_MS)),
                 move || {
                     pending_inner.replace(None);
-                    persist::save_ui_pref(
-                        &db,
-                        LEFT_PANEL_WIDTH_PREF_KEY,
-                        &outer.position().to_string(),
-                    );
+                    if !left_collapsed.get() {
+                        persist::save_ui_pref(
+                            &db,
+                            LEFT_PANEL_WIDTH_PREF_KEY,
+                            &outer.position().to_string(),
+                        );
+                    }
                     // The right panel's width, not its handle position — see the
                     // pref-key doc.
                     let right = (inner.width() - inner.position()).max(0);
-                    if right > 0 {
+                    if right > 0 && !right_collapsed.get() {
                         persist::save_ui_pref(
                             &db,
                             RIGHT_PANEL_WIDTH_PREF_KEY,
@@ -433,7 +628,19 @@ fn build_main_window(app: &Application) {
     // handle position is what the user set, so it is the thing to store — not a
     // width computed from it, which would drift with the window size.
     restore_panel_widths(&db_path, &outer_paned, &inner_paned);
-    persist_panel_widths(&db_path, &outer_paned, &inner_paned);
+
+    // Collapsible panels (parity audit 1.2). Built before the width persistence so
+    // that persistence can see the collapsed state and skip writing a hidden
+    // panel's width. Restored state is applied further down, once the header
+    // toggles exist to reflect it.
+    let collapse = PanelCollapse::new(
+        &db_path,
+        &outer_paned,
+        &inner_paned,
+        &left.widget,
+        &right.widget,
+    );
+    persist_panel_widths(&db_path, &outer_paned, &inner_paned, &collapse);
 
     hbox.append(&outer_paned);
 
@@ -464,6 +671,55 @@ fn build_main_window(app: &Application) {
     // ── Header bar ─────────────────────────────────────────────────────────
     let lt_header = adw::HeaderBar::new();
     lt_header.set_title_widget(Some(&adw::WindowTitle::new("Darkroom", "Lighttable")));
+
+    // Panel toggles (parity audit 1.2) — one per side, at the header's two ends so
+    // each button sits over the panel it hides. darktable puts triangles on the
+    // window edges; a header toggle is the GNOME idiom for the same thing and, being
+    // a real button with a tooltip, is findable, which the audit's complaint was
+    // half about. `L` / `R` do the same from the keyboard (wired with the grid's
+    // other keys).
+    let (left_toggle, right_toggle) = {
+        let mk = |icon: &str, tip: &str| {
+            gtk4::ToggleButton::builder()
+                .icon_name(icon)
+                .tooltip_text(tip)
+                .active(true) // panels start shown; restored state is applied below
+                .build()
+        };
+        let l = mk("sidebar-show-symbolic", "Show/hide the left panel (L)");
+        let r = mk("sidebar-show-right-symbolic", "Show/hide the right panel (R)");
+        // Active = panel SHOWN, so the pressed-in look means "there is a panel
+        // there", matching how the view-mode toggles read.
+        {
+            let collapse = collapse.clone();
+            l.connect_toggled(move |b| collapse.set_left_collapsed(!b.is_active()));
+        }
+        {
+            let collapse = collapse.clone();
+            r.connect_toggled(move |b| collapse.set_right_collapsed(!b.is_active()));
+        }
+        lt_header.pack_start(&l);
+        lt_header.pack_end(&r);
+        (l, r)
+    };
+
+    // Apply the persisted collapsed state through the toggles, so the buttons and
+    // the panels can't disagree about what is on screen. An unrecognised token is
+    // no opinion and leaves the panel shown (see `parse_collapsed_token`).
+    for (key, toggle) in [
+        (LEFT_PANEL_COLLAPSED_PREF_KEY, &left_toggle),
+        (RIGHT_PANEL_COLLAPSED_PREF_KEY, &right_toggle),
+    ] {
+        if let Some(true) = persist::load_ui_pref(&db_path, key)
+            .as_deref()
+            .and_then(parse_collapsed_token)
+        {
+            // Drives the same handler a click would, which hides the panel and
+            // re-persists the state it just read — a harmless idempotent write, and
+            // cheaper than a second code path that could drift from the click one.
+            toggle.set_active(false);
+        }
+    }
 
     // Search bar
     {
@@ -1164,8 +1420,10 @@ fn build_main_window(app: &Application) {
         let key = gtk4::EventControllerKey::new();
         let sel = lt_selection.clone();
         let db  = db_path.clone();
+        let panel_left_toggle  = left_toggle.clone();
+        let panel_right_toggle = right_toggle.clone();
         key.connect_key_pressed(clone!(@weak grid => @default-return glib::Propagation::Proceed, move |_, keyval, _, state| {
-            if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK) {
+            if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK | gtk4::gdk::ModifierType::SHIFT_MASK) {
                 return glib::Propagation::Proceed;
             }
             // Full preview (m4-98c c) is checked FIRST: while it is up, ← / →
@@ -1183,6 +1441,17 @@ fn build_main_window(app: &Application) {
                 if lighttable::cull_step(&grid, forward) {
                     return glib::Propagation::Stop;
                 }
+            }
+            // Panel toggles (parity audit 1.2). Driven through the header buttons so
+            // the key and the click share one path and the button can't be left
+            // showing the wrong state.
+            if let Some(side) = panel_toggle_key(keyval) {
+                let toggle = match side {
+                    PanelSide::Left => &panel_left_toggle,
+                    PanelSide::Right => &panel_right_toggle,
+                };
+                toggle.set_active(!toggle.is_active());
+                return glib::Propagation::Stop;
             }
             if let Some(color) = lighttable::fkey_to_color(keyval) {
                 lighttable::toggle_selected_color(&grid, &sel, &db, color);
@@ -1302,4 +1571,63 @@ fn build_main_window(app: &Application) {
     // above remain the fallback for WMs that don't honour maximize.
     window.maximize();
     window.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collapsed_token, panel_toggle_key, parse_collapsed_token, PanelSide,
+                PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, PANEL_WIDTH_MIN};
+    use gtk4::gdk::Key;
+
+    #[test]
+    fn collapsed_token_round_trips() {
+        for collapsed in [true, false] {
+            assert_eq!(
+                parse_collapsed_token(collapsed_token(collapsed)),
+                Some(collapsed),
+                "round-trip {collapsed}",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_collapsed_token_is_no_opinion() {
+        // A corrupt or hand-edited pref must never hide a panel the user then has to
+        // guess how to get back: `None` leaves it shown.
+        for tok in ["", "1", "0", "true", "collapsed", "HIDDEN", "shown ish"] {
+            assert_eq!(parse_collapsed_token(tok), None, "token {tok:?}");
+        }
+        // Surrounding whitespace is tolerated, though — it round-trips a value that
+        // was written correctly and then padded.
+        assert_eq!(parse_collapsed_token(" hidden\n"), Some(true));
+    }
+
+    #[test]
+    fn panel_keys_map_to_their_side_in_either_case() {
+        assert_eq!(panel_toggle_key(Key::l), Some(PanelSide::Left));
+        assert_eq!(panel_toggle_key(Key::L), Some(PanelSide::Left));
+        assert_eq!(panel_toggle_key(Key::r), Some(PanelSide::Right));
+        assert_eq!(panel_toggle_key(Key::R), Some(PanelSide::Right));
+    }
+
+    #[test]
+    fn panel_keys_dont_steal_the_lighttables_own_shortcuts() {
+        // Ratings are digits, colour labels are F1–F5, the full preview is `f`, and
+        // culling pages with the arrows. None of them may map to a panel toggle.
+        for k in [Key::f, Key::F, Key::_0, Key::_5, Key::F1, Key::F5,
+                  Key::Left, Key::Right, Key::Home, Key::End,
+                  Key::Return, Key::BackSpace, Key::Delete,
+                  Key::Escape, Key::space] {
+            assert_eq!(panel_toggle_key(k), None, "key {k:?}");
+        }
+    }
+
+    #[test]
+    fn default_expand_width_is_grabbable() {
+        // The width a never-dragged panel expands to has to sit inside the range a
+        // restored width is clamped into, or the first expand would land somewhere
+        // the user can't drag back.
+        assert!(PANEL_WIDTH_DEFAULT >= PANEL_WIDTH_MIN);
+        assert!(PANEL_WIDTH_DEFAULT <= PANEL_WIDTH_MAX);
+    }
 }
