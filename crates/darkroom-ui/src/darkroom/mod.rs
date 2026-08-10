@@ -1821,6 +1821,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Sharpen" => pg.add(&sharpen_module_row(ctx)),
                 "Vibrance" => pg.add(&vibrance_module_row(ctx)),
                 "Colorize" => pg.add(&colorize_module_row(ctx)),
+                "Color correction" => pg.add(&colorcorrection_module_row(ctx)),
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
@@ -1849,7 +1850,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color contrast", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2042,6 +2043,27 @@ fn colorcontrast_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.color_contrast_a_steepness = v);
             add_param_slider(e, ctx, "B steepness", 0.0, 5.0, 1.0, p0.color_contrast_b_steepness as f64,
                 |p, v| p.color_contrast_b_steepness = v);
+        })
+}
+
+fn colorcorrection_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Color correction", "shadow/highlight chroma recovery", p0.color_correction_on,
+        |p, on| p.color_correction_on = on,
+        |e, ctx| {
+            // Shadow a-channel offset (loa). Range -100..100 covers the Lab a
+            // axis (-128..127) with headroom.
+            add_param_slider(e, ctx, "Shadow a", -100.0, 100.0, 1.0, p0.color_correction_loa as f64,
+                |p, v| p.color_correction_loa = v);
+            add_param_slider(e, ctx, "Highlight a", -100.0, 100.0, 1.0, p0.color_correction_hia as f64,
+                |p, v| p.color_correction_hia = v);
+            add_param_slider(e, ctx, "Shadow b", -100.0, 100.0, 1.0, p0.color_correction_lob as f64,
+                |p, v| p.color_correction_lob = v);
+            add_param_slider(e, ctx, "Highlight b", -100.0, 100.0, 1.0, p0.color_correction_hib as f64,
+                |p, v| p.color_correction_hib = v);
+            // Global saturation: -3..3, default 1.0 = no change.
+            add_param_slider(e, ctx, "Saturation", -3.0, 3.0, 0.01, p0.color_correction_saturation as f64,
+                |p, v| p.color_correction_saturation = v);
         })
 }
 

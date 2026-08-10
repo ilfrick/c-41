@@ -65,6 +65,7 @@ static CATALOG: &[ModuleGroup] = &[
                 m("Velvia", false),
                 m("Vibrance", false),
                 m("Colorize", false),
+                m("Color correction", false),
                 m("Color contrast", false),
             ],
         },

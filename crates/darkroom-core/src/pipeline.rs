@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, colorize, exposure, invert, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
+use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, exposure, invert, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -125,6 +125,14 @@ pub enum Stage {
     /// **Pixel-local**: no neighbour reads, so the band-parallel path stays
     /// available.
     Colorize { color_l: f32, color_a: f32, color_b: f32, mix: f32, space: ColorSpace },
+    /// Luminance-dependent Lab a/b colour correction (colorcorrection.c).
+    /// `a_scale`/`b_scale` are chroma multipliers, `a_base`/`b_base` are additive
+    /// offsets, `saturation` is a global chroma scale. All are pre-computed from
+    /// the HSL params (hia/loa/hib/lob/saturation) by `commit_params` in
+    /// [`PreviewParams::to_pipeline`]. Lab-domain: needs the buffer's working
+    /// colour space. **Pixel-local**: no neighbour reads, so the band-parallel path
+    /// stays available.
+    ColorCorrection { a_scale: f32, a_base: f32, b_scale: f32, b_base: f32, saturation: f32, space: ColorSpace },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -165,6 +173,7 @@ impl Stage {
             Stage::Temperature { .. } => "temperature",
             Stage::Invert { .. } => "invert",
             Stage::Colorize { .. } => "colorize",
+            Stage::ColorCorrection { .. } => "colorcorrection",
         }
     }
 
@@ -198,6 +207,9 @@ impl Stage {
             // Colorize is pixel-local: per-pixel Lab replacement, no neighbours,
             // no neighbourhood reads.
             Stage::Colorize { .. } => true,
+            // ColorCorrection is pixel-local: per-pixel Lab a/b scaling, no
+            // neighbours, no neighbourhood reads.
+            Stage::ColorCorrection { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -218,6 +230,8 @@ impl Stage {
             Stage::ColorContrast { space, .. } => Some(*space),
             // Colorize converts RGB↔Lab and must agree with Sharpen/Vibrance/ColorContrast.
             Stage::Colorize { space, .. } => Some(*space),
+            // ColorCorrection converts RGB↔Lab and must agree with the other Lab stages.
+            Stage::ColorCorrection { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -479,6 +493,34 @@ impl Stage {
                 }
                 let mut lab_out = vec![0.0f32; n * 4];
                 colorize::process_pixels(&lab_in, &mut lab_out, color_l, color_a, color_b, mix);
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Color correction (colorcorrection.c) ────────────────────
+            // Luminance-dependent Lab a/b scaling + global saturation. Like
+            // ColorContrast/Colorize it round-trips RGB↔Lab (chosen by the
+            // buffer's working space), then calls colorcorrection::process_pixels.
+            Stage::ColorCorrection { a_scale, a_base, b_scale, b_base, saturation, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                colorcorrection::process_pixels(
+                    &lab_in, &mut lab_out,
+                    a_scale, a_base, b_scale, b_base, saturation,
+                );
                 for p in 0..n {
                     let i = p * 4;
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
@@ -834,6 +876,7 @@ mod tests {
             Stage::Temperature { coeffs: [1.0, 1.0, 1.0, 1.0] },
             Stage::Invert { color: [1.0, 1.0, 1.0, 1.0] },
             Stage::Colorize { color_l: 50.0, color_a: 0.0, color_b: 0.0, mix: 1.0, space: ColorSpace::LinearSrgb },
+            Stage::ColorCorrection { a_scale: 0.0, a_base: 0.0, b_scale: 0.0, b_base: 0.0, saturation: 1.0, space: ColorSpace::LinearSrgb },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }

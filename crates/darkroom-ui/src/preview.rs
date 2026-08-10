@@ -7,7 +7,8 @@
 //! Phase 3-m2-2: the stage chaining now lives in `darkroom_core::pipeline`.
 //! [`PreviewParams::to_pipeline`] maps the UI sliders (UI ranges) to a
 //! `Pipeline` of physical-param `Stage`s in darktable's canonical iop order
-//! (invert → temperature → exposure → monochrome → sigmoid → velvia → colorize → splittoning);
+//! (invert → temperature → exposure → monochrome → sharpen → vibrance → color
+//! correction → color contrast → sigmoid → velvia → colorize → splittoning);
 //! [`apply_pipeline`] just marshals the 8-bit pixbuf to/from the
 //! float RGBA the core pipeline runs on, preserving the source alpha channel and
 //! rowstride padding byte-for-byte.
@@ -22,7 +23,8 @@ use darkroom_core::pipeline::{ColorSpace, Pipeline, Stage};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `darkroom-core` IOP, in pixelpipe order
-/// (invert → temperature → exposure → monochrome → sigmoid → velvia → colorize → splittoning; see
+/// (invert → temperature → exposure → monochrome → sharpen → vibrance → color
+/// correction → color contrast → sigmoid → velvia → colorize → splittoning; see
 /// [`Self::to_pipeline`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreviewParams {
@@ -106,6 +108,18 @@ pub struct PreviewParams {
     pub colorize_lightness: f32,
     /// Source lightness mix, 0..100 (darktable slider scale; core gets ×0.01).
     pub colorize_lightness_mix: f32,
+    /// Color correction (Lab a/b scaling) stage on/off.
+    pub color_correction_on: bool,
+    /// Shadow a-channel offset (loa) — additive on Lab a for shadows.
+    pub color_correction_loa: f32,
+    /// Highlight a-channel offset (hia) — additive on Lab a for highlights.
+    pub color_correction_hia: f32,
+    /// Shadow b-channel offset (lob).
+    pub color_correction_lob: f32,
+    /// Highlight b-channel offset (hib).
+    pub color_correction_hib: f32,
+    /// Global chroma saturation (-3..3, default 1.0 = no change).
+    pub color_correction_saturation: f32,
 }
 
 impl Default for PreviewParams {
@@ -161,6 +175,13 @@ impl Default for PreviewParams {
             colorize_sat: 0.0,
             colorize_lightness: 50.0,
             colorize_lightness_mix: 50.0,
+            // Darktable default: off, saturation 1.0 (no change), offsets 0.
+            color_correction_on: false,
+            color_correction_loa: 0.0,
+            color_correction_hia: 0.0,
+            color_correction_lob: 0.0,
+            color_correction_hib: 0.0,
+            color_correction_saturation: 1.0,
         }
     }
 }
@@ -194,9 +215,17 @@ impl PreviewParams {
         // Colorize with sat 0 produces a grey (zero chroma) — that's a real
         // change (replacing a/b), so on == off is the only no-op guard.
         let colorize_identity = !self.colorize_on;
+        // Color correction: saturation 1.0 with all offsets 0 is identity
+        // (a_base=0, b_base=0, scales=0 ⇒ out.a = in.a, out.b = in.b).
+        let cc_corr_identity = !self.color_correction_on
+            || (self.color_correction_saturation == 1.0
+                && self.color_correction_loa == 0.0
+                && self.color_correction_hia == 0.0
+                && self.color_correction_lob == 0.0
+                && self.color_correction_hib == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
-            && invert_identity && colorize_identity
+            && invert_identity && colorize_identity && cc_corr_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -215,18 +244,19 @@ impl PreviewParams {
             temperature_on: false,
             invert_on: false,
             colorize_on: false,
+            color_correction_on: false,
             ..*self
         }
     }
 
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
-    /// `[version, 11×bool(u8), 31×f32_le]`. Decoded by [`PreviewParams::decode`].
+    /// `[version, 12×bool(u8), 36×f32_le]`. Decoded by [`PreviewParams::decode`].
     /// This is darkroom-ui's own layout (NOT a C IOP `op_params`), stored under a
     /// synthetic operation name the C reader ignores.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on] {
             v.push(b as u8);
         }
         for f in [
@@ -243,6 +273,7 @@ impl PreviewParams {
             self.temperature_r, self.temperature_g, self.temperature_b,
             self.invert_r, self.invert_g, self.invert_b,
             self.colorize_hue, self.colorize_sat, self.colorize_lightness, self.colorize_lightness_mix,
+            self.color_correction_loa, self.color_correction_hia, self.color_correction_lob, self.color_correction_hib, self.color_correction_saturation,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -256,9 +287,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..12];
-        // length is checked above, so exactly 31 f32 chunks follow
-        let f: Vec<f32> = bytes[12..]
+        let bools = &bytes[1..13];
+        // length is checked above, so exactly 36 f32 chunks follow
+        let f: Vec<f32> = bytes[13..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -274,6 +305,7 @@ impl PreviewParams {
             temperature_on: bools[8] != 0,
             invert_on: bools[9] != 0,
             colorize_on: bools[10] != 0,
+            color_correction_on: bools[11] != 0,
             black: f[0], ev: f[1],
             velvia_strength: f[2], velvia_bias: f[3],
             split_shadow_hue: f[4], split_shadow_sat: f[5],
@@ -287,6 +319,7 @@ impl PreviewParams {
             temperature_r: f[21], temperature_g: f[22], temperature_b: f[23],
             invert_r: f[24], invert_g: f[25], invert_b: f[26],
             colorize_hue: f[27], colorize_sat: f[28], colorize_lightness: f[29], colorize_lightness_mix: f[30],
+            color_correction_loa: f[31], color_correction_hia: f[32], color_correction_lob: f[33], color_correction_hib: f[34], color_correction_saturation: f[35],
         })
     }
 
@@ -296,9 +329,10 @@ impl PreviewParams {
     /// stages that would actually change the image (so a bypassed/neutral set
     /// yields an empty, identity pipeline).
     ///
-    /// Stage order follows darktable's canonical v3.0 scene-referred iop order
+    /// Stage order follows darktable's canonical v3.0 iop order
     /// (`src/common/iop_order.c`: invert 2 → temperature 3 → exposure 21 →
-    /// channelmixerrgb 39 → sigmoid 45.3 → velvia 57 → splittoning 67). The scene-referred stages
+    /// channelmixerrgb 39 → sharpen 53 → colorcorrection 55 → colorcontrast 56 →
+    /// sigmoid 45.3 → velvia 57 → colorize 62 → splittoning 67). The scene-referred stages
     /// (exposure, the channel-mix to grey) run on unbounded linear data; sigmoid
     /// tone-maps to display range; the display-referred creative stages (velvia,
     /// splittoning) run after it, where their [0,1] clamps are semantically
@@ -363,6 +397,27 @@ impl PreviewParams {
         if self.vibrance_on && self.vibrance_amount > 0.0 {
             p.push(Stage::Vibrance {
                 amount: self.vibrance_amount / 100.0,
+                space,
+            });
+        }
+        // Color correction (iop_order.c pos 55, after sharpen 53, before colorcontrast
+        // 56) — luminance-dependent Lab a/b scaling + global saturation. The HSL-
+        // style params (loa/hia/lob/hib/saturation) are converted to the core's
+        // physical params (a_scale/a_base/b_scale/b_base/saturation) via
+        // commit_params: a_scale = (hia - loa) / 100, a_base = loa, etc.
+        if self.color_correction_on
+            && (self.color_correction_saturation != 1.0
+                || self.color_correction_loa != 0.0
+                || self.color_correction_hia != 0.0
+                || self.color_correction_lob != 0.0
+                || self.color_correction_hib != 0.0)
+        {
+            p.push(Stage::ColorCorrection {
+                a_scale: (self.color_correction_hia - self.color_correction_loa) / 100.0,
+                a_base: self.color_correction_loa,
+                b_scale: (self.color_correction_hib - self.color_correction_lob) / 100.0,
+                b_base: self.color_correction_lob,
+                saturation: self.color_correction_saturation,
                 space,
             });
         }
@@ -431,10 +486,10 @@ impl PreviewParams {
 /// to `None` → defaults, rather than mis-parsing). v2 added the sigmoid stage.
 /// v3 added the sharpen stage. v4 added vibrance. v5 added color contrast.
 /// v6 added temperature (white balance). v7 adds invert (film-camera negative).
-/// v8 adds colorize (HSL colour replacement).
-const ENCODE_VERSION: u8 = 8;
-/// 1 version byte + 11 bool bytes + 31 little-endian f32.
-const ENCODED_LEN: usize = 1 + 11 + 31 * 4;
+/// v8 adds colorize (HSL colour replacement). v9 adds color correction.
+const ENCODE_VERSION: u8 = 9;
+/// 1 version byte + 12 bool bytes + 36 little-endian f32.
+const ENCODED_LEN: usize = 1 + 12 + 36 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1007,6 +1062,17 @@ mod tests {
         let mut cz = PreviewParams::default();
         cz.colorize_on = true;
         cfgs.push(cz);
+        // color correction with saturation=1.0 and all offsets 0 ⇒ identity
+        // (matches to_pipeline gate: no stage pushed)
+        let mut cc_id = PreviewParams::default();
+        cc_id.color_correction_on = true;
+        cc_id.color_correction_saturation = 1.0;
+        cfgs.push(cc_id);
+        // color correction with saturation != 1.0 ⇒ non-identity
+        let mut cc = PreviewParams::default();
+        cc.color_correction_on = true;
+        cc.color_correction_saturation = 1.5;
+        cfgs.push(cc);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
@@ -1052,11 +1118,13 @@ mod tests {
         p.split_on = true;
         p.sharpen_on = true;
         p.sharpen_amount = 1.0;
+        p.color_correction_on = true;
+        p.color_correction_saturation = 1.5;
         p.colorize_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
-            ["exposure", "channelmixer", "sharpen", "sigmoid", "velvia", "colorize", "splittoning"]
+            ["exposure", "channelmixer", "sharpen", "colorcorrection", "sigmoid", "velvia", "colorize", "splittoning"]
         );
     }
 
@@ -1143,6 +1211,8 @@ mod tests {
             temperature_on: true, temperature_r: 1.2, temperature_g: 0.9, temperature_b: 0.8,
             invert_on: true, invert_r: 0.9, invert_g: 0.8, invert_b: 0.7,
             colorize_on: true, colorize_hue: 0.1, colorize_sat: 0.6, colorize_lightness: 75.0, colorize_lightness_mix: 50.0,
+            color_correction_on: true, color_correction_loa: 5.0, color_correction_hia: 10.0,
+            color_correction_lob: -3.0, color_correction_hib: 7.0, color_correction_saturation: 1.5,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);

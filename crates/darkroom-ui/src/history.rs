@@ -297,6 +297,15 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if colorize {
         return "Colorize";
     }
+    let color_correction = old.color_correction_on != new.color_correction_on
+        || old.color_correction_loa != new.color_correction_loa
+        || old.color_correction_hia != new.color_correction_hia
+        || old.color_correction_lob != new.color_correction_lob
+        || old.color_correction_hib != new.color_correction_hib
+        || old.color_correction_saturation != new.color_correction_saturation;
+    if color_correction {
+        return "Color correction";
+    }
     "Edit"
 }
 
@@ -434,6 +443,10 @@ mod tests {
             describe_change(&base, &PreviewParams { colorize_hue: 0.3, ..d() }),
             "Colorize"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { color_correction_saturation: 1.5, ..d() }),
+            "Color correction"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -487,6 +500,12 @@ mod tests {
             colorize_sat: _,
             colorize_lightness: _,
             colorize_lightness_mix: _,
+            color_correction_on: _,
+            color_correction_loa: _,
+            color_correction_hia: _,
+            color_correction_lob: _,
+            color_correction_hib: _,
+            color_correction_saturation: _,
         } = PreviewParams::default();
     }
 
@@ -566,7 +585,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 136);
+        assert_eq!(PreviewParams::default().encode().len(), 157);
     }
 
     #[test]
