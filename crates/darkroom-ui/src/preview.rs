@@ -7,7 +7,7 @@
 //! Phase 3-m2-2: the stage chaining now lives in `darkroom_core::pipeline`.
 //! [`PreviewParams::to_pipeline`] maps the UI sliders (UI ranges) to a
 //! `Pipeline` of physical-param `Stage`s in darktable's canonical iop order
-//! (exposure → monochrome → sigmoid → velvia → splittoning);
+//! (invert → temperature → exposure → monochrome → sigmoid → velvia → splittoning);
 //! [`apply_pipeline`] just marshals the 8-bit pixbuf to/from the
 //! float RGBA the core pipeline runs on, preserving the source alpha channel and
 //! rowstride padding byte-for-byte.
@@ -22,7 +22,7 @@ use darkroom_core::pipeline::{ColorSpace, Pipeline, Stage};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `darkroom-core` IOP, in pixelpipe order
-/// (exposure → monochrome → sigmoid → velvia → splittoning; see
+/// (invert → temperature → exposure → monochrome → sigmoid → velvia → splittoning; see
 /// [`Self::to_pipeline`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreviewParams {
@@ -84,6 +84,12 @@ pub struct PreviewParams {
     pub color_contrast_a_steepness: f32,
     /// Blue-yellow contrast steepness [0, 5] (default 1.0 = no-op).
     pub color_contrast_b_steepness: f32,
+    /// Invert (film-camera negative) stage on/off.
+    pub invert_on: bool,
+    /// Per-channel film-back colour: out = color - in (default 1.0 = negate).
+    pub invert_r: f32,
+    pub invert_g: f32,
+    pub invert_b: f32,
     /// Temperature (white balance) stage on/off.
     pub temperature_on: bool,
     /// Per-channel multipliers (default 1.0 = no change). 0..=4 range.
@@ -134,6 +140,11 @@ impl Default for PreviewParams {
             temperature_r: 1.0,
             temperature_g: 1.0,
             temperature_b: 1.0,
+            // Darktable default: off, film-back colour (1,1,1,1) = standard negate.
+            invert_on: false,
+            invert_r: 1.0,
+            invert_g: 1.0,
+            invert_b: 1.0,
         }
     }
 }
@@ -161,8 +172,12 @@ impl PreviewParams {
             || (self.color_contrast_a_steepness == 1.0 && self.color_contrast_b_steepness == 1.0);
         let temp_identity = !self.temperature_on
             || (self.temperature_r == 1.0 && self.temperature_g == 1.0 && self.temperature_b == 1.0);
+        // Invert has no value at which it is a no-op while enabled (even
+        // color == (1,1,1,1) negates the image), so on == off.
+        let invert_identity = !self.invert_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
+            && invert_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -179,18 +194,19 @@ impl PreviewParams {
             vibrance_on: false,
             color_contrast_on: false,
             temperature_on: false,
+            invert_on: false,
             ..*self
         }
     }
 
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
-    /// `[version, 9×bool(u8), 24×f32_le]`. Decoded by [`PreviewParams::decode`].
+    /// `[version, 10×bool(u8), 27×f32_le]`. Decoded by [`PreviewParams::decode`].
     /// This is darkroom-ui's own layout (NOT a C IOP `op_params`), stored under a
     /// synthetic operation name the C reader ignores.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on] {
             v.push(b as u8);
         }
         for f in [
@@ -205,6 +221,7 @@ impl PreviewParams {
             self.vibrance_amount,
             self.color_contrast_a_steepness, self.color_contrast_b_steepness,
             self.temperature_r, self.temperature_g, self.temperature_b,
+            self.invert_r, self.invert_g, self.invert_b,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -218,9 +235,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..10];
-        // length is checked above, so exactly 24 f32 chunks follow
-        let f: Vec<f32> = bytes[10..]
+        let bools = &bytes[1..11];
+        // length is checked above, so exactly 27 f32 chunks follow
+        let f: Vec<f32> = bytes[11..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -234,6 +251,7 @@ impl PreviewParams {
             vibrance_on: bools[6] != 0,
             color_contrast_on: bools[7] != 0,
             temperature_on: bools[8] != 0,
+            invert_on: bools[9] != 0,
             black: f[0], ev: f[1],
             velvia_strength: f[2], velvia_bias: f[3],
             split_shadow_hue: f[4], split_shadow_sat: f[5],
@@ -245,6 +263,7 @@ impl PreviewParams {
             vibrance_amount: f[18],
             color_contrast_a_steepness: f[19], color_contrast_b_steepness: f[20],
             temperature_r: f[21], temperature_g: f[22], temperature_b: f[23],
+            invert_r: f[24], invert_g: f[25], invert_b: f[26],
         })
     }
 
@@ -255,8 +274,8 @@ impl PreviewParams {
     /// yields an empty, identity pipeline).
     ///
     /// Stage order follows darktable's canonical v3.0 scene-referred iop order
-    /// (`src/common/iop_order.c`: exposure 21 → channelmixerrgb 39 →
-    /// sigmoid 45.3 → velvia 57 → splittoning 67). The scene-referred stages
+    /// (`src/common/iop_order.c`: invert 2 → temperature 3 → exposure 21 →
+    /// channelmixerrgb 39 → sigmoid 45.3 → velvia 57 → splittoning 67). The scene-referred stages
     /// (exposure, the channel-mix to grey) run on unbounded linear data; sigmoid
     /// tone-maps to display range; the display-referred creative stages (velvia,
     /// splittoning) run after it, where their [0,1] clamps are semantically
@@ -278,6 +297,15 @@ impl PreviewParams {
     /// assumption holds, and on for raws, where it is what saves the highlights.
     pub fn to_pipeline(&self, space: ColorSpace, scale: f32) -> Pipeline {
         let mut p = Pipeline::new();
+        // Invert (film-camera negative, iop_order.c pos 2, before temperature 3) —
+        // per-channel `out = color - in` on the decoded linear buffer. Unlike
+        // temperature, color=[1,1,1] is NOT identity (it negates), so the only
+        // guard is the stage enable flag itself.
+        if self.invert_on {
+            p.push(Stage::Invert {
+                color: [self.invert_r, self.invert_g, self.invert_b, 1.0],
+            });
+        }
         // Temperature (white balance, iop_order.c pos ~20, before exposure 21) —
         // per-channel RGB multipliers on the decoded linear buffer. Runs first so
         // all downstream stages see corrected white balance.
@@ -359,10 +387,10 @@ impl PreviewParams {
 /// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
 /// to `None` → defaults, rather than mis-parsing). v2 added the sigmoid stage.
 /// v3 added the sharpen stage. v4 added vibrance. v5 added color contrast.
-/// v6 adds temperature (white balance).
-const ENCODE_VERSION: u8 = 6;
-/// 1 version byte + 9 bool bytes + 24 little-endian f32.
-const ENCODED_LEN: usize = 1 + 9 + 24 * 4;
+/// v6 added temperature (white balance). v7 adds invert (film-camera negative).
+const ENCODE_VERSION: u8 = 7;
+/// 1 version byte + 10 bool bytes + 27 little-endian f32.
+const ENCODED_LEN: usize = 1 + 10 + 27 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1063,6 +1091,7 @@ mod tests {
             vibrance_on: true, vibrance_amount: 33.0,
             color_contrast_on: true, color_contrast_a_steepness: 2.0, color_contrast_b_steepness: 1.5,
             temperature_on: true, temperature_r: 1.2, temperature_g: 0.9, temperature_b: 0.8,
+            invert_on: true, invert_r: 0.9, invert_g: 0.8, invert_b: 0.7,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -1082,7 +1111,7 @@ mod tests {
         blob[0] = 99;
         assert_eq!(PreviewParams::decode(&blob), None);
         // an old v1 blob (version 1, 57 bytes) must be rejected → caller defaults,
-        // never misread as v2 (lengths differ: 57 vs 66).
+        // never misread as the current version (lengths differ).
         let v1 = {
             let mut b = vec![0u8; 1 + 4 + 13 * 4];
             b[0] = 1;

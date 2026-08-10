@@ -1822,6 +1822,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Vibrance" => pg.add(&vibrance_module_row(ctx)),
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
+                "Invert" => pg.add(&invert_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -1847,7 +1848,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Color contrast", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Color contrast", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2056,6 +2057,22 @@ fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.temperature_g = v);
             add_param_slider(e, ctx, "Blue", 0.0, 4.0, 0.01, p0.temperature_b as f64,
                 |p, v| p.temperature_b = v);
+        })
+}
+
+fn invert_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Invert", "film negative inversion", p0.invert_on,
+        |p, on| p.invert_on = on,
+        |e, ctx| {
+            // Per-channel film-back colour: out = color - in (default 1.0 = negate).
+            // Range 0..=4 covers extreme inversions while staying bounded.
+            add_param_slider(e, ctx, "Red", 0.0, 4.0, 0.01, p0.invert_r as f64,
+                |p, v| p.invert_r = v);
+            add_param_slider(e, ctx, "Green", 0.0, 4.0, 0.01, p0.invert_g as f64,
+                |p, v| p.invert_g = v);
+            add_param_slider(e, ctx, "Blue", 0.0, 4.0, 0.01, p0.invert_b as f64,
+                |p, v| p.invert_b = v);
         })
 }
 

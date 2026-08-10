@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, exposure, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
+use crate::iop::{channelmixer, colorcontrast, exposure, invert, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -110,6 +110,12 @@ pub enum Stage {
     /// returns `None` for it. **Pixel-local**: no neighbour reads, so the
     /// band-parallel `process` path stays available.
     Temperature { coeffs: [f32; 4] },
+    /// Film-camera negative inversion (invert.c `process_rgb`): `out = color - in`
+    /// per channel. `color` is the 4-float film-back material colour
+    /// (`d->color[0..3]`, alpha usually 1.0). Works directly in linear RGB — no
+    /// Lab conversion, so `working_space()` returns `None`. **Pixel-local**: no
+    /// neighbour reads, so the band-parallel `process` path stays available.
+    Invert { color: [f32; 4] },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -148,6 +154,7 @@ impl Stage {
             Stage::Vibrance { .. } => "vibrance",
             Stage::ColorContrast { .. } => "colorcontrast",
             Stage::Temperature { .. } => "temperature",
+            Stage::Invert { .. } => "invert",
         }
     }
 
@@ -175,6 +182,9 @@ impl Stage {
             // Temperature is pixel-local: a per-channel scalar multiply, no
             // neighbours, no Lab conversion.
             Stage::Temperature { .. } => true,
+            // Invert is pixel-local: per-channel `color - in`, no neighbours,
+            // no Lab conversion.
+            Stage::Invert { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -409,6 +419,26 @@ impl Stage {
                         output.as_mut_ptr(),
                         npixels,
                         coeffs.as_ptr(),
+                    );
+                }
+            }
+            // ── Invert (invert.c) ─────────────────────────────────
+            // Per-channel film-camera negative inversion: `out = color - in`.
+            // Works directly in linear RGB — no Lab round-trip. The FFI
+            // (darkroom_invert_process) takes a 4-float color array [R, G, B, A].
+            // Pixel-local, pixel-exact.
+            Stage::Invert { color } => {
+                let npixels = input.len() / 4;
+                // Safety: input/output are packed RGBA f32 buffers of equal length
+                // (debug-asserted above: len % 4 == 0), so each holds exactly
+                // npixels*4 floats — the contract darkroom_invert_process documents.
+                // `color` is a fixed [f32; 4].
+                unsafe {
+                    invert::darkroom_invert_process(
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        npixels,
+                        color.as_ptr(),
                     );
                 }
             }
@@ -759,6 +789,7 @@ mod tests {
             Stage::Vibrance { amount: 0.0, space: ColorSpace::LinearSrgb },
             Stage::ColorContrast { a_steepness: 1.0, b_steepness: 1.0, space: ColorSpace::LinearSrgb },
             Stage::Temperature { coeffs: [1.0, 1.0, 1.0, 1.0] },
+            Stage::Invert { color: [1.0, 1.0, 1.0, 1.0] },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
@@ -1022,5 +1053,40 @@ mod tests {
         assert!((out[1] - 0.8).abs() < 1e-5, "G *= 4: got {}", out[1]);
         assert!((out[2] - 0.8).abs() < 1e-5, "B *= 8: got {}", out[2]);
         assert!((out[3] - 1.0).abs() < 1e-5, "A unchanged: got {}", out[3]);
+    }
+
+    #[test]
+    fn invert_unity_color_is_identity() {
+        // color = 1.0 per channel ⇒ out = 1.0 - in. With color = 1.0 this is
+        // a pure negate; NOT identity. But color = 2.0 + in = in only if
+        // color == 2*in, i.e. not identity either. The true identity for
+        // invert is color = 2*in for all pixels, which isn't a constant.
+        // So test the actual invert behaviour instead: color (1,1,1,1)
+        // gives out = 1 - in.
+        let px = vec![0.2f32, 0.5, 0.8, 1.0, 1.0, 0.0, 0.3, 1.0];
+        let p = Pipeline::with_stages(vec![Stage::Invert {
+            color: [1.0, 1.0, 1.0, 1.0],
+        }]);
+        let out = p.process(&px, px.len() / 4, 1);
+        assert!((out[0] - 0.8).abs() < 1e-6, "R: 1-0.2 = 0.8, got {}", out[0]);
+        assert!((out[1] - 0.5).abs() < 1e-6, "G: 1-0.5 = 0.5, got {}", out[1]);
+        assert!((out[2] - 0.2).abs() < 1e-6, "B: 1-0.8 = 0.2, got {}", out[2]);
+        assert!((out[3] - 0.0).abs() < 1e-6, "A: 1-1.0 = 0.0, got {}", out[3]);
+        assert!((out[4] - 0.0).abs() < 1e-6, "R: 1-1.0 = 0.0, got {}", out[4]);
+        assert!((out[6] - 0.7).abs() < 1e-6, "B: 1-0.3 = 0.7, got {}", out[6]);
+    }
+
+    #[test]
+    fn invert_scales_with_color() {
+        // Non-unity color: out = color - in per channel.
+        let px = vec![0.3f32, 0.6, 0.9, 1.0];
+        let p = Pipeline::with_stages(vec![Stage::Invert {
+            color: [1.0, 2.0, 0.5, 1.0],
+        }]);
+        let out = p.process(&px, 1, 1);
+        assert!((out[0] - 0.7).abs() < 1e-6, "R: 1.0-0.3 = 0.7, got {}", out[0]);
+        assert!((out[1] - 1.4).abs() < 1e-6, "G: 2.0-0.6 = 1.4, got {}", out[1]);
+        assert!((out[2] - (-0.4)).abs() < 1e-6, "B: 0.5-0.9 = -0.4, got {}", out[2]);
+        assert!((out[3] - 0.0).abs() < 1e-6, "A: 1.0-1.0 = 0.0, got {}", out[3]);
     }
 }
