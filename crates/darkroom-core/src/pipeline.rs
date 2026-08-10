@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, exposure, sharpen, sigmoid, splittoning, velvia, vibrance};
+use crate::iop::{channelmixer, colorcontrast, exposure, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -104,6 +104,12 @@ pub enum Stage {
     /// **pixel-local** (no neighbour reads), so the band-parallel path stays
     /// available.
     ColorContrast { a_steepness: f32, b_steepness: f32, space: ColorSpace },
+    /// Per-channel white-balance multipliers (temperature.c `process_rgb`):
+    /// `out = in * coeffs` (coeffs[0..3] = R, G, B; coeffs[3] = A, usually 1.0).
+    /// Works directly in linear RGB — no Lab conversion, so `working_space()`
+    /// returns `None` for it. **Pixel-local**: no neighbour reads, so the
+    /// band-parallel `process` path stays available.
+    Temperature { coeffs: [f32; 4] },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -141,6 +147,7 @@ impl Stage {
             Stage::Sharpen { .. } => "sharpen",
             Stage::Vibrance { .. } => "vibrance",
             Stage::ColorContrast { .. } => "colorcontrast",
+            Stage::Temperature { .. } => "temperature",
         }
     }
 
@@ -165,6 +172,9 @@ impl Stage {
             // ColorContrast is pixel-local: each output pixel depends only on
             // its own input pixel (Lab conversion is per-pixel, no neighbours).
             Stage::ColorContrast { .. } => true,
+            // Temperature is pixel-local: a per-channel scalar multiply, no
+            // neighbours, no Lab conversion.
+            Stage::Temperature { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -381,6 +391,25 @@ impl Stage {
                     // Alpha from the source, matching Sharpen/Vibrance.
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
                     output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Temperature (temperature.c) ────────────────────────────────
+            // Per-channel RGB multiply (white balance). Works directly in linear
+            // RGB — no Lab round-trip. The FFI signature (process_rgb) takes a
+            // 4-float coeffs array [R, G, B, A]. Pixel-local, pixel-exact.
+            Stage::Temperature { coeffs } => {
+                let npixels = input.len() / 4;
+                // Safety: input/output are packed RGBA f32 buffers of equal length
+                // (debug-asserted above: len % 4 == 0), so each holds exactly
+                // npixels*4 floats — the contract darkroom_temperature_process_rgb
+                // documents. coeffs is a fixed [f32; 4].
+                unsafe {
+                    temperature::darkroom_temperature_process_rgb(
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        npixels,
+                        coeffs.as_ptr(),
+                    );
                 }
             }
         }
@@ -729,6 +758,7 @@ mod tests {
             },
             Stage::Vibrance { amount: 0.0, space: ColorSpace::LinearSrgb },
             Stage::ColorContrast { a_steepness: 1.0, b_steepness: 1.0, space: ColorSpace::LinearSrgb },
+            Stage::Temperature { coeffs: [1.0, 1.0, 1.0, 1.0] },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
@@ -967,5 +997,30 @@ mod tests {
         assert_eq!(rad, 12);
         assert_eq!(mat.len(), 25);
         assert!((mat.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn temperature_unity_coeffs_are_identity() {
+        // All coeffs 1.0 ⇒ out = in (per-channel multiply by 1).
+        let px = vec![0.5f32, 0.3, 0.8, 1.0, 0.2, 0.6, 0.9, 1.0, 0.1, 0.4, 0.7, 1.0];
+        let p = Pipeline::with_stages(vec![Stage::Temperature {
+            coeffs: [1.0, 1.0, 1.0, 1.0],
+        }]);
+        let out = p.process(&px, px.len() / 4, 1);
+        assert_eq!(out, px, "unity temperature coeffs should be a no-op");
+    }
+
+    #[test]
+    fn temperature_scales_channels_independently() {
+        // Non-unity coeffs should multiply each channel independently.
+        let px = vec![0.8f32, 0.2, 0.1, 1.0];
+        let p = Pipeline::with_stages(vec![Stage::Temperature {
+            coeffs: [2.0, 4.0, 8.0, 1.0],
+        }]);
+        let out = p.process(&px, 1, 1);
+        assert!((out[0] - 1.6).abs() < 1e-5, "R *= 2: got {}", out[0]);
+        assert!((out[1] - 0.8).abs() < 1e-5, "G *= 4: got {}", out[1]);
+        assert!((out[2] - 0.8).abs() < 1e-5, "B *= 8: got {}", out[2]);
+        assert!((out[3] - 1.0).abs() < 1e-5, "A unchanged: got {}", out[3]);
     }
 }

@@ -1821,6 +1821,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Sharpen" => pg.add(&sharpen_module_row(ctx)),
                 "Vibrance" => pg.add(&vibrance_module_row(ctx)),
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
+                "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
             }
         }
@@ -1846,7 +1847,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Color contrast"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Color contrast", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2039,6 +2040,22 @@ fn colorcontrast_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.color_contrast_a_steepness = v);
             add_param_slider(e, ctx, "B steepness", 0.0, 5.0, 1.0, p0.color_contrast_b_steepness as f64,
                 |p, v| p.color_contrast_b_steepness = v);
+        })
+}
+
+fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "White balance", "channel multipliers", p0.temperature_on,
+        |p, on| p.temperature_on = on,
+        |e, ctx| {
+            // Per-channel RGB multipliers (1.0 = no change). Range 0..=4 to cover
+            // extreme WB shifts while staying bounded.
+            add_param_slider(e, ctx, "Red", 0.0, 4.0, 0.01, p0.temperature_r as f64,
+                |p, v| p.temperature_r = v);
+            add_param_slider(e, ctx, "Green", 0.0, 4.0, 0.01, p0.temperature_g as f64,
+                |p, v| p.temperature_g = v);
+            add_param_slider(e, ctx, "Blue", 0.0, 4.0, 0.01, p0.temperature_b as f64,
+                |p, v| p.temperature_b = v);
         })
 }
 

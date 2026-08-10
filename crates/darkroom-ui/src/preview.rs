@@ -84,6 +84,12 @@ pub struct PreviewParams {
     pub color_contrast_a_steepness: f32,
     /// Blue-yellow contrast steepness [0, 5] (default 1.0 = no-op).
     pub color_contrast_b_steepness: f32,
+    /// Temperature (white balance) stage on/off.
+    pub temperature_on: bool,
+    /// Per-channel multipliers (default 1.0 = no change). 0..=4 range.
+    pub temperature_r: f32,
+    pub temperature_g: f32,
+    pub temperature_b: f32,
 }
 
 impl Default for PreviewParams {
@@ -123,6 +129,11 @@ impl Default for PreviewParams {
             color_contrast_on: false,
             color_contrast_a_steepness: 1.0,
             color_contrast_b_steepness: 1.0,
+            // Darktable default: off, unity WB multipliers.
+            temperature_on: false,
+            temperature_r: 1.0,
+            temperature_g: 1.0,
+            temperature_b: 1.0,
         }
     }
 }
@@ -148,8 +159,10 @@ impl PreviewParams {
         // no-op on Lab a/b; any deviation from 1.0 changes chroma.
         let cc_identity = !self.color_contrast_on
             || (self.color_contrast_a_steepness == 1.0 && self.color_contrast_b_steepness == 1.0);
+        let temp_identity = !self.temperature_on
+            || (self.temperature_r == 1.0 && self.temperature_g == 1.0 && self.temperature_b == 1.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
-            && sharpen_identity && vibrance_identity && cc_identity
+            && sharpen_identity && vibrance_identity && cc_identity && temp_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -165,18 +178,19 @@ impl PreviewParams {
             sharpen_on: false,
             vibrance_on: false,
             color_contrast_on: false,
+            temperature_on: false,
             ..*self
         }
     }
 
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
-    /// `[version, 5×bool(u8), 15×f32_le]`. Decoded by [`PreviewParams::decode`].
+    /// `[version, 9×bool(u8), 24×f32_le]`. Decoded by [`PreviewParams::decode`].
     /// This is darkroom-ui's own layout (NOT a C IOP `op_params`), stored under a
     /// synthetic operation name the C reader ignores.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on] {
             v.push(b as u8);
         }
         for f in [
@@ -190,6 +204,7 @@ impl PreviewParams {
             self.sharpen_radius, self.sharpen_amount, self.sharpen_threshold,
             self.vibrance_amount,
             self.color_contrast_a_steepness, self.color_contrast_b_steepness,
+            self.temperature_r, self.temperature_g, self.temperature_b,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -203,9 +218,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..9];
-        // length is checked above, so exactly 21 f32 chunks follow
-        let f: Vec<f32> = bytes[9..]
+        let bools = &bytes[1..10];
+        // length is checked above, so exactly 24 f32 chunks follow
+        let f: Vec<f32> = bytes[10..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -218,6 +233,7 @@ impl PreviewParams {
             sharpen_on: bools[5] != 0,
             vibrance_on: bools[6] != 0,
             color_contrast_on: bools[7] != 0,
+            temperature_on: bools[8] != 0,
             black: f[0], ev: f[1],
             velvia_strength: f[2], velvia_bias: f[3],
             split_shadow_hue: f[4], split_shadow_sat: f[5],
@@ -228,6 +244,7 @@ impl PreviewParams {
             sharpen_radius: f[15], sharpen_amount: f[16], sharpen_threshold: f[17],
             vibrance_amount: f[18],
             color_contrast_a_steepness: f[19], color_contrast_b_steepness: f[20],
+            temperature_r: f[21], temperature_g: f[22], temperature_b: f[23],
         })
     }
 
@@ -261,6 +278,16 @@ impl PreviewParams {
     /// assumption holds, and on for raws, where it is what saves the highlights.
     pub fn to_pipeline(&self, space: ColorSpace, scale: f32) -> Pipeline {
         let mut p = Pipeline::new();
+        // Temperature (white balance, iop_order.c pos ~20, before exposure 21) —
+        // per-channel RGB multipliers on the decoded linear buffer. Runs first so
+        // all downstream stages see corrected white balance.
+        if self.temperature_on
+            && (self.temperature_r != 1.0 || self.temperature_g != 1.0 || self.temperature_b != 1.0)
+        {
+            p.push(Stage::Temperature {
+                coeffs: [self.temperature_r, self.temperature_g, self.temperature_b, 1.0],
+            });
+        }
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
         }
@@ -331,10 +358,11 @@ impl PreviewParams {
 
 /// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
 /// to `None` → defaults, rather than mis-parsing). v2 added the sigmoid stage.
-/// v3 added the sharpen stage. v4 added vibrance. v5 adds color contrast.
-const ENCODE_VERSION: u8 = 5;
-/// 1 version byte + 8 bool bytes + 21 little-endian f32.
-const ENCODED_LEN: usize = 1 + 8 + 21 * 4;
+/// v3 added the sharpen stage. v4 added vibrance. v5 added color contrast.
+/// v6 adds temperature (white balance).
+const ENCODE_VERSION: u8 = 6;
+/// 1 version byte + 9 bool bytes + 24 little-endian f32.
+const ENCODED_LEN: usize = 1 + 9 + 24 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1034,6 +1062,7 @@ mod tests {
             sharpen_on: true, sharpen_radius: 4.0, sharpen_amount: 1.0, sharpen_threshold: 0.05,
             vibrance_on: true, vibrance_amount: 33.0,
             color_contrast_on: true, color_contrast_a_steepness: 2.0, color_contrast_b_steepness: 1.5,
+            temperature_on: true, temperature_r: 1.2, temperature_g: 0.9, temperature_b: 0.8,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
