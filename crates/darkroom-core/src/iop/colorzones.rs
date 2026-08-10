@@ -274,18 +274,20 @@ fn compute_smooth_cubic_tangents(knots: &mut [Knot], periodic: bool, period: f32
             a[i + n * (i + 1)] = delta_x[i] / 6.0;
             b[i] = delta_y[i] / delta_x[i] - delta_y[i - 1] / delta_x[i - 1];
         }
-        a[0 + n * 0] = (delta_x[n - 1] + delta_x[0]) / 3.0;
-        a[(n - 1) + n * (n - 1)] = (delta_x[n - 2] + delta_x[n - 1]) / 3.0;
+        // Column-major: element (row, col) lives at `row + n * col`. Column 0
+        // is written as a bare row index (clippy rejects the literal `n * 0`).
+        a[0] = (delta_x[n - 1] + delta_x[0]) / 3.0;                       // (0, 0)
+        a[(n - 1) + n * (n - 1)] = (delta_x[n - 2] + delta_x[n - 1]) / 3.0; // (n-1, n-1)
         b[0] = delta_y[0] / delta_x[0] - delta_y[n - 1] / delta_x[n - 1];
         b[n - 1] = delta_y[n - 1] / delta_x[n - 1] - delta_y[n - 2] / delta_x[n - 2];
         if n > 2 {
-            a[0 + n * 1] = delta_x[0] / 6.0;
-            a[(n - 1) + n * (n - 2)] = delta_x[n - 2] / 6.0;
-            a[0 + n * (n - 1)] = delta_x[n - 1] / 6.0;
-            a[(n - 1) + n * 0] = delta_x[n - 1] / 6.0;
+            a[n] = delta_x[0] / 6.0;                                      // (0, 1)
+            a[(n - 1) + n * (n - 2)] = delta_x[n - 2] / 6.0;              // (n-1, n-2)
+            a[n * (n - 1)] = delta_x[n - 1] / 6.0;                        // (0, n-1)
+            a[n - 1] = delta_x[n - 1] / 6.0;                              // (n-1, 0)
         } else {
-            a[0 + n * 1] = (delta_x[0] + delta_x[1]) / 6.0;
-            a[1 + n * 0] = (delta_x[0] + delta_x[1]) / 6.0;
+            a[n] = (delta_x[0] + delta_x[1]) / 6.0;                       // (0, 1)
+            a[1] = (delta_x[0] + delta_x[1]) / 6.0;                       // (1, 0)
         }
 
         // LU factorisation
