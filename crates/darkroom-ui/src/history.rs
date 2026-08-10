@@ -306,6 +306,17 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if color_correction {
         return "Color correction";
     }
+    let colorzones = old.colorzones_on != new.colorzones_on
+        || old.colorzones_strength != new.colorzones_strength
+        || old.colorzones_channel != new.colorzones_channel
+        || old.colorzones_mode != new.colorzones_mode
+        || old.colorzones_num_nodes != new.colorzones_num_nodes
+        || old.colorzones_curve_type != new.colorzones_curve_type
+        || old.colorzones_curve_x != new.colorzones_curve_x
+        || old.colorzones_curve_y != new.colorzones_curve_y;
+    if colorzones {
+        return "Color zones";
+    }
     "Edit"
 }
 
@@ -447,6 +458,10 @@ mod tests {
             describe_change(&base, &PreviewParams { color_correction_saturation: 1.5, ..d() }),
             "Color correction"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { colorzones_strength: 50.0, ..d() }),
+            "Color zones"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -506,6 +521,14 @@ mod tests {
             color_correction_lob: _,
             color_correction_hib: _,
             color_correction_saturation: _,
+            colorzones_on: _,
+            colorzones_strength: _,
+            colorzones_channel: _,
+            colorzones_mode: _,
+            colorzones_num_nodes: _,
+            colorzones_curve_type: _,
+            colorzones_curve_x: _,
+            colorzones_curve_y: _,
         } = PreviewParams::default();
     }
 
@@ -585,7 +608,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 157);
+        assert_eq!(PreviewParams::default().encode().len(), 386);
     }
 
     #[test]

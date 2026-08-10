@@ -1823,6 +1823,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Colorize" => pg.add(&colorize_module_row(ctx)),
                 "Color correction" => pg.add(&colorcorrection_module_row(ctx)),
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
+                "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
@@ -1850,7 +1851,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2064,6 +2065,23 @@ fn colorcorrection_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             // Global saturation: -3..3, default 1.0 = no change.
             add_param_slider(e, ctx, "Saturation", -3.0, 3.0, 0.01, p0.color_correction_saturation as f64,
                 |p, v| p.color_correction_saturation = v);
+        })
+}
+
+fn colorzones_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Color zones", "LCH equaliser", p0.colorzones_on,
+        |p, on| p.colorzones_on = on,
+        |e, ctx| {
+            // Channel: 0 = L, 1 = C, 2 = h
+            add_param_slider(e, ctx, "Channel", 0.0, 2.0, 1.0, p0.colorzones_channel as f64,
+                |p, v| p.colorzones_channel = v);
+            // Mode: 0 = smooth (v3), 1 = strong (v1)
+            add_param_slider(e, ctx, "Mode", 0.0, 1.0, 1.0, p0.colorzones_mode as f64,
+                |p, v| p.colorzones_mode = v);
+            // Strength: 0..100 on the C slider scale
+            add_param_slider(e, ctx, "Strength", 0.0, 100.0, 1.0, p0.colorzones_strength as f64,
+                |p, v| p.colorzones_strength = v);
         })
 }
 

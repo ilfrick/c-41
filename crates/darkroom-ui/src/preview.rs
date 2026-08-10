@@ -19,6 +19,7 @@
 //! display-referred 8-bit image, not true scene-referred raw: a stepping-stone
 //! until a raw-decode/demosaic front end feeds `core::pipeline` directly.
 
+use darkroom_core::iop::colorzones;
 use darkroom_core::pipeline::{ColorSpace, Pipeline, Stage};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
@@ -120,6 +121,22 @@ pub struct PreviewParams {
     pub color_correction_hib: f32,
     /// Global chroma saturation (-3..3, default 1.0 = no change).
     pub color_correction_saturation: f32,
+    /// Color zones (LCH equaliser) stage on/off.
+    pub colorzones_on: bool,
+    /// Strength applied to curve y values: `y' = y + (y - 0.5) * (strength/100)`.
+    pub colorzones_strength: f32,
+    /// Select-by channel: 0 = L, 1 = C, 2 = h.
+    pub colorzones_channel: f32,
+    /// Process mode: 0 = smooth (v3), 1 = strong (v1).
+    pub colorzones_mode: f32,
+    /// Number of nodes per channel [L, C, h]; each ≤ 8.
+    pub colorzones_num_nodes: [f32; 3],
+    /// Spline type per channel: 0 = CUBIC, 1 = CATMULL_ROM, 2 = MONOTONE.
+    pub colorzones_curve_type: [f32; 3],
+    /// Curve x-coordinates: 3 channels × 8 nodes per channel.
+    pub colorzones_curve_x: [[f32; 8]; 3],
+    /// Curve y-coordinates: 3 channels × 8 nodes per channel.
+    pub colorzones_curve_y: [[f32; 8]; 3],
 }
 
 impl Default for PreviewParams {
@@ -182,6 +199,20 @@ impl Default for PreviewParams {
             color_correction_lob: 0.0,
             color_correction_hib: 0.0,
             color_correction_saturation: 1.0,
+            // ColorZones defaults from _reset_parameters (colorzones.c:735):
+            // channel=h, mode=SMOOTH, 2 nodes per channel at x=0.25,0.75, y=0.5.
+            colorzones_on: false,
+            colorzones_strength: 0.0,
+            colorzones_channel: 2.0, // h
+            colorzones_mode: 0.0,    // SMOOTH
+            colorzones_num_nodes: [2.0, 2.0, 2.0],
+            colorzones_curve_type: [1.0, 1.0, 1.0], // CATMULL_ROM
+            colorzones_curve_x: [
+                [0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            colorzones_curve_y: [[0.5; 8]; 3],
         }
     }
 }
@@ -223,9 +254,13 @@ impl PreviewParams {
                 && self.color_correction_hia == 0.0
                 && self.color_correction_lob == 0.0
                 && self.color_correction_hib == 0.0);
+        // ColorZones: the Lab→LCH→LUT→Lab round-trip is never a strict no-op
+        // while enabled (even with all-neutral LUTs, float rounding differs),
+        // so on == off is the only no-op guard.
+        let cz_identity = !self.colorzones_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
-            && invert_identity && colorize_identity && cc_corr_identity
+            && invert_identity && colorize_identity && cc_corr_identity && cz_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -245,6 +280,7 @@ impl PreviewParams {
             invert_on: false,
             colorize_on: false,
             color_correction_on: false,
+            colorzones_on: false,
             ..*self
         }
     }
@@ -256,7 +292,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on] {
             v.push(b as u8);
         }
         for f in [
@@ -274,6 +310,15 @@ impl PreviewParams {
             self.invert_r, self.invert_g, self.invert_b,
             self.colorize_hue, self.colorize_sat, self.colorize_lightness, self.colorize_lightness_mix,
             self.color_correction_loa, self.color_correction_hia, self.color_correction_lob, self.color_correction_hib, self.color_correction_saturation,
+            self.colorzones_strength, self.colorzones_channel, self.colorzones_mode,
+            self.colorzones_num_nodes[0], self.colorzones_num_nodes[1], self.colorzones_num_nodes[2],
+            self.colorzones_curve_type[0], self.colorzones_curve_type[1], self.colorzones_curve_type[2],
+            self.colorzones_curve_x[0][0], self.colorzones_curve_x[0][1], self.colorzones_curve_x[0][2], self.colorzones_curve_x[0][3], self.colorzones_curve_x[0][4], self.colorzones_curve_x[0][5], self.colorzones_curve_x[0][6], self.colorzones_curve_x[0][7],
+            self.colorzones_curve_x[1][0], self.colorzones_curve_x[1][1], self.colorzones_curve_x[1][2], self.colorzones_curve_x[1][3], self.colorzones_curve_x[1][4], self.colorzones_curve_x[1][5], self.colorzones_curve_x[1][6], self.colorzones_curve_x[1][7],
+            self.colorzones_curve_x[2][0], self.colorzones_curve_x[2][1], self.colorzones_curve_x[2][2], self.colorzones_curve_x[2][3], self.colorzones_curve_x[2][4], self.colorzones_curve_x[2][5], self.colorzones_curve_x[2][6], self.colorzones_curve_x[2][7],
+            self.colorzones_curve_y[0][0], self.colorzones_curve_y[0][1], self.colorzones_curve_y[0][2], self.colorzones_curve_y[0][3], self.colorzones_curve_y[0][4], self.colorzones_curve_y[0][5], self.colorzones_curve_y[0][6], self.colorzones_curve_y[0][7],
+            self.colorzones_curve_y[1][0], self.colorzones_curve_y[1][1], self.colorzones_curve_y[1][2], self.colorzones_curve_y[1][3], self.colorzones_curve_y[1][4], self.colorzones_curve_y[1][5], self.colorzones_curve_y[1][6], self.colorzones_curve_y[1][7],
+            self.colorzones_curve_y[2][0], self.colorzones_curve_y[2][1], self.colorzones_curve_y[2][2], self.colorzones_curve_y[2][3], self.colorzones_curve_y[2][4], self.colorzones_curve_y[2][5], self.colorzones_curve_y[2][6], self.colorzones_curve_y[2][7],
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -287,9 +332,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..13];
-        // length is checked above, so exactly 36 f32 chunks follow
-        let f: Vec<f32> = bytes[13..]
+        let bools = &bytes[1..14];
+        // length is checked above, so exactly 93 f32 chunks follow
+        let f: Vec<f32> = bytes[14..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -306,6 +351,7 @@ impl PreviewParams {
             invert_on: bools[9] != 0,
             colorize_on: bools[10] != 0,
             color_correction_on: bools[11] != 0,
+            colorzones_on: bools[12] != 0,
             black: f[0], ev: f[1],
             velvia_strength: f[2], velvia_bias: f[3],
             split_shadow_hue: f[4], split_shadow_sat: f[5],
@@ -320,6 +366,19 @@ impl PreviewParams {
             invert_r: f[24], invert_g: f[25], invert_b: f[26],
             colorize_hue: f[27], colorize_sat: f[28], colorize_lightness: f[29], colorize_lightness_mix: f[30],
             color_correction_loa: f[31], color_correction_hia: f[32], color_correction_lob: f[33], color_correction_hib: f[34], color_correction_saturation: f[35],
+            colorzones_strength: f[36], colorzones_channel: f[37], colorzones_mode: f[38],
+            colorzones_num_nodes: [f[39], f[40], f[41]],
+            colorzones_curve_type: [f[42], f[43], f[44]],
+            colorzones_curve_x: [
+                [f[45], f[46], f[47], f[48], f[49], f[50], f[51], f[52]],
+                [f[53], f[54], f[55], f[56], f[57], f[58], f[59], f[60]],
+                [f[61], f[62], f[63], f[64], f[65], f[66], f[67], f[68]],
+            ],
+            colorzones_curve_y: [
+                [f[69], f[70], f[71], f[72], f[73], f[74], f[75], f[76]],
+                [f[77], f[78], f[79], f[80], f[81], f[82], f[83], f[84]],
+                [f[85], f[86], f[87], f[88], f[89], f[90], f[91], f[92]],
+            ],
         })
     }
 
@@ -433,6 +492,41 @@ impl PreviewParams {
                 space,
             });
         }
+        // Color zones (iop_order.c pos 60, after colorcontrast 56, before sigmoid
+        // 45.3) — LCH equaliser via 3×65536-entry LUTs built from spline curve
+        // nodes. The LUTs are built here (at pipeline-build time) from the curve
+        // data stored in PreviewParams; they are large (768KB) and not stored in
+        // the params struct, so the params stay Copy-friendly.
+        if self.colorzones_on {
+            let periodic = self.colorzones_channel as i32 == 2; // h channel is periodic
+            let channel = self.colorzones_channel as i32;
+            let mode = self.colorzones_mode as i32;
+            let lut_l = colorzones::build_lut(
+                &self.colorzones_curve_x[0],
+                &self.colorzones_curve_y[0],
+                self.colorzones_num_nodes[0] as usize,
+                self.colorzones_curve_type[0] as u32,
+                periodic,
+                self.colorzones_strength,
+            );
+            let lut_c = colorzones::build_lut(
+                &self.colorzones_curve_x[1],
+                &self.colorzones_curve_y[1],
+                self.colorzones_num_nodes[1] as usize,
+                self.colorzones_curve_type[1] as u32,
+                periodic,
+                self.colorzones_strength,
+            );
+            let lut_h = colorzones::build_lut(
+                &self.colorzones_curve_x[2],
+                &self.colorzones_curve_y[2],
+                self.colorzones_num_nodes[2] as usize,
+                self.colorzones_curve_type[2] as u32,
+                periodic,
+                self.colorzones_strength,
+            );
+            p.push(Stage::ColorZones { lut_l, lut_c, lut_h, channel, mode, space });
+        }
         // Sigmoid is the scene-linear → display tone map. White (100%) / black
         // (0.0152%) targets are fixed at the darktable defaults (both > 0 ⇒ no
         // NaN); only contrast & skew are user-facing here.
@@ -487,9 +581,10 @@ impl PreviewParams {
 /// v3 added the sharpen stage. v4 added vibrance. v5 added color contrast.
 /// v6 added temperature (white balance). v7 adds invert (film-camera negative).
 /// v8 adds colorize (HSL colour replacement). v9 adds color correction.
-const ENCODE_VERSION: u8 = 9;
-/// 1 version byte + 12 bool bytes + 36 little-endian f32.
-const ENCODED_LEN: usize = 1 + 12 + 36 * 4;
+/// v10 adds color zones (LCH equaliser).
+const ENCODE_VERSION: u8 = 10;
+/// 1 version byte + 13 bool bytes + 93 little-endian f32.
+const ENCODED_LEN: usize = 1 + 13 + 93 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1170,7 +1265,7 @@ mod tests {
         };
         let velvia = Stage::Velvia { strength: 0.8, bias: 1.0 };
 
-        let canonical = Pipeline::with_stages(vec![sigmoid, velvia]).process(&lin, lin.len() / 4, 1);
+        let canonical = Pipeline::with_stages(vec![sigmoid.clone(), velvia.clone()]).process(&lin, lin.len() / 4, 1);
         let reversed = Pipeline::with_stages(vec![velvia, sigmoid]).process(&lin, lin.len() / 4, 1);
 
         assert!(
@@ -1213,6 +1308,12 @@ mod tests {
             colorize_on: true, colorize_hue: 0.1, colorize_sat: 0.6, colorize_lightness: 75.0, colorize_lightness_mix: 50.0,
             color_correction_on: true, color_correction_loa: 5.0, color_correction_hia: 10.0,
             color_correction_lob: -3.0, color_correction_hib: 7.0, color_correction_saturation: 1.5,
+            colorzones_on: true, colorzones_strength: 25.0, colorzones_channel: 1.0,
+            colorzones_mode: 0.0,
+            colorzones_num_nodes: [2.0, 2.0, 2.0],
+            colorzones_curve_type: [1.0, 1.0, 1.0],
+            colorzones_curve_x: [[0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; 3],
+            colorzones_curve_y: [[0.5; 8]; 3],
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);

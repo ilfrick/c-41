@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, exposure, invert, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
+use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, invert, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -45,7 +45,7 @@ pub enum ColorSpace {
 type LabConv = fn([f32; 4]) -> [f32; 4];
 
 /// One configured pipeline stage, backed by a migrated darkroom-core IOP.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Stage {
     /// `out = (in - black) * scale` over all four channels (scale = 2^EV).
     Exposure { black: f32, scale: f32 },
@@ -133,6 +133,18 @@ pub enum Stage {
     /// colour space. **Pixel-local**: no neighbour reads, so the band-parallel path
     /// stays available.
     ColorCorrection { a_scale: f32, a_base: f32, b_scale: f32, b_base: f32, saturation: f32, space: ColorSpace },
+    /// Color zones: LCH equaliser. 3×65536-entry LUTs (L, C, h) built from
+    /// spline curve nodes, applied in Lab space via
+    /// [`darkroom_colorzones_process`]. **Pixel-local**: no neighbour reads, so
+    /// the band-parallel path stays available.
+    ColorZones {
+        lut_l: Vec<f32>,
+        lut_c: Vec<f32>,
+        lut_h: Vec<f32>,
+        channel: i32,
+        mode: i32,
+        space: ColorSpace,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -174,6 +186,7 @@ impl Stage {
             Stage::Invert { .. } => "invert",
             Stage::Colorize { .. } => "colorize",
             Stage::ColorCorrection { .. } => "colorcorrection",
+            Stage::ColorZones { .. } => "colorzones",
         }
     }
 
@@ -210,6 +223,9 @@ impl Stage {
             // ColorCorrection is pixel-local: per-pixel Lab a/b scaling, no
             // neighbours, no neighbourhood reads.
             Stage::ColorCorrection { .. } => true,
+            // ColorZones is pixel-local: each output pixel depends only on its
+            // own input pixel (Lab→LCH→LUT→Lab, no neighbour reads).
+            Stage::ColorZones { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -232,6 +248,8 @@ impl Stage {
             Stage::Colorize { space, .. } => Some(*space),
             // ColorCorrection converts RGB↔Lab and must agree with the other Lab stages.
             Stage::ColorCorrection { space, .. } => Some(*space),
+            // ColorZones also converts RGB↔Lab and must agree with the other Lab stages.
+            Stage::ColorZones { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -521,6 +539,45 @@ impl Stage {
                     &lab_in, &mut lab_out,
                     a_scale, a_base, b_scale, b_base, saturation,
                 );
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Color zones (colorzones.c) ─────────────────────────────
+            // LCH equaliser via 3×65536-entry LUTs. Like ColorCorrection it
+            // round-trips RGB↔Lab (chosen by the buffer's working space), then
+            // calls the FFI darkroom_colorzones_process on the Lab buffer.
+            Stage::ColorZones { ref lut_l, ref lut_c, ref lut_h, channel, mode, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                // Safety: lab_in/lab_out are exactly n*4 f32 packed RGBA buffers,
+                // and lut_l/lut_c/lut_h are each exactly 65536 f32 — the contract
+                // darkroom_colorzones_process documents.
+                unsafe {
+                    colorzones::darkroom_colorzones_process(
+                        lab_in.as_ptr(),
+                        lab_out.as_mut_ptr(),
+                        n,
+                        mode,
+                        channel,
+                        lut_l.as_ptr(),
+                        lut_c.as_ptr(),
+                        lut_h.as_ptr(),
+                    );
+                }
                 for p in 0..n {
                     let i = p * 4;
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
@@ -877,6 +934,10 @@ mod tests {
             Stage::Invert { color: [1.0, 1.0, 1.0, 1.0] },
             Stage::Colorize { color_l: 50.0, color_a: 0.0, color_b: 0.0, mix: 1.0, space: ColorSpace::LinearSrgb },
             Stage::ColorCorrection { a_scale: 0.0, a_base: 0.0, b_scale: 0.0, b_base: 0.0, saturation: 1.0, space: ColorSpace::LinearSrgb },
+            Stage::ColorZones {
+                lut_l: vec![0.5; 65536], lut_c: vec![0.5; 65536], lut_h: vec![0.5; 65536],
+                channel: 2, mode: 0, space: ColorSpace::LinearSrgb,
+            },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
