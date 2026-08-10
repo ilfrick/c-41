@@ -289,6 +289,14 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if temperature {
         return "White balance";
     }
+    let colorize = old.colorize_on != new.colorize_on
+        || old.colorize_hue != new.colorize_hue
+        || old.colorize_sat != new.colorize_sat
+        || old.colorize_lightness != new.colorize_lightness
+        || old.colorize_lightness_mix != new.colorize_lightness_mix;
+    if colorize {
+        return "Colorize";
+    }
     "Edit"
 }
 
@@ -422,6 +430,10 @@ mod tests {
             describe_change(&base, &PreviewParams { temperature_r: 1.5, ..d() }),
             "White balance"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { colorize_hue: 0.3, ..d() }),
+            "Colorize"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -470,6 +482,11 @@ mod tests {
             temperature_r: _,
             temperature_g: _,
             temperature_b: _,
+            colorize_on: _,
+            colorize_hue: _,
+            colorize_sat: _,
+            colorize_lightness: _,
+            colorize_lightness_mix: _,
         } = PreviewParams::default();
     }
 
@@ -549,7 +566,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 119);
+        assert_eq!(PreviewParams::default().encode().len(), 136);
     }
 
     #[test]

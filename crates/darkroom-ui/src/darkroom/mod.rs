@@ -1820,6 +1820,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Sigmoid" => pg.add(&sigmoid_module_row(ctx)),
                 "Sharpen" => pg.add(&sharpen_module_row(ctx)),
                 "Vibrance" => pg.add(&vibrance_module_row(ctx)),
+                "Colorize" => pg.add(&colorize_module_row(ctx)),
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
@@ -1848,7 +1849,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Color contrast", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color contrast", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2073,6 +2074,25 @@ fn invert_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.invert_g = v);
             add_param_slider(e, ctx, "Blue", 0.0, 4.0, 0.01, p0.invert_b as f64,
                 |p, v| p.invert_b = v);
+        })
+}
+
+fn colorize_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Colorize", "HSL colour replacement", p0.colorize_on,
+        |p, on| p.colorize_on = on,
+        |e, ctx| {
+            // Hue 0..1 (normalised colour wheel), sat 0..1, lightness 0..100.
+            add_param_slider(e, ctx, "Hue", 0.0, 1.0, 0.01, p0.colorize_hue as f64,
+                |p, v| p.colorize_hue = v);
+            add_param_slider(e, ctx, "Saturation", 0.0, 1.0, 0.01, p0.colorize_sat as f64,
+                |p, v| p.colorize_sat = v);
+            add_param_slider(e, ctx, "Lightness", 0.0, 100.0, 1.0, p0.colorize_lightness as f64,
+                |p, v| p.colorize_lightness = v);
+            // Source lightness mix: how much of the input L is kept (0 = full colour,
+            // 100 = full input luminance). Core gets ×0.01.
+            add_param_slider(e, ctx, "Source mix", 0.0, 100.0, 1.0, p0.colorize_lightness_mix as f64,
+                |p, v| p.colorize_lightness_mix = v);
         })
 }
 

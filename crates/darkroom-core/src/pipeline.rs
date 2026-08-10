@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, exposure, invert, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
+use crate::iop::{channelmixer, colorcontrast, colorize, exposure, invert, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -116,6 +116,15 @@ pub enum Stage {
     /// Lab conversion, so `working_space()` returns `None`. **Pixel-local**: no
     /// neighbour reads, so the band-parallel `process` path stays available.
     Invert { color: [f32; 4] },
+    /// Colour replacement in Lab (colorize.c `process`): replaces a/b channels
+    /// with a fixed Lab colour, blends L from the input via `mix`. `color_l`,
+    /// `color_a`, `color_b` are the pre-converted Lab values (from HSL via
+    /// hsl2rgb→sRGB→XYZ(D50)→Lab in [`PreviewParams::to_pipeline`]). `mix` is the
+    /// pre-scaled `source_lightness_mix / 100.0`. Like Vibrance/ColorContrast it
+    /// converts RGB↔Lab, so it needs the buffer's working colour space.
+    /// **Pixel-local**: no neighbour reads, so the band-parallel path stays
+    /// available.
+    Colorize { color_l: f32, color_a: f32, color_b: f32, mix: f32, space: ColorSpace },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -155,6 +164,7 @@ impl Stage {
             Stage::ColorContrast { .. } => "colorcontrast",
             Stage::Temperature { .. } => "temperature",
             Stage::Invert { .. } => "invert",
+            Stage::Colorize { .. } => "colorize",
         }
     }
 
@@ -185,6 +195,9 @@ impl Stage {
             // Invert is pixel-local: per-channel `color - in`, no neighbours,
             // no Lab conversion.
             Stage::Invert { .. } => true,
+            // Colorize is pixel-local: per-pixel Lab replacement, no neighbours,
+            // no neighbourhood reads.
+            Stage::Colorize { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -203,6 +216,8 @@ impl Stage {
             Stage::Vibrance { space, .. } => Some(*space),
             // ColorContrast also converts RGB↔Lab and must agree with Sharpen/Vibrance.
             Stage::ColorContrast { space, .. } => Some(*space),
+            // Colorize converts RGB↔Lab and must agree with Sharpen/Vibrance/ColorContrast.
+            Stage::Colorize { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -440,6 +455,34 @@ impl Stage {
                         npixels,
                         color.as_ptr(),
                     );
+                }
+            }
+            // ── Colorize (colorize.c) ─────────────────────────────────
+            // Replaces a/b channels with a fixed Lab colour, blends L from the
+            // input via `mix`. Like Vibrance/ColorContrast it round-trips
+            // RGB↔Lab, so it needs the buffer's working colour space. The
+            // (color_l, color_a, color_b, mix) are pre-converted from HSL by
+            // `to_pipeline`; the per-pixel work is just the RGB→Lab, process,
+            // Lab→RGB sandwich.
+            Stage::Colorize { color_l, color_a, color_b, mix, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                colorize::process_pixels(&lab_in, &mut lab_out, color_l, color_a, color_b, mix);
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
                 }
             }
         }
@@ -790,6 +833,7 @@ mod tests {
             Stage::ColorContrast { a_steepness: 1.0, b_steepness: 1.0, space: ColorSpace::LinearSrgb },
             Stage::Temperature { coeffs: [1.0, 1.0, 1.0, 1.0] },
             Stage::Invert { color: [1.0, 1.0, 1.0, 1.0] },
+            Stage::Colorize { color_l: 50.0, color_a: 0.0, color_b: 0.0, mix: 1.0, space: ColorSpace::LinearSrgb },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
