@@ -1824,6 +1824,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color correction" => pg.add(&colorcorrection_module_row(ctx)),
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
+                "Levels" => pg.add(&levels_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
                 _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
@@ -1851,7 +1852,7 @@ fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
 /// rename silently dropping a module back to inert. Test-only: it exists purely
 /// as the contract checked by that test.
 #[cfg(test)]
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2082,6 +2083,24 @@ fn colorzones_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             // Strength: 0..100 on the C slider scale
             add_param_slider(e, ctx, "Strength", 0.0, 100.0, 1.0, p0.colorzones_strength as f64,
                 |p, v| p.colorzones_strength = v);
+        })
+}
+
+/// Levels module: enable switch gates `levels_on`; black / grey / white point
+/// sliders on darktable's 0..100 scale. Grey centred between black and white is
+/// gamma 1 (identity); moving it brightens or darkens the midtones. The stage
+/// builds its 65536-entry LUT in `to_pipeline`, as the C `commit_params` does.
+fn levels_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Levels", "black / grey / white points", p0.levels_on,
+        |p, on| p.levels_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Black", 0.0, 100.0, 0.5, p0.levels_black as f64,
+                |p, v| p.levels_black = v);
+            add_param_slider(e, ctx, "Grey", 0.0, 100.0, 0.5, p0.levels_grey as f64,
+                |p, v| p.levels_grey = v);
+            add_param_slider(e, ctx, "White", 0.0, 100.0, 0.5, p0.levels_white as f64,
+                |p, v| p.levels_white = v);
         })
 }
 

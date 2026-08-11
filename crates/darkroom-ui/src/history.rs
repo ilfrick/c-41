@@ -317,6 +317,13 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if colorzones {
         return "Color zones";
     }
+    let levels = old.levels_on != new.levels_on
+        || old.levels_black != new.levels_black
+        || old.levels_grey != new.levels_grey
+        || old.levels_white != new.levels_white;
+    if levels {
+        return "Levels";
+    }
     "Edit"
 }
 
@@ -462,6 +469,10 @@ mod tests {
             describe_change(&base, &PreviewParams { colorzones_strength: 50.0, ..d() }),
             "Color zones"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { levels_grey: 40.0, ..d() }),
+            "Levels"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -529,6 +540,10 @@ mod tests {
             colorzones_curve_type: _,
             colorzones_curve_x: _,
             colorzones_curve_y: _,
+            levels_on: _,
+            levels_black: _,
+            levels_grey: _,
+            levels_white: _,
         } = PreviewParams::default();
     }
 
@@ -608,7 +623,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 386);
+        assert_eq!(PreviewParams::default().encode().len(), 399);
     }
 
     #[test]

@@ -51,6 +51,13 @@ impl IopProcess for Levels {
 
 // ── Core pixel loop ───────────────────────────────────────────────────────────
 
+/// Upper bound on the L this module will emit from its overrange (`pct > 1`)
+/// branch. Lab→XYZ raises `(L+16)/116` to the third power, which overflows f32
+/// above L ≈ 8.1e14; 1e6 is ~4 orders of magnitude above the most extreme real
+/// highlight (L=100 is diffuse white) and ~8 orders below that overflow, so it
+/// bounds the arithmetic without touching any value a real edit produces.
+const L_MAX: f32 = 1.0e6;
+
 /// `lut` must have exactly 65536 entries.
 #[inline]
 pub fn process_pixels(
@@ -71,7 +78,15 @@ pub fn process_pixels(
                 let idx = (pct * 65536.0) as usize;
                 lut[idx.min(65535)]
             } else {
-                100.0 * pct.powf(inv_gamma)
+                // Overrange branch. levels.c leaves this unbounded because it
+                // runs display-referred, where L <= 100 keeps pct small. Our
+                // pipeline can hand it scene-linear input (L > 100), and a
+                // narrow range then makes pct large enough that pct^inv_gamma
+                // overflows f32 — Lab→XYZ cubes L, so anything past ~8e14
+                // becomes inf and lands as NaN in the pixel buffer. Clamp to
+                // L_MAX, far above any real highlight but safely finite
+                // through the cube.
+                (100.0 * pct.powf(inv_gamma)).min(L_MAX)
             }
         };
 
@@ -81,6 +96,55 @@ pub fn process_pixels(
         chunk_out[2] = chunk_in[2] * l_out / denom;
         chunk_out[3] = chunk_in[3];
     }
+}
+
+// ── LUT construction ──────────────────────────────────────────────────────────
+
+/// Port of `compute_lut` (src/iop/levels.c): derive the inverse gamma from the
+/// three level stops and fill the 65536-entry LUT with `100 * pct^inv_gamma`.
+///
+/// `levels` are the black / grey / white stops in the **normalised [0,1]**
+/// domain (the C `d->levels[]`, i.e. the 0..100 UI sliders divided by 100).
+/// Returns `(inv_gamma, lut)`; feed both to [`process_pixels`] along with
+/// `level_black = levels[0]` and `level_range = levels[2] - levels[0]`.
+///
+/// The grey stop sits at `mid = black + delta` where `delta = (white-black)/2`,
+/// so a centred grey gives `tmp = 0` ⇒ `inv_gamma = 1` ⇒ an identity ramp.
+///
+/// **Contract: `levels[0] < levels[1] < levels[2]`.** darktable guarantees this
+/// in the GUI layer (levels.c `color_picker_apply` nudges neighbouring stops by
+/// `FLT_EPSILON`), and it is what bounds `tmp` to `[-1, 1]` and `inv_gamma` to
+/// `[0.1, 10]`. Callers must re-impose it — `PreviewParams::to_pipeline` clamps
+/// the grey stop for exactly this reason. `tmp` is additionally clamped here so
+/// an out-of-contract caller degrades to darktable's extreme gamma instead of
+/// overflowing to `+inf` (which would put NaN into the pixel buffer via the
+/// `pct > 1` branch of [`process_pixels`]).
+pub fn build_lut(levels: [f32; 3]) -> (f32, Box<[f32; 65536]>) {
+    debug_assert!(
+        levels[0] < levels[1] && levels[1] < levels[2],
+        "levels stops must satisfy black < grey < white, got {levels:?}"
+    );
+    // A zero/negative range is a caller bug (to_pipeline rejects it); the floor
+    // only keeps the arithmetic defined so we return an extreme-but-finite
+    // gamma rather than NaN.
+    let delta = ((levels[2] - levels[0]) / 2.0).max(f32::MIN_POSITIVE);
+    let mid = levels[0] + delta;
+    // Clamped to the range darktable's ordered stops can produce.
+    let tmp = ((levels[1] - mid) / delta).clamp(-1.0, 1.0);
+    let inv_gamma = 10.0f32.powf(tmp);
+
+    // Heap-allocated directly: `Box::new([0.0; 65536])` materialises 256 KB on
+    // the stack first (LLVM elides it under -O but not in debug), which would
+    // be a hazard if this ever ran on a rayon worker's 2 MB stack.
+    let mut lut: Box<[f32; 65536]> = vec![0.0f32; 65536]
+        .into_boxed_slice()
+        .try_into()
+        .expect("65536-element vec converts to a fixed-size array");
+    for (i, v) in lut.iter_mut().enumerate() {
+        let percentage = i as f32 / 65536.0;
+        *v = 100.0 * percentage.powf(inv_gamma);
+    }
+    (inv_gamma, lut)
 }
 
 // ── C FFI entry point ─────────────────────────────────────────────────────────
@@ -164,6 +228,84 @@ mod tests {
         let mut output = vec![0.0f32; 4];
         process_pixels(&input, &mut output, 0.0, 1.0, 1.0, &lut);
         assert!((output[3] - 0.75).abs() < 1e-7);
+    }
+
+    #[test]
+    fn build_lut_default_stops_are_the_identity_ramp() {
+        // darktable defaults (black 0, grey 50, white 100 on the 0..100 sliders
+        // ⇒ 0.0/0.5/1.0 normalised): grey sits exactly at mid, so tmp = 0 and
+        // inv_gamma = 10^0 = 1 — the LUT is the plain 100*pct ramp the other
+        // tests hand-roll.
+        let (inv_gamma, lut) = build_lut([0.0, 0.5, 1.0]);
+        assert!((inv_gamma - 1.0).abs() < 1e-6, "inv_gamma: {inv_gamma}");
+        let reference = identity_lut();
+        for i in [0usize, 1, 12345, 65535] {
+            assert!(
+                (lut[i] - reference[i]).abs() < 1e-3,
+                "lut[{i}] = {} != {}", lut[i], reference[i]
+            );
+        }
+    }
+
+    #[test]
+    fn build_lut_gamma_follows_the_grey_stop() {
+        // Grey below mid ⇒ tmp < 0 ⇒ inv_gamma < 1 (brightens the midtones);
+        // grey above mid ⇒ inv_gamma > 1 (darkens them). Pins the direction so
+        // a sign slip in (grey - mid)/delta can't pass.
+        let (dark_grey, _) = build_lut([0.0, 0.25, 1.0]);
+        let (light_grey, _) = build_lut([0.0, 0.75, 1.0]);
+        assert!(dark_grey < 1.0, "grey below mid should give inv_gamma < 1: {dark_grey}");
+        assert!(light_grey > 1.0, "grey above mid should give inv_gamma > 1: {light_grey}");
+        // 10^((0.25-0.5)/0.5) = 10^-0.5, and the light case is its reciprocal.
+        assert!((dark_grey - 10.0f32.powf(-0.5)).abs() < 1e-5);
+        assert!((dark_grey * light_grey - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn build_lut_stays_bounded_across_the_in_contract_domain() {
+        // Regression: the earlier version of this test used one degenerate
+        // triple ([0.5,0.5,0.5]) that happened to give tmp = -1, so it passed
+        // while `black=0, grey=1.0, white=0.01` produced tmp = 199 ⇒ 10^199 ⇒
+        // +inf ⇒ NaN L in the pixel buffer. Sweep every ordered triple and
+        // demand darktable's bounded gamma and a finite LUT throughout.
+        // (Out-of-contract triples are the caller's job to prevent — see the
+        // debug_assert on build_lut and `levels_slider_domain_is_nan_free` in
+        // darkroom-ui, which covers the unordered case end to end.)
+        let stops = [0.0f32, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0];
+        let mut checked = 0;
+        for &b in &stops {
+            for &g in &stops {
+                for &w in &stops {
+                    if !(b < g && g < w) {
+                        continue;
+                    }
+                    checked += 1;
+                    let (inv_gamma, lut) = build_lut([b, g, w]);
+                    assert!(
+                        (0.1..=10.0).contains(&inv_gamma),
+                        "inv_gamma outside darktable's [0.1,10] for \
+                         black={b} grey={g} white={w}: {inv_gamma}"
+                    );
+                    assert!(
+                        lut.iter().all(|v| v.is_finite()),
+                        "LUT holds a non-finite entry for black={b} grey={g} white={w}"
+                    );
+                }
+            }
+        }
+        assert!(checked > 20, "sweep degenerated to {checked} cases");
+    }
+
+    #[test]
+    fn build_lut_clamp_bounds_gamma_at_the_domain_edges() {
+        // The extremes an ordered triple can reach: grey pinned just above
+        // black ⇒ tmp → -1 ⇒ gamma → 0.1; just below white ⇒ tmp → +1 ⇒
+        // gamma → 10. These are the values the clamp exists to cap at, so a
+        // regression that removed it would show up here as an overshoot.
+        let (lo, _) = build_lut([0.0, f32::EPSILON, 1.0]);
+        let (hi, _) = build_lut([0.0, 1.0 - f32::EPSILON, 1.0]);
+        assert!((lo - 0.1).abs() < 1e-3, "low-end gamma: {lo}");
+        assert!((hi - 10.0).abs() < 1e-2, "high-end gamma: {hi}");
     }
 
     #[test]

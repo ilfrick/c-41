@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, invert, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
+use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, invert, levels, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -145,6 +145,19 @@ pub enum Stage {
         mode: i32,
         space: ColorSpace,
     },
+    /// Black/grey/white point + gamma in Lab (levels.c). `black`/`range` are the
+    /// normalised [0,1] stops (`levels[0]`, `levels[2] - levels[0]`) and
+    /// `inv_gamma`/`lut` come from [`levels::build_lut`]. The a/b channels are
+    /// rescaled by `L_out / L_in` so chroma tracks the tone change. Lab-domain,
+    /// so it needs the buffer's working space. **Pixel-local**: no neighbour
+    /// reads, so the band-parallel path stays available.
+    Levels {
+        black: f32,
+        range: f32,
+        inv_gamma: f32,
+        lut: Vec<f32>,
+        space: ColorSpace,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -187,6 +200,7 @@ impl Stage {
             Stage::Colorize { .. } => "colorize",
             Stage::ColorCorrection { .. } => "colorcorrection",
             Stage::ColorZones { .. } => "colorzones",
+            Stage::Levels { .. } => "levels",
         }
     }
 
@@ -226,6 +240,9 @@ impl Stage {
             // ColorZones is pixel-local: each output pixel depends only on its
             // own input pixel (Lab→LCH→LUT→Lab, no neighbour reads).
             Stage::ColorZones { .. } => true,
+            // Levels is pixel-local: a per-pixel tone-curve lookup on L (with
+            // a/b scaled by the same ratio), no neighbour reads.
+            Stage::Levels { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -250,6 +267,8 @@ impl Stage {
             Stage::ColorCorrection { space, .. } => Some(*space),
             // ColorZones also converts RGB↔Lab and must agree with the other Lab stages.
             Stage::ColorZones { space, .. } => Some(*space),
+            // Levels works on Lab L (+ proportional a/b), so it too must agree.
+            Stage::Levels { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -578,6 +597,44 @@ impl Stage {
                         lut_h.as_ptr(),
                     );
                 }
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Levels (levels.c) ───────────────────────────────────────
+            // Black/grey/white points + gamma applied to Lab L via the
+            // pre-computed LUT, with a/b scaled by the same L ratio. Same
+            // RGB↔Lab sandwich as the other Lab-domain stages.
+            Stage::Levels { black, range, inv_gamma, ref lut, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                // The LUT is a fixed 65536-entry table (build_lut is the only
+                // producer), so a wrong length is a caller bug. Loud in debug;
+                // in release degrade to a byte-exact passthrough rather than
+                // panicking — this runs per band inside a rayon `for_each_init`,
+                // where a panic would take down the whole preview render.
+                debug_assert_eq!(
+                    lut.len(), 65536,
+                    "Stage::Levels: LUT must be exactly 65536 entries, got {}", lut.len()
+                );
+                let Ok(lut_arr): Result<&[f32; 65536], _> = lut.as_slice().try_into() else {
+                    output.copy_from_slice(input);
+                    return;
+                };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                levels::process_pixels(&lab_in, &mut lab_out, black, range, inv_gamma, lut_arr);
                 for p in 0..n {
                     let i = p * 4;
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
@@ -937,6 +994,10 @@ mod tests {
             Stage::ColorZones {
                 lut_l: vec![0.5; 65536], lut_c: vec![0.5; 65536], lut_h: vec![0.5; 65536],
                 channel: 2, mode: 0, space: ColorSpace::LinearSrgb,
+            },
+            Stage::Levels {
+                black: 0.0, range: 1.0, inv_gamma: 1.0,
+                lut: vec![0.0; 65536], space: ColorSpace::LinearSrgb,
             },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());

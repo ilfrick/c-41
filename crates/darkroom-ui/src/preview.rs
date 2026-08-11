@@ -8,7 +8,8 @@
 //! [`PreviewParams::to_pipeline`] maps the UI sliders (UI ranges) to a
 //! `Pipeline` of physical-param `Stage`s in darktable's canonical iop order
 //! (invert → temperature → exposure → monochrome → sharpen → vibrance → color
-//! correction → color contrast → sigmoid → velvia → colorize → splittoning);
+//! correction → color contrast → color zones → sigmoid → levels → velvia →
+//! colorize → splittoning);
 //! [`apply_pipeline`] just marshals the 8-bit pixbuf to/from the
 //! float RGBA the core pipeline runs on, preserving the source alpha channel and
 //! rowstride padding byte-for-byte.
@@ -25,7 +26,8 @@ use darkroom_core::pipeline::{ColorSpace, Pipeline, Stage};
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `darkroom-core` IOP, in pixelpipe order
 /// (invert → temperature → exposure → monochrome → sharpen → vibrance → color
-/// correction → color contrast → sigmoid → velvia → colorize → splittoning; see
+/// correction → color contrast → color zones → sigmoid → levels → velvia →
+/// colorize → splittoning; see
 /// [`Self::to_pipeline`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreviewParams {
@@ -137,6 +139,14 @@ pub struct PreviewParams {
     pub colorzones_curve_x: [[f32; 8]; 3],
     /// Curve y-coordinates: 3 channels × 8 nodes per channel.
     pub colorzones_curve_y: [[f32; 8]; 3],
+    /// Levels (black / grey / white point + gamma) stage on/off.
+    pub levels_on: bool,
+    /// Black point on the darktable 0..100 slider (core gets it /100).
+    pub levels_black: f32,
+    /// Grey (midtone) point, 0..100. Centred between black and white ⇒ gamma 1.
+    pub levels_grey: f32,
+    /// White point, 0..100.
+    pub levels_white: f32,
 }
 
 impl Default for PreviewParams {
@@ -213,11 +223,32 @@ impl Default for PreviewParams {
                 [0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             ],
             colorzones_curve_y: [[0.5; 8]; 3],
+            // Darktable defaults (levels.c): off, black 0 / grey 50 / white 100
+            // ⇒ grey exactly centred ⇒ gamma 1 ⇒ identity tone curve.
+            levels_on: false,
+            levels_black: 0.0,
+            levels_grey: 50.0,
+            levels_white: 100.0,
         }
     }
 }
 
 impl PreviewParams {
+    /// Whether a `Stage::Levels` will actually be emitted. Single source of
+    /// truth for [`Self::is_identity`] and [`Self::to_pipeline`] — they must
+    /// agree, or `is_identity` claims an edit that the pipeline never applies.
+    ///
+    /// Off when disabled, at the darktable defaults (0/50/100 — the identity
+    /// curve), or with a degenerate range (`white <= black`), where the C
+    /// `(white-black)/2` divisor would blow up.
+    fn levels_stage_active(&self) -> bool {
+        self.levels_on
+            && self.levels_white - self.levels_black >= LEVELS_MIN_RANGE
+            && !(self.levels_black == 0.0
+                && self.levels_grey == 50.0
+                && self.levels_white == 100.0)
+    }
+
     /// True when the pipeline would leave the image unchanged, so the caller
     /// can skip re-processing/uploading. Exposure is a no-op at ev 0 & black 0;
     /// velvia is a no-op when off or at strength 0.
@@ -258,9 +289,14 @@ impl PreviewParams {
         // while enabled (even with all-neutral LUTs, float rounding differs),
         // so on == off is the only no-op guard.
         let cz_identity = !self.colorzones_on;
+        // Shares one predicate with `to_pipeline` so the two can never disagree
+        // about whether a Levels stage exists (an inverted range is non-default
+        // but still emits nothing).
+        let levels_identity = !self.levels_stage_active();
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
+            && levels_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -281,6 +317,7 @@ impl PreviewParams {
             colorize_on: false,
             color_correction_on: false,
             colorzones_on: false,
+            levels_on: false,
             ..*self
         }
     }
@@ -292,7 +329,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on] {
             v.push(b as u8);
         }
         for f in [
@@ -319,6 +356,7 @@ impl PreviewParams {
             self.colorzones_curve_y[0][0], self.colorzones_curve_y[0][1], self.colorzones_curve_y[0][2], self.colorzones_curve_y[0][3], self.colorzones_curve_y[0][4], self.colorzones_curve_y[0][5], self.colorzones_curve_y[0][6], self.colorzones_curve_y[0][7],
             self.colorzones_curve_y[1][0], self.colorzones_curve_y[1][1], self.colorzones_curve_y[1][2], self.colorzones_curve_y[1][3], self.colorzones_curve_y[1][4], self.colorzones_curve_y[1][5], self.colorzones_curve_y[1][6], self.colorzones_curve_y[1][7],
             self.colorzones_curve_y[2][0], self.colorzones_curve_y[2][1], self.colorzones_curve_y[2][2], self.colorzones_curve_y[2][3], self.colorzones_curve_y[2][4], self.colorzones_curve_y[2][5], self.colorzones_curve_y[2][6], self.colorzones_curve_y[2][7],
+            self.levels_black, self.levels_grey, self.levels_white,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -332,9 +370,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..14];
-        // length is checked above, so exactly 93 f32 chunks follow
-        let f: Vec<f32> = bytes[14..]
+        let bools = &bytes[1..15];
+        // length is checked above, so exactly 96 f32 chunks follow
+        let f: Vec<f32> = bytes[15..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -379,6 +417,8 @@ impl PreviewParams {
                 [f[77], f[78], f[79], f[80], f[81], f[82], f[83], f[84]],
                 [f[85], f[86], f[87], f[88], f[89], f[90], f[91], f[92]],
             ],
+            levels_on: bools[13] != 0,
+            levels_black: f[93], levels_grey: f[94], levels_white: f[95],
         })
     }
 
@@ -391,10 +431,11 @@ impl PreviewParams {
     /// Stage order follows darktable's canonical v3.0 iop order
     /// (`src/common/iop_order.c`: invert 2 → temperature 3 → exposure 21 →
     /// channelmixerrgb 39 → sharpen 53 → colorcorrection 55 → colorcontrast 56 →
-    /// sigmoid 45.3 → velvia 57 → colorize 62 → splittoning 67). The scene-referred stages
+    /// colorzones 60 → sigmoid 45.3 → levels 49 → velvia 57 → colorize 62 →
+    /// splittoning 67). The scene-referred stages
     /// (exposure, the channel-mix to grey) run on unbounded linear data; sigmoid
-    /// tone-maps to display range; the display-referred creative stages (velvia,
-    /// splittoning) run after it, where their [0,1] clamps are semantically
+    /// tone-maps to display range; the display-referred creative stages (levels,
+    /// velvia, splittoning) run after it, where their [0,1] clamps are semantically
     /// correct — running them before the tone map would hard-clip scene-linear
     /// highlights (>1.0) that sigmoid is meant to roll off.
     ///
@@ -539,6 +580,42 @@ impl PreviewParams {
                 white_target, black_target, paper_exp, film_fog, film_power, paper_power,
             });
         }
+        // Levels (iop_order.c pos 49, in the display-referred cluster with
+        // colisa 47 / tonecurve 48 / shadhi 50) — runs AFTER the tone map, not
+        // before it. That ordering is load-bearing, not cosmetic: levels clips
+        // everything at or below its black point to L=0 and treats Lab L as
+        // 0..100, so on scene-linear input (L > 100 for highlights) it would
+        // crush exactly the highlights sigmoid exists to roll off.
+        //
+        // `levels_stage_active` holds the skip rules (identity defaults,
+        // degenerate range) and is shared with `is_identity`. The 65536-entry
+        // LUT and derived inverse gamma are built here, as C `commit_params` does.
+        if self.levels_stage_active() {
+            // darktable's levels GUI structurally enforces black < grey < white
+            // (levels.c `color_picker_apply` nudges the neighbours by
+            // FLT_EPSILON, and so does the drag handler), which is what bounds
+            // `tmp = (grey-mid)/delta` to [-1, 1] and hence inv_gamma to
+            // [0.1, 10]. Three independent sliders give no such guarantee: e.g.
+            // black 0 / grey 100 / white 1 is a legal set of positions and
+            // yields 10^199 = +inf, which poisons the `pct > 1` branch of
+            // process_pixels and lands NaN in the preview buffer. Re-impose the
+            // invariant here, at the same layer the C does.
+            let black = self.levels_black / 100.0;
+            let white = self.levels_white / 100.0;
+            let grey = (self.levels_grey / 100.0)
+                .clamp(black + f32::EPSILON, white - f32::EPSILON);
+            let stops = [black, grey, white];
+            let (inv_gamma, lut) = darkroom_core::iop::levels::build_lut(stops);
+            p.push(Stage::Levels {
+                black: stops[0],
+                range: stops[2] - stops[0],
+                inv_gamma,
+                // Unsized coercion + into_vec: reuses the allocation instead of
+                // memcpying 256 KB on every slider tick.
+                lut: (lut as Box<[f32]>).into_vec(),
+                space,
+            });
+        }
         if self.velvia_on && self.velvia_strength > 0.0 {
             p.push(Stage::Velvia { strength: self.velvia_strength / 100.0, bias: self.velvia_bias });
         }
@@ -581,10 +658,19 @@ impl PreviewParams {
 /// v3 added the sharpen stage. v4 added vibrance. v5 added color contrast.
 /// v6 added temperature (white balance). v7 adds invert (film-camera negative).
 /// v8 adds colorize (HSL colour replacement). v9 adds color correction.
-/// v10 adds color zones (LCH equaliser).
-const ENCODE_VERSION: u8 = 10;
-/// 1 version byte + 13 bool bytes + 93 little-endian f32.
-const ENCODED_LEN: usize = 1 + 13 + 93 * 4;
+/// v10 adds color zones (LCH equaliser). v11 adds levels (black/grey/white).
+/// Minimum black→white separation, on the 0..100 slider scale, for which a
+/// Levels stage is emitted. A hairline range is not a meaningful edit (it maps
+/// the whole tonal scale onto a sliver) and it drives `pct` — and hence the
+/// `pct^gamma` branch of `process_pixels` — to absurd magnitudes. One slider
+/// unit is far tighter than any useful edit while keeping the arithmetic sane;
+/// the actual overflow guarantee comes from the output clamp in
+/// `levels::process_pixels`, not from this.
+const LEVELS_MIN_RANGE: f32 = 1.0;
+
+const ENCODE_VERSION: u8 = 11;
+/// 1 version byte + 14 bool bytes + 96 little-endian f32.
+const ENCODED_LEN: usize = 1 + 14 + 96 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1152,6 +1238,23 @@ mod tests {
         sh.sharpen_on = true;
         sh.sharpen_amount = 1.0;
         cfgs.push(sh);
+        // levels enabled at the default stops ⇒ still identity (identity curve)
+        let mut lv_def = PreviewParams::default();
+        lv_def.levels_on = true;
+        cfgs.push(lv_def);
+        // levels with an inverted range ⇒ non-default but emits no stage, so
+        // is_identity must agree. This is the case that falsified the invariant
+        // before the two checks were factored into `levels_stage_active`.
+        let mut lv_inv = PreviewParams::default();
+        lv_inv.levels_on = true;
+        lv_inv.levels_black = 60.0;
+        lv_inv.levels_white = 40.0;
+        cfgs.push(lv_inv);
+        // levels with a real curve ⇒ non-identity
+        let mut lv = PreviewParams::default();
+        lv.levels_on = true;
+        lv.levels_grey = 35.0;
+        cfgs.push(lv);
         // colorize enabled ⇒ non-identity (on == off is the only no-op; sat 0 still
         // replaces a/b channels)
         let mut cz = PreviewParams::default();
@@ -1216,11 +1319,158 @@ mod tests {
         p.color_correction_on = true;
         p.color_correction_saturation = 1.5;
         p.colorize_on = true;
+        p.levels_on = true;
+        p.levels_grey = 40.0; // off-default so the stage is actually emitted
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
-            ["exposure", "channelmixer", "sharpen", "colorcorrection", "sigmoid", "velvia", "colorize", "splittoning"]
+            ["exposure", "channelmixer", "sharpen", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
         );
+        // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
+        // it clips at its black point and treats L as 0..100, so running it
+        // before the tone map would crush the scene-linear highlights sigmoid
+        // is there to roll off.
+        let sig = names.iter().position(|n| *n == "sigmoid").unwrap();
+        let lev = names.iter().position(|n| *n == "levels").unwrap();
+        assert!(lev > sig, "levels must run after sigmoid: {names:?}");
+    }
+
+    #[test]
+    fn levels_slider_domain_is_nan_free() {
+        // The three sliders move independently, so nothing stops a user from
+        // setting black=0, grey=100, white=1 — legal positions that pass the
+        // `white > black` gate but give tmp = 199 ⇒ 10^199 ⇒ +inf ⇒ NaN L in
+        // the preview buffer. `to_pipeline` clamps the grey stop into
+        // (black, white) to restore the invariant darktable's GUI enforces.
+        // Sweep the whole grid, including inverted and coincident stops, and
+        // demand a finite render every time.
+        let vals = [0.0f32, 1.0, 25.0, 50.0, 75.0, 99.0, 100.0];
+        // Includes an L above the white point to hit the `pct > 1` powf branch.
+        let px = vec![0.35f32, 0.5, 0.9, 1.0, 3.0, 3.0, 3.0, 1.0];
+        for &black in &vals {
+            for &grey in &vals {
+                for &white in &vals {
+                    let mut p = PreviewParams::default();
+                    p.levels_on = true;
+                    p.levels_black = black;
+                    p.levels_grey = grey;
+                    p.levels_white = white;
+                    let out = p
+                        .to_pipeline(ColorSpace::LinearSrgb, 1.0)
+                        .process(&px, 2, 1);
+                    assert!(
+                        out.iter().all(|v| v.is_finite()),
+                        "non-finite output for black={black} grey={grey} white={white}: {out:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn levels_black_and_white_points_move_tones_as_expected() {
+        // End-to-end through Stage::Levels::apply (the stage-emission tests
+        // above never exercise the pixel path).
+        //
+        // Note the grey stop is the *midtone* control and is held at the
+        // midpoint here. Moving black or white alone also moves the midpoint
+        // (mid = black + (white-black)/2), so a grey left at 50 becomes
+        // off-centre and changes gamma too — that is why this test moves grey
+        // with the endpoint rather than asserting a naive
+        // "raising black always darkens".
+        let mid = vec![0.35f32, 0.35, 0.35, 1.0];
+
+        // Raise black, keeping grey centred (gamma stays 1): the tonal range
+        // below the new black point is crushed, so the midtone darkens.
+        let mut raise_black = PreviewParams::default();
+        raise_black.levels_on = true;
+        raise_black.levels_black = 30.0;
+        raise_black.levels_grey = 65.0; // centred in [30, 100]
+        let darker = raise_black
+            .to_pipeline(ColorSpace::LinearSrgb, 1.0)
+            .process(&mid, 1, 1);
+        assert!(
+            darker[0] < mid[0],
+            "raising the black point (grey centred) should darken a midtone: {} !< {}",
+            darker[0], mid[0]
+        );
+
+        // Lower white, keeping grey centred: the range compresses upward, so
+        // the same midtone brightens.
+        let mut lower_white = PreviewParams::default();
+        lower_white.levels_on = true;
+        lower_white.levels_white = 60.0;
+        lower_white.levels_grey = 30.0; // centred in [0, 60]
+        let brighter = lower_white
+            .to_pipeline(ColorSpace::LinearSrgb, 1.0)
+            .process(&mid, 1, 1);
+        assert!(
+            brighter[0] > mid[0],
+            "lowering the white point (grey centred) should brighten a midtone: {} !> {}",
+            brighter[0], mid[0]
+        );
+
+        // The grey stop alone drives gamma: below the midpoint brightens.
+        let mut lift_grey = PreviewParams::default();
+        lift_grey.levels_on = true;
+        lift_grey.levels_grey = 35.0;
+        let lifted = lift_grey
+            .to_pipeline(ColorSpace::LinearSrgb, 1.0)
+            .process(&mid, 1, 1);
+        assert!(
+            lifted[0] > mid[0],
+            "grey below the midpoint should brighten: {} !> {}", lifted[0], mid[0]
+        );
+
+        assert!(darker.iter().chain(brighter.iter()).chain(lifted.iter()).all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn levels_after_sigmoid_preserves_scene_linear_highlight() {
+        // The behavioural counterpart to the name-position assertion in
+        // to_pipeline_orders_stages_canonically. Levels treats Lab L as 0..100
+        // and clips at its black point, so running it BEFORE the tone map
+        // crushes a scene-linear highlight that the canonical order rolls off.
+        let hot = [3.0f32, 3.0, 3.0, 1.0]; // L well above 100 before tone mapping
+        let [white_target, black_target, paper_exp, film_fog, film_power, paper_power] =
+            darkroom_core::iop::sigmoid::rgb_ratio_params(1.5, 0.0, 100.0, 0.0152);
+        let sigmoid = Stage::Sigmoid {
+            white_target, black_target, paper_exp, film_fog, film_power, paper_power,
+        };
+        let (inv_gamma, lut) = darkroom_core::iop::levels::build_lut([0.2, 0.5, 0.8]);
+        let levels = Stage::Levels {
+            black: 0.2,
+            range: 0.6,
+            inv_gamma,
+            lut: (lut as Box<[f32]>).into_vec(),
+            space: ColorSpace::LinearSrgb,
+        };
+
+        let canonical = Pipeline::with_stages(vec![sigmoid.clone(), levels.clone()])
+            .process(&hot, 1, 1);
+        let reversed = Pipeline::with_stages(vec![levels, sigmoid]).process(&hot, 1, 1);
+
+        assert!(
+            canonical[0] > reversed[0],
+            "canonical (sigmoid→levels) must retain more highlight than levels-first: \
+             {} !> {}", canonical[0], reversed[0]
+        );
+    }
+
+    #[test]
+    fn levels_default_stops_emit_no_stage() {
+        // black 0 / grey 50 / white 100 is the identity curve, and a degenerate
+        // range (white <= black) would divide by zero in the gamma derivation.
+        // Neither should reach the pipeline.
+        let mut p = PreviewParams::default();
+        p.levels_on = true;
+        assert!(p.is_identity(), "default stops should be identity");
+        assert!(!p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().any(|s| s.name() == "levels"));
+
+        p.levels_black = 60.0;
+        p.levels_white = 40.0; // inverted ⇒ degenerate
+        let stages = p.to_pipeline(ColorSpace::LinearSrgb, 1.0);
+        assert!(!stages.stages.iter().any(|s| s.name() == "levels"), "degenerate range must be skipped");
     }
 
     #[test]
@@ -1314,6 +1564,7 @@ mod tests {
             colorzones_curve_type: [1.0, 1.0, 1.0],
             colorzones_curve_x: [[0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; 3],
             colorzones_curve_y: [[0.5; 8]; 3],
+            levels_on: true, levels_black: 5.0, levels_grey: 45.0, levels_white: 95.0,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
