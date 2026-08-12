@@ -308,3 +308,41 @@ split the literal into two 8-byte `movabs` immediates, so it never appears
 contiguously. Grepping a stripped release binary proves nothing. A screenshot
 settled it in seconds and should have been the first move — the same lesson as
 2026-08-11, arrived at from a different direction.
+
+---
+
+## 2026-08-12 13:40 UTC — m4-111: Graduated ND live preview stage
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** Wired the graduatednd IOP into the preview pipeline — the **19th**
+live module, and the second position-dependent one.
+- `c41-core/iop/graduatednd.rs`: `commit_geometry()`, porting the block at the
+  top of graduatednd.c `process()` (`length_base`, `length_inc`, `cosv_hh_inv`,
+  `filter_hardness` from the filter radius) plus the colour step from
+  `commit_params` — `hsl2rgb(hue, sat, 0.5)`, inverted when density < 0, with
+  `color1 = 1 - color`. Note the C negates the rotation before converting to
+  radians.
+- `pipeline.rs`: `Stage::GraduatedNd`, RGB-domain (`working_space()` = None) and
+  **not pixel-local** — the filter strength is a function of the pixel's
+  `(x, y)` against a rotated line, so band-splitting would give each band the
+  wrong coordinates. Same reason as Vignette; second stage in that class.
+- `preview.rs`: 6 params + on/off; ENCODE_VERSION 13→14, len 457→482. Pushed at
+  iop_order.c **pos 25** — scene-referred, right after exposure 21 and before
+  the channel mix 28.5. Early placement is correct: it models glass in front of
+  the lens, so it belongs on linear scene data before any tone or colour work.
+  Density 0 is `exp2(0) = 1` everywhere, a true no-op, so it is skipped.
+- `history.rs` group; `darkroom/mod.rs` module row (6 sliders). The catalogue
+  already had "Graduated density", so no catalog.rs change was needed.
+
+**Verified.** `scripts/ci-local.sh` (all four steps); 976 tests. Rendered the
+filter as ASCII at three settings: rotation 0 darkens top-to-bottom, rotation 90
+turns the gradient left-to-right, and hardness 90 compresses the ramp into a
+sharp edge — all three correct.
+
+**Notes.** darktable also offers an on-canvas line handle for rotation/offset;
+the sliders carry the same parameters until that overlay exists. Also answered a
+user question: the header's **"Other"** button is empty because it fronts
+darktable's map / print / slideshow / tethering views, none of which are ported
+(parity 3.4). Of the four, slideshow is the only cheap one — map needs
+libosmgpsmap and tethering needs gphoto2.

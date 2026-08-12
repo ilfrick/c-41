@@ -341,6 +341,16 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if lowlight {
         return "Lowlight vision";
     }
+    let gradnd = old.gradnd_on != new.gradnd_on
+        || old.gradnd_density != new.gradnd_density
+        || old.gradnd_hardness != new.gradnd_hardness
+        || old.gradnd_rotation != new.gradnd_rotation
+        || old.gradnd_offset != new.gradnd_offset
+        || old.gradnd_hue != new.gradnd_hue
+        || old.gradnd_saturation != new.gradnd_saturation;
+    if gradnd {
+        return "Graduated density";
+    }
     "Edit"
 }
 
@@ -498,6 +508,10 @@ mod tests {
             describe_change(&base, &PreviewParams { lowlight_blueness: 20.0, ..d() }),
             "Lowlight vision"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { gradnd_rotation: 30.0, ..d() }),
+            "Graduated density"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -580,6 +594,13 @@ mod tests {
             lowlight_on: _,
             lowlight_blueness: _,
             lowlight_transition: _,
+            gradnd_on: _,
+            gradnd_density: _,
+            gradnd_hardness: _,
+            gradnd_rotation: _,
+            gradnd_offset: _,
+            gradnd_hue: _,
+            gradnd_saturation: _,
         } = PreviewParams::default();
     }
 
@@ -659,7 +680,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 457);
+        assert_eq!(PreviewParams::default().encode().len(), 482);
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, invert, levels, lowlight, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -209,6 +209,28 @@ pub enum Stage {
         lut: Vec<f32>,
         space: ColorSpace,
     },
+    /// Graduated neutral-density filter (graduatednd.c): darkens (or brightens,
+    /// for a negative density) across a rotatable gradient line. Works directly
+    /// in RGB — no Lab round-trip, so `working_space()` is `None`.
+    ///
+    /// **NOT pixel-local**, like [`Stage::Vignette`]: the filter strength is a
+    /// function of the pixel's `(x, y)` against that line, so band-splitting
+    /// would hand each band the wrong coordinates. Holds the user params rather
+    /// than the derived geometry, which depends on the buffer dimensions and is
+    /// therefore computed in `apply`.
+    GraduatedNd {
+        /// Filter density in EV, -8..8 (negative brightens).
+        density: f32,
+        /// Edge hardness, 0..100 (0 = soft gradient, 100 = hard line).
+        hardness: f32,
+        /// Rotation of the gradient line in degrees, -180..180.
+        rotation: f32,
+        /// Line offset across the frame, 0..100 (50 = centred).
+        offset: f32,
+        /// Filter tint, both 0..1 (saturation 0 = neutral grey).
+        hue: f32,
+        saturation: f32,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -254,6 +276,7 @@ impl Stage {
             Stage::Levels { .. } => "levels",
             Stage::Vignette { .. } => "vignette",
             Stage::Lowlight { .. } => "lowlight",
+            Stage::GraduatedNd { .. } => "graduatednd",
         }
     }
 
@@ -303,6 +326,11 @@ impl Stage {
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
             Stage::Sharpen { .. } => false,
+            // GraduatedNd is position-dependent for the same reason as Vignette:
+            // the filter strength is a function of the pixel's (x, y) against a
+            // rotated gradient line, so a band's (band_pixels, 1) rectangle
+            // would give every band the wrong coordinates.
+            Stage::GraduatedNd { .. } => false,
             // Vignette is position-DEPENDENT rather than neighbourhood-reading:
             // the falloff weight comes from each pixel's (i, j) relative to the
             // vignette centre, and the dither is a per-row TEA stream seeded
@@ -741,6 +769,34 @@ impl Stage {
                     output[i..i + 4].copy_from_slice(&rgb);
                 }
             }
+            // ── Graduated ND (graduatednd.c) ───────────────────────────
+            // Position-dependent gradient filter, straight in RGB. Not
+            // pixel-local, so `process` guarantees (width, height) is the true
+            // image rectangle here — the coordinates the geometry assumes.
+            Stage::GraduatedNd { density, hardness, rotation, offset, hue, saturation } => {
+                let g = graduatednd::commit_geometry(
+                    width, height, density, hardness, rotation, offset, hue, saturation,
+                );
+                // Safety: input/output are equal-length packed RGBA holding
+                // exactly width*height*4 floats, and color/color1 are [f32; 4] —
+                // the contract darkroom_graduatednd_process documents.
+                unsafe {
+                    graduatednd::darkroom_graduatednd_process(
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        width as i32,
+                        height as i32,
+                        density,
+                        g.length_base,
+                        g.length_inc,
+                        g.cosv_hh_inv,
+                        g.filter_hardness,
+                        0, // full-image preview ROI starts at y = 0
+                        g.color.as_ptr(),
+                        g.color1.as_ptr(),
+                    );
+                }
+            }
             // ── Vignette (vignette.c) ──────────────────────────────────
             // Position-dependent radial falloff, straight in RGB. `is_pixel_local`
             // returns false for this stage, so `process` guarantees (width,
@@ -1148,6 +1204,14 @@ mod tests {
             !Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020, scale: 1.0 }
                 .is_pixel_local(),
             "sharpen reads neighbours ⇒ NOT pixel-local"
+        );
+        assert!(
+            !Stage::GraduatedNd {
+                density: 1.0, hardness: 0.0, rotation: 0.0, offset: 50.0,
+                hue: 0.0, saturation: 0.0,
+            }
+            .is_pixel_local(),
+            "graduated ND derives its strength from pixel POSITION ⇒ NOT pixel-local"
         );
         assert!(
             !Stage::Vignette {

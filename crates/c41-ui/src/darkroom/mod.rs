@@ -1856,6 +1856,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
                 "Lowlight vision" => pg.add(&lowlight_module_row(ctx)),
+                "Graduated density" => pg.add(&gradnd_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
                 other => match elsewhere_hint(other) {
@@ -1942,7 +1943,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2252,6 +2253,38 @@ fn lowlight_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.lowlight_transition[4] = v);
             add_param_slider(e, ctx, "Zone 6 (bright)", 0.0, 1.0, 0.01, p0.lowlight_transition[5] as f64,
                 |p, v| p.lowlight_transition[5] = v);
+        })
+}
+
+/// Graduated ND module: enable switch gates `gradnd_on`; density, hardness,
+/// rotation, offset and an optional tint.
+///
+/// Like Vignetting this is a *position-dependent* stage, so enabling it puts the
+/// pipeline on the serial path (see `Stage::GraduatedNd`). darktable also offers
+/// an on-canvas line handle to set rotation/offset by dragging; the sliders here
+/// carry the same parameters until that overlay exists.
+fn gradnd_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Graduated density", "graduated ND filter", p0.gradnd_on,
+        |p, on| p.gradnd_on = on,
+        |e, ctx| {
+            // Density in EV; negative brightens rather than darkens. 0 is a
+            // no-op and to_pipeline skips the stage there.
+            add_param_slider(e, ctx, "Density", -8.0, 8.0, 0.05, p0.gradnd_density as f64,
+                |p, v| p.gradnd_density = v);
+            add_param_slider(e, ctx, "Hardness", 0.0, 100.0, 1.0, p0.gradnd_hardness as f64,
+                |p, v| p.gradnd_hardness = v);
+            add_param_slider(e, ctx, "Rotation", -180.0, 180.0, 1.0, p0.gradnd_rotation as f64,
+                |p, v| p.gradnd_rotation = v);
+            // 50 = the line through the frame centre.
+            add_param_slider(e, ctx, "Offset", 0.0, 100.0, 1.0, p0.gradnd_offset as f64,
+                |p, v| p.gradnd_offset = v);
+            // Saturation 0 keeps the filter neutral (a true ND); raise it for
+            // the classic tinted-grad look.
+            add_param_slider(e, ctx, "Hue", 0.0, 1.0, 0.01, p0.gradnd_hue as f64,
+                |p, v| p.gradnd_hue = v);
+            add_param_slider(e, ctx, "Saturation", 0.0, 1.0, 0.01, p0.gradnd_saturation as f64,
+                |p, v| p.gradnd_saturation = v);
         })
 }
 

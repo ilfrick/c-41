@@ -169,6 +169,19 @@ pub struct PreviewParams {
     /// Transition-curve band heights, 6 nodes at x = k/5, each 0..1.
     /// 0.5 everywhere = an even scotopic/photopic blend at every luminance.
     pub lowlight_transition: [f32; 6],
+    /// Graduated ND stage on/off.
+    pub gradnd_on: bool,
+    /// Filter density in EV, -8..8. Negative brightens instead of darkening.
+    pub gradnd_density: f32,
+    /// Edge hardness, 0..100 (0 = soft gradient, 100 = hard line).
+    pub gradnd_hardness: f32,
+    /// Rotation of the gradient line in degrees, -180..180.
+    pub gradnd_rotation: f32,
+    /// Line offset across the frame, 0..100 (50 = centred).
+    pub gradnd_offset: f32,
+    /// Filter tint; saturation 0 = a neutral ND filter.
+    pub gradnd_hue: f32,
+    pub gradnd_saturation: f32,
 }
 
 impl Default for PreviewParams {
@@ -267,6 +280,15 @@ impl Default for PreviewParams {
             lowlight_on: false,
             lowlight_blueness: 0.0,
             lowlight_transition: [0.5; 6],
+            // darktable defaults (graduatednd.c params): off, 1 EV, soft edge,
+            // horizontal, centred, neutral (saturation 0).
+            gradnd_on: false,
+            gradnd_density: 1.0,
+            gradnd_hardness: 0.0,
+            gradnd_rotation: 0.0,
+            gradnd_offset: 50.0,
+            gradnd_hue: 0.0,
+            gradnd_saturation: 0.0,
         }
     }
 }
@@ -338,12 +360,15 @@ impl PreviewParams {
         // even a flat 0.5 curve is a real 50% mix — so on == off is the only
         // no-op guard.
         let lowlight_identity = !self.lowlight_on;
+        // Density 0 makes the filter exp2(0) = 1 everywhere — a true no-op.
+        let gradnd_identity = !self.gradnd_on || self.gradnd_density == 0.0;
         let vignette_identity = !self.vignette_on
             || (self.vignette_brightness == 0.0 && self.vignette_saturation == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
             && levels_identity && vignette_identity && lowlight_identity
+            && gradnd_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -367,6 +392,7 @@ impl PreviewParams {
             levels_on: false,
             vignette_on: false,
             lowlight_on: false,
+            gradnd_on: false,
             ..*self
         }
     }
@@ -378,7 +404,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on] {
             v.push(b as u8);
         }
         for f in [
@@ -412,6 +438,8 @@ impl PreviewParams {
             self.lowlight_blueness,
             self.lowlight_transition[0], self.lowlight_transition[1], self.lowlight_transition[2],
             self.lowlight_transition[3], self.lowlight_transition[4], self.lowlight_transition[5],
+            self.gradnd_density, self.gradnd_hardness, self.gradnd_rotation,
+            self.gradnd_offset, self.gradnd_hue, self.gradnd_saturation,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -425,9 +453,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..17];
-        // length is checked above, so exactly 110 f32 chunks follow
-        let f: Vec<f32> = bytes[17..]
+        let bools = &bytes[1..18];
+        // length is checked above, so exactly 116 f32 chunks follow
+        let f: Vec<f32> = bytes[18..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -481,6 +509,9 @@ impl PreviewParams {
             lowlight_on: bools[15] != 0,
             lowlight_blueness: f[103],
             lowlight_transition: [f[104], f[105], f[106], f[107], f[108], f[109]],
+            gradnd_on: bools[16] != 0,
+            gradnd_density: f[110], gradnd_hardness: f[111], gradnd_rotation: f[112],
+            gradnd_offset: f[113], gradnd_hue: f[114], gradnd_saturation: f[115],
         })
     }
 
@@ -537,6 +568,23 @@ impl PreviewParams {
         }
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
+        }
+        // Graduated ND (iop_order.c pos 25 — scene-referred, right after
+        // exposure 21 and before the channel mix 28.5). Early placement is
+        // correct: it is an optical filter, modelling glass in front of the
+        // lens, so it belongs on linear scene data before any tone or colour
+        // work. Density 0 is exp2(0) = 1 everywhere, a true no-op, so it is
+        // skipped. The geometry depends on the buffer size and is derived in
+        // Stage::apply, not here.
+        if self.gradnd_on && self.gradnd_density != 0.0 {
+            p.push(Stage::GraduatedNd {
+                density: self.gradnd_density,
+                hardness: self.gradnd_hardness,
+                rotation: self.gradnd_rotation,
+                offset: self.gradnd_offset,
+                hue: self.gradnd_hue,
+                saturation: self.gradnd_saturation,
+            });
         }
         if self.mono_on {
             p.push(Stage::Monochrome { r: self.mono_r, g: self.mono_g, b: self.mono_b });
@@ -775,8 +823,8 @@ impl PreviewParams {
 const LEVELS_MIN_RANGE: f32 = 1.0;
 
 const ENCODE_VERSION: u8 = 11;
-/// 1 version byte + 16 bool bytes + 110 little-endian f32.
-const ENCODED_LEN: usize = 1 + 16 + 110 * 4;
+/// 1 version byte + 17 bool bytes + 116 little-endian f32.
+const ENCODED_LEN: usize = 1 + 17 + 116 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1676,6 +1724,9 @@ mod tests {
             vignette_center_x: -0.2, vignette_center_y: 0.15, vignette_shape: 1.4,
             lowlight_on: true, lowlight_blueness: 30.0,
             lowlight_transition: [0.1, 0.3, 0.5, 0.6, 0.8, 0.9],
+            gradnd_on: true, gradnd_density: -2.5, gradnd_hardness: 40.0,
+            gradnd_rotation: -75.0, gradnd_offset: 35.0,
+            gradnd_hue: 0.6, gradnd_saturation: 0.4,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
