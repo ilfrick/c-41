@@ -22,7 +22,7 @@ pub mod preview;
 pub mod raw_preview;
 pub mod snapshots;
 
-pub const APP_ID:        &str = "org.darkroom.Darkroom";
+pub const APP_ID:        &str = "org.c41.C41";
 pub const DEFAULT_WIDTH:  i32 = 1280;
 pub const DEFAULT_HEIGHT: i32 = 800;
 
@@ -452,7 +452,7 @@ fn build_main_window(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Darkroom")
+        .title("C-41")
         .default_width(DEFAULT_WIDTH)
         .default_height(DEFAULT_HEIGHT)
         .build();
@@ -670,7 +670,7 @@ fn build_main_window(app: &Application) {
 
     // ── Header bar ─────────────────────────────────────────────────────────
     let lt_header = adw::HeaderBar::new();
-    lt_header.set_title_widget(Some(&adw::WindowTitle::new("Darkroom", "Lighttable")));
+    lt_header.set_title_widget(Some(&adw::WindowTitle::new("C-41", "Lighttable")));
 
     // Panel toggles (parity audit 1.2) — one per side, at the header's two ends so
     // each button sits over the panel it hides. darktable puts triangles on the
