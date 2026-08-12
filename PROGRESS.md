@@ -265,3 +265,46 @@ job" and break one of them.
 
 **Verified.** `scripts/ci-local.sh` (all four steps) after the rename; 311 FFI
 exports and the prefs table confirmed intact by grep.
+
+---
+
+## 2026-08-12 12:05 UTC — App name fix + stop tracking runtime state
+
+**Commits** `e11615be`, `532326198d` (GitHub + Gitea)
+
+**What.** Two follow-ups from user-reported problems.
+
+1. **The app still called itself "Darkroom"** (`e11615be`). The rename pass
+   protected every `"Darkroom"` literal because darktable uses "darkroom" for
+   its editing *view*, and renaming that would make the UI lie about the app it
+   mirrors. Two of those literals were the app's own branding, not the view
+   term: the `ApplicationWindow` title and the lighttable header title, plus
+   `APP_ID` (`org.darkroom.Darkroom` → `org.c41.C41`). The view-switcher button
+   still reads "Darkroom", correctly.
+
+2. **26 MB of container runtime state was tracked** (`532326198d`). m4-109's
+   `git add -A` swept in the bind-mounted `/config`: the user's live catalogue
+   (`library.db`, `data.db`), thumbnail cache, KasmVNC session files and TLS
+   certs. `library.db` is rewritten on every run, so every unrelated commit
+   carried a binary diff of the user's photo database. `git rm -r --cached` plus
+   a `/config/` gitignore entry; files stay on disk, container verified healthy.
+
+**Verified.** `scripts/ci-local.sh` (all four steps); screenshotted the running
+app — title bar reads C-41, switcher button unchanged.
+
+**Notes — the other half of the report was "I still cannot see new features",
+and the features were fine.** The KasmVNC desktop was **1084×348** (KasmVNC
+sizes the virtual display to the client's browser window) while the app window
+is 663px tall, so roughly half the UI — including the entire module list —
+rendered below the visible area. Resizing the display to 1920×1080 showed
+everything working: "Modules — 18 of 45 active", live modules sorted first,
+"not yet wired" placeholders dimmed, and the Crop/Rotate rows pointing at their
+own controls.
+
+**Notes — my verification was wrong, twice over.** I "checked" the module panel
+by byte-grepping the release binary for `not yet wired`, got zero matches, and
+went hunting for a stale-build problem that did not exist: the optimiser had
+split the literal into two 8-byte `movabs` immediates, so it never appears
+contiguously. Grepping a stripped release binary proves nothing. A screenshot
+settled it in seconds and should have been the first move — the same lesson as
+2026-08-11, arrived at from a different direction.
