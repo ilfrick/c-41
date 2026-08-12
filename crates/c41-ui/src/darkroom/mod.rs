@@ -876,6 +876,9 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .vexpand(true)
         .content_fit(gtk4::ContentFit::Contain)
         .build();
+    // Middle-grey surround, as darktable does. Functional, not decorative: the
+    // colour behind the image shifts how you judge its tone (see `crate::theme`).
+    picture.add_css_class("c41-darkroom-canvas");
 
     // Scale-locked snapshot wipe: a transparent DrawingArea layered over the live
     // image (via the Overlay below) paints the selected snapshot to the left of a

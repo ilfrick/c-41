@@ -346,3 +346,43 @@ user question: the header's **"Other"** button is empty because it fronts
 darktable's map / print / slideshow / tethering views, none of which are ported
 (parity 3.4). Of the four, slideshow is the only cheap one — map needs
 libosmgpsmap and tethering needs gphoto2.
+
+---
+
+## 2026-08-12 16:30 UTC — parity-3.3: darktable-matched theme
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** The app shipped stock libadwaita dark — blue accents, rounded corners,
+GNOME idioms — against darktable's flat, square, entirely grey chrome. New
+`c41-ui/src/theme.rs` installs a `CssProvider` carrying darktable's own palette,
+lifted verbatim from `data/themes/darktable.css` in this repo:
+`bg #262626` (grey_15), panels `#303030` (grey_20), text `#b9b9b9` (grey_75),
+selection `#525252` (grey_35). Blue accent overridden to grey, `border-radius: 0`
+throughout, flat headers/buttons/sliders/scrollbars.
+
+**The canvas greys are functional, not decorative.** darktable puts the darkroom
+canvas at a true middle grey (`grey_50 #777777`) and the lighttable at
+`grey_40 #5e5e5e` because the surround changes how you judge the tone and colour
+of the image sitting on it — the upstream CSS says so in as many words. Both are
+now applied via `c41-darkroom-canvas` / `c41-lighttable-canvas` classes.
+
+**Verified.** `scripts/ci-local.sh` (all four steps); 979 tests (+3). Deployed
+and screenshotted, then sampled pixel values against the darktable reference
+screenshot: panels within a few levels, grid surround exactly `(94,94,94)`.
+
+**Notes.** First attempt at the canvas grey silently lost — the `GridView` sits
+in a `ScrolledWindow` whose generic `.view` rule beat the class on specificity,
+so the grid stayed `#303030`. Caught by sampling the pixel rather than trusting
+that the CSS "looked right"; fixed with explicit child/viewport selectors.
+
+Three tests guard the theme: the palette is pinned against the upstream values,
+the CSS is checked for un-interpolated `{gNN}` placeholders (which GTK drops
+silently, taking the whole rule with them), and **every colour literal is
+asserted to be an even grey** — the point of the exercise is an achromatic UI
+that cannot bias colour judgement, so a stray tint should fail the build.
+
+**Not attempted** (deliberately, and recorded in the module docs): darktable's
+"bauhaus" sliders are custom-drawn widgets, not styled GTK ranges, so matching
+them needs new widgets rather than CSS; and the panel *layout* (which modules
+live where) is parity 2.2-2.6, a separate track.

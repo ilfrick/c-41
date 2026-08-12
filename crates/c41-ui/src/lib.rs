@@ -11,6 +11,7 @@ use glib::clone;
 pub mod catalog;
 pub mod crop_overlay;
 pub mod darkroom;
+pub mod theme;
 pub mod dialogs;
 pub mod export;
 pub mod export_panel;
@@ -446,9 +447,10 @@ fn persist_panel_widths(db_path: &str, outer: &gtk4::Paned, inner: &gtk4::Paned,
 fn build_main_window(app: &Application) {
     // darktable ships a dark grey theme; match that first impression by forcing
     // libadwaita's dark colour scheme (the default follows the desktop setting,
-    // which is light in the KasmVNC container). A custom CSS provider matching
-    // darktable's exact greys is a later refinement (see RUST_MIGRATION_PLAN.md).
+    // which is light in the KasmVNC container), then darktable's own palette on
+    // top — see `theme` for why the canvas greys in particular are functional.
     adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+    theme::install();
 
     let window = ApplicationWindow::builder()
         .application(app)

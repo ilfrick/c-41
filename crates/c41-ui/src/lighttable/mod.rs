@@ -222,6 +222,9 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
         // `GRID_MIN_COLUMNS` keeps a narrow framebuffer from clipping the row.
         .min_columns(GRID_MIN_COLUMNS)
         .build();
+    // Slightly darker than the darkroom canvas, matching darktable's
+    // lighttable_bg_color (grey_40) — see `crate::theme`.
+    grid.add_css_class("c41-lighttable-canvas");
     grid.add_css_class("lighttable-grid");
 
     let scroll = ScrolledWindow::builder()

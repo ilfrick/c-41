@@ -68,7 +68,7 @@ severity-2 items are "attach a panel to code that already works", not new maths.
 |---|---------|
 | 3.1 | Zoomable view mode is still greyed out (`ViewMode::Zoomable::is_available() == false`). Deferred deliberately: `GridView` can't express an infinite zoom plane. |
 | 3.2 | Panel sections are flat; darktable uses collapsible expanders throughout both panels. |
-| 3.3 | Theme is libadwaita dark, not darktable's exact greys. |
+| 3.3 | ~~Theme is libadwaita dark, not darktable's exact greys.~~ **Fixed 2026-08-12** — `c41-ui/src/theme.rs` installs darktable's own palette (`grey_NN` from `data/themes/darktable.css`), flattens the chrome (square corners, no blue accent) and sets the functional canvas greys. Not attempted: bauhaus controls (custom-drawn upstream, not CSS) and panel *layout* (2.2-2.6). |
 | 3.4 | Map / print / tethering views absent — the header's "Other" is a permanent placeholder. |
 | 3.5 | Culling shows `THUMB_SIZE` cells rather than filling the viewport; full preview is gdk-pixbuf only, so raws it can't read (`.ORF`) show a message instead of an image. Both need the darkroom view's `BaseImage`/`render()` lifted into a shared module. |
 | 3.6 | Full preview has no 100 % zoom/pan (darktable does). |
