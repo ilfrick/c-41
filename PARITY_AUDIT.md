@@ -1,4 +1,13 @@
-# Darkroom vs darktable — parity audit (2026-08-08)
+# Darkroom vs darktable — parity audit
+
+**First written 2026-08-08. Last refreshed 2026-08-11** (severity 1 re-verified
+against the code; resolved items struck through rather than deleted, so the
+record of what was fixed survives).
+
+> Keep this current. Between 08-08 and 08-11 it went stale enough to be
+> actively misleading — it still listed three severity-1 items that had shipped
+> on 08-08/08-09, which led to a proposal to rebuild finished work. If you fix
+> something in here, mark it in the same commit.
 
 Audit against darktable 5.6.0 (reference screenshot `Schermata_20260721_210438.png`)
 and the running app in the KasmVNC container, plus a code sweep of
@@ -10,6 +19,11 @@ Deadline context: this is the list being worked top-down for **2026-08-20**.
 Everything not reached by then stays here, written down, rather than being quietly
 dropped. Full darktable parity is **not** reachable by that date and is not the
 target — see the note at the bottom.
+
+**Status 2026-08-11 (9 days out):** severity 1 is clear. The remaining work is
+severity 2, and within it 2.1 (attaching UI to already-ported processing) is
+both the largest gap and the cheapest per unit — each module is an increment.
+Per-increment progress is logged in `PROGRESS.md`.
 
 ## Where the port actually stands
 
@@ -27,18 +41,20 @@ severity-2 items are "attach a panel to code that already works", not new maths.
 
 ## Severity 1 — broken or blocking
 
-| # | Finding | Evidence |
-|---|---------|----------|
-| 1.1 | **Side panels cannot be resized.** No `GtkPaned` anywhere in the UI crate; panel widths are hard-coded (`panels/mod.rs:85`, `:1026` → 210px; `lib.rs:305` → 200px). darktable lets you drag both panel edges. | user-reported; `grep -c Paned` = 0 |
-| 1.2 | **Side panels cannot be collapsed.** darktable collapses each panel with the triangles at the screen edges. Ours are permanently on screen, which is also what makes 1.3 unavoidable. | reference screenshot, left/right edge triangles |
-| 1.3 | **~915px minimum content width overflows a narrow window** — fixed panels + a 2-column grid + fixed metadata panel. Below that the header controls and the bottom bar's right end clip off-screen. Open since m4-98a; 1.1/1.2 are the real fix. | `RUST_MIGRATION_PLAN.md` m4-98a note |
-| 1.4 | **Metadata panel is empty for the image selected at startup.** `SingleSelection` auto-selects index 0 on load, which fires no `selection-changed`, so the panel sits on "Select an image to view metadata" until the user clicks something else. | observed live 2026-08-07 |
+**All clear as of 2026-08-11.** Every item below is resolved; kept for the record.
+
+| # | Finding | Status |
+|---|---------|--------|
+| 1.1 | ~~**Side panels cannot be resized.**~~ | **Fixed** `45f0b427` (08-08). Nested `gtk4::Paned`; widths persist to the `darkroom_ui_prefs` table (debounced). Verified 08-11: `lib.rs` uses `Paned`, `LEFT/RIGHT_PANEL_*_PREF_KEY`. |
+| 1.2 | ~~**Side panels cannot be collapsed.**~~ | **Fixed** `9fc1e344` (08-09). Header toggle per side + `L`/`R` keys; collapsed state persisted (`*_PANEL_COLLAPSED_PREF_KEY`). A header button rather than darktable's edge triangle — the GNOME idiom, and findable, which was half the complaint. |
+| 1.3 | ~~**~915px minimum content width overflows a narrow window.**~~ | **Resolved by 1.1 + 1.2** — panels now shrink and collapse, so the fixed floor is gone. Re-check if a new fixed-width widget lands. |
+| 1.4 | ~~**Metadata panel empty for the image selected at startup.**~~ | **Fixed** (08-08 session). `SingleSelection` auto-selects index 0 without firing `selection-changed`; the panel is now seeded explicitly and a `follow_selection` observer keeps preview + metadata in step (`lib.rs:663`). |
 
 ## Severity 2 — missing, high value, processing already ported
 
 | # | Finding | Notes |
 |---|---------|-------|
-| 2.1 | **~80 ported modules have no UI.** The darkroom view has exposure/black, contrast, velvia, split-toning, monochrome, crop/rotate/straighten, demosaic choice. Missing with the Rust code already present: **white balance, tone curve, sharpen, denoise, highlight reconstruction, vignette, lens correction, colour balance**, and more. | highest value per day of work of anything on this list |
+| 2.1 | **Most ported modules still have no UI — but the gap is closing.** As of 2026-08-11 **14 modules are live** in the darkroom panel (exposure, velvia, split-toning, monochrome, sigmoid, sharpen, vibrance, colorize, color correction, color contrast, color zones, levels, white balance, invert) plus crop/rotate/straighten and the demosaic selector. The m4-10x series adds roughly one per increment. Still missing with Rust code already present: **tone curve, RGB curve, denoise, highlight reconstruction, vignette, lens correction, colour balance RGB, filmic RGB, tone equalizer**. | still the highest value per day of work on this list. Note the curve-based modules (tone curve, RGB curve, base curve) need a **curve-editor widget** that does not exist yet — they are not one-increment slider jobs like the rest, and colorzones shipped with sliders only for the same reason |
 | 2.2 | **No history stack in the lighttable.** The darkroom view has one; darktable exposes it in both. | `history.rs` exists — it is a darkroom-view panel |
 | 2.3 | **Metadata is read-only.** darktable has a *metadata editor* (title, creator, rights…). Ours displays EXIF and nothing is writable. | m4-100 shipped the read side |
 | 2.4 | **No styles.** darktable's "styles" panel (save a set of edits, apply to many images) has no equivalent. | |

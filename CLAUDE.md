@@ -15,18 +15,30 @@ For **every** code change, run this full loop in order:
    (Opus 4.8). It is nominally scoped to "Fricktrade" but is intentionally used
    for darkroom reviews too. Give it the full diff and context.
 3. **Fix** the review findings.
-4. **Test with Docker** — build the image, run the container, **read the logs**
-   (real runtime validation, not just `--version`/unit tests):
-   - Rust crates: `docker build -t darkroom-rust-dev -f docker/Dockerfile.rust-dev .`
-     then in the container run `cargo check --workspace`, `cargo clippy`, and
-     `cargo test` and inspect the output.
+4. **Test with Docker** — run **`scripts/ci-local.sh`**. It executes the same
+   four steps CI runs, in the CI image, and keys off **exit codes**:
+   `cargo check --workspace`, `cargo clippy --workspace`,
+   `cargo test --workspace --release`, and the
+   `cargo build --release -p darkroom --bin darkroom-rs` link.
+   - **Never conclude "clean" by grepping command output.** Clippy prints its
+     diagnostic on the line *before* the `--> file:line` locator, so grepping
+     locator lines for "error" silently reports success on a failing run — that
+     is exactly how m4-107 shipped a red build. Trust the exit code.
+   - Note CI runs tests under `--release`; a debug-only run is not sufficient.
+   - `scripts/pre-push` enforces this on every push
+     (`git config core.hooksPath scripts`; bypass with `--no-verify`).
    - C changes: also compile under Release `-Werror`. For the full app image use
      `--build-arg CACHEBUST=<sha>` or `--no-cache` (the `git clone` layer caches).
 5. **Fix** anything the build/logs surface.
-6. **Commit + push to BOTH remotes**: `origin` (GitHub `ilfrick/darkroom`) has
+6. **Log it in `PROGRESS.md`** — append a timestamped entry (UTC, newest last)
+   recording what changed, how it was verified, and anything that went wrong.
+   Keep failures and corrections in; they are the part worth rereading. Also
+   update `PARITY_AUDIT.md` in the *same* commit if the change resolves an item
+   there — that file went stale once and misled the next session's planning.
+7. **Commit + push to BOTH remotes**: `origin` (GitHub `ilfrick/darkroom`) has
    dual push URLs so a single `git push origin master` pushes to GitHub **and**
    Gitea (`housefz.com`). Verify both refs update.
-7. (Non-blocking) **Confirm CI green** via
+8. (Non-blocking) **Confirm CI green** via
    `gh api repos/ilfrick/darkroom/commits/<sha>/check-runs` — the
    `check + test + clippy` and `Build & push Docker image` runs. CI logs aren't
    directly readable (403); the local Docker build is the authoritative check.

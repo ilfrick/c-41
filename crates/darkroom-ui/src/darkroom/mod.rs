@@ -1802,6 +1802,20 @@ fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
 /// would fire those handlers per row and re-enter `render_preview` mid-rebuild.
 /// `module_expander`/`add_param_slider` already follow this (build then connect).
 fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
+    // Count first so the header can state how much of the catalogue is real.
+    // Without this the panel is 44 near-identical rows and the ~30 placeholders
+    // are indistinguishable from working modules — which made every shipped
+    // increment invisible (see `is_live_module`).
+    let total: usize = crate::catalog::module_catalog()
+        .iter()
+        .map(|g| g.modules.len())
+        .sum();
+    let live: usize = crate::catalog::module_catalog()
+        .iter()
+        .flat_map(|g| g.modules.iter())
+        .filter(|mi| is_live_module(mi.label))
+        .count();
+
     let header = gtk4::Label::builder()
         .label("Modules")
         .halign(gtk4::Align::Start)
@@ -1809,9 +1823,24 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     header.add_css_class("title-4");
     panel.append(&header);
 
+    let counter = gtk4::Label::builder()
+        .label(format!("{live} of {total} active"))
+        .halign(gtk4::Align::Start)
+        .build();
+    counter.add_css_class("dim-label");
+    counter.add_css_class("caption");
+    panel.append(&counter);
+
     for group in crate::catalog::module_catalog() {
         let pg = adw::PreferencesGroup::builder().title(group.name).build();
-        for mi in group.modules {
+        // Live modules first: the catalogue is authored in darktable's
+        // presentation order, which front-loads unported modules (Base opens
+        // with three inert rows, Effect with nine), so a top-down scan hit
+        // placeholders before anything that works. Stable within each half, so
+        // the familiar relative order survives.
+        let mut modules: Vec<&crate::catalog::ModuleInfo> = group.modules.iter().collect();
+        modules.sort_by_key(|mi| !is_live_module(mi.label));
+        for mi in modules {
             match mi.label {
                 "Exposure" => pg.add(&exposure_module_row(ctx)),
                 "Velvia" => pg.add(&velvia_module_row(ctx)),
@@ -1827,31 +1856,90 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
-                _ => pg.add(&inert_module_row(mi.label, mi.default_on)),
+                other => match elsewhere_hint(other) {
+                    // Implemented, but driven from its own control — point at it
+                    // rather than calling it unwired.
+                    Some(hint) => pg.add(&elsewhere_module_row(other, hint)),
+                    None => pg.add(&inert_module_row(other, mi.default_on)),
+                },
             }
         }
         panel.append(&pg);
     }
 }
 
-/// A placeholder module row: title + enable switch not yet wired to anything.
-fn inert_module_row(label: &str, default_on: bool) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title(label).build();
-    let toggle = gtk4::Switch::builder()
-        .active(default_on)
-        .valign(gtk4::Align::Center)
+/// A placeholder for a module whose processing exists in `darkroom-core` but has
+/// no controls wired to it yet.
+///
+/// Deliberately **not** interactive. It previously rendered as a normal row with
+/// a working switch, so ~30 of the 44 catalogue entries looked exactly like the
+/// live ones and could be toggled with no effect — which reads as "the app is
+/// broken" rather than "this module isn't wired yet", and buried each shipped
+/// module in a crowd of lookalikes. Now it is dimmed, labelled, and inert.
+fn inert_module_row(label: &str, _default_on: bool) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(label)
+        .subtitle("not yet wired")
         .build();
-    row.add_suffix(&toggle);
-    row.set_activatable_widget(Some(&toggle));
+    row.add_css_class("dim-label");
+    // No switch at all: a disabled switch still suggests "turn me on", while an
+    // icon reads as a status. Sensitivity off so it can't take focus either.
+    let marker = gtk4::Image::from_icon_name("content-loading-symbolic");
+    marker.set_valign(gtk4::Align::Center);
+    marker.set_tooltip_text(Some(
+        "Processing is ported to darkroom-core; the panel controls are not built yet.",
+    ));
+    row.add_suffix(&marker);
+    row.set_activatable(false);
+    row.set_sensitive(false);
     row
 }
 
+/// A row for a module that works but is driven from a control elsewhere in the
+/// panel. Not dimmed — it is functional — but non-activatable, since its switch
+/// would have nothing to gate.
+fn elsewhere_module_row(label: &str, hint: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(label).subtitle(hint).build();
+    let marker = gtk4::Image::from_icon_name("go-up-symbolic");
+    marker.set_valign(gtk4::Align::Center);
+    row.add_suffix(&marker);
+    row.set_activatable(false);
+    row
+}
+
+/// Whether `label` dispatches to a live preview module in [`populate_modules`].
+///
+/// Single source of truth for both the dispatch's presentation (ordering, the
+/// "N of M active" count) and the drift test — previously this list existed only
+/// under `#[cfg(test)]`, so the UI had no way to tell a working module from a
+/// placeholder and rendered them identically.
+pub(crate) fn is_live_module(label: &str) -> bool {
+    LIVE_MODULE_LABELS.contains(&label) || ELSEWHERE_MODULE_LABELS.contains(&label)
+}
+
+/// Catalog labels whose functionality *is* implemented, but through dedicated
+/// controls elsewhere in the darkroom panel rather than a row in this list —
+/// Crop has its own mode toggle and overlay, Rotate & perspective the Straighten
+/// slider. Marking them "not yet wired" would be simply false, so they count as
+/// live and are labelled with where their controls actually are.
+const ELSEWHERE_MODULE_LABELS: &[&str] = &["Crop", "Rotate & perspective"];
+
+/// Where a module implemented outside this list keeps its controls.
+fn elsewhere_hint(label: &str) -> Option<&'static str> {
+    match label {
+        "Crop" => Some("use the Crop button above"),
+        "Rotate & perspective" => Some("use the Straighten slider above"),
+        _ => None,
+    }
+}
+
 /// Catalog labels that [`build_modules_panel`] dispatches to a *live* preview
-/// module (everything else renders as an inert toggle). The match arms below
-/// use these same literals; `catalog_has_live_modules` guards against a catalog
-/// rename silently dropping a module back to inert. Test-only: it exists purely
-/// as the contract checked by that test.
-#[cfg(test)]
+/// module (everything else renders via [`inert_module_row`]). The match arms in
+/// [`populate_modules`] use these same literals, and `catalog_has_live_modules`
+/// guards against a catalog rename silently dropping a module back to inert.
+///
+/// Keep in sync with the match arms — adding a module means adding it here too,
+/// or it will render live but be counted and sorted as a placeholder.
 const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
@@ -2250,6 +2338,46 @@ mod tests {
         assert_eq!(r.nch, 3);
         assert_eq!(r.rowstride, 2 * 3);
         assert_eq!(r.bytes.len(), 2 * 1 * 3);
+    }
+
+    /// `LIVE_MODULE_LABELS` now drives presentation (ordering + the "N of M
+    /// active" count), not just this test, so a module present in the dispatch
+    /// but missing from the list would render live yet be sorted and counted as
+    /// a placeholder. Pin the two together by parsing the match arms from source.
+    #[test]
+    fn live_module_labels_match_the_dispatch_arms() {
+        let src = include_str!("mod.rs");
+        let dispatched: std::collections::BTreeSet<&str> = src
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix('"')?;
+                let (label, tail) = rest.split_once('"')?;
+                tail.trim_start().starts_with("=> pg.add").then_some(label)
+            })
+            .collect();
+        let declared: std::collections::BTreeSet<&str> =
+            LIVE_MODULE_LABELS.iter().copied().collect();
+        assert_eq!(
+            dispatched, declared,
+            "LIVE_MODULE_LABELS and the populate_modules match arms disagree — \
+             a module would be rendered live but counted/sorted as inert (or vice versa)"
+        );
+        // The "implemented elsewhere" labels are deliberately NOT dispatch arms;
+        // they must not overlap, or a module would get two rows.
+        for l in ELSEWHERE_MODULE_LABELS {
+            assert!(
+                !declared.contains(l),
+                "{l} is both a dispatch arm and an ELSEWHERE label"
+            );
+            assert!(elsewhere_hint(l).is_some(), "{l} has no hint text");
+            assert!(is_live_module(l), "{l} should count as live");
+        }
+        assert!(
+            declared.iter().all(|l| is_live_module(l)),
+            "is_live_module disagrees with its own backing list"
+        );
+        assert!(!is_live_module("Bloom"), "an unported module must not read as live");
     }
 
     /// Every live-module label must still exist verbatim in the catalog, else
