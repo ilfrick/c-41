@@ -33,3 +33,9 @@ cmake-build-debug/
 
 # local raw samples for manual verification (not committed)
 testdata/
+
+# Container runtime state — the bind-mounted /config for the c-41 container.
+# Holds the user's live catalogue (library.db, data.db), thumbnail cache and
+# KasmVNC session state/certs. Committed by accident in m4-109 via `git add -A`;
+# it is machine-local user data, not source, and library.db churns on every run.
+/config/
