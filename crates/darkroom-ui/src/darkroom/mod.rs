@@ -1854,6 +1854,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
+                "Vignetting" => pg.add(&vignette_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
                 other => match elsewhere_hint(other) {
@@ -1940,7 +1941,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2189,6 +2190,39 @@ fn levels_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.levels_grey = v);
             add_param_slider(e, ctx, "White", 0.0, 100.0, 0.5, p0.levels_white as f64,
                 |p, v| p.levels_white = v);
+        })
+}
+
+/// Vignetting module: enable switch gates `vignette_on`; fall-off start/radius,
+/// brightness and saturation strength, shape, and the centre offset.
+///
+/// This is the first *position-dependent* live module — its stage is not
+/// pixel-local, so enabling it puts the whole pipeline on the serial path (see
+/// `Stage::Vignette`). Nothing to do here, but it is why this module is more
+/// expensive to have on than the others.
+fn vignette_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Vignetting", "radial brightness falloff", p0.vignette_on,
+        |p, on| p.vignette_on = on,
+        |e, ctx| {
+            // Both strengths at 0 is a no-op (to_pipeline skips the stage);
+            // darktable's default is -0.5 for each, i.e. a darkening vignette.
+            add_param_slider(e, ctx, "Brightness", -1.0, 1.0, 0.01, p0.vignette_brightness as f64,
+                |p, v| p.vignette_brightness = v);
+            add_param_slider(e, ctx, "Saturation", -1.0, 1.0, 0.01, p0.vignette_saturation as f64,
+                |p, v| p.vignette_saturation = v);
+            // Inner radius then falloff width, both % of the largest dimension.
+            add_param_slider(e, ctx, "Fall-off start", 0.0, 200.0, 1.0, p0.vignette_scale as f64,
+                |p, v| p.vignette_scale = v);
+            add_param_slider(e, ctx, "Fall-off radius", 0.0, 200.0, 1.0, p0.vignette_falloff as f64,
+                |p, v| p.vignette_falloff = v);
+            // 1 = ellipse; higher squares the shape off.
+            add_param_slider(e, ctx, "Shape", 0.0, 5.0, 0.01, p0.vignette_shape as f64,
+                |p, v| p.vignette_shape = v);
+            add_param_slider(e, ctx, "Centre X", -1.0, 1.0, 0.01, p0.vignette_center_x as f64,
+                |p, v| p.vignette_center_x = v);
+            add_param_slider(e, ctx, "Centre Y", -1.0, 1.0, 0.01, p0.vignette_center_y as f64,
+                |p, v| p.vignette_center_y = v);
         })
 }
 

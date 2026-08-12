@@ -147,6 +147,21 @@ pub struct PreviewParams {
     pub levels_grey: f32,
     /// White point, 0..100.
     pub levels_white: f32,
+    /// Vignetting stage on/off.
+    pub vignette_on: bool,
+    /// Fall-off start (inner radius), 0..200 % of the largest image dimension.
+    pub vignette_scale: f32,
+    /// Fall-off radius, 0..200. Outer radius = inner + this.
+    pub vignette_falloff: f32,
+    /// Brightness reduction strength, -1..1 (darktable default -0.5).
+    pub vignette_brightness: f32,
+    /// Saturation reduction strength, -1..1 (darktable default -0.5).
+    pub vignette_saturation: f32,
+    /// Vignette centre offset, -1..1 in each axis (0 = image centre).
+    pub vignette_center_x: f32,
+    pub vignette_center_y: f32,
+    /// Shape exponent, 0..5 (1 = ellipse; higher = squarer).
+    pub vignette_shape: f32,
 }
 
 impl Default for PreviewParams {
@@ -229,6 +244,17 @@ impl Default for PreviewParams {
             levels_black: 0.0,
             levels_grey: 50.0,
             levels_white: 100.0,
+            // darktable defaults (vignette.c params struct): off, fall-off
+            // start 80, radius 50, brightness/saturation -0.5, centred,
+            // shape 1, automatic ratio (so whratio is not user-facing here).
+            vignette_on: false,
+            vignette_scale: 80.0,
+            vignette_falloff: 50.0,
+            vignette_brightness: -0.5,
+            vignette_saturation: -0.5,
+            vignette_center_x: 0.0,
+            vignette_center_y: 0.0,
+            vignette_shape: 1.0,
         }
     }
 }
@@ -293,10 +319,15 @@ impl PreviewParams {
         // about whether a Levels stage exists (an inverted range is non-default
         // but still emits nothing).
         let levels_identity = !self.levels_stage_active();
+        // Vignette with both strengths at 0 leaves every pixel untouched (the
+        // weight still varies, but it scales nothing); otherwise it always
+        // changes the image, so on == off is the only other no-op.
+        let vignette_identity = !self.vignette_on
+            || (self.vignette_brightness == 0.0 && self.vignette_saturation == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
-            && levels_identity
+            && levels_identity && vignette_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -318,6 +349,7 @@ impl PreviewParams {
             color_correction_on: false,
             colorzones_on: false,
             levels_on: false,
+            vignette_on: false,
             ..*self
         }
     }
@@ -329,7 +361,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on] {
             v.push(b as u8);
         }
         for f in [
@@ -357,6 +389,9 @@ impl PreviewParams {
             self.colorzones_curve_y[1][0], self.colorzones_curve_y[1][1], self.colorzones_curve_y[1][2], self.colorzones_curve_y[1][3], self.colorzones_curve_y[1][4], self.colorzones_curve_y[1][5], self.colorzones_curve_y[1][6], self.colorzones_curve_y[1][7],
             self.colorzones_curve_y[2][0], self.colorzones_curve_y[2][1], self.colorzones_curve_y[2][2], self.colorzones_curve_y[2][3], self.colorzones_curve_y[2][4], self.colorzones_curve_y[2][5], self.colorzones_curve_y[2][6], self.colorzones_curve_y[2][7],
             self.levels_black, self.levels_grey, self.levels_white,
+            self.vignette_scale, self.vignette_falloff,
+            self.vignette_brightness, self.vignette_saturation,
+            self.vignette_center_x, self.vignette_center_y, self.vignette_shape,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -370,9 +405,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..15];
-        // length is checked above, so exactly 96 f32 chunks follow
-        let f: Vec<f32> = bytes[15..]
+        let bools = &bytes[1..16];
+        // length is checked above, so exactly 103 f32 chunks follow
+        let f: Vec<f32> = bytes[16..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -419,6 +454,10 @@ impl PreviewParams {
             ],
             levels_on: bools[13] != 0,
             levels_black: f[93], levels_grey: f[94], levels_white: f[95],
+            vignette_on: bools[14] != 0,
+            vignette_scale: f[96], vignette_falloff: f[97],
+            vignette_brightness: f[98], vignette_saturation: f[99],
+            vignette_center_x: f[100], vignette_center_y: f[101], vignette_shape: f[102],
         })
     }
 
@@ -649,6 +688,35 @@ impl PreviewParams {
                 compress: (self.split_compress / 110.0) / 2.0,
             });
         }
+        // Vignette (iop_order.c pos 68, last of the creative modules — after
+        // splittoning 67). Both strengths at 0 scale nothing, so that is a
+        // genuine no-op and is skipped. The falloff geometry is NOT computed
+        // here: it depends on the buffer's dimensions, which only `Stage::apply`
+        // knows, so caching it in the stage would go stale at another zoom.
+        //
+        // Dither is left off: darktable's default is DITHER_OFF, and the TEA
+        // stream is seeded per row, so it belongs to the full-res render rather
+        // than a downscaled preview.
+        if self.vignette_on
+            && (self.vignette_brightness != 0.0 || self.vignette_saturation != 0.0)
+        {
+            p.push(Stage::Vignette {
+                scale: self.vignette_scale,
+                falloff: self.vignette_falloff,
+                brightness: self.vignette_brightness,
+                saturation: self.vignette_saturation,
+                center_x: self.vignette_center_x,
+                center_y: self.vignette_center_y,
+                shape: self.vignette_shape,
+                // Automatic ratio: the vignette follows the image's own aspect,
+                // which is darktable's behaviour for an un-set w/h ratio and
+                // avoids exposing a second, subtler control for the same thing.
+                autoratio: true,
+                whratio: 1.0,
+                dither_amt: 0.0,
+                unbound: false,
+            });
+        }
         p
     }
 }
@@ -669,8 +737,8 @@ impl PreviewParams {
 const LEVELS_MIN_RANGE: f32 = 1.0;
 
 const ENCODE_VERSION: u8 = 11;
-/// 1 version byte + 14 bool bytes + 96 little-endian f32.
-const ENCODED_LEN: usize = 1 + 14 + 96 * 4;
+/// 1 version byte + 15 bool bytes + 103 little-endian f32.
+const ENCODED_LEN: usize = 1 + 15 + 103 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1565,6 +1633,9 @@ mod tests {
             colorzones_curve_x: [[0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; 3],
             colorzones_curve_y: [[0.5; 8]; 3],
             levels_on: true, levels_black: 5.0, levels_grey: 45.0, levels_white: 95.0,
+            vignette_on: true, vignette_scale: 70.0, vignette_falloff: 40.0,
+            vignette_brightness: -0.6, vignette_saturation: 0.3,
+            vignette_center_x: -0.2, vignette_center_y: 0.15, vignette_shape: 1.4,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);

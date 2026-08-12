@@ -40,6 +40,85 @@ fn tpdf(urandom: u32) -> f32 {
     }
 }
 
+/// The pre-computed geometry `darkroom_vignette_process` takes, derived from the
+/// user-facing params plus the buffer dimensions. Mirrors the block at the top
+/// of vignette.c `process()`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VignetteGeometry {
+    pub xscale: f32,
+    pub yscale: f32,
+    pub roi_center_x: f32,
+    pub roi_center_y: f32,
+    pub dscale: f32,
+    pub fscale: f32,
+    pub exp1: f32,
+    pub exp2: f32,
+}
+
+/// Port of the geometry derivation in vignette.c `process()` (the block above
+/// the pixel loop). Kept here, beside the loop it feeds, so the two can't drift.
+///
+/// `width`/`height` are the buffer's dimensions; the preview runs at `scale`
+/// 1.0 with the ROI origin at the image origin, so `roi_center` reduces to the
+/// vignette centre in pixels.
+///
+/// `scale_pct` (fall-off start) and `falloff_pct` (fall-off radius) are the C
+/// 0..200 sliders; `center_x`/`center_y` are the -1..1 offsets; `whratio` is
+/// 0..2 (<=1 = w/h, >1 = h/w + 1); `shape` is 0..5. `autoratio` follows the
+/// buffer's own aspect instead of `whratio`.
+pub fn commit_geometry(
+    width: usize,
+    height: usize,
+    scale_pct: f32,
+    falloff_pct: f32,
+    center_x: f32,
+    center_y: f32,
+    autoratio: bool,
+    whratio: f32,
+    shape: f32,
+) -> VignetteGeometry {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+
+    // vignette_center = buffer centre + the normalised offset, in pixels.
+    let vignette_center_x = w / 2.0 + center_x * w / 2.0;
+    let vignette_center_y = h / 2.0 + center_y * h / 2.0;
+
+    let (xscale, yscale) = if autoratio {
+        (2.0 / w, 2.0 / h)
+    } else {
+        // Proportional to the longest side, then skewed by the ratio. The
+        // 0..1 / 1..2 split is darktable's encoding of w/h vs h/w.
+        let basis = 2.0 / w.max(h);
+        if whratio <= 1.0 {
+            let yscale = basis;
+            // whratio 0 would divide by zero; the C relies on its slider
+            // minimum, so floor it here.
+            (yscale / whratio.max(f32::MIN_POSITIVE), yscale)
+        } else {
+            let xscale = basis;
+            (xscale, xscale / (2.0 - whratio).max(f32::MIN_POSITIVE))
+        }
+    };
+
+    let dscale = scale_pct / 100.0;
+    // A minimum falloff smooths aliasing on small buffers (C comment).
+    let min_falloff = 100.0 / w.min(h);
+    let fscale = falloff_pct.max(min_falloff) / 100.0;
+    let shape = shape.max(0.001); // C: MAX(data->shape, 0.001f)
+
+    VignetteGeometry {
+        xscale,
+        yscale,
+        roi_center_x: vignette_center_x * xscale,
+        roi_center_y: vignette_center_y * yscale,
+        dscale,
+        fscale,
+        exp1: 2.0 / shape,
+        exp2: shape / 2.0,
+    }
+}
+
 /// Vignette IOP — radial brightness/saturation falloff with optional dithering.
 ///
 /// Geometry scalars pre-computed by C caller (from data + roi + buf_in):

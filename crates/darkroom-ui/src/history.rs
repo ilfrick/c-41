@@ -324,6 +324,17 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if levels {
         return "Levels";
     }
+    let vignette = old.vignette_on != new.vignette_on
+        || old.vignette_scale != new.vignette_scale
+        || old.vignette_falloff != new.vignette_falloff
+        || old.vignette_brightness != new.vignette_brightness
+        || old.vignette_saturation != new.vignette_saturation
+        || old.vignette_center_x != new.vignette_center_x
+        || old.vignette_center_y != new.vignette_center_y
+        || old.vignette_shape != new.vignette_shape;
+    if vignette {
+        return "Vignetting";
+    }
     "Edit"
 }
 
@@ -473,6 +484,10 @@ mod tests {
             describe_change(&base, &PreviewParams { levels_grey: 40.0, ..d() }),
             "Levels"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { vignette_scale: 60.0, ..d() }),
+            "Vignetting"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -544,6 +559,14 @@ mod tests {
             levels_black: _,
             levels_grey: _,
             levels_white: _,
+            vignette_on: _,
+            vignette_scale: _,
+            vignette_falloff: _,
+            vignette_brightness: _,
+            vignette_saturation: _,
+            vignette_center_x: _,
+            vignette_center_y: _,
+            vignette_shape: _,
         } = PreviewParams::default();
     }
 
@@ -623,7 +646,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 399);
+        assert_eq!(PreviewParams::default().encode().len(), 428);
     }
 
     #[test]

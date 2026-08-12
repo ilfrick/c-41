@@ -155,3 +155,44 @@ app. Every increment was verified by tests and CI and reported as shipped, while
 the result was invisible on screen. Tests and CI measure whether code is
 correct; they say nothing about whether a user can see it. The user's measure
 was the right one. Visual verification is now part of the loop.
+
+---
+
+## 2026-08-12 07:40 UTC — m4-109: Vignetting live preview stage
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** Wired the vignette IOP into the preview pipeline — the **17th** live
+module, and the first *position-dependent* one.
+- `darkroom-core/iop/vignette.rs`: new `commit_geometry()` porting the geometry
+  block at the top of vignette.c `process()` — xscale/yscale (auto-ratio or the
+  0..2 w/h encoding), the pixel-space centre, `dscale`, the size-dependent
+  `min_falloff` floor, and `exp1`/`exp2` from `shape`.
+- `pipeline.rs`: `Stage::Vignette`. Works in RGB, so `working_space()` is `None`.
+- `preview.rs`: 7 params + on/off; ENCODE_VERSION 11→12, len 399→428. Pushed
+  last (iop_order.c pos 68, after splittoning 67). Skipped when both strengths
+  are 0 — the only true no-op.
+- `history.rs`: "Vignetting" group. `darkroom/mod.rs`: module row with 7 sliders.
+
+**The design point: `is_pixel_local()` returns `false`.** Each pixel's falloff
+weight comes from its `(i, j)` relative to the vignette centre, and the dither is
+a per-row TEA stream seeded from `j`. The band-parallel path hands each band
+`(w, h) = (band_pixels, 1)`, so every band would compute its falloff from the
+wrong coordinates and reseed the dither — visible seams. This is only the second
+non-pixel-local stage (after Sharpen) and the first for *position* rather than
+neighbourhood reads, so having it enabled forces the whole pipeline serial.
+The exhaustive no-wildcard match in `is_pixel_local` is what forced the decision.
+
+**Geometry is derived in `apply`, not stored in the stage.** It depends on the
+buffer dimensions, which only `apply` knows; caching it would silently go stale
+at a different zoom or on export.
+
+**Verified.** `scripts/ci-local.sh` (all four steps); 974 tests (+2). Rendered
+the falloff as ASCII and eyeballed it — bright elliptical centre, smooth
+symmetric radial falloff, ellipse following the 100×40 aspect (auto-ratio
+working). Binary deployed to the running container.
+
+**Notes.** New test `vignette_is_radial_and_band_split_invariant` pins the three
+properties that follow from position-dependence: corner darker than centre,
+deterministic for a given rectangle, and falloff varying along x (which a
+per-band `h = 1` run would collapse).

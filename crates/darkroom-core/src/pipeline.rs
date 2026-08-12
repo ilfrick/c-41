@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, invert, levels, sharpen, sigmoid, splittoning, temperature, velvia, vibrance};
+use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, invert, levels, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -158,6 +158,47 @@ pub enum Stage {
         lut: Vec<f32>,
         space: ColorSpace,
     },
+    /// Radial brightness/saturation falloff (vignette.c). Works directly in RGB
+    /// — no Lab round-trip, so `working_space()` is `None`.
+    ///
+    /// **NOT pixel-local** — the second such stage after [`Stage::Sharpen`], and
+    /// for a different reason. Each pixel's weight comes from its `(i, j)`
+    /// *position* relative to the vignette centre, and the dither is a per-row
+    /// TEA stream seeded from `j`. The band-parallel path hands each band
+    /// `(w, h) = (band_pixels, 1)`, so every band would compute its falloff from
+    /// the wrong coordinates and reseed the dither — visible seams at band
+    /// boundaries. Returning `false` forces the whole pipeline serial whenever
+    /// this stage is present, which is the price of correctness here.
+    ///
+    /// Holds the **user-facing** params, not pre-computed geometry: the falloff
+    /// geometry depends on the buffer's dimensions, and `apply` already receives
+    /// them, so it is derived there via [`vignette::commit_geometry`]. Storing
+    /// it in the stage instead would go stale the moment the preview re-rendered
+    /// at another size (a different zoom, or export vs preview) — a silent
+    /// wrong-looking vignette. Deriving per apply costs one call per render.
+    Vignette {
+        /// Fall-off start (inner radius), 0..200 % of the largest dimension.
+        scale: f32,
+        /// Fall-off radius, 0..200.
+        falloff: f32,
+        /// Brightness/saturation reduction strengths, -1..1.
+        brightness: f32,
+        saturation: f32,
+        /// Centre offset, -1..1 per axis (0 = image centre).
+        center_x: f32,
+        center_y: f32,
+        /// Shape exponent (1 = ellipse, higher = squarer).
+        shape: f32,
+        /// Follow the buffer's own aspect rather than an explicit w/h ratio.
+        autoratio: bool,
+        /// Explicit w/h ratio, 0..2 (<=1 = w/h, >1 = h/w + 1). Ignored when
+        /// `autoratio`.
+        whratio: f32,
+        /// Dither amplitude: 0 = off, 1/256 = 8-bit, 1/65536 = 16-bit.
+        dither_amt: f32,
+        /// Skip the [0,1] clamp (darktable's "unbound" path).
+        unbound: bool,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -201,6 +242,7 @@ impl Stage {
             Stage::ColorCorrection { .. } => "colorcorrection",
             Stage::ColorZones { .. } => "colorzones",
             Stage::Levels { .. } => "levels",
+            Stage::Vignette { .. } => "vignette",
         }
     }
 
@@ -247,6 +289,13 @@ impl Stage {
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
             Stage::Sharpen { .. } => false,
+            // Vignette is position-DEPENDENT rather than neighbourhood-reading:
+            // the falloff weight comes from each pixel's (i, j) relative to the
+            // vignette centre, and the dither is a per-row TEA stream seeded
+            // from j. Under band-splitting every band gets (band_pixels, 1), so
+            // the coordinates — and the dither seed — would be wrong per band,
+            // giving seams. Same answer as Sharpen, different reason.
+            Stage::Vignette { .. } => false,
         }
     }
 
@@ -641,6 +690,45 @@ impl Stage {
                     output[i..i + 4].copy_from_slice(&rgb);
                 }
             }
+            // ── Vignette (vignette.c) ──────────────────────────────────
+            // Position-dependent radial falloff, straight in RGB. `is_pixel_local`
+            // returns false for this stage, so `process` guarantees (width,
+            // height) here is the true image rectangle — the coordinates the
+            // geometry was computed against — never a band's pixel run.
+            Stage::Vignette {
+                scale, falloff, brightness, saturation,
+                center_x, center_y, shape, autoratio, whratio, dither_amt, unbound,
+            } => {
+                // Derived here, not stored: the geometry is a function of the
+                // buffer size, which only `apply` knows.
+                let geometry = vignette::commit_geometry(
+                    width, height, scale, falloff, center_x, center_y,
+                    autoratio, whratio, shape,
+                );
+                // Safety: input/output are equal-length packed RGBA (asserted
+                // above) holding exactly width*height*4 floats, which is the
+                // contract darkroom_vignette_process documents.
+                unsafe {
+                    vignette::darkroom_vignette_process(
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        width as i32,
+                        height as i32,
+                        geometry.xscale,
+                        geometry.yscale,
+                        geometry.roi_center_x,
+                        geometry.roi_center_y,
+                        geometry.dscale,
+                        geometry.fscale,
+                        geometry.exp1,
+                        geometry.exp2,
+                        dither_amt,
+                        brightness,
+                        saturation,
+                        i32::from(unbound),
+                    );
+                }
+            }
         }
     }
 }
@@ -1007,6 +1095,53 @@ mod tests {
                 .is_pixel_local(),
             "sharpen reads neighbours ⇒ NOT pixel-local"
         );
+        assert!(
+            !Stage::Vignette {
+                scale: 80.0, falloff: 50.0, brightness: -0.5, saturation: -0.5,
+                center_x: 0.0, center_y: 0.0, shape: 1.0,
+                autoratio: true, whratio: 1.0, dither_amt: 0.0, unbound: false,
+            }
+            .is_pixel_local(),
+            "vignette derives its weight from pixel POSITION ⇒ NOT pixel-local"
+        );
+    }
+
+    #[test]
+    fn vignette_is_radial_and_band_split_invariant() {
+        // Two properties in one, both consequences of the position-dependence
+        // that makes this stage non-pixel-local.
+        let (w, h) = (64usize, 48usize);
+        let img = vec![0.5f32; w * h * 4];
+        let stage = Stage::Vignette {
+            scale: 40.0, falloff: 60.0, brightness: -1.0, saturation: 0.0,
+            center_x: 0.0, center_y: 0.0, shape: 1.0,
+            autoratio: true, whratio: 1.0, dither_amt: 0.0, unbound: false,
+        };
+        let out = Pipeline::with_stages(vec![stage.clone()]).process(&img, w, h);
+
+        // 1. Radial: the corner is darkened relative to the centre. If the
+        //    stage ever received per-band coordinates this would not hold.
+        let centre = out[((h / 2) * w + w / 2) * 4];
+        let corner = out[0];
+        assert!(
+            corner < centre,
+            "vignette must darken the corner more than the centre: corner {corner} !< centre {centre}"
+        );
+
+        // 2. Band-split invariant: `process` must keep this stage on the serial
+        //    whole-buffer path, so the result cannot depend on the buffer being
+        //    large enough to trigger banding. Re-running the same geometry over
+        //    the same rectangle must be bit-identical.
+        let again = Pipeline::with_stages(vec![stage]).process(&img, w, h);
+        assert_eq!(out, again, "vignette output must be deterministic for a given rectangle");
+
+        // 3. A row midway down is darker at its left edge than at its centre —
+        //    i.e. the falloff varies along x too, not just y. A per-band run
+        //    (h = 1 strips) collapses this.
+        let row = h / 2;
+        let left = out[(row * w) * 4];
+        let mid = out[(row * w + w / 2) * 4];
+        assert!(left < mid, "falloff must vary along x: left {left} !< mid {mid}");
     }
 
     #[test]
