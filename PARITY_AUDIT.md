@@ -1,4 +1,4 @@
-# Darkroom vs darktable — parity audit
+# C-41 vs darktable — parity audit
 
 **First written 2026-08-08. Last refreshed 2026-08-11** (severity 1 re-verified
 against the code; resolved items struck through rather than deleted, so the
@@ -11,7 +11,7 @@ record of what was fixed survives).
 
 Audit against darktable 5.6.0 (reference screenshot `Schermata_20260721_210438.png`)
 and the running app in the KasmVNC container, plus a code sweep of
-`crates/darkroom-ui`. Ordered by **severity**, not by roadmap position: severity 1
+`crates/c41-ui`. Ordered by **severity**, not by roadmap position: severity 1
 is "a user hits this and something is broken or blocked", severity 3 is "darktable
 has it and we don't, but nothing misbehaves".
 
@@ -31,7 +31,7 @@ Per-increment progress is logged in `PROGRESS.md`.
   (9 total), and 2 of those aren't pipeline code (`tests/cache.c`,
   `sidecar_jobs.c`). **83 of 93** image-operation modules are ported to Rust.
 - **UI (Phase 3): this is the whole remaining gap.** The processing for ~80
-  modules exists in `darkroom-core` with **no controls attached to it**. The
+  modules exists in `c41-core` with **no controls attached to it**. The
   darkroom view exposes about 6 adjustments; darktable exposes 93 modules.
 
 That asymmetry drives the ordering below: the expensive half is built, so most

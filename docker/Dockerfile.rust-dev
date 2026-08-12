@@ -1,10 +1,10 @@
 # Rust + GTK4 build environment for compiling and testing the Darkroom
-# workspace (darkroom-core, darkroom-db, darkroom-ui, darkroom-rs).
+# workspace (c41-core, c41-db, c41-ui, c41-rs).
 #
 # Use:
-#   docker build -t darkroom-rust-dev -f docker/Dockerfile.rust-dev .
-#   docker run --rm -v "$PWD:/src" -w /src darkroom-rust-dev cargo check --workspace
-#   docker run --rm -v "$PWD:/src" -w /src darkroom-rust-dev cargo test  --workspace --release
+#   docker build -t c41-rust-dev -f docker/Dockerfile.rust-dev .
+#   docker run --rm -v "$PWD:/src" -w /src c41-rust-dev cargo check --workspace
+#   docker run --rm -v "$PWD:/src" -w /src c41-rust-dev cargo test  --workspace --release
 #
 # The persistent image avoids re-installing Rust + GTK4 dev libs on every
 # cargo invocation. Re-run `docker build` only when this file changes.
@@ -15,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config curl ca-certificates git \
-    # GTK4 + libadwaita (needed by darkroom-ui)
+    # GTK4 + libadwaita (needed by c41-ui)
     libgtk-4-dev libadwaita-1-dev \
     # cairo / pango / gdk-pixbuf — pulled in transitively but make explicit
     libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \

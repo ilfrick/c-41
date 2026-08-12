@@ -26,7 +26,7 @@ echo "[darkroom-init] /config owned by $(stat -c '%u:%g' /config), darkroom by $
 # Refresh the openbox autostart from the image's /defaults copy on EVERY start.
 # The KasmVNC base image seeds /config/.config/openbox/autostart from /defaults
 # only when it is missing; since /config is a persisted volume, an image update
-# (e.g. the binary rename darkroom -> darkroom-rs) would otherwise keep running a
+# (e.g. the binary rename darkroom -> c41-rs) would otherwise keep running a
 # stale copy and fail with "/usr/local/bin/darkroom: not found" (exit 127).
 # Force-overwriting here makes image updates always propagate.
 if [ -f /defaults/autostart ]; then

@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/darkroom-sys",
-  "crates/darkroom-core",
-  "crates/darkroom-db",
-  "crates/darkroom-ui",
-  "crates/darkroom",
+  "crates/c41-sys",
+  "crates/c41-core",
+  "crates/c41-db",
+  "crates/c41-ui",
+  "crates/c41",
 ]
 
 [workspace.dependencies]
@@ -14,10 +14,10 @@ rayon        = "1"
 rusqlite     = { version = "0.31", features = ["bundled"] }
 tracing      = "0.1"
 walkdir      = "2"
-darkroom-sys  = { path = "crates/darkroom-sys" }
-darkroom-core = { path = "crates/darkroom-core" }
-darkroom-db   = { path = "crates/darkroom-db" }
-darkroom-ui   = { path = "crates/darkroom-ui" }
+c41-sys  = { path = "crates/c41-sys" }
+c41-core = { path = "crates/c41-core" }
+c41-db   = { path = "crates/c41-db" }
+c41-ui   = { path = "crates/c41-ui" }
 
 [profile.release]
 opt-level = 3

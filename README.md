@@ -1,8 +1,8 @@
-# Darkroom
+# C-41
 
-**Darkroom** is a professional photo editing and management application for Linux, forked from [darktable](https://www.darktable.org/) with additional features aimed at closing the gap with Adobe Lightroom.
+**C-41** is a professional photo editing and management application for Linux, forked from [darktable](https://www.darktable.org/) with additional features aimed at closing the gap with Adobe Lightroom.
 
-> Darkroom is open source software licensed under the GNU GPL v3.
+> C-41 is open source software licensed under the GNU GPL v3.
 
 ---
 
@@ -10,7 +10,7 @@
 
 See [CHANGES.md](CHANGES.md) for the full changelog.
 
-| Feature | Darkroom | darktable upstream |
+| Feature | C-41 | darktable upstream |
 |---------|----------|--------------------|
 | Smart Previews (offline editing) | ✅ | ❌ |
 | Virtual Copies | ✅ | ❌ |
@@ -21,7 +21,7 @@ See [CHANGES.md](CHANGES.md) for the full changelog.
 
 ## Quick start with Docker
 
-The fastest way to try Darkroom is via the pre-built Docker image, which provides a full GUI through your browser via KasmVNC.
+The fastest way to try C-41 is via the pre-built Docker image, which provides a full GUI through your browser via KasmVNC.
 
 ```bash
 # Pull and run (CPU, no GPU required)
@@ -30,7 +30,7 @@ docker run -d \
   -p 3000:3000 \
   -v ~/Pictures:/photos \
   -v ~/.config/darkroom-docker:/config \
-  ghcr.io/ilfrick/darkroom:latest
+  ghcr.io/ilfrick/c-41:latest
 
 # Open in browser
 open http://localhost:3000
@@ -45,7 +45,7 @@ For GPU acceleration and docker-compose usage see [docker/docker-compose.yml](do
 ### Build from source
 
 ```bash
-git clone https://www.housefz.com/git/ilfrick/darkroom.git
+git clone https://www.housefz.com/git/ilfrick/c-41.git
 cd darkroom
 docker build -t darkroom -f docker/Dockerfile .
 ```
@@ -83,7 +83,7 @@ Volumes:
 | Container path | Purpose |
 |----------------|---------|
 | `/photos` | Mount your photo library here |
-| `/config` | Persistent Darkroom configuration and cache |
+| `/config` | Persistent C-41 configuration and cache |
 
 ---
 
@@ -109,7 +109,7 @@ sudo apt-get install -y \
 ### Compile
 
 ```bash
-git clone --recurse-submodules https://www.housefz.com/git/ilfrick/darkroom.git
+git clone --recurse-submodules https://www.housefz.com/git/ilfrick/c-41.git
 cd darkroom
 cmake -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
@@ -128,12 +128,12 @@ Run: `/opt/darkroom/bin/darktable` (the binary keeps the upstream name internall
 
 | Remote | URL |
 |--------|-----|
-| Primary (Gitea) | https://www.housefz.com/git/ilfrick/darkroom |
-| Mirror (GitHub) | https://github.com/ilfrick/darkroom |
+| Primary (Gitea) | https://www.housefz.com/git/ilfrick/c-41 |
+| Mirror (GitHub) | https://github.com/ilfrick/c-41 |
 | Upstream | https://github.com/darktable-org/darktable |
 
 ---
 
 ## License
 
-Darkroom is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+C-41 is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.

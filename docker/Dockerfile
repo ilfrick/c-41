@@ -1,7 +1,7 @@
 # Darkroom — the production container image (cargo-native, CMake-free).
 #
 # Milestone 5 made this the default: it builds and ships ONLY the Rust/GTK4
-# front-end (darkroom-rs) — NO CMake and NO C darktable. There is no
+# front-end (c41-rs) — NO CMake and NO C darktable. There is no
 # `darktable-cli`, so exporting a heic/heif/avif SOURCE (the only cli user) is
 # unavailable and fails gracefully with a logged message; everything else (all
 # raws + JPEG/PNG/TIFF) develops through the pure-Rust pipeline. The former full
@@ -19,14 +19,14 @@
 # ─── Stage 1: Build (cargo only — no cmake, no C toolchain beyond cc) ─────────
 FROM ubuntu:24.04 AS builder
 
-ARG DARKROOM_REPO=https://github.com/ilfrick/darkroom.git
+ARG DARKROOM_REPO=https://github.com/ilfrick/c-41.git
 ARG DARKROOM_BRANCH=master
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Only the Rust + GTK4 build deps. None of docker/Dockerfile's C-darktable dep
 # list (exiv2, lcms2, libraw, gmic, …) or cmake/ninja — the Rust workspace links
-# only system GTK4/libadwaita, and darkroom-sys uses committed bindings (no
+# only system GTK4/libadwaita, and c41-sys uses committed bindings (no
 # libclang, no C source tree).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config git curl ca-certificates \
@@ -62,7 +62,7 @@ RUN git clone -b ${DARKROOM_BRANCH} ${DARKROOM_REPO} /src \
 WORKDIR /src
 # (Reproducibility follow-up: add `--locked` once Cargo.lock is committed — it's
 # currently gitignored, so --locked has no lockfile to honour and errors out.)
-RUN cargo build --release -p darkroom --bin darkroom-rs
+RUN cargo build --release -p c41 --bin c41-rs
 
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
 FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
@@ -74,7 +74,7 @@ FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
 LABEL maintainer="darkroom-project" \
       org.opencontainers.image.title="Darkroom" \
       org.opencontainers.image.description="Rust/GTK4 photo editor — cargo-native (CMake-free) build" \
-      org.opencontainers.image.source="https://github.com/ilfrick/darkroom"
+      org.opencontainers.image.source="https://github.com/ilfrick/c-41"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -98,19 +98,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # The only artifact from the build stage: the standalone Rust GUI binary. No
 # /opt/darkroom C install, no darktable / darktable-cli symlinks.
-COPY --from=builder /src/target/release/darkroom-rs /usr/local/bin/darkroom-rs
+COPY --from=builder /src/target/release/c41-rs /usr/local/bin/c41-rs
 
 # cont-init: create config dirs with the runtime user's ownership (runs as root).
 COPY docker/cont-init-darkroom.sh /etc/cont-init.d/50-darkroom-dirs
 RUN chmod +x /etc/cont-init.d/50-darkroom-dirs
 
-# KasmVNC autostart: launch darkroom-rs in the desktop session.
+# KasmVNC autostart: launch c41-rs in the desktop session.
 COPY docker/kasmvnc-autostart.sh /defaults/autostart
 RUN chmod +x /defaults/autostart
 
 ENV DARKROOM_CONFIGDIR=/config/darkroom
 ENV DARKROOM_CACHEDIR=/config/cache
-# darkroom-rs reads its catalog from this SQLite file.
+# c41-rs reads its catalog from this SQLite file.
 ENV DARKROOM_LIBRARY_DB=/config/darkroom/library.db
 # Force GTK4's software (Cairo) renderer — KasmVNC has no real GPU, and GSK's
 # default GL renderer draws a black window under it.

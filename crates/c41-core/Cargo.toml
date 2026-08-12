@@ -1,0 +1,18 @@
+[package]
+name = "c41-core"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust image processing pipeline — Phase 1 target"
+
+[lib]
+# cdylib  → libc41_core.so  linked into lib_darktable (C side)
+# rlib    → used by c41-db, c41-ui, darkroom (Rust side)
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+c41-sys = { workspace = true }
+anyhow       = { workspace = true }
+rayon        = { workspace = true }
+# Pinned exactly: Cargo.lock is gitignored (CI resolves fresh), and a silent
+# minor bump in the raw decoder must not change how irreplaceable raws decode.
+rawloader    = "=0.37.1"

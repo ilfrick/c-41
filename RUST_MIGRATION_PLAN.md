@@ -88,7 +88,7 @@ previously listed here/as stubs are at 0 loops — fully migrated.)
 | ~~Recursive Gaussian (`dt_gaussian`)~~ **PORTED — m4-78** (`gaussian.rs`, RGBA `blur_4c`) | bloom, highpass, lowpass, shadhi, hazeremoval |
 | ~~À-trous wavelet (`dwt.c`)~~ **PORTED — m4-79** (`dwt.rs`, `decompose` + `denoise`) | atrous, retouch, denoiseprofile (wavelet mode) |
 | Filmlight Yrg / `work_profile` callbacks — **Yrg/UCS/JzAzBz conversions DONE** (color.rs, thru m4-81); colorbalancergb loop port in progress (m4-82/83) | colorbalancergb, colorin |
-| Per-pixel ICC / LCMS — **DECISION (m4-86): pure-Rust matrix path, NO lcms2** (keeps the CMake-free / C-linkless build goal). Scope of the 20 remaining OMP loops re-surveyed: **colorout matrix path already Rust** (`darkroom_colorout_*`); **portable & DONE**: ~~colorin `:777` cmatrix-bm~~ **PORTED — m4-86** (`b0f20649e4`, `darkroom_colorin_cmatrix_bm`: tone-curve LUT + `_apply_blue_mapping` + matrix→Lab, incl. the nmatrix/lmatrix gamut-clip variant; architect APPROVE, transpose-equiv proven, full-c `-Werror` clean). So the meaningful portable-matrix ICC path is complete. **retouch ×2 (`:3082`/`:3135`) are GUI-ONLY** (re-checked m4-86 f/u): `rt_process_stats` runs only under `g && dt_pipe_is_full` w/ `preview_auto_levels==1`; `rt_adjust_levels` only when `dwt_p->return_layer>0` (the `display_wavelet_scale` toggle) — the wavelet-scale-preview auto-levels, not core processing. Reclassify as GUI-only (like colorequal/toneequal). **stays unsupported** (needs LCMS for non-matrix/LUT profiles) = colorin `:1054`/`:1097` "general lcms2 fallback", colorout's generic path. These are FFI-boundary ports (replace the C loop with a `#[no_mangle] extern "C"` call like `darkroom_colorin_cmatrix_fastpath_simple`), so they need C edits + the **full-app Docker build** (not cargo-only). **RESOLUTION (user chose option b): build a pure-Rust ICC engine** (`darkroom-core::icc`) to remove the lcms2 dependency entirely — same functionality (matrix **and** cLUT profiles), accuracy ≥ LCMS (f32 throughout vs LCMS's 16-bit path), pure Rust. NB: the shipped `darkroom-rs` product is ALREADY lcms-free (0 refs in `crates/`); the ~50 `cms*` calls live only in the transitional C darktable (colorin/colorout), of which only 7 are `cmsDoTransform` (the loops) — the rest are profile parse/build. So the engine is judged on *spec-correctness*, not bit-exact-to-LCMS. **ICC-engine roadmap:** m4-89 = parser (header/tag-table/`XYZ`/`curv`/`para`, matrix-shaper) ✅ (`c8fd82c4e5`, APPROVE-WITH-FIXES incl. a real DoS guard); m4-90 = cLUT **N-D interpolation core** (`icc/clut.rs`: LCMS-matched tetrahedral for 3-in RGB + general N-linear) ✅ (`7037102b86`, **APPROVE** — tetra vertex table verified arm-by-arm vs LCMS); m4-91 = parse the LUT **tags** (`mft1`/`mft2` v2, `mAB `/`mBA ` v4) into `Clut`+`Curve`+matrix (carry validate-before-reserve; add `Clut::validate()`; use stack arrays in N-linear when it goes hot); m4-92 = transform assembly (device→PCS→device, PCS Lab/XYZ, intents, CAT) + FFI-wire colorin/colorout LUT path. Large multi-increment build (~colorbalancergb scale); engine ~half done (matrix parse + interp core). | colorin, colorout, retouch |
+| Per-pixel ICC / LCMS — **DECISION (m4-86): pure-Rust matrix path, NO lcms2** (keeps the CMake-free / C-linkless build goal). Scope of the 20 remaining OMP loops re-surveyed: **colorout matrix path already Rust** (`darkroom_colorout_*`); **portable & DONE**: ~~colorin `:777` cmatrix-bm~~ **PORTED — m4-86** (`b0f20649e4`, `darkroom_colorin_cmatrix_bm`: tone-curve LUT + `_apply_blue_mapping` + matrix→Lab, incl. the nmatrix/lmatrix gamut-clip variant; architect APPROVE, transpose-equiv proven, full-c `-Werror` clean). So the meaningful portable-matrix ICC path is complete. **retouch ×2 (`:3082`/`:3135`) are GUI-ONLY** (re-checked m4-86 f/u): `rt_process_stats` runs only under `g && dt_pipe_is_full` w/ `preview_auto_levels==1`; `rt_adjust_levels` only when `dwt_p->return_layer>0` (the `display_wavelet_scale` toggle) — the wavelet-scale-preview auto-levels, not core processing. Reclassify as GUI-only (like colorequal/toneequal). **stays unsupported** (needs LCMS for non-matrix/LUT profiles) = colorin `:1054`/`:1097` "general lcms2 fallback", colorout's generic path. These are FFI-boundary ports (replace the C loop with a `#[no_mangle] extern "C"` call like `darkroom_colorin_cmatrix_fastpath_simple`), so they need C edits + the **full-app Docker build** (not cargo-only). **RESOLUTION (user chose option b): build a pure-Rust ICC engine** (`c41-core::icc`) to remove the lcms2 dependency entirely — same functionality (matrix **and** cLUT profiles), accuracy ≥ LCMS (f32 throughout vs LCMS's 16-bit path), pure Rust. NB: the shipped `c41-rs` product is ALREADY lcms-free (0 refs in `crates/`); the ~50 `cms*` calls live only in the transitional C darktable (colorin/colorout), of which only 7 are `cmsDoTransform` (the loops) — the rest are profile parse/build. So the engine is judged on *spec-correctness*, not bit-exact-to-LCMS. **ICC-engine roadmap:** m4-89 = parser (header/tag-table/`XYZ`/`curv`/`para`, matrix-shaper) ✅ (`c8fd82c4e5`, APPROVE-WITH-FIXES incl. a real DoS guard); m4-90 = cLUT **N-D interpolation core** (`icc/clut.rs`: LCMS-matched tetrahedral for 3-in RGB + general N-linear) ✅ (`7037102b86`, **APPROVE** — tetra vertex table verified arm-by-arm vs LCMS); m4-91 = parse the LUT **tags** (`mft1`/`mft2` v2, `mAB `/`mBA ` v4) into `Clut`+`Curve`+matrix (carry validate-before-reserve; add `Clut::validate()`; use stack arrays in N-linear when it goes hot); m4-92 = transform assembly (device→PCS→device, PCS Lab/XYZ, intents, CAT) + FFI-wire colorin/colorout LUT path. Large multi-increment build (~colorbalancergb scale); engine ~half done (matrix parse + interp core). | colorin, colorout, retouch |
 | ~~bespoke {L,a,b,weight} grid (own, not common/bilateral)~~ **PORTED — m4-80** (`colorreconstruct.rs`) | colorreconstruction |
 | GUI-only loops | colorequal, toneequal GUI LUT |
 
@@ -97,7 +97,7 @@ pipeline callbacks (`dt_dev_distort_backtransform_plus`) are split into
 serial C row loops calling Rust for the work before/after the callback —
 no Rust→C callback plumbing needed.
 
-#### Shared darkroom-core modules
+#### Shared c41-core modules
 
 | Module | Purpose |
 |--------|---------|
@@ -108,12 +108,12 @@ no Rust→C callback plumbing needed.
 
 ### Phase 2 -- Database complete
 
-`darkroom-db` crate: full CRUD for tags, metadata, film, collection, image, history.
+`c41-db` crate: full CRUD for tags, metadata, film, collection, image, history.
 C FFI trampolines for tags. 61 DB tests passing.
 
 ### Phase 3 -- GTK4 UI (in progress)
 
-`crates/darkroom-ui` (gtk4 0.9 + libadwaita 0.7). `darkroom_ui::run()` boots an
+`crates/c41-ui` (gtk4 0.9 + libadwaita 0.7). `c41_ui::run()` boots an
 `adw::Application`. **Done (ui-1..ui-14):**
 - **Lighttable** (functional): DB-backed `GridView` of thumbnails, collections
   left panel, metadata right panel, name search/filter, star ratings, import &
@@ -612,7 +612,7 @@ C FFI trampolines for tags. 61 DB tests passing.
 - **Darkroom view**: grouped IOP **module panel** sourced from a real module
   catalog, Export, and a **live multi-IOP preview pipeline** (`preview.rs`,
   ui-12/13/15): `PreviewParams` drives stages each chaining a *migrated
-  `darkroom-core` IOP* over the decoded 8-bit preview, re-uploading a
+  `c41-core` IOP* over the decoded 8-bit preview, re-uploading a
   `gdk::MemoryTexture`. Stages so far (pixelpipe order): `exposure` (black+EV) →
   `velvia` (strength) → `splittoning` (shadow/highlight hue+sat, balance,
   compress) → `monochrome` (channelmixer GRAY B&W mix, ui-18). RGBA-loop IOPs
@@ -643,28 +643,28 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    **persist to the db** and restore on reopen — `preview::PreviewParams::
    encode/decode` (versioned blob) stored in a dedicated `main.darkroom_preview`
    table (`crate::persist`), saved via a debounced autosave + flush on close.
-   `darkroom-db` gained the history write path (`history_add_entry`,
+   `c41-db` gained the history write path (`history_add_entry`,
    `history_get_op_params`) for future real-IOP-history wiring. Remaining: more
    live modules, module groups & favourites.
 2. *Live preview* — the load-bearing piece: a Rust pixelpipe driver that runs
-   the migrated `darkroom-core` IOPs and paints processed output into the
+   the migrated `c41-core` IOPs and paints processed output into the
    darkroom view. **Bootstrapped (ui-12/13/14):** `preview.rs::apply_pipeline`
    chains migrated IOPs over the 8-bit pixbuf, live via the per-module widgets.
-   **Core orchestrator landed (m2-1):** `darkroom_core::pipeline` — an ordered
+   **Core orchestrator landed (m2-1):** `c41_core::pipeline` — an ordered
    `Pipeline` of `Stage`s (exposure/velvia/splittoning/monochrome) over a
    scene-referred **float RGBA** buffer, ping-pong buffered, length-contract
-   asserted. **darkroom-ui adopted it (m2-2)** via `PreviewParams::to_pipeline`,
+   asserted. **c41-ui adopted it (m2-2)** via `PreviewParams::to_pipeline`,
    and the preview now runs in **linear light (m2-3)** — sRGB-decode on input /
    re-encode on output (`color::srgb_to_linear`/`linear_to_srgb`), so stages run
    in the real pipeline's domain. **Raw front end started (m2-4a):**
-   `darkroom_core::rawimage` decodes camera raws via the pure-Rust `rawloader`
+   `c41_core::rawimage` decodes camera raws via the pure-Rust `rawloader`
    (pinned `=0.37.1`) into a black/white-normalised linear CFA mosaic
    (`normalize_cfa`); Bayer only (X-Trans 6x6 rejected until its demosaic is
    wired). **m2-4b:** `demosaic_box` (reuses the migrated box3 kernel via a
    tested `filters_from_cfa` bridge) + `apply_white_balance` +
    `RawImage::to_linear_rgba()` give a full decode→demosaic→WB→linear-RGBA path
    ready for `pipeline`. **m2-4c:** the darkroom view now opens **camera raws**
-   — `crate::raw_preview` (darkroom-ui) decodes off-thread, downscales in linear,
+   — `crate::raw_preview` (c41-ui) decodes off-thread, downscales in linear,
    sRGB-encodes to an 8-bit `BaseImage` that flows through the same preview
    pipeline as a JPEG; verified end-to-end on a real 16MP Olympus ORF
    (decode→demosaic→WB→downscale→display preview). **m2-4d:** EXIF orientation
@@ -804,7 +804,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `$(FILE_FOLDER)` falls back to `.` (no rooting at `/`); and the export counts
    per-image failures, surfacing "Exported X of N (Y failed)" instead of a green
    toast over zero written files. **m4-8: tagging panel.** **m4-8a** — filter the
-   lighttable by tag: new `darkroom-db::tags::tag_list_with_counts` (all user tags
+   lighttable by tag: new `c41-db::tags::tag_list_with_counts` (all user tags
    with attached-image counts via `LEFT JOIN`, excluding pipe-namespaced
    `darktable|…` internal tags, ordered by name; unit-tested) + `lighttable_load_
    by_tag` (3-table JOIN filter). The left collections panel grows a conditional
@@ -896,7 +896,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    and any sub-tags" caption); the pure `respliced_tag_path` re-attaches the fixed
    parent prefix (rejecting blank, unchanged, or a `|`-containing segment — the
    last would re-parent/deepen the tree and could let the rewrite self-collide),
-   and `darkroom_db::tags::tag_rename_subtree` rewrites the node **plus every
+   and `c41_db::tags::tag_rename_subtree` rewrites the node **plus every
    descendant** in one atomic `UPDATE` (`SET name = ?new || substr(name,
    length(?old)+1)` over `name = ?old OR name LIKE ?old||'|%'`). `length()` is
    SQLite's char count so multi-byte prefixes rewrite at the right offset; the
@@ -906,7 +906,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    owns undo) — flagged for when undo lands in Rust. Known follow-ups: surface a
    collision to the user (this panel has no toast access; metadata panel does);
    tag merge-on-collision; a `with_image_id` helper if a fifth tag op appears.
-   **m4-19** — colour-label DAO layer (`darkroom-db/src/colorlabels.rs`), the
+   **m4-19** — colour-label DAO layer (`c41-db/src/colorlabels.rs`), the
    tested core for a new lighttable feature. darktable's 5 per-image colour labels
    (red/yellow/green/blue/purple, 0–4) live in `main.color_labels(imgid, color)`
    with a `UNIQUE(imgid, color)` index, so an image carries any **subset** (unlike
@@ -1144,7 +1144,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `ConstraintViolation` → "would clash with an existing tag" (deliberately NOT
    "`new_full` already exists" — the clash may be a *descendant's* rewritten path,
    architect Q6 honesty fix), else generic. Architect **SHIP**, no blockers; folded
-   in the reworded message + a darkroom-db regression test pinning the load-bearing
+   in the reworded message + a c41-db regression test pinning the load-bearing
    invariant (parent rename onto an existing name aborts, leaving parent+descendant
    intact). Primary `code == ConstraintViolation` is sufficient (only the name
    UNIQUE index can trip this UPDATE). db 85 tests (+1), ui 112 tests (+1),
@@ -1211,7 +1211,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    depth, user-chosen direction) (DONE). The Rust preview path (`rawimage::
    to_linear_rgba`, separate from the C FFI port) ignored the camera colour matrix,
    treating camera-native RGB as linear sRGB → wrong colours. Now derive camera→sRGB
-   from `rawloader`'s `xyz_to_cam` and apply it after WB. Pure `darkroom-core`, no
+   from `rawloader`'s `xyz_to_cam` and apply it after WB. Pure `c41-core`, no
    UI/persistence churn. New `srgb_from_cam_matrix(xyz_to_cam:[[f32;3];4]) ->
    [[f32;3];3]` follows dcraw's `cam_xyz_coeff`: `cam_rgb = xyz_to_cam·XYZ_RGB`
    (sRGB→XYZ, dcraw constants) → row-normalise (neutral-preserving) → `mat3_inverse`
@@ -1227,7 +1227,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    Canon 5D Mk III `xyz_to_cam` (dcraw `adobe_coeff`) → expected camera→sRGB from an
    independent pure-Python dcraw impl; a transposed multiply / wrong constant /
    inversion bug all diverge from it (the non-symmetric matrix locks multiply
-   order). darkroom-core 509→514 tests (+5), clippy clean.
+   order). c41-core 509→514 tests (+5), clippy clean.
    **KNOWN SIMPLIFICATION (architect-flagged, deferred):** the working space is
    sRGB primaries, so saturation ops (velvia, sigmoid) push colours out-of-gamut /
    negative sooner than darktable's Rec.2020 pipe would — fine for a preview; widen
@@ -1254,7 +1254,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    non-grey golden for `REC2020_TO_SRGB` (Rec.2020 red → sRGB
    [1.660, -0.125, -0.018]) since the grey test passes for ANY row-normalised
    matrix; plus a Canon 5D Mk III camera→Rec.2020 golden re-derived offline.
-   darkroom-core 514→516 tests (+2), all green in Docker.
+   c41-core 514→516 tests (+2), all green in Docker.
    **Deferred (architect-flagged, out of scope):** velvia hard-clamps [0,1]
    pre-sigmoid (pre-existing, loses >1.0 scene-linear data); default monochrome
    weights are Rec.709 luma now applied to Rec.2020 primaries (off by default,
@@ -1285,12 +1285,12 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    distinguish orders — velvia is identity on greys). Two Opus reviews (2nd read
    the C-port sources): reorder correct, **no blockers**; applied both should-fix
    items (the `channelmixerrgb`-vs-legacy-`channelmixer` citation fix, chromatic
-   test) + the mono+splittoning-tint doc note. darkroom-ui 114→115 tests, Docker
+   test) + the mono+splittoning-tint doc note. c41-ui 114→115 tests, Docker
    check/clippy/test green, both remotes synced.
 
    **m4-37** — port RCD (Ratio Corrected Demosaicing) to Rust (pipeline depth)
    (DONE, commit `e40ff6df3c`). New `demosaic_rcd` in
-   `crates/darkroom-core/src/rawimage.rs`, a faithful port of darktable's
+   `crates/c41-core/src/rawimage.rs`, a faithful port of darktable's
    `rcd_demosaic` (`src/iop/demosaicing/rcd.c`) — the default high-quality Bayer
    demosaicer, far fewer maze/zipper artefacts than PPG. **Correction to the
    m4-36 candidate note above:** RCD/VNG were NOT actually migrated — only VNG
@@ -1307,7 +1307,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    arithmetic / bounds / parity / the step-1 rewrite: **no correctness
    blockers**; applied all 3 should-fix test-coverage additions (interior-tile
    join 250×250, single-tile 50×50, BGGR parity) + nits (lpf half-stride comment,
-   step-3 `debug_assert`, hoisted `fc_bayer`). darkroom-core 516→523 tests.
+   step-3 `debug_assert`, hoisted `fc_bayer`). c41-core 516→523 tests.
 
    **m4-38** — use RCD as the Bayer demosaic in the preview pipeline (DONE,
    commit `daf8db6b1d`). One-line default swap: `RawImage::to_linear_rgba`'s
@@ -1335,7 +1335,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    RCD stays the Bayer default (m4-38); this makes VNG available for a future
    demosaic-method selector. Opus review: faithful to C, no P0/P1 (verified
    builders, negative-coord `fcol`, ring rotation, 6×6 bounds, pointer
-   lifetimes); applied the 2 P2 clarity comments. darkroom-core 523→527 tests.
+   lifetimes); applied the 2 P2 clarity comments. c41-core 523→527 tests.
 
    **m4-40..m4-43 — per-image Bayer demosaic-method selector (COMPLETE):** a
    user choice of RCD / VNG / PPG for the raw preview, persisted per image.
@@ -1358,10 +1358,10 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      generation guard makes only the newest decode paint (stale-paint guard for
      rapid switching). Opus review 9/10, no blockers; applied N1/N2/N3 (X-Trans
      tooltip caveat, failed-decode comment, stale raw_preview.rs doc fix).
-     darkroom-ui 115→119 tests, darkroom-core 527→530.
+     c41-ui 115→119 tests, c41-core 527→530.
 
    **m4-44/m4-45 — geometry primitives (crop + rotate), core done:** a new
-   `darkroom_core::geometry` module, kept SEPARATE from the per-pixel
+   `c41_core::geometry` module, kept SEPARATE from the per-pixel
    `pipeline` (every current stage is position-independent, so geometry commutes
    with them and the ping-pong Pipeline stays size-agnostic; caveat noted in
    both modules — revisit once a spatially-varying IOP lands).
@@ -1376,7 +1376,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      kernel — architect-endorsed). Positive = CCW. `ceil_dim` sub-pixel epsilon
      fixes a float-`ceil` bbox-inflation bug at near-axis angles (safe ≲22 000px).
      Composes with `apply_crop` for straighten-and-crop. Opus: correct, no
-     blocker. 7 tests. darkroom-core 530→545 tests.
+     blocker. 7 tests. c41-core 530→545 tests.
 
    **m4-46/m4-47 — geometry backend + straighten UI (done):**
    - **m4-46** (`d1411ef414`): `geometry::Geometry { crop, angle }` — one value
@@ -1394,7 +1394,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      not a re-decode) + persists, debounced 160ms (cancel-and-rearm) for drag
      responsiveness. **fricktrade-architect review was quota-blocked (weekly limit)
      → self-reviewed; a follow-up architect pass is queued for the reset.**
-     darkroom-ui 122→123.
+     c41-ui 122→123.
 
    **m4-48 — interactive crop overlay (DONE):** completes the straighten-and-crop UX.
    - **m4-48a** (`bc646f5746`): pure `crop_overlay` interaction math (fraction
@@ -1409,11 +1409,11 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      crop (no drift) into `ctx.geometry`, `save_geometry` on drag-end. Opus review:
      no blockers; applied the should-fix (entering crop dismisses any active wipe
      compare — mutual-exclusion) + 2 nice-to-haves. **m4-47 deferred review also
-     ran: clean, no blocker/should-fix.** darkroom-ui 123→127 tests.
+     ran: clean, no blocker/should-fix.** c41-ui 123→127 tests.
    **m4-49/m4-50 — Rust-native export (DONE): geometry + colour params now reach
    the exported file** (user chose the Rust-render route over post-processing
    darktable-cli). Export previously ALWAYS shelled to `darktable-cli`, which
-   develops the raw with darktable's own history and ignores every darkroom-ui
+   develops the raw with darktable's own history and ignores every c41-ui
    edit; now the single-image darkroom export renders through OUR pipeline so it
    matches the preview.
    - **m4-49** (`d93b409429`): `export::render_export_rgb8(img, method, geometry,
@@ -1452,14 +1452,14 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
 
    **m4-56..m4-59 — containerise the Rust UI + make it self-sufficient (all DONE):**
    - **m4-56** (`38c1d10b7d`): the full-app Docker image now BUILDS the Rust/GTK4
-     UI (`cargo build --release -p darkroom` → `darkroom-rs`) and the KasmVNC
+     UI (`cargo build --release -p c41` → `c41-rs`) and the KasmVNC
      autostart LAUNCHES it instead of the C darktable app (C `darkroom-cli`
      retained for the export shell-out). Added GTK4/libadwaita build+runtime deps
      (+ `adwaita-icon-theme`, `gsettings-desktop-schemas`), `GSK_RENDERER=cairo`
      (KasmVNC's software X server black-windows GSK's default GL renderer), and
-     `DARKROOM_LIBRARY_DB`. Two review BLOCKERs fixed: (1) production `darkroom-rs`
+     `DARKROOM_LIBRARY_DB`. Two review BLOCKERs fixed: (1) production `c41-rs`
      never created the catalog schema (all `CREATE TABLE` were `#[cfg(test)]`
-     fixtures; the C app's `dt_init` used to) → new `darkroom_db::schema::
+     fixtures; the C app's `dt_init` used to) → new `c41_db::schema::
      ensure_base_schema` (main-scoped) called at startup + before import, else a
      fresh `/config` imports 0 images; (2) the black-window renderer fix. Plus a
      SIGTERM/SIGINT handler in `run()` so the autostart's graceful-shutdown wait
@@ -1489,7 +1489,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      serial). Fail-safe guard: `Stage::is_pixel_local()` (exhaustive no-wildcard
      match) gates the parallel branch → a future spatial stage won't compile until
      classified, and non-local falls back to correct serial. Opus: SHIP, no
-     blockers. darkroom-core 549→552 tests.
+     blockers. c41-core 549→552 tests.
 
    **m4-60** (`1a82daaaab`) — lighttable batch export honours per-image edits.
    Previously only the single-image darkroom export rendered through our pipeline;
@@ -1506,7 +1506,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    SHIP, no blockers. **Known (expected, not a bug):** single-image darkroom
    export bakes LIVE (incl. unsaved) edits; lighttable export reads PERSISTED state
    only — so the same raw can export differently from the two entry points.
-   darkroom-ui 135→136 tests.
+   c41-ui 135→136 tests.
 
    **m4-61** (`70d5013ae4`) — hide the demosaic-method selector for X-Trans.
    The RCD/VNG/PPG dropdown only affects Bayer sensors; X-Trans (.raf) always
@@ -1521,7 +1521,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    after the generation guard so a stale X-Trans decode can't hide the selector
    under a newer Bayer one. Opus architect: SHIP, no blockers/majors. This
    closes the "Selector polish (deferred from m4-43 N3)" candidate below.
-   darkroom-ui 136 tests pass.
+   c41-ui 136 tests pass.
 
    **m4-62** (`d6ac01b6ea`) — rayon-parallelise the VNG demosaic gradient phase,
    the last serial hot loop in `demosaic_vng`. C's ring buffer defers each row's
@@ -1534,7 +1534,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    — a transient n*4-float clone (~1 GB on a 60 MP frame) buys the parallelism;
    the clone is load-bearing (a future memory-pressure tiling would need per-band
    ring buffers to drop it). Opus architect: SHIP, bit-identical watertight.
-   darkroom-core 552 tests pass. This closes the "parallelise `demosaic_vng`"
+   c41-core 552 tests pass. This closes the "parallelise `demosaic_vng`"
    candidate below; `pipeline::process` (m4-59) and RCD (m4-54) were already
    parallel, so the per-pixel demosaic/pipeline path is now fully multi-threaded.
 
@@ -1553,7 +1553,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    durable schema if the bootstrap warned) — commented as intentional. Marginal
    by design (the two ATTACHes dominate the probes); the value is the correct
    once-vs-per-open split. Opus architect: SHIP, composition provably identical,
-   ordering holds on every current path. darkroom-db 92 tests pass (new
+   ordering holds on every current path. c41-db 92 tests pass (new
    `session_open_reads_durable_tags_without_re_ensuring`). Architect's forward
    note: if a third read path or a non-`build_main_window` entry point appears,
    migrate to a one-opener + process-global per-path "already-ensured" guard
@@ -1572,7 +1572,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    "imported N" toast. Now count reflects only rows that landed; failures are
    logged. New test seeds a fresh config (no library.db/data.db) with mixed
    raw/non-raw files → asserts count == raw files, data.db materialised, empty
-   path is a no-op. Opus architect: APPROVE (Option C). darkroom-ui 136→137
+   path is a no-op. Opus architect: APPROVE (Option C). c41-ui 136→137
    tests.
 
    **m4-65** (`e7b148c6cb`) — make folder import transactional (the m4-64 N1
@@ -1591,7 +1591,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    (truthful "Imported 0"). Best-effort per-image survives for any statement-level
    error (none reachable today). Test proves the tx committed via
    `image_count_all()==3` after re-open. Opus architect: MAJOR poison-guard +
-   MINOR commit-log applied, two-phase design endorsed. darkroom-ui 137 tests.
+   MINOR commit-log applied, two-phase design endorsed. c41-ui 137 tests.
 
    **m4-67** (`33506a48f5`) — export unedited raws through the Rust pipeline
    (milestone 5; drops the darktable-cli fallback for ALL raws). Previously only
@@ -1608,7 +1608,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `unedited_raw_export_default_matches_preview_seed` pins export==preview.
    **Review debt:** the fricktrade-architect review was blocked by an account
    session limit; user directed proceeding — obtain the deferred review later.
-   darkroom-ui 137→138 tests. *(Review debt cleared — see m4-68.)*
+   c41-ui 137→138 tests. *(Review debt cleared — see m4-68.)*
 
    **m4-68** (`34d48a60c1`) — the deferred m4-67 review, run in full (two rounds),
    plus its fixes. `render_raw_export` created the destination then encoded into
@@ -1624,7 +1624,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    edit (would bake one crop onto all). **Known data-safety gap (deferred):** the
    non-raw `darktable-cli` export branch is still non-atomic (clobbers on
    mid-write failure) — not worth hardening code milestone 5 deletes once the
-   Rust pipeline covers non-raw formats. darkroom-ui 138→139 tests.
+   Rust pipeline covers non-raw formats. c41-ui 138→139 tests.
 
    **m4-69** (`4ad67c5bc1`) — Rust-native non-raw (JPEG/PNG/TIFF) export
    (milestone 5). `render_nonraw_export` decodes via the `image` crate → composites
@@ -1639,7 +1639,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    sources pre-pipeline (banding on edited gradients — 16-bit follow-up). Tests:
    extension predicate, real-PNG passthrough (pixel-exact), +1 EV brightens. Opus
    architect: APPROVE with minors, all applied before commit (alpha composite,
-   doc-comments, non-passthrough test). darkroom-ui 139→142 tests.
+   doc-comments, non-passthrough test). c41-ui 139→142 tests.
 
    **m4-70** (`f213fb5834`) — 16-bit non-raw PNG/TIFF export (m4-69 follow-up).
    New `preview::apply_pipeline_rgb16` (16-bit sibling of `apply_pipeline`, packed
@@ -1654,7 +1654,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    blockers, SHIP after the two tests (added). **Backlog nit:** resize runs in
    gamma space (both paths, pre-existing) — resampling error now exceeds the
    quantisation m4-70 removed; do linear-light resize before tightening further.
-   darkroom-ui 142→144 tests.
+   c41-ui 142→144 tests.
 
    **m4-73** (`f0b843e18f`) — **ROI/(width,height) pipeline signature + first
    spatial stage (Sharpen)**; the biggest architectural step for the pixel
@@ -1674,7 +1674,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    detail shifts chroma on saturated edges. No live caller yet (core stage only,
    like Sigmoid m2-5a before UI m2-5b). Opus architect: no blockers; MAJOR 1 (rad
    clamp) + MAJOR 2 (threshold domain) + stale-doc + test gaps all fixed before
-   commit. darkroom-core pipeline 15→21 tests.
+   commit. c41-core pipeline 15→21 tests.
 
    **m4-74** (`7a98fb2085`) — Rec.2020↔XYZ↔Lab color infra + **faithful Lab-`L`
    Sharpen** (first slice of the color-space-infrastructure scope). `color.rs`
@@ -1688,7 +1688,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    dev bugs caught+fixed (inverse matrix stored un-transposed; alpha dropped
    through CAT16). Opus architect independently re-derived the matrices from
    primaries — correct + genuine inverses to ~5e-8; SHIP, no blockers.
-   darkroom-core 549→563 tests. **HARD PREREQUISITES before Sharpen gets a live UI
+   c41-core 549→563 tests. **HARD PREREQUISITES before Sharpen gets a live UI
    caller** (both latent now — no caller): ~~**(M1)** make the pipeline working
    space an explicit contract~~ **DONE — m4-75**; ~~**(M2)** scale the Gaussian
    sigma by the pipeline `roi->scale`~~ **DONE — m4-76** (`Stage::Sharpen.scale`,
@@ -1719,10 +1719,10 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    signature; a `working_space()` helper + a debug_assert in process() enforces
    "one buffer, one working space" as stages grow. New test proves `space` routes
    the conversion (coloured edge: Rec2020 ≠ LinearSrgb) + alpha (0.5) survives both
-   paths. Opus architect: SHIP, no blockers. darkroom-core 563→565 tests.
+   paths. Opus architect: SHIP, no blockers. c41-core 563→565 tests.
    **Sharpen is now unblocked for a live UI caller once M2 (roi->scale) lands.**
 
-   **m4-77** (`d65d7bd60f`) — **3-D bilateral grid ported** (`darkroom-core/
+   **m4-77** (`d65d7bd60f`) — **3-D bilateral grid ported** (`c41-core/
    bilateral.rs`, faithful port of `src/common/bilateral.c`): shared edge-aware-
    filter infra for lowpass/shadhi/retouch/monochrome/globaltonemap/colormapping/
    ashift/bilat. `Bilateral::new/splat/blur/slice` (+ `slice_to_output`); the
@@ -1734,11 +1734,11 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    a benign OOB read but Rust panics — guarded to no-op below 4 grid points.
    No consumer wired yet (algorithm+tests first, like interp.rs). Opus architect:
    APPROVE after 3 fixes (premise/consumer correction, `slice_to_output`, the
-   panic guard — all applied). darkroom-core 566→573 tests. Follow-up: a
+   panic guard — all applied). c41-core 566→573 tests. Follow-up: a
    golden-vector test vs a C `buf` dump. **This is the first of the ~5 shared-infra
    pieces gating the remaining ~230 C loops** (see the "what blocks" table above).
 
-   **m4-78** (`01d0568432`) — **recursive Gaussian ported** (`darkroom-core/
+   **m4-78** (`01d0568432`) — **recursive Gaussian ported** (`c41-core/
    gaussian.rs`, faithful CPU-path port of `src/common/gaussian.c`): the second
    shared-infra piece, unblocking bloom/highpass/lowpass/shadhi/hazeremoval.
    `compute_params` ← `_compute_gauss_params` (Young–van Vliet IIR coefficients,
@@ -1754,12 +1754,12 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    Also guards empty images. 10 module tests incl. an **analytic impulse-response
    test** (blurred unit impulse ≈ `exp(-r²/2σ²)/(2πσ²)` within 1.5e-3 — the guard
    a transposed recursion variable can't pass), NaN-to-min, all-orders-finite,
-   channel independence, degenerate-dims no-panic. 582 darkroom-core tests; clippy
+   channel independence, degenerate-dims no-panic. 582 c41-core tests; clippy
    clean. **Second of the ~5 shared-infra pieces; ~3 remain** (Filmlight-Yrg,
    per-pixel ICC/LCMS, colorreconstruction bespoke grid; dwt.c also outstanding).
 
    **m4-79** (`396c8ab491`) — **à-trous wavelet decompose/denoise ported**
-   (`darkroom-core/dwt.rs`, faithful CPU-path port of `src/common/dwt.c` — the
+   (`c41-core/dwt.rs`, faithful CPU-path port of `src/common/dwt.c` — the
    GIMP "Wavelet Decompose" algorithm): the third shared-infra piece, unblocking
    **atrous, retouch, denoiseprofile** (wavelet mode). Ported: `decompose` ←
    `dwt_decompose` (RGBA `ch==4`, dilated 3×3 hat kernel per scale, per-scale
@@ -1785,13 +1785,13 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    reflection-index parity + telescoping reconstruction + ping-pong selection vs
    the C himself); applied F2 (negative-`return_layer` guard) + F3 (3 value-parity
    tests: detail-scales+residual telescoping, zoom `max_scale` clamp, merged-scale
-   ≡ sum-of-details). 13 module tests, **595 darkroom-core tests**, clippy clean.
+   ≡ sum-of-details). 13 module tests, **595 c41-core tests**, clippy clean.
    **Third of the ~5 shared-infra pieces; ~2 remain** (Filmlight-Yrg /
    `work_profile`; per-pixel ICC/LCMS; colorreconstruction's own {L,a,b,weight}
    grid is a separate bespoke port).
 
    **m4-80** (`a1793b76ce`) — **colorreconstruction's bespoke 4-field bilateral
-   grid ported** (`darkroom-core/colorreconstruct.rs`, faithful port of the
+   grid ported** (`c41-core/colorreconstruct.rs`, faithful port of the
    private grid in `src/iop/colorreconstruction.c`): the fourth shared-infra
    piece, unblocking **colorreconstruction**. Distinct from the shared 3-D
    bilateral grid (m4-77): a full `{L,a,b,weight}` `Cell` per grid point, an
@@ -1816,7 +1816,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    ~1 ULP/tap vs the C's field-first grouping — immaterial since the splat's
    atomic non-determinism dwarfs it), resolved by documenting per the reviewer's
    preferred option. 8 module tests (incl. the behavioral
-   clipped-highlight-borrows-neighbour-colour); **603 darkroom-core tests**;
+   clipped-highlight-borrows-neighbour-colour); **603 c41-core tests**;
    clippy clean. **Fourth of the ~5 shared-infra pieces; ~2 remain**
    (Filmlight-Yrg / `work_profile` → colorbalancergb/colorin; per-pixel ICC/LCMS
    → colorin/colorout/retouch — the biggest and needs a colour-management
@@ -1835,7 +1835,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    **APPROVE** — every constant/matrix-row/transposition/formula checked
    bit-for-bit vs the C headers, 10/10 parity, no fixes. 5 round-trip tests incl.
    the strong anchor (`xyz_to_jzazbz` ∘ the independently-written
-   `jzazbz_to_xyz_d65` recovers input within 2e-3). 608 darkroom-core tests.
+   `jzazbz_to_xyz_d65` recovers input within 2e-3). 608 c41-core tests.
 
    **m4-82** (`89d42e2ef7`) — **colorbalancergb per-pixel helpers** (`color.rs`):
    the 4 remaining small conversions both `commit_params` and the process loop
@@ -1844,7 +1844,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    masks + complement), `lookup_gamut` (cyclic hue→LUT linear interp) + the
    `LUT_ELEM = 512` const. 4 tests (fulcrum-symmetry 0.5/0.5/0.5, complement,
    linear-LUT index/interp exactness, hue=0→index 256, constant-LUT wrap). 612
-   darkroom-core tests; clippy clean. **Review debt CLEARED** — the
+   c41-core tests; clippy clean. **Review debt CLEARED** — the
    fricktrade-architect review was first quota-blocked (account session limit) so
    the commit went in on a bit-exact self-review; the formal Opus review was
    re-run after the 08:50 reset and returned **APPROVE** (all 5 ports bit-exact:
@@ -1854,7 +1854,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    `&[f32; LUT_ELEM]` once the m4-84 process-loop caller lands.
 
    **m4-83** (`f2de894e44`) — **colorbalancergb gamut-boundary LUT builders**
-   (new module `crates/darkroom-core/src/iop/colorbalancergb.rs`): the two
+   (new module `crates/c41-core/src/iop/colorbalancergb.rs`): the two
    `hue → max-saturation/colourfulness` LUT builders the process loop's
    `lookup_gamut` reads. `build_gamut_lut_jzazbz` (the `STEPS³`=92³ RGB-cube →
    JzAzBz → max-sat-per-hue + 5-tap box AA, ← `commit_params` JzAzBz branch) and
@@ -1869,7 +1869,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    (both AA boundary sets, all 3 UCS edge-intersection formulas, `t==clamp` NaN
    parity). Caveat (documented in code): the C marches the UCS builder with an
    OMP `reduction(+:)` whose FP add order is thread-count-dependent, so any golden
-   dump must use `OMP_NUM_THREADS=1`. 5 property tests; 617 darkroom-core tests.
+   dump must use `OMP_NUM_THREADS=1`. 5 property tests; 617 c41-core tests.
 
    **m4-84** (`c200e4ae02`) — **colorbalancergb `commit_params`**
    (`CbRgbData::from_params`): derives the process-ready data from `CbRgbParams`
@@ -1885,7 +1885,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    data-slot order `[shadows,midtones,highlights]` (a param-vs-slot ordering trap)
    and global's `·global_Y` vs shadows/highlights' `+*_Y`. 9 module tests (neutral
    → no-op balance `global=[0;4]`, zones=`[1;4]`; formula-selects-builder;
-   LUT-depends-on-matrix). 621 darkroom-core tests.
+   LUT-depends-on-matrix). 621 c41-core tests.
    **m4-85** (`2f75180f0b`) — **colorbalancergb main process loop** (`process()` +
    `saturation_jzazbz` + `saturation_dtucs`), port of `:662–943`. Completes the
    **colorbalancergb ALGORITHM** (m4-81 conversions → m4-82 helpers → m4-83 gamut
@@ -1902,13 +1902,13 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    signs, `SO[1]` clamp order + original-`SO[0]` use, `AI_trans` cols, HCB rotation,
    `max_chroma` powers). 14 module tests (neutral-preserves-grey both formulas
    within 3e-2 — colorbalancergb always gamut-maps so not bit-identity;
-   finite/non-neg; alpha; param effects; multi-pixel). 626 darkroom-core tests.
+   finite/non-neg; alpha; param effects; multi-pixel). 626 c41-core tests.
 
    - **m4-86 (optional, remaining):** wire `colorbalancergb::process` as a live
      `pipeline::Stage` (enum variant carrying `CbRgbData`, `is_pixel_local()=true`,
      applied in `Pipeline::process`) so preview/export actually run it — needs
      params plumbing from the edit/history layer (the algorithm is ported at the
-     darkroom-core level like the other IOP modules until then). Deferred m4-82
+     c41-core level like the other IOP modules until then). Deferred m4-82
      hardening to apply here: type `lookup_gamut`'s LUT as `&[f32; LUT_ELEM]`.
 
    **Candidate next increments after m4-60** (recorded so they survive a context
@@ -1924,27 +1924,27 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    - **Container follow-ups (deferred, reviewed non-blocking):** ~~S2 —
      `open_catalog` runs `ensure_full_schema` on every open.~~ **DONE — m4-63**
      (persistent-once-at-startup + session opener for the read-hot paths). Still
-     open: a live end-to-end KasmVNC session check of `darkroom-rs` (validated at
+     open: a live end-to-end KasmVNC session check of `c41-rs` (validated at
      build + unit level so far, not a live GUI run — needs a display).
    - Smaller: `with_image_id(full_path, db, |conn, imgid| …)` helper to dedupe the
      tag-op open→lookup→fault-log ceremony, once a 5th tag op appears (not before).
 5. *Cargo-native build* — once UI + pipeline run from Rust, retire CMake.
 
    **m4-66 (groundwork):** the standalone Rust app is already fully
-   cargo-native-buildable — `cargo build --release -p darkroom --bin darkroom-rs`
+   cargo-native-buildable — `cargo build --release -p c41 --bin c41-rs`
    links the GTK4 binary against system GTK4/libadwaita with **no CMake and no C
    darktable** (verified in the rust-dev image, ~2.5 min from clean). CI now
    guards this: the `Rust` workflow gained a "cargo-native app binary build" step
    (`cargo check` only type-checks; it does not *link* the bin — the full
    container image only links it after the heavy CMake C build, so a linker
    regression in the standalone app would otherwise escape until the Docker
-   build). `darkroom-sys` is a C-linkless bindings crate (committed `bindings.rs`,
+   build). `c41-sys` is a C-linkless bindings crate (committed `bindings.rs`,
    just `dt_imgid_t = i32` etc.), so nothing in the Rust workspace needs the C
    toolchain.
 
    **Remaining couplings before CMake can actually be retired** (both in the full
    `docker/Dockerfile`):
-   - *Runtime:* `darkroom-rs` shells out to `darkroom-cli` (the C `darktable-cli`)
+   - *Runtime:* `c41-rs` shells out to `darkroom-cli` (the C `darktable-cli`)
      only for **heic/heif/avif** (and unknown extensions) now. **m4-67:** all raws
      develop Rust-native (unedited → `default_raw_export_edit()`, the preview seed).
      **m4-69:** the non-raw formats the `image` crate decodes (jpg/jpeg/png/tif/
@@ -1957,31 +1957,31 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      preview uses GdkPixbuf vs export's `image` crate (JPEG ±1-2 LSB); resize runs
      in gamma space (pre-existing, both paths). **Blocker to full cli removal:** a
      Rust HEIF/AVIF decoder (or dropping those formats) + broad raw decode coverage.
-   - *Build:* CMake drives a `cargo build` of `darkroom-core` as a static lib
+   - *Build:* CMake drives a `cargo build` of `c41-core` as a static lib
      linked into the C app, and builds the C `darktable`/`darktable-cli` the
      runtime still needs. Once the export fallback is gone, the C build (and thus
      CMake) can be dropped and the image becomes a pure-cargo build of
-     `darkroom-rs` + a GTK4 runtime.
+     `c41-rs` + a GTK4 runtime.
    Ordered retirement path: reach export parity → drop the `darktable-cli`
    fallback in `dialogs::export_images_async` → strip the CMake C build from the
    Dockerfile (cargo-only) → retire `CMakeLists.txt` + `build.sh`.
 
    **m4-71** (`1d74f84407`) — **CMake-free container image** `docker/Dockerfile.
-   cargo-native`: builds/ships only `darkroom-rs` (no CMake, no C darktable, no
+   cargo-native`: builds/ships only `c41-rs` (no CMake, no C darktable, no
    cli). Kept separate from the untouched production `docker/Dockerfile` to prove
    the path A/B before flipping production. Shallow clone without submodules
    (C-only); GTK4/adwaita runtime only. Added `librsvg2-common` (the SVG pixbuf
    loader the `*-symbolic.svg` UI icons need — architect M1) + `GTK_A11Y=none`.
    Validated headlessly: build ✓, `ldd` fully resolved, SVG loader registered,
-   container boots and darkroom-rs stays up 80s with **0 autostart restarts**.
+   container boots and c41-rs stays up 80s with **0 autostart restarts**.
    heic/heif/avif export degrades gracefully (no cli). GUI rendering still needs a
    display to eyeball. **Next m5 steps:** verify the GUI live (display), decide
    heic/avif (drop vs keep cli optional), then flip production to cargo-only +
    retire CMakeLists/build.sh.
-   - **Discovered bug (pre-existing, follow-up):** darkroom-rs logs one
+   - **Discovered bug (pre-existing, follow-up):** c41-rs logs one
      `Gtk-CRITICAL gtk_box_append: gtk_widget_get_parent(child) == NULL` at
      startup — a child appended while already parented; non-fatal, affects the
-     full image too. Surface with `xvfb-run darkroom-rs` + grep Gtk-CRITICAL.
+     full image too. Surface with `xvfb-run c41-rs` + grep Gtk-CRITICAL.
 
    **m4-72** (`7661c6b5fe`) — **production is now CMake-free.** `git mv` promoted
    the validated cargo-only image to `docker/Dockerfile` (the published `:latest`)
@@ -2008,7 +2008,7 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      Confirm none resolve from darktable's installed icon theme under
      `/opt/darkroom/share`, or the chrome breaks when the C install goes (the
      runtime already installs `adwaita-icon-theme` — check that's sufficient).
-   - *Decode/preview path is already C-free* — `darkroom-core` decodes RAW via the
+   - *Decode/preview path is already C-free* — `c41-core` decodes RAW via the
      pure-Rust `rawloader = 0.37.1` and takes camera colour matrices from
      rawloader's `xyz_to_cam`, not darktable's `share/` data (architect-confirmed),
      so the runtime pixel path doesn't couple to the C install.
@@ -2034,7 +2034,7 @@ parallel; milestone 2 is where the two streams converge.
 |          Image pipeline (Rust)            |  Phase 1  at boundary
 |  pixelpipe . IOPs . demosaic . OpenCL    |
 +-------------------------------------------+
-|    C FFI shim (darkroom-sys)              |  Phase 0  complete
+|    C FFI shim (c41-sys)              |  Phase 0  complete
 +-------------------------------------------+
 ```
 

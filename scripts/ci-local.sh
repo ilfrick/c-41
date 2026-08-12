@@ -15,13 +15,13 @@
 #   2. cargo clippy --workspace          (default strictness, as CI)
 #   3. cargo test --workspace --release  (CI uses --release; debug-only runs
 #                                         have missed release-profile breakage)
-#   4. cargo build --release -p darkroom --bin darkroom-rs   (the real link)
+#   4. cargo build --release -p c41 --bin c41-rs   (the real link)
 #
 # Exit code is non-zero if any step fails, so it works as a pre-push gate.
 
 set -uo pipefail
 
-IMAGE=darkroom-rust-dev
+IMAGE=c41-rust-dev
 DOCKERFILE=docker/Dockerfile.rust-dev
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
@@ -63,7 +63,7 @@ failed=()
 run_step "cargo check"   "cargo check --workspace"                             || failed+=("check")
 run_step "cargo clippy"  "cargo clippy --workspace"                            || failed+=("clippy")
 run_step "cargo test"    "cargo test --workspace --release"                    || failed+=("test")
-run_step "release build" "cargo build --release -p darkroom --bin darkroom-rs" || failed+=("build")
+run_step "release build" "cargo build --release -p c41 --bin c41-rs" || failed+=("build")
 
 echo
 if [ ${#failed[@]} -ne 0 ]; then

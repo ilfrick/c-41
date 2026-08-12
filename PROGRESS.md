@@ -1,4 +1,4 @@
-# Progress log
+# C-41 — progress log
 
 Append-only, newest last. One entry per unit of work that reaches a remote,
 timestamped in UTC. Entries record what changed, how it was verified, and
@@ -14,7 +14,7 @@ Format: `## YYYY-MM-DD HH:MM UTC — <id>: <title>` followed by what/verify/note
 **Commit** `e2c5a8f5` (GitHub + Gitea)
 
 **What.** Wired the colorzones IOP into the Rust preview pipeline.
-- `darkroom-core/iop/colorzones.rs`: ported `build_lut` from
+- `c41-core/iop/colorzones.rs`: ported `build_lut` from
   `CurveDataSampleV2`/`CurveDataSampleV2Periodic` (`src/common/splines.cpp`) —
   all three spline types (Catmull-Rom, natural cubic via banded/full LU without
   pivoting, monotone Hermite: Fritsch-Carlson non-periodic, SIAM `G()` variant
@@ -58,7 +58,7 @@ This is the direct cause of `scripts/ci-local.sh` (2026-08-11).
 **Commit** `ebb4c7a6` (GitHub + Gitea) — CI green first attempt
 
 **What.**
-- `darkroom-core/iop/levels.rs`: ported `build_lut` from C `compute_lut`
+- `c41-core/iop/levels.rs`: ported `build_lut` from C `compute_lut`
   (`inv_gamma = 10^((grey-mid)/delta)`, `lut[i] = 100*(i/65536)^inv_gamma` — the
   65536 divisor matches C's `(float)0x10000ul`). Documented and debug-asserted
   the `black < grey < white` contract darktable enforces in its GUI; clamped
@@ -164,7 +164,7 @@ was the right one. Visual verification is now part of the loop.
 
 **What.** Wired the vignette IOP into the preview pipeline — the **17th** live
 module, and the first *position-dependent* one.
-- `darkroom-core/iop/vignette.rs`: new `commit_geometry()` porting the geometry
+- `c41-core/iop/vignette.rs`: new `commit_geometry()` porting the geometry
   block at the top of vignette.c `process()` — xscale/yscale (auto-ratio or the
   0..2 w/h encoding), the pixel-space centre, `dscale`, the size-dependent
   `min_falloff` floor, and `exp1`/`exp2` from `shape`.
@@ -205,7 +205,7 @@ per-band `h = 1` run would collapse).
 
 **What.** Wired the lowlight IOP (scotopic / "night vision") into the preview
 pipeline — the **18th** live module.
-- **`darkroom-core/src/splines.rs` (new)**: the cubic-spline machinery is lifted
+- **`c41-core/src/splines.rs` (new)**: the cubic-spline machinery is lifted
   out of `iop::colorzones` into a shared module. lowlight needed the same
   Catmull-Rom code, and a second copy would mean a fix to the interpolation
   reaching only one caller.
@@ -234,3 +234,34 @@ colour.
 **Notes.** Two new LUT tests pin the curve: flat 0.5 at the defaults, and
 monotonic for a monotonic ramp — the latter is what catches a padding-anchor or
 tangent mistake, which shows up as a dip near index 0.
+
+---
+
+## 2026-08-12 10:20 UTC — Rename: darkroom → C-41
+
+**Commit** pending (GitHub + Gitea, both repos renamed)
+
+**What.** The project is now **C-41** (after the colour-negative development
+process). Renamed: the 5 crates (`darkroom-core` → `c41-core`, …, umbrella
+`darkroom` → `c41`, binary `darkroom-rs` → `c41-rs`), the Docker dev image
+(`c41-rust-dev`), all documentation (README, CLAUDE, CHANGES, PARITY_AUDIT,
+PROGRESS), and **both remotes** — `github.com/ilfrick/c-41` and the Gitea
+mirror. Local `origin` dual push URLs re-pointed; GitHub auto-redirects the old
+URL, so existing clones keep working.
+
+**Deliberately NOT renamed** — each would break something real, so each was
+checked rather than assumed:
+- **311 `darkroom_*` FFI symbols**, called from 105 C files. Both sides would
+  have to change atomically for zero functional gain.
+- **`darkroom_ui_prefs`**, a live SQLite table (`persist.rs:63`). Renaming it
+  orphans every saved panel width, filter and view mode.
+- **`/config/darkroom/`, `DARKROOM_*` env vars.** Verified against the running
+  container: `/config/darkroom/library.db` is 7.7 MB and holds the real 2000-image
+  catalogue. Renaming strands it.
+- **"darkroom view"** — darktable's own term for the edit view, not our name.
+
+The reasoning is recorded in CLAUDE.md so the next session doesn't "finish the
+job" and break one of them.
+
+**Verified.** `scripts/ci-local.sh` (all four steps) after the rename; 311 FFI
+exports and the prefs table confirmed intact by grep.

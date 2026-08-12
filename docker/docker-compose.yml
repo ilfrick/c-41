@@ -24,7 +24,7 @@ x-common: &common
     # Keep watchtower's auto-update away from this container. It monitors every
     # container by default, and pulling a new base image recreates this one —
     # which wipes anything installed into the running container (the X tooling
-    # the visual-verification loop needs) and reverts a hot-copied darkroom-rs
+    # the visual-verification loop needs) and reverts a hot-copied c41-rs
     # binary to whatever the image ships, mid-session and with no warning.
     # Updates here are a rebuild (`docker compose build darkroom`), not a pull.
     com.centurylinklabs.watchtower.enable: "false"

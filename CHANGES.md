@@ -1,6 +1,6 @@
-# Darkroom — Changes vs. upstream darktable
+# C-41 — Changes vs. upstream darktable
 
-This document lists all modifications made to the darktable codebase in the Darkroom fork.
+This document lists all modifications made to the darktable codebase in the C-41 fork.
 The upstream base is darktable `master` as of May 2026.
 
 ---

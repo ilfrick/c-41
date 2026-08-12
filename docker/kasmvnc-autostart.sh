@@ -41,11 +41,11 @@ trap '_forward_signal INT'  INT
 trap '_forward_signal HUP'  HUP
 
 while true; do
-  # darkroom-rs is the Rust/GTK4 front-end. It takes no CLI args — it reads the
+  # c41-rs is the Rust/GTK4 front-end. It takes no CLI args — it reads the
   # catalog path from DARKROOM_LIBRARY_DB (set in the image, defaulted here as a
   # belt-and-suspenders fallback so the loop still works if the env is cleared).
   DARKROOM_LIBRARY_DB="${DARKROOM_LIBRARY_DB:-${DARKROOM_CONFIGDIR:-/config/darkroom}/library.db}" \
-    /usr/local/bin/darkroom-rs &
+    /usr/local/bin/c41-rs &
   child_pid=$!
   # `wait` is interruptible by signals, so the trap above can run while we
   # block here. If the signal came in, the trap calls exit() so the loop

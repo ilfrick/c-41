@@ -44,8 +44,8 @@ exceeds Lightroom in several areas:
 
 Prerequisite work; no user-visible features.
 
-- [x] **0.1** Fork darktable-org/darktable → ilfrick/darkroom on GitHub
-- [x] **0.2** Mirror to self-hosted Gitea (www.housefz.com/git/ilfrick/darkroom)
+- [x] **0.1** Fork darktable-org/darktable → ilfrick/c-41 on GitHub
+- [x] **0.2** Mirror to self-hosted Gitea (www.housefz.com/git/ilfrick/c-41)
 - [x] **0.3** Docker multi-stage build with KasmVNC (browser GUI) + GPU passthrough
 - [ ] **0.4** Rename project string "darktable" → "Darkroom" in UI, about dialog,
        config paths (`~/.config/darkroom`, `~/.cache/darkroom`)

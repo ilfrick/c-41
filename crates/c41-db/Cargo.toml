@@ -1,0 +1,10 @@
+[package]
+name = "c41-db"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust database layer — Phase 2 target"
+
+[dependencies]
+c41-sys = { workspace = true }
+anyhow       = { workspace = true }
+rusqlite     = { workspace = true }

@@ -27,7 +27,7 @@
 # ─── Stage 1: Build ──────────────────────────────────────────────────────────
 FROM ubuntu:24.04 AS builder
 
-ARG DARKROOM_REPO=https://github.com/ilfrick/darkroom.git
+ARG DARKROOM_REPO=https://github.com/ilfrick/c-41.git
 ARG DARKROOM_BRANCH=master
 ARG CMAKE_BUILD_TYPE=Release
 ARG USE_AI=OFF
@@ -54,7 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust stable — needed so CMake can invoke cargo to build darkroom-core
+# Install Rust stable — needed so CMake can invoke cargo to build c41-core
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal \
     && rm -rf /root/.rustup/toolchains/*/share/doc
@@ -81,11 +81,11 @@ RUN cmake -B build -G Ninja \
     && cmake --build build --parallel ${JOBS} \
     && cmake --install build
 
-# Build the Rust/GTK4 UI binary (darkroom-rs). CMake already invoked cargo to
-# build darkroom-core as a static lib for the C app, but the standalone GTK4
+# Build the Rust/GTK4 UI binary (c41-rs). CMake already invoked cargo to
+# build c41-core as a static lib for the C app, but the standalone GTK4
 # front-end is a separate workspace binary that must be built explicitly. It
-# lands at /src/target/release/darkroom-rs and is copied into the runtime stage.
-RUN cargo build --release -p darkroom --bin darkroom-rs
+# lands at /src/target/release/c41-rs and is copied into the runtime stage.
+RUN cargo build --release -p c41 --bin c41-rs
 
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
 # KasmVNC provides browser-accessible GUI (same approach as linuxserver/darktable)
@@ -94,7 +94,7 @@ FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
 LABEL maintainer="darkroom-project" \
       org.opencontainers.image.title="Darkroom" \
       org.opencontainers.image.description="Lightroom-competitive photo editor with GPU acceleration" \
-      org.opencontainers.image.source="https://github.com/ilfrick/darkroom"
+      org.opencontainers.image.source="https://github.com/ilfrick/c-41"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -109,7 +109,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpugixml1v5 libraw23 librsvg2-2 libsqlite3-0 libtiff6 \
     libwebp7 libx11-6 libxml2 zlib1g libsdl2-2.0-0 \
     libsecret-1-0 lua5.4 \
-    # GTK4 + libadwaita runtime for the Rust UI (darkroom-rs).
+    # GTK4 + libadwaita runtime for the Rust UI (c41-rs).
     # adwaita-icon-theme: symbolic icons libadwaita widgets draw (else blank glyphs).
     # gsettings-desktop-schemas: libadwaita reads org.gnome.desktop.interface; a
     #   missing schema makes GLib abort, so ship it even though we force no theme.
@@ -133,11 +133,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /opt/darkroom /opt/darkroom
 
 # Copy the Rust/GTK4 UI binary (the front-end launched by the desktop session)
-COPY --from=builder /src/target/release/darkroom-rs /usr/local/bin/darkroom-rs
+COPY --from=builder /src/target/release/c41-rs /usr/local/bin/c41-rs
 
 # Make darkroom binaries available system-wide. darkroom-cli is retained (the
 # Rust UI shells out to it for export/format paths); the C darkroom GUI stays
-# installed too, though the desktop session now launches the Rust darkroom-rs.
+# installed too, though the desktop session now launches the Rust c41-rs.
 RUN ln -s /opt/darkroom/bin/darktable /usr/local/bin/darkroom \
     && ln -s /opt/darkroom/bin/darktable-cli /usr/local/bin/darkroom-cli \
     && ldconfig
@@ -157,7 +157,7 @@ ENV XDG_DATA_DIRS=/opt/darkroom/share:/usr/share:/usr/local/share
 ENV DARKROOM_DATADIR=/opt/darkroom/share/darktable
 ENV DARKROOM_CONFIGDIR=/config/darkroom
 ENV DARKROOM_CACHEDIR=/config/cache
-# The Rust UI (darkroom-rs) reads its catalog from this SQLite file — the same
+# The Rust UI (c41-rs) reads its catalog from this SQLite file — the same
 # library.db the C darktable writes under its configdir, so both share a catalog.
 ENV DARKROOM_LIBRARY_DB=/config/darkroom/library.db
 # Force GTK4's software (Cairo) renderer. KasmVNC provides only a software X

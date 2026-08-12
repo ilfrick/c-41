@@ -28,10 +28,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # darkroom-ui pulls in gtk4 + libadwaita; without their system dev
+      # c41-ui pulls in gtk4 + libadwaita; without their system dev
       # packages cargo can't even type-check the workspace. Cairo / pango /
       # gdk-pixbuf / graphene cover the transitive crates; clang/libclang are
-      # for any future bindgen consumer (darkroom-sys may add them).
+      # for any future bindgen consumer (c41-sys may add them).
       - name: Install GTK4 + Adwaita system deps
         run: |
           sudo apt-get update
@@ -57,7 +57,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # `cargo check` proves the whole workspace type-checks (including the
-      # GTK4 darkroom-ui crate and the darkroom-rs binary).
+      # GTK4 c41-ui crate and the c41-rs binary).
       - name: cargo check
         run: cargo check --workspace
 
@@ -75,7 +75,7 @@ jobs:
         run: cargo clippy --workspace
 
       # Cargo-native build of the standalone GTK4 app binary (milestone 5 —
-      # retire CMake): guarantees the real, shippable `darkroom-rs` links with
+      # retire CMake): guarantees the real, shippable `c41-rs` links with
       # pure cargo + system GTK4 (no CMake, no C darktable). `cargo check` only
       # type-checks (no link), and `cargo test` links `main.rs` only as a
       # zero-test harness under `--cfg test` — it never produces the real
@@ -85,4 +85,4 @@ jobs:
       # dep rlibs `cargo test --release` already built (marginal cost ≈ the link,
       # not a full release codegen).
       - name: cargo-native app binary build
-        run: cargo build --release -p darkroom --bin darkroom-rs
+        run: cargo build --release -p c41 --bin c41-rs
