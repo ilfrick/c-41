@@ -19,6 +19,7 @@ pub mod pipeline;
 pub mod raw;
 pub mod rawimage;
 pub mod roi;
+pub mod splines;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;

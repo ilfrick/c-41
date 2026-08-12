@@ -335,6 +335,12 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if vignette {
         return "Vignetting";
     }
+    let lowlight = old.lowlight_on != new.lowlight_on
+        || old.lowlight_blueness != new.lowlight_blueness
+        || old.lowlight_transition != new.lowlight_transition;
+    if lowlight {
+        return "Lowlight vision";
+    }
     "Edit"
 }
 
@@ -488,6 +494,10 @@ mod tests {
             describe_change(&base, &PreviewParams { vignette_scale: 60.0, ..d() }),
             "Vignetting"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { lowlight_blueness: 20.0, ..d() }),
+            "Lowlight vision"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -567,6 +577,9 @@ mod tests {
             vignette_center_x: _,
             vignette_center_y: _,
             vignette_shape: _,
+            lowlight_on: _,
+            lowlight_blueness: _,
+            lowlight_transition: _,
         } = PreviewParams::default();
     }
 
@@ -646,7 +659,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 428);
+        assert_eq!(PreviewParams::default().encode().len(), 457);
     }
 
     #[test]

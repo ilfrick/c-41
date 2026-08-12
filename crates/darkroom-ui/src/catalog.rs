@@ -90,6 +90,7 @@ static CATALOG: &[ModuleGroup] = &[
                 m("Soften", false),
                 m("Highpass", false),
                 m("Lowpass", false),
+                m("Lowlight vision", false),
                 m("Monochrome", false),
                 m("Split-toning", false),
                 m("Graduated density", false),

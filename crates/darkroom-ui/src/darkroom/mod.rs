@@ -1855,6 +1855,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
+                "Lowlight vision" => pg.add(&lowlight_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
                 other => match elsewhere_hint(other) {
@@ -1941,7 +1942,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2223,6 +2224,34 @@ fn vignette_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.vignette_center_x = v);
             add_param_slider(e, ctx, "Centre Y", -1.0, 1.0, 0.01, p0.vignette_center_y as f64,
                 |p, v| p.vignette_center_y = v);
+        })
+}
+
+/// Lowlight vision module: enable switch gates `lowlight_on`; a blue-shift
+/// slider plus the six transition bands, which set how strongly the scotopic
+/// (rod) response is mixed in at each luminance — band 0 is the darkest zone,
+/// band 5 the brightest. darktable draws these as a curve widget; six sliders
+/// carry the same parameters until a curve editor exists.
+fn lowlight_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Lowlight vision", "scotopic night vision", p0.lowlight_on,
+        |p, on| p.lowlight_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Blue shift", 0.0, 100.0, 1.0, p0.lowlight_blueness as f64,
+                |p, v| p.lowlight_blueness = v);
+            // 0.5 across all bands is darktable's default (an even blend).
+            add_param_slider(e, ctx, "Zone 1 (dark)", 0.0, 1.0, 0.01, p0.lowlight_transition[0] as f64,
+                |p, v| p.lowlight_transition[0] = v);
+            add_param_slider(e, ctx, "Zone 2", 0.0, 1.0, 0.01, p0.lowlight_transition[1] as f64,
+                |p, v| p.lowlight_transition[1] = v);
+            add_param_slider(e, ctx, "Zone 3", 0.0, 1.0, 0.01, p0.lowlight_transition[2] as f64,
+                |p, v| p.lowlight_transition[2] = v);
+            add_param_slider(e, ctx, "Zone 4", 0.0, 1.0, 0.01, p0.lowlight_transition[3] as f64,
+                |p, v| p.lowlight_transition[3] = v);
+            add_param_slider(e, ctx, "Zone 5", 0.0, 1.0, 0.01, p0.lowlight_transition[4] as f64,
+                |p, v| p.lowlight_transition[4] = v);
+            add_param_slider(e, ctx, "Zone 6 (bright)", 0.0, 1.0, 0.01, p0.lowlight_transition[5] as f64,
+                |p, v| p.lowlight_transition[5] = v);
         })
 }
 

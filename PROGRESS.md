@@ -196,3 +196,41 @@ working). Binary deployed to the running container.
 properties that follow from position-dependence: corner darker than centre,
 deterministic for a given rectangle, and falloff varying along x (which a
 per-band `h = 1` run would collapse).
+
+---
+
+## 2026-08-12 09:05 UTC — m4-110: Lowlight vision live preview stage
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** Wired the lowlight IOP (scotopic / "night vision") into the preview
+pipeline — the **18th** live module.
+- **`darkroom-core/src/splines.rs` (new)**: the cubic-spline machinery is lifted
+  out of `iop::colorzones` into a shared module. lowlight needed the same
+  Catmull-Rom code, and a second copy would mean a fix to the interpolation
+  reaching only one caller.
+- `iop/lowlight.rs`: `build_transition_lut()`, porting `commit_params` plus the
+  **V1** sampler (`CurveDataSample`, via `dt_draw_curve_calc_values`). V1 differs
+  from the V2 sampler colorzones uses in two ways that matter: it rounds with a
+  truncating `+ 0.5` rather than `round()`, and it does not clamp to
+  `[min_y, max_y]` inside the loop. The *spline* is identical — V1's
+  `catmull_rom_set` computes exactly the non-periodic tangents of
+  `Catmull_Rom_spline::init` — which is why the shared module works for both.
+  The two padding anchors `commit_params` wraps around the 6 user nodes are
+  reproduced, including darktable's asymmetric choice of which y each takes.
+- `pipeline.rs`: `Stage::Lowlight` — Lab-domain, pixel-local.
+- `preview.rs`: blueness + 6 transition bands; ENCODE_VERSION 12→13, len
+  428→457. Pushed at iop_order.c pos 63 (between colorize 62 and monochrome 64).
+- `catalog.rs`: added "Lowlight vision" — **without this the module renders
+  inert**, since the panel dispatches on the catalogue label.
+- `history.rs` group; `darkroom/mod.rs` module row (blue shift + 6 zone sliders).
+
+**Verified.** `scripts/ci-local.sh` (all four steps); 978 tests (+4). Visually
+checked the actual output: neutral greys shift blue (R down, B up — the Purkinje
+shift), black stays black, and a saturated red desaturates hard toward luminance
+(0.30,0.02,0.02 → 0.159,0.023,0.033), which is right because rods carry no
+colour.
+
+**Notes.** Two new LUT tests pin the curve: flat 0.5 at the defaults, and
+monotonic for a monotonic ramp — the latter is what catches a padding-anchor or
+tangent mistake, which shows up as a dip near index 0.

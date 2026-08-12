@@ -55,6 +55,74 @@ fn lut_lookup(lut: &[f32; 65536], i: f32) -> f32 {
 
 /// `lut` must have exactly 65536 entries.
 #[inline]
+/// Build the 65536-entry transition LUT from the 6 band nodes, porting
+/// lowlight.c `commit_params` + the **V1** sampler (`CurveDataSample` in
+/// `src/common/curve_tools.c`, reached via `dt_draw_curve_calc_values`).
+///
+/// Two things differ from the V2 sampler used by colorzones, and both matter:
+/// V1 rounds with a truncating `+ 0.5` rather than `round()`, and it does not
+/// clamp the interpolated value to `[min_y, max_y]` before storing. The spline
+/// itself is the same — V1's `catmull_rom_set` computes exactly the non-periodic
+/// tangents of `Catmull_Rom_spline::init` — so the shared `crate::splines`
+/// machinery is reused.
+///
+/// `commit_params` wraps the 6 user nodes in two padding anchors (one before,
+/// one after) so the curve extends past the [0,1] domain; those are reproduced
+/// here, including darktable's asymmetric choice of which y each takes.
+pub fn build_transition_lut(transition_x: &[f32; 6], transition_y: &[f32; 6]) -> Box<[f32; 65536]> {
+    use crate::splines::{compute_catmull_rom_tangents, eval_knots, Knot};
+    const BANDS: usize = 6;
+    const RES: usize = 0x10000;
+
+    // Padding anchors, per commit_params: the leading one takes x[BANDS-2] - 1
+    // with y[0]; the trailing one x[1] + 1 with y[BANDS-1].
+    let mut knots: Vec<Knot> = Vec::with_capacity(BANDS + 2);
+    knots.push(Knot { x: transition_x[BANDS - 2] - 1.0, y: transition_y[0], dy: 0.0 });
+    for k in 0..BANDS {
+        knots.push(Knot { x: transition_x[k], y: transition_y[k], dy: 0.0 });
+    }
+    knots.push(Knot { x: transition_x[1] + 1.0, y: transition_y[BANDS - 1], dy: 0.0 });
+
+    knots.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+    compute_catmull_rom_tangents(&mut knots, false);
+
+    let n = knots.len();
+    let x_lim = (knots[0].x, knots[n - 1].x);
+    // V1 does not clamp inside the loop, so the evaluator must not either;
+    // an effectively infinite y window reproduces that.
+    let y_lim = (f32::NEG_INFINITY, f32::INFINITY);
+
+    let out_res = RES as f32;
+    let res = 1.0f32 / (RES as f32 - 1.0);
+    let first_x = (knots[0].x * (RES as f32 - 1.0)) as i32;
+    let first_y = (knots[0].y * (out_res - 1.0)) as i32;
+    let last_x = (knots[n - 1].x * (RES as f32 - 1.0)) as i32;
+    let last_y = (knots[n - 1].y * (out_res - 1.0)) as i32;
+    let (min_y, max_y) = (0i32, (out_res - 1.0) as i32);
+
+    let mut lut: Box<[f32; 65536]> = vec![0.0f32; RES]
+        .into_boxed_slice()
+        .try_into()
+        .expect("65536-element vec converts to a fixed-size array");
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let ii = i as i32;
+        let val = if ii < first_x {
+            first_y
+        } else if ii > last_x {
+            last_y
+        } else {
+            let s = eval_knots(&knots, i as f32 * res, x_lim, y_lim, false);
+            // V1's truncating `+ 0.5`, not round().
+            (s * (out_res - 1.0) + 0.5) as i32
+        }
+        .clamp(min_y, max_y);
+        // dt_draw_curve_smaple_values: min + (max-min) * sample / 0x10000,
+        // with min=0, max=1 for this module.
+        *slot = val as f32 / out_res;
+    }
+    lut
+}
+
 pub fn process_pixels(input: &[f32], output: &mut [f32], blueness: f32, lut: &[f32; 65536]) {
     const COEFF: f32 = 0.5;
     const THRESHOLD: f32 = 0.01;
@@ -109,6 +177,45 @@ pub unsafe extern "C" fn darkroom_lowlight_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transition_lut_at_defaults_is_flat_half() {
+        // darktable's init(): 6 bands at x = k/5, every y = 0.5. A Catmull-Rom
+        // through co-linear points is that same constant, so the whole LUT
+        // should read 0.5 — the "no transition" state where the module blends
+        // scotopic and photopic evenly at every luminance.
+        let x = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+        let y = [0.5f32; 6];
+        let lut = build_transition_lut(&x, &y);
+        for i in [0usize, 1, 1000, 32768, 65535] {
+            assert!(
+                (lut[i] - 0.5).abs() < 1e-3,
+                "lut[{i}] = {} should be ~0.5 at the defaults", lut[i]
+            );
+        }
+    }
+
+    #[test]
+    fn transition_lut_follows_the_band_nodes() {
+        // A ramp from 0 to 1 across the bands must come out monotonically
+        // increasing, near 0 at the bottom and near 1 at the top. This is what
+        // catches a padding-anchor or tangent mistake: a wrong leading anchor
+        // shows up as a non-monotonic dip near index 0.
+        let x = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+        let y = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+        let lut = build_transition_lut(&x, &y);
+        assert!(lut[0] < 0.05, "bottom should be near 0: {}", lut[0]);
+        assert!(lut[65535] > 0.95, "top should be near 1: {}", lut[65535]);
+        let mut prev = lut[0];
+        for i in (0..65536).step_by(256) {
+            assert!(
+                lut[i] >= prev - 1e-3,
+                "LUT must be monotonic for a monotonic ramp; dipped at {i}: {} < {prev}", lut[i]
+            );
+            prev = lut[i];
+        }
+        assert!(lut.iter().all(|v| v.is_finite()), "LUT holds a non-finite entry");
+    }
 
     fn flat_lut(v: f32) -> Box<[f32; 65536]> {
         Box::new([v; 65536])

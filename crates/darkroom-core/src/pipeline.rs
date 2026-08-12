@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, invert, levels, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, invert, levels, lowlight, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -199,6 +199,16 @@ pub enum Stage {
         /// Skip the [0,1] clamp (darktable's "unbound" path).
         unbound: bool,
     },
+    /// Scotopic ("night vision") simulation (lowlight.c): blends a blue-shifted
+    /// rod-vision response against the normal photopic image, mixed per pixel by
+    /// a luminance-driven transition curve. `lut` is the 65536-entry curve from
+    /// [`lowlight::build_transition_lut`]; `blueness` is the 0..100 blue shift.
+    /// Lab-domain, so it needs the buffer's working space. **Pixel-local**.
+    Lowlight {
+        blueness: f32,
+        lut: Vec<f32>,
+        space: ColorSpace,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -243,6 +253,7 @@ impl Stage {
             Stage::ColorZones { .. } => "colorzones",
             Stage::Levels { .. } => "levels",
             Stage::Vignette { .. } => "vignette",
+            Stage::Lowlight { .. } => "lowlight",
         }
     }
 
@@ -285,6 +296,9 @@ impl Stage {
             // Levels is pixel-local: a per-pixel tone-curve lookup on L (with
             // a/b scaled by the same ratio), no neighbour reads.
             Stage::Levels { .. } => true,
+            // Lowlight is pixel-local: a per-pixel scotopic/photopic blend
+            // driven by that pixel's own luminance, no neighbour reads.
+            Stage::Lowlight { .. } => true,
             // Sharpen reads a spatial neighbourhood → NOT pixel-local, so
             // `process` runs it on the whole buffer (serial path) where (w,h) is
             // the true image rectangle, never a band's pixel run.
@@ -318,6 +332,8 @@ impl Stage {
             Stage::ColorZones { space, .. } => Some(*space),
             // Levels works on Lab L (+ proportional a/b), so it too must agree.
             Stage::Levels { space, .. } => Some(*space),
+            // Lowlight works in Lab (via XYZ), so it must agree too.
+            Stage::Lowlight { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -684,6 +700,41 @@ impl Stage {
                 }
                 let mut lab_out = vec![0.0f32; n * 4];
                 levels::process_pixels(&lab_in, &mut lab_out, black, range, inv_gamma, lut_arr);
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Lowlight (lowlight.c) ──────────────────────────────────
+            // Scotopic/photopic blend in Lab, mixed by a luminance-driven
+            // curve. Same RGB↔Lab sandwich as the other Lab-domain stages.
+            Stage::Lowlight { blueness, ref lut, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                // Fixed 65536-entry curve; a wrong length is a caller bug.
+                // Loud in debug, passthrough in release (a panic here would be
+                // inside rayon's for_each_init).
+                debug_assert_eq!(
+                    lut.len(), 65536,
+                    "Stage::Lowlight: LUT must be exactly 65536 entries, got {}", lut.len()
+                );
+                let Ok(lut_arr): Result<&[f32; 65536], _> = lut.as_slice().try_into() else {
+                    output.copy_from_slice(input);
+                    return;
+                };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                lowlight::process_pixels(&lab_in, &mut lab_out, blueness, lut_arr);
                 for p in 0..n {
                     let i = p * 4;
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
@@ -1086,6 +1137,9 @@ mod tests {
             Stage::Levels {
                 black: 0.0, range: 1.0, inv_gamma: 1.0,
                 lut: vec![0.0; 65536], space: ColorSpace::LinearSrgb,
+            },
+            Stage::Lowlight {
+                blueness: 0.0, lut: vec![0.5; 65536], space: ColorSpace::LinearSrgb,
             },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());

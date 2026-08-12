@@ -162,6 +162,13 @@ pub struct PreviewParams {
     pub vignette_center_y: f32,
     /// Shape exponent, 0..5 (1 = ellipse; higher = squarer).
     pub vignette_shape: f32,
+    /// Lowlight (scotopic "night vision") stage on/off.
+    pub lowlight_on: bool,
+    /// Blue shift applied to the scotopic response, 0..100.
+    pub lowlight_blueness: f32,
+    /// Transition-curve band heights, 6 nodes at x = k/5, each 0..1.
+    /// 0.5 everywhere = an even scotopic/photopic blend at every luminance.
+    pub lowlight_transition: [f32; 6],
 }
 
 impl Default for PreviewParams {
@@ -255,6 +262,11 @@ impl Default for PreviewParams {
             vignette_center_x: 0.0,
             vignette_center_y: 0.0,
             vignette_shape: 1.0,
+            // darktable defaults (lowlight.c init): off, no blue shift, all six
+            // transition bands at 0.5.
+            lowlight_on: false,
+            lowlight_blueness: 0.0,
+            lowlight_transition: [0.5; 6],
         }
     }
 }
@@ -322,12 +334,16 @@ impl PreviewParams {
         // Vignette with both strengths at 0 leaves every pixel untouched (the
         // weight still varies, but it scales nothing); otherwise it always
         // changes the image, so on == off is the only other no-op.
+        // Lowlight always blends toward the scotopic response while enabled —
+        // even a flat 0.5 curve is a real 50% mix — so on == off is the only
+        // no-op guard.
+        let lowlight_identity = !self.lowlight_on;
         let vignette_identity = !self.vignette_on
             || (self.vignette_brightness == 0.0 && self.vignette_saturation == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
-            && levels_identity && vignette_identity
+            && levels_identity && vignette_identity && lowlight_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -350,6 +366,7 @@ impl PreviewParams {
             colorzones_on: false,
             levels_on: false,
             vignette_on: false,
+            lowlight_on: false,
             ..*self
         }
     }
@@ -361,7 +378,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on] {
             v.push(b as u8);
         }
         for f in [
@@ -392,6 +409,9 @@ impl PreviewParams {
             self.vignette_scale, self.vignette_falloff,
             self.vignette_brightness, self.vignette_saturation,
             self.vignette_center_x, self.vignette_center_y, self.vignette_shape,
+            self.lowlight_blueness,
+            self.lowlight_transition[0], self.lowlight_transition[1], self.lowlight_transition[2],
+            self.lowlight_transition[3], self.lowlight_transition[4], self.lowlight_transition[5],
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -405,9 +425,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..16];
-        // length is checked above, so exactly 103 f32 chunks follow
-        let f: Vec<f32> = bytes[16..]
+        let bools = &bytes[1..17];
+        // length is checked above, so exactly 110 f32 chunks follow
+        let f: Vec<f32> = bytes[17..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -458,6 +478,9 @@ impl PreviewParams {
             vignette_scale: f[96], vignette_falloff: f[97],
             vignette_brightness: f[98], vignette_saturation: f[99],
             vignette_center_x: f[100], vignette_center_y: f[101], vignette_shape: f[102],
+            lowlight_on: bools[15] != 0,
+            lowlight_blueness: f[103],
+            lowlight_transition: [f[104], f[105], f[106], f[107], f[108], f[109]],
         })
     }
 
@@ -688,6 +711,21 @@ impl PreviewParams {
                 compress: (self.split_compress / 110.0) / 2.0,
             });
         }
+        // Lowlight (iop_order.c pos 63, between colorize 62 and monochrome 64)
+        // — a display-referred creative module, so it sits after the tone map
+        // with the others. The transition LUT is built here, as commit_params
+        // does; the stage then does the RGB↔Lab round-trip per pixel.
+        if self.lowlight_on {
+            let x = [0.0f32, 0.2, 0.4, 0.6, 0.8, 1.0]; // bands at k/5, per init()
+            let lut = darkroom_core::iop::lowlight::build_transition_lut(
+                &x, &self.lowlight_transition,
+            );
+            p.push(Stage::Lowlight {
+                blueness: self.lowlight_blueness,
+                lut: (lut as Box<[f32]>).into_vec(),
+                space,
+            });
+        }
         // Vignette (iop_order.c pos 68, last of the creative modules — after
         // splittoning 67). Both strengths at 0 scale nothing, so that is a
         // genuine no-op and is skipped. The falloff geometry is NOT computed
@@ -737,8 +775,8 @@ impl PreviewParams {
 const LEVELS_MIN_RANGE: f32 = 1.0;
 
 const ENCODE_VERSION: u8 = 11;
-/// 1 version byte + 15 bool bytes + 103 little-endian f32.
-const ENCODED_LEN: usize = 1 + 15 + 103 * 4;
+/// 1 version byte + 16 bool bytes + 110 little-endian f32.
+const ENCODED_LEN: usize = 1 + 16 + 110 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1636,6 +1674,8 @@ mod tests {
             vignette_on: true, vignette_scale: 70.0, vignette_falloff: 40.0,
             vignette_brightness: -0.6, vignette_saturation: 0.3,
             vignette_center_x: -0.2, vignette_center_y: 0.15, vignette_shape: 1.4,
+            lowlight_on: true, lowlight_blueness: 30.0,
+            lowlight_transition: [0.1, 0.3, 0.5, 0.6, 0.8, 0.9],
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
