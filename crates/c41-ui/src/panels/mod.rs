@@ -93,8 +93,8 @@ impl LeftPanel {
             .build();
 
         // ── Collections (film rolls) ──────────────────────────────────────
-        content.append(&section_header("Collections"));
-        content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        let collections_header = section_header("Collections");
+        let collections_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
 
         let list_box = gtk4::ListBox::builder()
             .selection_mode(gtk4::SelectionMode::Single)
@@ -169,7 +169,16 @@ impl LeftPanel {
                 folder_filter.as_deref(),
             );
         }));
-        content.append(&list_box);
+        // darktable-style collapsible sections (parity 3.2): each panel section
+        // folds away from its title row, which is what keeps a panel with this
+        // many sections navigable without endless scrolling.
+        content.append(&collapsible_section(
+            &collections_header,
+            &[collections_sep.clone().upcast(), list_box.clone().upcast()]
+                .iter()
+                .collect::<Vec<_>>(),
+            true,
+        ));
 
         // ── Colours (colour-label filter) ─────────────────────────────────
         // The five colour labels as independent checks plus an Any/All combine
@@ -177,8 +186,8 @@ impl LeftPanel {
         // (m4-26). Always present (the colour domain is fixed, not data-driven), so
         // no refresh/visibility toggle is needed. The `color_box` + checks were
         // built above; here we wire the shared reload and append the widgets.
-        content.append(&section_header("Colours"));
-        content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        let colours_header = section_header("Colours");
+        let colours_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
 
         // Shared reload: read the current colour mask off the checks, clear the
         // folder/tag highlights + active tag (a colour view is not a tag filter, so
@@ -231,16 +240,24 @@ impl LeftPanel {
                 }
             });
         }
-        content.append(&mode_toggle);
-        content.append(&color_box);
+        content.append(&collapsible_section(
+            &colours_header,
+            &[
+                colours_sep.clone().upcast::<gtk4::Widget>(),
+                mode_toggle.clone().upcast(),
+                color_box.clone().upcast(),
+            ]
+            .iter()
+            .collect::<Vec<_>>(),
+            true,
+        ));
 
         // ── Tags ──────────────────────────────────────────────────────────
         // The header/separator/box are always present; their visibility tracks
         // whether the library has any user tags (toggled in `refresh_tags`).
         let tags_header = section_header("Tags");
         let tags_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-        content.append(&tags_header);
-        content.append(&tags_sep);
+
 
         let db_tags = db_path.to_string();
         let at_tag = active_tag.clone();
@@ -257,7 +274,13 @@ impl LeftPanel {
                 lighttable_load_by_tag_prefix(&lt_model, &db_tags, &prefix);
             }
         }));
-        content.append(&tag_box);
+        content.append(&collapsible_section(
+            &tags_header,
+            &[tags_sep.clone().upcast::<gtk4::Widget>(), tag_box.clone().upcast()]
+                .iter()
+                .collect::<Vec<_>>(),
+            true,
+        ));
 
         let scroll = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -811,6 +834,58 @@ fn section_header(text: &str) -> gtk4::Label {
         .build();
     header.add_css_class("heading");
     header
+}
+
+/// Wrap a section's widgets in a darktable-style collapsible (parity 3.2).
+///
+/// darktable's panels are stacks of expanders: each section shows a disclosure
+/// triangle and a lowercase title, and clicking the title folds the section
+/// away. Ours were flat labels with the content always visible, which is why a
+/// panel with several sections needs far more scrolling than darktable's.
+///
+/// Takes the already-built header label and content widgets so callers keep
+/// their existing references (the tag section, for one, toggles its header's
+/// visibility) — this only changes where those widgets are *parented*.
+///
+/// `expanded` seeds the state; collapsing is local to the session (persisting it
+/// per section is a follow-up, and would want a prefs key each).
+fn collapsible_section(
+    header: &gtk4::Label,
+    content: &[&gtk4::Widget],
+    expanded: bool,
+) -> gtk4::Box {
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    // The clickable title row: triangle + the caller's label.
+    let title_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    title_row.add_css_class("c41-section-title");
+    let arrow = gtk4::Image::from_icon_name("pan-down-symbolic");
+    arrow.set_valign(gtk4::Align::Center);
+    title_row.append(&arrow);
+    title_row.append(header);
+
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    for w in content {
+        body.append(*w);
+    }
+    body.set_visible(expanded);
+    if !expanded {
+        arrow.set_icon_name(Some("pan-end-symbolic"));
+    }
+
+    let click = gtk4::GestureClick::new();
+    let body_c = body.clone();
+    let arrow_c = arrow.clone();
+    click.connect_released(move |_, _, _, _| {
+        let now = !body_c.is_visible();
+        body_c.set_visible(now);
+        arrow_c.set_icon_name(Some(if now { "pan-down-symbolic" } else { "pan-end-symbolic" }));
+    });
+    title_row.add_controller(click);
+
+    outer.append(&title_row);
+    outer.append(&body);
+    outer
 }
 
 fn load_tags_with_counts(db_path: &str) -> Vec<(u32, String, i64)> {

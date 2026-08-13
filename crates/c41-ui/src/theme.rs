@@ -34,8 +34,6 @@
 //! sliders here are restyled GTK `Scale`s — flat and grey, but still GTK in
 //! shape. Same for the panel *layout*, which is parity 2.2-2.6.
 
-use gtk4::prelude::*;
-
 /// darktable's grey ramp (`data/themes/darktable.css`, `@define-color grey_NN`).
 /// Exposed so widget code can match the chrome without re-deriving hex values.
 pub mod grey {

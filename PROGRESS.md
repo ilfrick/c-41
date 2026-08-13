@@ -425,3 +425,30 @@ range must not divide by zero and put NaN in the draw path.
 **Not attempted:** bauhaus's popup editor, gradient stops, soft/hard bounds and
 the right-hand quad button — a much larger surface, none needed by the current
 module rows.
+
+---
+
+## 2026-08-13 10:40 UTC — parity-3.2: collapsible panel sections
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** The left panel's sections (Collections, Colours, Tags) were flat
+labels with their content permanently expanded. darktable's panels are stacks of
+expanders — a disclosure triangle and a title you click to fold the section
+away — which is what lets it show many sections in one panel.
+
+New `collapsible_section()` in `panels/mod.rs` wraps an existing header label
+plus its content widgets in a title row with a `pan-down`/`pan-end` triangle and
+a click gesture. It takes the *already-built* header so callers keep their
+references — the Tags section toggles its header's visibility from three other
+places, and this only changes where those widgets are parented.
+
+**Verified.** `scripts/ci-local.sh` (all four steps). Deployed, screenshotted,
+then clicked the Collections title: the triangle flipped, the 25-row film-roll
+list folded away, and **Colours became visible without scrolling** — which is
+the concrete payoff, since the colour-label filter was previously below the fold
+on a 1040px-tall window.
+
+**Notes.** Collapse state is per-session. Persisting it would want a prefs key
+per section, alongside the existing panel width/collapsed keys — a follow-up.
+The darkroom module panel already used `adw::ExpanderRow`, so it needed nothing.
