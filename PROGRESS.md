@@ -503,3 +503,41 @@ so there is nowhere to persist a fold state, and a single button does not earn
 one. Still missing from 2.6: darktable's **collection filters** expander, which
 is a real feature (compound filter rules) rather than a re-presentation of
 something we already have.
+
+---
+
+## 2026-08-14 11:15 UTC — m4-112: Contrast/brightness/saturation (colisa)
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** Wired the colisa IOP into the preview pipeline — the **20th** live
+module, and the first to need `dt_iop_estimate_exp`.
+- `c41-core/iop/colisa.rs`: ported `estimate_exp` (src/develop/imageop_math.h:98)
+  — fits `y = y0*(x/x0)^g` with the last sample pinned, averaging `g` over the
+  rest and skipping samples where either log would be undefined. Plus
+  `commit_params()`, porting colisa.c's: rescale contrast/saturation from -1..1
+  to 0..2 and brightness to -2..2, build both 65536-entry LUTs (the two builders
+  were already ported), and fit the unbounded-extrapolation coefficients from
+  four samples at x = 0.7..1.0.
+- `pipeline.rs`: `Stage::Colisa`, Lab-domain and pixel-local. Holds the three
+  sliders rather than the derived LUTs, so the stage stays `PartialEq` and the
+  384 KB of tables are not carried around per stage.
+- `preview.rs`: v14→v15, len 482→495. Pushed at iop_order.c **pos 47** —
+  display-referred, just before tonecurve 48 and levels 49. Upstream's own
+  comment on it is "edit contrast while damaging colour", which is why it lives
+  in that cluster.
+- `catalog.rs` entry under Tone; history group; module row (3 sliders).
+
+**Verified.** `scripts/ci-local.sh` (all four steps); 988 tests (+3). Checked
+the actual numbers rather than trusting green: contrast +0.5 pushes darks down
+(0.10→0.04) and lights up (0.66→0.90) — an S-curve about the midpoint;
+brightness +0.5 lifts everything, most in the shadows; saturation -1 leaves the
+grey ramp untouched and collapses a saturated red to exact neutral
+(R=G=B=0.216), which is the correct b&w endpoint.
+
+**Notes.** `estimate_exp` matters more than it looks: it extrapolates both tone
+curves above 1.0, so without it scene-linear highlights past the LUT's domain
+would clamp. A test recovers a known power law (y = 3x²) to confirm the fit, and
+another pins the fallback — non-positive ratios make the logs undefined, and the
+C returns g = 1 rather than NaN, which would otherwise propagate into every
+extrapolated highlight.

@@ -182,6 +182,12 @@ pub struct PreviewParams {
     /// Filter tint; saturation 0 = a neutral ND filter.
     pub gradnd_hue: f32,
     pub gradnd_saturation: f32,
+    /// Contrast/brightness/saturation (colisa) stage on/off.
+    pub colisa_on: bool,
+    /// All three on darktable's -1..1 scale; 0 is neutral for each.
+    pub colisa_contrast: f32,
+    pub colisa_brightness: f32,
+    pub colisa_saturation: f32,
 }
 
 impl Default for PreviewParams {
@@ -289,6 +295,11 @@ impl Default for PreviewParams {
             gradnd_offset: 50.0,
             gradnd_hue: 0.0,
             gradnd_saturation: 0.0,
+            // darktable defaults (colisa.c): off, all three neutral at 0.
+            colisa_on: false,
+            colisa_contrast: 0.0,
+            colisa_brightness: 0.0,
+            colisa_saturation: 0.0,
         }
     }
 }
@@ -362,13 +373,19 @@ impl PreviewParams {
         let lowlight_identity = !self.lowlight_on;
         // Density 0 makes the filter exp2(0) = 1 everywhere — a true no-op.
         let gradnd_identity = !self.gradnd_on || self.gradnd_density == 0.0;
+        // All three at 0 rescale to contrast 1 / brightness 0 / saturation 1,
+        // which is the identity curve pair and an unchanged a/b.
+        let colisa_identity = !self.colisa_on
+            || (self.colisa_contrast == 0.0
+                && self.colisa_brightness == 0.0
+                && self.colisa_saturation == 0.0);
         let vignette_identity = !self.vignette_on
             || (self.vignette_brightness == 0.0 && self.vignette_saturation == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
             && levels_identity && vignette_identity && lowlight_identity
-            && gradnd_identity
+            && gradnd_identity && colisa_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -393,6 +410,7 @@ impl PreviewParams {
             vignette_on: false,
             lowlight_on: false,
             gradnd_on: false,
+            colisa_on: false,
             ..*self
         }
     }
@@ -404,7 +422,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on] {
             v.push(b as u8);
         }
         for f in [
@@ -440,6 +458,7 @@ impl PreviewParams {
             self.lowlight_transition[3], self.lowlight_transition[4], self.lowlight_transition[5],
             self.gradnd_density, self.gradnd_hardness, self.gradnd_rotation,
             self.gradnd_offset, self.gradnd_hue, self.gradnd_saturation,
+            self.colisa_contrast, self.colisa_brightness, self.colisa_saturation,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -453,9 +472,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..18];
-        // length is checked above, so exactly 116 f32 chunks follow
-        let f: Vec<f32> = bytes[18..]
+        let bools = &bytes[1..19];
+        // length is checked above, so exactly 119 f32 chunks follow
+        let f: Vec<f32> = bytes[19..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -512,6 +531,8 @@ impl PreviewParams {
             gradnd_on: bools[16] != 0,
             gradnd_density: f[110], gradnd_hardness: f[111], gradnd_rotation: f[112],
             gradnd_offset: f[113], gradnd_hue: f[114], gradnd_saturation: f[115],
+            colisa_on: bools[17] != 0,
+            colisa_contrast: f[116], colisa_brightness: f[117], colisa_saturation: f[118],
         })
     }
 
@@ -690,6 +711,23 @@ impl PreviewParams {
                 white_target, black_target, paper_exp, film_fog, film_power, paper_power,
             });
         }
+        // Colisa (iop_order.c pos 47 — display-referred, just before tonecurve
+        // 48 and levels 49). Its own comment upstream is "edit contrast while
+        // damaging colour", which is why it sits in that cluster rather than
+        // with the scene-referred stages. All three sliders at 0 is the identity
+        // curve pair, so the stage is skipped there.
+        if self.colisa_on
+            && (self.colisa_contrast != 0.0
+                || self.colisa_brightness != 0.0
+                || self.colisa_saturation != 0.0)
+        {
+            p.push(Stage::Colisa {
+                contrast: self.colisa_contrast,
+                brightness: self.colisa_brightness,
+                saturation: self.colisa_saturation,
+                space,
+            });
+        }
         // Levels (iop_order.c pos 49, in the display-referred cluster with
         // colisa 47 / tonecurve 48 / shadhi 50) — runs AFTER the tone map, not
         // before it. That ordering is load-bearing, not cosmetic: levels clips
@@ -823,8 +861,8 @@ impl PreviewParams {
 const LEVELS_MIN_RANGE: f32 = 1.0;
 
 const ENCODE_VERSION: u8 = 11;
-/// 1 version byte + 17 bool bytes + 116 little-endian f32.
-const ENCODED_LEN: usize = 1 + 17 + 116 * 4;
+/// 1 version byte + 18 bool bytes + 119 little-endian f32.
+const ENCODED_LEN: usize = 1 + 18 + 119 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1727,6 +1765,8 @@ mod tests {
             gradnd_on: true, gradnd_density: -2.5, gradnd_hardness: 40.0,
             gradnd_rotation: -75.0, gradnd_offset: 35.0,
             gradnd_hue: 0.6, gradnd_saturation: 0.4,
+            colisa_on: true, colisa_contrast: 0.3,
+            colisa_brightness: -0.2, colisa_saturation: 0.45,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);

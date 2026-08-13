@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -218,6 +218,19 @@ pub enum Stage {
     /// would hand each band the wrong coordinates. Holds the user params rather
     /// than the derived geometry, which depends on the buffer dimensions and is
     /// therefore computed in `apply`.
+    /// Contrast / brightness / saturation (colisa.c). Applies two 65536-entry
+    /// tone curves to Lab `L` — contrast then brightness, each with an
+    /// exponential extrapolation above 1.0 — and scales a/b by `saturation`.
+    /// Holds the three user sliders on darktable's -1..1 scale; the LUTs are
+    /// derived in `apply` via [`colisa::commit_params`], which is cheap relative
+    /// to a render and keeps the stage `PartialEq`-comparable.
+    /// Lab-domain, **pixel-local**.
+    Colisa {
+        contrast: f32,
+        brightness: f32,
+        saturation: f32,
+        space: ColorSpace,
+    },
     GraduatedNd {
         /// Filter density in EV, -8..8 (negative brightens).
         density: f32,
@@ -277,6 +290,7 @@ impl Stage {
             Stage::Vignette { .. } => "vignette",
             Stage::Lowlight { .. } => "lowlight",
             Stage::GraduatedNd { .. } => "graduatednd",
+            Stage::Colisa { .. } => "colisa",
         }
     }
 
@@ -319,6 +333,9 @@ impl Stage {
             // Levels is pixel-local: a per-pixel tone-curve lookup on L (with
             // a/b scaled by the same ratio), no neighbour reads.
             Stage::Levels { .. } => true,
+            // Colisa is pixel-local: two per-pixel LUT lookups on L plus an a/b
+            // scale, no neighbour reads.
+            Stage::Colisa { .. } => true,
             // Lowlight is pixel-local: a per-pixel scotopic/photopic blend
             // driven by that pixel's own luminance, no neighbour reads.
             Stage::Lowlight { .. } => true,
@@ -362,6 +379,8 @@ impl Stage {
             Stage::Levels { space, .. } => Some(*space),
             // Lowlight works in Lab (via XYZ), so it must agree too.
             Stage::Lowlight { space, .. } => Some(*space),
+            // Colisa works on Lab L (+ a/b saturation), so it must agree.
+            Stage::Colisa { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -763,6 +782,34 @@ impl Stage {
                 }
                 let mut lab_out = vec![0.0f32; n * 4];
                 lowlight::process_pixels(&lab_in, &mut lab_out, blueness, lut_arr);
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Colisa (colisa.c) ──────────────────────────────────────
+            // Contrast/brightness tone curves on Lab L plus an a/b saturation
+            // scale. Same RGB↔Lab sandwich as the other Lab-domain stages.
+            Stage::Colisa { contrast, brightness, saturation, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let d = colisa::commit_params(contrast, brightness, saturation);
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                colisa::process_pixels(
+                    &lab_in, &mut lab_out,
+                    &d.ctable, &d.cunbounded, &d.ltable, &d.lunbounded, d.saturation,
+                );
                 for p in 0..n {
                     let i = p * 4;
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
@@ -1196,6 +1243,10 @@ mod tests {
             },
             Stage::Lowlight {
                 blueness: 0.0, lut: vec![0.5; 65536], space: ColorSpace::LinearSrgb,
+            },
+            Stage::Colisa {
+                contrast: 0.0, brightness: 0.0, saturation: 0.0,
+                space: ColorSpace::LinearSrgb,
             },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());

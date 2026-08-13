@@ -351,6 +351,13 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if gradnd {
         return "Graduated density";
     }
+    let colisa = old.colisa_on != new.colisa_on
+        || old.colisa_contrast != new.colisa_contrast
+        || old.colisa_brightness != new.colisa_brightness
+        || old.colisa_saturation != new.colisa_saturation;
+    if colisa {
+        return "Contrast brightness saturation";
+    }
     "Edit"
 }
 
@@ -512,6 +519,10 @@ mod tests {
             describe_change(&base, &PreviewParams { gradnd_rotation: 30.0, ..d() }),
             "Graduated density"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { colisa_contrast: 0.4, ..d() }),
+            "Contrast brightness saturation"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -601,6 +612,10 @@ mod tests {
             gradnd_offset: _,
             gradnd_hue: _,
             gradnd_saturation: _,
+            colisa_on: _,
+            colisa_contrast: _,
+            colisa_brightness: _,
+            colisa_saturation: _,
         } = PreviewParams::default();
     }
 
@@ -680,7 +695,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 482);
+        assert_eq!(PreviewParams::default().encode().len(), 495);
     }
 
     #[test]
