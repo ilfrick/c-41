@@ -1366,14 +1366,15 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         let straighten = labeled_slider("Straighten", -45.0, 45.0, 0.1, angle0_deg);
         straighten
             .scale
+            .widget
             .set_tooltip_text(Some("Rotate the image, degrees"));
         let g_ctx = ctx.clone();
         let g_path = file_path.to_string();
         let g_db = db_path.to_string();
         let g_debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        straighten.scale.connect_value_changed(move |sc| {
+        straighten.scale.connect_value_changed(move |v| {
             let mut geom = g_ctx.geometry.get();
-            geom.angle = straighten_deg_to_rad(sc.value());
+            geom.angle = straighten_deg_to_rad(v);
             g_ctx.geometry.set(geom);
             // Debounce the resample + persist so a drag doesn't thrash them; the
             // last value within the window is the one applied.
@@ -1402,7 +1403,8 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
             .margin_bottom(6)
             .build();
         let rg_ctx = ctx.clone();
-        let rg_scale = straighten.scale.downgrade();
+        // BauhausSlider is Rc-backed and Clone; no GObject weak ref needed.
+        let rg_scale = straighten.scale.clone();
         let rg_crop = crop_area.downgrade();
         let rg_db = db_path.to_string();
         let rg_path = file_path.to_string();
@@ -1410,9 +1412,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
             rg_ctx.geometry.set(Geometry::default());
             // Reflect it on the slider (a no-op notify if already 0); the reset
             // itself applies + persists below, so it doesn't rely on the handler.
-            if let Some(sc) = rg_scale.upgrade() {
-                sc.set_value(0.0);
-            }
+            rg_scale.set_value(0.0);
             crate::persist::save_geometry(&rg_db, &rg_path, &Geometry::default());
             apply_geometry_to_base(&rg_ctx); // re-render the (now un-cropped) frame
             if let Some(area) = rg_crop.upgrade() {
@@ -1741,30 +1741,23 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
 /// single IOP parameter).
 struct LabeledSlider {
     row: gtk4::Box,
-    scale: gtk4::Scale,
+    scale: crate::bauhaus::BauhausSlider,
 }
 
-/// Build a `[label] [────slider────]` row with a value read-out on the right.
+/// Build one darktable-style parameter row.
+///
+/// The label and value are drawn *inside* the control by
+/// [`crate::bauhaus::BauhausSlider`] rather than sitting in a separate label
+/// widget beside a GTK `Scale` — that is what makes darktable's panels read as
+/// dense rows of bars instead of a column of handles. The wrapping `Box` stays
+/// so callers keep appending a single row widget.
 fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> LabeledSlider {
-    let scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, min, max, step);
-    scale.set_value(value);
-    scale.set_hexpand(true);
-    scale.set_draw_value(true);
-    scale.set_value_pos(gtk4::PositionType::Right);
-
-    let lbl = gtk4::Label::new(Some(label));
-    lbl.set_xalign(0.0);
-    // Widest param label is 8 chars ("Compress", "Shad hue"); fixing the column
-    // width keeps every slider track left-aligned across rows.
-    lbl.set_width_chars(8);
-
+    let scale = crate::bauhaus::BauhausSlider::new(label, min, max, step, value);
     let row = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .margin_start(12).margin_end(12).margin_top(4).margin_bottom(4)
+        .margin_start(8).margin_end(8).margin_top(1).margin_bottom(1)
         .build();
-    row.append(&lbl);
-    row.append(&scale);
+    row.append(&scale.widget);
     LabeledSlider { row, scale }
 }
 
@@ -1995,8 +1988,8 @@ fn add_param_slider(
 ) {
     let row = labeled_slider(label, min, max, step, init);
     let ctx_cl = ctx.clone();
-    row.scale.connect_value_changed(move |s| {
-        set(&mut ctx_cl.params.borrow_mut(), s.value() as f32);
+    row.scale.connect_value_changed(move |v| {
+        set(&mut ctx_cl.params.borrow_mut(), v as f32);
         render_preview(&ctx_cl);
     });
     expander.add_row(&row.row);

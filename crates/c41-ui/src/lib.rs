@@ -10,6 +10,7 @@ use glib::clone;
 
 pub mod catalog;
 pub mod crop_overlay;
+pub mod bauhaus;
 pub mod darkroom;
 pub mod theme;
 pub mod dialogs;

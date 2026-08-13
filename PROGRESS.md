@@ -386,3 +386,42 @@ that cannot bias colour judgement, so a stray tint should fail the build.
 "bauhaus" sliders are custom-drawn widgets, not styled GTK ranges, so matching
 them needs new widgets rather than CSS; and the panel *layout* (which modules
 live where) is parity 2.2-2.6, a separate track.
+
+---
+
+## 2026-08-13 09:15 UTC — parity-3.3b: bauhaus-style sliders
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** New `c41-ui/src/bauhaus.rs`: a custom `DrawingArea` slider matching
+darktable's control shape — a flat baseline bar with the filled portion showing
+the value, an equilateral triangle indicator, and **the label and value drawn
+inside the same rectangle** (left and right) rather than a separate label widget
+beside a GTK `Scale`. Geometry follows `src/bauhaus/bauhaus.c`
+`_draw_indicator_shape` (sin = 0.866r, cos = 0.5r).
+
+`labeled_slider` now builds one of these, so all ~60 module sliders change at
+once. The widget mirrors the slice of `gtk4::Scale`'s API the call sites use
+(`value`, `set_value`, `connect_value_changed`), so only three sites needed
+touching — and those only because the callback now receives the value directly
+instead of the widget.
+
+**Why a widget and not CSS:** GTK's `Scale` always renders trough + handle as
+separate nodes and always reserves the handle's width. No stylesheet turns that
+into "text and value inside a filled bar".
+
+**Verified.** `scripts/ci-local.sh` (all four steps); 983 tests (+4). Deployed,
+expanded the Exposure module and looked at it: EV and Black render as darktable
+does, indicator at the right position for each (EV mid-range of -3..3, Black at
+the left of 0..0.2).
+
+**Notes.** First deploy had descenders touching the baseline bar; row height
+26→30 and the text baseline moved up by 1.5×PAD. Four tests cover the pure value
+logic (no display needed): step snapping, clamping, the range→unit mapping, and
+two edge cases worth pinning — snapping must not *overshoot* the bounds (with
+max 1.0 and step 0.3, `round(1.0/0.3)*0.3 = 1.2`), and a degenerate `min == max`
+range must not divide by zero and put NaN in the draw path.
+
+**Not attempted:** bauhaus's popup editor, gradient stops, soft/hard bounds and
+the right-hand quad button — a much larger surface, none needed by the current
+module rows.
