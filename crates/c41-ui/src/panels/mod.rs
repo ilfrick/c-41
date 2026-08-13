@@ -178,6 +178,8 @@ impl LeftPanel {
                 .iter()
                 .collect::<Vec<_>>(),
             true,
+            db_path,
+            COLLECTIONS_SECTION_PREF_KEY,
         ));
 
         // ── Colours (colour-label filter) ─────────────────────────────────
@@ -250,6 +252,8 @@ impl LeftPanel {
             .iter()
             .collect::<Vec<_>>(),
             true,
+            db_path,
+            COLOURS_SECTION_PREF_KEY,
         ));
 
         // ── Tags ──────────────────────────────────────────────────────────
@@ -280,6 +284,8 @@ impl LeftPanel {
                 .iter()
                 .collect::<Vec<_>>(),
             true,
+            db_path,
+            TAGS_SECTION_PREF_KEY,
         ));
 
         let scroll = gtk4::ScrolledWindow::builder()
@@ -709,6 +715,13 @@ impl TagPanel {
 /// row it is itself moving. The parent prefix is preserved verbatim; a top-level
 /// tag (no `|`) just becomes `new_segment`. Kept as a free function so the
 /// (display-bound) rename popover has a unit-testable core.
+/// `c41_ui_prefs` keys for the left panel's section fold state (parity 3.2).
+/// One per section; the value uses the same `shown`/`hidden` encoding as the
+/// side-panel collapse keys in `lib.rs`.
+const COLLECTIONS_SECTION_PREF_KEY: &str = "left_section_collections";
+const COLOURS_SECTION_PREF_KEY: &str = "left_section_colours";
+const TAGS_SECTION_PREF_KEY: &str = "left_section_tags";
+
 fn respliced_tag_path(full_name: &str, new_segment: &str) -> Option<String> {
     let new_segment = new_segment.trim();
     if new_segment.is_empty() || new_segment.contains('|') {
@@ -847,13 +860,26 @@ fn section_header(text: &str) -> gtk4::Label {
 /// their existing references (the tag section, for one, toggles its header's
 /// visibility) — this only changes where those widgets are *parented*.
 ///
-/// `expanded` seeds the state; collapsing is local to the session (persisting it
-/// per section is a follow-up, and would want a prefs key each).
+/// `pref_key` persists the fold state across sessions in `c41_ui_prefs`, using
+/// the same `shown`/`hidden` encoding as the side-panel keys; `default_expanded`
+/// applies on first run or if the stored token is unrecognised. Pass an empty
+/// `db_path` to skip persistence (tests, or a panel built before the DB opens).
 fn collapsible_section(
     header: &gtk4::Label,
     content: &[&gtk4::Widget],
-    expanded: bool,
+    default_expanded: bool,
+    db_path: &str,
+    pref_key: &str,
 ) -> gtk4::Box {
+    // Restore first: a stored token wins over the caller's default.
+    let expanded = if db_path.is_empty() {
+        default_expanded
+    } else {
+        crate::persist::load_ui_pref(db_path, pref_key)
+            .and_then(|t| crate::parse_collapsed_token(&t))
+            .map(|collapsed| !collapsed)
+            .unwrap_or(default_expanded)
+    };
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
     // The clickable title row: triangle + the caller's label.
@@ -876,10 +902,15 @@ fn collapsible_section(
     let click = gtk4::GestureClick::new();
     let body_c = body.clone();
     let arrow_c = arrow.clone();
+    let db = db_path.to_string();
+    let key = pref_key.to_string();
     click.connect_released(move |_, _, _, _| {
         let now = !body_c.is_visible();
         body_c.set_visible(now);
         arrow_c.set_icon_name(Some(if now { "pan-down-symbolic" } else { "pan-end-symbolic" }));
+        if !db.is_empty() {
+            crate::persist::save_ui_pref(&db, &key, crate::collapsed_token(!now));
+        }
     });
     title_row.add_controller(click);
 
@@ -1867,6 +1898,34 @@ mod exif_format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section_pref_keys_are_distinct_and_namespaced() {
+        // One key per section; a collision would make two sections share a fold
+        // state, and an un-namespaced key could clash with an unrelated pref.
+        let keys = [
+            COLLECTIONS_SECTION_PREF_KEY,
+            COLOURS_SECTION_PREF_KEY,
+            TAGS_SECTION_PREF_KEY,
+        ];
+        let uniq: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(uniq.len(), keys.len(), "duplicate section pref key");
+        for k in keys {
+            assert!(k.starts_with("left_section_"), "un-namespaced key: {k}");
+        }
+    }
+
+    #[test]
+    fn section_fold_state_round_trips_through_the_token_encoding() {
+        // collapsible_section stores !expanded and restores !collapsed; pin the
+        // double negation so a future edit can't invert the saved state (which
+        // would silently reopen every section the user closed).
+        for expanded in [true, false] {
+            let tok = crate::collapsed_token(!expanded);
+            let restored = crate::parse_collapsed_token(tok).map(|c| !c);
+            assert_eq!(restored, Some(expanded), "round trip failed for {expanded}");
+        }
+    }
 
     fn t(id: u32, name: &str, count: i64) -> (u32, String, i64) {
         (id, name.to_string(), count)

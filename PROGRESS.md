@@ -452,3 +452,24 @@ on a 1040px-tall window.
 **Notes.** Collapse state is per-session. Persisting it would want a prefs key
 per section, alongside the existing panel width/collapsed keys — a follow-up.
 The darkroom module panel already used `adw::ExpanderRow`, so it needed nothing.
+
+---
+
+## 2026-08-14 08:20 UTC — parity-3.2b: persist section fold state
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** `collapsible_section()` now takes a `db_path` and pref key and stores
+the fold state in `c41_ui_prefs`, reusing the `shown`/`hidden` token encoding the
+side-panel collapse keys already use. Three keys: `left_section_collections`,
+`left_section_colours`, `left_section_tags`. An empty `db_path` skips persistence
+(for panels built before the DB opens).
+
+**Verified.** `scripts/ci-local.sh` (all four steps); 985 tests (+2). Collapsed
+Collections, restarted the app, and confirmed it came back collapsed with Colours
+still expanded.
+
+**Notes.** The stored value is `!expanded` and restore is `!collapsed`; a test
+pins that double negation, because inverting it would silently reopen every
+section the user had closed — the kind of bug that looks like "it just doesn't
+remember" rather than an error.
