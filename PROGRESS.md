@@ -473,3 +473,33 @@ still expanded.
 pins that double negation, because inverting it would silently reopen every
 section the user had closed — the kind of bug that looks like "it just doesn't
 remember" rather than an error.
+
+---
+
+## 2026-08-14 09:30 UTC — parity-2.6a: Import and Export panel sections
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** darktable's left panel opens with an import module and its right panel
+ends with an export module. Ours had both only as header buttons, so the panels
+didn't match and the actions were less discoverable.
+
+- **Import** section at the top of the left panel (collapsible, persisted under
+  `left_section_import`), with an "Add images…" button.
+- **Export** section at the foot of the right panel, with "Export selected…".
+
+Both call `set_action_name` on the **existing** `win.import` /
+`win.export-selected` actions rather than duplicating the dialog code — one
+implementation, one behaviour, and the Ctrl+I / Ctrl+E accelerators keep working
+unchanged. GTK resolves action names through the widget hierarchy at activation
+time, so no window reference is needed in the panel constructors.
+
+**Verified.** `scripts/ci-local.sh` (all four steps). Deployed and screenshotted
+both panels: Import sits above Collections on the left, Export below Tags on the
+right, and Collections was still remembered as collapsed from the previous run.
+
+**Notes.** Export is not collapsible — `MetadataPanel::new()` takes no `db_path`,
+so there is nowhere to persist a fold state, and a single button does not earn
+one. Still missing from 2.6: darktable's **collection filters** expander, which
+is a real feature (compound filter rules) rather than a re-presentation of
+something we already have.

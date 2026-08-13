@@ -59,7 +59,7 @@ severity-2 items are "attach a panel to code that already works", not new maths.
 | 2.3 | **Metadata is read-only.** darktable has a *metadata editor* (title, creator, rights…). Ours displays EXIF and nothing is writable. | m4-100 shipped the read side |
 | 2.4 | **No styles.** darktable's "styles" panel (save a set of edits, apply to many images) has no equivalent. | |
 | 2.5 | **No colour-label quick filter in either bar.** darktable has colour circles in the top bar *and* the bottom bar. Ours filters colours only from the left panel. Deliberately deferred (would duplicate the left-panel selector — reconcile first). | |
-| 2.6 | **No collection-filters module** (darktable's "collection filters" expander), and no *import* module in the left panel — import is a header button only. | |
+| 2.6 | **Partly fixed 2026-08-14** — ~~no *import* module in the left panel~~ (Import section added at the top, and an Export section at the foot of the right panel; both activate the existing `win.import` / `win.export-selected` actions rather than duplicating the dialogs). Still missing: darktable's **collection filters** expander. | |
 | 2.7 | **No geotagging, no neural-restore panel.** | low priority; listed for completeness |
 
 ## Severity 3 — parity polish

@@ -92,6 +92,33 @@ impl LeftPanel {
             .spacing(0)
             .build();
 
+        // ── Import (parity 2.6) ───────────────────────────────────────────
+        // darktable's left panel opens with an import module; ours had import
+        // only as a header button, so the panel didn't match and the action was
+        // less discoverable. This surfaces the SAME `win.import` action rather
+        // than duplicating the dialog — one code path, one behaviour.
+        //
+        // `set_action_name` resolves through the widget hierarchy at activation
+        // time, so it binds correctly once the panel is inside the window; no
+        // window reference is needed here.
+        let import_header = section_header("Import");
+        let import_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        let import_btn = gtk4::Button::builder()
+            .label("Add images…")
+            .tooltip_text("Import images into the library (Ctrl+I)")
+            .margin_start(10).margin_end(10).margin_top(4).margin_bottom(6)
+            .build();
+        import_btn.set_action_name(Some("win.import"));
+        content.append(&collapsible_section(
+            &import_header,
+            &[import_sep.clone().upcast::<gtk4::Widget>(), import_btn.clone().upcast()]
+                .iter()
+                .collect::<Vec<_>>(),
+            true,
+            db_path,
+            IMPORT_SECTION_PREF_KEY,
+        ));
+
         // ── Collections (film rolls) ──────────────────────────────────────
         let collections_header = section_header("Collections");
         let collections_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
@@ -718,6 +745,7 @@ impl TagPanel {
 /// `c41_ui_prefs` keys for the left panel's section fold state (parity 3.2).
 /// One per section; the value uses the same `shown`/`hidden` encoding as the
 /// side-panel collapse keys in `lib.rs`.
+const IMPORT_SECTION_PREF_KEY: &str = "left_section_import";
 const COLLECTIONS_SECTION_PREF_KEY: &str = "left_section_collections";
 const COLOURS_SECTION_PREF_KEY: &str = "left_section_colours";
 const TAGS_SECTION_PREF_KEY: &str = "left_section_tags";
@@ -1245,6 +1273,23 @@ impl MetadataPanel {
                 entry.set_text("");
             });
         }
+
+        // ── Export (parity 2.6) ───────────────────────────────────────────
+        // darktable's right panel ends with an export module. Ours had export
+        // only as a header button; this surfaces the same `win.export-selected`
+        // action so there is one implementation, and puts it where a darktable
+        // user looks for it. Pushed to the bottom so it does not displace the
+        // metadata the panel exists to show.
+        let export_header = section_header("Export");
+        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        panel.append(&export_header);
+        let export_btn = gtk4::Button::builder()
+            .label("Export selected…")
+            .tooltip_text("Export the selected images (Ctrl+E)")
+            .margin_start(10).margin_end(10).margin_top(2).margin_bottom(8)
+            .build();
+        export_btn.set_action_name(Some("win.export-selected"));
+        panel.append(&export_btn);
 
         Self { widget: panel, filename_lbl, folder_lbl, dims_lbl, size_lbl,
                camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
