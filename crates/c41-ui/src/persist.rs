@@ -598,3 +598,292 @@ mod tests {
         assert_eq!(load_history_conn(&db, 42).map(|h| h.len()), Some(1));
     }
 }
+
+// ── Styles (parity 2.4) ──────────────────────────────────────────────────────
+
+/// DDL for the styles table.
+///
+/// darktable stores a style as rows in `style_items`, one per IOP, each holding
+/// that module's `op_params` blob. Our edits are not per-module blobs — they are
+/// a single versioned [`PreviewParams`], which the whole UI, history stack and
+/// export path already round-trip. So a style here is that same blob under a
+/// name, which means saving and applying a style reuse the encode/decode we
+/// already trust rather than a parallel serialisation.
+///
+/// The cost of that choice, stated plainly: a style is **all-or-nothing**. It
+/// carries every module's settings, so applying one replaces the target's whole
+/// edit rather than merging selected modules, which is what darktable's
+/// per-item styles allow. Partial styles want a module mask alongside the blob;
+/// the schema leaves room for it (`modules` is reserved, NULL today) so adding
+/// them later does not need a migration.
+const STYLES_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS main.c41_styles \
+     (name TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '', \
+      params BLOB NOT NULL, modules TEXT)";
+
+/// One saved style.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Style {
+    pub name: String,
+    pub description: String,
+    pub params: PreviewParams,
+}
+
+/// Save (or overwrite) a style. Returns false if the name is blank or the write
+/// fails — the caller surfaces that rather than silently doing nothing.
+pub fn save_style(db_path: &str, name: &str, description: &str, params: &PreviewParams) -> bool {
+    let name = name.trim();
+    if db_path.is_empty() || name.is_empty() {
+        return false;
+    }
+    let Ok(conn) = Connection::open(db_path) else { return false };
+    if conn.execute(STYLES_TABLE_DDL, []).is_err() {
+        return false;
+    }
+    conn.execute(
+        "INSERT INTO main.c41_styles (name, description, params) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(name) DO UPDATE SET description = excluded.description, \
+                                         params = excluded.params",
+        rusqlite::params![name, description, params.encode()],
+    )
+    .is_ok()
+}
+
+/// All styles, name-ordered. Empty on any failure — a missing table just means
+/// none have been saved yet.
+pub fn load_styles(db_path: &str) -> Vec<Style> {
+    if db_path.is_empty() {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open(db_path) else { return Vec::new() };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT name, description, params FROM main.c41_styles ORDER BY name COLLATE NOCASE",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    });
+    let Ok(rows) = rows else { return Vec::new() };
+    rows.flatten()
+        .filter_map(|(name, description, blob)| {
+            // A style written by an older ENCODE_VERSION decodes to None. Skip
+            // it rather than substituting defaults, which would silently apply
+            // a *different* edit than the one the user saved.
+            PreviewParams::decode(&blob).map(|params| Style { name, description, params })
+        })
+        .collect()
+}
+
+/// Delete a style by name. Returns whether a row was removed.
+pub fn delete_style(db_path: &str, name: &str) -> bool {
+    if db_path.is_empty() {
+        return false;
+    }
+    let Ok(conn) = Connection::open(db_path) else { return false };
+    conn.execute(
+        "DELETE FROM main.c41_styles WHERE name = ?1",
+        rusqlite::params![name],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// Apply a style's params to every image in `full_paths`, returning how many
+/// were **actually written**.
+///
+/// The count is writes, not attempts: params are keyed by `imgid`, so a path
+/// that is not in the catalogue (`images` ⋈ `film_rolls`) has nowhere to store
+/// an edit and is skipped. Reporting attempts would let the UI claim "applied
+/// to 5 images" when none were catalogued.
+///
+/// Note this **replaces** the target's params wholesale — see the note on
+/// [`STYLES_TABLE_DDL`].
+pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> usize {
+    if db_path.is_empty() {
+        return 0;
+    }
+    let Ok(conn) = Connection::open(db_path) else { return 0 };
+    let mut written = 0usize;
+    for path in full_paths.iter().filter(|p| !p.is_empty()) {
+        if let Some(imgid) = imgid_for_path(&conn, path) {
+            if save_params_conn(&conn, imgid, &style.params).is_ok() {
+                written += 1;
+            }
+        }
+    }
+    written
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+
+    /// A real temp file, not `:memory:` — the style API takes a path and opens
+    /// its own connection per call, which is exactly the behaviour worth
+    /// testing (an in-memory DB would be a fresh empty database each time).
+    ///
+    /// Deletes any previous file at the path so a crashed run cannot leak state
+    /// into the next; the guard removes it on drop.
+    struct TmpDb(String);
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            // Thread id keeps parallel test threads from sharing a file.
+            p.push(format!("c41-styles-{tag}-{:?}.db", std::thread::current().id()));
+            let path = p.to_string_lossy().into_owned();
+            let _ = std::fs::remove_file(&path);
+            TmpDb(path)
+        }
+    }
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn tmp_db(tag: &str) -> (TmpDb, String) {
+        let g = TmpDb::new(tag);
+        let path = g.0.clone();
+        (g, path)
+    }
+
+    fn params_with(ev: f32) -> PreviewParams {
+        PreviewParams { ev, ..PreviewParams::default() }
+    }
+
+    #[test]
+    fn save_load_round_trips_a_style() {
+        let (_d, db) = tmp_db("roundtrip");
+        assert!(save_style(&db, "Punchy", "high contrast", &params_with(1.5)));
+        let styles = load_styles(&db);
+        assert_eq!(styles.len(), 1);
+        assert_eq!(styles[0].name, "Punchy");
+        assert_eq!(styles[0].description, "high contrast");
+        assert_eq!(styles[0].params.ev, 1.5, "params must survive verbatim");
+    }
+
+    #[test]
+    fn save_overwrites_by_name_rather_than_duplicating() {
+        let (_d, db) = tmp_db("upsert");
+        assert!(save_style(&db, "S", "first", &params_with(1.0)));
+        assert!(save_style(&db, "S", "second", &params_with(2.0)));
+        let styles = load_styles(&db);
+        assert_eq!(styles.len(), 1, "same name must upsert, not duplicate");
+        assert_eq!(styles[0].description, "second");
+        assert_eq!(styles[0].params.ev, 2.0);
+    }
+
+    #[test]
+    fn blank_names_are_rejected() {
+        let (_d, db) = tmp_db("blank");
+        assert!(!save_style(&db, "", "x", &params_with(1.0)));
+        assert!(!save_style(&db, "   ", "x", &params_with(1.0)));
+        assert!(load_styles(&db).is_empty());
+        // Names are trimmed, so " S " and "S" are the same style rather than two
+        // rows that look identical in the list.
+        assert!(save_style(&db, " S ", "", &params_with(1.0)));
+        assert_eq!(load_styles(&db)[0].name, "S");
+    }
+
+    #[test]
+    fn a_style_from_an_incompatible_version_is_skipped_not_defaulted() {
+        // Substituting defaults for an undecodable blob would silently apply a
+        // DIFFERENT edit than the one saved — worse than the style vanishing.
+        let (_d, db) = tmp_db("badver");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(STYLES_TABLE_DDL, []).unwrap();
+        conn.execute(
+            "INSERT INTO main.c41_styles (name, description, params) VALUES ('old', '', ?1)",
+            rusqlite::params![vec![0u8, 1, 2, 3]],
+        )
+        .unwrap();
+        assert!(load_styles(&db).is_empty(), "undecodable style must be skipped");
+    }
+
+    #[test]
+    fn delete_removes_only_the_named_style() {
+        let (_d, db) = tmp_db("delete");
+        save_style(&db, "a", "", &params_with(1.0));
+        save_style(&db, "b", "", &params_with(2.0));
+        assert!(delete_style(&db, "a"));
+        assert!(!delete_style(&db, "a"), "second delete removes nothing");
+        let names: Vec<_> = load_styles(&db).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["b"]);
+    }
+
+    #[test]
+    fn styles_list_is_name_ordered_case_insensitively() {
+        let (_d, db) = tmp_db("order");
+        for n in ["zebra", "Apple", "mango"] {
+            save_style(&db, n, "", &params_with(0.5));
+        }
+        let names: Vec<_> = load_styles(&db).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["Apple", "mango", "zebra"]);
+    }
+
+    /// Params are keyed by imgid, so a target must exist in the catalogue for
+    /// an edit to have anywhere to live. Build the two tables the lookup joins.
+    fn catalogue(db: &str, folder: &str, files: &[&str]) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS main.film_rolls (id INTEGER PRIMARY KEY, folder TEXT);
+             CREATE TABLE IF NOT EXISTS main.images \
+                 (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO main.film_rolls (id, folder) VALUES (1, ?1)",
+            rusqlite::params![folder],
+        )
+        .unwrap();
+        for (i, f) in files.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO main.images (id, film_id, filename) VALUES (?1, 1, ?2)",
+                rusqlite::params![i as i32 + 1, f],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn apply_writes_the_style_to_every_target() {
+        let (_d, db) = tmp_db("apply");
+        catalogue(&db, "/photos", &["a.dng", "b.dng"]);
+        save_style(&db, "S", "", &params_with(2.5));
+        let style = load_styles(&db).remove(0);
+        let targets = vec!["/photos/a.dng".to_string(), "/photos/b.dng".to_string()];
+        assert_eq!(apply_style_to(&db, &targets, &style), 2);
+        for t in &targets {
+            assert_eq!(load_params(&db, t).ev, 2.5, "{t} did not receive the style");
+        }
+    }
+
+    #[test]
+    fn apply_counts_writes_not_attempts() {
+        // An uncatalogued path has no imgid, so its edit has nowhere to go. The
+        // count must reflect that rather than claiming a write that never
+        // happened — the UI reports this number back to the user.
+        let (_d, db) = tmp_db("applycount");
+        catalogue(&db, "/photos", &["a.dng"]);
+        save_style(&db, "S", "", &params_with(1.5));
+        let style = load_styles(&db).remove(0);
+        let targets = vec![
+            "/photos/a.dng".to_string(),
+            "/photos/not-imported.dng".to_string(),
+        ];
+        assert_eq!(apply_style_to(&db, &targets, &style), 1, "only the catalogued image counts");
+        assert_eq!(load_params(&db, "/photos/a.dng").ev, 1.5);
+    }
+
+    #[test]
+    fn apply_skips_empty_paths() {
+        let (_d, db) = tmp_db("applyempty");
+        save_style(&db, "S", "", &params_with(1.0));
+        let style = load_styles(&db).remove(0);
+        assert_eq!(apply_style_to(&db, &["".to_string()], &style), 0);
+    }
+}
