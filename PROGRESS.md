@@ -541,3 +541,88 @@ would clamp. A test recovers a known power law (y = 3x²) to confirm the fit, an
 another pins the fallback — non-positive ratios make the logs undefined, and the
 C returns g = 1 rather than NaN, which would otherwise propagate into every
 extrapolated highlight.
+
+---
+
+## 2026-08-18 15:38 UTC — Styles panel UI (parity 2.4) + GTK4 CSS corrections
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** The UI half of styles. The data layer shipped in `7a6a9744c1` and —
+a process miss worth recording — landed with **no PROGRESS entry and no
+PARITY_AUDIT update**; this entry covers both halves and 2.4 is marked here.
+
+- `panels/mod.rs`: a **Styles** section in the right panel — list, "Save
+  current…", "Apply", delete. `wire_styles()` takes a *getter* for the selected
+  image's path + params, because the panel is built once and the selection
+  changes constantly.
+- `lib.rs`: wires it to `lt_selection` and the existing `make_toast`.
+
+**Resumed into a tree that did not compile.** `theme.rs` had a comment reading
+`"reported min height -4"` *inside* the one `format!` literal that generates the
+whole stylesheet — the double quote closed the string:
+`error: expected ',', found min`. All four CI steps were failing. The sheet is
+~40% comments, so this is a standing trap; the fix uses backticks and says why.
+
+**Two blockers from senior review, both real:**
+
+- **Apply could never fire after choosing a target image.** `update()` rebuilt
+  the styles list on every `selection-changed`, and a wholesale rebuild drops
+  the `ListBox` selection. So "pick style → pick image → Apply" silently
+  no-opped; only style-last worked, the opposite of what the button says. The
+  rebuild was pointless anyway — `c41_styles` is mutated only by the save and
+  delete handlers, and both already refresh. Removed it, and made
+  `refresh_styles_list` selection-preserving as belt-and-braces.
+- **The success path destroyed the user's collection.** `on_applied` called
+  `lighttable_load_from_db`, which is *load the whole library, no folder*: it
+  discarded any active folder/tag/search collection, overwrote `RELOAD_CURRENT`
+  so the next sort re-loaded the wrong view, and reset the selection to image 0.
+  It could not even achieve its stated purpose — thumbnails decode from the
+  file's own bytes via `PixbufLoader` and never consult `PreviewParams`. Replaced
+  with a toast.
+
+Also from review: every failure path now reports through `notify` (`save_style`
+documents "the caller surfaces that"; the caller didn't); Apply reads the target
+path from the getter rather than `ctx`, removing a second source of truth that
+could write onto a stale path once the selection emptied; `wire_styles` is
+guarded against a double call (`connect_clicked` appends, and the panel is
+`Clone`); confirm-on-overwrite and confirm-on-delete, since styles have no
+history stack behind them; the list sits in a height-capped `ScrolledWindow`;
+double-click applies.
+
+**The `reported min height -4` warnings — the previous session blamed the wrong
+rule.** The diff claimed deleting the dead `GtkScale` rules and the
+`switch > slider` constraints was what silenced them. It wasn't: the process
+running that binary still emitted 13 of them. The actual source was
+`scrollbar slider { min-width: 8px; min-height: 8px }` — GTK subtracts the
+node's border and padding from a declared `min-*`, and 8px minus Adwaita's 12px
+is exactly the −4. Colour-only there too: **13 warnings → 0**, still 0 after
+clicking around. The comments now state what was measured; the earlier ones
+asserted a fix that had not happened.
+
+`:root` and `:has()` were separately confirmed dead on this runtime (Ubuntu
+Noble → GTK 4.14 / libadwaita 1.5; `:root` and custom properties arrived in
+4.16), so the accent override never applied and libadwaita's blue survived.
+Replaced with `@define-color`.
+
+**Verified.** `scripts/ci-local.sh` — exit code 0, all four steps, 999 tests.
+Deployed into the running `c-41` container and driven with xdotool: the Styles
+section renders, and clicking **Apply with nothing selected raises the toast
+"Select a style first"** — the notify wiring works end to end where before that
+click was a silent no-op.
+
+**Not verified, deliberately stated.** The save/overwrite/delete **dialogs were
+not confirmed visually**: `adw::AlertDialog` constructs (new layout warnings
+appear on click) but does not appear in the KasmVNC framebuffer — the known
+black-dialog issue in this container, not something this change introduced. The
+selection-preserving rebuild also has **no unit test**: the crate's suite is
+display-free (no `gtk4::init()` anywhere), so a `ListBox` cannot be built in a
+test. The primary fix — deleting the rebuild — is what actually restores the
+workflow.
+
+**Notes.** The denylist test that pins `:root`/`:has()` now strips `/* … */`
+first: it was scanning its own comments, which forced every warning to be
+phrased around naming its subject. It is a proxy, not a proof — the real check
+is `CssProvider::load_from_string` with `connect_parsing_error`, which needs GTK
+initialised. Its expiry is recorded in the test: past GTK 4.16 these selectors
+become valid and libadwaita ≥1.6 prefers them.

@@ -656,6 +656,29 @@ fn build_main_window(app: &Application) {
         right.update(&path, &db_path);
     }
 
+    // Styles (parity 2.4). "Save current" needs whatever edit the selected
+    // image carries *at click time*, so this is a getter rather than a captured
+    // value — the selection changes constantly and the panel is built once.
+    // In the lighttable the edit lives in the database (the darkroom view owns
+    // the live one), so read it back from there.
+    {
+        let sel = lt_selection.clone();
+        let db = db_path.to_string();
+        let get_params: panels::StyleParamsGetter = std::rc::Rc::new(move || {
+            let path = lighttable::selected_path(&sel)?;
+            let params = persist::load_params(&db, &path);
+            Some((path, params))
+        });
+        // Report outcomes in a toast, and do NOT reload the grid. Thumbnails are
+        // decoded from the file's own bytes and know nothing about
+        // PreviewParams, so a reload could not show the applied style anyway —
+        // and `lighttable_load_from_db` loads the WHOLE library, which would
+        // throw away an active folder/tag/search collection and reset the
+        // selection to image 0. That is a destructive no-op.
+        let notify: std::rc::Rc<dyn Fn(String)> = std::rc::Rc::new(make_toast.clone());
+        right.wire_styles(&db_path, get_params, notify);
+    }
+
     // The full preview follows the SELECTION, not just its own keys — the same
     // observer shape the metadata panel uses. Without this the ← / → step moves
     // the selection and the metadata panel while the preview keeps showing the

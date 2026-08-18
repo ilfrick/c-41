@@ -1125,12 +1125,30 @@ fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {
 
 // ── Right panel (metadata + tags) ────────────────────────────────────────
 
+/// Getter handed to [`MetadataPanel::wire_styles`]: the selected image's path
+/// and its current edit, read at click time. Named because the same type is
+/// spelled again at the call site in `lib.rs`.
+pub type StyleParamsGetter =
+    std::rc::Rc<dyn Fn() -> Option<(String, crate::preview::PreviewParams)>>;
+
 /// Metadata inspector widget with an `update` method.
 ///
 /// All GTK fields are GObject ref-counts so `MetadataPanel` is Clone.
 #[derive(Clone)]
 pub struct MetadataPanel {
     pub widget:   gtk4::Box,
+    /// Styles section (parity 2.4). Handlers are wired in `wire_styles`, which
+    /// the caller invokes once it can supply the current params — the panel
+    /// itself has no view of the darkroom's live edit state.
+    styles_list:      gtk4::ListBox,
+    style_save_btn:   gtk4::Button,
+    style_apply_btn:  gtk4::Button,
+    style_delete_btn: gtk4::Button,
+    /// Guards [`wire_styles`] against a second call. `connect_clicked` appends,
+    /// so wiring twice would stack two save dialogs and apply a style twice —
+    /// and `MetadataPanel` is `Clone`, so a clone reaching a second call site
+    /// is a plausible accident rather than a theoretical one.
+    styles_wired: std::rc::Rc<std::cell::Cell<bool>>,
     filename_lbl: gtk4::Label,
     folder_lbl:   gtk4::Label,
     dims_lbl:     gtk4::Label,
@@ -1153,6 +1171,309 @@ pub struct MetadataPanel {
 }
 
 impl MetadataPanel {
+    /// Rebuild the styles list from the database.
+    ///
+    /// Rows carry the style name as the widget name so the handlers can read
+    /// the selection back without a parallel model — the list is short and
+    /// rebuilt wholesale on every change, so a model would be more machinery
+    /// than the feature needs.
+    fn refresh_styles_list(list: &gtk4::ListBox, db_path: &str) {
+        // Re-select the same style afterwards. A wholesale rebuild drops the
+        // selection, and "pick a style, then pick a target, then Apply" is the
+        // entire workflow — losing it mid-way makes Apply a silent no-op.
+        let keep = list.selected_row().map(|r| r.widget_name().to_string());
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+        let styles = crate::persist::load_styles(db_path);
+        if styles.is_empty() {
+            let row = gtk4::ListBoxRow::new();
+            let lbl = gtk4::Label::builder()
+                .label("(no styles saved)")
+                .halign(gtk4::Align::Start)
+                .margin_start(8).margin_end(8).margin_top(4).margin_bottom(4)
+                .build();
+            lbl.add_css_class("dim-label");
+            row.set_child(Some(&lbl));
+            row.set_selectable(false);
+            // Unnamed widgets report their TYPE name ("GtkListBoxRow"), not "".
+            // The handlers guard on an empty name, so without this the
+            // placeholder would read as a style called "GtkListBoxRow" the day
+            // it stops being unselectable.
+            row.set_widget_name("");
+            list.append(&row);
+            return;
+        }
+        for st in styles {
+            let row = gtk4::ListBoxRow::new();
+            row.set_widget_name(&st.name);
+            let b = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            b.set_margin_start(8);
+            b.set_margin_end(8);
+            b.set_margin_top(3);
+            b.set_margin_bottom(3);
+            let name = gtk4::Label::builder()
+                .label(&st.name)
+                .halign(gtk4::Align::Start)
+                .build();
+            b.append(&name);
+            if !st.description.is_empty() {
+                let desc = gtk4::Label::builder()
+                    .label(&st.description)
+                    .halign(gtk4::Align::Start)
+                    .build();
+                desc.add_css_class("dim-label");
+                desc.add_css_class("caption");
+                b.append(&desc);
+            }
+            let is_kept = keep.as_deref() == Some(st.name.as_str());
+            row.set_child(Some(&b));
+            list.append(&row);
+            if is_kept {
+                list.select_row(Some(&row));
+            }
+        }
+    }
+
+    /// Wire the Styles buttons. **Call exactly once** per panel — see
+    /// `styles_wired`.
+    ///
+    /// `current_params` is a getter rather than a value because the panel is
+    /// built once and the selected image's edit changes constantly; asking at
+    /// click time is what makes "Save current" mean the edit on screen. It is
+    /// also the single source of truth for *which* image is the target: reading
+    /// the path from `self.ctx` instead would let Apply write onto a stale path
+    /// once the selection empties, since `update()` (ctx's only writer) is not
+    /// called when nothing is selected.
+    ///
+    /// `notify` surfaces outcomes to the user — every failure path here is
+    /// otherwise invisible, which is the same silent-failure class as a CSS
+    /// rule GTK drops on the floor.
+    ///
+    /// `db_path` is passed explicitly rather than read from `self.ctx.1`: that
+    /// field is a process-wide constant threaded through a per-image tuple, and
+    /// it is empty until the first `update()` — that is, whenever the catalogue
+    /// is empty, in which case every handler would return at its guard.
+    pub fn wire_styles(
+        &self,
+        db_path: &str,
+        current_params: StyleParamsGetter,
+        notify: std::rc::Rc<dyn Fn(String)>,
+    ) {
+        if self.styles_wired.replace(true) {
+            debug_assert!(false, "wire_styles called twice — handlers would double-fire");
+            return;
+        }
+
+        let db_path = db_path.to_string();
+        let list = self.styles_list.clone();
+
+        Self::refresh_styles_list(&list, &db_path);
+
+        {
+            let db_path = db_path.clone();
+            let list = list.clone();
+            let get = current_params.clone();
+            let notify = notify.clone();
+            self.style_save_btn.connect_clicked(move |btn| {
+                let db = db_path.clone();
+                if db.is_empty() {
+                    notify("No catalogue open".into());
+                    return;
+                }
+                let Some((_path, params)) = get() else {
+                    notify("Select an image first".into());
+                    return;
+                };
+                // adw::AlertDialog with an extra child, matching
+                // dialogs::show_export_dialog. gtk4::Dialog is deprecated in
+                // GTK4 and its content_area() did not lay the entries out at
+                // all — the dialog rendered as an empty frame.
+                let fields = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Vertical)
+                    .spacing(6)
+                    .build();
+                let name_entry = gtk4::Entry::builder()
+                    .placeholder_text("Style name")
+                    .activates_default(true)
+                    .build();
+                let desc_entry = gtk4::Entry::builder()
+                    .placeholder_text("Description (optional)")
+                    .build();
+                fields.append(&name_entry);
+                fields.append(&desc_entry);
+
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Save style")
+                    .body("Save this image's current edit for reuse.")
+                    .build();
+                dialog.set_extra_child(Some(&fields));
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("save", "Save");
+                dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+                dialog.set_default_response(Some("save"));
+
+                let list_c = list.clone();
+                let db_c = db.clone();
+                let notify_c = notify.clone();
+                // Present the overwrite prompt on the BUTTON, not on the
+                // dialog: the dialog is dismissing as this fires.
+                let parent = btn.clone().upcast::<gtk4::Widget>();
+                dialog.connect_response(Some("save"), move |_, _| {
+                    let name = name_entry.text().to_string();
+                    let desc = desc_entry.text().to_string();
+                    // save_style upserts, so a name collision silently replaces
+                    // a saved edit with no way back — styles have no history
+                    // stack behind them. Confirm first.
+                    let clash = crate::persist::load_styles(&db_c)
+                        .iter()
+                        .any(|s| s.name == name.trim());
+                    if clash {
+                        let confirm = adw::AlertDialog::builder()
+                            .heading("Replace style?")
+                            .body(format!("A style named \"{}\" already exists.", name.trim()))
+                            .build();
+                        confirm.add_response("cancel", "Cancel");
+                        confirm.add_response("replace", "Replace");
+                        confirm.set_response_appearance(
+                            "replace",
+                            adw::ResponseAppearance::Destructive,
+                        );
+                        let (db_x, list_x, notify_x) =
+                            (db_c.clone(), list_c.clone(), notify_c.clone());
+                        let (name_x, desc_x, params_x) =
+                            (name.clone(), desc.clone(), params.clone());
+                        confirm.connect_response(Some("replace"), move |_, _| {
+                            Self::save_style_reporting(
+                                &db_x, &name_x, &desc_x, &params_x, &list_x, &notify_x,
+                            );
+                        });
+                        confirm.present(Some(&parent));
+                        return;
+                    }
+                    Self::save_style_reporting(
+                        &db_c, &name, &desc, &params, &list_c, &notify_c,
+                    );
+                });
+                dialog.present(Some(btn.upcast_ref::<gtk4::Widget>()));
+            });
+        }
+
+        // Apply is reachable from the button and from double-clicking a row
+        // (darktable applies on activation), so the body lives in one closure
+        // rather than being written twice.
+        let do_apply: std::rc::Rc<dyn Fn()> = {
+            let db_path = db_path.clone();
+            let list = list.clone();
+            let get = current_params.clone();
+            let notify = notify.clone();
+            std::rc::Rc::new(move || {
+                let db = db_path.clone();
+                let Some(row) = list.selected_row() else {
+                    notify("Select a style first".into());
+                    return;
+                };
+                let name = row.widget_name().to_string();
+                if name.is_empty() {
+                    notify("Select a style first".into());
+                    return;
+                }
+                // The path comes from the getter, not ctx — one reading of
+                // "which image", so Apply cannot target a stale one.
+                let Some((path, _)) = get() else {
+                    notify("Select an image first".into());
+                    return;
+                };
+                if path.is_empty() || db.is_empty() {
+                    notify("Select an image first".into());
+                    return;
+                }
+                let Some(style) =
+                    crate::persist::load_styles(&db).into_iter().find(|s| s.name == name)
+                else {
+                    notify(format!("Style \"{name}\" is no longer available"));
+                    return;
+                };
+                // apply_style_to counts WRITES: an uncatalogued path has no
+                // imgid to store an edit against, so 0 here means "nothing
+                // happened", not "applied to zero of one".
+                if crate::persist::apply_style_to(&db, &[path], &style) > 0 {
+                    notify(format!("Applied style \"{name}\""));
+                } else {
+                    notify("Could not apply the style to this image".into());
+                }
+            })
+        };
+
+        {
+            let do_apply = do_apply.clone();
+            self.style_apply_btn.connect_clicked(move |_| do_apply());
+        }
+        {
+            let do_apply = do_apply.clone();
+            list.connect_row_activated(move |_, _| do_apply());
+        }
+
+        {
+            let db_path = db_path.clone();
+            let list = list.clone();
+            let notify = notify.clone();
+            self.style_delete_btn.connect_clicked(move |btn| {
+                let db = db_path.clone();
+                let Some(row) = list.selected_row() else {
+                    notify("Select a style first".into());
+                    return;
+                };
+                let name = row.widget_name().to_string();
+                if name.is_empty() {
+                    notify("Select a style first".into());
+                    return;
+                }
+                // Deleting a style is unrecoverable — confirm, as darktable does.
+                let confirm = adw::AlertDialog::builder()
+                    .heading("Delete style?")
+                    .body(format!("\"{name}\" will be removed permanently."))
+                    .build();
+                confirm.add_response("cancel", "Cancel");
+                confirm.add_response("delete", "Delete");
+                confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                let (db_c, list_c, notify_c) = (db.clone(), list.clone(), notify.clone());
+                confirm.connect_response(Some("delete"), move |_, _| {
+                    if crate::persist::delete_style(&db_c, &name) {
+                        Self::refresh_styles_list(&list_c, &db_c);
+                        notify_c(format!("Deleted style \"{name}\""));
+                    } else {
+                        notify_c("Could not delete the style".into());
+                    }
+                });
+                confirm.present(Some(btn.upcast_ref::<gtk4::Widget>()));
+            });
+        }
+    }
+
+    /// Save, refresh the list, and tell the user what happened either way.
+    ///
+    /// `save_style` documents that the caller surfaces its `false` — a blank
+    /// name or a locked database otherwise closes the dialog and changes
+    /// nothing, with no explanation.
+    fn save_style_reporting(
+        db: &str,
+        name: &str,
+        desc: &str,
+        params: &crate::preview::PreviewParams,
+        list: &gtk4::ListBox,
+        notify: &std::rc::Rc<dyn Fn(String)>,
+    ) {
+        if crate::persist::save_style(db, name, desc, params) {
+            Self::refresh_styles_list(list, db);
+            notify(format!("Saved style \"{}\"", name.trim()));
+        } else if name.trim().is_empty() {
+            notify("Style name cannot be empty".into());
+        } else {
+            notify("Could not save the style".into());
+        }
+    }
+
     pub fn new() -> Self {
         let panel = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
@@ -1274,6 +1595,52 @@ impl MetadataPanel {
             });
         }
 
+        // ── Styles (parity 2.4) ───────────────────────────────────────────
+        // darktable's styles module: save the current edit under a name, then
+        // apply it to other images. Ours stores the whole PreviewParams blob
+        // (see persist::STYLES_TABLE_DDL for why, and what that costs).
+        let styles_header = section_header("Styles");
+        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        panel.append(&styles_header);
+
+        let styles_list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .build();
+        styles_list.add_css_class("navigation-sidebar");
+        // Capped and scrolled: nothing bounds how many styles a user saves, and
+        // the panel is a plain Box with no scroller of its own — an unbounded
+        // list would push Export and the tag chips out of the panel.
+        let styles_scroll = gtk4::ScrolledWindow::builder()
+            .propagate_natural_height(true)
+            .max_content_height(180)
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .child(&styles_list)
+            .build();
+        panel.append(&styles_scroll);
+
+        let styles_btns = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .margin_start(10).margin_end(10).margin_top(4).margin_bottom(6)
+            .build();
+        let style_save_btn = gtk4::Button::builder()
+            .label("Save current…")
+            .tooltip_text("Save this image's edit as a reusable style")
+            .hexpand(true)
+            .build();
+        let style_apply_btn = gtk4::Button::builder()
+            .label("Apply")
+            .tooltip_text("Apply the selected style to this image")
+            .build();
+        let style_delete_btn = gtk4::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Delete the selected style")
+            .build();
+        styles_btns.append(&style_save_btn);
+        styles_btns.append(&style_apply_btn);
+        styles_btns.append(&style_delete_btn);
+        panel.append(&styles_btns);
+
         // ── Export (parity 2.6) ───────────────────────────────────────────
         // darktable's right panel ends with an export module. Ours had export
         // only as a header button; this surfaces the same `win.export-selected`
@@ -1291,7 +1658,10 @@ impl MetadataPanel {
         export_btn.set_action_name(Some("win.export-selected"));
         panel.append(&export_btn);
 
-        Self { widget: panel, filename_lbl, folder_lbl, dims_lbl, size_lbl,
+        Self { widget: panel, styles_list, style_save_btn, style_apply_btn,
+               style_delete_btn,
+               styles_wired: std::rc::Rc::new(std::cell::Cell::new(false)),
+               filename_lbl, folder_lbl, dims_lbl, size_lbl,
                camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
                focal_lbl, taken_lbl,
                tags_flow, tag_entry, ctx, on_tags_changed }
@@ -1327,6 +1697,14 @@ impl MetadataPanel {
 
         self.filename_lbl.set_label(filename);
         self.folder_lbl.set_label(folder.rsplit('/').next().unwrap_or(folder));
+
+        // NOTE: the styles list is deliberately NOT refreshed here. It is
+        // library-wide, not per-image, and `c41_styles` is only ever mutated by
+        // the save/delete handlers — both of which refresh already. Rebuilding
+        // on every selection change dropped the list selection, which broke the
+        // feature's whole workflow: pick a style, pick the target image, Apply.
+        // Step two silently deselected step one. It also cost a Connection::open
+        // per arrow-key press.
 
         // One query for every catalog-sourced field (m4-100) — dimensions used to
         // need their own connection; they now ride along with the EXIF row.

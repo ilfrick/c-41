@@ -28,11 +28,12 @@
 //! calls this out with "this need to be middle grey to correctly work on images.
 //! And for all themes". Do not darken it for looks.
 //!
-//! What this does NOT attempt: darktable's "bauhaus" controls (flat fill-bar
+//! Sliders are NOT styled here. darktable's "bauhaus" controls (flat fill-bar
 //! sliders with the label and value drawn inline) are custom-drawn widgets, not
-//! styled GTK ranges, so matching them means new widgets rather than CSS. The
-//! sliders here are restyled GTK `Scale`s — flat and grey, but still GTK in
-//! shape. Same for the panel *layout*, which is parity 2.2-2.6.
+//! styled GTK ranges — so they were built as one: every slider in the UI is
+//! [`crate::bauhaus`], a DrawingArea that paints itself. No `GtkScale` remains
+//! in the crate, and the rules that used to style one were removed. What this
+//! still does not attempt is the panel *layout*, which is parity 2.2-2.6.
 
 /// darktable's grey ramp (`data/themes/darktable.css`, `@define-color grey_NN`).
 /// Exposed so widget code can match the chrome without re-deriving hex values.
@@ -71,12 +72,16 @@ window, .background {{
 
 /* Kill libadwaita's blue. darktable has no accent colour — selection is a
    lighter grey (grey_35), which keeps the UI achromatic so it cannot bias
-   colour judgement. */
-:root {{
-  --accent-bg-color: {g35};
-  --accent-fg-color: {g90};
-  --accent-color: {g75};
-}}
+   colour judgement.
+
+   These are @define-color, NOT CSS custom properties: GTK4 has no `--var`
+   support and logs a no-such-property warning for each one, so a custom-property
+   block silently does nothing. libadwaita reads these @define-color names. */
+@define-color accent_bg_color {g35};
+@define-color accent_fg_color {g90};
+@define-color accent_color {g75};
+@define-color theme_selected_bg_color {g35};
+@define-color theme_selected_fg_color {g90};
 
 /* ── Header / toolbars ───────────────────────────────────────────────── */
 headerbar, .toolbar, actionbar > revealer > box {{
@@ -139,27 +144,14 @@ label.title-4, .heading {{
 label.dim-label {{ color: {g45}; }}
 
 /* ── Sliders ─────────────────────────────────────────────────────────── */
-/* Not bauhaus (those are custom-drawn upstream) but flat and grey: a thin
-   trough with a square fill, no gradient, no blue. */
-scale trough {{
-  background-color: {g10};
-  border: none;
-  border-radius: 0;
-  min-height: 6px;
-}}
-scale highlight {{
-  background-color: {g60};
-  border-radius: 0;
-}}
-scale slider {{
-  background-color: {g75};
-  border: 1px solid {g10};
-  border-radius: 0;
-  min-width: 10px;
-  min-height: 14px;
-}}
-scale slider:hover {{ background-color: {g90}; }}
-scale:disabled highlight {{ background-color: {g40}; }}
+/* Intentionally absent. Every slider in the UI is crate::bauhaus, a custom
+   DrawingArea that paints itself from the style context's colour — there is no
+   GtkScale anywhere in the crate, so the rules that used to live here styled
+   nothing at all and were removed as dead weight.
+   They were NOT the source of the negative-size gizmo warnings: those were
+   measured again after this deletion and were unchanged. The `slider` in those
+   warnings is the scrollbar's node, not a scale's — see the scrollbar block.
+   If a stock GtkScale is ever reintroduced, style it here and check stderr. */
 
 /* ── Entries, dropdowns, switches ────────────────────────────────────── */
 entry, dropdown, combobox button, spinbutton {{
@@ -179,22 +171,28 @@ switch {{
   box-shadow: none;
 }}
 switch:checked {{ background-color: {g50}; }}
+/* The knob: colour only. GTK names this node `slider` and derives its box from
+   the switch's own allocation, so a size or border constraint here risks the
+   same negative-gizmo trap as the scrollbar below. Dropping the constraints did
+   not by itself silence the `reported min height -4` stream — the scrollbar was
+   the actual source — but there is no reason to reintroduce the hazard.
+   (Backticks, not quotes: this whole sheet is one format! string literal, and
+   a double quote in here ends it — that is a compile error, not a CSS one.) */
 switch > slider {{
   background-color: {g75};
-  border-radius: 0;
-  border: 1px solid {g10};
-  min-width: 16px;
 }}
 
 /* ── Scrollbars ──────────────────────────────────────────────────────── */
 /* scroll_bar_bg = grey_10, inactive = grey_40, active = grey_60. */
 scrollbar {{ background-color: {g10}; border: none; }}
+/* Colour and corners only — no size or border constraint. Adwaita draws this
+   node with a transparent border for its inset look, and GTK subtracts that
+   border and padding from any min-* declared here: 8px minus 12px of inherited
+   border+padding is the `reported min height -4` in the app's stderr, once per
+   scrollbar per layout pass. Same trap as `switch > slider` above. */
 scrollbar slider {{
   background-color: {g40};
   border-radius: 0;
-  border: none;
-  min-width: 8px;
-  min-height: 8px;
 }}
 scrollbar slider:hover {{ background-color: {g60}; }}
 
@@ -229,11 +227,11 @@ tooltip {{ background-color: {g10}; color: {g80}; border-radius: 0; }}
 scrolledwindow > viewport > .c41-lighttable-canvas {{
   background-color: {g40};
 }}
-/* The scroller and viewport around the grid must not paint over it. */
-scrolledwindow:has(.c41-lighttable-canvas),
-scrolledwindow:has(.c41-lighttable-canvas) > viewport {{
-  background-color: {g40};
-}}
+/* NOTE: this used to be a `scrolledwindow:has(.c41-lighttable-canvas)` pair.
+   GTK4 does not implement :has() — and an unknown pseudo-class makes it discard
+   the entire rule, silently — so those two rules never painted anything. The
+   child selectors above are what actually paint the grid.
+   (stylesheet_uses_no_selectors_gtk4_rejects enforces this.) */
 ",
         g10 = grey::G10,
         g15 = grey::G15,
@@ -293,6 +291,64 @@ mod tests {
         // Spot-check that real values landed.
         assert!(sheet.contains("#262626"), "background grey missing");
         assert!(sheet.contains("#777777"), "darkroom canvas grey missing");
+    }
+
+    /// Strip `/* … */` so the selector ban applies to CSS, not to prose.
+    ///
+    /// The sheet is roughly 40% comments, and those comments need to *name* the
+    /// constructs they warn about. Scanning them would mean a comment saying
+    /// "don't use :has()" fails the build — the test dictating how the warning
+    /// is phrased, which is backwards.
+    fn selectors_only(sheet: &str) -> String {
+        let mut out = String::new();
+        let mut rest = sheet;
+        while let Some(i) = rest.find("/*") {
+            out.push_str(&rest[..i]);
+            rest = match rest[i..].find("*/") {
+                Some(j) => &rest[i + j + 2..],
+                None => "",
+            };
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn stylesheet_uses_no_selectors_gtk4_rejects() {
+        // GTK4's CSS engine is not a browser engine. An unknown pseudo-class
+        // makes it discard the ENTIRE rule, silently — the theme looks mostly
+        // right and one block is simply missing. Both of these shipped and were
+        // only found by reading the app's stderr:
+        //   `:root`   → "Unknown name of pseudo-class" (the accent override
+        //               never applied, so libadwaita's blue survived)
+        //   `:has()`  → "Unknown pseudoclass" (the grid background rule died)
+        //
+        // This is a DENYLIST, so it proves nothing in general — it pins the two
+        // bugs already shipped plus the obvious neighbours, and cannot catch the
+        // next novel one (GTK4 also rejects the `+` and `~` combinators, too
+        // noisy to grep for textually). The only real check is
+        // CssProvider::load_from_string with connect_parsing_error, which needs
+        // GTK initialised and so cannot run in this display-free suite.
+        //
+        // EXPIRY: this ban is a property of the runtime, not of CSS. The app
+        // ships on Ubuntu Noble → GTK 4.14 / libadwaita 1.5 (docker/Dockerfile),
+        // and Cargo.toml gates to v4_12/v1_5. GTK gained `:root` and custom
+        // properties in 4.16, and libadwaita ≥1.6 prefers them. When the runtime
+        // moves past 4.16, revisit rather than mechanically keeping this green.
+        let sheet = selectors_only(&css());
+        assert!(!sheet.contains(":root"), ":root is not a GTK4 selector — use `window`");
+        assert!(!sheet.contains(":has("), ":has() is unsupported; GTK4 drops the whole rule");
+        // Other browser-isms that would fail the same way.
+        for bad in [":is(", ":where(", "::before", "::after", "!important"] {
+            assert!(!sheet.contains(bad), "unsupported CSS construct in the theme: {bad}");
+        }
+    }
+
+    #[test]
+    fn selectors_only_strips_comments_not_css() {
+        let s = selectors_only("a {} /* :has( :root */ b {} /* unterminated");
+        assert!(s.contains("a {}") && s.contains("b {}"), "CSS was dropped: {s:?}");
+        assert!(!s.contains(":has("), "comment body survived: {s:?}");
     }
 
     #[test]
