@@ -718,6 +718,335 @@ pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> us
     written
 }
 
+// ── Image metadata editor (parity 2.3) ──────────────────────────────────────
+
+// Storage lives in `main.meta_data`, which is DARKTABLE'S table, not one of the
+// c41-ui-private ones above. Metadata is not our format: it is Dublin Core / XMP
+// text the C app reads, writes and exports to sidecars, so keeping it anywhere
+// else would produce metadata the rest of the application cannot see.
+//
+// Consequences of that, both learned the hard way:
+//
+//   * The table is created by `c41_db::schema::ensure_base_schema` with
+//     darktable's exact shape (FK to images + three indexes). This module does
+//     NOT issue its own `CREATE TABLE`. An earlier version did, and the ad-hoc
+//     DDL it used was NARROWER than upstream's — it would have produced a
+//     catalogue the C app could open but whose constraints silently differed.
+//   * The reads and writes go through `c41_db::metadata`, which already existed
+//     (Phase 2-db-3) and is the FFI-facing implementation of metadata.c. What
+//     lives here is only the path→imgid resolution and the UI's field set.
+//
+// The unique index is on `(id, key, value)` — NOT `(id, key)`. So it does not
+// enforce one value per key, and `ON CONFLICT(id, key)` has no index to target:
+// an upsert is unavailable, and the write is delete-then-insert exactly as
+// upstream does it (`src/common/metadata.c:310`, `:323`).
+
+/// The user-editable metadata fields, in darktable's own display order.
+///
+/// The discriminants are darktable's key ids, seeded into `data.meta_data` in
+/// `src/common/database.c:3253` as the index of each row in its `metadata_fields`
+/// array. **They are persisted values, not ours to renumber** — a change here
+/// silently re-labels every existing row (a creator would read back as a title).
+///
+/// Upstream defines nine keys; these are the five its metadata editor shows by
+/// default. The remaining four are either internal (`image id`,
+/// `preserved filename`) or off by default (`notes`, `version name`), and are
+/// left alone rather than half-exposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetaField {
+    Title = 2,
+    Description = 3,
+    Creator = 0,
+    Publisher = 1,
+    Rights = 4,
+}
+
+impl MetaField {
+    /// Display order, matching upstream's `display_order` for these five.
+    pub const ALL: [MetaField; 5] = [
+        MetaField::Title,
+        MetaField::Description,
+        MetaField::Creator,
+        MetaField::Publisher,
+        MetaField::Rights,
+    ];
+
+    /// darktable's `meta_data.key`.
+    pub fn key(self) -> i32 {
+        self as i32
+    }
+
+    /// The label upstream uses for the field.
+    pub fn label(self) -> &'static str {
+        match self {
+            MetaField::Title => "Title",
+            MetaField::Description => "Description",
+            MetaField::Creator => "Creator",
+            MetaField::Publisher => "Publisher",
+            MetaField::Rights => "Rights",
+        }
+    }
+}
+
+/// Read the five editable fields for an image, in [`MetaField::ALL`] order.
+///
+/// Always returns all five; a field with no row reads as an empty string, so the
+/// caller can drive a fixed set of entries without distinguishing "absent" from
+/// "blank". Empty on any failure — an uncatalogued image or a database that
+/// predates the table simply has no metadata.
+pub fn load_metadata(db_path: &str, full_path: &str) -> Vec<(MetaField, String)> {
+    if db_path.is_empty() {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open(db_path) else { return Vec::new() };
+    load_metadata_conn(&conn, full_path)
+}
+
+fn load_metadata_conn(conn: &Connection, full_path: &str) -> Vec<(MetaField, String)> {
+    let Some(imgid) = imgid_for_path(conn, full_path) else { return Vec::new() };
+    // One query for all keys, then project onto our field set — `metadata_get_all`
+    // is the same read the FFI path uses, so both see identical values.
+    let all = c41_db::metadata::metadata_get_all(conn, imgid).unwrap_or_default();
+    MetaField::ALL
+        .iter()
+        .map(|&f| {
+            let v = all
+                .iter()
+                .find(|(k, _)| *k == f.key())
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            (f, v)
+        })
+        .collect()
+}
+
+/// Write metadata for an image. Returns whether the write landed.
+///
+/// Only the fields named in `fields` are touched, so a caller editing one entry
+/// cannot blank the other four. An **empty value deletes** the row rather than
+/// storing `''` — that is upstream's convention, and it keeps "no title" as one
+/// state instead of two that compare unequal in a filter.
+///
+/// **Known gap — the XMP sidecar is not written.** darktable's own editor
+/// follows `dt_metadata_set_list` with `dt_image_synch_xmps`
+/// (`src/libs/metadata.c:383`, `:393`), so upstream metadata lands in *both* the
+/// catalogue and the image's `.xmp`. This writes the catalogue only, which means
+/// a value set here is invisible to other tools and does not travel with the
+/// file until darktable rewrites that sidecar itself. The catalogue is the
+/// source of truth either way — `dt_exif_xmp_read` reads sidecars back *into*
+/// this table — so nothing is lost or corrupted; it is unexported, not wrong.
+/// Closing the gap means an XMP writer, which is its own increment.
+pub fn save_metadata(db_path: &str, full_path: &str, fields: &[(MetaField, String)]) -> bool {
+    if db_path.is_empty() || fields.is_empty() {
+        return false;
+    }
+    let Ok(mut conn) = Connection::open(db_path) else { return false };
+    save_metadata_conn(&mut conn, full_path, fields).is_ok()
+}
+
+fn save_metadata_conn(
+    conn: &mut Connection,
+    full_path: &str,
+    fields: &[(MetaField, String)],
+) -> rusqlite::Result<()> {
+    // One transaction around the whole write: a delete that commits without its
+    // insert would silently erase metadata the user was editing, not merely fail
+    // to save it. The imgid lookup is inside it too, so the row cannot vanish
+    // between resolving it and writing against it.
+    let tx = conn.transaction()?;
+    let Some(imgid) = imgid_for_path(&tx, full_path) else {
+        // No catalogue row means no id to key metadata against.
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    for (field, value) in fields {
+        // Upstream trims spaces only (`_cleanup_metadata_value`,
+        // src/common/metadata.c:400); matching that keeps values byte-identical
+        // to darktable's for the same input.
+        let v = value.trim_matches(' ');
+        if v.is_empty() {
+            // Blank deletes rather than storing '' — upstream's convention, and
+            // it keeps "no title" as one state instead of two that compare
+            // unequal in a filter.
+            c41_db::metadata::metadata_delete_key(&tx, imgid, field.key())?;
+        } else {
+            c41_db::metadata::metadata_set_value(&tx, imgid, field.key(), v)?;
+        }
+    }
+    tx.commit()
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    /// Same real-temp-file rationale as `style_tests::TmpDb`: the public API
+    /// takes a path and opens its own connection, which an in-memory database
+    /// would not exercise.
+    /// Builds the catalogue from `ensure_base_schema` — the SAME DDL production
+    /// uses — so these tests run against darktable's real constraints
+    /// (`UNIQUE(id, key, value)`, the FK to `images`). An earlier version of this
+    /// fixture created its own narrower `meta_data`, which meant no test ever
+    /// exercised the constraints the app actually writes under.
+    fn catalogued_db(tag: &str) -> (String, String) {
+        let mut p = std::env::temp_dir();
+        p.push(format!("c41-meta-{tag}-{:?}.db", std::thread::current().id()));
+        let path = p.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        c41_db::schema::ensure_base_schema(&conn).unwrap();
+        conn.execute("INSERT INTO main.film_rolls (id, folder) VALUES (1, '/photos')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO main.images (id, film_id, filename) VALUES (7, 1, 'a.raw')",
+            [],
+        )
+        .unwrap();
+        (path, "/photos/a.raw".to_string())
+    }
+
+    #[test]
+    fn key_ids_match_darktable() {
+        // Pinned against src/common/database.c:3253 — these are persisted, and
+        // renumbering them would re-label every existing row.
+        assert_eq!(MetaField::Creator.key(), 0);
+        assert_eq!(MetaField::Publisher.key(), 1);
+        assert_eq!(MetaField::Title.key(), 2);
+        assert_eq!(MetaField::Description.key(), 3);
+        assert_eq!(MetaField::Rights.key(), 4);
+    }
+
+    #[test]
+    fn all_is_in_darktable_display_order() {
+        // display_order[] = {2,3,0,1,4,…} in src/common/database.c:3267 maps
+        // field→position, so sorted it reads title, description, creator,
+        // publisher, rights. This governs BOTH the on-screen row order and the
+        // index alignment the panel relies on when it zips ALL against the
+        // entries, so it is worth pinning separately from the key ids.
+        use MetaField::*;
+        assert_eq!(MetaField::ALL, [Title, Description, Creator, Publisher, Rights]);
+    }
+
+    #[test]
+    fn schema_matches_darktables_unique_index() {
+        // The index is on (id, key, VALUE) — not (id, key). That is why there is
+        // no upsert and why the writers delete before inserting. If this ever
+        // becomes (id, key), the delete-then-insert dance can be replaced by a
+        // real ON CONFLICT upsert.
+        let (db, _) = catalogued_db("schema");
+        let conn = Connection::open(&db).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM main.sqlite_master WHERE type='index' AND name='metadata_index'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("(id, key, value)"), "unexpected index shape: {sql}");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn round_trips_and_reads_absent_fields_as_blank() {
+        let (db, img) = catalogued_db("roundtrip");
+        assert!(save_metadata(&db, &img, &[(MetaField::Title, "Sunset".into())]));
+        let got = load_metadata(&db, &img);
+        assert_eq!(got.len(), 5, "all five fields are always returned");
+        assert_eq!(got[0], (MetaField::Title, "Sunset".to_string()));
+        // The untouched four read as empty, not as missing entries.
+        assert!(got[1..].iter().all(|(_, v)| v.is_empty()), "{got:?}");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn writing_one_field_leaves_the_others_alone() {
+        let (db, img) = catalogued_db("partial");
+        assert!(save_metadata(&db, &img, &[(MetaField::Title, "T".into()),
+                                           (MetaField::Creator, "C".into())]));
+        assert!(save_metadata(&db, &img, &[(MetaField::Title, "T2".into())]));
+        let got = load_metadata(&db, &img);
+        let creator = got.iter().find(|(f, _)| *f == MetaField::Creator).unwrap();
+        assert_eq!(creator.1, "C", "editing the title blanked the creator");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn rewrite_replaces_rather_than_duplicating() {
+        // The table has no uniqueness constraint, so a missing DELETE would
+        // accumulate rows and the reader would keep serving the FIRST one —
+        // edits would appear to do nothing.
+        let (db, img) = catalogued_db("dupe");
+        save_metadata(&db, &img, &[(MetaField::Title, "first".into())]);
+        save_metadata(&db, &img, &[(MetaField::Title, "second".into())]);
+        let conn = Connection::open(&db).unwrap();
+        let n: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM main.meta_data WHERE id = 7 AND key = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "rewrite duplicated the row instead of replacing it");
+        assert_eq!(load_metadata(&db, &img)[0].1, "second");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn blank_value_deletes_the_row() {
+        let (db, img) = catalogued_db("blank");
+        save_metadata(&db, &img, &[(MetaField::Rights, "CC-BY".into())]);
+        save_metadata(&db, &img, &[(MetaField::Rights, "   ".into())]);
+        let conn = Connection::open(&db).unwrap();
+        let n: i32 = conn
+            .query_row("SELECT COUNT(*) FROM main.meta_data WHERE id = 7 AND key = 4", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "a blank value should delete, not store an empty string");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn uncatalogued_image_is_reported_not_silently_dropped() {
+        let (db, _) = catalogued_db("uncatalogued");
+        assert!(!save_metadata(&db, "/photos/missing.raw", &[(MetaField::Title, "x".into())]));
+        assert!(load_metadata(&db, "/photos/missing.raw").is_empty());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn duplicate_rows_yield_a_stored_value_and_are_healed_by_a_write() {
+        // The unique index is on (id, key, value), so two rows sharing (id, key)
+        // with DIFFERENT values are legal — legacy databases do contain them, which
+        // is why upstream ships a dedupe migration (src/common/database.c:1778).
+        // Which of the two a read returns is NOT specified: the projection takes
+        // the first row `metadata_get_all` yields, and its ORDER BY is on `key`,
+        // so ties fall to whatever plan SQLite picks. Pinning "older" here would
+        // be pinning the query planner, not our behaviour.
+        //
+        // What IS guaranteed, and what actually matters: a duplicate never reads
+        // back blank, and the next write collapses it to one row.
+        let (db, img) = catalogued_db("legacydupe");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO main.meta_data VALUES (7, 2, 'older')", []).unwrap();
+        conn.execute("INSERT INTO main.meta_data VALUES (7, 2, 'newer')", []).unwrap();
+        drop(conn);
+
+        let got = load_metadata(&db, &img)[0].1.clone();
+        assert!(got == "older" || got == "newer", "duplicate read back as {got:?}");
+
+        assert!(save_metadata(&db, &img, &[(MetaField::Title, "single".into())]));
+        let conn = Connection::open(&db).unwrap();
+        let n: i32 = conn
+            .query_row("SELECT COUNT(*) FROM main.meta_data WHERE id = 7 AND key = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1, "a write should collapse legacy duplicates to one row");
+        assert_eq!(load_metadata(&db, &img)[0].1, "single");
+        let _ = std::fs::remove_file(&db);
+    }
+}
+
 #[cfg(test)]
 mod style_tests {
     use super::*;

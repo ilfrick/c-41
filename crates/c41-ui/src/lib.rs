@@ -679,6 +679,9 @@ fn build_main_window(app: &Application) {
         right.wire_styles(&db_path, get_params, notify);
     }
 
+    // Metadata editor (parity 2.3) reports failed writes the same way.
+    right.set_on_notify(make_toast.clone());
+
     // The full preview follows the SELECTION, not just its own keys — the same
     // observer shape the metadata panel uses. Without this the ← / → step moves
     // the selection and the metadata panel while the preview keeps showing the
@@ -1595,6 +1598,18 @@ fn build_main_window(app: &Application) {
     // openbox (and any EWMH WM) honours the maximized hint and re-fits the
     // window when the framebuffer is later resized. The default_width/height
     // above remain the fallback for WMs that don't honour maximize.
+    // Flush any in-progress metadata edit before the window goes away. GTK4 does
+    // not promise a focus-leave during teardown, so relying on the entry handlers
+    // alone would drop the last field the user typed — the same
+    // "persist-only-on-close" trap the darkroom view hit once already.
+    {
+        let right = right.clone();
+        window.connect_close_request(move |_| {
+            right.flush_metadata_edits();
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+
     window.maximize();
     window.present();
 }

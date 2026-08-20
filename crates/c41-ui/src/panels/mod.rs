@@ -1131,6 +1131,10 @@ fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {
 pub type StyleParamsGetter =
     std::rc::Rc<dyn Fn() -> Option<(String, crate::preview::PreviewParams)>>;
 
+/// Per-entry editing baseline for the metadata editor: `(path, db_path, original
+/// text)` captured when the entry gained focus. See `MetadataPanel::new`.
+type MetaTarget = std::rc::Rc<std::cell::RefCell<(String, String, String)>>;
+
 /// Metadata inspector widget with an `update` method.
 ///
 /// All GTK fields are GObject ref-counts so `MetadataPanel` is Clone.
@@ -1168,6 +1172,15 @@ pub struct MetadataPanel {
     /// Optional notify fired after a tag is attached, so other panels (the
     /// left-panel Tags section) can refresh. Set via [`set_on_tags_changed`].
     on_tags_changed: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
+    /// Metadata-editor entries, in [`crate::persist::MetaField::ALL`] order.
+    meta_entries: Vec<gtk4::Entry>,
+    /// Editing baselines, index-aligned with `meta_entries`. Held so `update()`
+    /// can re-baseline an entry it repaints, and so a focused entry is never left
+    /// showing one image's text while `ctx` points at another.
+    meta_targets: Vec<MetaTarget>,
+    /// Optional user-visible notifier, used to report a metadata save that could
+    /// not land. Same shape as `on_tags_changed`; set via [`set_on_notify`].
+    on_notify: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(String)>>>>,
 }
 
 impl MetadataPanel {
@@ -1534,6 +1547,30 @@ impl MetadataPanel {
         }
         panel.append(&grid);
 
+        // ── Metadata editor (parity 2.3) ──────────────────────────────────
+        // darktable's "metadata editor" module: the writable Dublin Core fields,
+        // as opposed to the read-only EXIF above. Written straight into
+        // darktable's own `main.meta_data` — see persist::MetaField.
+        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        panel.append(&section_header("Metadata editor"));
+
+        let meta_grid = gtk4::Grid::builder()
+            .row_spacing(4).column_spacing(8)
+            .margin_start(12).margin_end(12).margin_top(2).margin_bottom(6)
+            .build();
+        let mut meta_entries: Vec<gtk4::Entry> = Vec::new();
+        for (i, field) in crate::persist::MetaField::ALL.iter().enumerate() {
+            let e = gtk4::Entry::builder()
+                .hexpand(true)
+                .width_chars(8)
+                .placeholder_text("—")
+                .build();
+            meta_grid.attach(&mk_key(field.label()), 0, i as i32, 1, 1);
+            meta_grid.attach(&e, 1, i as i32, 1, 1);
+            meta_entries.push(e);
+        }
+        panel.append(&meta_grid);
+
         // ── Tags section ──────────────────────────────────────────────────
         let tags_header = gtk4::Label::builder()
             .label("Tags")
@@ -1658,8 +1695,109 @@ impl MetadataPanel {
         export_btn.set_action_name(Some("win.export-selected"));
         panel.append(&export_btn);
 
+        // Commit a metadata field on Enter or on losing focus.
+        //
+        // Two guards, both taken from upstream, because either alone is not enough:
+        //
+        //  1. The target image is snapshotted when the entry GAINS focus, not read
+        //     at save time — clicking a different thumbnail moves focus AND changes
+        //     the selection, and `update()` rewrites `ctx`, so reading ctx on
+        //     focus-out could save image A's text onto image B.
+        //  2. The ORIGINAL text is snapshotted alongside it, and an unchanged entry
+        //     never writes at all (`src/libs/metadata.c:360`).
+        //
+        // (2) is what makes this correct rather than merely lucky: GTK4's ordering
+        // of focus-leave against selection-changed is not contractual, and (1)
+        // alone would depend on it.
+        let on_notify: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(String)>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let meta_targets: Vec<MetaTarget> = Vec::new();
+        let mut meta_targets = meta_targets;
+        for (i, entry) in meta_entries.iter().enumerate() {
+            let field = crate::persist::MetaField::ALL[i];
+            // (path, db_path, original text) as they were when editing began.
+            let target: MetaTarget = std::rc::Rc::new(std::cell::RefCell::new((
+                String::new(),
+                String::new(),
+                String::new(),
+            )));
+            meta_targets.push(target.clone());
+
+            let focus = gtk4::EventControllerFocus::new();
+            {
+                let ctx = ctx.clone();
+                let target = target.clone();
+                let entry = entry.clone();
+                focus.connect_enter(move |_| {
+                    let (p, d) = ctx.borrow().clone();
+                    *target.borrow_mut() = (p, d, entry.text().to_string());
+                });
+            }
+
+            let commit = {
+                let target = target.clone();
+                let notify = on_notify.clone();
+                std::rc::Rc::new(move |e: &gtk4::Entry| {
+                    let (path, db, orig) = target.borrow().clone();
+                    if path.is_empty() || db.is_empty() {
+                        return;
+                    }
+                    let value = e.text().to_string();
+                    // The dirty check is what makes this safe, not the event
+                    // ordering. Upstream does the same (`src/libs/metadata.c:360`
+                    // compares against a stashed `text_orig` before adding a field
+                    // to the write list). An entry the user never touched can then
+                    // never write, so even a stale focus-leave — one that fires
+                    // after the selection moved on — is a no-op instead of copying
+                    // one image's text onto another.
+                    if value == orig {
+                        return;
+                    }
+                    // Only this field is passed, so the other four are untouched.
+                    if crate::persist::save_metadata(&db, &path, &[(field, value.clone())]) {
+                        // Re-baseline, so the focus-leave that follows an Enter
+                        // does not write the same value a second time.
+                        target.borrow_mut().2 = value;
+                    } else if let Some(n) = notify.borrow().as_ref() {
+                        n(format!("Could not save {}", field.label().to_lowercase()));
+                    }
+                })
+            };
+
+            {
+                let commit = commit.clone();
+                let entry = entry.clone();
+                focus.connect_leave(move |_| commit(&entry));
+            }
+            entry.add_controller(focus);
+            {
+                let commit = commit.clone();
+                entry.connect_activate(move |e| commit(e));
+            }
+            // Escape reverts, matching upstream's cancel button
+            // (`src/libs/metadata.c:438`). A bare GtkEntry ignores Escape, which
+            // would leave the edit in place to be committed by the next
+            // focus-leave — the opposite of what the key means.
+            {
+                let target = target.clone();
+                let entry_k = entry.clone();
+                let keys = gtk4::EventControllerKey::new();
+                keys.connect_key_pressed(move |_, key, _, _| {
+                    if key == gtk4::gdk::Key::Escape {
+                        // Restore the baseline. The focus-leave that follows then
+                        // sees text == orig and commits nothing.
+                        let orig = target.borrow().2.clone();
+                        entry_k.set_text(&orig);
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                    gtk4::glib::Propagation::Proceed
+                });
+                entry.add_controller(keys);
+            }
+        }
+
         Self { widget: panel, styles_list, style_save_btn, style_apply_btn,
-               style_delete_btn,
+               style_delete_btn, meta_entries, meta_targets, on_notify,
                styles_wired: std::rc::Rc::new(std::cell::Cell::new(false)),
                filename_lbl, folder_lbl, dims_lbl, size_lbl,
                camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
@@ -1677,6 +1815,44 @@ impl MetadataPanel {
     /// mutation, or it would loop.
     pub fn set_on_tags_changed<F: Fn() + 'static>(&self, f: F) {
         *self.on_tags_changed.borrow_mut() = Some(std::rc::Rc::new(f));
+    }
+
+    /// Set the user-visible notifier (a toast, in practice). Used to report a
+    /// metadata write that could not land — an uncatalogued image has no `imgid`
+    /// to key metadata against, and typing into a field that silently discards
+    /// the text is worse than not offering the field.
+    pub fn set_on_notify<F: Fn(String) + 'static>(&self, f: F) {
+        *self.on_notify.borrow_mut() = Some(std::rc::Rc::new(f));
+    }
+
+    /// Persist any metadata entry whose text differs from its editing baseline,
+    /// each against the image it was edited on.
+    ///
+    /// Called before `update()` repaints, and on window close — GTK4 does not
+    /// promise a focus-leave during teardown, so without the close hook the last
+    /// edit could be dropped, which is the "persist-only-on-close" trap the
+    /// darkroom view already learned once.
+    ///
+    /// Idempotent: it re-baselines each entry it writes, so calling it twice does
+    /// not write twice.
+    pub fn flush_metadata_edits(&self) {
+        for (i, entry) in self.meta_entries.iter().enumerate() {
+            let Some(target) = self.meta_targets.get(i) else { continue };
+            let (path, db, orig) = target.borrow().clone();
+            if path.is_empty() || db.is_empty() {
+                continue;
+            }
+            let value = entry.text().to_string();
+            if value == orig {
+                continue;
+            }
+            let field = crate::persist::MetaField::ALL[i];
+            if crate::persist::save_metadata(&db, &path, &[(field, value.clone())]) {
+                target.borrow_mut().2 = value;
+            } else if let Some(n) = self.on_notify.borrow().as_ref() {
+                n(format!("Could not save {}", field.label().to_lowercase()));
+            }
+        }
     }
 
     /// Re-render the current image's tag chips from the DB without changing the
@@ -1697,6 +1873,39 @@ impl MetadataPanel {
 
         self.filename_lbl.set_label(filename);
         self.folder_lbl.set_label(folder.rsplit('/').next().unwrap_or(folder));
+
+        // Metadata editor. Flush first, then repaint — the same order as
+        // upstream's `gui_update` (`src/libs/metadata.c:239`, writing at `:269`),
+        // and for the same reason: it makes correctness independent of whether
+        // GTK happens to deliver focus-leave before or after selection-changed.
+        //
+        // An earlier version skipped repainting a FOCUSED entry, to avoid
+        // clobbering what the user was typing. That left a worse state: if the
+        // selection changed while the entry kept focus, the entry went on showing
+        // image A's text under image B, with nothing to ever re-sync it — and the
+        // next focus-leave wrote A's text onto B. Flushing against the entry's own
+        // snapshot and then repainting unconditionally cannot lose an edit,
+        // because the flush has already persisted it.
+        self.flush_metadata_edits();
+
+        let meta = crate::persist::load_metadata(db_path, full_path);
+        for (i, entry) in self.meta_entries.iter().enumerate() {
+            // Match on the field rather than trusting index alignment between
+            // `load_metadata`'s result and `meta_entries`.
+            let field = crate::persist::MetaField::ALL[i];
+            let text = meta
+                .iter()
+                .find(|(f, _)| *f == field)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            entry.set_text(text);
+            // Re-baseline to the newly shown image, so a subsequent focus-leave
+            // compares against THIS image's value.
+            if let Some(t) = self.meta_targets.get(i) {
+                let mut t = t.borrow_mut();
+                *t = (full_path.to_string(), db_path.to_string(), text.to_string());
+            }
+        }
 
         // NOTE: the styles list is deliberately NOT refreshed here. It is
         // library-wide, not per-image, and `c41_styles` is only ever mutated by

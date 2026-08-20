@@ -626,3 +626,88 @@ phrased around naming its subject. It is a proxy, not a proof — the real check
 is `CssProvider::load_from_string` with `connect_parsing_error`, which needs GTK
 initialised. Its expiry is recorded in the test: past GTK 4.16 these selectors
 become valid and libadwaita ≥1.6 prefers them.
+
+---
+
+## 2026-08-19 12:33 UTC — Metadata editor (parity 2.3)
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** darktable's *metadata editor*: the five writable Dublin Core fields
+(title, description, creator, publisher, rights) as entries in the right panel,
+where before this the panel showed EXIF and nothing was editable.
+
+Unlike every other table `persist.rs` touches, storage here is **darktable's own
+`main.meta_data`**, not a c41-ui-private table. Metadata is not our format — it
+is XMP/Dublin Core text the C app reads, writes and exports to sidecars, so
+keeping it anywhere else would produce metadata the rest of the application
+cannot see.
+
+**Two blockers from senior review, the first of which was my own bad research.**
+
+- **I documented the schema wrongly, and built to the wrong shape.** The comment
+  claimed `main.meta_data` has no uniqueness constraint. It has
+  `UNIQUE(id, key, value)` plus an FK to `images`. The error came from reading
+  `database.c:264` — a legacy migration block — plus the `MIN(rowid)` dedupe at
+  `:1778`, and stopping there; the live schema is `database.c:3547`, and
+  `LAST_FULL_DATABASE_VERSION_LIBRARY` is 55, so *every* current catalogue has it.
+  Confirmed afterwards against the running container's own `library.db`:
+  `CREATE UNIQUE INDEX metadata_index ON meta_data (id, key, value)`.
+  The conclusion (no upsert; delete-then-insert) survives, but for a different
+  reason than stated: the index is on `(id, key, value)`, so `ON CONFLICT(id,key)`
+  has no index to target.
+  This was not just a comment. The ad-hoc `CREATE TABLE IF NOT EXISTS` in
+  `persist.rs` was the production path on c41-created catalogues and built a
+  **narrower** table than darktable's — no unique index, no FK, no secondary
+  indexes — i.e. a catalogue the C app opens but whose constraints differ. The
+  table is now created by `c41_db::schema::ensure_base_schema` with upstream's
+  exact shape, and `persist.rs` issues no DDL at all.
+- **No dirty check, so a stale focus-leave could write one image's text onto
+  another.** Entries snapshot the target image on focus-*enter*, which was the
+  right instinct but leaned on GTK4 delivering focus-leave before
+  selection-changed — not contractual. Upstream doesn't rely on it either: it
+  stashes `text_orig` and only writes a field that actually changed
+  (`src/libs/metadata.c:360`), and flushes in `gui_update` *before* repainting
+  (`:239`/`:269`). Both adopted. The old `has_focus()` guard was worse than
+  useless: if the selection changed while an entry kept focus, the entry showed
+  image A's text under image B permanently, and the next focus-leave wrote A onto
+  B. Repaint is now unconditional, because the flush already persisted the edit.
+
+**Also: this duplicated code that already existed.** `crates/c41-db/src/metadata.rs`
+has been there since Phase 2-db-3 with `metadata_get_all` / `metadata_set_value` /
+`metadata_delete_key`, `c41-ui` already depends on the crate, and its module doc
+states the schema *correctly* — including the unique index the new comment denied.
+Reads and writes now delegate to it, so the UI and the FFI path cannot diverge;
+`persist.rs` keeps only path→imgid resolution and the UI's field set.
+
+Smaller review items: Escape reverts (upstream cancels; a bare `GtkEntry` ignores
+it and would commit on the next focus-leave); a `close-request` flush, since GTK4
+does not promise focus-leave during teardown; trimming matches upstream's
+spaces-only `_cleanup_metadata_value` rather than Rust's `.trim()`; the imgid
+lookup moved inside the transaction.
+
+**Verified.** `scripts/ci-local.sh` — exit 0, all four steps, 1008 tests. Then
+driven in the running container with xdotool, re-run after the rework:
+- type a title + Tab → `(11371, 2, 'Rework check')` in `main.meta_data`;
+- select another image → fields blank; select back → value reloads;
+- **Escape** after editing → value unchanged in the db;
+- **type, then click a different thumbnail while the entry still has focus** →
+  the write lands on 11371, *not* on the newly selected image. That is the exact
+  cross-image write B2 described, shown not to happen.
+- clearing a field deletes the row rather than storing `''`.
+Test data was removed afterwards; `main.meta_data` is empty again.
+
+**Notes.** Tests now build their fixture from `ensure_base_schema`, so they run
+against the real constraints — the previous fixture created its own narrower
+table, which meant no test ever exercised what production writes under. Added
+pins for `MetaField::ALL` display order and the unique-index shape. The
+duplicate-row test no longer asserts rowid ordering (the delegated read orders by
+`key`, so ties are the planner's choice); it pins what is actually guaranteed —
+a duplicate never reads back blank, and the next write collapses it to one row.
+
+**Known gap, unchanged: the XMP sidecar is not written.** Upstream follows
+`dt_metadata_set_list` with `dt_image_synch_xmps` (`src/libs/metadata.c:383`,
+`:393`). We write the catalogue only, so a value set here does not travel with
+the file until darktable rewrites the sidecar. Nothing is lost or corrupted —
+`dt_exif_xmp_read` reads sidecars back *into* this table — it is unexported, not
+wrong. An XMP writer is its own increment.

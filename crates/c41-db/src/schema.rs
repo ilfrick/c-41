@@ -39,7 +39,26 @@ pub fn ensure_base_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS main.tagged_images (
             imgid INTEGER, tagid INTEGER, position INTEGER,
             PRIMARY KEY (imgid, tagid)
-         );",
+         );
+         -- Per-image metadata values (title/creator/rights/…). Shape copied
+         -- VERBATIM from darktable's fresh-database schema, src/common/database.c
+         -- (`_create_library_schema`, the meta_data block) — including the FK and
+         -- all three indexes. This table is darktable's, not ours: it holds XMP /
+         -- Dublin Core text the C app reads, writes and exports to sidecars, so a
+         -- narrower table here would be a catalogue the C app can open but whose
+         -- constraints silently differ from every darktable-created one.
+         -- NOTE the unique index is on (id, key, VALUE), not (id, key) — so it
+         -- does NOT enforce one value per key, and gives ON CONFLICT(id,key)
+         -- nothing to target. One-value-per-key is a convention the writers
+         -- maintain by deleting before inserting, not a constraint.
+         CREATE TABLE IF NOT EXISTS main.meta_data (
+            id INTEGER, key INTEGER, value VARCHAR,
+            FOREIGN KEY(id) REFERENCES images(id) ON DELETE CASCADE ON UPDATE CASCADE
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS main.metadata_index
+            ON meta_data (id, key, value);
+         CREATE INDEX IF NOT EXISTS main.metadata_index_key ON meta_data (key);
+         CREATE INDEX IF NOT EXISTS main.metadata_index_value ON meta_data (value);",
     )
 }
 
