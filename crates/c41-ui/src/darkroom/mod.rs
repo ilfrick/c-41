@@ -1854,6 +1854,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Lowlight vision" => pg.add(&lowlight_module_row(ctx)),
                 "Graduated density" => pg.add(&gradnd_module_row(ctx)),
                 "Contrast brightness saturation" => pg.add(&colisa_module_row(ctx)),
+                "Basic adjustments" => pg.add(&basicadj_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
                 other => match elsewhere_hint(other) {
@@ -1940,7 +1941,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2300,6 +2301,51 @@ fn colisa_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.colisa_brightness = v);
             add_param_slider(e, ctx, "Saturation", -1.0, 1.0, 0.01, p0.colisa_saturation as f64,
                 |p, v| p.colisa_saturation = v);
+        })
+}
+
+/// Basic adjustments (basicadj): black point, exposure, highlight compression,
+/// brightness, contrast, saturation and vibrance in one module.
+///
+/// Ranges are darktable's own `$MIN`/`$MAX` from `dt_iop_basicadj_params_t`,
+/// except exposure: upstream allows -18..18 EV but its slider soft-range is far
+/// narrower, and a full-width -18..18 control makes every useful adjustment
+/// sub-pixel. -3..3 matches what the exposure module already exposes here.
+///
+/// Two of darktable's params are deliberately not surfaced. `clip` has no
+/// implementation in the migrated kernel, so a slider for it would do nothing.
+/// `preserve_colors` is an enum, not a slider, and defaults to LUMINANCE; it
+/// wants a dropdown, which is a separate increment rather than a fake slider.
+///
+/// Upstream's own iop_order note on this module is "mixing view/model/control at
+/// once, usage should be discouraged" — it overlaps exposure, filmic and
+/// colorbalancergb. It is here because the processing is ported and darktable
+/// still ships it, not as the recommended path.
+fn basicadj_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Basic adjustments", "black, exposure, tone", p0.basicadj_on,
+        |p, on| p.basicadj_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Black level", -1.0, 1.0, 0.001, p0.basicadj_black_point as f64,
+                |p, v| p.basicadj_black_point = v);
+            add_param_slider(e, ctx, "Exposure", -3.0, 3.0, 0.01, p0.basicadj_exposure as f64,
+                |p, v| p.basicadj_exposure = v);
+            // `hlcompr` has a slider (darktable exposes it at 0..100 soft-max 500);
+            // `hlcomprthresh` does NOT — darktable only sets it via auto-exposure,
+            // so it stays at its 0.0 default here. Exposing it would be a control
+            // that does nothing useful from the user's perspective.
+            add_param_slider(e, ctx, "Highlight compression", 0.0, 500.0, 1.0, p0.basicadj_hlcompr as f64,
+                |p, v| p.basicadj_hlcompr = v);
+            add_param_slider(e, ctx, "Contrast", -1.0, 5.0, 0.01, p0.basicadj_contrast as f64,
+                |p, v| p.basicadj_contrast = v);
+            add_param_slider(e, ctx, "Middle gray", 0.05, 100.0, 0.01, p0.basicadj_middle_grey as f64,
+                |p, v| p.basicadj_middle_grey = v);
+            add_param_slider(e, ctx, "Brightness", -4.0, 4.0, 0.01, p0.basicadj_brightness as f64,
+                |p, v| p.basicadj_brightness = v);
+            add_param_slider(e, ctx, "Saturation", -1.0, 1.0, 0.01, p0.basicadj_saturation as f64,
+                |p, v| p.basicadj_saturation = v);
+            add_param_slider(e, ctx, "Vibrance", -1.0, 1.0, 0.01, p0.basicadj_vibrance as f64,
+                |p, v| p.basicadj_vibrance = v);
         })
 }
 

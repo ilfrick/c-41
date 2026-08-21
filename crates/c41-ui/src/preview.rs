@@ -188,6 +188,25 @@ pub struct PreviewParams {
     pub colisa_contrast: f32,
     pub colisa_brightness: f32,
     pub colisa_saturation: f32,
+    /// Basic adjustments (basicadj) stage on/off.
+    ///
+    /// Upstream's own iop_order comment calls this a "module mixing view/model/
+    /// control at once, usage should be discouraged" — it overlaps exposure,
+    /// filmic and colorbalancergb. Exposed because the processing is ported and
+    /// darktable still ships it, not because it is the recommended path.
+    pub basicadj_on: bool,
+    pub basicadj_black_point: f32,
+    pub basicadj_exposure: f32,
+    pub basicadj_hlcompr: f32,
+    pub basicadj_hlcomprthresh: f32,
+    pub basicadj_contrast: f32,
+    /// `dt_iop_rgb_norms_t` as a float so it rides the existing f32 payload.
+    /// 0 = off (per-channel LUT contrast), 1 = luminance, 2 = max RGB, …
+    pub basicadj_preserve_colors: f32,
+    pub basicadj_middle_grey: f32,
+    pub basicadj_brightness: f32,
+    pub basicadj_saturation: f32,
+    pub basicadj_vibrance: f32,
 }
 
 impl Default for PreviewParams {
@@ -300,6 +319,19 @@ impl Default for PreviewParams {
             colisa_contrast: 0.0,
             colisa_brightness: 0.0,
             colisa_saturation: 0.0,
+            // darktable defaults (basicadj.c $DEFAULT): off, neutral, middle
+            // grey 18.42, preserve_colors = LUMINANCE (1).
+            basicadj_on: false,
+            basicadj_black_point: 0.0,
+            basicadj_exposure: 0.0,
+            basicadj_hlcompr: 0.0,
+            basicadj_hlcomprthresh: 0.0,
+            basicadj_contrast: 0.0,
+            basicadj_preserve_colors: 1.0,
+            basicadj_middle_grey: 18.42,
+            basicadj_brightness: 0.0,
+            basicadj_saturation: 0.0,
+            basicadj_vibrance: 0.0,
         }
     }
 }
@@ -379,13 +411,24 @@ impl PreviewParams {
             || (self.colisa_contrast == 0.0
                 && self.colisa_brightness == 0.0
                 && self.colisa_saturation == 0.0);
+        // Identity when off, or when every slider that can change a pixel is at
+        // its neutral. middle_grey and preserve_colors are NOT in this list:
+        // both only matter via contrast, which is checked.
+        let basicadj_identity = !self.basicadj_on
+            || (self.basicadj_black_point == 0.0
+                && self.basicadj_exposure == 0.0
+                && self.basicadj_hlcompr == 0.0
+                && self.basicadj_contrast == 0.0
+                && self.basicadj_brightness == 0.0
+                && self.basicadj_saturation == 0.0
+                && self.basicadj_vibrance == 0.0);
         let vignette_identity = !self.vignette_on
             || (self.vignette_brightness == 0.0 && self.vignette_saturation == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
             && levels_identity && vignette_identity && lowlight_identity
-            && gradnd_identity && colisa_identity
+            && gradnd_identity && colisa_identity && basicadj_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -411,6 +454,7 @@ impl PreviewParams {
             lowlight_on: false,
             gradnd_on: false,
             colisa_on: false,
+            basicadj_on: false,
             ..*self
         }
     }
@@ -422,7 +466,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on] {
             v.push(b as u8);
         }
         for f in [
@@ -459,6 +503,11 @@ impl PreviewParams {
             self.gradnd_density, self.gradnd_hardness, self.gradnd_rotation,
             self.gradnd_offset, self.gradnd_hue, self.gradnd_saturation,
             self.colisa_contrast, self.colisa_brightness, self.colisa_saturation,
+            self.basicadj_black_point, self.basicadj_exposure,
+            self.basicadj_hlcompr, self.basicadj_hlcomprthresh,
+            self.basicadj_contrast, self.basicadj_preserve_colors,
+            self.basicadj_middle_grey, self.basicadj_brightness,
+            self.basicadj_saturation, self.basicadj_vibrance,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -472,9 +521,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..19];
-        // length is checked above, so exactly 119 f32 chunks follow
-        let f: Vec<f32> = bytes[19..]
+        let bools = &bytes[1..20];
+        // length is checked above, so exactly 129 f32 chunks follow
+        let f: Vec<f32> = bytes[20..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -533,6 +582,12 @@ impl PreviewParams {
             gradnd_offset: f[113], gradnd_hue: f[114], gradnd_saturation: f[115],
             colisa_on: bools[17] != 0,
             colisa_contrast: f[116], colisa_brightness: f[117], colisa_saturation: f[118],
+            basicadj_on: bools[18] != 0,
+            basicadj_black_point: f[119], basicadj_exposure: f[120],
+            basicadj_hlcompr: f[121], basicadj_hlcomprthresh: f[122],
+            basicadj_contrast: f[123], basicadj_preserve_colors: f[124],
+            basicadj_middle_grey: f[125], basicadj_brightness: f[126],
+            basicadj_saturation: f[127], basicadj_vibrance: f[128],
         })
     }
 
@@ -628,6 +683,37 @@ impl PreviewParams {
         if self.vibrance_on && self.vibrance_amount > 0.0 {
             p.push(Stage::Vibrance {
                 amount: self.vibrance_amount / 100.0,
+                space,
+            });
+        }
+        // Basic adjustments (iop_order.c pos 40, between channelmixer 39 and
+        // colorbalance 41) — scene-referred, so it lands well before the tone
+        // map, unlike colisa 47 which is display-referred.
+        //
+        // The gate mirrors `is_identity`: middle_grey and preserve_colors cannot
+        // move a pixel on their own, so they are not in it. Without that, a user
+        // who only nudged middle_grey would add a stage that does nothing but
+        // cost a full-buffer pass.
+        if self.basicadj_on
+            && (self.basicadj_black_point != 0.0
+                || self.basicadj_exposure != 0.0
+                || self.basicadj_hlcompr != 0.0
+                || self.basicadj_contrast != 0.0
+                || self.basicadj_brightness != 0.0
+                || self.basicadj_saturation != 0.0
+                || self.basicadj_vibrance != 0.0)
+        {
+            p.push(Stage::Basicadj {
+                black_point: self.basicadj_black_point,
+                exposure: self.basicadj_exposure,
+                hlcompr: self.basicadj_hlcompr,
+                hlcomprthresh: self.basicadj_hlcomprthresh,
+                contrast: self.basicadj_contrast,
+                preserve_colors: self.basicadj_preserve_colors as i32,
+                middle_grey: self.basicadj_middle_grey,
+                brightness: self.basicadj_brightness,
+                saturation: self.basicadj_saturation,
+                vibrance: self.basicadj_vibrance,
                 space,
             });
         }
@@ -860,9 +946,9 @@ impl PreviewParams {
 /// `levels::process_pixels`, not from this.
 const LEVELS_MIN_RANGE: f32 = 1.0;
 
-const ENCODE_VERSION: u8 = 11;
+const ENCODE_VERSION: u8 = 12;
 /// 1 version byte + 18 bool bytes + 119 little-endian f32.
-const ENCODED_LEN: usize = 1 + 18 + 119 * 4;
+const ENCODED_LEN: usize = 1 + 19 + 129 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1508,6 +1594,8 @@ mod tests {
         p.split_on = true;
         p.sharpen_on = true;
         p.sharpen_amount = 1.0;
+        p.basicadj_on = true;
+        p.basicadj_exposure = 0.5; // off-default so the stage is emitted
         p.color_correction_on = true;
         p.color_correction_saturation = 1.5;
         p.colorize_on = true;
@@ -1516,7 +1604,7 @@ mod tests {
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
-            ["exposure", "channelmixer", "sharpen", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
+            ["exposure", "channelmixer", "sharpen", "basicadj", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
         );
         // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
         // it clips at its black point and treats L as 0..100, so running it
@@ -1767,6 +1855,15 @@ mod tests {
             gradnd_hue: 0.6, gradnd_saturation: 0.4,
             colisa_on: true, colisa_contrast: 0.3,
             colisa_brightness: -0.2, colisa_saturation: 0.45,
+            // Every value distinct, so a field packed or unpacked at the wrong
+            // offset shows up as a mismatch rather than coincidentally matching
+            // its neighbour.
+            basicadj_on: true, basicadj_black_point: 0.02,
+            basicadj_exposure: 1.25, basicadj_hlcompr: 70.0,
+            basicadj_hlcomprthresh: 30.0, basicadj_contrast: 0.6,
+            basicadj_preserve_colors: 2.0, basicadj_middle_grey: 22.5,
+            basicadj_brightness: -0.4, basicadj_saturation: 0.15,
+            basicadj_vibrance: -0.35,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);

@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -231,6 +231,34 @@ pub enum Stage {
         saturation: f32,
         space: ColorSpace,
     },
+    /// Basic adjustments (basicadj.c): black point, exposure, highlight
+    /// compression, brightness, contrast, saturation and vibrance in one pass.
+    ///
+    /// Works directly in **linear RGB** — no Lab round-trip, so `working_space()`
+    /// returns `None` — but it does need the working space's luminance weights
+    /// for the highlight-compression pass, which is what `space` selects.
+    /// Holds the user sliders, not the two 65536-entry LUTs: those are derived in
+    /// `apply` via [`basicadj::commit_params`], keeping the stage `PartialEq` and
+    /// out of the business of carrying 512 KB per stage. **Pixel-local**.
+    ///
+    /// `clip` from darktable's params struct is deliberately absent — the
+    /// migrated kernel does not implement it, and a slider that does nothing is
+    /// worse than no slider.
+    Basicadj {
+        black_point: f32,
+        exposure: f32,
+        hlcompr: f32,
+        hlcomprthresh: f32,
+        contrast: f32,
+        /// `dt_iop_rgb_norms_t`: 0 = off (per-channel LUT contrast), 1 = luminance,
+        /// 2 = max RGB, … See `crate::color::rgb_norm`.
+        preserve_colors: i32,
+        middle_grey: f32,
+        brightness: f32,
+        saturation: f32,
+        vibrance: f32,
+        space: ColorSpace,
+    },
     GraduatedNd {
         /// Filter density in EV, -8..8 (negative brightens).
         density: f32,
@@ -291,6 +319,7 @@ impl Stage {
             Stage::Lowlight { .. } => "lowlight",
             Stage::GraduatedNd { .. } => "graduatednd",
             Stage::Colisa { .. } => "colisa",
+            Stage::Basicadj { .. } => "basicadj",
         }
     }
 
@@ -336,6 +365,9 @@ impl Stage {
             // Colisa is pixel-local: two per-pixel LUT lookups on L plus an a/b
             // scale, no neighbour reads.
             Stage::Colisa { .. } => true,
+            // Basicadj is pixel-local: exposure, LUT lookups and a
+            // per-pixel saturation blend, no neighbour reads.
+            Stage::Basicadj { .. } => true,
             // Lowlight is pixel-local: a per-pixel scotopic/photopic blend
             // driven by that pixel's own luminance, no neighbour reads.
             Stage::Lowlight { .. } => true,
@@ -381,6 +413,10 @@ impl Stage {
             Stage::Lowlight { space, .. } => Some(*space),
             // Colisa works on Lab L (+ a/b saturation), so it must agree.
             Stage::Colisa { space, .. } => Some(*space),
+            // Basicadj works in linear RGB, so it has no Lab working
+            // space to agree on — its `space` selects luminance
+            // weights, not a Lab conversion.
+            Stage::Basicadj { .. } => None,
             _ => None,
         }
     }
@@ -816,6 +852,25 @@ impl Stage {
                     output[i..i + 4].copy_from_slice(&rgb);
                 }
             }
+            // ── Basic adjustments (basicadj.c) ─────────────────────────
+            // Straight linear RGB, no Lab sandwich. `space` only picks the
+            // luminance weights the highlight-compression pass uses — the Y row
+            // of that space's RGB→XYZ matrix, which is what the C pulls out of
+            // the work profile.
+            Stage::Basicadj {
+                black_point, exposure, hlcompr, hlcomprthresh, contrast,
+                preserve_colors, middle_grey, brightness, saturation, vibrance, space,
+            } => {
+                let luma = match space {
+                    ColorSpace::Rec2020 => [0.2627f32, 0.6780, 0.0593],
+                    ColorSpace::LinearSrgb => [0.2126f32, 0.7152, 0.0722],
+                };
+                let d = basicadj::commit_params(
+                    black_point, exposure, hlcompr, hlcomprthresh, contrast,
+                    preserve_colors, middle_grey, brightness, saturation, vibrance, luma,
+                );
+                d.process(input, output);
+            }
             // ── Graduated ND (graduatednd.c) ───────────────────────────
             // Position-dependent gradient filter, straight in RGB. Not
             // pixel-local, so `process` guarantees (width, height) is the true
@@ -1246,6 +1301,12 @@ mod tests {
             },
             Stage::Colisa {
                 contrast: 0.0, brightness: 0.0, saturation: 0.0,
+                space: ColorSpace::LinearSrgb,
+            },
+            Stage::Basicadj {
+                black_point: 0.0, exposure: 0.0, hlcompr: 0.0, hlcomprthresh: 0.0,
+                contrast: 0.0, preserve_colors: 1, middle_grey: 18.42,
+                brightness: 0.0, saturation: 0.0, vibrance: 0.0,
                 space: ColorSpace::LinearSrgb,
             },
         ] {

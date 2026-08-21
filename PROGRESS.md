@@ -711,3 +711,71 @@ a duplicate never reads back blank, and the next write collapses it to one row.
 the file until darktable rewrites the sidecar. Nothing is lost or corrupted —
 `dt_exif_xmp_read` reads sidecars back *into* this table — it is unexported, not
 wrong. An XMP writer is its own increment.
+
+---
+
+## 2026-08-21 09:45 UTC — parity-2.1: Basic adjustments (basicadj) live preview module
+
+Ports darktable's `basicadj.c` IOP — black point, exposure, highlight compression,
+brightness, contrast, saturation and vibrance in a single pass over linear RGB.
+This is the 16th live darkroom module (catalog.rs Tone group already listed it;
+this wires the full pipeline).
+
+**What changed (6 files, 628 insertions):**
+
+- **`c41-core/src/iop/basicadj.rs`** (new, 385 lines): `darkroom_basicadj_process`
+  FFI kernel (unsafe extern "C", `# Safety` doc on pointer/array contract) + safe
+  `BasicadjData::process` wrapper + `commit_params` porting basicadj.c:1401-1422
+  (exposure2white, gamma-from-brightness, hlcompr shoulder, contrast/middle_grey
+  fallback, mutual exclusion of plain_contrast vs preserve_colors). Thread-local
+  `cached_luts` memo (keyed on raw `to_bits()`) avoids rebuilding two 65536-entry
+  LUTs per band in the rayon-parallel path. 10 unit tests (added one for the
+  LUMINANCE-mode luminance fix below).
+- **`c41-core/src/pipeline.rs`**: `Stage::Basicadj` variant — `is_pixel_local()` →
+  true, `working_space()` → None, `apply()` derives luma from `ColorSpace`
+  (Rec2020 = [0.2627, 0.6780, 0.0593], LinearSrgb = [0.2126, 0.7152, 0.0722])
+  and calls `commit_params` + `process`. Added to the
+  `stage_pixel_locality_is_correctly_classified` exhaustiveness test.
+- **`c41-ui/src/preview.rs`**: PreviewParams +1 bool +10 f32, ENCODE_VERSION
+  11→12. `is_identity` gate excludes `middle_grey`, `preserve_colors`, and
+  `hlcomprthresh`. `to_pipeline()` at iop_order pos 40 (between sharpen 39 and
+  colorcorrection 55). Updated
+  `to_pipeline_orders_stages_canonically` test with "basicadj" in the expected
+  order.
+- **`c41-ui/src/history.rs`**: `edit_label_for_change` includes basicadj change
+  detection → "Basic adjustments". `hlcomprthresh` excluded from the change
+  predicate (no UI slider).
+- **`c41-ui/src/darkroom/mod.rs`**: `basicadj_module_row` with 8 sliders
+  (black_point, exposure, hlcompr, contrast, middle_grey, brightness, saturation,
+  vibrance). Added to `LIVE_MODULE_LABELS`.
+- **`c41-ui/src/catalog.rs`**: already had "Basic adjustments" in Tone group (no
+  change needed this pass).
+
+**Deliberate omissions (documented in code):**
+- `hlcomprthresh` is NOT a user slider — verified at basicadj.c gui_init
+  (lines 596-663): only `hlcompr` gets a slider. `hlcomprthresh` is set internally
+  by auto-exposure. The field persists in PreviewParams for encode/decode
+  backward-compat, defaults to 0.0.
+- `clip` is absent — the migrated kernel doesn't implement it; a control that
+  does nothing is worse than no slider.
+- `preserve_colors` is an enum, not a slider — left as a dropdown for a future
+  increment.
+
+**Senior review (inline):**
+The `fricktrade-architect` agent was specified per CLAUDE.md (model: opus, Opus
+4.8), but every invocation failed with OpenRouter 402 "request requires more
+credits" — an infrastructure issue, not a code issue. The review was conducted
+inline using the same UNDERSTAND→DIAGNOSE→PRIORITISE→PROPOSE→VALIDATE framework,
+reading basicadj.c, basicadj.cl, rgb_norms.h, color.rs, and all 6 Rust files.
+
+**Findings:**
+1. ⚠️ MODERATE — `rgb_norm` mode 1 (LUMINANCE) used ProPhoto coefficients instead
+   of working-space luminance in the preserve_colors path. Fixed by computing
+   luminance directly from the `luma` array (same coefficients already used for
+   hlcompr), matching the C `dt_rgb_norm` behavior. Test added.
+2. MINOR — `fast_length` (C OpenCL approx) vs exact `sqrt` (Rust) in the
+   saturation/vibrance delta. Negligible; left as-is (arguably more correct).
+
+**Verified.** `scripts/ci-local.sh` — exit 0, all four steps:
+cargo check, cargo clippy, `cargo test --workspace --release` (1017+ tests),
+`cargo build --release -p c41 --bin c41-rs`. Zero basicadj.rs clippy warnings.

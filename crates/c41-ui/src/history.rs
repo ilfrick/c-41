@@ -200,7 +200,7 @@ impl HistoryStack {
 }
 
 /// Version byte for [`HistoryStack::encode`]; bump on any layout change.
-const HISTORY_ENCODE_VERSION: u8 = 2;
+const HISTORY_ENCODE_VERSION: u8 = 3;
 
 fn read_u32(bytes: &[u8], p: &mut usize) -> Option<u32> {
     let end = p.checked_add(4)?;
@@ -357,6 +357,22 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
         || old.colisa_saturation != new.colisa_saturation;
     if colisa {
         return "Contrast brightness saturation";
+    }
+    // hlcomprthresh is not a user control (darktable only sets it via
+    // auto-exposure), so it is excluded from change detection — it stays at
+    // its 0.0 default and would never meaningfully differ between snapshots.
+    let basicadj = old.basicadj_on != new.basicadj_on
+        || old.basicadj_black_point != new.basicadj_black_point
+        || old.basicadj_exposure != new.basicadj_exposure
+        || old.basicadj_hlcompr != new.basicadj_hlcompr
+        || old.basicadj_contrast != new.basicadj_contrast
+        || old.basicadj_preserve_colors != new.basicadj_preserve_colors
+        || old.basicadj_middle_grey != new.basicadj_middle_grey
+        || old.basicadj_brightness != new.basicadj_brightness
+        || old.basicadj_saturation != new.basicadj_saturation
+        || old.basicadj_vibrance != new.basicadj_vibrance;
+    if basicadj {
+        return "Basic adjustments";
     }
     "Edit"
 }
@@ -616,6 +632,17 @@ mod tests {
             colisa_contrast: _,
             colisa_brightness: _,
             colisa_saturation: _,
+            basicadj_on: _,
+            basicadj_black_point: _,
+            basicadj_exposure: _,
+            basicadj_hlcompr: _,
+            basicadj_hlcomprthresh: _,
+            basicadj_contrast: _,
+            basicadj_preserve_colors: _,
+            basicadj_middle_grey: _,
+            basicadj_brightness: _,
+            basicadj_saturation: _,
+            basicadj_vibrance: _,
         } = PreviewParams::default();
     }
 
@@ -695,7 +722,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 495);
+        assert_eq!(PreviewParams::default().encode().len(), 536);
     }
 
     #[test]
