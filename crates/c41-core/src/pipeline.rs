@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -231,6 +231,27 @@ pub enum Stage {
         saturation: f32,
         space: ColorSpace,
     },
+    /// Low-pass local-contrast filter (lowpass.c). Blurs the image in Lab with a
+    /// recursive Gaussian, then applies a contrast LUT + brightness LUT (each with
+    /// exponential extrapolation above 1.0) to the blurred `L`, and scales a/b by
+    /// `saturation`. The contrast/brightness LUTs and their extrapolation
+    /// coefficients are derived in `apply` via [`lowpass::commit_params`], keeping
+    /// the stage `PartialEq`-comparable and the LUTs out of the stage struct.
+    ///
+    /// Lab-domain (RGB-to-Lab round-trip per pixel), so it needs the buffer's
+    /// working space. **NOT pixel-local** -- the Gaussian blur reads a spatial
+    /// neighbourhood, so `process` falls back to the serial whole-buffer path
+    /// whenever this stage is present. Like [`Stage::Sharpen`], holds a `scale`
+    /// so the blur radius tracks the ROI resolution (`radius * scale` = the
+    /// sigma passed to the recursive filter).
+    Lowpass {
+        radius: f32,
+        contrast: f32,
+        brightness: f32,
+        saturation: f32,
+        scale: f32,
+        space: ColorSpace,
+    },
     /// Basic adjustments (basicadj.c): black point, exposure, highlight
     /// compression, brightness, contrast, saturation and vibrance in one pass.
     ///
@@ -320,6 +341,7 @@ impl Stage {
             Stage::GraduatedNd { .. } => "graduatednd",
             Stage::Colisa { .. } => "colisa",
             Stage::Basicadj { .. } => "basicadj",
+            Stage::Lowpass { .. } => "lowpass",
         }
     }
 
@@ -368,6 +390,12 @@ impl Stage {
             // Basicadj is pixel-local: exposure, LUT lookups and a
             // per-pixel saturation blend, no neighbour reads.
             Stage::Basicadj { .. } => true,
+            // Lowpass is NOT pixel-local: the Gaussian blur reads a spatial
+            // neighbourhood, so band-splitting would hand it a (band_pixels, 1)
+            // rectangle and produce wrong-edge artefacts. Returning false forces
+            // the whole pipeline serial whenever this stage is present, where
+            // (width, height) is the true image rectangle.
+            Stage::Lowpass { .. } => false,
             // Lowlight is pixel-local: a per-pixel scotopic/photopic blend
             // driven by that pixel's own luminance, no neighbour reads.
             Stage::Lowlight { .. } => true,
@@ -413,6 +441,9 @@ impl Stage {
             Stage::Lowlight { space, .. } => Some(*space),
             // Colisa works on Lab L (+ a/b saturation), so it must agree.
             Stage::Colisa { space, .. } => Some(*space),
+            // Lowpass works in Lab (RGB-to-Lab blur then Lab-to-RGB), so it
+            // must agree with the other Lab-domain stages on the working space.
+            Stage::Lowpass { space, .. } => Some(*space),
             // Basicadj works in linear RGB, so it has no Lab working
             // space to agree on — its `space` selects luminance
             // weights, not a Lab conversion.
@@ -870,6 +901,57 @@ impl Stage {
                     preserve_colors, middle_grey, brightness, saturation, vibrance, luma,
                 );
                 d.process(input, output);
+            }
+            // ── Lowpass (lowpass.c) ──────────────────────────────────
+            // Local-contrast reduction: blur in Lab, then apply contrast +
+            // brightness LUTs to the blurred L and saturation-scale a/b. Same
+            // RGB-to-Lab sandwich as the other Lab-domain stages. NOT
+            // pixel-local (the Gaussian blur reads neighbours), so `process`
+            // guarantees (width, height) here is the true image rectangle.
+            Stage::Lowpass { radius, contrast, brightness, saturation, scale, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let sigma = f32::max(0.1, radius) * scale;
+                let n = width * height;
+                // RGB => Lab, then blur the Lab copy into a second buffer.
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut blurred = vec![0.0f32; n * 4];
+                {
+                    // darktable clamps each Lab channel into [Labmin, Labmax] as
+                    // it enters the recursion; unbound=true (the C default) widens
+                    // that to +/-FLT_MAX, matching our Stage default.
+                    let mut g = crate::gaussian::Gaussian::new(
+                        width, height,
+                        [-f32::MAX, -f32::MAX, -f32::MAX, -f32::MAX],
+                        [f32::MAX, f32::MAX, f32::MAX, f32::MAX],
+                        sigma,
+                        crate::gaussian::GaussianOrder::Zero,
+                    );
+                    g.blur_4c(&lab_in, &mut blurred);
+                }
+                // Build LUTs + extrapolation coeffs, then run the per-pixel LUT
+                // pass. `in` = original Lab (for alpha), `out` = blurred Lab
+                // (modified in place).
+                let d = lowpass::commit_params(contrast, brightness, saturation, /* unbound = */ true);
+                lowpass::process_pixels(
+                    &lab_in, &mut blurred,
+                    &d.ctable, &d.cunbounded, &d.ltable, &d.lunbounded,
+                    d.saturation, d.lab_min_ab, d.lab_max_ab,
+                );
+                // Lab => RGB for the final output.
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([blurred[i], blurred[i + 1], blurred[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
             }
             // ── Graduated ND (graduatednd.c) ───────────────────────────
             // Position-dependent gradient filter, straight in RGB. Not
@@ -1333,6 +1415,16 @@ mod tests {
             }
             .is_pixel_local(),
             "vignette derives its weight from pixel POSITION ⇒ NOT pixel-local"
+        );
+        // Lowpass is NOT pixel-local: the Gaussian blur reads a spatial
+        // neighbourhood, so band-splitting would produce wrong-edge artefacts.
+        assert!(
+            !Stage::Lowpass {
+                radius: 10.0, contrast: 1.0, brightness: 0.0, saturation: 1.0,
+                scale: 1.0, space: ColorSpace::LinearSrgb,
+            }
+                .is_pixel_local(),
+            "lowpass blurs a spatial neighbourhood ⇒ NOT pixel-local"
         );
     }
 

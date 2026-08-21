@@ -1,16 +1,149 @@
-use crate::{params::IopParams, roi::RoiIn, Result};
+use crate::{
+    iop::colisa::estimate_exp,
+    params::IopParams,
+    roi::RoiIn,
+    Error, Result,
+};
 use super::{ClBuffer, IopProcess};
 
 pub struct Lowpass;
 
 impl IopProcess for Lowpass {
+    fn name(&self) -> &'static str {
+        "lowpass"
+    }
+
     fn process(&self, _input: &[f32], _output: &mut [f32], _params: &IopParams, _roi: &RoiIn) -> Result<()> {
-        Err(crate::Error::Pipeline("not implemented".into()))
+        // Lowpass params contain 65K-entry LUT tables that are not trivially
+        // cast via IopParams::cast. Call through the C FFI path instead.
+        Err(Error::Pipeline(
+            "lowpass: use the C FFI entry point (LUT tables cannot be cast from raw params)".into(),
+        ))
     }
+
     fn process_cl(&self, _buf: &mut ClBuffer, _params: &IopParams) -> Result<()> {
-        Err(crate::Error::Pipeline("not implemented".into()))
+        Err(Error::OpenCl("lowpass: OpenCL path not yet ported".into()))
     }
-    fn name(&self) -> &'static str { "lowpass" }
+}
+
+// ── Core pixel loop ───────────────────────────────────────────────────────────
+
+/// Hold the derived tables that [`process_pixels`] needs, owned by the Rust side
+/// after [`commit_params`] builds them from the three user sliders.
+///
+/// Mirrors darktable's `dt_iop_lowpass_data_t`: the contrast and brightness
+/// 65536-entry LUTs, their unbounded-extrapolation coefficients, the saturation
+/// multiplier and the Lab a/b clamp range.
+pub struct LowpassData {
+    pub ctable: Box<[f32; 65536]>,
+    pub cunbounded: [f32; 3],
+    pub ltable: Box<[f32; 65536]>,
+    pub lunbounded: [f32; 3],
+    pub saturation: f32,
+    /// `lab_min_ab` / `lab_max_ab` clamp range for the a/b channels after the
+    /// saturation scale. `unbound == true` widens them to ±FLT_MAX.
+    pub lab_min_ab: f32,
+    pub lab_max_ab: f32,
+}
+
+/// Port of lowpass.c `commit_params` (src/iop/lowpass.c:442).
+///
+/// The lowpass sliders arrive on darktable's own scale and are used **directly**
+/// — unlike colisa, which rescales contrast/saturation/brightness from the
+/// -1..1 universal slider scale. Here `contrast` feeds the contrast LUT builder
+/// straight off the slider (-3..3, default 1.0 = identity), `brightness`
+/// selects the LUT gamma via the same asymmetric formula colisa uses, and
+/// `saturation` is the raw a/b multiplier (default 1.0 = unchanged).
+///
+/// `unbound` widens the a/b clamp from ±128 to ±FLT_MAX — darktable's default
+/// (the checkbox in the GUI is unchecked only for the scene-referred safety
+/// path, which we don't surface here).
+pub fn commit_params(contrast: f32, brightness: f32, saturation: f32, unbound: bool) -> LowpassData {
+    let mut ctable: Box<[f32; 65536]> = vec![0.0f32; 65536]
+        .into_boxed_slice()
+        .try_into()
+        .expect("65536-element vec converts to a fixed-size array");
+    let mut ltable: Box<[f32; 65536]> = vec![0.0f32; 65536]
+        .into_boxed_slice()
+        .try_into()
+        .expect("65536-element vec converts to a fixed-size array");
+
+    // Safety: both pointers address exactly 0x10000 floats, the documented
+    // contract of the two builders.
+    unsafe {
+        darkroom_lowpass_build_contrast_lut(ctable.as_mut_ptr(), contrast);
+        let gamma = if brightness >= 0.0 {
+            1.0 / (1.0 + brightness)
+        } else {
+            1.0 - brightness
+        };
+        darkroom_lowpass_build_brightness_lut(ltable.as_mut_ptr(), gamma);
+    }
+
+    // Sample the top of each curve and fit the extrapolation, per the C.
+    let xs = [0.7f32, 0.8, 0.9, 1.0];
+    let sample = |t: &Box<[f32; 65536]>| -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for (i, x) in xs.iter().enumerate() {
+            let idx = ((x * 65536.0) as i32).clamp(0, 0xffff) as usize;
+            out[i] = t[idx];
+        }
+        out
+    };
+    let cunbounded = estimate_exp(&xs, &sample(&ctable));
+    let lunbounded = estimate_exp(&xs, &sample(&ltable));
+
+    let (lab_min_ab, lab_max_ab) = if unbound {
+        (-f32::MAX, f32::MAX)
+    } else {
+        (-128.0, 128.0)
+    };
+
+    LowpassData { ctable, cunbounded, ltable, lunbounded, saturation, lab_min_ab, lab_max_ab }
+}
+
+#[inline]
+/// Apply the contrast/brightness LUT pair + a/b saturation to a blurred Lab
+/// buffer, matching the per-pixel loop in `darkroom_lowpass_process`.
+///
+/// `input` is the original (pre-blur) Lab RGBA — alpha is taken from it.
+/// `output` holds the blurred Lab on entry and receives the final result in place.
+pub fn process_pixels(
+    input: &[f32],
+    output: &mut [f32],
+    ctable: &[f32; 65536],
+    cunbounded: &[f32; 3],
+    ltable: &[f32; 65536],
+    lunbounded: &[f32; 3],
+    saturation: f32,
+    lab_min_ab: f32,
+    lab_max_ab: f32,
+) {
+    for (chunk_in, chunk_out) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+        let l_in = chunk_out[0];
+
+        // 1. Contrast LUT on L
+        let l_contrast = if l_in < 100.0 {
+            let idx = ((l_in / 100.0 * 65536.0) as usize).min(65535);
+            ctable[idx]
+        } else {
+            eval_exp(cunbounded, l_in / 100.0)
+        };
+
+        // 2. Brightness LUT on L
+        chunk_out[0] = if l_contrast < 100.0 {
+            let idx = ((l_contrast / 100.0 * 65536.0) as usize).min(65535);
+            ltable[idx]
+        } else {
+            eval_exp(lunbounded, l_contrast / 100.0)
+        };
+
+        // 3. Saturation on a/b, clamped
+        chunk_out[1] = (chunk_out[1] * saturation).clamp(lab_min_ab, lab_max_ab);
+        chunk_out[2] = (chunk_out[2] * saturation).clamp(lab_min_ab, lab_max_ab);
+        // 4. Alpha from the original (pre-blur) pixel
+        chunk_out[3] = chunk_in[3];
+    }
 }
 
 /// Matches dt_iop_eval_exp(): coeff[1] * (x * coeff[0])^coeff[2]

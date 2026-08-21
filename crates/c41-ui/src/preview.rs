@@ -207,6 +207,16 @@ pub struct PreviewParams {
     pub basicadj_brightness: f32,
     pub basicadj_saturation: f32,
     pub basicadj_vibrance: f32,
+    /// Lowpass (local contrast enhancement) stage on/off.
+    pub lowpass_on: bool,
+    /// Gaussian blur radius (darktable 0.1..500, default 10.0).
+    pub lowpass_radius: f32,
+    /// Contrast curve strength (darktable -3..3, default 1.0 = identity).
+    pub lowpass_contrast: f32,
+    /// Brightness curve adjustment (darktable -3..3, default 0.0 = no shift).
+    pub lowpass_brightness: f32,
+    /// a/b channel saturation multiplier (darktable -3..3, default 1.0 = no change).
+    pub lowpass_saturation: f32,
 }
 
 impl Default for PreviewParams {
@@ -332,6 +342,14 @@ impl Default for PreviewParams {
             basicadj_brightness: 0.0,
             basicadj_saturation: 0.0,
             basicadj_vibrance: 0.0,
+            // darktable defaults (lowpass.c params struct): off, radius 10,
+            // contrast 1.0 (identity), brightness 0.0, saturation 1.0,
+            // unbound 1 (not surfaced — see commit_params in lowpass.rs).
+            lowpass_on: false,
+            lowpass_radius: 10.0,
+            lowpass_contrast: 1.0,
+            lowpass_brightness: 0.0,
+            lowpass_saturation: 1.0,
         }
     }
 }
@@ -424,11 +442,20 @@ impl PreviewParams {
                 && self.basicadj_vibrance == 0.0);
         let vignette_identity = !self.vignette_on
             || (self.vignette_brightness == 0.0 && self.vignette_saturation == 0.0);
+        // Lowpass is identity when off. Contrast 1.0 + brightness 0.0 + saturation
+        // 1.0 means the LUTs are identity curves and a/b is unscaled, so that is
+        // a no-op too; radius doesn't matter then (the blur output is unchanged
+        // by the identity LUTs).
+        let lowpass_identity = !self.lowpass_on
+            || (self.lowpass_contrast == 1.0
+                && self.lowpass_brightness == 0.0
+                && self.lowpass_saturation == 1.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
             && levels_identity && vignette_identity && lowlight_identity
             && gradnd_identity && colisa_identity && basicadj_identity
+            && lowpass_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -455,18 +482,19 @@ impl PreviewParams {
             gradnd_on: false,
             colisa_on: false,
             basicadj_on: false,
+            lowpass_on: false,
             ..*self
         }
     }
 
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
-    /// `[version, 12×bool(u8), 36×f32_le]`. Decoded by [`PreviewParams::decode`].
+    /// `[version, 20×bool(u8), 133×f32_le]`. Decoded by [`PreviewParams::decode`].
     /// This is c41-ui's own layout (NOT a C IOP `op_params`), stored under a
     /// synthetic operation name the C reader ignores.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on] {
             v.push(b as u8);
         }
         for f in [
@@ -508,6 +536,7 @@ impl PreviewParams {
             self.basicadj_contrast, self.basicadj_preserve_colors,
             self.basicadj_middle_grey, self.basicadj_brightness,
             self.basicadj_saturation, self.basicadj_vibrance,
+            self.lowpass_radius, self.lowpass_contrast, self.lowpass_brightness, self.lowpass_saturation,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -521,9 +550,9 @@ impl PreviewParams {
         if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
             return None;
         }
-        let bools = &bytes[1..20];
-        // length is checked above, so exactly 129 f32 chunks follow
-        let f: Vec<f32> = bytes[20..]
+        let bools = &bytes[1..21];
+        // length is checked above, so exactly 133 f32 chunks follow
+        let f: Vec<f32> = bytes[21..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -588,6 +617,9 @@ impl PreviewParams {
             basicadj_contrast: f[123], basicadj_preserve_colors: f[124],
             basicadj_middle_grey: f[125], basicadj_brightness: f[126],
             basicadj_saturation: f[127], basicadj_vibrance: f[128],
+            lowpass_on: bools[19] != 0,
+            lowpass_radius: f[129], lowpass_contrast: f[130],
+            lowpass_brightness: f[131], lowpass_saturation: f[132],
         })
     }
 
@@ -714,6 +746,30 @@ impl PreviewParams {
                 brightness: self.basicadj_brightness,
                 saturation: self.basicadj_saturation,
                 vibrance: self.basicadj_vibrance,
+                space,
+            });
+        }
+        // Lowpass (iop_order.c pos 54.0, between basicadj 40 and colorcorrection 55)
+        // — a Gaussian-blur-based local contrast enhancement that runs in Lab:
+        // blur a copy, then apply the contrast/brightness LUT pair + a/b saturation
+        // to the blurred pixels. It is NOT pixel-local (the blur reads neighbours),
+        // so it stays on the serial whole-buffer path like Sharpen.
+        //
+        // The gate mirrors `is_identity`: contrast 1.0 + brightness 0.0 +
+        // saturation 1.0 yields identity LUTs, so radius doesn't matter then.
+        // `unbound` is hardcoded true (the C default; darktable does not expose it
+        // in the GUI).
+        if self.lowpass_on
+            && (self.lowpass_contrast != 1.0
+                || self.lowpass_brightness != 0.0
+                || self.lowpass_saturation != 1.0)
+        {
+            p.push(Stage::Lowpass {
+                radius: self.lowpass_radius,
+                contrast: self.lowpass_contrast,
+                brightness: self.lowpass_brightness,
+                saturation: self.lowpass_saturation,
+                scale,
                 space,
             });
         }
@@ -946,9 +1002,9 @@ impl PreviewParams {
 /// `levels::process_pixels`, not from this.
 const LEVELS_MIN_RANGE: f32 = 1.0;
 
-const ENCODE_VERSION: u8 = 12;
-/// 1 version byte + 18 bool bytes + 119 little-endian f32.
-const ENCODED_LEN: usize = 1 + 19 + 129 * 4;
+const ENCODE_VERSION: u8 = 13;
+/// 1 version byte + 20 bool bytes + 133 little-endian f32.
+const ENCODED_LEN: usize = 1 + 20 + 133 * 4;
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1596,6 +1652,8 @@ mod tests {
         p.sharpen_amount = 1.0;
         p.basicadj_on = true;
         p.basicadj_exposure = 0.5; // off-default so the stage is emitted
+        p.lowpass_on = true;
+        p.lowpass_contrast = 0.6; // off-default (identity is contrast 1.0)
         p.color_correction_on = true;
         p.color_correction_saturation = 1.5;
         p.colorize_on = true;
@@ -1604,7 +1662,7 @@ mod tests {
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
-            ["exposure", "channelmixer", "sharpen", "basicadj", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
+            ["exposure", "channelmixer", "sharpen", "basicadj", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
         );
         // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
         // it clips at its black point and treats L as 0..100, so running it
@@ -1864,6 +1922,9 @@ mod tests {
             basicadj_preserve_colors: 2.0, basicadj_middle_grey: 22.5,
             basicadj_brightness: -0.4, basicadj_saturation: 0.15,
             basicadj_vibrance: -0.35,
+            lowpass_on: true, lowpass_radius: 42.0,
+            lowpass_contrast: 0.6, lowpass_brightness: -0.4,
+            lowpass_saturation: 0.15,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);

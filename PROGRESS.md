@@ -779,3 +779,61 @@ reading basicadj.c, basicadj.cl, rgb_norms.h, color.rs, and all 6 Rust files.
 **Verified.** `scripts/ci-local.sh` — exit 0, all four steps:
 cargo check, cargo clippy, `cargo test --workspace --release` (1017+ tests),
 `cargo build --release -p c41 --bin c41-rs`. Zero basicadj.rs clippy warnings.
+
+---
+
+## 2026-08-21 — m4-112: Lowpass (local contrast enhancement) live preview module
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** Wired the lowpass IOP into the Rust preview pipeline — the 20th live
+module. Lowpass blurs a copy of the image and applies contrast/brightness LUTs +
+a/b saturation to the blurred pixels.
+
+- `c41-core/src/iop/lowpass.rs`: Already ported (FFI kernels ported + tested in
+  Phase 2z+40). `commit_params()` builds 65536-entry contrast + brightness LUTs
+  using `darkroom_lowpass_build_contrast_lut`/`darkroom_lowpass_build_brightness_lut`,
+  fits extrapolation coefficients with `colisa::estimate_exp`, and hardcodes
+  `unbound=true` (the C default; darktable does not expose it in the GUI).
+  `process_pixels()` applies the LUT pair + saturation clamp to the blurred Lab
+  buffer, matching `darkroom_lowpass_process`.
+- `pipeline.rs`: `Stage::Lowpass { radius, contrast, brightness, saturation, scale,
+  space }` variant. `is_pixel_local() = false` (Gaussian blur reads neighbours →
+  serial whole-buffer path, same as Sharpen). Apply arm: RGB→Lab → Gaussian blur
+  → `lowpass::process_pixels` → Lab→RGB. Added `lowpass` to the iop import list.
+  Added assertion to `stage_pixel_locality_is_correctly_classified` test.
+- `preview.rs`: Added 5 new PreviewParams fields (`lowpass_on: bool` + 4 f32s).
+  ENCODE_VERSION 12→13, ENCODED_LEN 536→553 (1 ver + 20 bool + 133×4). Encode
+  writes bools at bytes[0..20] then 133 f32s. Decode reads bools at
+  bytes[1..21] then f32s from bytes[21..]. Updated encode/decode/
+  default/bypassed/is_identity/to_pipeline and the
+  `params_encode_decode_roundtrips` test literal. Lowpass placed in
+  `to_pipeline` between basicadj (pos 40) and colorcorrection (pos 55), matching
+  darktable iop_order.c pos 54.0.
+- `history.rs`: Added "Lowpass" to `describe_change()`, updated exhaustive
+  destructure test, bumped HISTORY_ENCODE_VERSION 3→4, pinned length 536→553.
+- `darkroom/mod.rs`: Added "Lowpass" to LIVE_MODULE_LABELS, dispatch match arm,
+  and `lowpass_module_row` with 4 sliders (radius 0.1..500, contrast/
+  brightness/saturation -3..3 — matching darktable C params defaults).
+
+**Verified.** `scripts/ci-local.sh` — exit 0, all four steps:
+cargo check, cargo clippy, `cargo test --workspace --release`, and
+`cargo build --release -p c41 --bin c41-rs`.
+
+**Notes.**
+
+- First CI run failed: `lowpass` was not in the iop import list in pipeline.rs
+  (the `Stage::Lowpass` apply arm references `lowpass::commit_params`). Fixed by
+  adding `lowpass` to the `use crate::iop::{...}` line.
+- Second CI run failed: encode/decode offset mismatch. The decode read f32s from
+  `bytes[20..]` (the old 19-bool boundary) instead of `bytes[21..]` (20-bool
+  boundary). This caused `params_encode_decode_roundtrips` and all
+  history/persist roundtrip tests to fail with garbage values. Fixed by shifting
+  the f32 slice start to `bytes[21..]` and updating the comment.
+- The senior-review (fricktrade-architect, Opus 4.8) could not be launched — the
+  OpenRouter endpoint returned HTTP 402 (insufficient credits). The review was
+  performed inline instead: verified LUT formulas match `darkroom_lowpass_build_*`
+  (contrast ≤1.0 linear, >1.0 sigmoid with boost=5.0; brightness gamma),
+  process_pixels order (contrast LUT → brightness LUT → saturation clamp → alpha
+  from input), unbound=true default, iop_order position 54.0, and test coverage
+  patterns consistent with basicadj/colisa.

@@ -200,7 +200,7 @@ impl HistoryStack {
 }
 
 /// Version byte for [`HistoryStack::encode`]; bump on any layout change.
-const HISTORY_ENCODE_VERSION: u8 = 3;
+const HISTORY_ENCODE_VERSION: u8 = 4;
 
 fn read_u32(bytes: &[u8], p: &mut usize) -> Option<u32> {
     let end = p.checked_add(4)?;
@@ -374,6 +374,14 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if basicadj {
         return "Basic adjustments";
     }
+    let lowpass = old.lowpass_on != new.lowpass_on
+        || old.lowpass_radius != new.lowpass_radius
+        || old.lowpass_contrast != new.lowpass_contrast
+        || old.lowpass_brightness != new.lowpass_brightness
+        || old.lowpass_saturation != new.lowpass_saturation;
+    if lowpass {
+        return "Lowpass";
+    }
     "Edit"
 }
 
@@ -539,6 +547,10 @@ mod tests {
             describe_change(&base, &PreviewParams { colisa_contrast: 0.4, ..d() }),
             "Contrast brightness saturation"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { lowpass_contrast: 0.6, ..d() }),
+            "Lowpass"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -643,6 +655,11 @@ mod tests {
             basicadj_brightness: _,
             basicadj_saturation: _,
             basicadj_vibrance: _,
+            lowpass_on: _,
+            lowpass_radius: _,
+            lowpass_contrast: _,
+            lowpass_brightness: _,
+            lowpass_saturation: _,
         } = PreviewParams::default();
     }
 
@@ -722,7 +739,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 536);
+        assert_eq!(PreviewParams::default().encode().len(), 553);
     }
 
     #[test]

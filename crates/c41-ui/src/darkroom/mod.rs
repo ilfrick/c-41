@@ -1855,6 +1855,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Graduated density" => pg.add(&gradnd_module_row(ctx)),
                 "Contrast brightness saturation" => pg.add(&colisa_module_row(ctx)),
                 "Basic adjustments" => pg.add(&basicadj_module_row(ctx)),
+                "Lowpass" => pg.add(&lowpass_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
                 other => match elsewhere_hint(other) {
@@ -1941,7 +1942,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Lowpass", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2346,6 +2347,30 @@ fn basicadj_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.basicadj_saturation = v);
             add_param_slider(e, ctx, "Vibrance", -1.0, 1.0, 0.01, p0.basicadj_vibrance as f64,
                 |p, v| p.basicadj_vibrance = v);
+        })
+}
+
+/// Lowpass (local contrast enhancement): a Gaussian blur of the image, then
+/// contrast/brightness LUTs + a/b saturation applied to the blurred copy.
+///
+/// Ranges mirror `dt_iop_lowpass_params_t` from `src/iop/lowpass.c`: radius
+/// 0.1..500 (default 10), contrast/brightness/saturation all -3..3 (defaults
+/// 1.0 / 0.0 / 1.0). `unbound` is not surfaced — darktable's default is 1 (true),
+/// and the GUI checkbox only appears in the scene-referred safety path we don't
+/// expose here.
+fn lowpass_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Lowpass", "local contrast boost", p0.lowpass_on,
+        |p, on| p.lowpass_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Radius", 0.1, 500.0, 1.0, p0.lowpass_radius as f64,
+                |p, v| p.lowpass_radius = v);
+            add_param_slider(e, ctx, "Contrast", -3.0, 3.0, 0.01, p0.lowpass_contrast as f64,
+                |p, v| p.lowpass_contrast = v);
+            add_param_slider(e, ctx, "Brightness", -3.0, 3.0, 0.01, p0.lowpass_brightness as f64,
+                |p, v| p.lowpass_brightness = v);
+            add_param_slider(e, ctx, "Saturation", -3.0, 3.0, 0.01, p0.lowpass_saturation as f64,
+                |p, v| p.lowpass_saturation = v);
         })
 }
 
