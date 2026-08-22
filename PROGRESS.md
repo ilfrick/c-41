@@ -908,3 +908,22 @@ below) — exit 0, all four steps: cargo check, cargo clippy,
   saved style (written under ENCODE_VERSION 13 before shadhi landed) would
   decode to `None` and be replaced by defaults — effectively wiping all edits
   for every existing user on first load after this version bump.
+
+---
+
+## 2026-08-22 07:42 UTC — m4-113: Full CI verification + dual-push
+
+**What.** Re-ran `scripts/ci-local.sh` after all senior-review fix-ups (P0–P3)
+to verify the complete codebase compiles and all tests pass under `--release`.
+
+**Verified.** Exit code 0 on all four steps:
+1. `cargo check --workspace` — OK (warnings only: pre-existing unused_parens in
+   `color.rs`, unused_import in `film.rs`, deprecated `clone!` macros in c41-ui)
+2. `cargo clippy --workspace` — OK (same warnings, no errors)
+3. `cargo test --workspace --release` — OK (692 core + 92 db + 239 ui = **1023
+   tests passed, 0 failed**; includes 3 new shadhi tests)
+4. `cargo build --release -p c41 --bin c41-rs` — OK (links successfully)
+
+**Push.** Commit `d7613a0ee9` pushed to both remotes:
+- GitHub `ilfrick/c-41` ✓
+- Gitea `housefz.com` ✓
