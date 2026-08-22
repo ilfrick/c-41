@@ -52,6 +52,7 @@ static CATALOG: &[ModuleGroup] = &[
                 m("Levels", false),
                 m("Contrast brightness saturation", false),
                 m("Basic adjustments", false),
+                m("Shadows/Highlights", false),
                 m("RGB curve", false),
                 m("Base curve", false),
             ],

@@ -21,6 +21,15 @@ const UNBOUND_HIGHLIGHTS_L: u32 = 8;
 const UNBOUND_HIGHLIGHTS_A: u32 = 16;
 const UNBOUND_HIGHLIGHTS_B: u32 = 32;
 
+/// C-compatible sign: returns +1.0 for x ≥ 0.0 (including +0.0), -1.0 for x < 0.0.
+/// Differs from `f32::signum` only at +0.0 (which `f32::signum` maps to 0.0,
+/// not +1.0). Matches C's `#define sign(x) ((x) < 0 ? -1 : 1)` from
+/// `src/iop/shadhi.c`.
+///
+/// Cross-reference: `pipeline.rs` defines `CSignum::signum_c()` for the
+/// pre-scaling of `sh_cc`/`hg_cc` in the Rust preview path; this kernel's
+/// overlay-loop `sign()` serves the same role for the `lb` term. They must
+/// agree on the ±0.0 boundary — see shadhi.rs P2-6 fix notes.
 #[inline(always)]
 fn sign(x: f32) -> f32 { if x < 0.0 { -1.0 } else { 1.0 } }
 
@@ -96,14 +105,11 @@ pub unsafe extern "C" fn darkroom_shadhi_process(
             let mut lb = (tb[0] - HALF) * sign(-highlights) * sign(LMAX - la) + HALF;
             if unbound_mask == 0 { lb = lb.clamp(LMIN, LMAX); }
 
-            let lref = {
-                let v = la.abs().max(low_approximation);
-                la.signum() / v
-            };
-            let href = {
-                let v = (1.0 - la).abs().max(low_approximation);
-                (1.0 - la).signum() / v
-            };
+            // C uses copysignf (sign matches at ±0.0); f32::signum returns 0.0
+            // for ±0.0 — a divergence that matters at exactly black/white, the
+            // pixels this module exists to fix. Use copysign to match.
+            let lref = (1.0 / la.abs().max(low_approximation)).copysign(la);
+            let href = (1.0 / (1.0 - la).abs().max(low_approximation)).copysign(1.0 - la);
 
             let chunk = if highlights2 > 1.0 { 1.0 } else { highlights2 };
             let optrans = chunk * highlights_xform;
@@ -129,19 +135,24 @@ pub unsafe extern "C" fn darkroom_shadhi_process(
         let mut shadows2 = shadows * shadows; // 0..4
         let shadows_xform = (tb[0] / (1.0 - compress) - compress / (1.0 - compress)).clamp(0.0, 1.0);
 
+        // NOTE: darktable's shadhi.c::process() shadows loop has a latent
+        // copy-paste bug — it tests `UNBOUND_HIGHLIGHTS_L` (a highlight flag)
+        // for the shadow L channel clamp, where it should be
+        // `UNBOUND_SHADOWS_L`. Under the default UNBOUND mask both are set, so
+        // the bug is masked in practice, but with per-channel unbound flags it
+        // would clamp shadows on the wrong flag. Our port uses the correct
+        // `UNBOUND_SHADOWS_L` here; the discrepancy is documented so a future
+        // side-by-side with upstream doesn't "fix" us to match the bug.
         while shadows2 > 0.0 {
             let la = if (flags & UNBOUND_SHADOWS_L) != 0 { ta[0] } else { ta[0].clamp(LMIN, LMAX) };
             let mut lb = (tb[0] - HALF) * sign(shadows) * sign(LMAX - la) + HALF;
             if unbound_mask == 0 { lb = lb.clamp(LMIN, LMAX); }
 
-            let lref = {
-                let v = la.abs().max(low_approximation);
-                la.signum() / v
-            };
-            let href = {
-                let v = (1.0 - la).abs().max(low_approximation);
-                (1.0 - la).signum() / v
-            };
+            // C uses copysignf (sign matches at ±0.0); f32::signum returns 0.0
+            // for ±0.0 — a divergence that matters at exactly black/white, the
+            // pixels this module exists to fix. Use copysign to match.
+            let lref = (1.0 / la.abs().max(low_approximation)).copysign(la);
+            let href = (1.0 / (1.0 - la).abs().max(low_approximation)).copysign(1.0 - la);
 
             let chunk = if shadows2 > 1.0 { 1.0 } else { shadows2 };
             let optrans = chunk * shadows_xform;

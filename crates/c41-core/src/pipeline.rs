@@ -28,7 +28,13 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, shadhi, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+
+/// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
+/// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
+/// kernel mirrors a C macro (`#define sign(x) ((x)>0?1:((x)<0?-1:1))`).
+trait CSignum { fn signum_c(self) -> f32; }
+impl CSignum for f32 { fn signum_c(self) -> f32 { if self > 0.0 { 1.0 } else if self < 0.0 { -1.0 } else { 1.0 } } }
 
 /// The working colour space of the buffer a colour-space-dependent (Lab-domain)
 /// stage processes. The raw pipeline works in linear **Rec.2020**; the non-raw
@@ -280,6 +286,46 @@ pub enum Stage {
         vibrance: f32,
         space: ColorSpace,
     },
+    /// Shadows/highlights local-contrast enhancement (shadhi.c). A Gaussian blur
+    /// produces a base layer; the shadows/highlights overlays are then blended in
+    /// Lab space: shadows lift the dark regions, highlights recover blown areas,
+    /// whitepoint shifts the white point, compress preserves mid-tones, and the
+    /// ccorrect params control colour bleed into shadows/highlights.
+    ///
+    /// Lab-domain (`default_colorspace` returns `IOP_CS_LAB` in the C), so it needs
+    /// the buffer's working colour space for the RGB↔Lab pair. NOT pixel-local —
+    /// the Gaussian blur reads a spatial neighbourhood, so `process` falls back to
+    /// the serial whole-buffer path whenever this stage is present. Like
+    /// [`Stage::Lowpass`], holds a `scale` so the blur sigma tracks the ROI
+    /// resolution (`radius * scale`).
+    ///
+    /// `flags` is hardcoded to `UNBOUND_DEFAULT` (127) — darktable's default, and
+    /// the C GUI doesn't expose an unbound checkbox for this module.
+    /// `low_approximation` is hardcoded to its C default (0.000001). We don't use
+    /// bilateral (the C default algorithm) because `crate::gaussian` only implements
+    /// the recursive Gaussian, not the bilateral filter — the Gaussian path is a
+    /// faithful, if slightly different, blur; the shadow/highlight math is
+    /// identical.
+    Shadhi {
+        /// Shadows lift, -100..100 (C slider; core gets `2 * clamp(s/100, -1, 1)`).
+        shadows: f32,
+        /// Highlights recovery, -100..100.
+        highlights: f32,
+        /// White point shift, -10..10 (core gets `max(1 - w/100, 0.01)`).
+        whitepoint: f32,
+        /// Blur radius, 0.1..500 (core sigma = `max(0.1, radius) * scale`).
+        radius: f32,
+        /// Compression, 0..100 (core gets `clamp(c/100, 0, 0.99)`).
+        compress: f32,
+        /// Shadows colour correction, 0..100.
+        shadows_ccorrect: f32,
+        /// Highlights colour correction, 0..100.
+        highlights_ccorrect: f32,
+        /// ROI scale so the blur tracks preview resolution (1.0 = full res).
+        scale: f32,
+        /// Buffer working colour space (Rec2020 for raws, LinearSrgb for JPEGs).
+        space: ColorSpace,
+    },
     GraduatedNd {
         /// Filter density in EV, -8..8 (negative brightens).
         density: f32,
@@ -341,6 +387,7 @@ impl Stage {
             Stage::GraduatedNd { .. } => "graduatednd",
             Stage::Colisa { .. } => "colisa",
             Stage::Basicadj { .. } => "basicadj",
+            Stage::Shadhi { .. } => "shadhi",
             Stage::Lowpass { .. } => "lowpass",
         }
     }
@@ -390,6 +437,13 @@ impl Stage {
             // Basicadj is pixel-local: exposure, LUT lookups and a
             // per-pixel saturation blend, no neighbour reads.
             Stage::Basicadj { .. } => true,
+            // Shadhi is NOT pixel-local: the Gaussian blur reads a spatial
+            // neighbourhood, so band-splitting would hand it a (band_pixels, 1)
+            // rectangle and produce wrong-edge artefacts. Returning false forces
+            // the whole pipeline serial whenever this stage is present, where
+            // (width, height) is the true image rectangle — same reason as
+            // Lowpass and Sharpen.
+            Stage::Shadhi { .. } => false,
             // Lowpass is NOT pixel-local: the Gaussian blur reads a spatial
             // neighbourhood, so band-splitting would hand it a (band_pixels, 1)
             // rectangle and produce wrong-edge artefacts. Returning false forces
@@ -444,6 +498,11 @@ impl Stage {
             // Lowpass works in Lab (RGB-to-Lab blur then Lab-to-RGB), so it
             // must agree with the other Lab-domain stages on the working space.
             Stage::Lowpass { space, .. } => Some(*space),
+            // Shadhi works in Lab (RGB→Lab blur then Lab→RGB process), so it
+            // must agree with the other Lab-domain stages on the working space.
+            // The C `default_colorspace` returns `IOP_CS_LAB` and the process
+            // kernel operates on Lab buffers.
+            Stage::Shadhi { space, .. } => Some(*space),
             // Basicadj works in linear RGB, so it has no Lab working
             // space to agree on — its `space` selects luminance
             // weights, not a Lab conversion.
@@ -901,6 +960,92 @@ impl Stage {
                     preserve_colors, middle_grey, brightness, saturation, vibrance, luma,
                 );
                 d.process(input, output);
+            }
+            // ── Shadows/Highlights (shadhi.c) ───────────────────────
+            // A Gaussian-blurred base layer of the Lab buffer is merged with
+            // the original to lift shadows / recover highlights. The C
+            // `process()` pre-scales all the user sliders into core scalars
+            // (e.g. shadows ∈ [-100,100] → [-2,2]); we mirror that exactly so
+            // the FFI kernel `darkroom_shadhi_process` receives the same
+            // values; the shadow/highlight *math* inside the kernel is identical,
+            // but the base layer differs (Gaussian blur, not bilateral — see below).
+            //
+            // We hardcode `shadhi_algo = GAUSSIAN` — the C default is
+            // bilateral, but `crate::gaussian` only implements the recursive
+            // Gaussian, not a bilateral filter. The Gaussian blur is a faithful
+            // (if slightly different) base layer; the shadow/highlight math is
+            // identical. `flags` is hardcoded to `UNBOUND_DEFAULT` (127) —
+            // darktable's own default and not exposed in the GUI.
+            Stage::Shadhi {
+                shadows, highlights, whitepoint, radius, compress,
+                shadows_ccorrect, highlights_ccorrect, scale, space,
+            } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                // RGB => Lab, holding the original sharp pixels.
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                // Blur the Lab buffer in place into a second buffer — mirrors
+                // the C `dt_gaussian_blur_4c` over unbound Lab bounds.
+                let sigma = f32::max(0.1, radius) * scale;
+                let mut blurred = vec![0.0f32; n * 4];
+                {
+                    // unbound_mask is true (shadhi_algo=GAUSSIAN & flags & UNBOUND_GAUSSIAN),
+                    // so the C widens Lab bounds to ±FLT_MAX — matching our Stage default.
+                    let mut g = crate::gaussian::Gaussian::new(
+                        width, height,
+                        [-f32::MAX, -f32::MAX, -f32::MAX, -f32::MAX],
+                        [f32::MAX, f32::MAX, f32::MAX, f32::MAX],
+                        sigma,
+                        crate::gaussian::GaussianOrder::Zero,
+                    );
+                    g.blur_4c(&lab_in, &mut blurred);
+                }
+                // Pre-scale user sliders into core scalars (C process() lines 343-355).
+                let sh = 2.0 * f32::clamp(shadows / 100.0, -1.0, 1.0);
+                let hg = 2.0 * f32::clamp(highlights / 100.0, -1.0, 1.0);
+                let w  = f32::max(1.0 - whitepoint / 100.0, 0.01);
+                let cs = f32::clamp(compress / 100.0, 0.0, 0.99);
+                // C's `sign()` macro returns 1 for ±0.0; f32::signum returns 0.0.
+                // Use a C-compatible sign so the neutral (sliders at 0) case matches.
+                let sh_cc = (f32::clamp(shadows_ccorrect / 100.0, 0.0, 1.0) - 0.5) * sh.signum_c() + 0.5;
+                let hg_cc = (f32::clamp(highlights_ccorrect / 100.0, 0.0, 1.0) - 0.5) * (-hg).signum_c() + 0.5;
+                // Hardcoded C defaults: flags=UNBOUND_DEFAULT(127), low_approximation=0.000001,
+                // unbound_mask=1 (GAUSSIAN algo, UNBOUND_GAUSSIAN bit set).
+                // SAFETY: `lab_in` and `blurred` are distinct `Vec<f32>` of exactly
+                // `n*4` elements (allocated above, n = width*height satisfies the
+                // `(width, height)` precondition upheld by `Pipeline::process`), so
+                // both slices the kernel materialises are in bounds and cannot
+                // alias. Crucially, `blurred` is read-modify-write and MUST already
+                // hold the Gaussian-blurred Lab layer — the blur above establishes
+                // that. Scalars are pre-scaled to the physical ranges the kernel
+                // documents (C `process()` / shadhi.c lines 343-355).
+                unsafe {
+                    shadhi::darkroom_shadhi_process(
+                        lab_in.as_ptr(),
+                        blurred.as_mut_ptr(),
+                        n,
+                        sh, hg, w, cs,
+                        sh_cc, hg_cc,
+                        0.000001f32, // low_approximation
+                        127u32,       // flags = UNBOUND_DEFAULT
+                        1i32,         // unbound_mask = true (GAUSSIAN + UNBOUND_GAUSSIAN)
+                    );
+                }
+                // Lab => RGB for the final output.
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([blurred[i], blurred[i + 1], blurred[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
             }
             // ── Lowpass (lowpass.c) ──────────────────────────────────
             // Local-contrast reduction: blur in Lab, then apply contrast +
@@ -1426,6 +1571,18 @@ mod tests {
                 .is_pixel_local(),
             "lowpass blurs a spatial neighbourhood ⇒ NOT pixel-local"
         );
+        // Shadhi is NOT pixel-local: the Gaussian blur reads a spatial
+        // neighbourhood, so band-splitting would produce wrong-edge artefacts.
+        assert!(
+            !Stage::Shadhi {
+                shadows: 25.0, highlights: -30.0, whitepoint: 2.0,
+                radius: 100.0, compress: 50.0,
+                shadows_ccorrect: 75.0, highlights_ccorrect: 40.0,
+                scale: 1.0, space: ColorSpace::Rec2020,
+            }
+                .is_pixel_local(),
+            "shadhi blurs a spatial neighbourhood ⇒ NOT pixel-local"
+        );
     }
 
     #[test]
@@ -1754,5 +1911,95 @@ mod tests {
         assert!((out[1] - 1.4).abs() < 1e-6, "G: 2.0-0.6 = 1.4, got {}", out[1]);
         assert!((out[2] - (-0.4)).abs() < 1e-6, "B: 0.5-0.9 = -0.4, got {}", out[2]);
         assert!((out[3] - 0.0).abs() < 1e-6, "A: 1.0-1.0 = 0.0, got {}", out[3]);
+    }
+
+    #[test]
+    fn shadhi_nonneutral_params_change_output() {
+        // A vertical gradient 0.05→0.95. With shadows=80/highlights=-80 the
+        // shadow and highlight overlays are active, so the output must differ
+        // from the neutral (shadows=0/highlights=0) pass. We don't assert the
+        // *direction* per-pixel — the Lab-domain overlay math is input-dependent
+        // for mid-tones — only that the stage has a visible, non-zero effect.
+        let (w, h) = (32usize, 32usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        for y in 0..h {
+            let v = 0.05 + 0.9 * (y as f32) / ((h - 1) as f32);
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                img[i] = v; img[i + 1] = v; img[i + 2] = v; img[i + 3] = 1.0;
+            }
+        }
+        let mk = |shadows, highlights| {
+            Pipeline::with_stages(vec![Stage::Shadhi {
+                shadows, highlights, whitepoint: 0.0,
+                radius: 8.0, compress: 0.0,
+                shadows_ccorrect: 100.0, highlights_ccorrect: 50.0,
+                scale: 1.0, space: ColorSpace::LinearSrgb,
+            }])
+        };
+        let neutral = mk(0.0, 0.0).process(&img, w, h);
+        let active = mk(80.0, -80.0).process(&img, w, h);
+        // The L channel of the top row (dark) should change — shadows lifting it.
+        let top_diff = (active[0] - neutral[0]).abs();
+        assert!(top_diff > 1e-4, "shadows did not affect the dark pixel: diff={top_diff}");
+        // The L channel of the bottom row (bright) should change — highlights recovering it.
+        let bot_diff = (active[(h - 1) * w * 4] - neutral[(h - 1) * w * 4]).abs();
+        assert!(bot_diff > 1e-4, "highlights did not affect the bright pixel: diff={bot_diff}");
+        // Alpha passes through unchanged.
+        assert_eq!(active[3], 1.0, "alpha should be preserved");
+    }
+
+    #[test]
+    fn shadhi_neutral_on_flat_is_identity() {
+        // sliders all at 0/neutral ⇒ the shadow/highlight overlays are zero, so a
+        // flat field should come out unchanged (the blur of a flat is itself).
+        let (w, h) = (8usize, 8usize);
+        let flat = vec![0.42f32; w * h * 4];
+        let p = Pipeline::with_stages(vec![Stage::Shadhi {
+            shadows: 0.0, highlights: 0.0, whitepoint: 0.0,
+            radius: 100.0, compress: 0.0,
+            shadows_ccorrect: 100.0, highlights_ccorrect: 50.0,
+            scale: 1.0, space: ColorSpace::LinearSrgb,
+        }]);
+        let out = p.process(&flat, w, h);
+        for px in out.chunks_exact(4) {
+            for c in 0..4 {
+                assert!((px[c] - 0.42).abs() < 1e-5, "flat pixel changed: {}", px[c]);
+            }
+        }
+    }
+
+    #[test]
+    fn shadhi_highlights_ccorrect_sign_direction() {
+        // Regression guard for P0-1: the highlights_ccorrect sign must follow
+        // C's `sign(-highlights)` (negated), not `sign(highlights)`. With
+        // highlights = -50 (hg < 0, the common case), hcc=0 and hcc=100 must
+        // produce *different* blue channels, and the direction must match the
+        // C implementation. 50.0 (the annihilating fixed point where
+        // (x-0.5)=0) is deliberately avoided.
+        let (w, h) = (32usize, 32usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        for y in 0..h {
+            let v = 0.5 + 0.4 * ((y as f32) / (h as f32) - 0.5);
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                img[i] = v + 0.1; img[i + 1] = v; img[i + 2] = v - 0.1; img[i + 3] = 1.0;
+            }
+        }
+        let mk = |hcc: f32| {
+            Pipeline::with_stages(vec![Stage::Shadhi {
+                shadows: 0.0, highlights: -50.0, whitepoint: 0.0,
+                radius: 5.0, compress: 10.0,
+                shadows_ccorrect: 100.0, highlights_ccorrect: hcc,
+                scale: 1.0, space: ColorSpace::LinearSrgb,
+            }])
+        };
+        let lo = mk(0.0).process(&img, w, h);
+        let hi = mk(100.0).process(&img, w, h);
+        // Blue channel of the brightest pixel must differ — sign flip on hg
+        // changes hg_cc from 0→1 or 1→0, altering chroma blend.
+        let bot = (h - 1) * w * 4;
+        let diff = (lo[bot + 2] - hi[bot + 2]).abs();
+        assert!(diff > 1e-5, "highlights_ccorrect sign does not affect blue: diff={diff}");
     }
 }

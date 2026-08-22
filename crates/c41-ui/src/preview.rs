@@ -217,6 +217,28 @@ pub struct PreviewParams {
     pub lowpass_brightness: f32,
     /// a/b channel saturation multiplier (darktable -3..3, default 1.0 = no change).
     pub lowpass_saturation: f32,
+    /// Shadows/Highlights (shadhi.c) stage on/off. iop_order.c position 50.0.
+    ///
+    /// A Gaussian-blurred base layer of the Lab buffer is merged with the original:
+    /// shadows lifts dark regions, highlights recovers blown highlights. Not
+    /// pixel-local (the blur reads neighbours), so it stays on the serial path.
+    /// The C default algorithm is bilateral; we hardcode Gaussian because
+    /// `crate::gaussian` only implements that (the shadow/highlight math is identical).
+    pub shadhi_on: bool,
+    /// Shadows lift, -100..100 (C `shadows` slider, darktable default 50).
+    pub shadhi_shadows: f32,
+    /// Highlights recovery, -100..100 (C `highlights` slider, default -50).
+    pub shadhi_highlights: f32,
+    /// White point shift, -10..10 (C `whitepoint` slider, default 0).
+    pub shadhi_whitepoint: f32,
+    /// Blur radius, 0.1..500 (C `radius` slider, default 100). Sigma = max(0.1, radius) * scale.
+    pub shadhi_radius: f32,
+    /// Compression strength, 0..100 (C `compress` slider, default 50).
+    pub shadhi_compress: f32,
+    /// Shadows colour correction, 0..100 (C `shadows_ccorrect` slider, default 100).
+    pub shadhi_shadows_ccorrect: f32,
+    /// Highlights colour correction, 0..100 (C `highlights_ccorrect` slider, default 50).
+    pub shadhi_highlights_ccorrect: f32,
 }
 
 impl Default for PreviewParams {
@@ -350,6 +372,19 @@ impl Default for PreviewParams {
             lowpass_contrast: 1.0,
             lowpass_brightness: 0.0,
             lowpass_saturation: 1.0,
+            // Shadhi defaults mirror dt_iop_shadhi_params_t (shadhi.c lines 70-80):
+            // off, radius 100, shadows 50, whitepoint 0, highlights -50,
+            // compress 50, shadows_ccorrect 100, highlights_ccorrect 50.
+            // `flags` (UNBOUND_DEFAULT=127) and `low_approximation` (0.000001)
+            // are hardcoded in the Stage apply arm, not surfaced in the UI.
+            shadhi_on: false,
+            shadhi_shadows: 50.0,
+            shadhi_highlights: -50.0,
+            shadhi_whitepoint: 0.0,
+            shadhi_radius: 100.0,
+            shadhi_compress: 50.0,
+            shadhi_shadows_ccorrect: 100.0,
+            shadhi_highlights_ccorrect: 50.0,
         }
     }
 }
@@ -450,12 +485,18 @@ impl PreviewParams {
             || (self.lowpass_contrast == 1.0
                 && self.lowpass_brightness == 0.0
                 && self.lowpass_saturation == 1.0);
+        // Shadhi is identity when off, or when shadows and highlights are both 0
+        // (no overlay to blend). whitepoint alone at 0 is already identity
+        // (max(1-0/100, 0.01) = 1.0); compress, ccorrect and radius have no effect
+        // without a non-zero shadow/highlight to drive them.
+        let shadhi_identity = !self.shadhi_on
+            || (self.shadhi_shadows == 0.0 && self.shadhi_highlights == 0.0 && self.shadhi_whitepoint == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
             && levels_identity && vignette_identity && lowlight_identity
             && gradnd_identity && colisa_identity && basicadj_identity
-            && lowpass_identity
+            && lowpass_identity && shadhi_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -483,18 +524,19 @@ impl PreviewParams {
             colisa_on: false,
             basicadj_on: false,
             lowpass_on: false,
+            shadhi_on: false,
             ..*self
         }
     }
 
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
-    /// `[version, 20×bool(u8), 133×f32_le]`. Decoded by [`PreviewParams::decode`].
+    /// `[version, 21×bool(u8), 140×f32_le]`. Decoded by [`PreviewParams::decode`].
     /// This is c41-ui's own layout (NOT a C IOP `op_params`), stored under a
     /// synthetic operation name the C reader ignores.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on] {
             v.push(b as u8);
         }
         for f in [
@@ -537,25 +579,38 @@ impl PreviewParams {
             self.basicadj_middle_grey, self.basicadj_brightness,
             self.basicadj_saturation, self.basicadj_vibrance,
             self.lowpass_radius, self.lowpass_contrast, self.lowpass_brightness, self.lowpass_saturation,
+            self.shadhi_shadows, self.shadhi_highlights, self.shadhi_whitepoint,
+            self.shadhi_radius, self.shadhi_compress,
+            self.shadhi_shadows_ccorrect, self.shadhi_highlights_ccorrect,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
         v
     }
 
-    /// Inverse of [`PreviewParams::encode`]. Returns `None` for the wrong version
-    /// byte or wrong length (e.g. a blob written by an older/other schema), so
-    /// the caller falls back to defaults rather than loading garbage.
+    /// Inverse of [`PreviewParams::encode`]. Returns `None` for a blob whose
+    /// version byte or length doesn't match any known layout, so the caller falls
+    /// back to defaults rather than loading garbage.
+    ///
+    /// **Backward compatible.** Because the layout is strictly append-only (new
+    /// modules append bool + f32 fields at the end), an older blob decodes with
+    /// the new fields defaulted — so bumping `ENCODE_VERSION` does NOT silently
+    /// delete saved styles or history entries.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != ENCODED_LEN || bytes[0] != ENCODE_VERSION {
-            return None;
-        }
-        let bools = &bytes[1..21];
-        // length is checked above, so exactly 133 f32 chunks follow
-        let f: Vec<f32> = bytes[21..]
+        let n_bools = PARAMS_LAYOUTS
+            .iter()
+            .find(|(v, nb, nf)| bytes.first() == Some(v) && bytes.len() == 1 + nb + nf * 4)
+            .map(|(_, nb, _)| *nb)?;
+        let bools = &bytes[1..1 + n_bools];
+        let f: Vec<f32> = bytes[1 + n_bools..]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        // v13-and-earlier blobs lack the shadhi fields (appended in v14).
+        // Use .get() with defaults from PreviewParams::default() so they decode
+        // cleanly instead of panicking on a short slice — and so the fallback
+        // values can never drift from Default.
+        let d = Self::default();
         Some(Self {
             exposure_on: bools[0] != 0,
             velvia_on: bools[1] != 0,
@@ -620,6 +675,14 @@ impl PreviewParams {
             lowpass_on: bools[19] != 0,
             lowpass_radius: f[129], lowpass_contrast: f[130],
             lowpass_brightness: f[131], lowpass_saturation: f[132],
+            shadhi_on: bools.get(20).map_or(d.shadhi_on, |&b| b != 0),
+            shadhi_shadows: f.get(133).copied().unwrap_or(d.shadhi_shadows),
+            shadhi_highlights: f.get(134).copied().unwrap_or(d.shadhi_highlights),
+            shadhi_whitepoint: f.get(135).copied().unwrap_or(d.shadhi_whitepoint),
+            shadhi_radius: f.get(136).copied().unwrap_or(d.shadhi_radius),
+            shadhi_compress: f.get(137).copied().unwrap_or(d.shadhi_compress),
+            shadhi_shadows_ccorrect: f.get(138).copied().unwrap_or(d.shadhi_shadows_ccorrect),
+            shadhi_highlights_ccorrect: f.get(139).copied().unwrap_or(d.shadhi_highlights_ccorrect),
         })
     }
 
@@ -749,11 +812,39 @@ impl PreviewParams {
                 space,
             });
         }
-        // Lowpass (iop_order.c pos 54.0, between basicadj 40 and colorcorrection 55)
-        // — a Gaussian-blur-based local contrast enhancement that runs in Lab:
-        // blur a copy, then apply the contrast/brightness LUT pair + a/b saturation
-        // to the blurred pixels. It is NOT pixel-local (the blur reads neighbours),
-        // so it stays on the serial whole-buffer path like Sharpen.
+        // Shadows/Highlights (shadhi.c, iop_order.c v50_order pos 50.0 — between
+        // basicadj 40.0 and colorcorrection 55.0). A Gaussian-blurred base layer is merged with the
+        // original Lab pixels to lift shadows / recover highlights. NOT pixel-local
+        // (the blur reads neighbours), so it stays on the serial whole-buffer path
+        // like Sharpen.
+        //
+        // Identity when off, or when shadows + highlights + whitepoint are all 0
+        // (the gate mirrors `is_identity`). `compress`, `ccorrect` and `radius` have
+        // no effect without a non-zero shadow/highlight to drive them, so they are
+        // not in the gate — a user who only nudged radius shouldn't get a stage that
+        // does nothing but cost a full-buffer blur.
+        if self.shadhi_on
+            && (self.shadhi_shadows != 0.0
+                || self.shadhi_highlights != 0.0
+                || self.shadhi_whitepoint != 0.0)
+        {
+            p.push(Stage::Shadhi {
+                shadows: self.shadhi_shadows,
+                highlights: self.shadhi_highlights,
+                whitepoint: self.shadhi_whitepoint,
+                radius: self.shadhi_radius,
+                compress: self.shadhi_compress,
+                shadows_ccorrect: self.shadhi_shadows_ccorrect,
+                highlights_ccorrect: self.shadhi_highlights_ccorrect,
+                scale,
+                space,
+            });
+        }
+        // Lowpass (iop_order.c v50_order pos 33.0) — a Gaussian-blur-based local
+        // contrast enhancement that runs in Lab: blur a copy, then apply the
+        // contrast/brightness LUT pair + a/b saturation to the blurred pixels. It
+        // is NOT pixel-local (the blur reads neighbours), so it stays on the serial
+        // whole-buffer path like Sharpen.
         //
         // The gate mirrors `is_identity`: contrast 1.0 + brightness 0.0 +
         // saturation 1.0 yields identity LUTs, so radius doesn't matter then.
@@ -987,12 +1078,6 @@ impl PreviewParams {
     }
 }
 
-/// Bump when the [`PreviewParams::encode`] layout changes (old blobs then decode
-/// to `None` → defaults, rather than mis-parsing). v2 added the sigmoid stage.
-/// v3 added the sharpen stage. v4 added vibrance. v5 added color contrast.
-/// v6 added temperature (white balance). v7 adds invert (film-camera negative).
-/// v8 adds colorize (HSL colour replacement). v9 adds color correction.
-/// v10 adds color zones (LCH equaliser). v11 adds levels (black/grey/white).
 /// Minimum black→white separation, on the 0..100 slider scale, for which a
 /// Levels stage is emitted. A hairline range is not a meaningful edit (it maps
 /// the whole tonal scale onto a sliver) and it drives `pct` — and hence the
@@ -1002,9 +1087,37 @@ impl PreviewParams {
 /// `levels::process_pixels`, not from this.
 const LEVELS_MIN_RANGE: f32 = 1.0;
 
-const ENCODE_VERSION: u8 = 13;
-/// 1 version byte + 20 bool bytes + 133 little-endian f32.
-const ENCODED_LEN: usize = 1 + 20 + 133 * 4;
+/// Bump when the [`PreviewParams::encode`] layout changes (old blobs in
+/// [`PARAMS_LAYOUTS`] decode with the new fields defaulted, rather than
+/// mis-parsing). v2 added the sigmoid stage.
+/// v3 added the sharpen stage. v4 added vibrance. v5 added color contrast.
+/// v6 added temperature (white balance). v7 adds invert (film-camera negative).
+/// v8 adds colorize (HSL colour replacement). v9 adds color correction.
+/// v10 adds color zones (LCH equaliser). v11 adds levels (black/grey/white).
+/// v12 adds basicadj (basic adjustments). v13 adds lowpass.
+/// v14 adds shadhi (shadows/highlights).
+const ENCODE_VERSION: u8 = 14;
+/// 1 version byte + 21 bool bytes + 140 little-endian f32.
+const ENCODED_LEN: usize = 1 + 21 + 140 * 4;
+
+/// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
+/// Append-only: a new module appends to both regions. Public so
+/// `HistoryStack::decode` can size entries without hardcoding the current
+/// default length (which would misparse older blobs).
+pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
+    (12, 19, 129), // v12: basicadj was the last module
+    (13, 20, 133), // v13: lowpass added
+    (14, 21, 140), // v14: shadhi added
+];
+
+/// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
+/// version is not in [`PARAMS_LAYOUTS`] (and thus can't be decoded).
+pub(crate) fn encoded_len_for_version(version: u8) -> Option<usize> {
+    PARAMS_LAYOUTS
+        .iter()
+        .find(|(v, _, _)| *v == version)
+        .map(|(_, nb, nf)| 1 + nb + nf * 4)
+}
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
 /// layout (rowstride) and any alpha channel. Colour channels (0..min(3,nch))
@@ -1652,6 +1765,8 @@ mod tests {
         p.sharpen_amount = 1.0;
         p.basicadj_on = true;
         p.basicadj_exposure = 0.5; // off-default so the stage is emitted
+        p.shadhi_on = true;
+        p.shadhi_shadows = 25.0; // off-default so the stage is emitted
         p.lowpass_on = true;
         p.lowpass_contrast = 0.6; // off-default (identity is contrast 1.0)
         p.color_correction_on = true;
@@ -1660,9 +1775,12 @@ mod tests {
         p.levels_on = true;
         p.levels_grey = 40.0; // off-default so the stage is actually emitted
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
+        // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
+        // basicadj 40), but we run it after (after shadhi 50), matching the legacy
+        // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["exposure", "channelmixer", "sharpen", "basicadj", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
+            ["exposure", "channelmixer", "sharpen", "basicadj", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
         );
         // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
         // it clips at its black point and treats L as 0..100, so running it
@@ -1925,6 +2043,10 @@ mod tests {
             lowpass_on: true, lowpass_radius: 42.0,
             lowpass_contrast: 0.6, lowpass_brightness: -0.4,
             lowpass_saturation: 0.15,
+            shadhi_on: true, shadhi_shadows: 25.0,
+            shadhi_highlights: -30.0, shadhi_whitepoint: 2.0,
+            shadhi_radius: 80.0, shadhi_compress: 60.0,
+            shadhi_shadows_ccorrect: 75.0, shadhi_highlights_ccorrect: 40.0,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -1951,6 +2073,42 @@ mod tests {
             b
         };
         assert_eq!(PreviewParams::decode(&v1), None);
+    }
+
+    #[test]
+    fn decode_v13_blob_defaults_shadhi_fields() {
+        // A v13 blob (before shadhi was added — 20 bools / 133 f32s) must
+        // decode successfully: the new shadhi fields fall back to their defaults,
+        // so a saved style from the pre-shadhi era loads cleanly instead of
+        // being silently discarded.
+        let v13 = {
+            let mut b = vec![0u8; 1 + 20 + 133 * 4];
+            b[0] = 13; // version 13
+            b
+        };
+        let decoded = PreviewParams::decode(&v13)
+            .expect("v13 blob must decode (backward compat)");
+        // Shadhi fields should be at their defaults, not garbage.
+        let def = PreviewParams::default();
+        assert_eq!(decoded.shadhi_on, def.shadhi_on);
+        assert_eq!(decoded.shadhi_shadows, def.shadhi_shadows);
+        assert_eq!(decoded.shadhi_highlights, def.shadhi_highlights);
+        assert_eq!(decoded.shadhi_radius, def.shadhi_radius);
+        assert_eq!(decoded.shadhi_compress, def.shadhi_compress);
+        assert_eq!(decoded.shadhi_shadows_ccorrect, def.shadhi_shadows_ccorrect);
+        assert_eq!(decoded.shadhi_highlights_ccorrect, def.shadhi_highlights_ccorrect);
+    }
+
+    #[test]
+    fn layouts_covers_current_version() {
+        // PARAMS_LAYOUTS (used by decode and encoded_len_for_version) must
+        // track ENCODE_VERSION and ENCODED_LEN in lock-step. Bump one without
+        // the other and you get blobs that encode() emits but decode() rejects
+        // — a silent round-trip break. This test guards the three-way invariant.
+        let &curr = PARAMS_LAYOUTS.last().unwrap();
+        assert_eq!(curr.0, ENCODE_VERSION, "PARAMS_LAYOUTS must have a row for the current version");
+        assert_eq!(1 + curr.1 + curr.2 * 4, ENCODED_LEN, "current PARAMS_LAYOUTS row must match ENCODED_LEN");
+        assert!(PARAMS_LAYOUTS.windows(2).all(|w| w[0].0 < w[1].0), "PARAMS_LAYOUTS must be version-ascending");
     }
 
     #[test]

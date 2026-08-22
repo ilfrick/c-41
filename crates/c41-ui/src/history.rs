@@ -161,14 +161,18 @@ impl HistoryStack {
     ///
     /// [`encode`]: Self::encode
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        // Length of one params blob (fixed; computed from a default encode).
-        let plen = PreviewParams::default().encode().len();
         let mut p = 0usize;
         let take = |p: &mut usize, n: usize| -> Option<()> {
             (*p + n <= bytes.len()).then(|| *p += n)
         };
 
-        if *bytes.first()? != HISTORY_ENCODE_VERSION {
+        // Accept both the current and the previous history version. v4 stored
+        // v13 PreviewParams blobs (553 bytes); v5 stores v14 blobs (582 bytes).
+        // Rejecting v4 outright would wipe every saved undo/redo stack on first
+        // load, so we decode leniently and let PreviewParams::decode handle
+        // the per-entry version byte.
+        let version = *bytes.first()?;
+        if version != HISTORY_ENCODE_VERSION && version != HISTORY_ENCODE_VERSION - 1 {
             return None;
         }
         p += 1;
@@ -187,7 +191,10 @@ impl HistoryStack {
             take(&mut p, label_len)?;
             let label = std::str::from_utf8(&bytes[lstart..p]).ok()?.to_string();
             let pstart = p;
-            take(&mut p, plen)?;
+            // Peek at the params version byte to determine this entry's blob
+            // length — older history stacks contain shorter (v13) blobs.
+            let params_len = crate::preview::encoded_len_for_version(bytes[pstart])?;
+            take(&mut p, params_len)?;
             let params = PreviewParams::decode(&bytes[pstart..p])?;
             entries.push(HistoryEntry { label, params });
         }
@@ -200,7 +207,7 @@ impl HistoryStack {
 }
 
 /// Version byte for [`HistoryStack::encode`]; bump on any layout change.
-const HISTORY_ENCODE_VERSION: u8 = 4;
+const HISTORY_ENCODE_VERSION: u8 = 5;
 
 fn read_u32(bytes: &[u8], p: &mut usize) -> Option<u32> {
     let end = p.checked_add(4)?;
@@ -382,6 +389,17 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if lowpass {
         return "Lowpass";
     }
+    let shadhi = old.shadhi_on != new.shadhi_on
+        || old.shadhi_shadows != new.shadhi_shadows
+        || old.shadhi_highlights != new.shadhi_highlights
+        || old.shadhi_whitepoint != new.shadhi_whitepoint
+        || old.shadhi_radius != new.shadhi_radius
+        || old.shadhi_compress != new.shadhi_compress
+        || old.shadhi_shadows_ccorrect != new.shadhi_shadows_ccorrect
+        || old.shadhi_highlights_ccorrect != new.shadhi_highlights_ccorrect;
+    if shadhi {
+        return "Shadows/Highlights";
+    }
     "Edit"
 }
 
@@ -551,6 +569,10 @@ mod tests {
             describe_change(&base, &PreviewParams { lowpass_contrast: 0.6, ..d() }),
             "Lowpass"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { shadhi_shadows: 25.0, ..d() }),
+            "Shadows/Highlights"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -660,6 +682,14 @@ mod tests {
             lowpass_contrast: _,
             lowpass_brightness: _,
             lowpass_saturation: _,
+            shadhi_on: _,
+            shadhi_shadows: _,
+            shadhi_highlights: _,
+            shadhi_whitepoint: _,
+            shadhi_radius: _,
+            shadhi_compress: _,
+            shadhi_shadows_ccorrect: _,
+            shadhi_highlights_ccorrect: _,
         } = PreviewParams::default();
     }
 
@@ -739,7 +769,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 553);
+        assert_eq!(PreviewParams::default().encode().len(), 582);
     }
 
     #[test]

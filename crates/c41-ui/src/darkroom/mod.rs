@@ -1855,6 +1855,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Graduated density" => pg.add(&gradnd_module_row(ctx)),
                 "Contrast brightness saturation" => pg.add(&colisa_module_row(ctx)),
                 "Basic adjustments" => pg.add(&basicadj_module_row(ctx)),
+                "Shadows/Highlights" => pg.add(&shadhi_module_row(ctx)),
                 "Lowpass" => pg.add(&lowpass_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
@@ -1942,7 +1943,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Lowpass", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2347,6 +2348,41 @@ fn basicadj_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.basicadj_saturation = v);
             add_param_slider(e, ctx, "Vibrance", -1.0, 1.0, 0.01, p0.basicadj_vibrance as f64,
                 |p, v| p.basicadj_vibrance = v);
+        })
+}
+
+/// Shadows/Highlights (shadhi.c): a Gaussian-blurred base layer is merged with
+/// the original Lab pixels to lift shadows and recover highlights. Not exposed
+/// here: the C bilateral algorithm (the GUI default) — we hardcode Gaussian
+/// because `crate::gaussian` only implements that, and the shadow/highlight math
+/// is identical regardless of blur kernel.
+///
+/// Ranges mirror `dt_iop_shadhi_params_v5_t` from `src/iop/shadhi.c`:
+/// shadows/highlights -100..100, whitepoint -10..10, radius 0.1..500,
+/// compress 0..100, ccorrect 0..100. `flags` (UNBOUND_DEFAULT) and
+/// `low_approximation` (0.000001) are hardcoded in the Stage apply arm.
+fn shadhi_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Shadows/Highlights", "local contrast recovery", p0.shadhi_on,
+        |p, on| p.shadhi_on = on,
+        |e, ctx| {
+            // The darktable slider order is shadows, highlights, whitepoint,
+            // radius, compress, shadows_ccorrect, highlights_ccorrect — matching
+            // the params struct field order in shadhi.c.
+            add_param_slider(e, ctx, "Shadows", -100.0, 100.0, 1.0, p0.shadhi_shadows as f64,
+                |p, v| p.shadhi_shadows = v);
+            add_param_slider(e, ctx, "Highlights", -100.0, 100.0, 1.0, p0.shadhi_highlights as f64,
+                |p, v| p.shadhi_highlights = v);
+            add_param_slider(e, ctx, "Whitepoint", -10.0, 10.0, 0.1, p0.shadhi_whitepoint as f64,
+                |p, v| p.shadhi_whitepoint = v);
+            add_param_slider(e, ctx, "Radius", 0.1, 500.0, 1.0, p0.shadhi_radius as f64,
+                |p, v| p.shadhi_radius = v);
+            add_param_slider(e, ctx, "Compress", 0.0, 100.0, 1.0, p0.shadhi_compress as f64,
+                |p, v| p.shadhi_compress = v);
+            add_param_slider(e, ctx, "Shadows color adj.", 0.0, 100.0, 1.0, p0.shadhi_shadows_ccorrect as f64,
+                |p, v| p.shadhi_shadows_ccorrect = v);
+            add_param_slider(e, ctx, "Highlights color adj.", 0.0, 100.0, 1.0, p0.shadhi_highlights_ccorrect as f64,
+                |p, v| p.shadhi_highlights_ccorrect = v);
         })
 }
 

@@ -837,3 +837,74 @@ cargo check, cargo clippy, `cargo test --workspace --release`, and
   process_pixels order (contrast LUT → brightness LUT → saturation clamp → alpha
   from input), unbound=true default, iop_order position 54.0, and test coverage
   patterns consistent with basicadj/colisa.
+
+## m4-113 — Shadows/Highlights (shadhi) senior-review fix-ups (2026-08-22)
+
+**What changed** (review findings from fricktrade-architect, Opus 4.8, applied
+after CI went green on the initial shadhi wiring):
+
+- `preview.rs`: Rewrote `PreviewParams::decode` to be **version-aware** via a
+  `LAYOUTS` table (`[(version, n_bools, n_f32s)]`). v13 blobs (20 bools /
+  133 f32s) decode successfully with shadhi fields defaulted, so bumping
+  `ENCODE_VERSION` 13→14 does NOT silently delete saved styles. The old
+  length-gate (`bytes.len() != ENCODED_LEN`) would have rejected v13 blobs
+  entirely → silent style loss.
+- `preview.rs`: Relocated the ENCODE_VERSION history doc-block from
+  `LEVELS_MIN_RANGE` (where it was accidentally attached) onto
+  `const ENCODE_VERSION`, and corrected the v13 history note (lowpass, not
+  lowlight). Added a `decode_v13_blob_defaults_shadhi_fields` roundtrip test
+  that builds a raw v13 blob and asserts shadhi fields fall back to defaults.
+- `pipeline.rs`: Replaced `f32::signum(sh)` / `f32::signum(-hg)` (returns
+  0.0 for ±0.0) with a `CSignum` trait providing C-compatible `signum_c()`
+  (returns 1.0 for ±0.0), matching darktable's `#define sign(x)` macro so the
+  neutral-slider case is identical.
+- `pipeline.rs`: Toned down the "bit-identical output to darktable" claim in
+  the shadhi doc — the shadow/highlight *math* is identical, but the Gaussian
+  blur (not bilateral) means the base layer differs.
+- `pipeline.rs`: Added `// SAFETY:` comment on the `darkroom_shadhi_process`
+  FFI call documenting buffer lengths, aliasing, and parameter provenance.
+- `pipeline.rs`: Added `shadhi_*` to the `is_pixel_local` exhaustive-match test
+  (asserts NOT pixel-local, same rationale as lowpass). Added two numeric
+  tests: `shadhi_lifts_shadows_and_recovers_highlights` (gradient →
+  shadows lift, highlights recover) and `shadhi_neutral_on_flat_is_identity`
+  (neutral sliders on flat field → unchanged).
+- `PARITY_AUDIT.md`: Reconciled the live-module count from 17 → **21** and
+  added the 4 previously-omitted modules (vignette, lowlight, graduated ND,
+  colour brightness saturation / colisa) to the 2.1 list.
+
+**Verified.** `scripts/ci-local.sh` re-run after all senior-review fixes (see
+below) — exit 0, all four steps: cargo check, cargo clippy,
+`cargo test --workspace --release`, and `cargo build --release -p c41 --bin c41-rs`.
+
+> **Correction (2026-08-22):** The original PROGRESS entry claimed CI was green
+> immediately after the initial shadhi wiring; the senior review found CI was
+> actually RED at that point (test fixture panic: `radius: 100.0` on a 16×16
+> image collapsed the Gaussian to a global mean). That claim was recorded
+> prematurely and is corrected here.
+
+**Additional fix-ups applied after senior review (P0–P3):**
+- `preview.rs`: Reconciled the local `LAYOUTS` const inside `decode()` with the
+  module-level `PARAMS_LAYOUTS` (DRY — was duplicated). Updated
+  `layouts_covers_current_version` test to assert against `PARAMS_LAYOUTS`
+  directly instead of a mirrored copy.
+- `history.rs`: Fixed `encoded_len_for_version` call site — it is a `pub(crate)`
+  free function, not an associated function of `PreviewParams`. Changed
+  `PreviewParams::encoded_len_for_version(...)` →
+  `crate::preview::encoded_len_for_version(...)`.
+- `preview.rs`: Rewrote the stale `ENCODE_VERSION` doc comment — it claimed
+  "old blobs decode to `None` → defaults", which contradicts the version-aware
+  decode that accepts any version in `PARAMS_LAYOUTS`.
+- `shadhi.rs`: Added cross-reference comment on `sign()` documenting its
+  relationship to `CSignum::signum_c()` in pipeline.rs (must agree at ±0.0).
+- `shadhi.rs`: Added latent-upstream-bug note on the shadows overlay loop —
+  darktable's `shadhi.c` tests `UNBOUND_HIGHLIGHTS_L` (a highlight flag) for the
+  shadow L channel clamp; our port correctly uses `UNBOUND_SHADOWS_L`, and the
+  discrepancy is documented so a future side-by-side doesn't "fix" us to match
+  the bug.
+
+**Notes.**
+
+- The v13 backward-compat fix is the critical one: without it, every existing
+  saved style (written under ENCODE_VERSION 13 before shadhi landed) would
+  decode to `None` and be replaced by defaults — effectively wiping all edits
+  for every existing user on first load after this version bump.
