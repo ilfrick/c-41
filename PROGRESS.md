@@ -1073,3 +1073,86 @@ deprecation warnings in c41-ui, out of scope per CLAUDE.md), `cargo test --works
 green; the new `negadoctor_commit_params_matches_darktable` parity test pins the full
 commit_params arithmetic against darktable negadoctor.c:239-267 for both colour and B&W
 film stock.
+
+## 2026-08-23 22:30 UTC — m4-116: Tone equalizer (exposure-channel tone mapping) live preview module
+
+**What.** Wired the 24th live darkroom module: darktable's tone equalizer
+(`toneequal.c`, iop_order.c v50_order pos 24.0 — before graduatednd 25, the
+28.5 group). 24th module ⇒ parity audit item 2.1 updated in the same commit.
+
+- `c41-core/iop/toneequal.rs` (preview path, +351 lines): `solve_weights` ports
+  `build_interpolation_matrix` + `pseudo_solve`/`_solve_hermitian` (normal
+  equations AᵀA·w = Aᵀy over the lower triangle only + Cholesky–Banachiewicz,
+  matching the C pivot gates); `cached_correction_lut` builds the 80 001-entry
+  correction LUT via the existing `darkroom_toneequal_build_lut` FFI behind a
+  thread-local memo keyed on `f32::to_bits` of the nine gains (per-band rebuilds
+  would cost ~640k exp calls each — same rationale as the basicadj LUT memo);
+  `process_preview_pixels` = norm-2 luminance mask (`pixel_rgb_norm_2`,
+  luminance_mask.h) + apply-LUT pixel pass for the `details == DT_TONEEQ_NONE`
+  configuration. Four new unit tests: normal-equation residual ≈0, flat unity
+  at default gains (±1% RBF residual), single-channel boost lands at ≈1.746×
+  at −4 EV (numpy lstsq cross-check), uniform-patch scaling.
+- `pipeline.rs`: `Stage::ToneEqual { gains: [f32; 9] }`; name/is_pixel_local
+  (true — per-pixel mask+LUT lookup, no neighbours)/working_space (None)/apply;
+  exhaustiveness test entry.
+- `preview.rs`: `toneeq_on` + nine EV gains (noise −8 EV … speculars 0 EV,
+  get_channels_gains order); encode/decode v16→v17 (+1 bool +9 f32, 680→717 B),
+  PARAMS_LAYOUTS row + explicit `decode_v16_blob_defaults_toneeq_fields`
+  backward-compat test; to_pipeline pushes raw gains (no arithmetic — the solve
+  happens in `Stage::apply`) between Exposure and GraduatedNd; ordering test now
+  enables graduatednd too and pins toneequal-before-graduatednd; new
+  raw-passthrough/identity-gate parity test and an end-to-end midtone-boost
+  render test. History container stays at v5 (m4-115 precedent).
+- `darkroom/mod.rs`: `toneequal_module_row` — nine −2..+2 EV sliders labelled
+  with darktable's params descriptions + EV positions ("Blacks (−8 EV)" …
+  "Speculars (+0 EV)", gui toneequal.c:3205-3213); dispatch arm +
+  LIVE_MODULE_LABELS. `history.rs`: "Tone equalizer" describe_change block +
+  exhaustive-destructure drift guard + pinned blob length 717.
+
+**Scope decisions** (documented in PARITY_AUDIT.md): runs
+`details == DT_TONEEQ_NONE` only — darktable's shipped default is the guided
+filter (`DT_TONEEQ_EIGF`), not ported, and with it go the smoothing/feathering/
+blending controls and mask display. Smoothing fixed at √2 (darktable removed its
+slider in module version 2). Luminance estimator hardcoded to `DT_TONEEQ_NORM_2`
+(the C default). All-zero gains render exact identity in C41 vs darktable's ±0.7%
+fitted curve deviation.
+
+**Mistakes caught this increment.**
+- I first placed ToneEqual after GraduatedNd citing "v50_order pos 28.0" — that
+  figure came from the *_jpg order tables; v50_order has toneequal at 24.0,
+  BEFORE graduatednd 25. Caught by re-checking the table boundaries during a
+  self-review of the diff; placement + all comments fixed, ordering test
+  strengthened to pin toneequal-before-graduatednd by enabling graduatednd.
+- The WIP `solve_weights` doc claimed the C leaves `d->factors` calloc-zero on a
+  failed solve. Wrong: `commit_params` ignores `pseudo_solve`'s FALSE return and
+  `dt_simd_memcpy`s the unsolved exp2(gains) vector into `d->factors`
+  unconditionally (dt_simd_memcpy(in, out, n) — checked imagebuf.h:63). C41 now
+  documents returning zeros instead (uniform ×0.25 floor — visibly broken rather
+  than subtly wrong); branch unreachable for the fixed σ=√2 SPD basis anyway.
+- One bad Edit duplicated two lines of `whitebalance_module_row` while inserting
+  the new row function above it; noticed immediately from the file state and
+  reverted.
+
+**Senior review (fricktrade-architect).** Verdict APPROVE-WITH-FIXES; no
+correctness bugs. Reviewer independently cross-checked the least-squares
+numerics against numpy f64 lstsq (weights and LUT values match our pins:
+×1.7459 @−4 EV, ×0.9646 @0 EV) and verified the memo cache is sound under the
+rayon band-split (bit-identical bands hold). Findings, all addressed:
+- MEDIUM: PARITY_AUDIT.md item 2.1 not yet updated → updated in this commit
+  (24 modules, tone equalizer moved out of the missing list, scope deviations
+  recorded).
+- LOW: stale comments from the pre-fix draft (negadoctor block still said
+  "after graduatednd 28.0"; GraduatedNd block said "right after exposure 21")
+  → both corrected.
+- LOW: UI comments claimed all-zero gains are exp2(0)=1 "everywhere" without
+  the ≤0.7% fit-residual caveat → reworded with a pointer to the core test.
+- LOW (no action): per-band luminance Vec allocation matches the C's own
+  per-call alloc; noted as a future thread-local-scratch candidate if it ever
+  profiles hot.
+
+**Verified.** `scripts/ci-local.sh` — all four CI steps pass (exit 0):
+`cargo check --workspace` ✓, `cargo clippy --workspace` ✓ (zero new warnings —
+verified 559 pre-existing warnings before and after the change; clone!
+deprecations in c41-ui remain known/out-of-scope), `cargo test --workspace
+--release` ✓, `cargo build --release -p c41 --bin c41-rs` ✓. c41-core suite
+locally: 701 tests green including the 11 toneequal tests.

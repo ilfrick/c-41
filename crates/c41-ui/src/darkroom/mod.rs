@@ -1850,6 +1850,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
                 "Primaries" => pg.add(&primaries_module_row(ctx)),
                 "Negadoctor" => pg.add(&negadoctor_module_row(ctx)),
+                "Tone equalizer" => pg.add(&toneequal_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
@@ -1945,7 +1946,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2559,6 +2560,50 @@ fn negadoctor_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             let exposure_ev = (p0.negadoctor_exposure as f64).log2();
             add_param_slider(e, ctx, "Exposure (EV)", -1.0, 1.0, 0.01, exposure_ev,
                 |p, v| p.negadoctor_exposure = 2.0f32.powf(v));
+        })
+}
+
+/// Tone equalizer (toneequal.c): nine per-exposure-channel gain sliders, one
+/// per EV band from −8 EV to 0 EV. Labels pair darktable's params-struct
+/// descriptions with the EV positions its GUI shows
+/// (`dt_bauhaus_widget_set_label`, toneequal.c:3205-3213). All sliders are
+/// −2..+2 EV, step 0.01 ($MIN/$MAX/$DEFAULT in the params struct comments,
+/// toneequal.c:172-180); all zero = flat unity correction.
+///
+/// Scope note: this runs the `details == DT_TONEEQ_NONE` configuration
+/// ("preserve details: no") — darktable's default is the guided-filter mode,
+/// which is not ported; the smoothing/feathering/blending controls only affect
+/// those modes or the mask display, so they are not surfaced.
+fn toneequal_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Tone equalizer", "exposure channel tone mapping", p0.toneeq_on,
+        |p, on| p.toneeq_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Blacks (−8 EV)", -2.0, 2.0, 0.01, p0.toneeq_noise as f64,
+                |p, v| p.toneeq_noise = v);
+            add_param_slider(e, ctx, "Deep shadows (−7 EV)", -2.0, 2.0, 0.01,
+                p0.toneeq_ultra_deep_blacks as f64,
+                |p, v| p.toneeq_ultra_deep_blacks = v);
+            add_param_slider(e, ctx, "Shadows (−6 EV)", -2.0, 2.0, 0.01,
+                p0.toneeq_deep_blacks as f64,
+                |p, v| p.toneeq_deep_blacks = v);
+            add_param_slider(e, ctx, "Light shadows (−5 EV)", -2.0, 2.0, 0.01,
+                p0.toneeq_blacks as f64,
+                |p, v| p.toneeq_blacks = v);
+            add_param_slider(e, ctx, "Mid-tones (−4 EV)", -2.0, 2.0, 0.01,
+                p0.toneeq_shadows as f64,
+                |p, v| p.toneeq_shadows = v);
+            add_param_slider(e, ctx, "Dark highlights (−3 EV)", -2.0, 2.0, 0.01,
+                p0.toneeq_midtones as f64,
+                |p, v| p.toneeq_midtones = v);
+            add_param_slider(e, ctx, "Highlights (−2 EV)", -2.0, 2.0, 0.01,
+                p0.toneeq_highlights as f64,
+                |p, v| p.toneeq_highlights = v);
+            add_param_slider(e, ctx, "Whites (−1 EV)", -2.0, 2.0, 0.01, p0.toneeq_whites as f64,
+                |p, v| p.toneeq_whites = v);
+            add_param_slider(e, ctx, "Speculars (+0 EV)", -2.0, 2.0, 0.01,
+                p0.toneeq_speculars as f64,
+                |p, v| p.toneeq_speculars = v);
         })
 }
 

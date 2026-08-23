@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -375,6 +375,30 @@ pub enum Stage {
         soft_clip_comp: f32,
         exposure: f32,
     },
+
+    /// Tone equalizer (toneequal.c) — an exposure-domain tone curve driven by
+    /// nine per-exposure-channel gains (EV offsets at −8…0 EV, ordered
+    /// noise→speculars, matching `get_channels_gains`, toneequal.c:1210). The
+    /// gains are stored raw; `apply` performs the RBF least-squares solve
+    /// (`pseudo_solve`, choleski.h) and correction-LUT build per render, memoised
+    /// on its inputs (see `toneequal::cached_correction_lut`).
+    ///
+    /// Scope: runs in the `details == DT_TONEEQ_NONE` configuration ("preserve
+    /// details: no") — no guided-filter/surface-blur luminance pre-pass. The
+    /// luminance estimator is darktable's default `DT_TONEEQ_NORM_2`
+    /// (sqrt(r²+g²+b²)) and, with the defaults `exposure_boost = 0`,
+    /// `contrast_boost = 0`, fulcrum 0, `linear_contrast` reduces to the exp2(−16)
+    /// MIN_FLOAT floor — exactly what `process_preview_pixels` mirrors.
+    ///
+    /// Works directly on linear RGB (`default_colorspace` returns `IOP_CS_RGB`)
+    /// via a per-pixel luminance lookup — no Lab conversion, so
+    /// `working_space()` returns `None`. **Pixel-local**: each output pixel
+    /// depends only on its own input pixel, so the band-parallel path stays
+    /// available.
+    ToneEqual {
+        /// Nine channel gains in EV (log2), −8 EV … 0 EV. All zero = identity.
+        gains: [f32; 9],
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -427,6 +451,7 @@ impl Stage {
             Stage::Lowpass { .. } => "lowpass",
             Stage::Primaries { .. } => "primaries",
             Stage::Negadoctor { .. } => "negadoctor",
+            Stage::ToneEqual { .. } => "toneequal",
         }
     }
 
@@ -514,6 +539,12 @@ impl Stage {
             // Negadoctor is pixel-local: a per-channel log-density inversion,
             // no neighbour reads, so the band-parallel path stays available.
             Stage::Negadoctor { .. } => true,
+            // ToneEqual (details == NONE) is pixel-local: the luminance mask is
+            // computed per pixel from that pixel's own RGB and the correction is
+            // a LUT lookup at that luminance — no neighbour reads. (The skipped
+            // guided-filter modes WOULD read neighbours; if they are ever ported
+            // this must be revisited.) Band-parallel stays available.
+            Stage::ToneEqual { .. } => true,
         }
     }
 
@@ -559,6 +590,11 @@ impl Stage {
             // Negadoctor works directly in linear RGB — no Lab conversion, no
             // working-space agreement needed.
             Stage::Negadoctor { .. } => None,
+            // ToneEqual reads the RGB norm-2 luminance and scales channels by a
+            // correction looked up in its LUT — it runs on whatever RGB buffer
+            // it is given (darktable `default_colorspace` = IOP_CS_RGB), so no
+            // Lab working-space agreement is needed.
+            Stage::ToneEqual { .. } => None,
             Stage::GraduatedNd { .. } => None,
             _ => None,
         }
@@ -1258,6 +1294,14 @@ impl Stage {
                     );
                 }
             }
+            // ── ToneEqual (toneequal.c, details == DT_TONEEQ_NONE) ───────
+            // Scene-referred tone mapping by exposure channel. The RBF solve +
+            // correction-LUT build happen inside `process_preview_pixels`, memoised
+            // per thread on the gains (see toneequal::CORRECTION_LUT_CACHE) so the
+            // per-band calls of the parallel path share one table.
+            Stage::ToneEqual { gains } => {
+                toneequal::process_preview_pixels(input, output, &gains);
+            }
         }
     }
 }
@@ -1634,6 +1678,7 @@ mod tests {
                 dmin: [0.0; 4], wb_high: [0.0; 4], offset: [0.0; 4],
                 black: 0.0, gamma: 1.0, soft_clip: 0.0, soft_clip_comp: 1.0, exposure: 0.0,
             },
+            Stage::ToneEqual { gains: [0.0; 9] },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }

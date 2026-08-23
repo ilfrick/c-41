@@ -169,8 +169,9 @@ impl HistoryStack {
         // Accept both the current and the previous history-container version.
         // The container (v5) wraps PreviewParams blobs that carry their own
         // per-entry version byte — PreviewParams::ENCODE_VERSION has drifted
-        // from v13 (553 B) to v16 (680 B) as basicadj/shadhi/lowpass/negadoctor
-        // layers were added, but the history *container* format is unchanged.
+        // from v13 (553 B) to v17 (717 B) as basicadj/shadhi/lowpass/negadoctor/
+        // toneequalizer layers were added, but the history *container* format is
+        // unchanged.
         // Rejecting the prior container version outright would wipe every saved
         // undo/redo stack on first load, so we decode leniently and let
         // PreviewParams::decode default any missing fields via the version byte.
@@ -435,6 +436,19 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if negadoctor {
         return "Negadoctor";
     }
+    let toneeq = old.toneeq_on != new.toneeq_on
+        || old.toneeq_noise != new.toneeq_noise
+        || old.toneeq_ultra_deep_blacks != new.toneeq_ultra_deep_blacks
+        || old.toneeq_deep_blacks != new.toneeq_deep_blacks
+        || old.toneeq_blacks != new.toneeq_blacks
+        || old.toneeq_shadows != new.toneeq_shadows
+        || old.toneeq_midtones != new.toneeq_midtones
+        || old.toneeq_highlights != new.toneeq_highlights
+        || old.toneeq_whites != new.toneeq_whites
+        || old.toneeq_speculars != new.toneeq_speculars;
+    if toneeq {
+        return "Tone equalizer";
+    }
     "Edit"
 }
 
@@ -612,6 +626,10 @@ mod tests {
             describe_change(&base, &PreviewParams { primaries_red_hue: 10.0, ..d() }),
             "Primaries"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { toneeq_shadows: 0.5, ..d() }),
+            "Tone equalizer"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -755,6 +773,16 @@ mod tests {
             negadoctor_gamma: _,
             negadoctor_soft_clip: _,
             negadoctor_exposure: _,
+            toneeq_on: _,
+            toneeq_noise: _,
+            toneeq_ultra_deep_blacks: _,
+            toneeq_deep_blacks: _,
+            toneeq_blacks: _,
+            toneeq_shadows: _,
+            toneeq_midtones: _,
+            toneeq_highlights: _,
+            toneeq_whites: _,
+            toneeq_speculars: _,
         } = PreviewParams::default();
     }
 
@@ -834,7 +862,8 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 680);
+        // m4-116 (toneequalizer): 680 → 717 (1 + 24 bools + 173 f32).
+        assert_eq!(PreviewParams::default().encode().len(), 717);
     }
 
     #[test]

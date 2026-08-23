@@ -298,6 +298,32 @@ pub struct PreviewParams {
     pub negadoctor_soft_clip: f32,
     /// Print exposure adjustment, 0.5..2.0, default 0.9245.
     pub negadoctor_exposure: f32,
+    // ── Tone equalizer (toneequal.c, iop_order.c v50_order pos 24.0) ─────
+    // Scene-referred tone mapping by exposure channel: nine gain sliders, one
+    // per exposure band from −8 EV to 0 EV, interpolated by a Gaussian RBF fit.
+    // Runs in the `details == DT_TONEEQ_NONE` configuration ("preserve details:
+    // no"); the guided-filter modes are not ported. Gains are EV offsets
+    // (slider range −2..+2, darktable $MIN/$MAX), all zero = identity.
+    /// Tone equalizer module enabled.
+    pub toneeq_on: bool,
+    /// Gain at −8 EV ("blacks" in the C params struct: `noise`), −2..+2 EV.
+    pub toneeq_noise: f32,
+    /// Gain at −7 EV (`ultra_deep_blacks`, "deep shadows"), −2..+2 EV.
+    pub toneeq_ultra_deep_blacks: f32,
+    /// Gain at −6 EV (`deep_blacks`, "shadows"), −2..+2 EV.
+    pub toneeq_deep_blacks: f32,
+    /// Gain at −5 EV (`blacks`, "light shadows"), −2..+2 EV.
+    pub toneeq_blacks: f32,
+    /// Gain at −4 EV (`shadows`, "mid-tones"), −2..+2 EV.
+    pub toneeq_shadows: f32,
+    /// Gain at −3 EV (`midtones`, "dark highlights"), −2..+2 EV.
+    pub toneeq_midtones: f32,
+    /// Gain at −2 EV (`highlights`), −2..+2 EV.
+    pub toneeq_highlights: f32,
+    /// Gain at −1 EV (`whites`), −2..+2 EV.
+    pub toneeq_whites: f32,
+    /// Gain at 0 EV (`speculars`), −2..+2 EV.
+    pub toneeq_speculars: f32,
 }
 
 impl Default for PreviewParams {
@@ -476,6 +502,16 @@ impl Default for PreviewParams {
             negadoctor_gamma: 4.0,
             negadoctor_soft_clip: 0.75,
             negadoctor_exposure: 0.9245,
+            toneeq_on: false,
+            toneeq_noise: 0.0,
+            toneeq_ultra_deep_blacks: 0.0,
+            toneeq_deep_blacks: 0.0,
+            toneeq_blacks: 0.0,
+            toneeq_shadows: 0.0,
+            toneeq_midtones: 0.0,
+            toneeq_highlights: 0.0,
+            toneeq_whites: 0.0,
+            toneeq_speculars: 0.0,
         }
     }
 }
@@ -589,6 +625,21 @@ impl PreviewParams {
         // while enabled (it always inverts). The gate mirrors `to_pipeline`:
         // only the enable flag matters.
         let negadoctor_identity = !self.negadoctor_on;
+        // Tone equalizer: all-zero gains are exp2(0) = 1 at every channel (the
+        // fitted curve tracks unity to ≤0.7% RBF residual — see
+        // solve_weights_flat_unity_at_default_gains in c41-core), so that is
+        // identity regardless of the on flag — but keep the flag in the gate to
+        // mirror `to_pipeline`, which only pushes the stage when a gain moved.
+        let toneeq_identity = !self.toneeq_on
+            || (self.toneeq_noise == 0.0
+                && self.toneeq_ultra_deep_blacks == 0.0
+                && self.toneeq_deep_blacks == 0.0
+                && self.toneeq_blacks == 0.0
+                && self.toneeq_shadows == 0.0
+                && self.toneeq_midtones == 0.0
+                && self.toneeq_highlights == 0.0
+                && self.toneeq_whites == 0.0
+                && self.toneeq_speculars == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -596,6 +647,7 @@ impl PreviewParams {
             && gradnd_identity && colisa_identity && basicadj_identity
             && lowpass_identity && shadhi_identity
             && primaries_identity && negadoctor_identity
+            && toneeq_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -626,6 +678,7 @@ impl PreviewParams {
             shadhi_on: false,
             primaries_on: false,
             negadoctor_on: false,
+            toneeq_on: false,
             ..*self
         }
     }
@@ -652,7 +705,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on] {
             v.push(b as u8);
         }
         for f in [
@@ -709,6 +762,11 @@ impl PreviewParams {
             self.negadoctor_d_max, self.negadoctor_offset,
             self.negadoctor_black, self.negadoctor_gamma,
             self.negadoctor_soft_clip, self.negadoctor_exposure,
+            self.toneeq_noise, self.toneeq_ultra_deep_blacks,
+            self.toneeq_deep_blacks, self.toneeq_blacks,
+            self.toneeq_shadows, self.toneeq_midtones,
+            self.toneeq_highlights, self.toneeq_whites,
+            self.toneeq_speculars,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -836,6 +894,16 @@ impl PreviewParams {
             negadoctor_gamma: f.get(161).copied().unwrap_or(d.negadoctor_gamma),
             negadoctor_soft_clip: f.get(162).copied().unwrap_or(d.negadoctor_soft_clip),
             negadoctor_exposure: f.get(163).copied().unwrap_or(d.negadoctor_exposure),
+            toneeq_on: bools.get(23).map_or(d.toneeq_on, |&b| b != 0),
+            toneeq_noise: f.get(164).copied().unwrap_or(d.toneeq_noise),
+            toneeq_ultra_deep_blacks: f.get(165).copied().unwrap_or(d.toneeq_ultra_deep_blacks),
+            toneeq_deep_blacks: f.get(166).copied().unwrap_or(d.toneeq_deep_blacks),
+            toneeq_blacks: f.get(167).copied().unwrap_or(d.toneeq_blacks),
+            toneeq_shadows: f.get(168).copied().unwrap_or(d.toneeq_shadows),
+            toneeq_midtones: f.get(169).copied().unwrap_or(d.toneeq_midtones),
+            toneeq_highlights: f.get(170).copied().unwrap_or(d.toneeq_highlights),
+            toneeq_whites: f.get(171).copied().unwrap_or(d.toneeq_whites),
+            toneeq_speculars: f.get(172).copied().unwrap_or(d.toneeq_speculars),
         })
     }
 
@@ -893,13 +961,50 @@ impl PreviewParams {
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
         }
-        // Graduated ND (iop_order.c pos 25 — scene-referred, right after
-        // exposure 21 and before the channel mix 28.5). Early placement is
-        // correct: it is an optical filter, modelling glass in front of the
-        // lens, so it belongs on linear scene data before any tone or colour
-        // work. Density 0 is exp2(0) = 1 everywhere, a true no-op, so it is
-        // skipped. The geometry depends on the buffer size and is derived in
-        // Stage::apply, not here.
+        // Tone equalizer (toneequal.c, iop_order.c v50_order pos 24.0 — "last
+        // module that need enlarged roi_in", after exposure 21 and BEFORE
+        // graduatednd 25 / the channelmixerrgb·negadoctor·primaries group 28.5).
+        // Scene-referred tone mapping by exposure channel: nine gains (EV
+        // offsets, −8…0 EV) are least-squares-fitted to a Gaussian RBF and
+        // applied per pixel as a correction looked up at that pixel's own
+        // luminance. The stage carries the raw gains; the solve + LUT build
+        // happen in `Stage::apply`, memoised.
+        //
+        // The gate mirrors `is_identity`: all-zero gains are exp2(0) = 1 at
+        // every channel (fitted curve ≈1, ≤0.7% RBF residual) — a flat unity
+        // correction — so they are skipped.
+        if self.toneeq_on
+            && (self.toneeq_noise != 0.0
+                || self.toneeq_ultra_deep_blacks != 0.0
+                || self.toneeq_deep_blacks != 0.0
+                || self.toneeq_blacks != 0.0
+                || self.toneeq_shadows != 0.0
+                || self.toneeq_midtones != 0.0
+                || self.toneeq_highlights != 0.0
+                || self.toneeq_whites != 0.0
+                || self.toneeq_speculars != 0.0)
+        {
+            p.push(Stage::ToneEqual {
+                gains: [
+                    self.toneeq_noise,
+                    self.toneeq_ultra_deep_blacks,
+                    self.toneeq_deep_blacks,
+                    self.toneeq_blacks,
+                    self.toneeq_shadows,
+                    self.toneeq_midtones,
+                    self.toneeq_highlights,
+                    self.toneeq_whites,
+                    self.toneeq_speculars,
+                ],
+            });
+        }
+        // Graduated ND (iop_order.c v50_order pos 25 — scene-referred, after
+        // the tone equalizer 24 and before the channel mix 28.5). Early
+        // placement is correct: it is an optical filter, modelling glass in
+        // front of the lens, so it belongs on linear scene data before any tone
+        // or colour work. Density 0 is exp2(0) = 1 everywhere, a true no-op, so
+        // it is skipped. The geometry depends on the buffer size and is derived
+        // in Stage::apply, not here.
         if self.gradnd_on && self.gradnd_density != 0.0 {
             p.push(Stage::GraduatedNd {
                 density: self.gradnd_density,
@@ -910,8 +1015,9 @@ impl PreviewParams {
                 saturation: self.gradnd_saturation,
             });
         }
-        // Negadoctor (negadoctor.c, iop_order.c pos 28.5 — after graduatednd 28.0,
-        // before channelmixerrgb/primaries at the same position). Display-referred
+        // Negadoctor (negadoctor.c, iop_order.c v50_order pos 28.5 — after
+        // graduatednd 25, alongside channelmixerrgb/primaries at the same
+        // position). Display-referred
         // film-negative inversion via Cineon-style log-density: undoes the scanner's
         // log-density exposure and simulates print-on-paper (gamma, black, soft-clip).
         // Runs on linear RGB before any colour-space adjustment.
@@ -1320,9 +1426,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v12 adds basicadj (basic adjustments). v13 adds lowpass.
 /// v14 adds shadhi (shadows/highlights). v15 adds primaries (RGB adjustment).
 /// v16 adds negadoctor (film negative inversion).
-const ENCODE_VERSION: u8 = 16;
-/// 1 version byte + 23 bool bytes + 164 little-endian f32.
-const ENCODED_LEN: usize = 1 + 23 + 164 * 4;
+/// v17 adds toneequalizer (exposure-channel tone mapping).
+const ENCODE_VERSION: u8 = 17;
+/// 1 version byte + 24 bool bytes + 173 little-endian f32.
+const ENCODED_LEN: usize = 1 + 24 + 173 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1334,6 +1441,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (14, 21, 140), // v14: shadhi added
     (15, 22, 148), // v15: primaries added
     (16, 23, 164), // v16: negadoctor added
+    (17, 24, 173), // v17: toneequalizer added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2009,15 +2117,25 @@ mod tests {
         p.levels_on = true;
         p.levels_grey = 40.0; // off-default so the stage is actually emitted
         // negadoctor: on by itself is enough to emit the stage (on is the gate).
-        // Positioned at iop_order 28.5 — after graduatednd 28.0, before primaries.
+        // Positioned at iop_order 28.5 — after graduatednd 25, before primaries
+        // in table order.
         p.negadoctor_on = true;
+        // tone equalizer: pos 24.0 in v50_order ("last module that need enlarged
+        // roi_in") — after exposure 21, before graduatednd 25 and the 28.5 group
+        // (negadoctor/primaries). A single non-zero gain is enough to emit it.
+        p.toneeq_on = true;
+        p.toneeq_shadows = 0.5;
+        // graduatednd enabled too, so the toneequal-before-graduatednd order is
+        // actually pinned by this test.
+        p.gradnd_on = true;
+        p.gradnd_density = -2.0;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["exposure", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
+            ["exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
         );
         // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
         // it clips at its black point and treats L as 0..100, so running it
@@ -2344,6 +2462,18 @@ mod tests {
             negadoctor_gamma: 3.0,
             negadoctor_soft_clip: 0.4,
             negadoctor_exposure: 1.5,
+            // Nine distinct gains so any wrong-offset packing shows as a mismatch
+            // (they are adjacent f32s in the blob).
+            toneeq_on: true,
+            toneeq_noise: 0.11,
+            toneeq_ultra_deep_blacks: -0.22,
+            toneeq_deep_blacks: 0.33,
+            toneeq_blacks: -0.44,
+            toneeq_shadows: 0.55,
+            toneeq_midtones: -0.66,
+            toneeq_highlights: 0.77,
+            toneeq_whites: -0.88,
+            toneeq_speculars: 0.99,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -2455,6 +2585,31 @@ mod tests {
     }
 
     #[test]
+    fn decode_v16_blob_defaults_toneeq_fields() {
+        // A v16 blob (before the tone equalizer was added — 23 bools / 164 f32s)
+        // must decode successfully: the new toneeq fields fall back to their
+        // defaults, so a saved style from the pre-toneequalizer era loads cleanly.
+        let v16 = {
+            let mut b = vec![0u8; 1 + 23 + 164 * 4];
+            b[0] = 16; // version 16
+            b
+        };
+        let decoded = PreviewParams::decode(&v16)
+            .expect("v16 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.toneeq_on, def.toneeq_on);
+        assert_eq!(decoded.toneeq_noise, def.toneeq_noise);
+        assert_eq!(decoded.toneeq_ultra_deep_blacks, def.toneeq_ultra_deep_blacks);
+        assert_eq!(decoded.toneeq_deep_blacks, def.toneeq_deep_blacks);
+        assert_eq!(decoded.toneeq_blacks, def.toneeq_blacks);
+        assert_eq!(decoded.toneeq_shadows, def.toneeq_shadows);
+        assert_eq!(decoded.toneeq_midtones, def.toneeq_midtones);
+        assert_eq!(decoded.toneeq_highlights, def.toneeq_highlights);
+        assert_eq!(decoded.toneeq_whites, def.toneeq_whites);
+        assert_eq!(decoded.toneeq_speculars, def.toneeq_speculars);
+    }
+
+    #[test]
     fn negadoctor_commit_params_matches_darktable() {
         // Pins the commit_params arithmetic in src/iop/negadoctor.c:239-267:
         //   wb_high[c] = p->wb_high[c] / p->D_max   (premultiply, spare one div/pixel)
@@ -2551,6 +2706,80 @@ mod tests {
             for c in 0..3 {
                 assert!((neg[c] - 1.0).abs() < 1e-6, "dmin channel {c} should collapse to Dmin[0]=1.0, got {}", neg[c]);
             }
+        }
+    }
+
+    #[test]
+    fn toneequal_gains_reach_stage_raw_and_identity_gate_holds() {
+        // Unlike negadoctor, toneequal's to_pipeline does NO param arithmetic:
+        // the nine EV gains are carried raw into Stage::ToneEqual and all the
+        // derivation (exp2 conversion, RBF solve, LUT build) happens in
+        // `Stage::apply`, mirroring darktable where commit_params solves and
+        // process builds the LUT. This pins (a) raw passthrough, in
+        // get_channels_gains order (noise −8 EV … speculars 0 EV,
+        // toneequal.c:1210), and (b) the identity gate — an enabled module with
+        // all-zero gains emits NO stage.
+        {
+            let mut p = PreviewParams::default();
+            p.toneeq_on = true;
+            p.toneeq_noise = -0.8;
+            p.toneeq_ultra_deep_blacks = -0.7;
+            p.toneeq_deep_blacks = -0.6;
+            p.toneeq_blacks = -0.5;
+            p.toneeq_shadows = 1.0;
+            p.toneeq_midtones = -0.3;
+            p.toneeq_highlights = -0.2;
+            p.toneeq_whites = -0.1;
+            p.toneeq_speculars = 0.9;
+
+            let pipe = p.to_pipeline(ColorSpace::LinearSrgb, 1.0);
+            let stage = pipe
+                .stages
+                .iter()
+                .find(|s| s.name() == "toneequal")
+                .expect("toneequal stage should be emitted");
+            match stage {
+                Stage::ToneEqual { gains } => assert_eq!(
+                    gains,
+                    &[-0.8, -0.7, -0.6, -0.5, 1.0, -0.3, -0.2, -0.1, 0.9]
+                ),
+                _ => panic!("expected Stage::ToneEqual, got {stage:?}"),
+            }
+        }
+        // All-zero gains ⇒ no stage even while enabled (flat unity correction).
+        let mut p = PreviewParams::default();
+        p.toneeq_on = true;
+        assert!(
+            p.to_pipeline(ColorSpace::LinearSrgb, 1.0)
+                .stages
+                .iter()
+                .all(|s| s.name() != "toneequal"),
+            "all-zero gains must not emit a toneequal stage"
+        );
+    }
+
+    #[test]
+    fn toneequal_midtone_boost_brightens_midgrey_end_to_end() {
+        // End-to-end through to_pipeline + Pipeline::process: a +1 EV mid-tones
+        // gain on a dark-grey patch must brighten it (the RBF fit trades peak
+        // amplitude for smoothness, so ≈×1.7 rather than ×2 at −4 EV — pinned
+        // numerically by c41-core's `single_channel_boost_lands_near_exp2_gain`).
+        // Here we only demand direction + a sane magnitude band.
+        let mut p = PreviewParams::default();
+        p.toneeq_on = true;
+        p.toneeq_shadows = 1.0; // −4 EV channel ("mid-tones" slider)
+        // A uniform grey of 0.25 sits at norm-2 luminance √3·0.25 ≈ 0.43 ≈
+        // −1.2 EV, between the −2 and −1 EV channels. Use a darker patch so it
+        // lands near the boosted −4 EV centre: 0.25·2⁻³ ≈ 0.031 → expo ≈ −5 EV.
+        let dark = [0.031_f32, 0.031, 0.031, 1.0];
+        let input: Vec<f32> = dark.repeat(16);
+        let out = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).process(&input, 4, 4);
+        for chunk in out.chunks_exact(4) {
+            assert!(
+                chunk[0] > dark[0] * 1.4 && chunk[0] < dark[0] * 2.1,
+                "dark grey should be boosted ≈×1.75, got ×{}",
+                chunk[0] / dark[0]
+            );
         }
     }
 
