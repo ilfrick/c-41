@@ -927,3 +927,80 @@ to verify the complete codebase compiles and all tests pass under `--release`.
 **Push.** Commit `d7613a0ee9` pushed to both remotes:
 - GitHub `ilfrick/c-41` ✓
 - Gitea `housefz.com` ✓
+
+---
+
+## 2026-08-23 07:45 UTC — m4-114: Primaries (RGB primaries adjustment) live preview module
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** Wired the primaries IOP (RGB primaries rotation/scaling) into the
+preview pipeline — the **21st** live module.
+
+- `c41-core/iop/primaries.rs`: fully ported from
+  `src/iop/primaries.c` + `src/common/custom_primaries.c`. Key components:
+  - `rotate_and_scale_primary`, `find_distance_to_edge`, `intersect_line_segments`
+    — faithful ports of the gamut-hull projection geometry.
+  - `mat3_inv` (port of `mat3SSEinv`) — all 9 cofactors verified term-for-term.
+    Now returns `Option` (was: identity on singular); divergence from C is
+    deliberate: C's caller writes nothing to a zero-initialised matrix (→ black
+    frame, loud); the Rust identity fallback was a plausible-but-wrong silent mode.
+  - `make_transposed_matrices_from_primaries_and_whitepoint` (Lindbloom) +
+    `colormatrix_mul` (`dt_colormatrix_mul`, verified `M_dst = M_m2·M_m1`).
+  - `compute_matrix` — public entry: builds custom RGB→XYZ, inverts working
+    RGB→XYZ for `matrix_out`, multiplies, pads to 4×4. Added two fail-safes:
+    (1) triangle-area precondition (1e-9 threshold; degenerate configs return
+    identity), (2) output reasonableness backstop (non-finite or |coeff| > 1e3).
+  - `process_pixels` — safe bounds-checked wrapper around the raw `darkroom_primaries_process`
+    FFI shim; release-mode aliasing guard via `debug_assert_ne!(input.as_ptr(), output.as_ptr())`.
+  - 7 unit tests including `degenerate_hue_returns_identity` and a full
+    3⁸-parameter sweep over the proposed slider ranges asserting all coefficients
+    stay bounded (< 10.0).
+
+- `pipeline.rs`: `Stage::Primaries { matrix: [f32; 16] }` after `GraduatedNd`.
+  Pixel-local (true) → stays on the rayon band-parallel path. Added explicit
+  `working_space() => None` arm (linear RGB, no Lab agreement needed). `apply`
+  now calls the safe `process_pixels` wrapper.
+
+- `preview.rs`: 9 new fields (on/off + 8 params). ENCODE_VERSION 14→15,
+  ENCODED_LEN 582→615, `PARAMS_LAYOUTS += (15, 22, 148)`. Extracted
+  `primaries_is_neutral()` as the single source of truth for `is_identity()`,
+  `to_pipeline()`, and tests (was 4 duplicated copies).
+
+- `catalog.rs`: added "Primaries" to the Color group.
+- `darkroom/mod.rs`: `primaries_module_row` with 8 GTK4 sliders using darktable's
+  **soft** ranges (hue ±20°, purity 0.5..1.5, tint purity 0..0.2; tint hue keeps
+  full ±180° since it only moves the white point and is safe).
+- `history.rs`: primaries field comparison in `describe_change()`; pinned length
+  582→615.
+
+**Verified.** `scripts/ci-local.sh` — all four steps green:
+1. `cargo check --workspace` — OK (pre-existing warnings only)
+2. `cargo clippy --workspace` — OK (pre-existing warnings: unused_parens
+   in color.rs, unused_import in film.rs, deprecated `clone!` macros in c41-ui)
+3. `cargo test --workspace --release` — OK (695 core + 92 db + 256 ui = **1043
+   tests passed, 0 failed**)
+4. `cargo build --release -p c41 --bin c41-rs` — OK
+
+**Senior review.** Spawned `fricktrade-architect` (Opus 4.8) with the full diff.
+Two HIGH findings blocked commit; both fixed:
+- H1: Slider ranges used darktable's hard range (±180°, purity 0.01..5.0) instead
+  of the soft range (±20°, 0.5..1.5). Past ~112° hue the primaries go collinear
+  (triangle area ~2.6e-18), giving singular matrices with coefficients ~1e16.
+  Fixed by adopting the soft ranges as the slider bounds.
+- H2: `mat3_inv` returned identity on near-singular (silent-wrong-answer); the
+  absolute 1e-7 epsilon was straddled by f32 noise. Fixed by returning `Option`
+  and adding a triangle-area precondition (1e-9) + output magnitude backstop (1e3)
+  in `compute_matrix`.
+
+MEDIUM/LOW fixes also applied:
+- M1: Extracted `primaries_is_neutral()` to eliminate 4 duplicated neutral-check copies.
+- M3: Added explicit `Stage::Primaries => None` arm to `working_space()`.
+- L1: Added safe `process_pixels` wrapper with aliasing debug_assert; `apply` no longer uses `unsafe`.
+- L2: Fixed doc comment ("gradnd 25" → "graduatednd 28.0").
+- L4: Added Primaries to the `is_pixel_local` test vector.
+
+**Notes.** PARITY_AUDIT.md updated with the ~10% working-profile divergence
+(C41 uses nominal xy from colorspaces.c; darktable reads ICC colorant tags at
+runtime which differ slightly after D50 adaptation). C41's choice is self-
+consistent (identity at defaults is exact to 6e-16) and is kept deliberately.

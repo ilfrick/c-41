@@ -400,6 +400,18 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if shadhi {
         return "Shadows/Highlights";
     }
+    let primaries = old.primaries_on != new.primaries_on
+        || old.primaries_achromatic_tint_hue != new.primaries_achromatic_tint_hue
+        || old.primaries_achromatic_tint_purity != new.primaries_achromatic_tint_purity
+        || old.primaries_red_hue != new.primaries_red_hue
+        || old.primaries_red_purity != new.primaries_red_purity
+        || old.primaries_green_hue != new.primaries_green_hue
+        || old.primaries_green_purity != new.primaries_green_purity
+        || old.primaries_blue_hue != new.primaries_blue_hue
+        || old.primaries_blue_purity != new.primaries_blue_purity;
+    if primaries {
+        return "Primaries";
+    }
     "Edit"
 }
 
@@ -573,6 +585,10 @@ mod tests {
             describe_change(&base, &PreviewParams { shadhi_shadows: 25.0, ..d() }),
             "Shadows/Highlights"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { primaries_red_hue: 10.0, ..d() }),
+            "Primaries"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -690,6 +706,15 @@ mod tests {
             shadhi_compress: _,
             shadhi_shadows_ccorrect: _,
             shadhi_highlights_ccorrect: _,
+            primaries_on: _,
+            primaries_achromatic_tint_hue: _,
+            primaries_achromatic_tint_purity: _,
+            primaries_red_hue: _,
+            primaries_red_purity: _,
+            primaries_green_hue: _,
+            primaries_green_purity: _,
+            primaries_blue_hue: _,
+            primaries_blue_purity: _,
         } = PreviewParams::default();
     }
 
@@ -769,7 +794,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 582);
+        assert_eq!(PreviewParams::default().encode().len(), 615);
     }
 
     #[test]

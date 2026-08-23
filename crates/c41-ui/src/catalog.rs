@@ -70,6 +70,7 @@ static CATALOG: &[ModuleGroup] = &[
                 m("Colorize", false),
                 m("Color correction", false),
                 m("Color contrast", false),
+                m("Primaries", false),
             ],
         },
         ModuleGroup {

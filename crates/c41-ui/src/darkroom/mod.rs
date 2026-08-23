@@ -1848,6 +1848,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Colorize" => pg.add(&colorize_module_row(ctx)),
                 "Color correction" => pg.add(&colorcorrection_module_row(ctx)),
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
+                "Primaries" => pg.add(&primaries_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
@@ -1943,7 +1944,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2407,6 +2408,46 @@ fn lowpass_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.lowpass_brightness = v);
             add_param_slider(e, ctx, "Saturation", -3.0, 3.0, 0.01, p0.lowpass_saturation as f64,
                 |p, v| p.lowpass_saturation = v);
+        })
+}
+
+/// Primaries (primaries.c): rotate and scale each working-space primary
+/// around the white point. Two controls per channel — hue (degrees) and purity
+/// (multiplier, 1.0 = unchanged). Achromatic tint shifts the white point itself.
+///
+/// Ranges are darktable's *soft* ranges (from primaries.c `_setup_*_slider`),
+/// NOT the introspection hard range (hue ±180°, purity 0.01..5.0). The hard hue
+/// range is unusable: `rotate_and_scale_primary` projects primaries onto the
+/// gamut hull, so |hue| ≳ 112° lands them on the opposite triangle edge, making
+/// all three primaries collinear and the matrix singular (coefficients ~1e16).
+/// darktable hides this behind the soft range; we do too. Tint hue keeps its
+/// full ±180° — darktable sets no soft range on it, and it is safe (moves only
+/// the white point, leaving the primaries triangle intact).
+fn primaries_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Primaries", "primary hue & purity", p0.primaries_on,
+        |p, on| p.primaries_on = on,
+        |e, ctx| {
+            // Tint hue: full ±180° is safe (moves only the white point).
+            add_param_slider(e, ctx, "Achromatic tint hue", -180.0, 180.0, 1.0, p0.primaries_achromatic_tint_hue as f64,
+                |p, v| p.primaries_achromatic_tint_hue = v);
+            // Tint purity: darktable's soft range is 0..0.2.
+            add_param_slider(e, ctx, "Achromatic tint purity", 0.0, 0.99, 0.01, p0.primaries_achromatic_tint_purity as f64,
+                |p, v| p.primaries_achromatic_tint_purity = v);
+            // RGB hue: darktable's soft range is ±20° (hard is ±180°).
+            add_param_slider(e, ctx, "Red hue", -20.0, 20.0, 1.0, p0.primaries_red_hue as f64,
+                |p, v| p.primaries_red_hue = v);
+            // RGB purity: darktable's soft range is 0.5..1.5 (hard is 0.01..5.0).
+            add_param_slider(e, ctx, "Red purity", 0.5, 1.5, 0.01, p0.primaries_red_purity as f64,
+                |p, v| p.primaries_red_purity = v);
+            add_param_slider(e, ctx, "Green hue", -20.0, 20.0, 1.0, p0.primaries_green_hue as f64,
+                |p, v| p.primaries_green_hue = v);
+            add_param_slider(e, ctx, "Green purity", 0.5, 1.5, 0.01, p0.primaries_green_purity as f64,
+                |p, v| p.primaries_green_purity = v);
+            add_param_slider(e, ctx, "Blue hue", -20.0, 20.0, 1.0, p0.primaries_blue_hue as f64,
+                |p, v| p.primaries_blue_hue = v);
+            add_param_slider(e, ctx, "Blue purity", 0.5, 1.5, 0.01, p0.primaries_blue_purity as f64,
+                |p, v| p.primaries_blue_purity = v);
         })
 }
 

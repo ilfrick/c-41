@@ -21,6 +21,7 @@
 //! until a raw-decode/demosaic front end feeds `core::pipeline` directly.
 
 use c41_core::iop::colorzones;
+use c41_core::iop::primaries;
 use c41_core::pipeline::{ColorSpace, Pipeline, Stage};
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
@@ -239,6 +240,29 @@ pub struct PreviewParams {
     pub shadhi_shadows_ccorrect: f32,
     /// Highlights colour correction, 0..100 (C `highlights_ccorrect` slider, default 50).
     pub shadhi_highlights_ccorrect: f32,
+    // ── Primaries (primaries.c, iop_order.c v50_order pos 28.5) ──────────
+    // RGB chromaticity adjustment: rotates each working-space primary
+    // around the white point and scales its distance from it. Hue is stored
+    // in degrees (slider range -180..180); purity is a multiplier (1.0 =
+    // unchanged). Achromatic tint purity 0 keeps the white point fixed.
+    /// Primaries module enabled.
+    pub primaries_on: bool,
+    /// Achromatic tint hue, degrees (-180..180, default 0).
+    pub primaries_achromatic_tint_hue: f32,
+    /// Achromatic tint purity, 0..0.99 (default 0 = white point fixed).
+    pub primaries_achromatic_tint_purity: f32,
+    /// Red primary hue shift, degrees (-180..180, default 0).
+    pub primaries_red_hue: f32,
+    /// Red primary purity scale, 0.01..5.0 (default 1.0 = unchanged).
+    pub primaries_red_purity: f32,
+    /// Green primary hue shift, degrees (-180..180, default 0).
+    pub primaries_green_hue: f32,
+    /// Green primary purity scale, 0.01..5.0 (default 1.0 = unchanged).
+    pub primaries_green_purity: f32,
+    /// Blue primary hue shift, degrees (-180..180, default 0).
+    pub primaries_blue_hue: f32,
+    /// Blue primary purity scale, 0.01..5.0 (default 1.0 = unchanged).
+    pub primaries_blue_purity: f32,
 }
 
 impl Default for PreviewParams {
@@ -385,6 +409,17 @@ impl Default for PreviewParams {
             shadhi_compress: 50.0,
             shadhi_shadows_ccorrect: 100.0,
             shadhi_highlights_ccorrect: 50.0,
+            // Primaries defaults: off, all hues at 0, all RGB purities at 1.0
+            // (unchanged), achromatic tint purity at 0 (white point fixed).
+            primaries_on: false,
+            primaries_achromatic_tint_hue: 0.0,
+            primaries_achromatic_tint_purity: 0.0,
+            primaries_red_hue: 0.0,
+            primaries_red_purity: 1.0,
+            primaries_green_hue: 0.0,
+            primaries_green_purity: 1.0,
+            primaries_blue_hue: 0.0,
+            primaries_blue_purity: 1.0,
         }
     }
 }
@@ -491,12 +526,16 @@ impl PreviewParams {
         // without a non-zero shadow/highlight to drive them.
         let shadhi_identity = !self.shadhi_on
             || (self.shadhi_shadows == 0.0 && self.shadhi_highlights == 0.0 && self.shadhi_whitepoint == 0.0);
+        // Primaries: the matrix is identity when all hues are 0 (no rotation)
+        // The gate mirrors `to_pipeline`.
+        let primaries_identity = !self.primaries_on || self.primaries_is_neutral();
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
             && levels_identity && vignette_identity && lowlight_identity
             && gradnd_identity && colisa_identity && basicadj_identity
             && lowpass_identity && shadhi_identity
+            && primaries_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -525,8 +564,24 @@ impl PreviewParams {
             basicadj_on: false,
             lowpass_on: false,
             shadhi_on: false,
+            primaries_on: false,
             ..*self
         }
+    }
+
+    /// Whether the primaries params are at their neutral defaults (all hues 0,
+    /// all RGB purities 1.0, achromatic tint purity 0). This is the single source
+    /// of truth for the three places that need to know (is_identity, to_pipeline,
+    /// and the `default_params_are_neutral` test).
+    pub fn primaries_is_neutral(&self) -> bool {
+        self.primaries_achromatic_tint_hue == 0.0
+            && self.primaries_achromatic_tint_purity == 0.0
+            && self.primaries_red_hue == 0.0
+            && self.primaries_red_purity == 1.0
+            && self.primaries_green_hue == 0.0
+            && self.primaries_green_purity == 1.0
+            && self.primaries_blue_hue == 0.0
+            && self.primaries_blue_purity == 1.0
     }
 
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
@@ -536,7 +591,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on] {
             v.push(b as u8);
         }
         for f in [
@@ -582,6 +637,10 @@ impl PreviewParams {
             self.shadhi_shadows, self.shadhi_highlights, self.shadhi_whitepoint,
             self.shadhi_radius, self.shadhi_compress,
             self.shadhi_shadows_ccorrect, self.shadhi_highlights_ccorrect,
+            self.primaries_achromatic_tint_hue, self.primaries_achromatic_tint_purity,
+            self.primaries_red_hue, self.primaries_red_purity,
+            self.primaries_green_hue, self.primaries_green_purity,
+            self.primaries_blue_hue, self.primaries_blue_purity,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -676,6 +735,7 @@ impl PreviewParams {
             lowpass_radius: f[129], lowpass_contrast: f[130],
             lowpass_brightness: f[131], lowpass_saturation: f[132],
             shadhi_on: bools.get(20).map_or(d.shadhi_on, |&b| b != 0),
+            primaries_on: bools.get(21).map_or(d.primaries_on, |&b| b != 0),
             shadhi_shadows: f.get(133).copied().unwrap_or(d.shadhi_shadows),
             shadhi_highlights: f.get(134).copied().unwrap_or(d.shadhi_highlights),
             shadhi_whitepoint: f.get(135).copied().unwrap_or(d.shadhi_whitepoint),
@@ -683,6 +743,14 @@ impl PreviewParams {
             shadhi_compress: f.get(137).copied().unwrap_or(d.shadhi_compress),
             shadhi_shadows_ccorrect: f.get(138).copied().unwrap_or(d.shadhi_shadows_ccorrect),
             shadhi_highlights_ccorrect: f.get(139).copied().unwrap_or(d.shadhi_highlights_ccorrect),
+            primaries_achromatic_tint_hue: f.get(140).copied().unwrap_or(d.primaries_achromatic_tint_hue),
+            primaries_achromatic_tint_purity: f.get(141).copied().unwrap_or(d.primaries_achromatic_tint_purity),
+            primaries_red_hue: f.get(142).copied().unwrap_or(d.primaries_red_hue),
+            primaries_red_purity: f.get(143).copied().unwrap_or(d.primaries_red_purity),
+            primaries_green_hue: f.get(144).copied().unwrap_or(d.primaries_green_hue),
+            primaries_green_purity: f.get(145).copied().unwrap_or(d.primaries_green_purity),
+            primaries_blue_hue: f.get(146).copied().unwrap_or(d.primaries_blue_hue),
+            primaries_blue_purity: f.get(147).copied().unwrap_or(d.primaries_blue_purity),
         })
     }
 
@@ -755,6 +823,29 @@ impl PreviewParams {
                 offset: self.gradnd_offset,
                 hue: self.gradnd_hue,
                 saturation: self.gradnd_saturation,
+            });
+        }
+        // Primaries (primaries.c, iop_order.c v50_order pos 28.5 — between
+        // graduatednd 28.0 and lowpass 33.0; shares 28.5 with channelmixerrgb,
+        // which the v50 table lists first). Scene-referred colour-space
+        // adjustment: rotates and scales the working-space primaries. The 4×4
+        // matrix is pre-computed here from the 8 UI params (hue in degrees →
+        // radians, purity as multiplier). The gate mirrors `is_identity`: off,
+        // or at the neutral defaults.
+        if self.primaries_on && !self.primaries_is_neutral()
+        {
+            p.push(Stage::Primaries {
+                matrix: primaries::compute_matrix(
+                    space,
+                    self.primaries_achromatic_tint_hue.to_radians(),
+                    self.primaries_achromatic_tint_purity,
+                    self.primaries_red_hue.to_radians(),
+                    self.primaries_red_purity,
+                    self.primaries_green_hue.to_radians(),
+                    self.primaries_green_purity,
+                    self.primaries_blue_hue.to_radians(),
+                    self.primaries_blue_purity,
+                ),
             });
         }
         if self.mono_on {
@@ -1095,10 +1186,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v8 adds colorize (HSL colour replacement). v9 adds color correction.
 /// v10 adds color zones (LCH equaliser). v11 adds levels (black/grey/white).
 /// v12 adds basicadj (basic adjustments). v13 adds lowpass.
-/// v14 adds shadhi (shadows/highlights).
-const ENCODE_VERSION: u8 = 14;
-/// 1 version byte + 21 bool bytes + 140 little-endian f32.
-const ENCODED_LEN: usize = 1 + 21 + 140 * 4;
+/// v14 adds shadhi (shadows/highlights). v15 adds primaries (RGB adjustment).
+const ENCODE_VERSION: u8 = 15;
+/// 1 version byte + 22 bool bytes + 148 little-endian f32.
+const ENCODED_LEN: usize = 1 + 22 + 148 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1108,6 +1199,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (12, 19, 129), // v12: basicadj was the last module
     (13, 20, 133), // v13: lowpass added
     (14, 21, 140), // v14: shadhi added
+    (15, 22, 148), // v15: primaries added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -1756,6 +1848,8 @@ mod tests {
         let mut p = PreviewParams::default();
         p.exposure_on = true;
         p.ev = 0.5;
+        p.primaries_on = true;
+        p.primaries_red_hue = 10.0; // off-default so the stage is emitted
         p.mono_on = true;
         p.sigmoid_on = true;
         p.velvia_on = true;
@@ -1780,7 +1874,7 @@ mod tests {
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["exposure", "channelmixer", "sharpen", "basicadj", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
+            ["exposure", "primaries", "channelmixer", "sharpen", "basicadj", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
         );
         // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
         // it clips at its black point and treats L as 0..100, so running it
@@ -1789,6 +1883,40 @@ mod tests {
         let sig = names.iter().position(|n| *n == "sigmoid").unwrap();
         let lev = names.iter().position(|n| *n == "levels").unwrap();
         assert!(lev > sig, "levels must run after sigmoid: {names:?}");
+    }
+
+    /// Ties PreviewParams::default() (the UI defaults) to the identity matrix in
+    /// core. This is the cross-crate invariant that M1 (the duplicated "neutral"
+    /// predicate) is designed to protect: if someone changes a default in preview.rs
+    /// without updating primaries_is_neutral, this fails.
+    #[test]
+    fn default_primaries_params_are_a_true_no_op() {
+        let d = PreviewParams::default();
+        assert!(d.primaries_is_neutral(), "default params must be neutral");
+        for space in [ColorSpace::Rec2020, ColorSpace::LinearSrgb] {
+            let m = primaries::compute_matrix(
+                space,
+                d.primaries_achromatic_tint_hue.to_radians(),
+                d.primaries_achromatic_tint_purity,
+                d.primaries_red_hue.to_radians(),
+                d.primaries_red_purity,
+                d.primaries_green_hue.to_radians(),
+                d.primaries_green_purity,
+                d.primaries_blue_hue.to_radians(),
+                d.primaries_blue_purity,
+            );
+            for i in 0..3 {
+                for j in 0..3 {
+                    let expected = if i == j { 1.0f32 } else { 0.0 };
+                    assert!(
+                        (m[i * 4 + j] - expected).abs() < 1e-5,
+                        "{space:?}: matrix[{i}][{j}] = {} ≠ {}",
+                        m[i * 4 + j],
+                        expected
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2047,6 +2175,15 @@ mod tests {
             shadhi_highlights: -30.0, shadhi_whitepoint: 2.0,
             shadhi_radius: 80.0, shadhi_compress: 60.0,
             shadhi_shadows_ccorrect: 75.0, shadhi_highlights_ccorrect: 40.0,
+            primaries_on: true,
+            primaries_achromatic_tint_hue: 10.0,
+            primaries_achromatic_tint_purity: 0.3,
+            primaries_red_hue: -15.0,
+            primaries_red_purity: 1.5,
+            primaries_green_hue: 5.0,
+            primaries_green_purity: 0.8,
+            primaries_blue_hue: 20.0,
+            primaries_blue_purity: 1.2,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -2097,6 +2234,32 @@ mod tests {
         assert_eq!(decoded.shadhi_compress, def.shadhi_compress);
         assert_eq!(decoded.shadhi_shadows_ccorrect, def.shadhi_shadows_ccorrect);
         assert_eq!(decoded.shadhi_highlights_ccorrect, def.shadhi_highlights_ccorrect);
+    }
+
+    #[test]
+    fn decode_v14_blob_defaults_primaries_fields() {
+        // A v14 blob (before primaries was added — 21 bools / 140 f32s) must
+        // decode successfully: the new primaries fields fall back to their
+        // defaults, so a saved style from the pre-primaries era loads cleanly
+        // instead of being silently discarded.
+        let v14 = {
+            let mut b = vec![0u8; 1 + 21 + 140 * 4];
+            b[0] = 14; // version 14
+            b
+        };
+        let decoded = PreviewParams::decode(&v14)
+            .expect("v14 blob must decode (backward compat)");
+        // Primaries fields should be at their defaults, not garbage.
+        let def = PreviewParams::default();
+        assert_eq!(decoded.primaries_on, def.primaries_on);
+        assert_eq!(decoded.primaries_achromatic_tint_hue, def.primaries_achromatic_tint_hue);
+        assert_eq!(decoded.primaries_achromatic_tint_purity, def.primaries_achromatic_tint_purity);
+        assert_eq!(decoded.primaries_red_hue, def.primaries_red_hue);
+        assert_eq!(decoded.primaries_red_purity, def.primaries_red_purity);
+        assert_eq!(decoded.primaries_green_hue, def.primaries_green_hue);
+        assert_eq!(decoded.primaries_green_purity, def.primaries_green_purity);
+        assert_eq!(decoded.primaries_blue_hue, def.primaries_blue_hue);
+        assert_eq!(decoded.primaries_blue_purity, def.primaries_blue_purity);
     }
 
     #[test]

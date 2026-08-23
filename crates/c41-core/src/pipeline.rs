@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, shadhi, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -339,6 +339,16 @@ pub enum Stage {
         hue: f32,
         saturation: f32,
     },
+    /// RGB primaries adjustment (primaries.c). Rotates and scales the working
+    /// space primaries, producing a 4×4 colour matrix applied per pixel via
+    /// [`darkroom_primaries_process`]. `matrix` is pre-computed from the 8 UI
+    /// params (4 hue + 4 purity, radians + multiplier scale) and the working
+    /// colour space in [`c41_ui::preview::PreviewParams::to_pipeline`].
+    ///
+    /// Works directly in linear RGB — no Lab conversion, so `working_space()`
+    /// returns `None`. **Pixel-local**: a pure 4×4 matrix multiply, no neighbor
+    /// reads, so the band-parallel `process` path stays available.
+    Primaries { matrix: [f32; 16] },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -389,6 +399,7 @@ impl Stage {
             Stage::Basicadj { .. } => "basicadj",
             Stage::Shadhi { .. } => "shadhi",
             Stage::Lowpass { .. } => "lowpass",
+            Stage::Primaries { .. } => "primaries",
         }
     }
 
@@ -469,6 +480,10 @@ impl Stage {
             // the coordinates — and the dither seed — would be wrong per band,
             // giving seams. Same answer as Sharpen, different reason.
             Stage::Vignette { .. } => false,
+            // Primaries is pixel-local: a 4×4 matrix multiply, no neighbor
+            // reads no position dependence — each output pixel depends only on
+            // its own input. The band-parallel path stays available.
+            Stage::Primaries { .. } => true,
         }
     }
 
@@ -507,6 +522,11 @@ impl Stage {
             // space to agree on — its `space` selects luminance
             // weights, not a Lab conversion.
             Stage::Basicadj { .. } => None,
+            // Primaries works directly in linear RGB — no Lab conversion, no
+            // working-space agreement needed. The matrix (including any working-space
+            // adaptation) is baked into the 4×4 at `to_pipeline` time.
+            Stage::Primaries { .. } => None,
+            Stage::GraduatedNd { .. } => None,
             _ => None,
         }
     }
@@ -1165,6 +1185,18 @@ impl Stage {
                     );
                 }
             }
+            // ── Primaries (primaries.c) ────────────────────────────────
+            // Per-pixel 4×4 colour matrix multiply (RGB↔RGB in the working
+            // space). Works directly in linear RGB — no Lab round-trip, so
+            // `working_space()` returns `None`. The matrix is pre-computed by
+            // `PreviewParams::to_pipeline` from the 8 UI params and cached in
+            // the stage, so apply just dispatches to the FFI kernel.
+            Stage::Primaries { matrix } => {
+                // Safe wrapper: applies the 4x4 matrix per-pixel, with bounds
+                // checks and an aliasing debug_assert. The matrix (including
+                // any working-space adaptation) is baked in by to_pipeline.
+                primaries::process_pixels(input, output, &matrix);
+            }
         }
     }
 }
@@ -1536,6 +1568,7 @@ mod tests {
                 brightness: 0.0, saturation: 0.0, vibrance: 0.0,
                 space: ColorSpace::LinearSrgb,
             },
+            Stage::Primaries { matrix: crate::iop::primaries::IDENTITY_4X4 },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
