@@ -33,6 +33,7 @@ static CATALOG: &[ModuleGroup] = &[
             modules: &[
                 m("Raw black/white point", true),
                 m("Invert", false),
+                m("Negadoctor", false),
                 m("White balance", true),
                 m("Highlight reconstruction", false),
                 m("Demosaic", true),

@@ -1849,6 +1849,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color correction" => pg.add(&colorcorrection_module_row(ctx)),
                 "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
                 "Primaries" => pg.add(&primaries_module_row(ctx)),
+                "Negadoctor" => pg.add(&negadoctor_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
@@ -1944,7 +1945,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2448,6 +2449,116 @@ fn primaries_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.primaries_blue_hue = v);
             add_param_slider(e, ctx, "Blue purity", 0.5, 1.5, 0.01, p0.primaries_blue_purity as f64,
                 |p, v| p.primaries_blue_purity = v);
+        })
+}
+
+/// Negadoctor (negadoctor.c): Cinéon-style log-density film negative inversion
+/// with print-on-paper simulation. Display-referred, iop_order.c pos 28.5.
+fn negadoctor_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    let is_bw = (p0.negadoctor_film_stock as i32) == 0;
+
+    module_expander(ctx, "Negadoctor", "film negative inversion", p0.negadoctor_on,
+        |p, on| p.negadoctor_on = on,
+        |e, ctx| {
+            // Dmin G/B: created first so the film-stock callback can toggle their
+            // visibility (darktable toggle_stock_controls:negadoctor.c:388-410
+            // hides them when film_stock == B&W). Added to the expander after
+            // Dmin R, keeping the same visual order darktable uses.
+            let dmin_g = Rc::new(labeled_slider("Dmin G", 0.00001, 1.5, 0.001,
+                p0.negadoctor_dmin_g as f64));
+            let dmin_b = Rc::new(labeled_slider("Dmin B", 0.00001, 1.5, 0.001,
+                p0.negadoctor_dmin_b as f64));
+            dmin_g.row.set_visible(!is_bw);
+            dmin_b.row.set_visible(!is_bw);
+
+            let ctx_g = ctx.clone();
+            dmin_g.scale.connect_value_changed(move |v| {
+                ctx_g.params.borrow_mut().negadoctor_dmin_g = v as f32;
+                render_preview(&ctx_g);
+            });
+            let ctx_b = ctx.clone();
+            dmin_b.scale.connect_value_changed(move |v| {
+                ctx_b.params.borrow_mut().negadoctor_dmin_b = v as f32;
+                render_preview(&ctx_b);
+            });
+
+            // Film stock: 0 = B&W, 1 = colour (darktable DT_FILMSTOCK_NB / COLOR).
+            // Uses labeled_slider directly (not add_param_slider) so the
+            // callback can toggle Dmin G/B visibility — add_param_slider takes
+            // a bare fn pointer and can't capture widget handles.
+            let dg = dmin_g.clone();
+            let db = dmin_b.clone();
+            let filmstock = labeled_slider("Film stock", 0.0, 1.0, 1.0,
+                p0.negadoctor_film_stock as f64);
+            let ctx_fs = ctx.clone();
+            filmstock.scale.connect_value_changed(move |v| {
+                let bw = (v as i32) == 0;
+                {
+                    let mut p = ctx_fs.params.borrow_mut();
+                    p.negadoctor_film_stock = v as u8 as f32;
+                    // Mirror Dmin R → G/B in B&W mode (gui_changed:negadoctor.c:953-957).
+                    if bw {
+                        p.negadoctor_dmin_g = p.negadoctor_dmin_r;
+                        p.negadoctor_dmin_b = p.negadoctor_dmin_r;
+                    }
+                }
+                dg.row.set_visible(!bw);
+                db.row.set_visible(!bw);
+                render_preview(&ctx_fs);
+            });
+            e.add_row(&filmstock.row);
+
+            // Dmin R: per-channel minimum film density. Mono-collapse to R in
+            // to_pipeline when film_stock is B&W. Range 0.00001..1.5.
+            // In B&W mode the callback also mirrors to G/B params (gui_changed:negadoctor.c:953-957);
+            // the G/B sliders are hidden, so only params need updating.
+            add_param_slider(e, ctx, "Dmin R", 0.00001, 1.5, 0.001, p0.negadoctor_dmin_r as f64,
+                |p, v| {
+                    p.negadoctor_dmin_r = v;
+                    if (p.negadoctor_film_stock as i32) == 0 {
+                        p.negadoctor_dmin_g = v;
+                        p.negadoctor_dmin_b = v;
+                    }
+                });
+            e.add_row(&dmin_g.row);
+            e.add_row(&dmin_b.row);
+            // White balance high (illuminant multipliers). Range 0.25..2.
+            add_param_slider(e, ctx, "WB high R", 0.25, 2.0, 0.001, p0.negadoctor_wb_high_r as f64,
+                |p, v| p.negadoctor_wb_high_r = v);
+            add_param_slider(e, ctx, "WB high G", 0.25, 2.0, 0.001, p0.negadoctor_wb_high_g as f64,
+                |p, v| p.negadoctor_wb_high_g = v);
+            add_param_slider(e, ctx, "WB high B", 0.25, 2.0, 0.001, p0.negadoctor_wb_high_b as f64,
+                |p, v| p.negadoctor_wb_high_b = v);
+            // White balance low (base light offsets). Range 0.25..2.
+            add_param_slider(e, ctx, "WB low R", 0.25, 2.0, 0.001, p0.negadoctor_wb_low_r as f64,
+                |p, v| p.negadoctor_wb_low_r = v);
+            add_param_slider(e, ctx, "WB low G", 0.25, 2.0, 0.001, p0.negadoctor_wb_low_g as f64,
+                |p, v| p.negadoctor_wb_low_g = v);
+            add_param_slider(e, ctx, "WB low B", 0.25, 2.0, 0.001, p0.negadoctor_wb_low_b as f64,
+                |p, v| p.negadoctor_wb_low_b = v);
+            // D_max: maximum film density. Range 0.1..6.
+            add_param_slider(e, ctx, "D max", 0.1, 6.0, 0.001, p0.negadoctor_d_max as f64,
+                |p, v| p.negadoctor_d_max = v);
+            // Offset: inversion offset. Range -1..1.
+            add_param_slider(e, ctx, "Offset", -1.0, 1.0, 0.001, p0.negadoctor_offset as f64,
+                |p, v| p.negadoctor_offset = v);
+            // Black point: affects the print-linear to display mapping.
+            add_param_slider(e, ctx, "Black", -0.5, 0.5, 0.001, p0.negadoctor_black as f64,
+                |p, v| p.negadoctor_black = v);
+            // Gamma: display gamma (Cinéon 2.2 power, darktable default 4.0 = 1/0.222).
+            add_param_slider(e, ctx, "Gamma", 1.0, 8.0, 0.01, p0.negadoctor_gamma as f64,
+                |p, v| p.negadoctor_gamma = v);
+            // Soft clip: highlight compression threshold in [0,1].
+            add_param_slider(e, ctx, "Soft clip", 0.0001, 1.0, 0.001, p0.negadoctor_soft_clip as f64,
+                |p, v| p.negadoctor_soft_clip = v);
+            // Exposure: slider in EV (−1..=1), param stores the linear multiplier
+            // 2^EV. Mirrors darktable negadoctor.c gui_init:925-929 (slider in EV,
+            // range −1..+1, format "EV"), gui_changed:964 (param = 2^slider) and
+            // gui_update:988 (slider = log2(param)).
+            let exposure_ev = (p0.negadoctor_exposure as f64).log2();
+            add_param_slider(e, ctx, "Exposure (EV)", -1.0, 1.0, 0.01, exposure_ev,
+                |p, v| p.negadoctor_exposure = 2.0f32.powf(v));
         })
 }
 

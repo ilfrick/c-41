@@ -263,6 +263,41 @@ pub struct PreviewParams {
     pub primaries_blue_hue: f32,
     /// Blue primary purity scale, 0.01..5.0 (default 1.0 = unchanged).
     pub primaries_blue_purity: f32,
+    /// Negadoctor (film negative scan inversion) stage on/off.
+    ///
+    /// Replaces the old invert module for colour negatives, taking the film's
+    /// Dmin substrate colour, white-balance coefficients, Dmax and paper-grade
+    /// gamma into account. iop_order.c position 28.5 — display-referred, right
+    /// after graduatednd (28.0) and alongside channelmixerrgb/primaries.
+    pub negadoctor_on: bool,
+    /// Film stock: 0 = B&W, 1 = colour (darktable `DT_FILMSTOCK_NB` / `DT_FILMSTOCK_COLOR`).
+    pub negadoctor_film_stock: f32,
+    /// Dmin substrate colour multipliers (RGB). For B&W film the mono default
+    /// collapses to (1.0, 1.0, 1.0).
+    pub negadoctor_dmin_r: f32,
+    pub negadoctor_dmin_g: f32,
+    pub negadoctor_dmin_b: f32,
+    /// White-balance RGB coefficients (illuminant); core gets `wb_high / D_max`.
+    pub negadoctor_wb_high_r: f32,
+    pub negadoctor_wb_high_g: f32,
+    pub negadoctor_wb_high_b: f32,
+    /// White-balance RGB offsets (base light); combined with `offset` and `wb_high`
+    /// in `to_pipeline` to form the per-channel density offset.
+    pub negadoctor_wb_low_r: f32,
+    pub negadoctor_wb_low_g: f32,
+    pub negadoctor_wb_low_b: f32,
+    /// Max density of the film (core divides `wb_high` by `D_max` per channel).
+    pub negadoctor_d_max: f32,
+    /// Inversion offset (scan exposure bias), -1..1, default -0.05.
+    pub negadoctor_offset: f32,
+    /// Display black level (paper black, density correction), -0.5..0.5, default 0.0755.
+    pub negadoctor_black: f32,
+    /// Paper grade (gamma), 1.0..8.0, default 4.0.
+    pub negadoctor_gamma: f32,
+    /// Highlights roll-off (paper gloss), 0.0001..1.0, default 0.75.
+    pub negadoctor_soft_clip: f32,
+    /// Print exposure adjustment, 0.5..2.0, default 0.9245.
+    pub negadoctor_exposure: f32,
 }
 
 impl Default for PreviewParams {
@@ -420,6 +455,27 @@ impl Default for PreviewParams {
             primaries_green_purity: 1.0,
             primaries_blue_hue: 0.0,
             primaries_blue_purity: 1.0,
+            // Negadoctor defaults mirror the darktable struct $DEFAULTs and
+            // default_params(): colour film stock, Dmin {1.0, 0.45, 0.25, 1.0},
+            // unit WB coeffs, D_max 2.046, offset -0.05, black 0.0755, gamma
+            // 4.0, soft_clip 0.75, exposure 0.9245. Off by default.
+            negadoctor_on: false,
+            negadoctor_film_stock: 1.0, // DT_FILMSTOCK_COLOR
+            negadoctor_dmin_r: 1.0,
+            negadoctor_dmin_g: 0.45,
+            negadoctor_dmin_b: 0.25,
+            negadoctor_wb_high_r: 1.0,
+            negadoctor_wb_high_g: 1.0,
+            negadoctor_wb_high_b: 1.0,
+            negadoctor_wb_low_r: 1.0,
+            negadoctor_wb_low_g: 1.0,
+            negadoctor_wb_low_b: 1.0,
+            negadoctor_d_max: 2.046,
+            negadoctor_offset: -0.05,
+            negadoctor_black: 0.0755,
+            negadoctor_gamma: 4.0,
+            negadoctor_soft_clip: 0.75,
+            negadoctor_exposure: 0.9245,
         }
     }
 }
@@ -529,13 +585,17 @@ impl PreviewParams {
         // Primaries: the matrix is identity when all hues are 0 (no rotation)
         // The gate mirrors `to_pipeline`.
         let primaries_identity = !self.primaries_on || self.primaries_is_neutral();
+        // Negadoctor is a film-negative inverter — there is no neutral value
+        // while enabled (it always inverts). The gate mirrors `to_pipeline`:
+        // only the enable flag matters.
+        let negadoctor_identity = !self.negadoctor_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
             && levels_identity && vignette_identity && lowlight_identity
             && gradnd_identity && colisa_identity && basicadj_identity
             && lowpass_identity && shadhi_identity
-            && primaries_identity
+            && primaries_identity && negadoctor_identity
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -565,6 +625,7 @@ impl PreviewParams {
             lowpass_on: false,
             shadhi_on: false,
             primaries_on: false,
+            negadoctor_on: false,
             ..*self
         }
     }
@@ -591,7 +652,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on] {
             v.push(b as u8);
         }
         for f in [
@@ -641,6 +702,13 @@ impl PreviewParams {
             self.primaries_red_hue, self.primaries_red_purity,
             self.primaries_green_hue, self.primaries_green_purity,
             self.primaries_blue_hue, self.primaries_blue_purity,
+            self.negadoctor_film_stock,
+            self.negadoctor_dmin_r, self.negadoctor_dmin_g, self.negadoctor_dmin_b,
+            self.negadoctor_wb_high_r, self.negadoctor_wb_high_g, self.negadoctor_wb_high_b,
+            self.negadoctor_wb_low_r, self.negadoctor_wb_low_g, self.negadoctor_wb_low_b,
+            self.negadoctor_d_max, self.negadoctor_offset,
+            self.negadoctor_black, self.negadoctor_gamma,
+            self.negadoctor_soft_clip, self.negadoctor_exposure,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -751,6 +819,23 @@ impl PreviewParams {
             primaries_green_purity: f.get(145).copied().unwrap_or(d.primaries_green_purity),
             primaries_blue_hue: f.get(146).copied().unwrap_or(d.primaries_blue_hue),
             primaries_blue_purity: f.get(147).copied().unwrap_or(d.primaries_blue_purity),
+            negadoctor_on: bools.get(22).map_or(d.negadoctor_on, |&b| b != 0),
+            negadoctor_film_stock: f.get(148).copied().unwrap_or(d.negadoctor_film_stock),
+            negadoctor_dmin_r: f.get(149).copied().unwrap_or(d.negadoctor_dmin_r),
+            negadoctor_dmin_g: f.get(150).copied().unwrap_or(d.negadoctor_dmin_g),
+            negadoctor_dmin_b: f.get(151).copied().unwrap_or(d.negadoctor_dmin_b),
+            negadoctor_wb_high_r: f.get(152).copied().unwrap_or(d.negadoctor_wb_high_r),
+            negadoctor_wb_high_g: f.get(153).copied().unwrap_or(d.negadoctor_wb_high_g),
+            negadoctor_wb_high_b: f.get(154).copied().unwrap_or(d.negadoctor_wb_high_b),
+            negadoctor_wb_low_r: f.get(155).copied().unwrap_or(d.negadoctor_wb_low_r),
+            negadoctor_wb_low_g: f.get(156).copied().unwrap_or(d.negadoctor_wb_low_g),
+            negadoctor_wb_low_b: f.get(157).copied().unwrap_or(d.negadoctor_wb_low_b),
+            negadoctor_d_max: f.get(158).copied().unwrap_or(d.negadoctor_d_max),
+            negadoctor_offset: f.get(159).copied().unwrap_or(d.negadoctor_offset),
+            negadoctor_black: f.get(160).copied().unwrap_or(d.negadoctor_black),
+            negadoctor_gamma: f.get(161).copied().unwrap_or(d.negadoctor_gamma),
+            negadoctor_soft_clip: f.get(162).copied().unwrap_or(d.negadoctor_soft_clip),
+            negadoctor_exposure: f.get(163).copied().unwrap_or(d.negadoctor_exposure),
         })
     }
 
@@ -823,6 +908,53 @@ impl PreviewParams {
                 offset: self.gradnd_offset,
                 hue: self.gradnd_hue,
                 saturation: self.gradnd_saturation,
+            });
+        }
+        // Negadoctor (negadoctor.c, iop_order.c pos 28.5 — after graduatednd 28.0,
+        // before channelmixerrgb/primaries at the same position). Display-referred
+        // film-negative inversion via Cineon-style log-density: undoes the scanner's
+        // log-density exposure and simulates print-on-paper (gamma, black, soft-clip).
+        // Runs on linear RGB before any colour-space adjustment.
+        //
+        // commit_params logic (src/iop/negadoctor.c:239-267) is replicated here:
+        //   wb_high[c] = wb_high[c] / D_max        (premultiply to spare one div/pixel)
+        //   offset[c]  = wb_high[c] * offset * wb_low[c]
+        //   Dmin: monochrome collapse (film_stock == NB) → all channels = Dmin[0]
+        //   black = -exposure * (1 + black)         (arithmetic trick for FMA)
+        //   soft_clip_comp = 1 - soft_clip
+        if self.negadoctor_on {
+            let film_stock_nb = (self.negadoctor_film_stock as i32) == 0; // DT_FILMSTOCK_NB = 0
+            // Defensive floor: darktable's slider enforces $MIN 0.1, but a
+            // loaded style or programmatic value could be zero — guard the
+            // division in wb_high above.
+            let d_max = self.negadoctor_d_max.max(f32::MIN_POSITIVE);
+            let negadoctor_wb_high_div = [
+                self.negadoctor_wb_high_r / d_max,
+                self.negadoctor_wb_high_g / d_max,
+                self.negadoctor_wb_high_b / d_max,
+                1.0,
+            ];
+            let negadoctor_offset = [
+                self.negadoctor_wb_high_r * self.negadoctor_offset * self.negadoctor_wb_low_r,
+                self.negadoctor_wb_high_g * self.negadoctor_offset * self.negadoctor_wb_low_g,
+                self.negadoctor_wb_high_b * self.negadoctor_offset * self.negadoctor_wb_low_b,
+                0.0,
+            ];
+            let dmin = if film_stock_nb {
+                let mono = self.negadoctor_dmin_r;
+                [mono, mono, mono, 1.0]
+            } else {
+                [self.negadoctor_dmin_r, self.negadoctor_dmin_g, self.negadoctor_dmin_b, 1.0]
+            };
+            p.push(Stage::Negadoctor {
+                dmin,
+                wb_high: negadoctor_wb_high_div,
+                offset: negadoctor_offset,
+                black: -self.negadoctor_exposure * (1.0 + self.negadoctor_black),
+                gamma: self.negadoctor_gamma,
+                soft_clip: self.negadoctor_soft_clip,
+                soft_clip_comp: 1.0 - self.negadoctor_soft_clip,
+                exposure: self.negadoctor_exposure,
             });
         }
         // Primaries (primaries.c, iop_order.c v50_order pos 28.5 — between
@@ -1187,9 +1319,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v10 adds color zones (LCH equaliser). v11 adds levels (black/grey/white).
 /// v12 adds basicadj (basic adjustments). v13 adds lowpass.
 /// v14 adds shadhi (shadows/highlights). v15 adds primaries (RGB adjustment).
-const ENCODE_VERSION: u8 = 15;
-/// 1 version byte + 22 bool bytes + 148 little-endian f32.
-const ENCODED_LEN: usize = 1 + 22 + 148 * 4;
+/// v16 adds negadoctor (film negative inversion).
+const ENCODE_VERSION: u8 = 16;
+/// 1 version byte + 23 bool bytes + 164 little-endian f32.
+const ENCODED_LEN: usize = 1 + 23 + 164 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1200,6 +1333,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (13, 20, 133), // v13: lowpass added
     (14, 21, 140), // v14: shadhi added
     (15, 22, 148), // v15: primaries added
+    (16, 23, 164), // v16: negadoctor added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -1810,6 +1944,12 @@ mod tests {
         cc.color_correction_on = true;
         cc.color_correction_saturation = 1.5;
         cfgs.push(cc);
+        // negadoctor disabled ⇒ identity (matches to_pipeline gate: off ⇒ no stage)
+        cfgs.push(PreviewParams::default());
+        // negadoctor enabled ⇒ non-identity (on == the only gate)
+        let mut nd = PreviewParams::default();
+        nd.negadoctor_on = true;
+        cfgs.push(nd);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
@@ -1868,13 +2008,16 @@ mod tests {
         p.colorize_on = true;
         p.levels_on = true;
         p.levels_grey = 40.0; // off-default so the stage is actually emitted
+        // negadoctor: on by itself is enough to emit the stage (on is the gate).
+        // Positioned at iop_order 28.5 — after graduatednd 28.0, before primaries.
+        p.negadoctor_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["exposure", "primaries", "channelmixer", "sharpen", "basicadj", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
+            ["exposure", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
         );
         // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
         // it clips at its black point and treats L as 0..100, so running it
@@ -2184,6 +2327,23 @@ mod tests {
             primaries_green_purity: 0.8,
             primaries_blue_hue: 20.0,
             primaries_blue_purity: 1.2,
+            negadoctor_on: true,
+            negadoctor_film_stock: 0.0, // DT_FILMSTOCK_NB
+            negadoctor_dmin_r: 0.2,
+            negadoctor_dmin_g: 0.35,
+            negadoctor_dmin_b: 0.5,
+            negadoctor_wb_high_r: 1.4,
+            negadoctor_wb_high_g: 1.1,
+            negadoctor_wb_high_b: 0.9,
+            negadoctor_wb_low_r: 0.8,
+            negadoctor_wb_low_g: 0.95,
+            negadoctor_wb_low_b: 1.05,
+            negadoctor_d_max: 1.8,
+            negadoctor_offset: 0.1,
+            negadoctor_black: 0.02,
+            negadoctor_gamma: 3.0,
+            negadoctor_soft_clip: 0.4,
+            negadoctor_exposure: 1.5,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -2260,6 +2420,138 @@ mod tests {
         assert_eq!(decoded.primaries_green_purity, def.primaries_green_purity);
         assert_eq!(decoded.primaries_blue_hue, def.primaries_blue_hue);
         assert_eq!(decoded.primaries_blue_purity, def.primaries_blue_purity);
+    }
+
+    #[test]
+    fn decode_v15_blob_defaults_negadoctor_fields() {
+        // A v15 blob (before negadoctor was added — 22 bools / 148 f32s) must
+        // decode successfully: the new negadoctor fields fall back to their
+        // defaults, so a saved style from the pre-negadoctor era loads cleanly.
+        let v15 = {
+            let mut b = vec![0u8; 1 + 22 + 148 * 4];
+            b[0] = 15; // version 15
+            b
+        };
+        let decoded = PreviewParams::decode(&v15)
+            .expect("v15 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.negadoctor_on, def.negadoctor_on);
+        assert_eq!(decoded.negadoctor_film_stock, def.negadoctor_film_stock);
+        assert_eq!(decoded.negadoctor_dmin_r, def.negadoctor_dmin_r);
+        assert_eq!(decoded.negadoctor_dmin_g, def.negadoctor_dmin_g);
+        assert_eq!(decoded.negadoctor_dmin_b, def.negadoctor_dmin_b);
+        assert_eq!(decoded.negadoctor_wb_high_r, def.negadoctor_wb_high_r);
+        assert_eq!(decoded.negadoctor_wb_high_g, def.negadoctor_wb_high_g);
+        assert_eq!(decoded.negadoctor_wb_high_b, def.negadoctor_wb_high_b);
+        assert_eq!(decoded.negadoctor_wb_low_r, def.negadoctor_wb_low_r);
+        assert_eq!(decoded.negadoctor_wb_low_g, def.negadoctor_wb_low_g);
+        assert_eq!(decoded.negadoctor_wb_low_b, def.negadoctor_wb_low_b);
+        assert_eq!(decoded.negadoctor_d_max, def.negadoctor_d_max);
+        assert_eq!(decoded.negadoctor_offset, def.negadoctor_offset);
+        assert_eq!(decoded.negadoctor_black, def.negadoctor_black);
+        assert_eq!(decoded.negadoctor_gamma, def.negadoctor_gamma);
+        assert_eq!(decoded.negadoctor_soft_clip, def.negadoctor_soft_clip);
+        assert_eq!(decoded.negadoctor_exposure, def.negadoctor_exposure);
+    }
+
+    #[test]
+    fn negadoctor_commit_params_matches_darktable() {
+        // Pins the commit_params arithmetic in src/iop/negadoctor.c:239-267:
+        //   wb_high[c] = p->wb_high[c] / p->D_max   (premultiply, spare one div/pixel)
+        //   offset[c]  = p->wb_high[c] * p->offset * p->wb_low[c]  (uses ORIGINAL wb_high)
+        //   Dmin B&W   = collapse to p->Dmin[0] for all channels
+        //   black      = -p->exposure * (1.0f + p->black)          (FMA trick)
+        //   soft_clip_comp = 1.0f - p->soft_clip
+        // Uses non-default values so that any regression in the derivation is
+        // caught — identity params (1/1/1, D_max=1, offset=0) trivially pass.
+        {
+            // ── Color film stock ──────────────────────────────────────────────
+            let mut p = PreviewParams::default();
+            p.negadoctor_on = true;
+            p.negadoctor_film_stock = 1.0; // DT_FILMSTOCK_COLOR
+            p.negadoctor_dmin_r = 1.13;
+            p.negadoctor_dmin_g = 0.49;
+            p.negadoctor_dmin_b = 0.27;
+            p.negadoctor_wb_high_r = 1.2;
+            p.negadoctor_wb_high_g = 0.8;
+            p.negadoctor_wb_high_b = 1.1;
+            p.negadoctor_wb_low_r = 1.1;
+            p.negadoctor_wb_low_g = 0.9;
+            p.negadoctor_wb_low_b = 1.3;
+            p.negadoctor_d_max = 2.0;
+            p.negadoctor_offset = -0.03;
+            p.negadoctor_black = 0.0755;
+            p.negadoctor_gamma = 4.0;
+            p.negadoctor_soft_clip = 0.75;
+            p.negadoctor_exposure = 0.9245;
+
+            let pipe = p.to_pipeline(ColorSpace::LinearSrgb, 1.0);
+            let stage = pipe
+                .stages
+                .iter()
+                .find(|s| s.name() == "negadoctor")
+                .expect("negadoctor stage should be emitted");
+            let neg = match stage {
+                Stage::Negadoctor { dmin, wb_high, offset, black, gamma, soft_clip, soft_clip_comp, exposure } => {
+                    (dmin, wb_high, offset, black, gamma, soft_clip, soft_clip_comp, exposure)
+                }
+                _ => panic!("expected Stage::Negadoctor, got {stage:?}"),
+            };
+
+            // wb_high = wb_high_original / D_max  (per darktable:247)
+            assert!((neg.1[0] - 1.2 / 2.0).abs() < 1e-6, "wb_high_r");
+            assert!((neg.1[1] - 0.8 / 2.0).abs() < 1e-6, "wb_high_g");
+            assert!((neg.1[2] - 1.1 / 2.0).abs() < 1e-6, "wb_high_b");
+
+            // offset = ORIGINAL wb_high * offset * wb_low  (per darktable:249)
+            assert!((neg.2[0] - 1.2 * (-0.03) * 1.1).abs() < 1e-6, "offset_r");
+            assert!((neg.2[1] - 0.8 * (-0.03) * 0.9).abs() < 1e-6, "offset_g");
+            assert!((neg.2[2] - 1.1 * (-0.03) * 1.3).abs() < 1e-6, "offset_b");
+
+            // Dmin color: channels copied directly (channel 3 is inert — the
+            // process loop only iterates 0..3, so the sentinel 1.0 is harmless).
+            assert!((neg.0[0] - 1.13).abs() < 1e-6, "dmin_r");
+            assert!((neg.0[1] - 0.49).abs() < 1e-6, "dmin_g");
+            assert!((neg.0[2] - 0.27).abs() < 1e-6, "dmin_b");
+
+            // black = -exposure * (1 + black)  (FMA trick, per darktable:258)
+            let expected_black = -0.9245 * (1.0 + 0.0755);
+            assert!((neg.3 - expected_black).abs() < 1e-6, "black: {} vs {}", neg.3, expected_black);
+
+            // soft_clip / soft_clip_comp = 1 - soft_clip
+            assert!((neg.4 - 4.0).abs() < 1e-6, "gamma");
+            assert!((neg.5 - 0.75).abs() < 1e-6, "soft_clip");
+            assert!((neg.6 - (1.0 - 0.75)).abs() < 1e-6, "soft_clip_comp");
+
+            // exposure passthrough
+            assert!((neg.7 - 0.9245).abs() < 1e-6, "exposure");
+        }
+
+        // ── B&W film stock: Dmin mono-collapse ─────────────────────────────────
+        {
+            let mut p = PreviewParams::default();
+            p.negadoctor_on = true;
+            p.negadoctor_film_stock = 0.0; // DT_FILMSTOCK_NB
+            p.negadoctor_dmin_r = 1.0;
+            p.negadoctor_dmin_g = 0.5;
+            p.negadoctor_dmin_b = 0.3;
+            p.negadoctor_d_max = 2.2;
+
+            let pipe = p.to_pipeline(ColorSpace::LinearSrgb, 1.0);
+            let stage = pipe
+                .stages
+                .iter()
+                .find(|s| s.name() == "negadoctor")
+                .expect("negadoctor stage should be emitted");
+            let neg = match stage {
+                Stage::Negadoctor { dmin, .. } => dmin,
+                _ => panic!("expected Stage::Negadoctor"),
+            };
+            // All RGB channels collapse to Dmin[0] per darktable:254-255
+            for c in 0..3 {
+                assert!((neg[c] - 1.0).abs() < 1e-6, "dmin channel {c} should collapse to Dmin[0]=1.0, got {}", neg[c]);
+            }
+        }
     }
 
     #[test]

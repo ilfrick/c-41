@@ -166,11 +166,14 @@ impl HistoryStack {
             (*p + n <= bytes.len()).then(|| *p += n)
         };
 
-        // Accept both the current and the previous history version. v4 stored
-        // v13 PreviewParams blobs (553 bytes); v5 stores v14 blobs (582 bytes).
-        // Rejecting v4 outright would wipe every saved undo/redo stack on first
-        // load, so we decode leniently and let PreviewParams::decode handle
-        // the per-entry version byte.
+        // Accept both the current and the previous history-container version.
+        // The container (v5) wraps PreviewParams blobs that carry their own
+        // per-entry version byte — PreviewParams::ENCODE_VERSION has drifted
+        // from v13 (553 B) to v16 (680 B) as basicadj/shadhi/lowpass/negadoctor
+        // layers were added, but the history *container* format is unchanged.
+        // Rejecting the prior container version outright would wipe every saved
+        // undo/redo stack on first load, so we decode leniently and let
+        // PreviewParams::decode default any missing fields via the version byte.
         let version = *bytes.first()?;
         if version != HISTORY_ENCODE_VERSION && version != HISTORY_ENCODE_VERSION - 1 {
             return None;
@@ -411,6 +414,26 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
         || old.primaries_blue_purity != new.primaries_blue_purity;
     if primaries {
         return "Primaries";
+    }
+    let negadoctor = old.negadoctor_on != new.negadoctor_on
+        || old.negadoctor_film_stock != new.negadoctor_film_stock
+        || old.negadoctor_dmin_r != new.negadoctor_dmin_r
+        || old.negadoctor_dmin_g != new.negadoctor_dmin_g
+        || old.negadoctor_dmin_b != new.negadoctor_dmin_b
+        || old.negadoctor_wb_high_r != new.negadoctor_wb_high_r
+        || old.negadoctor_wb_high_g != new.negadoctor_wb_high_g
+        || old.negadoctor_wb_high_b != new.negadoctor_wb_high_b
+        || old.negadoctor_wb_low_r != new.negadoctor_wb_low_r
+        || old.negadoctor_wb_low_g != new.negadoctor_wb_low_g
+        || old.negadoctor_wb_low_b != new.negadoctor_wb_low_b
+        || old.negadoctor_d_max != new.negadoctor_d_max
+        || old.negadoctor_offset != new.negadoctor_offset
+        || old.negadoctor_black != new.negadoctor_black
+        || old.negadoctor_gamma != new.negadoctor_gamma
+        || old.negadoctor_soft_clip != new.negadoctor_soft_clip
+        || old.negadoctor_exposure != new.negadoctor_exposure;
+    if negadoctor {
+        return "Negadoctor";
     }
     "Edit"
 }
@@ -715,6 +738,23 @@ mod tests {
             primaries_green_purity: _,
             primaries_blue_hue: _,
             primaries_blue_purity: _,
+            negadoctor_on: _,
+            negadoctor_film_stock: _,
+            negadoctor_dmin_r: _,
+            negadoctor_dmin_g: _,
+            negadoctor_dmin_b: _,
+            negadoctor_wb_high_r: _,
+            negadoctor_wb_high_g: _,
+            negadoctor_wb_high_b: _,
+            negadoctor_wb_low_r: _,
+            negadoctor_wb_low_g: _,
+            negadoctor_wb_low_b: _,
+            negadoctor_d_max: _,
+            negadoctor_offset: _,
+            negadoctor_black: _,
+            negadoctor_gamma: _,
+            negadoctor_soft_clip: _,
+            negadoctor_exposure: _,
         } = PreviewParams::default();
     }
 
@@ -794,7 +834,7 @@ mod tests {
         // HISTORY_ENCODE_VERSION (and PreviewParams' ENCODE_VERSION) so old
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
-        assert_eq!(PreviewParams::default().encode().len(), 615);
+        assert_eq!(PreviewParams::default().encode().len(), 680);
     }
 
     #[test]

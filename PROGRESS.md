@@ -1004,3 +1004,72 @@ MEDIUM/LOW fixes also applied:
 (C41 uses nominal xy from colorspaces.c; darktable reads ICC colorant tags at
 runtime which differ slightly after D50 adaptation). C41's choice is self-
 consistent (identity at defaults is exact to 6e-16) and is kept deliberately.
+
+---
+
+## 2026-08-23 11:00 UTC — m4-115: Negadoctor (film negative inversion) live preview module
+
+**Commit** `ef75389094` (GitHub + Gitea)
+
+**What.** Wired the fully-ported `c41-core/iop/negadoctor.rs` (Cineon-style log-density
+film negative inversion) into the Rust preview pipeline as a live `Stage::Negadoctor`.
+21st live darkroom module (parity 2.1).
+- `pipeline.rs`: `Stage::Negadoctor` variant with dmin/wb_high/offset arrays +
+  black/gamma/soft_clip/soft_clip_comp/exposure scalars. Pixel-local (no neighbour
+  reads → band-parallel path stays available).
+- `preview.rs`: `PreviewParams` +1 bool (negadoctor_on) +1 f32 (negadoctor_film_stock)
+  +14 f32 (Dmin R/G/B, WB_high R/G/B, WB_low R/G/B, D_max, offset, black, gamma,
+  soft_clip, exposure) → ENCODE_VERSION 14→16, len 582→680. `to_pipeline` replicates
+  darktable `commit_params` (negadoctor.c:239-267): `wb_high = wb_high/D_max` premultiply,
+  `offset = wb_high_original * offset * wb_low`, B&W Dmin mono-collapse,
+  `black = -exposure * (1 + black)` FMA trick, `soft_clip_comp = 1 - soft_clip`.
+- `preview.rs` tests: `negadoctor_commit_params_matches_darktable` parity test
+  verifying every derived field against the C arithmetic; `decode_v15_blob_defaults_`
+  `negadoctor_fields` (backward compat with pre-negadoctor styles); encode/decode
+  roundtrip updated to 16 fields.
+- `darkroom/mod.rs`: `negadoctor_module_row` 15-slider UI.
+- `history.rs`: `describe_change` "Negadoctor" label.
+- `catalog.rs`: "Negadoctor" added to the "Base" group (after "Invert").
+
+**Senior review (fricktrade-architect, Opus 4.8).** 8 findings + 1 process gap:
+- **HIGH-1.** Exposure slider used linear multiplier (0.5–2.0) instead of darktable's
+  EV scale (−1..+1). Fixed: slider in EV, param = 2^EV conversion at the widget boundary
+  (darktable gui_init:925-929, gui_changed:964, gui_update:988).
+- **HIGH-2.** `commit_params` arithmetic was correct but untested. Fixed: added
+  `negadoctor_commit_params_matches_darktable` parity test pinning every derived field.
+- **MEDIUM-1.** Comments mislabelled negadoctor as "scene-referred" (it simulates print
+  on paper — gamma/black/soft-clip — which is display-referred). Also reviewed iop_order
+  position (28.5, verified correct). Fixed: "Scene-referred" → "display-referred" in
+  doc comments.
+- **MEDIUM-2.** B&W mode didn't hide Dmin G/B sliders or mirror Dmin R. Fixed: Dmin G/B
+  rows hidden when film_stock==B&W (toggle_stock_controls:388-410), Dmin R callback
+  mirrors to G/B (gui_changed:953-957), film-stock slider toggles visibility.
+- **MEDIUM-3.** `HISTORY_ENCODE_VERSION` bumped 5→6 unnecessarily — the container format
+  is unchanged (PreviewParams carries its own per-entry version byte). Fixed: reverted
+  to 5, corrected comment.
+- **LOW-1.** Black slider step was 0.0001 (too fine). Fixed: 0.0001 → 0.001.
+- **LOW-2.** No comment noting channel-3 (alpha) is inert in the process loop.
+  Fixed: doc comment on `Stage::Negadoctor`.
+- **LOW-3.** No defensive floor on `D_max` division (division by zero if a loaded
+  style has D_max=0). Fixed: `.max(f32::MIN_POSITIVE)`.
+- **Process gap.** Review found the negadoctor parity test was missing from the initial
+  commit — addressed by HIGH-2 (test added before other fixes, per review's recommended
+  order).
+
+**Senior review (second pass, complete diff).** One residual finding:
+- **MEDIUM.** The struct field doc comment on `PreviewParams::negadoctor_on` (preview.rs:270)
+  still said "scene-referred" — the MEDIUM-1 fix in the first pass had changed the
+  `to_pipeline()` comment and the `negadoctor_module_row` doc, but missed this one field-level
+  comment. Fixed: "scene-referred" → "display-referred". One-word edit; re-ran CI (all four
+  steps green).
+
+**Verified.** `scripts/ci-local.sh` — all four CI steps pass:
+`cargo check --workspace` ✓, `cargo clippy --workspace` ✓ (26 pre-existing clone!
+deprecation warnings in c41-ui, out of scope per CLAUDE.md), `cargo test --workspace
+--release` ✓ (1082 tests pass, including the new parity test),
+`cargo build --release -p c41 --bin c41-rs` ✓.
+
+**Notes.** The second senior review passed clean after the one-word doc fix. All 1082 tests
+green; the new `negadoctor_commit_params_matches_darktable` parity test pins the full
+commit_params arithmetic against darktable negadoctor.c:239-267 for both colour and B&W
+film stock.

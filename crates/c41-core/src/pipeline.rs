@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -349,6 +349,32 @@ pub enum Stage {
     /// returns `None`. **Pixel-local**: a pure 4×4 matrix multiply, no neighbor
     /// reads, so the band-parallel `process` path stays available.
     Primaries { matrix: [f32; 16] },
+    /// Film negative scan inversion (negadoctor.c). The 4×4 data arrays
+    /// (Dmin, wb_high, offset) are pre-computed by
+    /// [`c41_ui::preview::PreviewParams::to_pipeline`] following darktable's
+    /// `commit_params` — including the `Dmax` division of `wb_high` and the
+    /// film-stock monochrome Dmin collapse. `black` is the FMA-rewritten
+    /// `-exposure * (1 + black)`, per the C arithmetic trick.
+    ///
+    /// Channel 3 (alpha) is inert: the process loop (`process_pixels`)
+    /// iterates `c in 0..3` and copies `co[3] = ci[3]` — the fourth slot
+    /// of each array is a sentinel (`dmin[3]=1.0`, `offset[3]=0.0`,
+    /// `wb_high[3]=1.0`) that never participates in a computation.
+    ///
+    /// Works directly in linear RGB — no Lab conversion, so
+    /// `working_space()` returns `None`. **Pixel-local**: each pixel is
+    /// inverted independently, no neighbour reads, so the band-parallel path
+    /// stays available.
+    Negadoctor {
+        dmin: [f32; 4],
+        wb_high: [f32; 4],
+        offset: [f32; 4],
+        black: f32,
+        gamma: f32,
+        soft_clip: f32,
+        soft_clip_comp: f32,
+        exposure: f32,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -400,6 +426,7 @@ impl Stage {
             Stage::Shadhi { .. } => "shadhi",
             Stage::Lowpass { .. } => "lowpass",
             Stage::Primaries { .. } => "primaries",
+            Stage::Negadoctor { .. } => "negadoctor",
         }
     }
 
@@ -484,6 +511,9 @@ impl Stage {
             // reads no position dependence — each output pixel depends only on
             // its own input. The band-parallel path stays available.
             Stage::Primaries { .. } => true,
+            // Negadoctor is pixel-local: a per-channel log-density inversion,
+            // no neighbour reads, so the band-parallel path stays available.
+            Stage::Negadoctor { .. } => true,
         }
     }
 
@@ -526,6 +556,9 @@ impl Stage {
             // working-space agreement needed. The matrix (including any working-space
             // adaptation) is baked into the 4×4 at `to_pipeline` time.
             Stage::Primaries { .. } => None,
+            // Negadoctor works directly in linear RGB — no Lab conversion, no
+            // working-space agreement needed.
+            Stage::Negadoctor { .. } => None,
             Stage::GraduatedNd { .. } => None,
             _ => None,
         }
@@ -1197,6 +1230,34 @@ impl Stage {
                 // any working-space adaptation) is baked in by to_pipeline.
                 primaries::process_pixels(input, output, &matrix);
             }
+            // ── Negadoctor (negadoctor.c) ────────────────────────────────
+            // Film-negative scan inversion via Cineon-style log-density.
+            // Works directly in linear RGB — no Lab round-trip, so
+            // `working_space()` returns `None`. The data arrays (Dmin, wb_high,
+            // offset) are pre-computed by PreviewParams::to_pipeline (following
+            // darktable's commit_params) and cached in the stage. apply dispatches
+            // to the migrated FFI kernel.
+            Stage::Negadoctor {
+                dmin, wb_high, offset, black, gamma, soft_clip, soft_clip_comp, exposure,
+            } => {
+                let npixels = input.len() / 4;
+                // Safety: input/output are packed RGBA f32 buffers of equal length
+                // (debug-asserted above: len % 4 == 0), so each holds exactly
+                // npixels*4 floats — the contract the FFI kernel documents.
+                // The [f32; 4] arrays are stack copies, so their pointers outlive
+                // the call.
+                unsafe {
+                    negadoctor::darkroom_negadoctor_process(
+                        input.as_ptr(),
+                        output.as_mut_ptr(),
+                        npixels,
+                        dmin.as_ptr(),
+                        wb_high.as_ptr(),
+                        offset.as_ptr(),
+                        black, gamma, soft_clip, soft_clip_comp, exposure,
+                    );
+                }
+            }
         }
     }
 }
@@ -1569,6 +1630,10 @@ mod tests {
                 space: ColorSpace::LinearSrgb,
             },
             Stage::Primaries { matrix: crate::iop::primaries::IDENTITY_4X4 },
+            Stage::Negadoctor {
+                dmin: [0.0; 4], wb_high: [0.0; 4], offset: [0.0; 4],
+                black: 0.0, gamma: 1.0, soft_clip: 0.0, soft_clip_comp: 1.0, exposure: 0.0,
+            },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
