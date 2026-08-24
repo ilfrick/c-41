@@ -1156,3 +1156,75 @@ verified 559 pre-existing warnings before and after the change; clone!
 deprecations in c41-ui remain known/out-of-scope), `cargo test --workspace
 --release` ✓, `cargo build --release -p c41 --bin c41-rs` ✓. c41-core suite
 locally: 701 tests green including the 11 toneequal tests.
+
+## 2026-08-24T00:10Z — m4-117: colour balance RGB (`colorbalancergb`) live preview module
+
+**What changed.** darktable's most complex IOP is now the **25th live darkroom
+preview module**, wired end-to-end following the m4-115/m4-116 pattern:
+
+- `c41-core/iop/colorbalancergb.rs`: `PartialEq` on `CbRgbParams` (backs the
+  identity gate) and on `CbRgbData` (travels inside a `pipeline::Stage`); new
+  test pinning the equality gate against a neutral edit.
+- `c41-core/pipeline.rs`: `Stage::ColorBalanceRgb { data: Box<CbRgbData>, space }`
+  carries the **prebuilt** commit output (zone vectors, weights, fulcrums and the
+  hue-indexed 512-entry gamut LUT — the dt-UCS build alone marches the RGB gamut
+  boundary 25 600 times) computed once per render in `to_pipeline`, so each
+  per-band apply call is pure pixel math. Pixel-local ⇒ band-parallel stays
+  available. Placed between basicadj (40.0) and shadhi, matching v50_order pos
+  41.5; ordering test extended with a `<sigmoid (45.3)` assertion.
+- `c41-ui/preview.rs`: 34 `cb_*` fields (1 bool + 33 f32), encode v17→v18
+  append-only (850 B), backward-compatible decode, single-source-of-truth
+  `cb_params()`/`cb_is_neutral()` pair so the identity gate and stage emission
+  can never disagree; enabled-at-defaults emits no stage (darktable's defaults
+  are a neutral edit).
+- `c41-ui/history.rs`: "Color balance RGB" change label, exhaustive-destructure
+  and len-pin tests updated.
+- `c41-ui/darkroom/mod.rs`: expander row with 29 sliders using darktable's soft
+  ranges (colorbalancergb.c:1786-1990) + saturation-formula dropdown
+  (JzAzBz/dt-UCS) encoded as an f32.
+
+**The bug found before review could.** My own field-mapping audit caught that
+the kernel's Yrg/LMS chain hardcoded Rec.2020↔XYZ-D65 conversions — correct on
+the raw path but wrong for the non-raw pipeline which runs linear sRGB (JPEGs
+would grade under mismatched primaries). Fixed by generalising: `process()` is
+now a thin Rec.2020 alias over `process_in_space(..., rgb_to_xyz_d65,
+xyz_d65_to_rgb)`; the Stage carries `space: ColorSpace` (Sharpen/Vibrance
+idiom), `working_space()` reports it, and `to_pipeline` picks the gamut-LUT
+matrix and converter pair together per space. New pub
+`color::{SRGB_TO_XYZ_D65_T4, srgb_to_xyz_d65}` complete the linear-sRGB↔XYZ-D65
+pair (matrix rows sum to the D65 white 0.95047/1.0/1.08883).
+
+**Cross-space semantics discovered while testing that fix:** results do NOT
+agree bit-for-bit across working spaces, and shouldn't — the UCS soft-clip knee
+starts at 0.8× the gamut boundary and each space's LUT encodes its own RGB cube
+(sRGB ⊂ Rec.2020), exactly as the C whose LUT comes from
+`work_profile->matrix_in`. A probe over an input grid showed 3–10% chroma
+divergence everywhere once saturation edits land in the knee. The tests pin
+what actually holds: delegation alias sanity, finite/non-negative output in
+both spaces (catches crossed converter/LUT wiring), sRGB-clips-harder-than-
+Rec2020 under a heavy push, UI-level assert_ne between spaces' stage data, and
+the LUT-builders-distinguish-matrices test now using the shared matrix const.
+
+**Senior review (fricktrade-architect).** The named agent was unavailable this
+session — four launch/resume attempts died with API 402 credit errors; after
+the fourth the review was performed by a fork subagent acting as senior
+reviewer with the same checklist (substitution documented here per workflow).
+Verdict **APPROVE-WITH-FIXES**, one finding: a stale doc fragment from the pre-
+generalisation draft left stranded above `pub type RgbXyzConv` describing a
+Rec.2020-only function contract — fixed by moving it onto `pub fn process`.
+Reviewer independently verified params mapping vs colorbalancergb.c:60-105,
+all 14 soft ranges (:1791-2004), the from_params↔commit_params arithmetic
+(:1087), encode v17→v18 discipline, ordering claims, and the space fix.
+
+**Verified.** `scripts/ci-local.sh` exit 0 (twice — after the space fix and
+again after the doc fix): check/clippy/test --release/link all pass; 705 core +
+92 + 249 UI tests green; zero new clippy warnings (remaining families
+pre-existing).
+
+**Also went wrong, fixed inline:** two malformed Edit calls during the kernel
+generalisation (a placeholder fragment replacing the tail of
+`xyz_d65_to_srgb`; a joined comment/code line in the UI test) — both caught
+immediately from tool feedback and repaired; one E0308 in the new test (fn
+items have unique types — cast to `RgbXyzConv` fn pointers); one genuinely
+wrong test premise (cross-space XYZ identity) replaced twice before landing on
+the invariants above.

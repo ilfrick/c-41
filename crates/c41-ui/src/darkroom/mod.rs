@@ -1851,6 +1851,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Primaries" => pg.add(&primaries_module_row(ctx)),
                 "Negadoctor" => pg.add(&negadoctor_module_row(ctx)),
                 "Tone equalizer" => pg.add(&toneequal_module_row(ctx)),
+                "Color balance RGB" => pg.add(&cbrgb_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
@@ -1946,7 +1947,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2605,6 +2606,110 @@ fn toneequal_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 p0.toneeq_speculars as f64,
                 |p, v| p.toneeq_speculars = v);
         })
+}
+
+/// Color balance RGB module: enable switch gates `cb_on`; darktable's control
+/// set in its GUI page order — global/shadows/mid-tones/highlights grading
+/// (luminance·chroma·hue each), colourfulness (chroma, saturation, brilliance,
+/// vibrance), luminance-range weights and fulcrums, contrast and hue shift.
+///
+/// Slider ranges are darktable's soft ranges where the C sets them
+/// (`dt_bauhaus_slider_set_soft_range`), else the params-struct $MIN/$MAX.
+/// The saturation-formula selector maps DropDown index 0/1 onto
+/// JzAzBz/dt-UCS (the C enum order; dt-UCS is darktable's default).
+fn cbrgb_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    let e = module_expander(ctx, "Color balance RGB", "scene-referred grading", p0.cb_on,
+        |p, on| p.cb_on = on,
+        |e, ctx| {
+            // ── global ──
+            add_param_slider(e, ctx, "Global luminance", -0.05, 0.05, 0.001,
+                p0.cb_global_y as f64, |p, v| p.cb_global_y = v);
+            add_param_slider(e, ctx, "Global chroma", 0.0, 0.01, 0.0005,
+                p0.cb_global_c as f64, |p, v| p.cb_global_c = v);
+            add_param_slider(e, ctx, "Global hue (°)", 0.0, 360.0, 0.5,
+                p0.cb_global_h as f64, |p, v| p.cb_global_h = v);
+            // ── shadows / mid-tones / highlights: Y · C · H ──
+            add_param_slider(e, ctx, "Shadows luminance", -1.0, 1.0, 0.005,
+                p0.cb_shadows_y as f64, |p, v| p.cb_shadows_y = v);
+            add_param_slider(e, ctx, "Shadows chroma", 0.0, 0.5, 0.005,
+                p0.cb_shadows_c as f64, |p, v| p.cb_shadows_c = v);
+            add_param_slider(e, ctx, "Shadows hue (°)", 0.0, 360.0, 0.5,
+                p0.cb_shadows_h as f64, |p, v| p.cb_shadows_h = v);
+            add_param_slider(e, ctx, "Mid-tones luminance", -0.25, 0.25, 0.005,
+                p0.cb_midtones_y as f64, |p, v| p.cb_midtones_y = v);
+            add_param_slider(e, ctx, "Mid-tones chroma", 0.0, 0.1, 0.002,
+                p0.cb_midtones_c as f64, |p, v| p.cb_midtones_c = v);
+            add_param_slider(e, ctx, "Mid-tones hue (°)", 0.0, 360.0, 0.5,
+                p0.cb_midtones_h as f64, |p, v| p.cb_midtones_h = v);
+            add_param_slider(e, ctx, "Highlights luminance", -0.5, 0.5, 0.005,
+                p0.cb_highlights_y as f64, |p, v| p.cb_highlights_y = v);
+            add_param_slider(e, ctx, "Highlights chroma", 0.0, 0.2, 0.002,
+                p0.cb_highlights_c as f64, |p, v| p.cb_highlights_c = v);
+            add_param_slider(e, ctx, "Highlights hue (°)", 0.0, 360.0, 0.5,
+                p0.cb_highlights_h as f64, |p, v| p.cb_highlights_h = v);
+            // ── colourfulness ──
+            add_param_slider(e, ctx, "Chroma — global", -0.5, 0.5, 0.005,
+                p0.cb_chroma_global as f64, |p, v| p.cb_chroma_global = v);
+            add_param_slider(e, ctx, "Chroma — shadows", -1.0, 1.0, 0.01,
+                p0.cb_chroma_shadows as f64, |p, v| p.cb_chroma_shadows = v);
+            add_param_slider(e, ctx, "Chroma — mid-tones", -1.0, 1.0, 0.01,
+                p0.cb_chroma_midtones as f64, |p, v| p.cb_chroma_midtones = v);
+            add_param_slider(e, ctx, "Chroma — highlights", -1.0, 1.0, 0.01,
+                p0.cb_chroma_highlights as f64, |p, v| p.cb_chroma_highlights = v);
+            add_param_slider(e, ctx, "Saturation — global", -1.0, 1.0, 0.01,
+                p0.cb_saturation_global as f64, |p, v| p.cb_saturation_global = v);
+            add_param_slider(e, ctx, "Saturation — shadows", -1.0, 1.0, 0.01,
+                p0.cb_saturation_shadows as f64, |p, v| p.cb_saturation_shadows = v);
+            add_param_slider(e, ctx, "Saturation — mid-tones", -1.0, 1.0, 0.01,
+                p0.cb_saturation_midtones as f64, |p, v| p.cb_saturation_midtones = v);
+            add_param_slider(e, ctx, "Saturation — highlights", -1.0, 1.0, 0.01,
+                p0.cb_saturation_highlights as f64, |p, v| p.cb_saturation_highlights = v);
+            add_param_slider(e, ctx, "Brilliance — global", -1.0, 1.0, 0.01,
+                p0.cb_brilliance_global as f64, |p, v| p.cb_brilliance_global = v);
+            add_param_slider(e, ctx, "Brilliance — shadows", -1.0, 1.0, 0.01,
+                p0.cb_brilliance_shadows as f64, |p, v| p.cb_brilliance_shadows = v);
+            add_param_slider(e, ctx, "Brilliance — mid-tones", -1.0, 1.0, 0.01,
+                p0.cb_brilliance_midtones as f64, |p, v| p.cb_brilliance_midtones = v);
+            add_param_slider(e, ctx, "Brilliance — highlights", -1.0, 1.0, 0.01,
+                p0.cb_brilliance_highlights as f64, |p, v| p.cb_brilliance_highlights = v);
+            add_param_slider(e, ctx, "Vibrance", -0.5, 0.5, 0.005,
+                p0.cb_vibrance as f64, |p, v| p.cb_vibrance = v);
+            // ── masks & threshold ──
+            add_param_slider(e, ctx, "Shadows fall-off", 0.0, 3.0, 0.02,
+                p0.cb_shadows_weight as f64, |p, v| p.cb_shadows_weight = v);
+            add_param_slider(e, ctx, "Highlights fall-off", 0.0, 3.0, 0.02,
+                p0.cb_highlights_weight as f64, |p, v| p.cb_highlights_weight = v);
+            add_param_slider(e, ctx, "Mask middle-grey fulcrum", 0.0, 1.0, 0.005,
+                p0.cb_mask_grey_fulcrum as f64, |p, v| p.cb_mask_grey_fulcrum = v);
+            add_param_slider(e, ctx, "White fulcrum (EV)", -2.0, 2.0, 0.05,
+                p0.cb_white_fulcrum as f64, |p, v| p.cb_white_fulcrum = v);
+            add_param_slider(e, ctx, "Grey fulcrum", 0.1, 0.5, 0.005,
+                p0.cb_grey_fulcrum as f64, |p, v| p.cb_grey_fulcrum = v);
+            add_param_slider(e, ctx, "Contrast", -0.5, 0.5, 0.005,
+                p0.cb_contrast as f64, |p, v| p.cb_contrast = v);
+            add_param_slider(e, ctx, "Hue shift (°)", -180.0, 180.0, 0.5,
+                p0.cb_hue_angle as f64, |p, v| p.cb_hue_angle = v);
+            // ── saturation formula ──
+            // DropDown index == the C enum value of
+            // `dt_iop_colorbalancrgb_saturation_t` (JzAzBz = 0, dt-UCS = 1),
+            // stored in `cb_formula`; decode maps < 0.5 back to JzAzBz.
+            const FORMULA_LABELS: [&str; 2] = ["JzAzBz (2021)", "darktable UCS (2022)"];
+            let formula_row = adw::ActionRow::builder()
+                .title("Saturation formula")
+                .subtitle("uniform colour space used for saturation")
+                .build();
+            let formula_dd = gtk4::DropDown::from_strings(&FORMULA_LABELS);
+            formula_dd.set_selected(p0.cb_formula.round().clamp(0.0, 1.0) as u32);
+            let dd_ctx = ctx.clone();
+            formula_dd.connect_selected_notify(move |dd| {
+                dd_ctx.params.borrow_mut().cb_formula = dd.selected() as f32;
+                render_preview(&dd_ctx);
+            });
+            formula_row.add_suffix(&formula_dd);
+            e.add_row(&formula_row);
+        });
+    e
 }
 
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {

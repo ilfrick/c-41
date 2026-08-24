@@ -169,9 +169,9 @@ impl HistoryStack {
         // Accept both the current and the previous history-container version.
         // The container (v5) wraps PreviewParams blobs that carry their own
         // per-entry version byte — PreviewParams::ENCODE_VERSION has drifted
-        // from v13 (553 B) to v17 (717 B) as basicadj/shadhi/lowpass/negadoctor/
-        // toneequalizer layers were added, but the history *container* format is
-        // unchanged.
+        // from v13 (553 B) to v18 (850 B) as basicadj/shadhi/lowpass/negadoctor/
+        // toneequalizer/colorbalancergb layers were added, but the history
+        // *container* format is unchanged.
         // Rejecting the prior container version outright would wipe every saved
         // undo/redo stack on first load, so we decode leniently and let
         // PreviewParams::decode default any missing fields via the version byte.
@@ -449,6 +449,43 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if toneeq {
         return "Tone equalizer";
     }
+    let cb = old.cb_on != new.cb_on
+        || old.cb_shadows_y != new.cb_shadows_y
+        || old.cb_shadows_c != new.cb_shadows_c
+        || old.cb_shadows_h != new.cb_shadows_h
+        || old.cb_midtones_y != new.cb_midtones_y
+        || old.cb_midtones_c != new.cb_midtones_c
+        || old.cb_midtones_h != new.cb_midtones_h
+        || old.cb_highlights_y != new.cb_highlights_y
+        || old.cb_highlights_c != new.cb_highlights_c
+        || old.cb_highlights_h != new.cb_highlights_h
+        || old.cb_global_y != new.cb_global_y
+        || old.cb_global_c != new.cb_global_c
+        || old.cb_global_h != new.cb_global_h
+        || old.cb_shadows_weight != new.cb_shadows_weight
+        || old.cb_white_fulcrum != new.cb_white_fulcrum
+        || old.cb_highlights_weight != new.cb_highlights_weight
+        || old.cb_chroma_shadows != new.cb_chroma_shadows
+        || old.cb_chroma_highlights != new.cb_chroma_highlights
+        || old.cb_chroma_global != new.cb_chroma_global
+        || old.cb_chroma_midtones != new.cb_chroma_midtones
+        || old.cb_saturation_global != new.cb_saturation_global
+        || old.cb_saturation_highlights != new.cb_saturation_highlights
+        || old.cb_saturation_midtones != new.cb_saturation_midtones
+        || old.cb_saturation_shadows != new.cb_saturation_shadows
+        || old.cb_hue_angle != new.cb_hue_angle
+        || old.cb_brilliance_global != new.cb_brilliance_global
+        || old.cb_brilliance_highlights != new.cb_brilliance_highlights
+        || old.cb_brilliance_midtones != new.cb_brilliance_midtones
+        || old.cb_brilliance_shadows != new.cb_brilliance_shadows
+        || old.cb_mask_grey_fulcrum != new.cb_mask_grey_fulcrum
+        || old.cb_vibrance != new.cb_vibrance
+        || old.cb_grey_fulcrum != new.cb_grey_fulcrum
+        || old.cb_contrast != new.cb_contrast
+        || old.cb_formula != new.cb_formula;
+    if cb {
+        return "Color balance RGB";
+    }
     "Edit"
 }
 
@@ -630,6 +667,10 @@ mod tests {
             describe_change(&base, &PreviewParams { toneeq_shadows: 0.5, ..d() }),
             "Tone equalizer"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { cb_saturation_global: 0.3, ..d() }),
+            "Color balance RGB"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -783,6 +824,40 @@ mod tests {
             toneeq_highlights: _,
             toneeq_whites: _,
             toneeq_speculars: _,
+            cb_on: _,
+            cb_shadows_y: _,
+            cb_shadows_c: _,
+            cb_shadows_h: _,
+            cb_midtones_y: _,
+            cb_midtones_c: _,
+            cb_midtones_h: _,
+            cb_highlights_y: _,
+            cb_highlights_c: _,
+            cb_highlights_h: _,
+            cb_global_y: _,
+            cb_global_c: _,
+            cb_global_h: _,
+            cb_shadows_weight: _,
+            cb_white_fulcrum: _,
+            cb_highlights_weight: _,
+            cb_chroma_shadows: _,
+            cb_chroma_highlights: _,
+            cb_chroma_global: _,
+            cb_chroma_midtones: _,
+            cb_saturation_global: _,
+            cb_saturation_highlights: _,
+            cb_saturation_midtones: _,
+            cb_saturation_shadows: _,
+            cb_hue_angle: _,
+            cb_brilliance_global: _,
+            cb_brilliance_highlights: _,
+            cb_brilliance_midtones: _,
+            cb_brilliance_shadows: _,
+            cb_mask_grey_fulcrum: _,
+            cb_vibrance: _,
+            cb_grey_fulcrum: _,
+            cb_contrast: _,
+            cb_formula: _,
         } = PreviewParams::default();
     }
 
@@ -863,7 +938,8 @@ mod tests {
         // history blobs are rejected rather than mis-parsed. This pin forces the
         // deliberate decision when the length drifts.
         // m4-116 (toneequalizer): 680 → 717 (1 + 24 bools + 173 f32).
-        assert_eq!(PreviewParams::default().encode().len(), 717);
+        // m4-117 (colorbalancergb): 717 → 850 (1 + 25 bools + 206 f32).
+        assert_eq!(PreviewParams::default().encode().len(), 850);
     }
 
     #[test]

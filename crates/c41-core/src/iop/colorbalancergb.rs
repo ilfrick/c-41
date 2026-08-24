@@ -12,10 +12,10 @@
 //!   `dt_UCS_22_build_gamut_LUT`, darktable_ucs_22_helpers.h).
 //!
 //! Both take the **RGB → XYZ D65** matrix in transposed form (the C premultiplies
-//! `XYZ_D50→D65_CAT16 · work_profile->matrix_in`; for the Rust pipeline the
-//! working space is known Rec.2020, giving Rec.2020→XYZ D65 directly). `commit_params`
-//! (m4-84) will derive that matrix and pick the builder; the per-pixel process
-//! loop (m4-85) will be wired as a `pipeline::Stage`.
+//! `XYZ_D50→D65_CAT16 · work_profile->matrix_in`; the Rust pipeline passes its
+//! working space's matrix — Rec.2020 on the raw path, linear sRGB on the non-raw
+//! path). `commit_params` (m4-84) derives that matrix and picks the builder; the
+//! per-pixel process loop (m4-85) is wired as a `pipeline::Stage`.
 
 use crate::color::{
     apply_transposed_color_matrix, d65_xyz_to_xyy, dt_ucs_hcb_to_jch, dt_ucs_hsb_to_jch,
@@ -58,7 +58,11 @@ pub enum SaturationFormula {
 /// User-facing colorbalancergb parameters (`dt_iop_colorbalancergb_params_t`,
 /// v5). Hue fields are in degrees `[0, 360)`, chroma `[0, 1]`, the ±1 sliders as
 /// stored. GUI-only fields (checker colours/size) are omitted.
-#[derive(Clone, Copy, Debug)]
+///
+/// `PartialEq` backs the pipeline's identity gate: a params set equal to
+/// [`CbRgbParams::default`] is darktable's neutral edit and emits no stage
+/// (`to_pipeline` in c41-ui compares against exactly this value).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CbRgbParams {
     pub shadows_y: f32,
     pub shadows_c: f32,
@@ -120,7 +124,12 @@ impl Default for CbRgbParams {
 /// Derived per-commit data (`dt_iop_colorbalancergb_data_t`), ready for the
 /// per-pixel process loop. GUI-only fields (checker, `lut_inited`, `work_profile`)
 /// are omitted; `max_chroma` is unused by the process loop.
-#[derive(Clone)]
+///
+/// `Debug`/`PartialEq` exist because the value travels inside a
+/// `pipeline::Stage` (which derives both). The builders are pure and
+/// deterministic (pinned by `builders_are_deterministic`), so two data sets
+/// derived from equal params compare equal field-for-field.
+#[derive(Clone, Debug, PartialEq)]
 pub struct CbRgbData {
     pub global: [f32; 4],
     pub shadows: [f32; 4],
@@ -485,15 +494,42 @@ fn saturation_dtucs(xyz_d65: [f32; 4], opacities: &[f32; 4], d: &CbRgbData, l_wh
     xyy_to_xyz(&xyy)
 }
 
-/// Apply colorbalancergb to a packed-RGBA scene-linear **Rec.2020** buffer
-/// (`input`/`output` are `n·4` floats). Faithful port of the process loop
-/// (colorbalancergb.c:662–943), sans the GUI mask-display checkerboard.
-///
-/// The C's premultiplied pipeline↔LMS matrices become direct compositions of the
-/// pipeline's fixed Rec.2020↔XYZ-D65 conversions. Alpha (lane 3) is preserved
-/// from the input (the color chain drops it via the matrices, as in the C, but the
-/// pipeline keeps it rather than emitting 0).
+/// Working-space RGB↔XYZ(D65) converter pair for [`process_in_space`] — the
+/// alpha-preserving `[f32; 4] -> [f32; 4]` colour transforms `pipeline::Stage`
+/// picks per buffer space (`rec2020_to_xyz_d65`/`xyz_d65_to_rec2020` on the raw
+/// path, `srgb_to_xyz_d65`/`xyz_d65_to_srgb` on the non-raw path).
+pub type RgbXyzConv = fn([f32; 4]) -> [f32; 4];
+
+/// Apply colorbalancergb to a packed-RGBA scene-linear buffer (`input`/
+/// `output` are `n·4` floats) in the pipeline's **raw-path** Rec.2020 working
+/// space. Faithful port of the process loop (colorbalancergb.c:662–943), sans
+/// the GUI mask-display checkerboard. See [`process_in_space`] for the
+/// space-general form.
 pub fn process(input: &[f32], output: &mut [f32], d: &CbRgbData) {
+    process_in_space(input, output, d, rec2020_to_xyz_d65, xyz_d65_to_rec2020);
+}
+
+/// The same grading over an arbitrary working space: pass the matching
+/// RGB→XYZ-D65 / XYZ-D65→RGB pair and build `d`'s gamut LUT with that space's
+/// [`crate::color`]-matrix twin ([`crate::color::REC2020_TO_XYZ_D65_T4`] /
+/// [`crate::color::SRGB_TO_XYZ_D65_T4`]) so saturation gamut-mapping clips at
+/// the right primaries — how the C gets its LUT from `work_profile->matrix_in`.
+/// Between the two conversions (Yrg chain, masks, offsets) everything depends
+/// only on XYZ, so colours grading to results inside *both* spaces' gamuts come
+/// out identical; near/over the working-space boundary the per-space LUT
+/// correctly clips harder in the smaller space (sRGB ⊂ Rec.2020).
+///
+/// The C's premultiplied pipeline↔LMS matrices become direct compositions of
+/// the working-space conversions. Alpha (lane 3) is preserved from the input
+/// (the color chain drops it via the matrices, as in the C, but the pipeline
+/// keeps it rather than emitting 0).
+pub fn process_in_space(
+    input: &[f32],
+    output: &mut [f32],
+    d: &CbRgbData,
+    rgb_to_xyz_d65: RgbXyzConv,
+    xyz_d65_to_rgb: RgbXyzConv,
+) {
     let (hue_cos, hue_sin) = (d.hue_angle.cos(), d.hue_angle.sin());
     let l_white = y_to_dt_ucs_l_star(d.white_fulcrum);
 
@@ -502,7 +538,7 @@ pub fn process(input: &[f32], output: &mut [f32], d: &CbRgbData) {
         let mut rgb = [i_px[0].max(0.0), i_px[1].max(0.0), i_px[2].max(0.0), 0.0];
 
         // → CIE 2006 LMS D65 → Filmlight Yrg → Ych
-        let mut lms = xyz_to_lms_2006(rec2020_to_xyz_d65(rgb));
+        let mut lms = xyz_to_lms_2006(rgb_to_xyz_d65(rgb));
         let mut yrg = lms_to_yrg(lms);
         let mut ych = yrg_to_ych(yrg);
         ych[0] = ych[0].max(0.0); // no negative luminance
@@ -566,7 +602,7 @@ pub fn process(input: &[f32], output: &mut [f32], d: &CbRgbData) {
         };
 
         // back to pipeline RGB, clip negatives, preserve alpha
-        let pix = xyz_d65_to_rec2020(xyz_d65);
+        let pix = xyz_d65_to_rgb(xyz_d65);
         o_px[0] = pix[0].max(0.0);
         o_px[1] = pix[1].max(0.0);
         o_px[2] = pix[2].max(0.0);
@@ -577,14 +613,10 @@ pub fn process(input: &[f32], output: &mut [f32], d: &CbRgbData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::SRGB_TO_XYZ_D65_T4;
 
-    // sRGB → XYZ (D65), transposed for `apply_transposed_color_matrix`.
-    const SRGB_TO_XYZ_D65_T: [[f32; 4]; 4] = [
-        [0.4124, 0.2126, 0.0193, 0.0],
-        [0.3576, 0.7152, 0.1192, 0.0],
-        [0.1805, 0.0722, 0.9505, 0.0],
-        [0.0, 0.0, 0.0, 0.0],
-    ];
+    // (the sRGB → XYZ D65 test matrix moved to `color::SRGB_TO_XYZ_D65_T4` —
+    // one source of truth now that the pipeline grades in both spaces)
 
     fn finite_nonneg(lut: &[f32; LUT_ELEM]) -> bool {
         lut.iter().all(|v| v.is_finite() && *v >= 0.0)
@@ -598,14 +630,14 @@ mod tests {
 
     #[test]
     fn jzazbz_lut_is_finite_nonneg_and_varies() {
-        let lut = build_gamut_lut_jzazbz(&SRGB_TO_XYZ_D65_T);
+        let lut = build_gamut_lut_jzazbz(&SRGB_TO_XYZ_D65_T4);
         assert!(finite_nonneg(&lut), "jzazbz LUT has non-finite/negative entries");
         assert!(has_variation(&lut), "jzazbz LUT is flat — hue binning likely broken");
     }
 
     #[test]
     fn ucs_lut_is_finite_nonneg_and_varies() {
-        let lut = build_gamut_lut_ucs(&SRGB_TO_XYZ_D65_T);
+        let lut = build_gamut_lut_ucs(&SRGB_TO_XYZ_D65_T4);
         assert!(finite_nonneg(&lut), "ucs LUT has non-finite/negative entries");
         assert!(has_variation(&lut), "ucs LUT is flat — boundary march likely broken");
     }
@@ -614,12 +646,12 @@ mod tests {
     fn builders_are_deterministic() {
         // pure functions of the input matrix.
         assert_eq!(
-            build_gamut_lut_jzazbz(&SRGB_TO_XYZ_D65_T),
-            build_gamut_lut_jzazbz(&SRGB_TO_XYZ_D65_T)
+            build_gamut_lut_jzazbz(&SRGB_TO_XYZ_D65_T4),
+            build_gamut_lut_jzazbz(&SRGB_TO_XYZ_D65_T4)
         );
         assert_eq!(
-            build_gamut_lut_ucs(&SRGB_TO_XYZ_D65_T),
-            build_gamut_lut_ucs(&SRGB_TO_XYZ_D65_T)
+            build_gamut_lut_ucs(&SRGB_TO_XYZ_D65_T4),
+            build_gamut_lut_ucs(&SRGB_TO_XYZ_D65_T4)
         );
     }
 
@@ -697,6 +729,30 @@ mod tests {
     }
 
     #[test]
+    fn params_equality_gate_tracks_the_neutral_edit() {
+        // The pipeline's identity gate compares params against `default()` with
+        // derived `PartialEq`. Pin that the default IS equal to itself (trivial,
+        // but guards an accidental NaN creeping into a default — NaN != NaN
+        // would make every enabled instance emit a stage) and that each slider's
+        // neutral position is exactly representable, so "moved away and back"
+        // re-derives an equal struct.
+        assert_eq!(CbRgbParams::default(), CbRgbParams::default());
+        for moved in [
+            CbRgbParams { shadows_y: 0.1, ..CbRgbParams::default() },
+            CbRgbParams { global_c: 0.5, ..CbRgbParams::default() },
+            CbRgbParams { white_fulcrum: -2.0, ..CbRgbParams::default() },
+            CbRgbParams { contrast: 0.25, ..CbRgbParams::default() },
+            CbRgbParams { grey_fulcrum: 0.3, ..CbRgbParams::default() },
+            CbRgbParams {
+                saturation_formula: SaturationFormula::Jzazbz,
+                ..CbRgbParams::default()
+            },
+        ] {
+            assert_ne!(moved, CbRgbParams::default());
+        }
+    }
+
+    #[test]
     fn gamut_lut_actually_uses_the_input_matrix() {
         // a genuinely different gamut (sRGB primaries) must change the LUT — proves
         // the matrix argument is honoured (guards the transpose-contract wiring).
@@ -704,7 +760,7 @@ mod tests {
         // matrix would NOT change it (same xyY) — the primaries must actually move.
         let p = CbRgbParams::default();
         let rec = CbRgbData::from_params(&p, &REC2020_TO_XYZ_D65_T4);
-        let srgb = CbRgbData::from_params(&p, &SRGB_TO_XYZ_D65_T);
+        let srgb = CbRgbData::from_params(&p, &SRGB_TO_XYZ_D65_T4);
         let differ = rec.gamut_lut.iter().zip(srgb.gamut_lut.iter()).any(|(a, b)| (a - b).abs() > 1e-4);
         assert!(differ, "LUT ignored the input matrix (Rec.2020 vs sRGB identical)");
     }
@@ -720,6 +776,134 @@ mod tests {
         let mut out = [0.0f32; 4];
         process(&inp, &mut out, d);
         out
+    }
+
+    #[test]
+    fn process_in_space_produces_valid_pixels_in_both_working_spaces() {
+        // Each pipeline path (raw Rec.2020 / non-raw linear sRGB) must emit
+        // finite, non-negative pixels in its OWN space for mild and heavy
+        // edits alike. Crossed wiring (converters from one space, gamut LUT
+        // from the other) pushes results outside the buffer's hull and shows
+        // up here as negatives; legitimate per-space gamut-mapping differences
+        // do NOT (each LUT matches its converters).
+        let edits = [
+            CbRgbParams { saturation_global: 0.2, ..CbRgbParams::default() },
+            CbRgbParams {
+                saturation_global: 0.9,
+                global_y: 0.03,
+                global_h: 210.0,
+                shadows_h: 30.0,
+                contrast: 0.3,
+                vibrance: 0.4,
+                ..CbRgbParams::default()
+            },
+        ];
+        let colours = [[0.55_f32, 0.25, 0.08], [0.5, 0.5, 0.6], [0.2, 0.45, 0.3], [0.05, 0.09, 0.4]];
+        for p in &edits {
+            for (matrix_t, to_xyz, from_xyz) in [
+                (
+                    &REC2020_TO_XYZ_D65_T4,
+                    rec2020_to_xyz_d65 as RgbXyzConv,
+                    xyz_d65_to_rec2020 as RgbXyzConv,
+                ),
+                (
+                    &SRGB_TO_XYZ_D65_T4,
+                    crate::color::srgb_to_xyz_d65 as RgbXyzConv,
+                    crate::color::xyz_d65_to_srgb as RgbXyzConv,
+                ),
+            ] {
+                let d = CbRgbData::from_params(p, matrix_t);
+                for colour in colours {
+                    let inp = [colour[0], colour[1], colour[2], 1.0];
+                    let mut out = [0.0f32; 4];
+                    process_in_space(&inp, &mut out, &d, to_xyz, from_xyz);
+                    assert!(
+                        out[..3].iter().all(|v| v.is_finite() && *v >= 0.0),
+                        "invalid output {out:?} for {colour:?} with edit sat={}",
+                        p.saturation_global
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_delegates_to_process_in_space_with_the_rec2020_pair() {
+        // process() is a thin alias — pin it to the Rec2020 converters so the
+        // raw-path entry point can't drift from the general one.
+        let p = CbRgbParams {
+            saturation_global: 0.6,
+            contrast: 0.3,
+            ..CbRgbParams::default()
+        };
+        let d = CbRgbData::from_params(&p, &REC2020_TO_XYZ_D65_T4);
+        let inp = [0.42_f32, 0.19, 0.07, 1.0];
+
+        let mut via_alias = [0.0f32; 4];
+        process(&inp, &mut via_alias, &d);
+        let mut via_general = [0.0f32; 4];
+        process_in_space(
+            &inp,
+            &mut via_general,
+            &d,
+            rec2020_to_xyz_d65,
+            xyz_d65_to_rec2020,
+        );
+        assert_eq!(via_alias, via_general);
+    }
+
+    #[test]
+    fn srgb_path_clips_into_its_own_gamut_while_rec2020_keeps_chroma() {
+        // A heavy saturation push sends the pixel past the sRGB boundary but
+        // not past Rec.2020's (its triangle strictly contains sRGB's): the
+        // sRGB path must map chroma back toward its boundary while the Rec.2020
+        // path keeps the boost — the per-space behaviour the C gets from
+        // building the LUT off the working profile.
+        let p = CbRgbParams {
+            saturation_global: 0.9,
+            ..CbRgbParams::default()
+        };
+        let d_rec = CbRgbData::from_params(&p, &REC2020_TO_XYZ_D65_T4);
+        let d_srgb = CbRgbData::from_params(&p, &SRGB_TO_XYZ_D65_T4);
+
+        let srgb_in = [0.55_f32, 0.25, 0.08, 1.0]; // saturated orange
+        let rec_in = xyz_d65_to_rec2020(crate::color::srgb_to_xyz_d65(srgb_in));
+
+        let mut out_srgb = [0.0f32; 4];
+        process_in_space(
+            &srgb_in,
+            &mut out_srgb,
+            &d_srgb,
+            crate::color::srgb_to_xyz_d65,
+            crate::color::xyz_d65_to_srgb,
+        );
+        let out_rec = run_one(rec_in[..3].try_into().unwrap(), &d_rec);
+
+        // Chroma proxy in XYZ: distance from the equal-chroma axis, scaled by
+        // luminance — (X+Z)/(Y) style spread. Simpler and robust here: the
+        // sRGB result converted back into Rec.2020 must stay non-negative
+        // (inside the Rec.2020 unit cube ⇒ representable), while BOTH results
+        // are finite/non-negative in their own spaces.
+        let back = xyz_d65_to_rec2020(crate::color::srgb_to_xyz_d65(out_srgb));
+        for c in 0..3 {
+            assert!(out_srgb[c].is_finite() && out_srgb[c] >= 0.0);
+            assert!(out_rec[c].is_finite() && out_rec[c] >= 0.0);
+            assert!(
+                back[c] >= -1e-4,
+                "sRGB-path result left the Rec.2020 hull on channel {c}: {back:?}"
+            );
+        }
+        // And the sRGB path must end up LESS chromatic than the unclipped
+        // Rec.2020 path at the same hue: compare UCS-style x-spread from D65.
+        let xyy_r = crate::color::d65_xyz_to_xyy(&rec2020_to_xyz_d65(out_rec));
+        let xyy_s = crate::color::d65_xyz_to_xyy(&crate::color::srgb_to_xyz_d65(out_srgb));
+        let d65 = [crate::color::D65_X, crate::color::D65_Y];
+        let dr = ((xyy_r[0] - d65[0]).powi(2) + (xyy_r[1] - d65[1]).powi(2)).sqrt();
+        let ds = ((xyy_s[0] - d65[0]).powi(2) + (xyy_s[1] - d65[1]).powi(2)).sqrt();
+        assert!(
+            ds < dr,
+            "expected the sRGB path to clip harder than Rec.2020: ds={ds} dr={dr}"
+        );
     }
 
     #[test]

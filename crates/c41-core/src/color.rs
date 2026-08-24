@@ -168,6 +168,37 @@ pub fn xyz_d65_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], xyz[3]]
 }
 
+// ── linear sRGB (D65) → XYZ D65 ──────────────────────────────────────────────
+// The exact inverse of the matrix in `xyz_d65_to_srgb` above (same transposed
+// M[in][out] storage convention). Completes the sRGB↔XYZ-D65 pair so space-
+// aware IOPs can grade in linear sRGB the way they already do in Rec.2020.
+
+const SRGB_TO_XYZ_D65_T: [[f32; 3]; 3] = [
+    [0.4124564, 0.2126729, 0.0193339],  // R → X,Y,Z
+    [0.3575761, 0.7151522, 0.0721750],  // G → X,Y,Z
+    [0.1804375, 0.0721750, 0.9503041],  // B → X,Y,Z
+];
+
+/// [`SRGB_TO_XYZ_D65_T`] padded to `[[f32; 4]; 4]` for
+/// [`apply_transposed_color_matrix`] — the RGB→XYZ-D65 input matrix for a
+/// **linear sRGB** working profile (the non-raw pipeline's space), derived
+/// from the 3×3 so the two can't drift.
+pub const SRGB_TO_XYZ_D65_T4: [[f32; 4]; 4] = [
+    [SRGB_TO_XYZ_D65_T[0][0], SRGB_TO_XYZ_D65_T[0][1], SRGB_TO_XYZ_D65_T[0][2], 0.0],
+    [SRGB_TO_XYZ_D65_T[1][0], SRGB_TO_XYZ_D65_T[1][1], SRGB_TO_XYZ_D65_T[1][2], 0.0],
+    [SRGB_TO_XYZ_D65_T[2][0], SRGB_TO_XYZ_D65_T[2][1], SRGB_TO_XYZ_D65_T[2][2], 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
+/// Linear **sRGB** (D65) → XYZ (D65). Alpha (ch 3) passes through. The
+/// linear-sRGB working-space twin of [`rec2020_to_xyz_d65`].
+pub fn srgb_to_xyz_d65(rgb: [f32; 4]) -> [f32; 4] {
+    let xyz: [f32; 3] = std::array::from_fn(|o|
+        SRGB_TO_XYZ_D65_T[0][o]*rgb[0] + SRGB_TO_XYZ_D65_T[1][o]*rgb[1] + SRGB_TO_XYZ_D65_T[2][o]*rgb[2]
+    );
+    [xyz[0], xyz[1], xyz[2], rgb[3]]
+}
+
 // ── Rec.2020 (D65) ↔ XYZ ─────────────────────────────────────────────────────
 // BT.2020 primaries, D65 white. Stored transposed (M[in][out]) like the sRGB
 // matrices above: out[o] = sum_c M[c][o] * in[c]. The Rec.2020 luma row

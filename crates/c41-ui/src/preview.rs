@@ -324,6 +324,83 @@ pub struct PreviewParams {
     pub toneeq_whites: f32,
     /// Gain at 0 EV (`speculars`), −2..+2 EV.
     pub toneeq_speculars: f32,
+    // ── Color balance RGB (colorbalancergb.c, iop_order.c v50_order pos 41.5) ─
+    // Scene-referred grading in Filmlight's Yrg space with perceptual
+    // saturation/brilliance in dt-UCS (default) or JzAzBz. Field names and
+    // defaults mirror `dt_iop_colorbalancergb_params_t` (v5); ranges are
+    // darktable's soft ranges where set, else $MIN/$MAX.
+    /// Color balance RGB module enabled.
+    pub cb_on: bool,
+    /// Shadows luminance offset (`shadows_Y`), −1..1.
+    pub cb_shadows_y: f32,
+    /// Shadows chroma (`shadows_C`), soft 0..0.5.
+    pub cb_shadows_c: f32,
+    /// Shadows hue in degrees (`shadows_H`), 0..360.
+    pub cb_shadows_h: f32,
+    /// Mid-tones luminance exponent offset (`midtones_Y`), soft −0.25..0.25.
+    pub cb_midtones_y: f32,
+    /// Mid-tones chroma of the colour exponent (`midtones_C`), soft 0..0.1.
+    pub cb_midtones_c: f32,
+    /// Mid-tones hue in degrees (`midtones_H`), 0..360.
+    pub cb_midtones_h: f32,
+    /// Highlights luminance offset (`highlights_Y`), soft −0.5..0.5.
+    pub cb_highlights_y: f32,
+    /// Highlights chroma (`highlights_C`), soft 0..0.2.
+    pub cb_highlights_c: f32,
+    /// Highlights hue in degrees (`highlights_H`), 0..360.
+    pub cb_highlights_h: f32,
+    /// Global luminance offset (`global_Y`), soft −0.05..0.05.
+    pub cb_global_y: f32,
+    /// Global chroma offset (`global_C`), soft 0..0.01.
+    pub cb_global_c: f32,
+    /// Global hue offset in degrees (`global_H`), 0..360.
+    pub cb_global_h: f32,
+    /// Shadows zone fall-off weight (`shadows_weight`), 0..3, default 1.
+    pub cb_shadows_weight: f32,
+    /// White fulcrum as an EV exponent (`white_fulcrum`; commit_params takes
+    /// exp2 of it), soft −2..+2 EV, default 0.
+    pub cb_white_fulcrum: f32,
+    /// Highlights zone fall-off weight (`highlights_weight`), 0..3, default 1.
+    pub cb_highlights_weight: f32,
+    /// Chroma boost, shadows (`chroma_shadows`), ±1.
+    pub cb_chroma_shadows: f32,
+    /// Chroma boost, highlights (`chroma_highlights`), ±1.
+    pub cb_chroma_highlights: f32,
+    /// Chroma boost, global (`chroma_global`), soft ±0.5.
+    pub cb_chroma_global: f32,
+    /// Chroma boost, mid-tones (`chroma_midtones`), ±1.
+    pub cb_chroma_midtones: f32,
+    /// Perceptual saturation, global (`saturation_global`), ±1.
+    pub cb_saturation_global: f32,
+    /// Perceptual saturation, highlights (`saturation_highlights`), ±1.
+    pub cb_saturation_highlights: f32,
+    /// Perceptual saturation, mid-tones (`saturation_midtones`), ±1.
+    pub cb_saturation_midtones: f32,
+    /// Perceptual saturation, shadows (`saturation_shadows`), ±1.
+    pub cb_saturation_shadows: f32,
+    /// Global hue shift in degrees (`hue_angle`), ±180.
+    pub cb_hue_angle: f32,
+    /// Brilliance (luminance-correlated saturation), global, ±1.
+    pub cb_brilliance_global: f32,
+    /// Brilliance, highlights (`brilliance_highlights`), ±1.
+    pub cb_brilliance_highlights: f32,
+    /// Brilliance, mid-tones (`brilliance_midtones`), ±1.
+    pub cb_brilliance_midtones: f32,
+    /// Brilliance, shadows (`brilliance_shadows`), ±1.
+    pub cb_brilliance_shadows: f32,
+    /// Middle-grey fulcrum of the luminance masks (`mask_grey_fulcrum`),
+    /// 0..1, default 0.1845.
+    pub cb_mask_grey_fulcrum: f32,
+    /// Vibrance — chroma boost weighted toward low chroma (`vibrance`),
+    /// soft ±0.5.
+    pub cb_vibrance: f32,
+    /// Contrast grey fulcrum (`grey_fulcrum`), soft 0.1..0.5, default 0.1845.
+    pub cb_grey_fulcrum: f32,
+    /// Fulcrumed contrast strength (`contrast`), soft ±0.5.
+    pub cb_contrast: f32,
+    /// Saturation formula selector: 0 = JzAzBz (2021), 1 = dt-UCS (2022, the
+    /// darktable default). Encoded as a float to keep the append-only layout.
+    pub cb_formula: f32,
 }
 
 impl Default for PreviewParams {
@@ -512,6 +589,44 @@ impl Default for PreviewParams {
             toneeq_highlights: 0.0,
             toneeq_whites: 0.0,
             toneeq_speculars: 0.0,
+            // Color balance RGB defaults mirror the $DEFAULTs in
+            // dt_iop_colorbalancergb_params_t: the neutral edit (offset 0 /
+            // slope 1 / power 1 everywhere), weights at 1, both fulcrums at
+            // middle grey 0.1845, dt-UCS saturation formula.
+            cb_on: false,
+            cb_shadows_y: 0.0,
+            cb_shadows_c: 0.0,
+            cb_shadows_h: 0.0,
+            cb_midtones_y: 0.0,
+            cb_midtones_c: 0.0,
+            cb_midtones_h: 0.0,
+            cb_highlights_y: 0.0,
+            cb_highlights_c: 0.0,
+            cb_highlights_h: 0.0,
+            cb_global_y: 0.0,
+            cb_global_c: 0.0,
+            cb_global_h: 0.0,
+            cb_shadows_weight: 1.0,
+            cb_white_fulcrum: 0.0,
+            cb_highlights_weight: 1.0,
+            cb_chroma_shadows: 0.0,
+            cb_chroma_highlights: 0.0,
+            cb_chroma_global: 0.0,
+            cb_chroma_midtones: 0.0,
+            cb_saturation_global: 0.0,
+            cb_saturation_highlights: 0.0,
+            cb_saturation_midtones: 0.0,
+            cb_saturation_shadows: 0.0,
+            cb_hue_angle: 0.0,
+            cb_brilliance_global: 0.0,
+            cb_brilliance_highlights: 0.0,
+            cb_brilliance_midtones: 0.0,
+            cb_brilliance_shadows: 0.0,
+            cb_mask_grey_fulcrum: 0.1845,
+            cb_vibrance: 0.0,
+            cb_grey_fulcrum: 0.1845,
+            cb_contrast: 0.0,
+            cb_formula: 1.0, // SaturationFormula::DtUcs
         }
     }
 }
@@ -640,6 +755,12 @@ impl PreviewParams {
                 && self.toneeq_highlights == 0.0
                 && self.toneeq_whites == 0.0
                 && self.toneeq_speculars == 0.0);
+        // Color balance RGB is identity when off, or when the mapped params are
+        // exactly darktable's neutral edit (the gate mirrors `to_pipeline`,
+        // which builds CbRgbParams and compares against `default()`). Note the
+        // C would still run its near-no-op gamut map; we skip it like every
+        // other identity module.
+        let cb_identity = !self.cb_on || self.cb_is_neutral();
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -648,6 +769,53 @@ impl PreviewParams {
             && lowpass_identity && shadhi_identity
             && primaries_identity && negadoctor_identity
             && toneeq_identity
+            && cb_identity
+    }
+
+    /// The UI fields mapped onto the core's `CbRgbParams` — the single
+    /// construction site shared by `is_identity`, `cb_is_neutral` and
+    /// `to_pipeline`, so they can never disagree about what the sliders mean.
+    fn cb_params(&self) -> c41_core::iop::colorbalancergb::CbRgbParams {
+        use c41_core::iop::colorbalancergb::{CbRgbParams, SaturationFormula};
+        CbRgbParams {
+            shadows_y: self.cb_shadows_y,
+            shadows_c: self.cb_shadows_c,
+            shadows_h: self.cb_shadows_h,
+            midtones_y: self.cb_midtones_y,
+            midtones_c: self.cb_midtones_c,
+            midtones_h: self.cb_midtones_h,
+            highlights_y: self.cb_highlights_y,
+            highlights_c: self.cb_highlights_c,
+            highlights_h: self.cb_highlights_h,
+            global_y: self.cb_global_y,
+            global_c: self.cb_global_c,
+            global_h: self.cb_global_h,
+            shadows_weight: self.cb_shadows_weight,
+            white_fulcrum: self.cb_white_fulcrum,
+            highlights_weight: self.cb_highlights_weight,
+            chroma_shadows: self.cb_chroma_shadows,
+            chroma_highlights: self.cb_chroma_highlights,
+            chroma_global: self.cb_chroma_global,
+            chroma_midtones: self.cb_chroma_midtones,
+            saturation_global: self.cb_saturation_global,
+            saturation_highlights: self.cb_saturation_highlights,
+            saturation_midtones: self.cb_saturation_midtones,
+            saturation_shadows: self.cb_saturation_shadows,
+            hue_angle: self.cb_hue_angle,
+            brilliance_global: self.cb_brilliance_global,
+            brilliance_highlights: self.cb_brilliance_highlights,
+            brilliance_midtones: self.cb_brilliance_midtones,
+            brilliance_shadows: self.cb_brilliance_shadows,
+            mask_grey_fulcrum: self.cb_mask_grey_fulcrum,
+            vibrance: self.cb_vibrance,
+            grey_fulcrum: self.cb_grey_fulcrum,
+            contrast: self.cb_contrast,
+            saturation_formula: if self.cb_formula < 0.5 {
+                SaturationFormula::Jzazbz
+            } else {
+                SaturationFormula::DtUcs
+            },
+        }
     }
 
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
@@ -679,8 +847,18 @@ impl PreviewParams {
             primaries_on: false,
             negadoctor_on: false,
             toneeq_on: false,
+            cb_on: false,
             ..*self
         }
+    }
+
+    /// Whether the color balance RGB params are darktable's neutral edit (the
+    /// mapped `CbRgbParams` equals its default — offset 0 / slope 1 / power 1).
+    /// Single source of truth for `is_identity`; `to_pipeline` shares the same
+    /// comparison through [`Self::cb_params`].
+    fn cb_is_neutral(&self) -> bool {
+        use c41_core::iop::colorbalancergb::CbRgbParams;
+        self.cb_params() == CbRgbParams::default()
     }
 
     /// Whether the primaries params are at their neutral defaults (all hues 0,
@@ -705,7 +883,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on] {
             v.push(b as u8);
         }
         for f in [
@@ -767,6 +945,24 @@ impl PreviewParams {
             self.toneeq_shadows, self.toneeq_midtones,
             self.toneeq_highlights, self.toneeq_whites,
             self.toneeq_speculars,
+            // Color balance RGB — field order mirrors
+            // dt_iop_colorbalancergb_params_t (v5), so the blob reads like the
+            // C struct.
+            self.cb_shadows_y, self.cb_shadows_c, self.cb_shadows_h,
+            self.cb_midtones_y, self.cb_midtones_c, self.cb_midtones_h,
+            self.cb_highlights_y, self.cb_highlights_c, self.cb_highlights_h,
+            self.cb_global_y, self.cb_global_c, self.cb_global_h,
+            self.cb_shadows_weight, self.cb_white_fulcrum, self.cb_highlights_weight,
+            self.cb_chroma_shadows, self.cb_chroma_highlights,
+            self.cb_chroma_global, self.cb_chroma_midtones,
+            self.cb_saturation_global, self.cb_saturation_highlights,
+            self.cb_saturation_midtones, self.cb_saturation_shadows,
+            self.cb_hue_angle,
+            self.cb_brilliance_global, self.cb_brilliance_highlights,
+            self.cb_brilliance_midtones, self.cb_brilliance_shadows,
+            self.cb_mask_grey_fulcrum,
+            self.cb_vibrance, self.cb_grey_fulcrum, self.cb_contrast,
+            self.cb_formula,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -904,6 +1100,40 @@ impl PreviewParams {
             toneeq_highlights: f.get(170).copied().unwrap_or(d.toneeq_highlights),
             toneeq_whites: f.get(171).copied().unwrap_or(d.toneeq_whites),
             toneeq_speculars: f.get(172).copied().unwrap_or(d.toneeq_speculars),
+            cb_on: bools.get(24).map_or(d.cb_on, |&b| b != 0),
+            cb_shadows_y: f.get(173).copied().unwrap_or(d.cb_shadows_y),
+            cb_shadows_c: f.get(174).copied().unwrap_or(d.cb_shadows_c),
+            cb_shadows_h: f.get(175).copied().unwrap_or(d.cb_shadows_h),
+            cb_midtones_y: f.get(176).copied().unwrap_or(d.cb_midtones_y),
+            cb_midtones_c: f.get(177).copied().unwrap_or(d.cb_midtones_c),
+            cb_midtones_h: f.get(178).copied().unwrap_or(d.cb_midtones_h),
+            cb_highlights_y: f.get(179).copied().unwrap_or(d.cb_highlights_y),
+            cb_highlights_c: f.get(180).copied().unwrap_or(d.cb_highlights_c),
+            cb_highlights_h: f.get(181).copied().unwrap_or(d.cb_highlights_h),
+            cb_global_y: f.get(182).copied().unwrap_or(d.cb_global_y),
+            cb_global_c: f.get(183).copied().unwrap_or(d.cb_global_c),
+            cb_global_h: f.get(184).copied().unwrap_or(d.cb_global_h),
+            cb_shadows_weight: f.get(185).copied().unwrap_or(d.cb_shadows_weight),
+            cb_white_fulcrum: f.get(186).copied().unwrap_or(d.cb_white_fulcrum),
+            cb_highlights_weight: f.get(187).copied().unwrap_or(d.cb_highlights_weight),
+            cb_chroma_shadows: f.get(188).copied().unwrap_or(d.cb_chroma_shadows),
+            cb_chroma_highlights: f.get(189).copied().unwrap_or(d.cb_chroma_highlights),
+            cb_chroma_global: f.get(190).copied().unwrap_or(d.cb_chroma_global),
+            cb_chroma_midtones: f.get(191).copied().unwrap_or(d.cb_chroma_midtones),
+            cb_saturation_global: f.get(192).copied().unwrap_or(d.cb_saturation_global),
+            cb_saturation_highlights: f.get(193).copied().unwrap_or(d.cb_saturation_highlights),
+            cb_saturation_midtones: f.get(194).copied().unwrap_or(d.cb_saturation_midtones),
+            cb_saturation_shadows: f.get(195).copied().unwrap_or(d.cb_saturation_shadows),
+            cb_hue_angle: f.get(196).copied().unwrap_or(d.cb_hue_angle),
+            cb_brilliance_global: f.get(197).copied().unwrap_or(d.cb_brilliance_global),
+            cb_brilliance_highlights: f.get(198).copied().unwrap_or(d.cb_brilliance_highlights),
+            cb_brilliance_midtones: f.get(199).copied().unwrap_or(d.cb_brilliance_midtones),
+            cb_brilliance_shadows: f.get(200).copied().unwrap_or(d.cb_brilliance_shadows),
+            cb_mask_grey_fulcrum: f.get(201).copied().unwrap_or(d.cb_mask_grey_fulcrum),
+            cb_vibrance: f.get(202).copied().unwrap_or(d.cb_vibrance),
+            cb_grey_fulcrum: f.get(203).copied().unwrap_or(d.cb_grey_fulcrum),
+            cb_contrast: f.get(204).copied().unwrap_or(d.cb_contrast),
+            cb_formula: f.get(205).copied().unwrap_or(d.cb_formula),
         })
     }
 
@@ -1138,6 +1368,35 @@ impl PreviewParams {
                 brightness: self.basicadj_brightness,
                 saturation: self.basicadj_saturation,
                 vibrance: self.basicadj_vibrance,
+                space,
+            });
+        }
+        // Color balance RGB (colorbalancergb.c, iop_order.c v50_order pos 41.5
+        // — after basicadj 40.0, before rgblevels 43.0). Scene-referred grading
+        // in Filmlight's Yrg space with perceptual saturation/brilliance in
+        // dt-UCS (default) or JzAzBz. The whole commit_params derivation — zone
+        // vectors, weights, fulcrums and the hue-indexed 512-entry gamut LUT
+        // (the dt-UCS build alone marches the RGB gamut boundary 25 600 times)
+        // — happens here, ONCE per render; the finished `CbRgbData` travels in
+        // the stage so each per-band apply call is pure pixel math.
+        //
+        // The gate mirrors `is_identity`: darktable's default params are a
+        // neutral edit, so an enabled module at its defaults emits no stage.
+        // (The C would still run its near-no-op gamut map on every pixel; we
+        // skip it like every other identity module.)
+        if self.cb_on && !self.cb_is_neutral() {
+            // The gamut-LUT matrix and the stage's pixel-loop converters must
+            // be the same working space: raw previews grade Rec.2020, non-raw
+            // linear sRGB. Mismatched primaries would silently shift hues.
+            let lut_matrix_t = match space {
+                ColorSpace::Rec2020 => &c41_core::color::REC2020_TO_XYZ_D65_T4,
+                ColorSpace::LinearSrgb => &c41_core::color::SRGB_TO_XYZ_D65_T4,
+            };
+            p.push(Stage::ColorBalanceRgb {
+                data: Box::new(c41_core::iop::colorbalancergb::CbRgbData::from_params(
+                    &self.cb_params(),
+                    lut_matrix_t,
+                )),
                 space,
             });
         }
@@ -1427,9 +1686,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v14 adds shadhi (shadows/highlights). v15 adds primaries (RGB adjustment).
 /// v16 adds negadoctor (film negative inversion).
 /// v17 adds toneequalizer (exposure-channel tone mapping).
-const ENCODE_VERSION: u8 = 17;
-/// 1 version byte + 24 bool bytes + 173 little-endian f32.
-const ENCODED_LEN: usize = 1 + 24 + 173 * 4;
+/// v18 adds colorbalancergb (colour balance RGB, 1 bool + 33 f32).
+const ENCODE_VERSION: u8 = 18;
+/// 1 version byte + 25 bool bytes + 206 little-endian f32.
+const ENCODED_LEN: usize = 1 + 25 + 206 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1442,6 +1702,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (15, 22, 148), // v15: primaries added
     (16, 23, 164), // v16: negadoctor added
     (17, 24, 173), // v17: toneequalizer added
+    (18, 25, 206), // v18: colorbalancergb added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2125,6 +2386,10 @@ mod tests {
         // (negadoctor/primaries). A single non-zero gain is enough to emit it.
         p.toneeq_on = true;
         p.toneeq_shadows = 0.5;
+        // color balance RGB: pos 41.5 in v50_order — after basicadj 40.0, before
+        // rgblevels 43.0.
+        p.cb_on = true;
+        p.cb_contrast = 0.3;
         // graduatednd enabled too, so the toneequal-before-graduatednd order is
         // actually pinned by this test.
         p.gradnd_on = true;
@@ -2135,8 +2400,13 @@ mod tests {
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
+            ["exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
         );
+        // Color balance RGB is scene-referred (v50_order 41.5): it must run
+        // before the sigmoid tone map (45.3), on unbounded linear data.
+        let cb = names.iter().position(|n| *n == "colorbalancergb").unwrap();
+        let sig_pos = names.iter().position(|n| *n == "sigmoid").unwrap();
+        assert!(cb < sig_pos, "colorbalancergb must run before sigmoid: {names:?}");
         // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
         // it clips at its black point and treats L as 0..100, so running it
         // before the tone map would crush the scene-linear highlights sigmoid
@@ -2474,6 +2744,43 @@ mod tests {
             toneeq_highlights: 0.77,
             toneeq_whites: -0.88,
             toneeq_speculars: 0.99,
+            // Color balance RGB: every field set off-default and pairwise
+            // distinct, so a wrong offset in the 33-float block shows as a
+            // mismatch.
+            cb_on: true,
+            cb_shadows_y: 0.01,
+            cb_shadows_c: -0.02,
+            cb_shadows_h: 3.0,
+            cb_midtones_y: 0.04,
+            cb_midtones_c: -0.05,
+            cb_midtones_h: 6.0,
+            cb_highlights_y: 0.07,
+            cb_highlights_c: -0.08,
+            cb_highlights_h: 9.0,
+            cb_global_y: 0.10,
+            cb_global_c: -0.11,
+            cb_global_h: 12.0,
+            cb_shadows_weight: 1.13,
+            cb_white_fulcrum: -1.14,
+            cb_highlights_weight: 2.15,
+            cb_chroma_shadows: 0.16,
+            cb_chroma_highlights: -0.17,
+            cb_chroma_global: 0.18,
+            cb_chroma_midtones: -0.19,
+            cb_saturation_global: 0.20,
+            cb_saturation_highlights: -0.21,
+            cb_saturation_midtones: 0.22,
+            cb_saturation_shadows: -0.23,
+            cb_hue_angle: 24.0,
+            cb_brilliance_global: 0.25,
+            cb_brilliance_highlights: -0.26,
+            cb_brilliance_midtones: 0.27,
+            cb_brilliance_shadows: -0.28,
+            cb_mask_grey_fulcrum: 0.29,
+            cb_vibrance: -0.30,
+            cb_grey_fulcrum: 0.31,
+            cb_contrast: -0.32,
+            cb_formula: 0.0, // JzAzBz — the non-default formula
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -2781,6 +3088,167 @@ mod tests {
                 chunk[0] / dark[0]
             );
         }
+    }
+
+    #[test]
+    fn decode_v17_blob_defaults_cb_fields() {
+        // A v17 blob (before color balance RGB was added — 24 bools / 173 f32s)
+        // must decode successfully: the new cb_* fields fall back to their
+        // defaults, so a saved style from the pre-colorbalancergb era loads
+        // cleanly.
+        let v17 = {
+            let mut b = vec![0u8; 1 + 24 + 173 * 4];
+            b[0] = 17; // version 17
+            b
+        };
+        let decoded = PreviewParams::decode(&v17)
+            .expect("v17 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.cb_on, def.cb_on);
+        assert_eq!(decoded.cb_shadows_y, def.cb_shadows_y);
+        assert_eq!(decoded.cb_shadows_h, def.cb_shadows_h);
+        assert_eq!(decoded.cb_midtones_y, def.cb_midtones_y);
+        assert_eq!(decoded.cb_highlights_c, def.cb_highlights_c);
+        assert_eq!(decoded.cb_global_y, def.cb_global_y);
+        assert_eq!(decoded.cb_global_h, def.cb_global_h);
+        assert_eq!(decoded.cb_shadows_weight, def.cb_shadows_weight);
+        assert_eq!(decoded.cb_white_fulcrum, def.cb_white_fulcrum);
+        assert_eq!(decoded.cb_chroma_shadows, def.cb_chroma_shadows);
+        assert_eq!(decoded.cb_saturation_global, def.cb_saturation_global);
+        assert_eq!(decoded.cb_saturation_shadows, def.cb_saturation_shadows);
+        assert_eq!(decoded.cb_hue_angle, def.cb_hue_angle);
+        assert_eq!(decoded.cb_brilliance_global, def.cb_brilliance_global);
+        assert_eq!(decoded.cb_brilliance_shadows, def.cb_brilliance_shadows);
+        assert_eq!(decoded.cb_mask_grey_fulcrum, def.cb_mask_grey_fulcrum);
+        assert_eq!(decoded.cb_vibrance, def.cb_vibrance);
+        assert_eq!(decoded.cb_grey_fulcrum, def.cb_grey_fulcrum);
+        assert_eq!(decoded.cb_contrast, def.cb_contrast);
+        assert_eq!(decoded.cb_formula, def.cb_formula);
+    }
+
+    #[test]
+    fn cbrgb_params_map_into_the_stage_and_gate_holds() {
+        // The UI fields must land on the right CbRgbParams slots (the mapping is
+        // positional and easy to scramble), the commit-path derivation must run
+        // at pipeline-build time (the stage carries finished data), and an
+        // enabled module at its defaults must emit NO stage.
+        {
+            let mut p = PreviewParams::default();
+            p.cb_on = true;
+            p.cb_global_y = 0.02;
+            p.cb_shadows_h = 30.0;
+            p.cb_contrast = 0.25;
+            p.cb_formula = 0.0; // JzAzBz
+
+            let pipe = p.to_pipeline(ColorSpace::Rec2020, 1.0);
+            let stage = pipe
+                .stages
+                .iter()
+                .find(|s| s.name() == "colorbalancergb")
+                .expect("colorbalancergb stage should be emitted");
+            match stage {
+                Stage::ColorBalanceRgb { data, .. } => {
+                    use c41_core::iop::colorbalancergb::{
+                        CbRgbData, CbRgbParams, SaturationFormula,
+                    };
+                    // Re-derive from an equal params set and compare: pins the
+                    // whole commit_params pass-through field-for-field.
+                    let mut expect = CbRgbParams::default();
+                    expect.global_y = 0.02;
+                    expect.shadows_h = 30.0;
+                    expect.contrast = 0.25;
+                    expect.saturation_formula = SaturationFormula::Jzazbz;
+                    let expected = CbRgbData::from_params(
+                        &expect,
+                        &c41_core::color::REC2020_TO_XYZ_D65_T4,
+                    );
+                    assert_eq!(**data, expected);
+                }
+                _ => panic!("expected Stage::ColorBalanceRgb, got {stage:?}"),
+            }
+        }
+        // The gamut LUT must follow the working space: identical params built
+        // for Rec.2020 vs linear sRGB produce different stage data, because the
+        // sRGB primaries move the gamut boundary the LUT encodes.
+        {
+            let stage_data = |sp: ColorSpace| {
+                let mut q = PreviewParams::default();
+                q.cb_on = true;
+                q.cb_saturation_global = 0.4;
+                match q
+                    .to_pipeline(sp, 1.0)
+                    .stages
+                    .into_iter()
+                    .find(|s| s.name() == "colorbalancergb")
+                    .expect("stage should be emitted in both spaces")
+                {
+                    Stage::ColorBalanceRgb { data, .. } => data,
+                    other => panic!("expected Stage::ColorBalanceRgb, got {other:?}"),
+                }
+            };
+            assert_ne!(
+                stage_data(ColorSpace::Rec2020),
+                stage_data(ColorSpace::LinearSrgb),
+                "gamut LUT must track the working space"
+            );
+        }
+        // Enabled at defaults ⇒ no stage (darktable's neutral edit).
+        let mut p = PreviewParams::default();
+        p.cb_on = true;
+        assert!(
+            p.to_pipeline(ColorSpace::Rec2020, 1.0)
+                .stages
+                .iter()
+                .all(|s| s.name() != "colorbalancergb"),
+            "neutral colorbalancergb params must not emit a stage"
+        );
+        // Disabled with non-neutral sliders ⇒ still no stage.
+        let mut p = PreviewParams::default();
+        p.cb_contrast = 0.5;
+        assert!(
+            p.to_pipeline(ColorSpace::Rec2020, 1.0)
+                .stages
+                .iter()
+                .all(|s| s.name() != "colorbalancergb"),
+            "a disabled module must never emit a stage"
+        );
+        // Default UI params are neutral (guards a default/`cb_is_neutral`
+        // divergence the way `default_primaries_params_are_a_true_no_op` does).
+        assert!(PreviewParams::default().cb_is_neutral());
+    }
+
+    #[test]
+    fn cbrgb_global_saturation_boost_end_to_end() {
+        // End-to-end through to_pipeline + Pipeline::process: a global
+        // saturation boost on a saturated patch must increase chroma while
+        // keeping luminance roughly stable (dt-UCS brilliance axis untouched),
+        // and the output must stay finite/non-negative (the gamut map's job).
+        let mut p = PreviewParams::default();
+        // Defaults leave only exposure enabled, inert at ev 0 / black 0 — so
+        // the pipeline under test is exactly one ColorBalanceRgb stage.
+        p.cb_on = true;
+        p.cb_saturation_global = 0.5;
+        // A mid orange in Rec.2020-linear terms.
+        let input: Vec<f32> = [0.45_f32, 0.22, 0.05, 1.0].repeat(16);
+        let out = p.to_pipeline(ColorSpace::Rec2020, 1.0).process(&input, 4, 4);
+        for chunk in out.chunks_exact(4) {
+            assert!(chunk.iter().all(|v| v.is_finite() && *v >= 0.0), "bad px {chunk:?}");
+        }
+        let lum = |c: &[f32]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        // Chroma proxy: max channel spread.
+        let spread = |c: &[f32]| (c[0] - c[2]).abs();
+        assert!(
+            spread(&out[0..4]) > spread(&input[0..4]),
+            "global saturation should widen channel spread: {} -> {}",
+            spread(&input[0..4]),
+            spread(&out[0..4])
+        );
+        let l_in = lum(&input[0..4]);
+        let l_out = lum(&out[0..4]);
+        assert!(
+            (l_out - l_in).abs() < 0.15 * l_in,
+            "luminance should stay roughly put under pure saturation: {l_in} -> {l_out}"
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -399,6 +399,26 @@ pub enum Stage {
         /// Nine channel gains in EV (log2), −8 EV … 0 EV. All zero = identity.
         gains: [f32; 9],
     },
+
+    /// Colour balance RGB (colorbalancergb.c) — scene-referred grading in
+    /// Filmlight's Yrg space with perceptual saturation/brilliance in dt-UCS or
+    /// JzAzBz. The stage carries the **prebuilt** per-commit data: everything
+    /// `commit_params` derives (the four zone vectors, weights, fulcrums and the
+    /// hue-indexed 512-entry gamut LUT) is computed once at pipeline-build time,
+    /// because the dt-UCS LUT alone marches the RGB gamut boundary 25 600 times —
+    /// not work to redo per band.
+    ///
+    /// Converts through XYZ D65 with the buffer's working-space pair (raw
+    /// pipeline Rec.2020, non-raw linear sRGB — how the C derives everything
+    /// from the working profile), and the gamut LUT in `data` must be built
+    /// against that same space's primaries (`to_pipeline` picks both together),
+    /// so `working_space()` reports it like the other space-aware stages.
+    /// **Pixel-local**: every transform is a per-pixel colour map — no neighbour
+    /// reads, no position dependence — so the band-parallel path stays available.
+    ColorBalanceRgb {
+        data: Box<colorbalancergb::CbRgbData>,
+        space: ColorSpace,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -452,6 +472,7 @@ impl Stage {
             Stage::Primaries { .. } => "primaries",
             Stage::Negadoctor { .. } => "negadoctor",
             Stage::ToneEqual { .. } => "toneequal",
+            Stage::ColorBalanceRgb { .. } => "colorbalancergb",
         }
     }
 
@@ -545,6 +566,12 @@ impl Stage {
             // guided-filter modes WOULD read neighbours; if they are ever ported
             // this must be revisited.) Band-parallel stays available.
             Stage::ToneEqual { .. } => true,
+            // ColorBalanceRgb is pixel-local: a long chain of per-pixel colour
+            // transforms (Yrg grading, zone masks from the pixel's own luminance,
+            // perceptual saturation) — no neighbour reads, no position
+            // dependence. The gamut LUT it reads is prebuilt and immutable.
+            // Band-parallel stays available.
+            Stage::ColorBalanceRgb { .. } => true,
         }
     }
 
@@ -595,6 +622,12 @@ impl Stage {
             // it is given (darktable `default_colorspace` = IOP_CS_RGB), so no
             // Lab working-space agreement is needed.
             Stage::ToneEqual { .. } => None,
+            // ColorBalanceRgb converts through XYZ D65 with a working-space-
+            // selected RGB↔XYZ pair (its Yrg/UCS chain is space-agnostic in
+            // between), and its gamut LUT was built against that same space's
+            // primaries at pipeline-build time — so it must agree with the
+            // other Lab/space-aware stages exactly like Sharpen/Vibrance do.
+            Stage::ColorBalanceRgb { space, .. } => Some(*space),
             Stage::GraduatedNd { .. } => None,
             _ => None,
         }
@@ -1302,6 +1335,29 @@ impl Stage {
             Stage::ToneEqual { gains } => {
                 toneequal::process_preview_pixels(input, output, &gains);
             }
+            // ── ColorBalanceRgb (colorbalancergb.c) ──────────────────────
+            // Scene-referred grading in Filmlight Yrg + perceptual saturation
+            // (dt-UCS/JzAzBz). The commit_params derivation — zone vectors,
+            // weights and the 512-entry gamut LUT — is prebuilt by
+            // `PreviewParams::to_pipeline` and carried in the stage, so the
+            // per-band call is pure pixel math.
+            Stage::ColorBalanceRgb { ref data, space } => {
+                // The RGB↔XYZ-D65 pair is chosen by the buffer's working space
+                // (same split as Sharpen/Vibrance): raw previews grade in
+                // Rec.2020, non-raw in linear sRGB. `data`'s gamut LUT was
+                // built against that same space at `to_pipeline` time.
+                let (to_xyz, from_xyz): (colorbalancergb::RgbXyzConv, colorbalancergb::RgbXyzConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (
+                            crate::color::rec2020_to_xyz_d65,
+                            crate::color::xyz_d65_to_rec2020,
+                        ),
+                        ColorSpace::LinearSrgb => {
+                            (crate::color::srgb_to_xyz_d65, crate::color::xyz_d65_to_srgb)
+                        }
+                    };
+                colorbalancergb::process_in_space(input, output, data, to_xyz, from_xyz);
+            }
         }
     }
 }
@@ -1679,6 +1735,13 @@ mod tests {
                 black: 0.0, gamma: 1.0, soft_clip: 0.0, soft_clip_comp: 1.0, exposure: 0.0,
             },
             Stage::ToneEqual { gains: [0.0; 9] },
+            Stage::ColorBalanceRgb {
+                data: Box::new(colorbalancergb::CbRgbData::from_params(
+                    &colorbalancergb::CbRgbParams::default(),
+                    &crate::color::REC2020_TO_XYZ_D65_T4,
+                )),
+                space: ColorSpace::Rec2020,
+            },
         ] {
             assert!(s.is_pixel_local(), "{} should be pixel-local", s.name());
         }
