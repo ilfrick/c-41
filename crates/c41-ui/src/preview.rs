@@ -502,6 +502,41 @@ pub struct PreviewParams {
     /// L-curve anchor positions in curve-box coordinates ([0,1]²),
     /// x-sorted, first fixed at x=0 and last at x=1.
     pub tc_nodes_l: [(f32, f32); 20],
+    // ── RGB curve (m4-123, rgbcurve) ────────────────────────────────────────
+    /// RGB curve module enabled. Ships off, like darktable's default.
+    pub rc_on: bool,
+    /// Spline type per channel (`curve[ch].m_spline_type`): 0 = cubic spline,
+    /// 1 = Catmull-Rom, 2 = monotone Hermite (C default). The UI exposes ONE
+    /// interpolator dropdown that writes all three, mirroring C's
+    /// `interpolator_callback` — but they are stored per channel because C does.
+    pub rc_type_r: f32,
+    pub rc_type_g: f32,
+    pub rc_type_b: f32,
+    /// Channel linking (`autoscale`): 0 = AUTOMATIC_RGB (the R curve drives all
+    /// channels), 1 = MANUAL_RGB (independent per-channel curves). C default 0.
+    pub rc_autoscale: f32,
+    /// Colour-preservation norm for linked mode (`preserve_colors`):
+    /// 0 none, 1 luminance (C default), 2 max, 3 average, 4 sum, 5 norm,
+    /// 6 power.
+    pub rc_preserve: f32,
+    /// Anchor counts in use per channel (2..=20); tails of the node arrays
+    /// beyond these counts are ignored.
+    pub rc_nnodes_r: f32,
+    pub rc_nnodes_g: f32,
+    pub rc_nnodes_b: f32,
+    /// Per-channel anchor positions in curve-box coordinates ([0,1]²),
+    /// x-sorted, first fixed at x=0 and last at x=1.
+    pub rc_nodes_r: [(f32, f32); 20],
+    pub rc_nodes_g: [(f32, f32); 20],
+    pub rc_nodes_b: [(f32, f32); 20],
+}
+
+/// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
+/// by the tone-curve and RGB-curve default anchors.
+fn identity_nodes_20() -> [(f32, f32); 20] {
+    let mut n = [(0.0f32, 0.0f32); 20];
+    n[1] = (1.0, 1.0);
+    n
 }
 
 impl Default for PreviewParams {
@@ -765,6 +800,19 @@ impl Default for PreviewParams {
                 n[1] = (1.0, 1.0);
                 n
             },
+            rc_on: false,
+            rc_type_r: 2.0, // MONOTONE_HERMITE ($DEFAULT annotation)
+            rc_type_g: 2.0,
+            rc_type_b: 2.0,
+            rc_autoscale: 0.0, // DT_S_SCALE_AUTOMATIC_RGB (C default)
+            rc_preserve: 1.0,  // DT_RGB_NORM_LUMINANCE (C default)
+            // rgbcurve.c $DEFAULT curves: two identity nodes per channel.
+            rc_nnodes_r: 2.0,
+            rc_nnodes_g: 2.0,
+            rc_nnodes_b: 2.0,
+            rc_nodes_r: identity_nodes_20(),
+            rc_nodes_g: identity_nodes_20(),
+            rc_nodes_b: identity_nodes_20(),
         }
     }
 }
@@ -917,6 +965,9 @@ impl PreviewParams {
         // default identity anchors still run the full LUT + a/b re-derivation
         // round-trip (float noise, if nothing else) — same policy as Bloom.
         let tc_identity = !self.tc_on;
+        // RGB curve: identical policy — commit_params is trivial and process()
+        // always rebuilds + applies the LUTs while enabled.
+        let rc_identity = !self.rc_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -931,6 +982,7 @@ impl PreviewParams {
             && dn_identity
             && bl_identity
             && tc_identity
+            && rc_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -1052,6 +1104,7 @@ impl PreviewParams {
             dn_on: false,
             bl_on: false,
             tc_on: false,
+            rc_on: false,
             ..*self
         }
     }
@@ -1080,6 +1133,19 @@ impl PreviewParams {
             && self.primaries_blue_purity == 1.0
     }
 
+    /// Read up to 20 interleaved (x, y) anchors starting at float index `base`,
+    /// falling back to `dflt` slot-by-slot so short (older-version) blobs keep
+    /// their defaults instead of panicking.
+    fn decode_nodes(f: &[f32], base: usize, dflt: [(f32, f32); 20]) -> [(f32, f32); 20] {
+        let mut nodes = dflt;
+        for (k, slot) in nodes.iter_mut().enumerate() {
+            if let (Some(&x), Some(&y)) = (f.get(base + 2 * k), f.get(base + 1 + 2 * k)) {
+                *slot = (x, y);
+            }
+        }
+        nodes
+    }
+
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
     /// `[version, N×bool(u8), M×f32_le]` (see [`ENCODED_LEN`]). Decoded by
     /// [`PreviewParams::decode`].
@@ -1088,7 +1154,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1197,6 +1263,29 @@ impl PreviewParams {
         for &(x, y) in &self.tc_nodes_l {
             v.extend_from_slice(&x.to_le_bytes());
             v.extend_from_slice(&y.to_le_bytes());
+        }
+        // RGB curve (m4-123): per-channel spline types + mode scalars (floats
+        // 264–271), written as their own block AFTER the tone-curve anchors —
+        // strictly append-only, so v23 blobs keep reading tc anchors at 224.
+        for s in [
+            self.rc_type_r,
+            self.rc_type_g,
+            self.rc_type_b,
+            self.rc_autoscale,
+            self.rc_preserve,
+            self.rc_nnodes_r,
+            self.rc_nnodes_g,
+            self.rc_nnodes_b,
+        ] {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        // RGB curve anchors (m4-123): R, then G, then B — each 20 interleaved
+        // (x, y) pairs, all slots always written so the layout stays fixed.
+        for nodes in [&self.rc_nodes_r, &self.rc_nodes_g, &self.rc_nodes_b] {
+            for &(x, y) in nodes {
+                v.extend_from_slice(&x.to_le_bytes());
+                v.extend_from_slice(&y.to_le_bytes());
+            }
         }
         v
     }
@@ -1395,17 +1484,23 @@ impl PreviewParams {
             // L anchors start at float 224 as 40 interleaved (x, y) values.
             // Older blobs (v22) have none of these entries — every `.get`
             // misses and the slot keeps the C-default identity anchor.
-            tc_nodes_l: {
-                let mut nodes = d.tc_nodes_l;
-                for (k, slot) in nodes.iter_mut().enumerate() {
-                    if let (Some(&x), Some(&y)) =
-                        (f.get(224 + 2 * k), f.get(225 + 2 * k))
-                    {
-                        *slot = (x, y);
-                    }
-                }
-                nodes
-            },
+            tc_nodes_l: Self::decode_nodes(&f, 224, d.tc_nodes_l),
+            // RGB curve (m4-123): scalars at floats 264–271, then R/G/B node
+            // arrays of 40 interleaved values each (272 / 312 / 352). v23-and-
+            // earlier blobs end before any of this — every `.get` misses and
+            // each slot keeps its C-default value.
+            rc_on: bools.get(33).map_or(d.rc_on, |&b| b != 0),
+            rc_type_r: f.get(264).copied().unwrap_or(d.rc_type_r),
+            rc_type_g: f.get(265).copied().unwrap_or(d.rc_type_g),
+            rc_type_b: f.get(266).copied().unwrap_or(d.rc_type_b),
+            rc_autoscale: f.get(267).copied().unwrap_or(d.rc_autoscale),
+            rc_preserve: f.get(268).copied().unwrap_or(d.rc_preserve),
+            rc_nnodes_r: f.get(269).copied().unwrap_or(d.rc_nnodes_r),
+            rc_nnodes_g: f.get(270).copied().unwrap_or(d.rc_nnodes_g),
+            rc_nnodes_b: f.get(271).copied().unwrap_or(d.rc_nnodes_b),
+            rc_nodes_r: Self::decode_nodes(&f, 272, d.rc_nodes_r),
+            rc_nodes_g: Self::decode_nodes(&f, 312, d.rc_nodes_g),
+            rc_nodes_b: Self::decode_nodes(&f, 352, d.rc_nodes_b),
         })
     }
 
@@ -1921,6 +2016,44 @@ impl PreviewParams {
                 space,
             });
         }
+        // RGB curve (iop_order.c v50 pos 50.5 — after rgblevels 50.2, before
+        // relight 51; here immediately after levels) — per-channel LUTs built
+        // from the R/G/B anchors through the V1 `curve_tools` sampler (the same
+        // machinery darktable's `dt_draw_curve_calc_values` uses), so the drawn
+        // curve IS the applied curve. Unlike tonecurve there is no autoscale
+        // re-derivation: commit_params is trivial in C and the tables are built
+        // in process(), exactly like `rgbcurve::build_luts` does. The stage
+        // applies its LUTs directly on the working RGB lanes (C
+        // default_colorspace is IOP_CS_RGB) — no Lab sandwich.
+        if self.rc_on {
+            // Keep the anchors x-sorted with endpoints pinned per channel: the
+            // editor maintains this invariant, but a decoded blob might not.
+            let pinned = |count: f32, nodes_in: &[(f32, f32); 20]| -> Vec<(f32, f32)> {
+                let nnodes = (count.round() as usize).clamp(2, 20);
+                let mut nodes = *nodes_in;
+                nodes[..nnodes]
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                nodes[0].0 = 0.0;
+                nodes[nnodes - 1].0 = 1.0;
+                nodes[..nnodes].to_vec()
+            };
+            let luts = c41_core::iop::rgbcurve::build_luts(
+                &pinned(self.rc_nnodes_r, &self.rc_nodes_r),
+                self.rc_type_r as i32 as u32,
+                &pinned(self.rc_nnodes_g, &self.rc_nodes_g),
+                self.rc_type_g as i32 as u32,
+                &pinned(self.rc_nnodes_b, &self.rc_nodes_b),
+                self.rc_type_b as i32 as u32,
+            );
+            p.push(Stage::RgbCurve {
+                table_r: luts.table_r,
+                table_g: luts.table_g,
+                table_b: luts.table_b,
+                coeffs: luts.unbounded_coeffs,
+                autoscale: self.rc_autoscale as i32,
+                preserve_colors: self.rc_preserve as i32,
+            });
+        }
         if self.velvia_on && self.velvia_strength > 0.0 {
             p.push(Stage::Velvia { strength: self.velvia_strength / 100.0, bias: self.velvia_bias });
         }
@@ -2050,9 +2183,11 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v22 adds bloom (1 bool + 3 f32).
 /// v23 adds tone curve (2 bools + 4 f32 scalars + 40 interleaved L-anchor
 /// coordinates).
-const ENCODE_VERSION: u8 = 23;
-/// 1 version byte + 33 bool bytes + 264 little-endian f32.
-const ENCODED_LEN: usize = 1 + 33 + 264 * 4;
+/// v24 adds RGB curve (1 bool + 8 f32 scalars + 3×40 interleaved R/G/B anchor
+/// coordinates).
+const ENCODE_VERSION: u8 = 24;
+/// 1 version byte + 34 bool bytes + 392 little-endian f32.
+const ENCODED_LEN: usize = 1 + 34 + 392 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2071,6 +2206,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (21, 30, 217), // v21: denoise profiled added
     (22, 31, 220), // v22: bloom added
     (23, 33, 264), // v23: tone curve added
+    (24, 34, 392), // v24: RGB curve added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2569,6 +2705,30 @@ mod tests {
     }
 
     #[test]
+    fn rgbcurve_darkens_midtones_end_to_end() {
+        // An R-channel anchor pulling 0.5 down to 0.35 must darken a mid-grey —
+        // linked AUTOMATIC_RGB mode (the default) applies the R curve to every
+        // channel, so the grey stays grey while getting darker. The drawn curve
+        // IS the applied curve (both go through curve_data_sample).
+        let mut p = PreviewParams::default();
+        p.exposure_on = false; // isolate the curve
+        p.rc_on = true;
+        p.rc_type_r = 1.0; // Catmull-Rom
+        p.rc_nnodes_r = 3.0;
+        p.rc_nodes_r[1] = (0.5, 0.35);
+        p.rc_nodes_r[2] = (1.0, 1.0);
+        assert!(!p.is_identity());
+        let base = vec![128u8, 128, 128];
+        let out = apply_pipeline(&base, 1, 1, 3, 3, &p);
+        assert!(
+            out.iter().enumerate().all(|(k, &v)| v < base[k]),
+            "every channel must darken, got {out:?} from {base:?}"
+        );
+        assert_eq!(out[0], out[1], "grey must stay neutral (equal ratios)");
+        assert_eq!(out[1], out[2]);
+    }
+
+    #[test]
     fn monochrome_produces_equal_rgb_from_weighted_mix() {
         // weights (0.2,0.7,0.1) on (1.0, 0.502, 0.0):
         // gray = 0.2 + 0.7*0.502 + 0 = 0.5514 → *255 ≈ 141, R=G=B.
@@ -2812,13 +2972,16 @@ mod tests {
         // tone curve: pos 48 in v50_order — display-referred cluster, between
         // colisa 47 and levels 49. On by itself is enough to emit the stage.
         p.tc_on = true;
+        // RGB curve: pos 50.5 in v50_order — right after rgblevels 50.2 /
+        // levels, before relight 51. On by itself is enough to emit the stage.
+        p.rc_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "rgbcurve", "velvia", "bloom", "colorize", "splittoning"]
         );
         // Tone curve sits in the display-referred cluster (iop_order.c pos 48):
         // after the scene-referred tone map, before levels.
@@ -2856,6 +3019,12 @@ mod tests {
         let lev = names.iter().position(|n| *n == "levels").unwrap();
         assert!(lev > sig_pos, "levels must run after sigmoid: {names:?}");
         assert!(lev > filmic, "levels must run after filmicrgb: {names:?}");
+        // RGB curve is v50_order 50.5: immediately after levels, still ahead of
+        // the creative cluster (velvia onwards).
+        let rc = names.iter().position(|n| *n == "rgbcurve").unwrap();
+        assert!(rc > lev, "rgbcurve must run after levels: {names:?}");
+        assert!(rc < names.iter().position(|n| *n == "velvia").unwrap(),
+            "rgbcurve must run before velvia: {names:?}");
     }
 
     /// Ties PreviewParams::default() (the UI defaults) to the identity matrix in
@@ -3268,6 +3437,38 @@ mod tests {
                 n[2] = (1.0, 1.0);
                 n
             },
+            // RGB curve: bool flipped from default; every scalar off-default and
+            // pairwise distinct so a wrong offset inside the appended block shows
+            // as a mismatch; each channel's node array edited differently (R gets
+            // a third node, G keeps 2 but moves its endpoint, B gets two extra)
+            // so per-channel offsets can't silently swap.
+            rc_on: true,
+            rc_type_r: 1.0,
+            rc_type_g: 0.0,
+            rc_type_b: 2.0,
+            rc_autoscale: 1.0, // MANUAL_RGB
+            rc_preserve: 3.0,  // AVERAGE norm
+            rc_nnodes_r: 3.0,
+            rc_nnodes_g: 2.0,
+            rc_nnodes_b: 4.0,
+            rc_nodes_r: {
+                let mut n = [(0.0f32, 0.0f32); 20];
+                n[1] = (0.75, 0.4);
+                n[2] = (1.0, 1.0);
+                n
+            },
+            rc_nodes_g: {
+                let mut n = [(0.0f32, 0.0f32); 20];
+                n[1] = (0.85, 0.6);
+                n
+            },
+            rc_nodes_b: {
+                let mut n = [(0.0f32, 0.0f32); 20];
+                n[1] = (0.25, 0.45);
+                n[2] = (0.6, 0.55);
+                n[3] = (1.0, 1.0);
+                n
+            },
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -3388,6 +3589,33 @@ mod tests {
         assert_eq!(decoded.tc_preserve, def.tc_preserve);
         assert_eq!(decoded.tc_nnodes, def.tc_nnodes);
         assert_eq!(decoded.tc_nodes_l, def.tc_nodes_l);
+    }
+
+    #[test]
+    fn decode_v23_blob_defaults_rc_fields() {
+        // A v23 blob (before RGB curve was added — 33 bools / 264 f32s) must
+        // decode successfully: the new rgbcurve fields fall back to their
+        // C defaults, so a saved style from the pre-rgbcurve era loads cleanly.
+        let v23 = {
+            let mut b = vec![0u8; 1 + 33 + 264 * 4];
+            b[0] = 23; // version 23
+            b
+        };
+        let decoded = PreviewParams::decode(&v23)
+            .expect("v23 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.rc_on, def.rc_on);
+        assert_eq!(decoded.rc_type_r, def.rc_type_r);
+        assert_eq!(decoded.rc_type_g, def.rc_type_g);
+        assert_eq!(decoded.rc_type_b, def.rc_type_b);
+        assert_eq!(decoded.rc_autoscale, def.rc_autoscale);
+        assert_eq!(decoded.rc_preserve, def.rc_preserve);
+        assert_eq!(decoded.rc_nnodes_r, def.rc_nnodes_r);
+        assert_eq!(decoded.rc_nnodes_g, def.rc_nnodes_g);
+        assert_eq!(decoded.rc_nnodes_b, def.rc_nnodes_b);
+        assert_eq!(decoded.rc_nodes_r, def.rc_nodes_r);
+        assert_eq!(decoded.rc_nodes_g, def.rc_nodes_g);
+        assert_eq!(decoded.rc_nodes_b, def.rc_nodes_b);
     }
 
     #[test]

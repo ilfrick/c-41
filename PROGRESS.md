@@ -1625,3 +1625,80 @@ with no-mutation, v22-decode fallback, params→pipeline end-to-end): 757 core
 warnings. New end-to-end test pins midtone darkening through the
 full params→pipeline path (Catmull-Rom node at (0.5,0.35): 128-grey drops
 below 110, whites stay >200).
+
+## 2026-08-24T21:20Z — m4-123: RGB curve (`rgbcurve`) live preview module #31
+
+Fourth curve-family module and the second consumer of the m4-122 editor, which this
+increment generalised into a shared **multi-channel** widget. `Stage::RgbCurve` applies
+per-channel user-drawn curves directly to the working RGB lanes (IOP_CS_RGB — no Lab
+sandwich; darktable's rgbcurve likewise never leaves RGB).
+
+**Core** (`c41-core/src/iop/rgbcurve.rs`, extending the pre-existing FFI-kernel file):
+`build_luts` samples three 65 536-entry tables through the shared
+`curve_tools::curve_data_sample` and replicates `_generate_curve_lut`
+(rgbcurve.c:1671–1742) right-tail extrapolation — xm = last node x, sample xs at
+{0.7, 0.8, 0.9, 1.0}·xm with y read from `table[CLAMP((int)(x·0x10000))]`,
+exponent fitted by `eval_exp` ≡ `dt_iop_estimate_exp`; the LUT lookup index
+`((v·0x10000) as usize).clamp(0, 0xffff)` matches C's CLAMP including negative
+inputs (Rust's saturating float→uint cast lands negatives at 0 before the clamp).
+`process_pixels` implements all three process() branches: MANUAL → per-channel
+tables; AUTOMATIC + preserve==0 ("none") → R table applied to all three lanes;
+AUTOMATIC + preserve≠0 → single ratio curve(rgb_norm)/rgb_norm scaling all lanes
+equally with lum≤0 passthrough; alpha passes through (`o[3]=i[3]`). Notably C's own
+process() already delegates into the Rust FFI kernel `darkroom_rgbcurve_process`, so
+preview and production share one implementation — pinned byte-equal by
+`ffi_kernel_matches_safe_path` over 7 pixels including the v=1.0 boundary (the FFI
+delegation initially transposed the coefficient matrix; caught by that test, fixed
+with a per-channel `copy_from_slice` zip fold). Placed at iop_order v50 pos **50.5**
+(rgblevels 50.2 < rgbcurve < relight 51, verified in iop_order.c) → emitted after
+Levels; ordering test pins `levels < rgbcurve < velvia`. Pixel-local → rayon band
+path. Identity gate flag-only (`rc_identity = !rc_on`) per Bloom/ToneCurve precedent.
+
+**UI**: params **v24** (+1 bool/+8 f32/+120 interleaved node coords, blob 1090→1603,
+length-pinned by test). The encode layout is append-only and an early draft violated
+it: the 8 rc scalars went *inside* the main float list, shifting tone-curve anchors
+from float 224 to 232 and breaking six tests across persist/history/dialogs before it
+was caught — rc scalars now emit in their own loop after the tc anchor loop (floats
+264–271), R/G/B node arrays at 272–311/312–351/352–391; v23 blobs still decode with
+defaulted rc fields (dedicated fallback test). The curve editor was rebuilt as a
+shared multi-channel builder (`multi_curve_area`): channels are injected as closures
+(`TypeFn`/`SyncFn`) plus per-channel stroke colours, so tone curve (single amber L)
+and RGB curve (R/G/B-coloured lanes) share one gesture implementation; gestures route
+through the active channel, release clears every channel's drag slot (no stale drag
+across channel switches), and `set_channel_nodes` is the single write site pairing
+each array with its count. RGB-curve row: interpolator combo writes all three
+`rc_type_*` (mirrors `interpolator_callback`), linked/independent mode combo toggles
+preserve-colors row sensitivity (`_rgbcurve_show_hide_controls` analogue), norm combo
+(none/luminance/max/average/sum/norm/power = DT_RGB_NORM_*), R/G/B channel selector.
+History label "RGB curve"; drift-guard destructure extended with all 12 rc fields;
+catalog row was pre-existing.
+
+**Deviations (documented):** compensate_middle_grey path omitted (default-off; needs
+work-profile matrix plumbing); work-profile early-return cache in commit_params
+omitted (C's is pure memoization — commit_params builds nothing, so building LUTs
+once per render is faithful); picker_scale work-profile luminance is GUI-only;
+corrupted-blob spline types degrade to curve_tools' box-diagonal fallback (safe, not
+bit-faithful to C's default arm); channel selector stays visible-but-inert in linked
+mode (semantic superset of C's tab hiding).
+
+**Senior review** — fricktrade-architect died on API 402 again (recurring); fork
+subagent stood in per the documented fallback and verified against source:
+LUT generation + tail arithmetic, trivial commit_params (validates build-once-per-
+render), init() 2-node identity defaults for all channels, header $DEFAULTs
+(MONOTONE_HERMITE/AUTOMATIC_RGB/LUMINANCE/compensate_middle_grey=0), iop_order 50.5
+placement, process() xm derivation and FFI call shape, v24 offsets offset-by-offset
+both directions, editor borrow-safety (editor RefCells ≠ ctx.params RefCell), and
+cross-file consistency (identity gate/bypassed/drift guard/ordering pin).
+Verdict: **APPROVE** — zero BLOCKER/should-fix findings; three nits recorded
+(truncating type cast mirrors the existing tc pattern; unknown-blob spline type
+fallback; linked-mode channel-selector visibility), none actioned.
+
+**Verified.** First ci-local attempt failed for a dumb reason: I ran the script
+*inside* a Docker container (`docker run … bash scripts/ci-local.sh`), where docker
+does not exist — it is the host-side entry point that drives Docker itself. Re-run on
+the host: `scripts/ci-local.sh` exit 0, all four CI steps keyed off exit codes, never
+grep. c41-core **761** + c41-db 92 + c41-ui **267** green in --release (+7 rgbcurve
+core tests incl. FFI/safe byte equality and the three process() branches; +4 ui tests
+for channel routing/seed clamping/v23 fallback/ordering/end-to-end midtone darken
+with linked-channel equality), plus the release link of `c41-rs`.
+PARITY_AUDIT.md row 2.1 updated to 31 modules in the same commit.

@@ -1,4 +1,5 @@
-//! Interactive L-curve editor for the Tone curve module (m4-122).
+//! Interactive L-curve editor shared by the Tone curve (m4-122) and RGB curve
+//! (m4-123) modules.
 //!
 //! A `DrawingArea` painting the curve box — grid, dashed identity diagonal,
 //! the spline itself and draggable anchor nodes — plus click/drag handlers
@@ -9,10 +10,15 @@
 //! - **click empty space** → insert an anchor (x-order preserved, ≤ 20 nodes)
 //! - **double-click a node** → remove it (interior nodes only, ≥ 2 remain)
 //!
+//! One builder serves both modules because the interaction is identical; what
+//! differs is the number of channels (1 vs 3), the stroke colours and which
+//! params fields back each channel. Those differences are injected as closures
+//! ([`TypeFn`] reads a channel's spline type, [`SyncFn`] writes a channel's
+//! anchors back into params), so the gesture code exists exactly once.
+//!
 //! The drawn curve is sampled through [`c41_core::curve_tools::curve_data_sample`]
-//! — the *same* sampler `PreviewParams::to_pipeline` uses to build the LUT — so
-//! what the user sees is exactly what the pipeline applies. Every mutation is
-//! written back into `ctx.params.tc_nodes_l` / `tc_nnodes` before re-rendering.
+//! — the *same* sampler `PreviewParams::to_pipeline` uses to build the LUTs —
+//! so what the user sees is exactly what the pipeline applies.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -23,6 +29,7 @@ use gtk4::{DrawingArea, EventControllerMotion, GestureClick};
 use c41_core::curve_tools;
 
 use super::PreviewCtx;
+use crate::preview::PreviewParams;
 
 /// Widget padding around the plot box, in px.
 const PAD: f64 = 10.0;
@@ -32,6 +39,37 @@ const HIT_PX: f64 = 10.0;
 const X_EPS: f32 = 1e-4;
 /// Curve samples drawn per repaint.
 const DRAW_SAMPLES: usize = 256;
+/// Maximum anchors per channel (the encoded-blob slot count).
+const MAX_ANCHORS: usize = 20;
+
+/// Stroke + grab-ring colours for one channel's curve.
+#[derive(Clone, Copy)]
+struct ChannelStyle {
+    line: (f64, f64, f64),
+    ring: (f64, f64, f64),
+}
+
+/// Tone curve: the single Lab L channel, amber.
+const TONECURVE_STYLE: ChannelStyle = ChannelStyle {
+    line: (0.98, 0.72, 0.11),
+    ring: (0.98, 0.72, 0.11),
+};
+
+/// RGB curve: per-channel colours matching the R/G/B lanes they remap.
+const RGBCURVE_STYLES: [ChannelStyle; 3] = [
+    ChannelStyle {
+        line: (0.94, 0.25, 0.25),
+        ring: (0.94, 0.25, 0.25),
+    },
+    ChannelStyle {
+        line: (0.30, 0.85, 0.35),
+        ring: (0.30, 0.85, 0.35),
+    },
+    ChannelStyle {
+        line: (0.35, 0.55, 0.98),
+        ring: (0.35, 0.55, 0.98),
+    },
+];
 
 /// The plot rectangle inside the widget: `[x, x+w) × [y, y+h)`, with curve
 /// coordinate (0,0) mapping to its bottom-left corner (y flipped).
@@ -71,12 +109,12 @@ impl PlotRect {
 }
 
 /// Insert `(x, y)` keeping the list x-sorted. Returns the new index, or `None`
-/// when the list already holds [`curve_tools::MAX_ANCHORS`] nodes or the
-/// (box-clamped) x collides with a neighbour — every spline rejects
-/// non-increasing anchors, so a duplicate x would silently snap the whole
-/// curve to the identity diagonal while the nodes stay visible.
+/// when the list already holds [`MAX_ANCHORS`] nodes or the (box-clamped) x
+/// collides with a neighbour — every spline rejects non-increasing anchors, so
+/// a duplicate x would silently snap the whole curve to the identity diagonal
+/// while the nodes stay visible.
 fn insert_node(nodes: &mut Vec<(f32, f32)>, x: f32, y: f32) -> Option<usize> {
-    if nodes.len() >= curve_tools::MAX_ANCHORS {
+    if nodes.len() >= MAX_ANCHORS {
         return None;
     }
     // Collide-check the CLAMPED x: that is what gets stored, and a raw x
@@ -130,41 +168,81 @@ fn remove_node(nodes: &mut Vec<(f32, f32)>, idx: usize) -> bool {
 
 /// Pack the live anchors into the fixed-width param array (tail zeroed), so
 /// the encoded blob layout stays stable regardless of how many are in use.
-fn nodes_to_array(nodes: &[(f32, f32)]) -> [(f32, f32); curve_tools::MAX_ANCHORS] {
-    let mut arr = [(0.0f32, 0.0f32); curve_tools::MAX_ANCHORS];
+fn nodes_to_array(nodes: &[(f32, f32)]) -> [(f32, f32); MAX_ANCHORS] {
+    let mut arr = [(0.0f32, 0.0f32); MAX_ANCHORS];
     for (slot, n) in arr.iter_mut().zip(nodes.iter()) {
         *slot = *n;
     }
     arr
 }
 
-/// Copy `nodes` into the shared params (fixed-width array + count).
-fn sync_params(ctx: &PreviewCtx, nodes: &[(f32, f32)]) {
-    let mut p = ctx.params.borrow_mut();
-    p.tc_nodes_l = nodes_to_array(nodes);
-    p.tc_nnodes = nodes.len() as f32;
+// ── RGB-curve param plumbing (pure, unit-tested) ────────────────────────────
+
+/// Copy `nodes` into channel `ch`'s fixed-width array + count (0 = R, 1 = G,
+/// 2 = B). Single write site for the editor's sync callback, so the array and
+/// its count can never disagree.
+fn set_channel_nodes(p: &mut PreviewParams, ch: usize, nodes: &[(f32, f32)]) {
+    let arr = nodes_to_array(nodes);
+    let count = nodes.len() as f32;
+    match ch {
+        0 => {
+            p.rc_nodes_r = arr;
+            p.rc_nnodes_r = count;
+        }
+        1 => {
+            p.rc_nodes_g = arr;
+            p.rc_nnodes_g = count;
+        }
+        _ => {
+            p.rc_nodes_b = arr;
+            p.rc_nnodes_b = count;
+        }
+    }
 }
 
-/// Shared editor state: the anchor list plus which node (if any) a drag holds.
-struct CurveState {
-    /// Anchors in curve-box coordinates, x-sorted, endpoints pinned at x=0/1.
-    nodes: Rc<RefCell<Vec<(f32, f32)>>>,
-    drag: Rc<Cell<Option<usize>>>,
+/// A channel's anchor array + live count, for seeding the editor.
+fn channel_nodes(p: &PreviewParams, ch: usize) -> (&[(f32, f32); MAX_ANCHORS], f32) {
+    match ch {
+        0 => (&p.rc_nodes_r, p.rc_nnodes_r),
+        1 => (&p.rc_nodes_g, p.rc_nnodes_g),
+        _ => (&p.rc_nodes_b, p.rc_nnodes_b),
+    }
 }
 
-/// Build the Tone curve module row: enable switch, interpolator selector and
-/// the interactive L-curve editor.
-pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
-    let p0 = *ctx.params.borrow();
-    let initial: Vec<(f32, f32)> =
-        p0.tc_nodes_l[..(p0.tc_nnodes.round() as usize).clamp(2, curve_tools::MAX_ANCHORS)]
-            .to_vec();
-    let state = Rc::new(CurveState {
-        nodes: Rc::new(RefCell::new(initial)),
-        drag: Rc::new(Cell::new(None)),
-    });
+// ── Shared multi-channel editor ──────────────────────────────────────────────
 
-    // ── The editor canvas ──────────────────────────────────────────────────
+/// Reads a channel's spline type from the live params (the drawn curve must
+/// follow the interpolator dropdown without a rebuild).
+type TypeFn = Rc<dyn Fn(&PreviewParams, usize) -> u32>;
+/// Writes a channel's anchors back into the shared params before re-rendering.
+type SyncFn = Rc<dyn Fn(&PreviewCtx, usize, &[(f32, f32)])>;
+
+/// Shared editor state: per-channel anchor lists plus which node (if any) each
+/// channel's drag holds, and which channel the gestures edit / the canvas paints.
+struct MultiCurveState {
+    channels: Vec<(Rc<RefCell<Vec<(f32, f32)>>>, Rc<Cell<Option<usize>>>)>,
+    /// Index into [`MultiCurveState::channels`] (bounded by the selector UI).
+    active: Rc<Cell<usize>>,
+}
+
+impl MultiCurveState {
+    /// The active channel, clamped so an out-of-range index can never panic.
+    fn active_ch(&self) -> usize {
+        self.active.get().min(self.channels.len().saturating_sub(1))
+    }
+}
+
+/// Build the interactive curve canvas for `state`: draw func painting the
+/// ACTIVE channel through its own style/spline-type, and click/motion/release
+/// gestures routed at the active channel. Every mutation goes through `sync`
+/// (which writes params) followed by a re-render.
+fn multi_curve_area(
+    ctx: &PreviewCtx,
+    state: &Rc<MultiCurveState>,
+    styles: Vec<ChannelStyle>,
+    type_of: TypeFn,
+    sync: SyncFn,
+) -> DrawingArea {
     let area = DrawingArea::builder()
         .content_width(240)
         .content_height(170)
@@ -176,45 +254,54 @@ pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     area.set_margin_start(6);
     area.set_margin_end(6);
 
-    // Draw func: captures ctx (to read tc_type live) + the shared nodes + the
-    // drag slot (so the grabbed node gets a highlight ring). No reference back
-    // to `area`, so no ownership cycle.
+    // Draw func: captures ctx (to read the live spline type), the shared
+    // state and the styles. No reference back to `area`, so no ownership cycle.
     {
         let draw_ctx = ctx.clone();
-        let draw_nodes = state.nodes.clone();
-        let draw_drag = state.drag.clone();
+        let draw_state = state.clone();
+        let mut draw_styles = styles.clone();
+        let type_of = type_of.clone();
         area.set_draw_func(move |_, cr, w, h| {
             let rect = PlotRect::from_widget_size(w, h);
-            let spline_type = draw_ctx.params.borrow().tc_type as i32 as u32;
-            let nodes = draw_nodes.borrow();
-            draw_curve(cr, rect, &nodes, spline_type, draw_drag.get());
+            let ch = draw_state.active_ch();
+            // Defensive against a styles slice shorter than the channel count
+            // (both call sites ship matching lengths; this keeps indexing total).
+            while draw_styles.len() < draw_state.channels.len() {
+                draw_styles.push(*draw_styles.last().unwrap_or(&TONECURVE_STYLE));
+            }
+            let (nodes, drag) = &draw_state.channels[ch];
+            let spline_type = type_of(&draw_ctx.params.borrow(), ch);
+            let nodes = nodes.borrow();
+            draw_curve(cr, rect, &nodes, spline_type, drag.get(), &draw_styles[ch]);
         });
     }
 
-    // ── Gestures ───────────────────────────────────────────────────────────
-    // Press: grab / insert / double-click-remove. Motion: move the grabbed
-    // node. Release: drop it. Every mutation syncs params + re-renders.
+    // Gestures: press grabs/inserts/removes on the ACTIVE channel, motion moves
+    // the grabbed node, release drops it. Every mutation syncs params + repaints.
     let click = GestureClick::new();
     {
         let st = state.clone();
         let edit_ctx = ctx.clone();
         let edit_area = area.downgrade();
+        let sync = sync.clone();
         click.connect_pressed(move |_, n_press, wx, wy| {
             let rect = current_rect(&edit_area);
             let Some(rect) = rect else { return };
+            let ch = st.active_ch();
+            let (nodes_cell, drag_slot) = st.channels[ch].clone();
             let (u, v) = rect.to_curve(wx, wy);
             // Double-click on a node removes it (interior only).
             if n_press >= 2 {
                 let hit = {
-                    let nodes = st.nodes.borrow();
+                    let nodes = nodes_cell.borrow();
                     hit_node(&nodes, u as f32, v as f32, hit_tol(rect))
                 };
                 if let Some(idx) = hit {
-                    let removed = remove_node(&mut st.nodes.borrow_mut(), idx);
-                    st.drag.set(None);
+                    let removed = remove_node(&mut nodes_cell.borrow_mut(), idx);
+                    drag_slot.set(None);
                     if removed {
-                        let nodes = st.nodes.borrow();
-                        sync_params(&edit_ctx, &nodes);
+                        let nodes = nodes_cell.borrow();
+                        sync(&edit_ctx, ch, &nodes);
                         drop(nodes);
                         if let Some(a) = edit_area.upgrade() {
                             a.queue_draw();
@@ -226,7 +313,7 @@ pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             }
             // Single press: grab a nearby node, or plant a new one here.
             let hit = {
-                let nodes = st.nodes.borrow();
+                let nodes = nodes_cell.borrow();
                 hit_node(&nodes, u as f32, v as f32, hit_tol(rect))
             };
             let target = match hit {
@@ -234,16 +321,16 @@ pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 None => {
                     // Only accept inserts that land inside the plot box.
                     if (0.0..=1.0).contains(&(u as f32)) && (0.0..=1.0).contains(&(v as f32)) {
-                        insert_node(&mut st.nodes.borrow_mut(), u as f32, v as f32)
+                        insert_node(&mut nodes_cell.borrow_mut(), u as f32, v as f32)
                     } else {
                         None
                     }
                 }
             };
-            st.drag.set(target);
+            drag_slot.set(target);
             if target.is_some() {
-                let nodes = st.nodes.borrow();
-                sync_params(&edit_ctx, &nodes);
+                let nodes = nodes_cell.borrow();
+                sync(&edit_ctx, ch, &nodes);
                 drop(nodes);
                 if let Some(a) = edit_area.upgrade() {
                     a.queue_draw();
@@ -256,7 +343,9 @@ pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         let st = state.clone();
         let end_area = area.downgrade();
         click.connect_released(move |_, _, _, _| {
-            st.drag.set(None);
+            for (_, drag_slot) in &st.channels {
+                drag_slot.set(None);
+            }
             if let Some(a) = end_area.upgrade() {
                 a.queue_draw();
             }
@@ -270,18 +359,20 @@ pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         let move_ctx = ctx.clone();
         let move_area = area.downgrade();
         motion.connect_motion(move |_, wx, wy| {
-            let Some(_idx) = st.drag.get() else { return };
+            let ch = st.active_ch();
+            let (nodes_cell, drag_slot) = st.channels[ch].clone();
+            let Some(_idx) = drag_slot.get() else { return };
             let Some(rect) = current_rect(&move_area) else { return };
             let (u, v) = rect.to_curve(wx, wy);
             {
-                let mut nodes = st.nodes.borrow_mut();
-                let Some(idx) = st.drag.get() else { return };
+                let mut nodes = nodes_cell.borrow_mut();
+                let Some(idx) = drag_slot.get() else { return };
                 let clamped_x = clamp_drag_x(&nodes, idx, u as f32);
                 nodes[idx] = (
                     clamped_x,
                     (v as f32).clamp(0.0, 1.0),
                 );
-                sync_params(&move_ctx, &nodes);
+                sync(&move_ctx, ch, &nodes);
             }
             if let Some(a) = move_area.upgrade() {
                 a.queue_draw();
@@ -290,6 +381,37 @@ pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         });
     }
     area.add_controller(motion);
+
+    area
+}
+
+/// Seed a channel's live anchor list from the params (first `count` slots).
+fn seed_nodes(p: &PreviewParams, ch: usize) -> Vec<(f32, f32)> {
+    let (arr, count) = channel_nodes(p, ch);
+    arr[..(count.round() as usize).clamp(2, MAX_ANCHORS)].to_vec()
+}
+
+/// Build the Tone curve module row: enable switch, interpolator selector and
+/// the interactive L-curve editor (single Lab L channel).
+pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    let state = Rc::new(MultiCurveState {
+        channels: vec![(
+            Rc::new(RefCell::new(seed_nodes(&p0, 0))),
+            Rc::new(Cell::new(None)),
+        )],
+        active: Rc::new(Cell::new(0)),
+    });
+
+    // Spline type: one field drives the (only) channel.
+    let type_of: TypeFn = Rc::new(|p, _| p.tc_type.round() as i32 as u32);
+    // Anchors live in tc_nodes_l / tc_nnodes.
+    let sync: SyncFn = Rc::new(|ctx, _, nodes| {
+        let mut p = ctx.params.borrow_mut();
+        p.tc_nodes_l = nodes_to_array(nodes);
+        p.tc_nnodes = nodes.len() as f32;
+    });
+    let area = multi_curve_area(ctx, &state, vec![TONECURVE_STYLE], type_of, sync);
 
     // ── Module row assembly ────────────────────────────────────────────────
     let expander = super::module_expander(ctx, "Tone curve", "Lab L curve", p0.tc_on,
@@ -319,6 +441,146 @@ pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     expander
 }
 
+/// Build the RGB curve module row: enable switch, one interpolator selector
+/// (writing all three channel types, mirroring C's `interpolator_callback`),
+/// channel-mode + colour-preservation selectors, an R/G/B channel picker and
+/// the interactive editor.
+pub(crate) fn rgbcurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    let state = Rc::new(MultiCurveState {
+        channels: (0..3)
+            .map(|ch| {
+                (
+                    Rc::new(RefCell::new(seed_nodes(&p0, ch))),
+                    Rc::new(Cell::new(None)),
+                )
+            })
+            .collect(),
+        active: Rc::new(Cell::new(0)),
+    });
+
+    // Per-channel spline types; anchors route through set_channel_nodes.
+    let type_of: TypeFn = Rc::new(|p, ch| match ch {
+        0 => p.rc_type_r.round() as i32 as u32,
+        1 => p.rc_type_g.round() as i32 as u32,
+        _ => p.rc_type_b.round() as i32 as u32,
+    });
+    let sync: SyncFn = Rc::new(|ctx, ch, nodes| {
+        set_channel_nodes(&mut ctx.params.borrow_mut(), ch, nodes);
+    });
+    let area = multi_curve_area(ctx, &state, RGBCURVE_STYLES.to_vec(), type_of.clone(), sync);
+
+    let expander = super::module_expander(ctx, "RGB curve", "R/G/B curves", p0.rc_on,
+        |p, on| p.rc_on = on,
+        move |e, ctx| {
+            let p0 = *ctx.params.borrow();
+
+            // ONE interpolator dropdown for all three channels — C's
+            // interpolator_callback sets every curve's m_spline_type together.
+            let labels = ["cubic spline", "Catmull-Rom", "monotone Hermite"];
+            let interp = adw::ComboRow::builder()
+                .title("Interpolator")
+                .model(&gtk4::StringList::new(&labels))
+                .selected((p0.rc_type_r.round() as usize).min(labels.len() - 1) as u32)
+                .build();
+            {
+                let type_ctx = ctx.clone();
+                let type_area = area.downgrade();
+                interp.connect_selected_notify(move |row| {
+                    let t = row.selected() as f32;
+                    {
+                        let mut p = type_ctx.params.borrow_mut();
+                        p.rc_type_r = t;
+                        p.rc_type_g = t;
+                        p.rc_type_b = t;
+                    }
+                    if let Some(a) = type_area.upgrade() {
+                        a.queue_draw(); // the drawn spline shape changes too
+                    }
+                    super::render_preview(&type_ctx);
+                });
+            }
+
+            // Channel linking: AUTOMATIC_RGB (the R curve drives all channels)
+            // vs MANUAL_RGB (independent per-channel curves).
+            let mode_labels = ["linked", "independent"];
+            let mode = adw::ComboRow::builder()
+                .title("Channel mode")
+                .model(&gtk4::StringList::new(&mode_labels))
+                .selected((p0.rc_autoscale.round() as usize).min(mode_labels.len() - 1) as u32)
+                .build();
+
+            // Colour-preservation norm for linked mode (DT_RGB_NORM_*). Meaningless
+            // in independent mode, so it greys out there (C hides the combo too).
+            let norm_labels =
+                ["none", "luminance", "max", "average", "sum", "norm", "power"];
+            let norm = adw::ComboRow::builder()
+                .title("Preserve colors")
+                .model(&gtk4::StringList::new(&norm_labels))
+                .selected((p0.rc_preserve.round() as usize).min(norm_labels.len() - 1) as u32)
+                .sensitive(p0.rc_autoscale.round() as i32 == 0)
+                .build();
+
+            // Which channel the canvas paints + the gestures edit. In linked
+            // mode only R is editable — rgbcurve.c:855 ("if autoscale is on:
+            // do not display g and b curves") greys/hides them there too.
+            let chan_labels = ["R", "G", "B"];
+            let manual0 = p0.rc_autoscale.round() as i32 == 1;
+            let chan = adw::ComboRow::builder()
+                .title("Channel")
+                .model(&gtk4::StringList::new(&chan_labels))
+                .selected(0)
+                .sensitive(manual0)
+                .build();
+            {
+                let st = state.clone();
+                let chan_area = area.downgrade();
+                chan.connect_selected_notify(move |row| {
+                    st.active.set(row.selected() as usize);
+                    if let Some(a) = chan_area.upgrade() {
+                        a.queue_draw();
+                    }
+                });
+            }
+
+            {
+                let mode_ctx = ctx.clone();
+                let mode_area = area.downgrade();
+                let norm_for_mode = norm.clone();
+                let chan_for_mode = chan.clone();
+                mode.connect_selected_notify(move |row| {
+                    let manual = row.selected() == 1;
+                    mode_ctx.params.borrow_mut().rc_autoscale = row.selected() as f32;
+                    norm_for_mode.set_sensitive(!manual);
+                    // Linked mode edits R only; snap the picker back so an
+                    // inert G/B curve is never shown as if it were live.
+                    if manual {
+                        chan_for_mode.set_sensitive(true);
+                    } else {
+                        chan_for_mode.set_selected(0);
+                        chan_for_mode.set_sensitive(false);
+                    }
+                    if let Some(a) = mode_area.upgrade() {
+                        a.queue_draw();
+                    }
+                    super::render_preview(&mode_ctx);
+                });
+                let norm_ctx = ctx.clone();
+                norm.connect_selected_notify(move |row| {
+                    norm_ctx.params.borrow_mut().rc_preserve = row.selected() as f32;
+                    super::render_preview(&norm_ctx);
+                });
+            }
+
+            e.add_row(&interp);
+            e.add_row(&mode);
+            e.add_row(&norm);
+            e.add_row(&chan);
+            e.add_row(&area);
+        });
+    expander
+}
+
 /// Current plot rect for gesture callbacks (`None` while the widget is gone or
 /// not yet allocated).
 fn current_rect(area: &glib::WeakRef<DrawingArea>) -> Option<PlotRect> {
@@ -341,6 +603,7 @@ fn draw_curve(
     nodes: &[(f32, f32)],
     spline_type: u32,
     drag_idx: Option<usize>,
+    style: &ChannelStyle,
 ) {
     // Backdrop.
     cr.set_source_rgb(0.10, 0.10, 0.10);
@@ -374,7 +637,8 @@ fn draw_curve(
 
     // The curve itself — same sampler the pipeline builds its LUT with, so the
     // drawing IS the applied transfer function.
-    cr.set_source_rgb(0.98, 0.72, 0.11);
+    let (lr, lg, lb) = style.line;
+    cr.set_source_rgb(lr, lg, lb);
     cr.set_line_width(2.0);
     let mut lut = vec![0.0f32; DRAW_SAMPLES];
     curve_tools::curve_data_sample(nodes, spline_type, 0.0, 1.0, &mut lut);
@@ -397,7 +661,8 @@ fn draw_curve(
         cr.arc(cx, cy, 3.5, 0.0, 2.0 * std::f64::consts::PI);
         let _ = cr.fill();
         if grabbed {
-            cr.set_source_rgb(0.98, 0.72, 0.11);
+            let (rr, rg, rb) = style.ring;
+            cr.set_source_rgb(rr, rg, rb);
             cr.set_line_width(1.5);
             cr.arc(cx, cy, 5.5, 0.0, 2.0 * std::f64::consts::PI);
             let _ = cr.stroke();
@@ -460,11 +725,11 @@ mod tests {
     #[test]
     fn insert_node_refuses_when_full() {
         let mut nodes: Vec<(f32, f32)> =
-            (0..curve_tools::MAX_ANCHORS).map(|i| (i as f32 / 19.0, 0.5)).collect();
+            (0..MAX_ANCHORS).map(|i| (i as f32 / 19.0, 0.5)).collect();
         nodes[0].0 = 0.0;
         nodes.last_mut().unwrap().0 = 1.0;
         assert_eq!(insert_node(&mut nodes, 0.5, 0.5), None, "20 anchors is the cap");
-        assert_eq!(nodes.len(), curve_tools::MAX_ANCHORS);
+        assert_eq!(nodes.len(), MAX_ANCHORS);
     }
 
     #[test]
@@ -514,5 +779,44 @@ mod tests {
         assert_eq!(arr[1], (0.3, 0.2));
         assert_eq!(arr[2], (1.0, 1.0));
         assert!(arr[3..].iter().all(|&n| n == (0.0, 0.0)));
+    }
+
+    #[test]
+    fn set_channel_nodes_routes_to_the_right_channel() {
+        let mut p = PreviewParams::default();
+        let nodes = vec![(0.0, 0.0), (0.5, 0.35), (1.0, 1.0)];
+        set_channel_nodes(&mut p, 1, &nodes);
+        // G got the list AND its count…
+        assert_eq!(p.rc_nnodes_g, 3.0);
+        assert_eq!(p.rc_nodes_g[1], (0.5, 0.35));
+        // …while R and B keep their defaults untouched.
+        assert_eq!(p.rc_nnodes_r, 2.0);
+        assert_eq!(p.rc_nodes_r[1], (1.0, 1.0));
+        assert_eq!(p.rc_nnodes_b, 2.0);
+        // Channel 2 (B) routes too; the catch-all must not swallow ch 0.
+        set_channel_nodes(&mut p, 2, &nodes);
+        assert_eq!(p.rc_nnodes_b, 3.0);
+        set_channel_nodes(&mut p, 0, &nodes);
+        assert_eq!(p.rc_nnodes_r, 3.0);
+    }
+
+    #[test]
+    fn channel_nodes_seeds_from_the_matching_array_and_count() {
+        let mut p = PreviewParams::default();
+        p.rc_nnodes_b = 4.0;
+        p.rc_nodes_b[1] = (0.25, 0.45);
+        let (arr_b, count_b) = channel_nodes(&p, 2);
+        assert_eq!(count_b, 4.0);
+        assert_eq!(arr_b[1], (0.25, 0.45));
+        // Out-of-range channel falls back to B (same catch-all as the setter).
+        let (arr_x, count_x) = channel_nodes(&p, 7);
+        assert_eq!(count_x, 4.0);
+        assert_eq!(arr_x[1], (0.25, 0.45));
+
+        // seed_nodes clamps the count into [2, 20] whatever the blob said.
+        p.rc_nnodes_g = 99.0;
+        assert_eq!(seed_nodes(&p, 1).len(), MAX_ANCHORS);
+        p.rc_nnodes_g = 0.0;
+        assert_eq!(seed_nodes(&p, 1).len(), 2, "minimum two anchors");
     }
 }

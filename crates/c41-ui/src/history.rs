@@ -533,6 +533,23 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if tc {
         return "Tone curve";
     }
+    // RGB curve (m4-123): same pairwise-array comparison, now across all three
+    // channels' anchors.
+    let rc = old.rc_on != new.rc_on
+        || old.rc_type_r != new.rc_type_r
+        || old.rc_type_g != new.rc_type_g
+        || old.rc_type_b != new.rc_type_b
+        || old.rc_autoscale != new.rc_autoscale
+        || old.rc_preserve != new.rc_preserve
+        || old.rc_nnodes_r != new.rc_nnodes_r
+        || old.rc_nnodes_g != new.rc_nnodes_g
+        || old.rc_nnodes_b != new.rc_nnodes_b
+        || old.rc_nodes_r != new.rc_nodes_r
+        || old.rc_nodes_g != new.rc_nodes_g
+        || old.rc_nodes_b != new.rc_nodes_b;
+    if rc {
+        return "RGB curve";
+    }
     "Edit"
 }
 
@@ -735,6 +752,24 @@ mod tests {
                 }
             ),
             "Tone curve"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { rc_on: true, ..d() }),
+            "RGB curve"
+        );
+        assert_eq!(
+            describe_change(
+                &base,
+                &PreviewParams {
+                    rc_nodes_b: {
+                        let mut n = [(0.0f32, 0.0f32); 20];
+                        n[1] = (0.6, 0.55);
+                        n
+                    },
+                    ..d()
+                }
+            ),
+            "RGB curve"
         );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
@@ -950,6 +985,18 @@ mod tests {
             tc_preserve: _,
             tc_nnodes: _,
             tc_nodes_l: _,
+            rc_on: _,
+            rc_type_r: _,
+            rc_type_g: _,
+            rc_type_b: _,
+            rc_autoscale: _,
+            rc_preserve: _,
+            rc_nnodes_r: _,
+            rc_nnodes_g: _,
+            rc_nnodes_b: _,
+            rc_nodes_r: _,
+            rc_nodes_g: _,
+            rc_nodes_b: _,
         } = PreviewParams::default();
     }
 
@@ -1037,7 +1084,9 @@ mod tests {
         // m4-121 (bloom): 899 → 912 (1 + 31 bools + 220 f32).
         // m4-122 (tonecurve): 912 → 1090 (1 + 33 bools + 264 f32 — 4 scalars +
         // 40 interleaved L-anchor coordinates).
-        assert_eq!(PreviewParams::default().encode().len(), 1090);
+        // m4-123 (rgbcurve): 1090 → 1603 (1 + 34 bools + 392 f32 — 8 scalars +
+        // 3×40 interleaved R/G/B anchor coordinates).
+        assert_eq!(PreviewParams::default().encode().len(), 1603);
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -180,6 +180,19 @@ pub enum Stage {
         unbound_ab: i32,
         preserve_colors: i32,
         space: ColorSpace,
+    },
+    /// RGB curve (rgbcurve.c): three per-channel LUTs applied directly on the
+    /// buffer's RGB lanes (IOP_CS_RGB — no Lab conversion, so no working-space
+    /// agreement). Tables/coeffs come from [`rgbcurve::build_luts`]; `autoscale`
+    /// is 0 = AUTOMATIC_RGB (linked channels) or 1 = MANUAL_RGB (independent);
+    /// `preserve_colors` is 0 = NONE or a `color::rgb_norm` mode.
+    RgbCurve {
+        table_r: Box<[f32; 65536]>,
+        table_g: Box<[f32; 65536]>,
+        table_b: Box<[f32; 65536]>,
+        coeffs: [[f32; 3]; 3],
+        autoscale: i32,
+        preserve_colors: i32,
     },
     /// Black/grey/white point + gamma in Lab (levels.c). `black`/`range` are the
     /// normalised [0,1] stops (`levels[0]`, `levels[2] - levels[0]`) and
@@ -524,6 +537,7 @@ impl Stage {
             Stage::ColorZones { .. } => "colorzones",
             Stage::Bloom { .. } => "bloom",
             Stage::ToneCurve { .. } => "tonecurve",
+            Stage::RgbCurve { .. } => "rgbcurve",
             Stage::Levels { .. } => "levels",
             Stage::Vignette { .. } => "vignette",
             Stage::Lowlight { .. } => "lowlight",
@@ -584,6 +598,9 @@ impl Stage {
             // (plus an optional a/b re-derivation that only touches the same
             // pixel), no neighbour reads.
             Stage::ToneCurve { .. } => true,
+            // RgbCurve likewise: pure per-pixel LUT lookups / norm-ratio math,
+            // no neighbour reads.
+            Stage::RgbCurve { .. } => true,
             // Levels is pixel-local: a per-pixel tone-curve lookup on L (with
             // a/b scaled by the same ratio), no neighbour reads.
             Stage::Levels { .. } => true,
@@ -725,6 +742,9 @@ impl Stage {
             // (IOP_CS_RGB in the C, no profile dependency in the VST) — no
             // Lab conversion, no working-space agreement needed.
             Stage::DenoiseProfile { .. } => None,
+            // RgbCurve applies its LUTs directly on the working RGB lanes
+            // (C default_colorspace: IOP_CS_RGB) — nothing to agree on.
+            Stage::RgbCurve { .. } => None,
             Stage::GraduatedNd { .. } => None,
             _ => None,
         }
@@ -1123,6 +1143,23 @@ impl Stage {
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
                     output[i..i + 4].copy_from_slice(&rgb);
                 }
+            }
+            // ── RGB curve (rgbcurve.c) ──────────────────────────────────
+            // Three per-channel LUTs applied straight on the working RGB
+            // lanes — IOP_CS_RGB in the C, so no Lab sandwich. Pixel-local
+            // (pure lookups / per-pixel norm math), so it also runs on bands
+            // under rayon.
+            Stage::RgbCurve { ref table_r, ref table_g, ref table_b, ref coeffs, autoscale, preserve_colors } => {
+                rgbcurve::process_pixels(
+                    input,
+                    output,
+                    &table_r[..],
+                    &table_g[..],
+                    &table_b[..],
+                    coeffs,
+                    autoscale,
+                    preserve_colors,
+                );
             }
             // ── Levels (levels.c) ───────────────────────────────────────
             // Black/grey/white points + gamma applied to Lab L via the
@@ -1911,6 +1948,14 @@ mod tests {
                 unbound_ab: 1,
                 preserve_colors: 3,
                 space: ColorSpace::LinearSrgb,
+            },
+            Stage::RgbCurve {
+                table_r: Box::new(std::array::from_fn(|i| i as f32 / 65535.0)),
+                table_g: Box::new(std::array::from_fn(|i| i as f32 / 65535.0)),
+                table_b: Box::new(std::array::from_fn(|i| i as f32 / 65535.0)),
+                coeffs: [[1.0; 3]; 3],
+                autoscale: 0,
+                preserve_colors: 1,
             },
             Stage::Lowlight {
                 blueness: 0.0, lut: vec![0.5; 65536], space: ColorSpace::LinearSrgb,
