@@ -514,6 +514,13 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if dn {
         return "Denoise (profiled)";
     }
+    let bl = old.bl_on != new.bl_on
+        || old.bl_size != new.bl_size
+        || old.bl_threshold != new.bl_threshold
+        || old.bl_strength != new.bl_strength;
+    if bl {
+        return "Bloom";
+    }
     "Edit"
 }
 
@@ -902,6 +909,10 @@ mod tests {
             dn_strength: _,
             dn_shadows: _,
             dn_bias: _,
+            bl_on: _,
+            bl_size: _,
+            bl_threshold: _,
+            bl_strength: _,
         } = PreviewParams::default();
     }
 
@@ -986,7 +997,8 @@ mod tests {
         // m4-118 (filmicrgb): 850 → 879 (1 + 26 bools + 213 f32).
         // m4-119 (highlight reconstruction): 879 → 885 (1 + 28 bools + 214 f32).
         // m4-120 (denoise profiled): 885 → 899 (1 + 30 bools + 217 f32).
-        assert_eq!(PreviewParams::default().encode().len(), 899);
+        // m4-121 (bloom): 899 → 912 (1 + 31 bools + 220 f32).
+        assert_eq!(PreviewParams::default().encode().len(), 912);
     }
 
     #[test]

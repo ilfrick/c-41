@@ -4,6 +4,7 @@
 //! implementing `IopProcess`. Migration order follows RUST_MIGRATION_PLAN.md.
 
 pub mod agx;
+pub mod box_filters;
 pub mod ashift;
 pub mod clipping;
 pub mod denoiseprofile;

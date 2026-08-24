@@ -1878,6 +1878,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Filmic RGB" => pg.add(&filmic_module_row(ctx)),
                 "Highlight reconstruction" => pg.add(&highlights_module_row(ctx)),
                 "Denoise (profiled)" => pg.add(&denoise_module_row(ctx)),
+                "Bloom" => pg.add(&bloom_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
@@ -1973,7 +1974,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Bloom", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2885,6 +2886,26 @@ fn denoise_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         })
 }
 
+/// Bloom (bloom.c): display-referred glow — iop_order.c pos 61, a normal
+/// pipeline stage in the creative cluster, so [`module_expander`]'s plain
+/// re-render applies (no re-decode needed).
+///
+/// Slider ranges mirror the C introspection (bloom.h `$MIN/$MAX` 0..100 for
+/// all three sliders); defaults are size 20 / threshold 90 / strength 25.
+fn bloom_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Bloom", "glow around bright areas", p0.bl_on,
+        |p, on| p.bl_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Size", 0.0, 100.0, 1.0, p0.bl_size as f64,
+                |p, v| p.bl_size = v);
+            add_param_slider(e, ctx, "Threshold", 0.0, 100.0, 1.0, p0.bl_threshold as f64,
+                |p, v| p.bl_threshold = v);
+            add_param_slider(e, ctx, "Strength", 0.0, 100.0, 1.0, p0.bl_strength as f64,
+                |p, v| p.bl_strength = v);
+        })
+}
+
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     module_expander(ctx, "White balance", "channel multipliers", p0.temperature_on,
@@ -3070,7 +3091,10 @@ mod tests {
             declared.iter().all(|l| is_live_module(l)),
             "is_live_module disagrees with its own backing list"
         );
-        assert!(!is_live_module("Bloom"), "an unported module must not read as live");
+        // m4-121 ported bloom, so it must now read as live; pick another
+        // still-unported module as the negative case.
+        assert!(is_live_module("Bloom"), "a ported module must read as live");
+        assert!(!is_live_module("Grain"), "an unported module must not read as live");
     }
 
     /// Every live-module label must still exist verbatim in the catalog, else

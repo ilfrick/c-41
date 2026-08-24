@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -149,6 +149,18 @@ pub enum Stage {
         lut_h: Vec<f32>,
         channel: i32,
         mode: i32,
+        space: ColorSpace,
+    },
+    /// Glow/bloom effect (bloom.c `process`): gathers Lab L above a threshold,
+    /// box-blurs the gathered light (`dt_box_mean`, ch=1, 8 iterations) and
+    /// screen-blends it back into L. Like Colorize it round-trips RGB↔Lab, so
+    /// it needs the buffer's working colour space. **NOT pixel-local**: the
+    /// box blur reads a spatial neighbourhood (radius up to 256), so it runs
+    /// on whole frames only.
+    Bloom {
+        size: f32,
+        threshold: f32,
+        strength: f32,
         space: ColorSpace,
     },
     /// Black/grey/white point + gamma in Lab (levels.c). `black`/`range` are the
@@ -492,6 +504,7 @@ impl Stage {
             Stage::Colorize { .. } => "colorize",
             Stage::ColorCorrection { .. } => "colorcorrection",
             Stage::ColorZones { .. } => "colorzones",
+            Stage::Bloom { .. } => "bloom",
             Stage::Levels { .. } => "levels",
             Stage::Vignette { .. } => "vignette",
             Stage::Lowlight { .. } => "lowlight",
@@ -545,6 +558,9 @@ impl Stage {
             // ColorZones is pixel-local: each output pixel depends only on its
             // own input pixel (Lab→LCH→LUT→Lab, no neighbour reads).
             Stage::ColorZones { .. } => true,
+            // Bloom is NOT pixel-local: the box blur reads a spatial
+            // neighbourhood up to radius 256, so it must run on whole frames.
+            Stage::Bloom { .. } => false,
             // Levels is pixel-local: a per-pixel tone-curve lookup on L (with
             // a/b scaled by the same ratio), no neighbour reads.
             Stage::Levels { .. } => true,
@@ -637,6 +653,9 @@ impl Stage {
             Stage::ColorCorrection { space, .. } => Some(*space),
             // ColorZones also converts RGB↔Lab and must agree with the other Lab stages.
             Stage::ColorZones { space, .. } => Some(*space),
+            // Bloom converts RGB↔Lab (it operates on L) and must agree with
+            // the other Lab stages.
+            Stage::Bloom { space, .. } => Some(*space),
             // Levels works on Lab L (+ proportional a/b), so it too must agree.
             Stage::Levels { space, .. } => Some(*space),
             // Lowlight works in Lab (via XYZ), so it must agree too.
@@ -1010,6 +1029,34 @@ impl Stage {
                         lut_h.as_ptr(),
                     );
                 }
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Bloom (bloom.c) ────────────────────────────────────────
+            // Threshold-gather Lab L, box-blur the gathered light, screen-blend
+            // it back into L. Same RGB↔Lab sandwich as the other Lab-domain
+            // stages; the blur is a neighbourhood read (radius up to 256), so
+            // this stage runs on whole frames only — see is_pixel_local.
+            Stage::Bloom { size, threshold, strength, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                bloom::process(
+                    &lab_in, &mut lab_out, width, height, size, threshold, strength,
+                );
                 for p in 0..n {
                     let i = p * 4;
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
@@ -1832,6 +1879,11 @@ mod tests {
             !Stage::Sharpen { radius: 2.0, threshold: 0.0, amount: 1.0, space: ColorSpace::Rec2020, scale: 1.0 }
                 .is_pixel_local(),
             "sharpen reads neighbours ⇒ NOT pixel-local"
+        );
+        assert!(
+            !Stage::Bloom { size: 20.0, threshold: 90.0, strength: 25.0, space: ColorSpace::LinearSrgb }
+                .is_pixel_local(),
+            "bloom box-blurs a neighbourhood ⇒ NOT pixel-local"
         );
         assert!(
             !Stage::GraduatedNd {

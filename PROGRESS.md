@@ -1462,3 +1462,69 @@ restructured before compiling.
 — all four CI steps keyed off exit codes; 733 c41-core (+10 new: 4 eaw,
 6 wavelets incl. 2 review regressions) + 254 c41-ui tests green; clippy exit 0
 (pre-existing warning classes only).
+
+## 2026-08-24T19:40Z — m4-121: bloom (`bloom`) live preview module #29
+
+**What changed.** Bloom (display-referred glow, iop_order.c v50 pos 61) wired
+end to end as a normal pipeline stage. The enabler was the missing box-mean
+kernel:
+
+- **New `c41-core/src/iop/box_filters.rs`** — port of the ch=1 path of
+  `dt_box_mean` (box_filters.cc `_blur_horizontal`:185 / `_blur_vertical`:308 /
+  `_box_mean<1>`:361). Five-phase sliding window preserved exactly:
+  left-half accumulate over MIN(radius,dim); grow while `pos≤radius &&
+  pos+radius<dim`; stall when radius>dim/2; bulk subtract-*then*-add;
+  right-end decrement with `hits--` before the sub. Edge windows shrink via
+  hits-counting (window∩bounds — no clamped replication). Plain f32
+  accumulation, matching bloom's non-Kahan ch=1 dispatch. Documented
+  layout-only deviations: no MAX_VECT vectorisation; full-length scratch
+  instead of the power-of-two circular mask (numerically identical — every
+  line is independent).
+- **`bloom.rs` driver** — safe `process()` composing the existing tested FFI
+  kernels (`darkroom_bloom_gather` → box_mean_1ch → `darkroom_bloom_blend`)
+  with bloom.c process():137-146 derivations replicated including C int
+  truncation: rad = int(256·(min(100,size+1)/100)), radius = MIN(256,
+  ceil(rad·scale/iscale)) with scale/iscale ≡ 1 whole-frame (ratio kept as a
+  documented parameter slot for future tiled callers), blur radius =
+  (2r+1)/2 ≡ r, scale = exp2(min(100,strength+1)/100), BOX_ITERATIONS = 8.
+- **pipeline.rs** — `Stage::Bloom { size, threshold, strength, space }`;
+  NOT pixel-local (whole-frame serial path, like Sharpen/Lowpass); RGB↔Lab
+  sandwich in the apply arm per the Colorize precedent.
+- **UI** — PreviewParams v22 append-only (+bl_on bool #30, +bl_size/
+  bl_threshold/bl_strength floats #217-219; blob 899→912; PARAMS_LAYOUTS +=
+  (22,31,220)); defaults from bloom.h introspection (20/90/25, ranges 0..100);
+  identity gate flag-only (correct: scale ≥ exp2(0.01) > 1 means even
+  strength=0 changes output once anything passes the threshold, so there is no
+  neutral-while-enabled — same reasoning class as Colorize); to_pipeline emits
+  between velvia (57) and colorize (62) per iop_order 61, pinned by the
+  ordering test with positional assertions; history label "Bloom" + drift
+  guard + pin bump to 912; module row with three sliders mirroring the C
+  ranges; liveness test flipped ("Bloom" now live, "Grain" negative case).
+  Export parity inherits through to_pipeline.
+
+**Went wrong.** Two of my own test bugs caught before review: (1) the glow test
+put the spot at L=100, where the screen blend caps and "gains L" is
+unobservable — spot moved to L=95; (2) I forgot that 8 iterations compound the
+blur reach (~8×radius per axis), so a 21px frame was entirely inside the halo
+and an "outside the halo ⇒ exact identity" assertion failed at the corner
+(30.258 vs 30.0). Frame enlarged to 61px with decay asserted instead of
+isolation. Also one Edit accidentally clipped the whitebalance_module_row
+header when inserting bloom_module_row; restored immediately and verified.
+
+**Senior review** — fricktrade-architect died on API 402 again (recurring);
+fork subagent stood in per the documented fallback, verified every claim
+against box_filters.cc/bloom.c/iop_order.c line-by-line. Verdict: **SHIP**,
+zero BLOCKER/MAJOR/MINOR. Explicitly confirmed subtle spots: five-phase
+boundary conditions, scratch copy-before-overwrite semantics, index-safety of
+the op underflow paths, `as i32` ≡ C truncation for these positive in-range
+values, exp2 sign-flip exactness, alpha handling through the Lab sandwich,
+four-way gate agreement, and that upstream darktable in this repo calls these
+very gather/blend Rust exports. Nits applied: mass-conservation comment
+reworded (interior-only invariant, not global — border windows drop taps),
+merged duplicate `use super::` imports.
+
+**Verified.** `scripts/ci-local.sh` exit 0 twice (pre-review tree and post-nit
+tree) — all four CI steps keyed off exit codes; 741 c41-core tests (+10 new:
+5 box_filters incl. naive-reference differential across shapes/radii/
+iterations, 3 new bloom driver tests, plus existing FFI kernels) and 255
+c41-ui tests green in --release.

@@ -462,6 +462,21 @@ pub struct PreviewParams {
     /// soft slider range −10..10 (denoiseprofile.c:3559-3560); we expose
     /// −10..10, default 0. Effective correction is bias·(strength·2.5|1).
     pub dn_bias: f32,
+    // ── Bloom (bloom.c) ─────────────────────────────────────────────────────
+    // Display-referred creative module (iop_order.c v50 pos 61, between
+    // colorzones 60 and colorize 62): gathers Lab L above a threshold,
+    // box-blurs it and screen-blends it back — a whole-frame stage.
+    /// Bloom module enabled. Ships off, like darktable's default.
+    pub bl_on: bool,
+    /// Glow size (`size`), 0..100, darktable default 20. Sets the box radius:
+    /// rad = int(256·(min(100,size+1)/100)), capped at 256.
+    pub bl_size: f32,
+    /// Light threshold (`threshold`), 0..100 (on Lab L), darktable default 90.
+    /// Only L values above it contribute gathered light.
+    pub bl_threshold: f32,
+    /// Glow strength (`strength`), 0..100, darktable default 25. Scales the
+    /// gathered light by exp2(min(100,strength+1)/100) before the blur.
+    pub bl_strength: f32,
 }
 
 impl Default for PreviewParams {
@@ -709,6 +724,10 @@ impl Default for PreviewParams {
             dn_strength: 1.0,
             dn_shadows: 1.0,
             dn_bias: 0.0,
+            bl_on: false,
+            bl_size: 20.0,      // bloom.h $DEFAULT
+            bl_threshold: 90.0, // bloom.h $DEFAULT
+            bl_strength: 25.0,  // bloom.h $DEFAULT
         }
     }
 }
@@ -853,6 +872,10 @@ impl PreviewParams {
         // strict no-op while enabled (even strength 0 leaves the coarse
         // residual path). The gate mirrors `to_pipeline`: only the enable flag.
         let dn_identity = !self.dn_on;
+        // Bloom gates on the enable flag alone (like Colorize): while on, the
+        // screen blend lifts any pixel whose gathered neighbours pass the
+        // threshold, and darktable's own defaults (threshold 90) do real work.
+        let bl_identity = !self.bl_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -865,6 +888,7 @@ impl PreviewParams {
             && filmic_identity
             && hl_identity
             && dn_identity
+            && bl_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -984,6 +1008,7 @@ impl PreviewParams {
             filmic_on: false,
             hl_on: false,
             dn_on: false,
+            bl_on: false,
             ..*self
         }
     }
@@ -1020,7 +1045,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1110,6 +1135,10 @@ impl PreviewParams {
             self.dn_strength,
             self.dn_shadows,
             self.dn_bias,
+            // Bloom (m4-121).
+            self.bl_size,
+            self.bl_threshold,
+            self.bl_strength,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -1297,6 +1326,10 @@ impl PreviewParams {
             dn_strength: f.get(214).copied().unwrap_or(d.dn_strength),
             dn_shadows: f.get(215).copied().unwrap_or(d.dn_shadows),
             dn_bias: f.get(216).copied().unwrap_or(d.dn_bias),
+            bl_on: bools.get(30).map_or(d.bl_on, |&b| b != 0),
+            bl_size: f.get(217).copied().unwrap_or(d.bl_size),
+            bl_threshold: f.get(218).copied().unwrap_or(d.bl_threshold),
+            bl_strength: f.get(219).copied().unwrap_or(d.bl_strength),
         })
     }
 
@@ -1779,6 +1812,20 @@ impl PreviewParams {
         if self.velvia_on && self.velvia_strength > 0.0 {
             p.push(Stage::Velvia { strength: self.velvia_strength / 100.0, bias: self.velvia_bias });
         }
+        // Bloom (iop_order.c pos 61, creative cluster: after colorzones 60,
+        // before colorize 62) — display-referred glow: gather Lab L above the
+        // threshold, box-blur it, screen-blend back. The enable flag alone
+        // gates the stage (matching Colorize): with darktable's own defaults
+        // the screen blend does visible work whenever anything passes the
+        // threshold.
+        if self.bl_on {
+            p.push(Stage::Bloom {
+                size: self.bl_size,
+                threshold: self.bl_threshold,
+                strength: self.bl_strength,
+                space,
+            });
+        }
         // Colorize (iop_order.c pos 62, between velvia 57 and splittoning 67) —
         // replaces a/b channels with a fixed Lab colour, blends L from input.
         // The HSL params are converted to Lab here (in to_pipeline) via
@@ -1882,9 +1929,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v20 adds highlight reconstruction (2 bools + 1 f32; runs pre-demosaic in
 /// the raw front end, not as a pipeline stage — see [`PreviewParams::hl_opts`]).
 /// v21 adds denoise profiled (2 bools + 3 f32, normal pipeline stage).
-const ENCODE_VERSION: u8 = 21;
-/// 1 version byte + 30 bool bytes + 217 little-endian f32.
-const ENCODED_LEN: usize = 1 + 30 + 217 * 4;
+/// v22 adds bloom (1 bool + 3 f32).
+const ENCODE_VERSION: u8 = 22;
+/// 1 version byte + 31 bool bytes + 220 little-endian f32.
+const ENCODED_LEN: usize = 1 + 31 + 220 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1901,6 +1949,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (19, 26, 213), // v19: filmicrgb added
     (20, 28, 214), // v20: highlight reconstruction added
     (21, 30, 217), // v21: denoise profiled added
+    (22, 31, 220), // v22: bloom added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2522,6 +2571,11 @@ mod tests {
         let mut dn = PreviewParams::default();
         dn.dn_on = true;
         cfgs.push(dn);
+        // bloom disabled ⇒ identity; enabled ⇒ non-identity (same gate shape)
+        cfgs.push(PreviewParams::default());
+        let mut bl = PreviewParams::default();
+        bl.bl_on = true;
+        cfgs.push(bl);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
@@ -2603,14 +2657,25 @@ mod tests {
         // denoise profiled: pos 9/10 in v50_order — immediately after demosaic
         // 8, before exposure. On by itself is enough to emit the stage.
         p.dn_on = true;
+        // bloom: pos 61 in v50_order — creative cluster, after velvia 57,
+        // before colorize 62. On by itself is enough to emit the stage.
+        p.bl_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "levels", "velvia", "colorize", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "levels", "velvia", "bloom", "colorize", "splittoning"]
         );
+        // Bloom sits in the display-referred creative cluster (iop_order.c pos
+        // 61): after the tone map, and screen-blending on Lab L only makes sense
+        // there.
+        let bl_pos = names.iter().position(|n| *n == "bloom").unwrap();
+        assert!(bl_pos > names.iter().position(|n| *n == "velvia").unwrap(),
+            "bloom must run after velvia: {names:?}");
+        assert!(bl_pos < names.iter().position(|n| *n == "colorize").unwrap(),
+            "bloom must run before colorize: {names:?}");
         // Denoise is scene-referred and noise-thresholds against raw-domain
         // statistics: it must run BEFORE any tone mapping (exposure onwards).
         let dn_pos = names.iter().position(|n| *n == "denoiseprofile").unwrap();
@@ -3022,6 +3087,11 @@ mod tests {
             dn_strength: 0.8,
             dn_shadows: 1.3,
             dn_bias: -0.25,
+            // Bloom: bool flipped from default, floats off-default and distinct.
+            bl_on: true,
+            bl_size: 33.0,
+            bl_threshold: 72.5,
+            bl_strength: 60.5,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -3120,6 +3190,25 @@ mod tests {
         assert_eq!(decoded.dn_strength, def.dn_strength);
         assert_eq!(decoded.dn_shadows, def.dn_shadows);
         assert_eq!(decoded.dn_bias, def.dn_bias);
+    }
+
+    #[test]
+    fn decode_v21_blob_defaults_bl_fields() {
+        // A v21 blob (before bloom was added — 30 bools / 217 f32s) must
+        // decode successfully: the new bloom fields fall back to their
+        // defaults, so a saved style from the pre-bloom era loads cleanly.
+        let v21 = {
+            let mut b = vec![0u8; 1 + 30 + 217 * 4];
+            b[0] = 21; // version 21
+            b
+        };
+        let decoded = PreviewParams::decode(&v21)
+            .expect("v21 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.bl_on, def.bl_on);
+        assert_eq!(decoded.bl_size, def.bl_size);
+        assert_eq!(decoded.bl_threshold, def.bl_threshold);
+        assert_eq!(decoded.bl_strength, def.bl_strength);
     }
 
     #[test]
