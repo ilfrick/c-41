@@ -1702,3 +1702,41 @@ core tests incl. FFI/safe byte equality and the three process() branches; +4 ui 
 for channel routing/seed clamping/v23 fallback/ordering/end-to-end midtone darken
 with linked-channel equality), plus the release link of `c41-rs`.
 PARITY_AUDIT.md row 2.1 updated to 31 modules in the same commit.
+
+## 2026-08-24T22:05Z — m4-123b: fix RGB curve stage order (v50_order 42.0, not 50.5)
+
+**The bug.** The m4-123 cut emitted `Stage::RgbCurve` immediately after Levels,
+citing iop_order "v50 pos 50.5 — after rgblevels 50.2, before relight 51". That
+pin misread src/common/iop_order.c: rgbcurve@50.5 lives in **legacy_order**
+(lines 81–176), not v50_order (298–416). In v50_order — the table every other
+C41 stage pin follows — rgbcurve sits at **42.0**, between colorbalancergb 41.5
+and rgblevels 43.0, i.e. BEFORE the whole display-referred tone-mapping cluster
+(filmic 45.0 / sigmoid 45.3 / filmicrgb 46.0 / colisa 47.0 / tonecurve 48.0 /
+levels 49.0 / shadhi 50.0). Found while surveying basecurve for m4-124: its
+v50_order neighbours forced a re-check of which array each pin actually comes
+from. Practical impact: with both modules active, an RGB curve applied after
+tone-mapping/levels produces a different (wrong-order) result than darktable's
+scene-referred placement.
+
+**The fix.** Moved the RgbCurve emission block to right after ColorBalanceRgb
+in `to_pipeline` (pure move — same code, same gate); comment rewritten with a
+note recording the legacy_order confusion; canonical-ordering test updated
+(expected array gains "rgbcurve" between "colorbalancergb" and "shadhi";
+positional asserts now rc > colorbalancergb and rc < sigmoid); PARITY_AUDIT.md
+row 2.1's m4-123 paragraph corrected in the same commit (position fixed,
+blocker documented, premature-APPROVE process note kept).
+
+**Review.** fricktrade-architect died on API 402 again; the fork fallback was
+also unavailable (fork-in-fork), so the review was performed inline by this
+session with a *programmatic* cross-check instead of eyeballing: every C41 pin
+(basicadj 40 … velvia 57) parsed against all five order tables and confirmed to
+match v50_order exactly; rgbcurve = 42.0 in v30/v50/v30_jpg/v50_jpg and 50.5
+only in legacy_order; basecurve = 44.0 in all modern tables (the input for
+m4-124). No findings beyond the fix itself.
+
+**Verified.** `scripts/ci-local.sh` exit 0 — all four CI steps keyed off exit
+codes: c41-core 761 + c41-db 92 + c41-ui 267 green in --release (ordering test
+now pins colorbalancergb < rgbcurve < sigmoid). Note: an editing race with a
+concurrent worker on preview.rs briefly produced two RgbCurve emission blocks;
+resolved by keeping the concurrent (better-commented) version and dropping the
+duplicate before any build ran.

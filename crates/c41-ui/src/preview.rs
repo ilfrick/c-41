@@ -1783,6 +1783,49 @@ impl PreviewParams {
                 space,
             });
         }
+        // RGB curve (rgbcurve.c, iop_order.c v50_order pos 42.0 — between
+        // colorbalancergb 41.5 and rgblevels 43.0, i.e. BEFORE the whole
+        // display-referred tone-mapping cluster; the C comment calls it "a
+        // really versatile way to edit colour in scene-referred AND
+        // display-referred workflow"). Per-channel LUTs built from the R/G/B
+        // anchors through the V1 `curve_tools` sampler (the same machinery
+        // darktable's `dt_draw_curve_calc_values` uses), so the drawn curve IS
+        // the applied curve. Unlike tonecurve there is no autoscale
+        // re-derivation: commit_params is trivial in C and the tables are built
+        // in process(), exactly like `rgbcurve::build_luts` does. The stage
+        // applies its LUTs directly on the working RGB lanes (C
+        // default_colorspace is IOP_CS_RGB) — no Lab sandwich. (An earlier cut
+        // of this module placed it after levels, citing pos 50.5 — that entry
+        // is in legacy_order, not v50_order.)
+        if self.rc_on {
+            // Keep the anchors x-sorted with endpoints pinned per channel: the
+            // editor maintains this invariant, but a decoded blob might not.
+            let pinned = |count: f32, nodes_in: &[(f32, f32); 20]| -> Vec<(f32, f32)> {
+                let nnodes = (count.round() as usize).clamp(2, 20);
+                let mut nodes = *nodes_in;
+                nodes[..nnodes]
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                nodes[0].0 = 0.0;
+                nodes[nnodes - 1].0 = 1.0;
+                nodes[..nnodes].to_vec()
+            };
+            let luts = c41_core::iop::rgbcurve::build_luts(
+                &pinned(self.rc_nnodes_r, &self.rc_nodes_r),
+                self.rc_type_r as i32 as u32,
+                &pinned(self.rc_nnodes_g, &self.rc_nodes_g),
+                self.rc_type_g as i32 as u32,
+                &pinned(self.rc_nnodes_b, &self.rc_nodes_b),
+                self.rc_type_b as i32 as u32,
+            );
+            p.push(Stage::RgbCurve {
+                table_r: luts.table_r,
+                table_g: luts.table_g,
+                table_b: luts.table_b,
+                coeffs: luts.unbounded_coeffs,
+                autoscale: self.rc_autoscale as i32,
+                preserve_colors: self.rc_preserve as i32,
+            });
+        }
         // Shadows/Highlights (shadhi.c, iop_order.c v50_order pos 50.0 — between
         // basicadj 40.0 and colorcorrection 55.0). A Gaussian-blurred base layer is merged with the
         // original Lab pixels to lift shadows / recover highlights. NOT pixel-local
@@ -2014,44 +2057,6 @@ impl PreviewParams {
                 // memcpying 256 KB on every slider tick.
                 lut: (lut as Box<[f32]>).into_vec(),
                 space,
-            });
-        }
-        // RGB curve (iop_order.c v50 pos 50.5 — after rgblevels 50.2, before
-        // relight 51; here immediately after levels) — per-channel LUTs built
-        // from the R/G/B anchors through the V1 `curve_tools` sampler (the same
-        // machinery darktable's `dt_draw_curve_calc_values` uses), so the drawn
-        // curve IS the applied curve. Unlike tonecurve there is no autoscale
-        // re-derivation: commit_params is trivial in C and the tables are built
-        // in process(), exactly like `rgbcurve::build_luts` does. The stage
-        // applies its LUTs directly on the working RGB lanes (C
-        // default_colorspace is IOP_CS_RGB) — no Lab sandwich.
-        if self.rc_on {
-            // Keep the anchors x-sorted with endpoints pinned per channel: the
-            // editor maintains this invariant, but a decoded blob might not.
-            let pinned = |count: f32, nodes_in: &[(f32, f32); 20]| -> Vec<(f32, f32)> {
-                let nnodes = (count.round() as usize).clamp(2, 20);
-                let mut nodes = *nodes_in;
-                nodes[..nnodes]
-                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                nodes[0].0 = 0.0;
-                nodes[nnodes - 1].0 = 1.0;
-                nodes[..nnodes].to_vec()
-            };
-            let luts = c41_core::iop::rgbcurve::build_luts(
-                &pinned(self.rc_nnodes_r, &self.rc_nodes_r),
-                self.rc_type_r as i32 as u32,
-                &pinned(self.rc_nnodes_g, &self.rc_nodes_g),
-                self.rc_type_g as i32 as u32,
-                &pinned(self.rc_nnodes_b, &self.rc_nodes_b),
-                self.rc_type_b as i32 as u32,
-            );
-            p.push(Stage::RgbCurve {
-                table_r: luts.table_r,
-                table_g: luts.table_g,
-                table_b: luts.table_b,
-                coeffs: luts.unbounded_coeffs,
-                autoscale: self.rc_autoscale as i32,
-                preserve_colors: self.rc_preserve as i32,
             });
         }
         if self.velvia_on && self.velvia_strength > 0.0 {
@@ -2972,8 +2977,9 @@ mod tests {
         // tone curve: pos 48 in v50_order — display-referred cluster, between
         // colisa 47 and levels 49. On by itself is enough to emit the stage.
         p.tc_on = true;
-        // RGB curve: pos 50.5 in v50_order — right after rgblevels 50.2 /
-        // levels, before relight 51. On by itself is enough to emit the stage.
+        // RGB curve: pos 42.0 in v50_order — scene-referred cluster, between
+        // colorbalancergb 41.5 and rgblevels 43.0 (the 50.5 entry is in
+        // legacy_order, not v50). On by itself is enough to emit the stage.
         p.rc_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
@@ -2981,7 +2987,7 @@ mod tests {
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "rgbcurve", "velvia", "bloom", "colorize", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "splittoning"]
         );
         // Tone curve sits in the display-referred cluster (iop_order.c pos 48):
         // after the scene-referred tone map, before levels.
@@ -3019,12 +3025,14 @@ mod tests {
         let lev = names.iter().position(|n| *n == "levels").unwrap();
         assert!(lev > sig_pos, "levels must run after sigmoid: {names:?}");
         assert!(lev > filmic, "levels must run after filmicrgb: {names:?}");
-        // RGB curve is v50_order 50.5: immediately after levels, still ahead of
-        // the creative cluster (velvia onwards).
+        // RGB curve is v50_order 42.0 — scene-referred: after color balance
+        // RGB (41.5), before every tone-mapping module (sigmoid 45.3 onwards).
         let rc = names.iter().position(|n| *n == "rgbcurve").unwrap();
-        assert!(rc > lev, "rgbcurve must run after levels: {names:?}");
-        assert!(rc < names.iter().position(|n| *n == "velvia").unwrap(),
-            "rgbcurve must run before velvia: {names:?}");
+        assert!(
+            rc > names.iter().position(|n| *n == "colorbalancergb").unwrap(),
+            "rgbcurve must run after colorbalancergb: {names:?}"
+        );
+        assert!(rc < sig_pos, "rgbcurve must run before sigmoid: {names:?}");
     }
 
     /// Ties PreviewParams::default() (the UI defaults) to the identity matrix in
