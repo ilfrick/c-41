@@ -1135,6 +1135,81 @@ pub type StyleParamsGetter =
 /// text)` captured when the entry gained focus. See `MetadataPanel::new`.
 type MetaTarget = std::rc::Rc<std::cell::RefCell<(String, String, String)>>;
 
+/// A copied edit: the saved params blob plus the image's undo-stack, and the
+/// source path it came from. Plain data so clipboard semantics are testable
+/// without GTK.
+#[derive(Clone)]
+struct HistoryClipboard {
+    /// Full path of the copy's source (names the origin in the paste toast).
+    source: String,
+    params: crate::preview::PreviewParams,
+    stack: Option<crate::history::HistoryStack>,
+}
+
+impl HistoryClipboard {
+    /// Copy the named image's saved edit. `None` when it has none.
+    fn from_image(db_path: &str, full_path: &str) -> Option<Self> {
+        let params = crate::persist::load_saved(db_path, full_path)?;
+        Some(Self {
+            source: full_path.to_string(),
+            params,
+            stack: crate::persist::load_history(db_path, full_path),
+        })
+    }
+
+    /// Write the copied edit onto `full_path`, replacing both its rows —
+    /// darktable's paste replaces the target stack rather than appending. When
+    /// the copy carried no stack row (source predates the history feature or
+    /// its blob failed to decode), seed a fresh one-entry stack from the pasted
+    /// params instead of leaving the target's old stack describing edits that
+    /// no longer exist — the same picture the loader paints for a params row
+    /// without a stack row.
+    fn apply_to(&self, db_path: &str, full_path: &str) {
+        crate::persist::save_params(db_path, full_path, &self.params);
+        match &self.stack {
+            Some(h) => crate::persist::save_history(db_path, full_path, h),
+            None => crate::persist::save_history(
+                db_path,
+                full_path,
+                &crate::history::HistoryStack::new("Original", self.params),
+            ),
+        }
+    }
+
+    /// The source's file name for toasts ("Pasted edit from DSC_1234.NEF").
+    fn source_basename(&self) -> &str {
+        std::path::Path::new(&self.source)
+            .file_name().and_then(|n| n.to_str()).unwrap_or("another image")
+    }
+}
+
+/// Shared clipboard handle ([`HistoryClipboard`] behind an Rc cell).
+type HistoryClipboardHandle = std::rc::Rc<std::cell::RefCell<Option<HistoryClipboard>>>;
+
+/// Repaint the History section's one-line readout for `(db, path)`.
+fn refresh_history_readout(lbl: &gtk4::Label, db: &str, path: &str) {
+    lbl.set_label(&history_readout_text(db, path));
+}
+
+/// The readout text itself, split out so it is testable without GTK:
+/// "(no image selected)" / "no saved edits" / "N-step edit stack".
+fn history_readout_text(db: &str, path: &str) -> String {
+    if path.is_empty() {
+        return "(no image selected)".into();
+    }
+    // A saved params row IS an edit (even an all-neutral one): it changes how
+    // the image renders vs raw defaults, e.g. raw-only sigmoid seeding.
+    match crate::persist::load_saved(db, path) {
+        None => "no saved edits".into(),
+        Some(_) => {
+            let steps = crate::persist::load_history(db, path)
+                .map(|h| h.len())
+                .unwrap_or(1);
+            format!("{steps}-step edit stack")
+        }
+    }
+}
+
 /// Metadata inspector widget with an `update` method.
 ///
 /// All GTK fields are GObject ref-counts so `MetadataPanel` is Clone.
@@ -1153,6 +1228,17 @@ pub struct MetadataPanel {
     /// and `MetadataPanel` is `Clone`, so a clone reaching a second call site
     /// is a plausible accident rather than a theoretical one.
     styles_wired: std::rc::Rc<std::cell::Cell<bool>>,
+    /// History-stack section (parity row 2.2): copy/paste/discard on the
+    /// selected image, mirroring darktable's lighttable "actions on selection"
+    /// history group adapted to single selection.
+    history_copy_btn:    gtk4::Button,
+    history_paste_btn:   gtk4::Button,
+    history_discard_btn: gtk4::Button,
+    /// One-line state readout ("no saved edits" / "N-step edit stack").
+    history_lbl:         gtk4::Label,
+    /// The copied edit (params + undo-stack blob) awaiting Paste. Process-local,
+    /// like darktable's own history clipboard — it dies with the app.
+    history_clipboard: HistoryClipboardHandle,
     filename_lbl: gtk4::Label,
     folder_lbl:   gtk4::Label,
     dims_lbl:     gtk4::Label,
@@ -1678,6 +1764,174 @@ impl MetadataPanel {
         styles_btns.append(&style_delete_btn);
         panel.append(&styles_btns);
 
+        // Toast channel shared with the metadata editor (declared here because
+        // the history handlers below fire it too).
+        let on_notify: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(String)>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+
+        // ── History stack (parity row 2.2) ────────────────────────────────
+        // darktable's lighttable "actions on selection" history group — copy,
+        // paste, discard — adapted to C-41's single-selection grid: the
+        // actions act on the currently-selected image. Copy reads both saved
+        // rows (params + undo-stack); paste REPLACES the target's rows, as
+        // darktable's paste replaces the stack; discard clears both in one
+        // transaction and confirms first (deliberate deviation: darktable acts
+        // immediately, but its action targets a whole multi-image selection).
+        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        panel.append(&section_header("History"));
+
+        let history_lbl = gtk4::Label::builder()
+            .label("(no image selected)")
+            .halign(gtk4::Align::Start)
+            .margin_start(12).margin_end(12).margin_top(2)
+            .build();
+        history_lbl.add_css_class("dim-label");
+        panel.append(&history_lbl);
+
+        let history_btns = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .margin_start(10).margin_end(10).margin_top(4).margin_bottom(6)
+            .build();
+        let history_copy_btn = gtk4::Button::builder()
+            .label("Copy")
+            .tooltip_text("Copy this image's edit stack (darktable: copy history)")
+            .hexpand(true)
+            .build();
+        let history_paste_btn = gtk4::Button::builder()
+            .label("Paste")
+            .tooltip_text("Paste the copied edit onto this image, replacing its own (darktable: paste history)")
+            .hexpand(true)
+            .sensitive(false) // clipboard starts empty
+            .build();
+        let history_discard_btn = gtk4::Button::builder()
+            .label("Discard")
+            .tooltip_text("Remove every saved edit from this image (darktable: discard history)")
+            .hexpand(true)
+            .build();
+        history_btns.append(&history_copy_btn);
+        history_btns.append(&history_paste_btn);
+        history_btns.append(&history_discard_btn);
+        panel.append(&history_btns);
+
+        // The clipboard lives on the panel so `update()` can gate Paste's
+        // sensitivity on it across selection changes.
+        let history_clipboard: HistoryClipboardHandle =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        {
+            let clip = history_clipboard.clone();
+            let paste_btn = history_paste_btn.clone();
+            let notify = on_notify.clone();
+            let ctx = ctx.clone();
+            history_copy_btn.connect_clicked(move |_| {
+                let (path, db) = ctx.borrow().clone();
+                if path.is_empty() { return; }
+                if db.is_empty() {
+                    // Underlying reads would silently no-op; say so honestly.
+                    if let Some(n) = notify.borrow().as_ref() {
+                        n("No catalogue open".into());
+                    }
+                    return;
+                }
+                match HistoryClipboard::from_image(&db, &path) {
+                    Some(c) => {
+                        *clip.borrow_mut() = Some(c);
+                        paste_btn.set_sensitive(true);
+                    }
+                    None => {
+                        if let Some(n) = notify.borrow().as_ref() {
+                            n("Nothing to copy — the selected image has no saved edits".into());
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let clip = history_clipboard.clone();
+            let notify = on_notify.clone();
+            let lbl = history_lbl.clone();
+            let copy_btn = history_copy_btn.clone();
+            let discard_btn = history_discard_btn.clone();
+            let ctx = ctx.clone();
+            history_paste_btn.connect_clicked(move |_| {
+                let (path, db) = ctx.borrow().clone();
+                if path.is_empty() { return; }
+                if db.is_empty() {
+                    // Underlying writes would silently no-op; say so honestly.
+                    if let Some(n) = notify.borrow().as_ref() {
+                        n("No catalogue open".into());
+                    }
+                    return;
+                }
+                // Apply and lift the source name to an owned String while the
+                // clipboard borrow is alive; the guard drops at statement end.
+                let pasted_from = clip.borrow().as_ref().map(|c| {
+                    c.apply_to(&db, &path);
+                    c.source_basename().to_string()
+                });
+                let Some(from) = pasted_from else { return };
+                if let Some(n) = notify.borrow().as_ref() {
+                    n(format!("Pasted edit from {from}"));
+                }
+                refresh_history_readout(&lbl, &db, &path);
+                // The target just gained edits — mirror update()'s gating now
+                // rather than waiting for the next selection change.
+                let has_edits = crate::persist::load_saved(&db, &path).is_some();
+                copy_btn.set_sensitive(has_edits);
+                discard_btn.set_sensitive(has_edits);
+            });
+        }
+        {
+            // Discard is destructive with no undo behind it, so confirm first.
+            // Deliberate deviation from darktable, which acts immediately: its
+            // actions-on-selection target a whole multi-image selection and are
+            // part of a keyboard-driven workflow. Present on the BUTTON, not on
+            // the dialog itself — the same pattern wire_styles uses because the
+            // dialog is dismissing as the response fires.
+            let notify = on_notify.clone();
+            let lbl = history_lbl.clone();
+            let copy_btn = history_copy_btn.clone();
+            let discard_btn = history_discard_btn.clone();
+            let ctx = ctx.clone();
+            history_discard_btn.connect_clicked(move |btn| {
+                let (path, db) = ctx.borrow().clone();
+                if path.is_empty() { return; }
+                if db.is_empty() {
+                    // Underlying writes would silently no-op; say so honestly.
+                    if let Some(n) = notify.borrow().as_ref() {
+                        n("No catalogue open".into());
+                    }
+                    return;
+                }
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Discard history?")
+                    .body("Remove every saved edit from this image? This cannot be undone.")
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("discard", "Discard");
+                dialog.set_response_appearance(
+                    "discard", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("cancel"));
+                let (db_c, path_c, lbl_c, notify_c) =
+                    (db.clone(), path.clone(), lbl.clone(), notify.clone());
+                let (copy_c, discard_self) =
+                    (copy_btn.clone(), discard_btn.clone());
+                dialog.connect_response(Some("discard"), move |_, _| {
+                    crate::persist::discard_history(&db_c, &path_c);
+                    refresh_history_readout(&lbl_c, &db_c, &path_c);
+                    // Nothing remains to copy or re-discard until new edits
+                    // land; mirror update()'s gating immediately.
+                    copy_c.set_sensitive(false);
+                    discard_self.set_sensitive(false);
+                    if let Some(n) = notify_c.borrow().as_ref() {
+                        n("Discarded all edits".into());
+                    }
+                });
+                let parent = btn.clone().upcast::<gtk4::Widget>();
+                dialog.present(Some(&parent));
+            });
+        }
+
         // ── Export (parity 2.6) ───────────────────────────────────────────
         // darktable's right panel ends with an export module. Ours had export
         // only as a header button; this surfaces the same `win.export-selected`
@@ -1709,8 +1963,6 @@ impl MetadataPanel {
         // (2) is what makes this correct rather than merely lucky: GTK4's ordering
         // of focus-leave against selection-changed is not contractual, and (1)
         // alone would depend on it.
-        let on_notify: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(String)>>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
         let meta_targets: Vec<MetaTarget> = Vec::new();
         let mut meta_targets = meta_targets;
         for (i, entry) in meta_entries.iter().enumerate() {
@@ -1797,7 +2049,10 @@ impl MetadataPanel {
         }
 
         Self { widget: panel, styles_list, style_save_btn, style_apply_btn,
-               style_delete_btn, meta_entries, meta_targets, on_notify,
+               style_delete_btn,
+               history_copy_btn, history_paste_btn, history_discard_btn,
+               history_lbl, history_clipboard,
+               meta_entries, meta_targets, on_notify,
                styles_wired: std::rc::Rc::new(std::cell::Cell::new(false)),
                filename_lbl, folder_lbl, dims_lbl, size_lbl,
                camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
@@ -1949,6 +2204,16 @@ impl MetadataPanel {
 
         // Store context for the tag-entry / detach handlers
         *self.ctx.borrow_mut() = (full_path.to_string(), db_path.to_string());
+
+        // History section: refresh the readout and re-derive button sensitivity
+        // from THIS image's saved state (Copy/Discard need an edited image;
+        // Paste needs a non-empty clipboard).
+        let has_edits = crate::persist::load_saved(db_path, full_path).is_some();
+        self.history_copy_btn.set_sensitive(has_edits);
+        self.history_discard_btn.set_sensitive(has_edits);
+        self.history_paste_btn.set_sensitive(
+            self.history_clipboard.borrow().is_some());
+        refresh_history_readout(&self.history_lbl, db_path, full_path);
 
         // Rebuild tag chips (display only — no notify on a mere selection change)
         rebuild_tags_flow(&self.tags_flow, &self.ctx, &self.on_tags_changed);
@@ -2702,5 +2967,111 @@ mod tests {
     fn flatten_drops_all_separator_name() {
         // A name with no representable segment contributes nothing.
         assert!(flatten_tag_tree(&[t(1, "|", 1), t(2, "", 1)]).is_empty());
+    }
+
+    /// Temp catalogue with two images (`a.raw` id 7 and `b.raw` id 8 in
+    /// `/photos`) — the copy/paste pair for the history tests. Built from
+    /// `ensure_base_schema`, the same DDL production writes under.
+    fn history_catalogue(tag: &str) -> (String, String, String) {
+        let mut p = std::env::temp_dir();
+        p.push(format!("c41-hist-{tag}-{:?}.db", std::thread::current().id()));
+        let path = p.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        c41_db::schema::ensure_base_schema(&conn).unwrap();
+        conn.execute("INSERT INTO main.film_rolls (id, folder) VALUES (1, '/photos')", [])
+            .unwrap();
+        conn.execute("INSERT INTO main.images (id, film_id, filename) VALUES (7, 1, 'a.raw')", [])
+            .unwrap();
+        conn.execute("INSERT INTO main.images (id, film_id, filename) VALUES (8, 1, 'b.raw')", [])
+            .unwrap();
+        (path, "/photos/a.raw".to_string(), "/photos/b.raw".to_string())
+    }
+
+    #[test]
+    fn history_readout_tracks_selection_and_edits() {
+        let (db, a, _b) = history_catalogue("readout");
+        assert_eq!(history_readout_text(&db, ""), "(no image selected)");
+        assert_eq!(history_readout_text(&db, &a), "no saved edits");
+
+        // A params row without a stack row still counts as one step: it changes
+        // how the image renders vs raw defaults even with nothing to undo.
+        crate::persist::save_params(
+            &db,
+            &a,
+            &crate::preview::PreviewParams { ev: 0.4, ..Default::default() },
+        );
+        assert_eq!(history_readout_text(&db, &a), "1-step edit stack");
+
+        let mut h = crate::history::HistoryStack::new(
+            "Original",
+            crate::preview::PreviewParams::default(),
+        );
+        h.record("Exposure", crate::preview::PreviewParams { ev: 0.9, ..Default::default() });
+        crate::persist::save_history(&db, &a, &h);
+        assert_eq!(history_readout_text(&db, &a), "2-step edit stack");
+    }
+
+    #[test]
+    fn clipboard_copies_edits_between_images_replacing_the_target() {
+        let (db, src, dst) = history_catalogue("paste");
+        // Source: params + 2-step stack. Destination: an older edit that paste
+        // must REPLACE (darktable's copy/paste replaces the target stack).
+        let edited = crate::preview::PreviewParams { ev: 2.0, ..Default::default() };
+        crate::persist::save_params(&db, &src, &edited);
+        let mut h = crate::history::HistoryStack::new(
+            "Original",
+            crate::preview::PreviewParams::default(),
+        );
+        h.record("Exposure", edited.clone());
+        crate::persist::save_history(&db, &src, &h);
+        crate::persist::save_params(&db, &dst, &crate::preview::PreviewParams { ev: -1.0, ..Default::default() });
+
+        let clip = HistoryClipboard::from_image(&db, &src).expect("source has edits");
+        assert_eq!(clip.params.ev, 2.0);
+        assert_eq!(clip.stack.as_ref().map(|s| s.len()), Some(2));
+        assert_eq!(clip.source_basename(), "a.raw", "toast names the source file");
+
+        clip.apply_to(&db, &dst);
+        let pasted = crate::persist::load_saved(&db, &dst).expect("params pasted");
+        assert_eq!(pasted.ev, 2.0, "destination edit was replaced, not kept");
+        assert_eq!(
+            crate::persist::load_history(&db, &dst).map(|s| s.len()),
+            Some(2),
+            "stack pasted wholesale"
+        );
+
+        // Copying an unedited image yields nothing — the UI keeps Paste disabled.
+        assert!(HistoryClipboard::from_image(&db, "/photos/never-edited.raw").is_none());
+    }
+
+    #[test]
+    fn clipboard_paste_without_stack_row_replaces_the_targets_stale_stack() {
+        // A copy of an image whose params row has NO stack row (source predates
+        // the history feature, was discarded, or its blob failed to decode) must
+        // not leave the target's old stack describing edits that no longer
+        // exist — paste replaces the whole pair.
+        let (db, src, dst) = history_catalogue("pastenostack");
+        crate::persist::save_params(
+            &db,
+            &src,
+            &crate::preview::PreviewParams { ev: 1.0, ..Default::default() },
+        );
+        let stale = crate::preview::PreviewParams { ev: -2.0, ..Default::default() };
+        let mut h = crate::history::HistoryStack::new("Original", stale);
+        h.record("Exposure", stale);
+        crate::persist::save_history(&db, &dst, &h);
+        crate::persist::save_params(&db, &dst, &stale);
+
+        HistoryClipboard::from_image(&db, &src)
+            .expect("params to copy")
+            .apply_to(&db, &dst);
+
+        assert_eq!(crate::persist::load_saved(&db, &dst).unwrap().ev, 1.0);
+        assert_eq!(
+            crate::persist::load_history(&db, &dst).map(|s| s.len()),
+            Some(1),
+            "stale stack replaced by a fresh seed stack"
+        );
     }
 }

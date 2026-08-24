@@ -191,6 +191,34 @@ fn save_history_conn(conn: &Connection, imgid: i32, history: &HistoryStack) -> r
     Ok(())
 }
 
+/// Remove every saved edit for the image at `full_path`: both the preview
+/// params row and the edit-history stack row. This is the lighttable
+/// "discard history" operation (parity row 2.2): afterwards the image renders
+/// and reopens with default params and a fresh one-entry history stack.
+///
+/// Best-effort like every writer here: silently no-ops with no db or an
+/// uncatalogued image.
+pub fn discard_history(db_path: &str, full_path: &str) {
+    if db_path.is_empty() {
+        return;
+    }
+    let Ok(conn) = Connection::open(db_path) else { return };
+    if let Some(imgid) = imgid_for_path(&conn, full_path) {
+        let _ = discard_history_conn(&conn, imgid);
+    }
+}
+
+/// Testable core of [`discard_history`]: clear both rows in one transaction so
+/// a failure cannot leave params pointing at a discarded stack (or vice versa).
+fn discard_history_conn(conn: &Connection, imgid: i32) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(PREVIEW_TABLE_DDL, [])?;
+    tx.execute(HISTORY_TABLE_DDL, [])?;
+    tx.execute("DELETE FROM main.darkroom_preview WHERE imgid = ?1", [imgid])?;
+    tx.execute("DELETE FROM main.darkroom_history WHERE imgid = ?1", [imgid])?;
+    tx.commit()
+}
+
 /// Load the saved Bayer [`DemosaicMethod`] for the image at `full_path`, falling
 /// back to the default (RCD) on any miss (no db, uncatalogued image, no row, or
 /// table absent). Unknown stored codes also decode to the default — see
@@ -1214,5 +1242,32 @@ mod style_tests {
         save_style(&db, "S", "", &params_with(1.0));
         let style = load_styles(&db).remove(0);
         assert_eq!(apply_style_to(&db, &["".to_string()], &style), 0);
+    }
+
+    #[test]
+    fn discard_history_clears_both_rows() {
+        let (_d, db) = tmp_db("discard");
+        catalogue(&db, "/photos", &["a.raw"]);
+        let img = "/photos/a.raw";
+        save_params(&db, img, &PreviewParams { ev: 1.5, ..Default::default() });
+        let mut h = HistoryStack::new("Original", PreviewParams::default());
+        h.record("Exposure", PreviewParams { ev: 0.9, ..Default::default() });
+        save_history(&db, img, &h);
+        assert!(load_saved(&db, img).is_some());
+        assert!(load_history(&db, img).is_some());
+
+        discard_history(&db, img);
+        assert!(load_saved(&db, img).is_none(), "params row must go");
+        assert!(load_history(&db, img).is_none(), "history row must go");
+    }
+
+    #[test]
+    fn discard_is_a_noop_for_uncatalogued_images() {
+        // No imgid for the path → there is nothing to delete; the call must not
+        // panic and must leave the catalogue untouched.
+        let (_d, db) = tmp_db("discardmiss");
+        discard_history(&db, "/photos/never-seen.raw"); // must not panic
+        assert!(load_saved(&db, "/photos/never-seen.raw").is_none());
+        assert!(load_history(&db, "/photos/never-seen.raw").is_none());
     }
 }

@@ -1810,3 +1810,45 @@ Docker test run (`| tail` swallows cargo's status) and was re-run redirect-first
 Process notes: PARITY_AUDIT row 2.1 updated in the same commit (31→32 live;
 only lens correction remains missing, lensfun-blocked). NIT backlog: shared
 endpoint-pinning helper when the next curve module lands.
+
+## 2026-08-24T23:20Z — m4-125: lighttable history stack operations (parity row 2.2)
+
+darktable's "actions on selection → history" group lands in C-41's lighttable as a
+**History** section on the metadata panel: Copy / Paste / Discard plus a one-line
+readout. Copy grabs the selected image's saved edit (`darkroom_preview` params blob
++ `darkroom_history` undo-stack); Paste REPLACES both target rows (dt paste
+semantics) and toasts "Pasted edit from <basename>"; Discard clears both rows
+behind an adw::AlertDialog confirm (deliberate deviation: dt acts immediately, but
+its actions target a multi-image keyboard-driven selection while our grid is
+SingleSelection). New `persist::discard_history` deletes both rows for an imgid in
+one `unchecked_transaction` (DDL inside the tx keeps it safe on legacy dbs where
+neither private table exists yet) so params can never point at a discarded stack.
+Readout is a pure headless-testable function: "(no image selected)" /
+"no saved edits" / "N-step edit stack" (a params row without a stack row counts as
+1 step — it still changes the render vs raw defaults).
+
+Review findings all fixed (fork subagent standing in as senior reviewer after the
+fricktrade-architect 402 again; APPROVE-WITH-NITS): (1) partial-paste coherence —
+a copy with params but NO stack row (pre-history source, or decode failure) now
+seeds a fresh one-entry stack from the pasted params instead of leaving the
+target's stale stack describing edits that no longer exist (+regression test);
+(2) post-action sensitivity staleness — Copy/Discard re-derive their gating at the
+tail of paste/discard instead of waiting for the next selection change;
+(3) false-success toasts when no catalogue is open — paste/discard/copy now say
+"No catalogue open" like the styles save button. NIT backlog accepted:
+history_readout_text opens two SQLite connections per call (consistent-with-
+neighbourhood cost, query_exif does the same); step count includes the "Original"
+seed (display-only, pinned by test); clipboard field now typed via the
+HistoryClipboardHandle alias.
+
+Verification: c41-ui release tests green by EXIT CODE (274 passed, incl. new
+discard-clears-both / discard-noop-for-uncatalogued / readout-transitions /
+clipboard-roundtrip-between-images / params-only-paste-replaces-stale-stack).
+First Docker run failed compile (EXIT=101) — my persist tests referenced helpers
+from a *different* test module (catalogued_db lives in metadata_tests,
+sample_history in tests) and three panels closures moved the shared ctx Rc /
+dropped a live borrow; fixed with per-closure ctx clones and a statement-scoped
+borrow that lifts the basename to owned String. En route self-correction: the
+first discard test draft also had a redundant table-wipe (tmp_db already starts
+clean). Full scripts/ci-local.sh gate then ran green by exit code.
+PARITY_AUDIT row 2.2 closed in this commit.
