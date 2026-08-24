@@ -477,6 +477,31 @@ pub struct PreviewParams {
     /// Glow strength (`strength`), 0..100, darktable default 25. Scales the
     /// gathered light by exp2(min(100,strength+1)/100) before the blur.
     pub bl_strength: f32,
+    // ── Tone curve (tonecurve.c) ────────────────────────────────────────────
+    // Three-channel Lab LUT module (iop_order.c pos 48, between colisa 47 and
+    // levels 49). First slice: the L channel editor only — a/b keep their C
+    // defaults (identity 3-node curves). Anchors are sampled through the V1
+    // `curve_tools` port (`curve_data_sample`) exactly like commit_params.
+    /// Tone curve module enabled. Ships off, like darktable's default.
+    pub tc_on: bool,
+    /// Spline type for all channels (`CurveData.m_spline_type`):
+    /// 0 = cubic spline, 1 = Catmull-Rom, 2 = monotone Hermite (C default).
+    pub tc_type: f32,
+    /// a/b re-derivation mode (`autoscale_ab`): 0 manual, 1 automatic (XYZ),
+    /// 2 automatic XYZ, 3 automatic RGB (C default).
+    pub tc_autoscale: f32,
+    /// Unbounded a/b curves (`unbound_ab`, C default true) — lets the
+    /// extrapolated a/b tails leave [0,255].
+    pub tc_unbound: bool,
+    /// Colour-preservation norm for linked a/b (`preserve_colors`,
+    /// DT_RGB_NORM_AVERAGE = 3 is the C default).
+    pub tc_preserve: f32,
+    /// Number of L-curve anchors in use (2..=20); the tail of
+    /// [`PreviewParams::tc_nodes_l`] beyond this count is ignored.
+    pub tc_nnodes: f32,
+    /// L-curve anchor positions in curve-box coordinates ([0,1]²),
+    /// x-sorted, first fixed at x=0 and last at x=1.
+    pub tc_nodes_l: [(f32, f32); 20],
 }
 
 impl Default for PreviewParams {
@@ -728,6 +753,18 @@ impl Default for PreviewParams {
             bl_size: 20.0,      // bloom.h $DEFAULT
             bl_threshold: 90.0, // bloom.h $DEFAULT
             bl_strength: 25.0,  // bloom.h $DEFAULT
+            tc_on: false,
+            tc_type: 2.0,        // MONOTONE_HERMITE ($DEFAULT annotation)
+            tc_autoscale: 3.0,   // DT_S_SCALE_AUTOMATIC_RGB (C default)
+            tc_unbound: true,    // unbound_ab = TRUE in C init()
+            tc_preserve: 3.0,    // DT_RGB_NORM_AVERAGE (C default)
+            // tonecurve.c $DEFAULT L curve: two nodes (0,0)→(1,1) — identity.
+            tc_nnodes: 2.0,
+            tc_nodes_l: {
+                let mut n = [(0.0f32, 0.0f32); 20];
+                n[1] = (1.0, 1.0);
+                n
+            },
         }
     }
 }
@@ -876,6 +913,10 @@ impl PreviewParams {
         // screen blend lifts any pixel whose gathered neighbours pass the
         // threshold, and darktable's own defaults (threshold 90) do real work.
         let bl_identity = !self.bl_on;
+        // Tone curve gates on the enable flag alone: while on, even the
+        // default identity anchors still run the full LUT + a/b re-derivation
+        // round-trip (float noise, if nothing else) — same policy as Bloom.
+        let tc_identity = !self.tc_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -889,6 +930,7 @@ impl PreviewParams {
             && hl_identity
             && dn_identity
             && bl_identity
+            && tc_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -1009,6 +1051,7 @@ impl PreviewParams {
             hl_on: false,
             dn_on: false,
             bl_on: false,
+            tc_on: false,
             ..*self
         }
     }
@@ -1045,7 +1088,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound] {
             v.push(b as u8);
         }
         for f in [
@@ -1139,8 +1182,21 @@ impl PreviewParams {
             self.bl_size,
             self.bl_threshold,
             self.bl_strength,
+            // Tone curve (m4-122): scalar controls, then the L anchors as
+            // interleaved (x0, y0, x1, y1, …) pairs — 20 slots always written
+            // so the layout stays fixed.
+            self.tc_type,
+            self.tc_autoscale,
+            self.tc_preserve,
+            self.tc_nnodes,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
+        }
+        // Tone curve L anchors (m4-122): interleaved (x0, y0, x1, y1, …) —
+        // all 20 slots always written so the layout stays fixed.
+        for &(x, y) in &self.tc_nodes_l {
+            v.extend_from_slice(&x.to_le_bytes());
+            v.extend_from_slice(&y.to_le_bytes());
         }
         v
     }
@@ -1330,6 +1386,26 @@ impl PreviewParams {
             bl_size: f.get(217).copied().unwrap_or(d.bl_size),
             bl_threshold: f.get(218).copied().unwrap_or(d.bl_threshold),
             bl_strength: f.get(219).copied().unwrap_or(d.bl_strength),
+            tc_on: bools.get(31).map_or(d.tc_on, |&b| b != 0),
+            tc_unbound: bools.get(32).map_or(d.tc_unbound, |&b| b != 0),
+            tc_type: f.get(220).copied().unwrap_or(d.tc_type),
+            tc_autoscale: f.get(221).copied().unwrap_or(d.tc_autoscale),
+            tc_preserve: f.get(222).copied().unwrap_or(d.tc_preserve),
+            tc_nnodes: f.get(223).copied().unwrap_or(d.tc_nnodes),
+            // L anchors start at float 224 as 40 interleaved (x, y) values.
+            // Older blobs (v22) have none of these entries — every `.get`
+            // misses and the slot keeps the C-default identity anchor.
+            tc_nodes_l: {
+                let mut nodes = d.tc_nodes_l;
+                for (k, slot) in nodes.iter_mut().enumerate() {
+                    if let (Some(&x), Some(&y)) =
+                        (f.get(224 + 2 * k), f.get(225 + 2 * k))
+                    {
+                        *slot = (x, y);
+                    }
+                }
+                nodes
+            },
         })
     }
 
@@ -1773,6 +1849,42 @@ impl PreviewParams {
                 space,
             });
         }
+        // Tone curve (iop_order.c pos 48, between colisa 47 and levels 49) —
+        // three-channel Lab LUT built from the L-curve anchors through the V1
+        // `curve_tools` sampler (the same machinery darktable's
+        // `dt_draw_curve_calc_values` uses), so the drawn curve IS the applied
+        // curve. First slice exposes the L channel; a/b keep their C-default
+        // identity curves (3 nodes at (0,0),(0.5,0.5),(1,1), MONOTONE_HERMITE)
+        // and the C-default autoscale/unbound/preserve modes.
+        if self.tc_on {
+            let nnodes = (self.tc_nnodes.round() as usize).clamp(2, 20);
+            let mut nodes_l = self.tc_nodes_l;
+            // Keep the anchors x-sorted and the endpoints pinned: the editor
+            // maintains this invariant, but a decoded blob might not.
+            nodes_l[..nnodes].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            nodes_l[0].0 = 0.0;
+            nodes_l[nnodes - 1].0 = 1.0;
+            let tables = c41_core::iop::tonecurve::build_lut(
+                &nodes_l[..nnodes],
+                self.tc_type as i32 as u32,
+                &TONECURVE_DEFAULT_AB_NODES,
+                c41_core::curve_tools::MONOTONE_HERMITE,
+                &TONECURVE_DEFAULT_AB_NODES,
+                c41_core::curve_tools::MONOTONE_HERMITE,
+                self.tc_autoscale as i32,
+            );
+            p.push(Stage::ToneCurve {
+                table_l: tables.table_l,
+                table_a: tables.table_a,
+                table_b: tables.table_b,
+                coeffs_l: tables.unbounded_coeffs_l,
+                coeffs_ab: tables.unbounded_coeffs_ab,
+                autoscale_ab: self.tc_autoscale as i32,
+                unbound_ab: self.tc_unbound as i32,
+                preserve_colors: self.tc_preserve as i32,
+                space,
+            });
+        }
         // Levels (iop_order.c pos 49, in the display-referred cluster with
         // colisa 47 / tonecurve 48 / shadhi 50) — runs AFTER the tone map, not
         // before it. That ordering is load-bearing, not cosmetic: levels clips
@@ -1904,6 +2016,12 @@ impl PreviewParams {
     }
 }
 
+/// tonecurve.c $DEFAULT a/b curves: 3 identity nodes, evaluated with the
+/// MONOTONE_HERMITE spline. The first slice exposes only the L editor, so a/b
+/// always build from these (matching C `commit_params`, which samples whatever
+/// the curve widgets hold — identity by default).
+const TONECURVE_DEFAULT_AB_NODES: [(f32, f32); 3] = [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)];
+
 /// Minimum black→white separation, on the 0..100 slider scale, for which a
 /// Levels stage is emitted. A hairline range is not a meaningful edit (it maps
 /// the whole tonal scale onto a sliver) and it drives `pct` — and hence the
@@ -1930,9 +2048,11 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// the raw front end, not as a pipeline stage — see [`PreviewParams::hl_opts`]).
 /// v21 adds denoise profiled (2 bools + 3 f32, normal pipeline stage).
 /// v22 adds bloom (1 bool + 3 f32).
-const ENCODE_VERSION: u8 = 22;
-/// 1 version byte + 31 bool bytes + 220 little-endian f32.
-const ENCODED_LEN: usize = 1 + 31 + 220 * 4;
+/// v23 adds tone curve (2 bools + 4 f32 scalars + 40 interleaved L-anchor
+/// coordinates).
+const ENCODE_VERSION: u8 = 23;
+/// 1 version byte + 33 bool bytes + 264 little-endian f32.
+const ENCODED_LEN: usize = 1 + 33 + 264 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1950,6 +2070,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (20, 28, 214), // v20: highlight reconstruction added
     (21, 30, 217), // v21: denoise profiled added
     (22, 31, 220), // v22: bloom added
+    (23, 33, 264), // v23: tone curve added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2425,6 +2546,29 @@ mod tests {
     }
 
     #[test]
+    fn tonecurve_darkens_midtones_end_to_end() {
+        // An L anchor pulling 0.5 down to 0.35 must darken an 8-bit mid-gray,
+        // while white stays near the top — the drawn curve IS the applied
+        // curve (both go through curve_data_sample).
+        let mut p = PreviewParams::default();
+        p.exposure_on = false; // isolate the curve
+        p.tc_on = true;
+        p.tc_type = 1.0; // Catmull-Rom
+        p.tc_nnodes = 3.0;
+        p.tc_nodes_l[1] = (0.5, 0.35);
+        p.tc_nodes_l[2] = (1.0, 1.0);
+        assert!(!p.is_identity());
+        let base = vec![128u8, 128, 128, 250, 250, 250];
+        let out = apply_pipeline(&base, 2, 1, 3, 3, &p);
+        assert!(out[0] < 110, "midtone must darken, got {}", out[0]);
+        assert!(
+            out[3] > 200 && out[3] >= out[0],
+            "near-white must stay near-white, got {}",
+            out[3]
+        );
+    }
+
+    #[test]
     fn monochrome_produces_equal_rgb_from_weighted_mix() {
         // weights (0.2,0.7,0.1) on (1.0, 0.502, 0.0):
         // gray = 0.2 + 0.7*0.502 + 0 = 0.5514 → *255 ≈ 141, R=G=B.
@@ -2576,6 +2720,11 @@ mod tests {
         let mut bl = PreviewParams::default();
         bl.bl_on = true;
         cfgs.push(bl);
+        // tone curve disabled ⇒ identity; enabled ⇒ non-identity (same gate shape)
+        cfgs.push(PreviewParams::default());
+        let mut tc = PreviewParams::default();
+        tc.tc_on = true;
+        cfgs.push(tc);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
@@ -2660,14 +2809,24 @@ mod tests {
         // bloom: pos 61 in v50_order — creative cluster, after velvia 57,
         // before colorize 62. On by itself is enough to emit the stage.
         p.bl_on = true;
+        // tone curve: pos 48 in v50_order — display-referred cluster, between
+        // colisa 47 and levels 49. On by itself is enough to emit the stage.
+        p.tc_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "levels", "velvia", "bloom", "colorize", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "splittoning"]
         );
+        // Tone curve sits in the display-referred cluster (iop_order.c pos 48):
+        // after the scene-referred tone map, before levels.
+        let tc_pos = names.iter().position(|n| *n == "tonecurve").unwrap();
+        assert!(tc_pos > names.iter().position(|n| *n == "sigmoid").unwrap(),
+            "tonecurve must run after sigmoid: {names:?}");
+        assert!(tc_pos < names.iter().position(|n| *n == "levels").unwrap(),
+            "tonecurve must run before levels: {names:?}");
         // Bloom sits in the display-referred creative cluster (iop_order.c pos
         // 61): after the tone map, and screen-blending on Lab L only makes sense
         // there.
@@ -3092,6 +3251,23 @@ mod tests {
             bl_size: 33.0,
             bl_threshold: 72.5,
             bl_strength: 60.5,
+            // Tone curve: both bools flipped from their (false/true) defaults,
+            // scalars off-default and pairwise distinct, and a third node
+            // moved so a wrong offset inside the 40-float anchor block shows
+            // as a mismatch (slots 0/1 are the C-default identity endpoints —
+            // slot 2 is the first one that differs from the default blob).
+            tc_on: true,
+            tc_unbound: false,
+            tc_type: 1.0,      // Catmull-Rom
+            tc_autoscale: 0.0, // manual
+            tc_preserve: 2.0,  // MAX norm
+            tc_nnodes: 3.0,
+            tc_nodes_l: {
+                let mut n = [(0.0f32, 0.0f32); 20];
+                n[1] = (0.75, 0.75);
+                n[2] = (1.0, 1.0);
+                n
+            },
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -3190,6 +3366,28 @@ mod tests {
         assert_eq!(decoded.dn_strength, def.dn_strength);
         assert_eq!(decoded.dn_shadows, def.dn_shadows);
         assert_eq!(decoded.dn_bias, def.dn_bias);
+    }
+
+    #[test]
+    fn decode_v22_blob_defaults_tc_fields() {
+        // A v22 blob (before tone curve was added — 31 bools / 220 f32s) must
+        // decode successfully: the new tone-curve fields fall back to their
+        // C defaults, so a saved style from the pre-tonecurve era loads cleanly.
+        let v22 = {
+            let mut b = vec![0u8; 1 + 31 + 220 * 4];
+            b[0] = 22; // version 22
+            b
+        };
+        let decoded = PreviewParams::decode(&v22)
+            .expect("v22 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.tc_on, def.tc_on);
+        assert_eq!(decoded.tc_type, def.tc_type);
+        assert_eq!(decoded.tc_autoscale, def.tc_autoscale);
+        assert_eq!(decoded.tc_unbound, def.tc_unbound);
+        assert_eq!(decoded.tc_preserve, def.tc_preserve);
+        assert_eq!(decoded.tc_nnodes, def.tc_nnodes);
+        assert_eq!(decoded.tc_nodes_l, def.tc_nodes_l);
     }
 
     #[test]

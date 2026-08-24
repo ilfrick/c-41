@@ -50,6 +50,7 @@ static CATALOG: &[ModuleGroup] = &[
                 m("Sigmoid", false),
                 m("Filmic RGB", true),
                 m("Tone equalizer", false),
+                m("Tone curve", false),
                 m("Levels", false),
                 m("Contrast brightness saturation", false),
                 m("Basic adjustments", false),

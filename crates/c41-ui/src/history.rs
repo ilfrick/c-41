@@ -521,6 +521,18 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if bl {
         return "Bloom";
     }
+    // Tone curve (m4-122): the L anchors are compared pairwise (the array is a
+    // plain [(f32, f32); 20], so `!=` does the right thing).
+    let tc = old.tc_on != new.tc_on
+        || old.tc_type != new.tc_type
+        || old.tc_autoscale != new.tc_autoscale
+        || old.tc_unbound != new.tc_unbound
+        || old.tc_preserve != new.tc_preserve
+        || old.tc_nnodes != new.tc_nnodes
+        || old.tc_nodes_l != new.tc_nodes_l;
+    if tc {
+        return "Tone curve";
+    }
     "Edit"
 }
 
@@ -705,6 +717,24 @@ mod tests {
         assert_eq!(
             describe_change(&base, &PreviewParams { cb_saturation_global: 0.3, ..d() }),
             "Color balance RGB"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { tc_on: true, ..d() }),
+            "Tone curve"
+        );
+        assert_eq!(
+            describe_change(
+                &base,
+                &PreviewParams {
+                    tc_nodes_l: {
+                        let mut n = [(0.0f32, 0.0f32); 20];
+                        n[1] = (0.75, 0.75);
+                        n
+                    },
+                    ..d()
+                }
+            ),
+            "Tone curve"
         );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
@@ -913,6 +943,13 @@ mod tests {
             bl_size: _,
             bl_threshold: _,
             bl_strength: _,
+            tc_on: _,
+            tc_type: _,
+            tc_autoscale: _,
+            tc_unbound: _,
+            tc_preserve: _,
+            tc_nnodes: _,
+            tc_nodes_l: _,
         } = PreviewParams::default();
     }
 
@@ -998,7 +1035,9 @@ mod tests {
         // m4-119 (highlight reconstruction): 879 → 885 (1 + 28 bools + 214 f32).
         // m4-120 (denoise profiled): 885 → 899 (1 + 30 bools + 217 f32).
         // m4-121 (bloom): 899 → 912 (1 + 31 bools + 220 f32).
-        assert_eq!(PreviewParams::default().encode().len(), 912);
+        // m4-122 (tonecurve): 912 → 1090 (1 + 33 bools + 264 f32 — 4 scalars +
+        // 40 interleaved L-anchor coordinates).
+        assert_eq!(PreviewParams::default().encode().len(), 1090);
     }
 
     #[test]

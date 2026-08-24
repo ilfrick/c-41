@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -161,6 +161,24 @@ pub enum Stage {
         size: f32,
         threshold: f32,
         strength: f32,
+        space: ColorSpace,
+    },
+    /// Tone curve (tonecurve.c): 3-channel Lab LUT built from spline nodes via
+    /// [`crate::tonecurve::build_lut`] (the V1 `dt_draw_curve_*` sampler),
+    /// applied per pixel by [`tonecurve::process_pixels`]. The L table is in
+    /// Lab units [0,100] for MANUAL/AUTOMATIC modes or [0,1] RGB/Y units after
+    /// the linked-channel re-derivation — exactly as upstream leaves it.
+    /// Lab-domain, so it needs the buffer's working space. **Pixel-local**
+    /// (pure LUT lookup), so the band-parallel path stays available.
+    ToneCurve {
+        table_l: Box<[f32; 65536]>,
+        table_a: Box<[f32; 65536]>,
+        table_b: Box<[f32; 65536]>,
+        coeffs_l: [f32; 3],
+        coeffs_ab: [f32; 12],
+        autoscale_ab: i32,
+        unbound_ab: i32,
+        preserve_colors: i32,
         space: ColorSpace,
     },
     /// Black/grey/white point + gamma in Lab (levels.c). `black`/`range` are the
@@ -505,6 +523,7 @@ impl Stage {
             Stage::ColorCorrection { .. } => "colorcorrection",
             Stage::ColorZones { .. } => "colorzones",
             Stage::Bloom { .. } => "bloom",
+            Stage::ToneCurve { .. } => "tonecurve",
             Stage::Levels { .. } => "levels",
             Stage::Vignette { .. } => "vignette",
             Stage::Lowlight { .. } => "lowlight",
@@ -561,6 +580,10 @@ impl Stage {
             // Bloom is NOT pixel-local: the box blur reads a spatial
             // neighbourhood up to radius 256, so it must run on whole frames.
             Stage::Bloom { .. } => false,
+            // ToneCurve is pixel-local: three pure per-pixel LUT lookups
+            // (plus an optional a/b re-derivation that only touches the same
+            // pixel), no neighbour reads.
+            Stage::ToneCurve { .. } => true,
             // Levels is pixel-local: a per-pixel tone-curve lookup on L (with
             // a/b scaled by the same ratio), no neighbour reads.
             Stage::Levels { .. } => true,
@@ -656,6 +679,8 @@ impl Stage {
             // Bloom converts RGB↔Lab (it operates on L) and must agree with
             // the other Lab stages.
             Stage::Bloom { space, .. } => Some(*space),
+            // ToneCurve works on Lab (L + a/b LUTs), so it must agree too.
+            Stage::ToneCurve { space, .. } => Some(*space),
             // Levels works on Lab L (+ proportional a/b), so it too must agree.
             Stage::Levels { space, .. } => Some(*space),
             // Lowlight works in Lab (via XYZ), so it must agree too.
@@ -1056,6 +1081,42 @@ impl Stage {
                 let mut lab_out = vec![0.0f32; n * 4];
                 bloom::process(
                     &lab_in, &mut lab_out, width, height, size, threshold, strength,
+                );
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Tone curve (tonecurve.c) ───────────────────────────────
+            // Three-channel Lab LUT (L + a + b curves) built from the spline
+            // nodes via tonecurve::build_lut. Same RGB↔Lab sandwich as the
+            // other Lab-domain stages; the stage itself is pixel-local (pure
+            // LUT lookups), so it also runs on bands under rayon.
+            Stage::ToneCurve { ref table_l, ref table_a, ref table_b, ref coeffs_l, ref coeffs_ab, autoscale_ab, unbound_ab, preserve_colors, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                tonecurve::process_pixels(
+                    &lab_in, &mut lab_out,
+                    table_l,
+                    table_a,
+                    table_b,
+                    &coeffs_l[..],
+                    &coeffs_ab[..],
+                    autoscale_ab,
+                    unbound_ab,
+                    preserve_colors,
                 );
                 for p in 0..n {
                     let i = p * 4;
@@ -1839,6 +1900,17 @@ mod tests {
             Stage::Levels {
                 black: 0.0, range: 1.0, inv_gamma: 1.0,
                 lut: vec![0.0; 65536], space: ColorSpace::LinearSrgb,
+            },
+            Stage::ToneCurve {
+                table_l: Box::new(std::array::from_fn(|i| i as f32 / 65535.0)),
+                table_a: Box::new(std::array::from_fn(|i| i as f32 / 65535.0)),
+                table_b: Box::new(std::array::from_fn(|i| i as f32 / 65535.0)),
+                coeffs_l: [0.0; 3],
+                coeffs_ab: [0.0; 12],
+                autoscale_ab: 3,
+                unbound_ab: 1,
+                preserve_colors: 3,
+                space: ColorSpace::LinearSrgb,
             },
             Stage::Lowlight {
                 blueness: 0.0, lut: vec![0.5; 65536], space: ColorSpace::LinearSrgb,

@@ -13,14 +13,138 @@
 //! unbounded_coeffs_ab : 12 floats (d->unbounded_coeffs_ab; 4 groups of 3 for a-right, a-left, b-right, b-left)
 
 use crate::{
-    color::{eval_exp, lab_to_prophotorgb, lab_to_xyz, prophotorgb_to_lab, rgb_norm, xyz_to_lab},
-    iop::{ClBuffer, IopProcess},
+    color::{
+        eval_exp, lab_to_prophotorgb, lab_to_xyz, prophotorgb_to_lab, rgb_norm, xyz_to_lab,
+    },
+    curve_tools,
+    iop::{colisa::estimate_exp, ClBuffer, IopProcess},
     params::IopParams,
     roi::RoiIn,
     Error, Result,
 };
 
 pub struct ToneCurve;
+
+// ── LUT construction (tonecurve.c commit_params :625) ────────────────────────
+
+/// autoscale_ab modes (dt_iop_tonecurve_autoscale_t).
+pub const DT_S_SCALE_MANUAL: i32 = 0;
+pub const DT_S_SCALE_AUTOMATIC: i32 = 1;
+pub const DT_S_SCALE_AUTOMATIC_XYZ: i32 = 2;
+pub const DT_S_SCALE_AUTOMATIC_RGB: i32 = 3;
+
+/// Everything [`process_pixels`] needs, produced by [`build_lut`].
+pub struct ToneCurveTables {
+    pub table_l: Box<[f32; 65536]>,
+    pub table_a: Box<[f32; 65536]>,
+    pub table_b: Box<[f32; 65536]>,
+    pub unbounded_coeffs_l: [f32; 3],
+    pub unbounded_coeffs_ab: [f32; 12],
+}
+
+/// Port of tonecurve.c `commit_params`: build the three channel tables from
+/// the node sets via the V1 sampler (`curve_tools::curve_data_sample`, the
+/// dt_draw_curve_* machinery), rescale them to Lab units (L×100, a/b
+/// ×256−128), re-derive the L table through the XYZ/RGB round-trip for the
+/// linked-channels modes, and fit the exponential tail extrapolations.
+///
+/// Node anchors are box-relative [0,1] coordinates exactly as stored in the C
+/// params struct. `autoscale_ab` is one of the DT_S_SCALE_* constants.
+#[allow(clippy::too_many_arguments)]
+pub fn build_lut(
+    nodes_l: &[(f32, f32)],
+    type_l: u32,
+    nodes_a: &[(f32, f32)],
+    type_a: u32,
+    nodes_b: &[(f32, f32)],
+    type_b: u32,
+    autoscale_ab: i32,
+) -> ToneCurveTables {
+    let mut raw = vec![0.0f32; 0x1_0000];
+    let mut t_l = Box::new([0.0f32; 65536]);
+    let mut t_a = Box::new([0.0f32; 65536]);
+    let mut t_b = Box::new([0.0f32; 65536]);
+
+    // Per-channel: sample the curve at 0x10000 resolution into [0,1], then
+    // rescale to the channel's Lab units (:659-666).
+    curve_tools::curve_data_sample(nodes_l, type_l, 0.0, 1.0, &mut raw);
+    for k in 0..0x1_0000 {
+        t_l[k] = raw[k] * 100.0;
+    }
+    curve_tools::curve_data_sample(nodes_a, type_a, 0.0, 1.0, &mut raw);
+    for k in 0..0x1_0000 {
+        t_a[k] = raw[k] * 256.0 - 128.0;
+    }
+    curve_tools::curve_data_sample(nodes_b, type_b, 0.0, 1.0, &mut raw);
+    for k in 0..0x1_0000 {
+        t_b[k] = raw[k] * 256.0 - 128.0;
+    }
+
+    if autoscale_ab == DT_S_SCALE_AUTOMATIC_XYZ {
+        // Derive the Y→Y mapping (:669-681): gray XYZ in, curved XYZ out.
+        // Reads and writes share t_l in-place, iteration order preserved.
+        for k in 0..0x1_0000 {
+            let g = k as f32 / 0x1_0000 as f32;
+            let lab = xyz_to_lab([g, g, g, 1.0]);
+            let idx = ((lab[0] / 100.0 * 0x1_0000 as f32) as i64).clamp(0, 0xffff) as usize;
+            let mut lab2 = lab;
+            lab2[0] = t_l[idx];
+            let xyz = lab_to_xyz(lab2);
+            t_l[k] = xyz[1];
+        }
+    } else if autoscale_ab == DT_S_SCALE_AUTOMATIC_RGB {
+        // Derive the G→G mapping (:682-694) through ProPhoto.
+        for k in 0..0x1_0000 {
+            let g = k as f32 / 0x1_0000 as f32;
+            let lab = prophotorgb_to_lab([g, g, g, 1.0]);
+            let idx = ((lab[0] / 100.0 * 0x1_0000 as f32) as i64).clamp(0, 0xffff) as usize;
+            let mut lab2 = lab;
+            lab2[0] = t_l[idx];
+            let rgb = lab_to_prophotorgb(lab2);
+            t_l[k] = rgb[1];
+        }
+    }
+
+    // Exponential tails (dt_iop_estimate_exp over {0.7,0.8,0.9,1.0}·xm
+    // samples of each table; ab mirrors x for the left side).
+    let lut_index = |v: f32| -> usize { ((v * 0x1_0000_u32 as f32) as i64).clamp(0, 0xffff) as usize };
+
+    let coeffs_l = {
+        let xm = nodes_l[nodes_l.len() - 1].0;
+        let xs: Vec<f32> = [0.7f32, 0.8, 0.9, 1.0].iter().map(|m| m * xm).collect();
+        let ys: Vec<f32> = xs.iter().map(|&x| t_l[lut_index(x)]).collect();
+        estimate_exp(&xs, &ys)
+    };
+
+    // ab tails: right side of each channel, then the mirrored left side —
+    // commit_params order a-right, a-left, b-right, b-left (:709-745).
+    let mut coeffs_ab = [0.0f32; 12];
+    for (slot, (table, edge_x, mirror)) in [
+        (&t_a, nodes_a[nodes_a.len() - 1].0, false),
+        (&t_a, nodes_a[0].0, true),
+        (&t_b, nodes_b[nodes_b.len() - 1].0, false),
+        (&t_b, nodes_b[0].0, true),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let xm = if *mirror { 1.0 - *edge_x } else { *edge_x };
+        let xs: Vec<f32> = [0.7f32, 0.8, 0.9, 1.0].iter().map(|m| m * xm).collect();
+        let ys: Vec<f32> = xs
+            .iter()
+            .map(|&x| table[lut_index(if *mirror { 1.0 - x } else { x })])
+            .collect();
+        coeffs_ab[slot * 3..slot * 3 + 3].copy_from_slice(&estimate_exp(&xs, &ys));
+    }
+
+    ToneCurveTables {
+        table_l: t_l,
+        table_a: t_a,
+        table_b: t_b,
+        unbounded_coeffs_l: coeffs_l,
+        unbounded_coeffs_ab: coeffs_ab,
+    }
+}
 
 impl IopProcess for ToneCurve {
     fn name(&self) -> &'static str {
@@ -192,6 +316,15 @@ pub unsafe extern "C" fn darkroom_tonecurve_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::curve_tools::{CATMULL_ROM, MONOTONE_HERMITE};
+
+    /// C default node sets (init(), tonecurve.c:828-837).
+    fn default_nodes_l() -> Vec<(f32, f32)> {
+        vec![(0.0, 0.0), (1.0, 1.0)]
+    }
+    fn default_nodes_ab() -> Vec<(f32, f32)> {
+        vec![(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)]
+    }
 
     fn identity_lut() -> Box<[f32; 65536]> {
         // L identity: maps L/100 → L  (table value = 100 * i/65536 ≈ L)
@@ -291,5 +424,137 @@ mod tests {
         for (i, &v) in output[..3].iter().enumerate() {
             assert!(v.is_finite(), "ch{i}: {v}");
         }
+    }
+
+    // ── build_lut (commit_params port) ────────────────────────────────────
+
+    /// Identity curve + RGB-linked mode: the G→G re-derivation leaves t_l as
+    /// the identity ramp in [0,1] units (within u16 quantisation).
+    #[test]
+    fn build_lut_identity_is_ramp_under_rgb_mode() {
+        let tabs = build_lut(
+            &default_nodes_l(),
+            MONOTONE_HERMITE,
+            &default_nodes_ab(),
+            MONOTONE_HERMITE,
+            &default_nodes_ab(),
+            MONOTONE_HERMITE,
+            DT_S_SCALE_AUTOMATIC_RGB,
+        );
+        for k in [0usize, 1, 4096, 32768, 65280, 65535] {
+            let want = k as f32 / 65536.0;
+            // Tolerance covers u16 quantisation plus ProPhoto round-trip
+            // float noise (~1e-4 worst case near the top of the ramp).
+            assert!(
+                (tabs.table_l[k] - want).abs() < 2e-4,
+                "@{k}: {} vs {want}",
+                tabs.table_l[k]
+            );
+        }
+        // Tail coefficients finite with positive inverse-x (eval usable).
+        assert!(tabs.unbounded_coeffs_l[0] > 0.0);
+        assert!(tabs.unbounded_coeffs_l.iter().all(|c| c.is_finite()));
+    }
+
+    /// A mid-tones-dropping L curve must darken gray input end to end:
+    /// process_pixels on a neutral Lab pixel with the built tables moves L
+    /// down and keeps a/b at ~0 (preserve colors AVERAGE).
+    #[test]
+    fn build_lut_contrast_curve_darkens_neutral_pixel() {
+        let nodes = vec![(0.0f32, 0.0), (0.5, 0.35), (1.0, 1.0)];
+        let tabs = build_lut(
+            &nodes,
+            CATMULL_ROM,
+            &default_nodes_ab(),
+            MONOTONE_HERMITE,
+            &default_nodes_ab(),
+            MONOTONE_HERMITE,
+            DT_S_SCALE_AUTOMATIC_RGB,
+        );
+        let input = vec![50.0f32, 0.0, 0.0, 1.0];
+        let mut output = vec![0.0f32; 4];
+        process_pixels(
+            &input, &mut output,
+            &tabs.table_l, &tabs.table_a, &tabs.table_b,
+            &tabs.unbounded_coeffs_l, &tabs.unbounded_coeffs_ab,
+            DT_S_SCALE_AUTOMATIC_RGB, 1, /* DT_RGB_NORM_AVERAGE */ 3,
+        );
+        assert!(
+            output[0] < 45.0,
+            "contrast curve must darken L=50: got {}",
+            output[0]
+        );
+        assert!(output[0] > 30.0, "not that dark: {}", output[0]);
+        // Neutral stays near-neutral under AVERAGE preservation.
+        assert!(output[1].abs() < 2.0 && output[2].abs() < 2.0,
+            "a/b: {}, {}", output[1], output[2]);
+    }
+
+    /// MANUAL mode skips the RGB re-derivation, so tables keep their Lab-unit
+    /// scaling (L×100 / ab ×256−128): an identity a-curve maps mid-gray a
+    /// (raw 0.5 → −128+128 = 0) back to ≈0.
+    #[test]
+    fn build_lut_manual_mode_keeps_lab_units() {
+        let tabs = build_lut(
+            &default_nodes_l(),
+            MONOTONE_HERMITE,
+            &[(0.0, 0.0), (1.0, 1.0)],
+            MONOTONE_HERMITE,
+            &[(0.0, 0.0), (1.0, 1.0)],
+            MONOTONE_HERMITE,
+            DT_S_SCALE_MANUAL,
+        );
+        // raw table_a[32768] ≈ 0.5·65535/65536 → ·256−128 ≈ −0.002.
+        assert!(tabs.table_a[32768].abs() < 0.05, "{}", tabs.table_a[32768]);
+        assert!((tabs.table_l[32768] - 50.0).abs() < 0.05, "{}", tabs.table_l[32768]);
+    }
+
+    /// XYZ-linked re-derivation maps Y→Y: identity curve stays the identity
+    /// ramp (XYZ luminance of equal channels is Y itself after round-trip).
+    #[test]
+    fn build_lut_xyz_identity_stays_identity() {
+        let tabs = build_lut(
+            &default_nodes_l(),
+            MONOTONE_HERMITE,
+            &default_nodes_ab(),
+            MONOTONE_HERMITE,
+            &default_nodes_ab(),
+            MONOTONE_HERMITE,
+            DT_S_SCALE_AUTOMATIC_XYZ,
+        );
+        for k in [0usize, 8192, 32768, 60000, 65535] {
+            let want = k as f32 / 65536.0;
+            assert!(
+                (tabs.table_l[k] - want).abs() < 2e-3,
+                "@{k}: {} vs {want}",
+                tabs.table_l[k]
+            );
+        }
+    }
+
+    /// Full round trip: built-identity tables through process_pixels leave a
+    /// neutral pixel untouched (the module's neutral-state contract).
+    #[test]
+    fn built_identity_tables_are_pixel_neutral() {
+        let tabs = build_lut(
+            &default_nodes_l(),
+            MONOTONE_HERMITE,
+            &default_nodes_ab(),
+            MONOTONE_HERMITE,
+            &default_nodes_ab(),
+            MONOTONE_HERMITE,
+            DT_S_SCALE_AUTOMATIC_RGB,
+        );
+        let input = vec![50.0f32, 4.0, -3.0, 1.0];
+        let mut output = vec![0.0f32; 4];
+        process_pixels(
+            &input, &mut output,
+            &tabs.table_l, &tabs.table_a, &tabs.table_b,
+            &tabs.unbounded_coeffs_l, &tabs.unbounded_coeffs_ab,
+            DT_S_SCALE_AUTOMATIC_RGB, 1, 3,
+        );
+        assert!((output[0] - 50.0).abs() < 0.5, "L: {}", output[0]);
+        assert!((output[1] - 4.0).abs() < 0.5, "a: {}", output[1]);
+        assert!((output[2] - (-3.0)).abs() < 0.5, "b: {}", output[2]);
     }
 }

@@ -5,6 +5,7 @@
 
 pub mod bilateral;
 pub mod color;
+pub mod curve_tools;
 pub mod colorreconstruct;
 pub mod dwt;
 pub mod error;

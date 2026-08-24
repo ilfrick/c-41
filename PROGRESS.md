@@ -1528,3 +1528,100 @@ tree) — all four CI steps keyed off exit codes; 741 c41-core tests (+10 new:
 5 box_filters incl. naive-reference differential across shapes/radii/
 iterations, 3 new bloom driver tests, plus existing FFI kernels) and 255
 c41-ui tests green in --release.
+
+## 2026-08-24T19:56Z — m4-122: tone curve (`tonecurve`) live preview module #30 + curve editor widget
+
+**What changed.** The first curve-based module wired, which required building
+the missing widget class. Two enablers landed together:
+
+- **New `c41-core/src/curve_tools.rs`** — port of src/common/curve_tools.c
+  (the UFraw-lineage V1 sampler used by tonecurve/basecurve/atrous/
+  denoiseprofile) plus the src/gui/draw.h wrappers. Thomas solver over the
+  Burkardt D3 collapsed tridiagonal layout (a[3i]=super from row i−1,
+  a[3i+1]=diag, a[3i+2]=sub from row i+1); boundary conditions ibcbeg/ibcend
+  ∈ {natural, first-derivative}; MONOTONE_HERMITE computes Fritsch-Carlson
+  tangents but *evaluates* via catmull_rom_val, mirroring draw.h's
+  spline_val[] dispatch (the C never calls spline_cubic_val for that type);
+  unknown type → None → box-diagonal fallback. `curve_data_sample` composes
+  CurveDataSample exactly: box transform to [0,1] (all real callers), flat
+  endpoint extension for x before the first anchor, int-truncation
+  val·(res−1)+0.5 with clamping to [minY,maxY]·(res−1), ÷0x10000 float
+  conversion.
+- **New `c41-ui/src/darkroom/curve_editor.rs`** (~510 lines) — interactive
+  L-curve editor: DrawingArea canvas painting grid/dashed diagonal/the spline
+  itself via `curve_data_sample` (drawn curve IS the applied curve) plus
+  darktable's basic gestures: press-to-grab and drag anchors, click empty
+  space to insert (≤ 20 anchors, MAX_ANCHORS cap), double-click removes an
+  interior node, endpoints pinned at x=0/1, interior x kept strictly between
+  neighbours ± X_EPS. Draw func captures WeakRefs only (no ownership cycle);
+  drag state is Rc<Cell<Option<usize>>> so the draw closure can read it.
+- **`tonecurve.rs` build_lut + pipeline.rs Stage::ToneCurve** — commit_params
+  replicated: sample curves at 65536, scale L×100 / ab×(256−128)
+  unconditionally, then AUTOMATIC_RGB autoscale re-derives t_l IN PLACE via a
+  ProPhoto round-trip (AUTOMATIC_XYZ ported alongside; Lab→XYZ→L-curve→Lab);
+  signed CLAMP index semantics preserved via i64 widening; unbounded tails
+  extrapolated by estimate_exp over x∈{0.7..1.0}·xm with mirrored lookups
+  (slot order L-right, a-right, a-left, b-right, b-left). Placed at iop_order
+  pos 48 (colisa 47 < tonecurve < levels 49, pinned by the ordering test);
+  pixel-local = true (pure LUT lookups → rayon band path, exhaustiveness test
+  updated); working space Rec2020/linear-sRGB with Lab sandwich preserving
+  input alpha.
+- **UI** — PreviewParams v23 append-only (+tc_on bool #31, +tc_unbound bool
+  #32, +tc_type/tc_autoscale/tc_preserve/tc_nnodes floats #220-223, +40 f32
+  interleaved L-anchor coords #224-263; blob 912→1090; PARAMS_LAYOUTS +=
+  (23,33,264)); decode starts from defaults so v22 blobs keep identity
+  anchors. Defaults are darktable's: interpolator monotone Hermite(2),
+  autoscale AUTOMATIC_RGB(3), preserve_colors AVERAGE(3), unbound_ab=true,
+  identity 2-node L anchors. Module row = enable switch + interpolator
+  DropDown (seeded BEFORE connect_selected_notify per the rebuild invariant)
+  + the editor canvas; history label "Tone curve" with full 7-field drift
+  guard; catalog entry in the Tone group; liveness list updated. Export
+  parity inherits through to_pipeline.
+
+**Scope deviation (documented).** First slice ships the **L channel only**;
+a/b channel tabs are deferred but their params already exist and decode
+(tc_nodes default = darktable's 3-node identity monotone-Hermite ab curves),
+so adding tabs later is additive, not a blob bump. Identity gate is flag-only
+(Bloom precedent).
+
+**Went wrong.** My own regression test for the review fix exposed a deeper
+hole in the fix itself: collision detection compared the *raw* x while
+storage clamps, so an out-of-range click (x=−3) clamps onto the x=0
+endpoint's column and would have produced two anchors at x=0 — exactly the
+non-increasing-anchor hazard the fix targeted. The check now runs on the
+clamped coordinate, and the test asserts refusal for duplicate columns, near-
+endpoint clicks, AND out-of-range clamps, plus no-mutation on refusal. Also:
+an earlier draft embedded a `for` loop inside an array literal (invalid Rust);
+a v22-decode draft started from zeroed nodes instead of defaults (would have
+snapped legacy blobs' anchors off the diagonal); the pin test briefly carried
+both the old 912 assert and the new 1090 one; hit_node needed total_cmp +
+then_some restructure after `?` on Option-in-Result confusion; remove_node's
+bool return forbids `?` (match-based rewrite). Every-node highlight-ring bug
+caught by self-review before commit (selected_ring returned Some(idx)
+unconditionally → all nodes ringed; replaced by drag_idx comparison).
+
+**Senior review** — fricktrade-architect died on API 402 again (recurring);
+fork subagent stood in per the documented fallback and verified the
+load-bearing subtleties against curve_tools.c/draw.h/tonecurve.c line-by-line
+(unconditional ×100/×256−128 scaling before autoscale re-derivation, signed
+CLAMP semantics, tail-extrapolation slot order, D3 layout, catmull_rom_val vs
+spline_cubic_val dispatch asymmetry, borrow scoping around queue_draw,
+drag-index invalidation on refused removals). Verdict: **FIX FIRST**, both
+findings one-liners, both applied: (1) ibcend==1 boundary diagonal carries
+Δt/3, not 1 (curve_tools.c:324 — verified in source before fixing); (2)
+insert_node must refuse duplicate-x inserts (accepting one silently snaps the
+whole curve to the identity diagonal while nodes stay visible). NITs
+consciously accepted, not deferred: isotropic hit tolerance ≈14.7px
+horizontally on the 240px widget; NaN-in-blob falls back to box-diagonal
+rather than sanitised (unreachable from the editor — every write clamps).
+
+**Verified.** `scripts/ci-local.sh` exit 0 twice (pre-review tree and again
+on the post-fix tree) — all four CI steps keyed off exit codes, never grep.
++16 c41-core tests (11 curve_tools sampler incl. hand-solved natural cubic,
+non-increasing-anchor fallback and leading-gap clamp; 5 build_lut parity) and
++8 c41-ui tests (6 editor gesture-contract helpers incl. duplicate-x refusal
+with no-mutation, v22-decode fallback, params→pipeline end-to-end): 757 core
++ 263 ui green in --release, plus 92 bin tests; only known pre-existing
+warnings. New end-to-end test pins midtone darkening through the
+full params→pipeline path (Catmull-Rom node at (0.5,0.35): 128-grey drops
+below 110, whites stay >200).
