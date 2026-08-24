@@ -1400,3 +1400,65 @@ class as the existing RGBA result); X-Trans opposed coverage is smoke-only.
 
 **Verified.** `scripts/ci-local.sh` exit 0 — all four CI steps pass keyed off
 exit codes; 723 c41-core (+7 new) + 92 c41-db + 253 c41-ui tests green under `--release`.
+
+## 2026-08-24T16:52Z — m4-120: denoise (profiled) (`denoiseprofile`, wavelets) live preview module #28
+
+Wired darktable's denoise (profiled) — wavelets mode — as a normal pipeline
+stage. Core: new `c41-core::iop::eaw` porting eaw.c (`eaw_dn_decompose`
+5×5 B-spline à-trous with edge-avoiding `dn_weight`, `eaw_synthesize`
+soft-threshold accumulate, float `fast_mexp2f` bit-punning port) and a
+`wavelets_denoise` driver in `denoiseprofile.rs`: VST precondition → per-scale
+decompose + BayesShrink thresholds (adjt = 8.0 exactly — the default force
+curve is flat 0.5, so Catmull-Rom gives force²·4 ≡ 1) → synthesize → residual
+add → backtransform; alpha lane restored from input because the VST kernels
+garble lane 3 (C callers never read it). `Stage::DenoiseProfile` with
+`is_pixel_local() == false` (multi-scale neighbourhood), placed between
+temperature and exposure per v50_order pos 9/10 — pinned by the ordering test.
+UI: PreviewParams v21 (+2 bools/+3 f32, blob 885 → 899, pin test bumped;
+HISTORY_ENCODE_VERSION stays 5 via per-entry version peeking), backward-compat
+decode test for v20 blobs, identity/bypass/to_pipeline gates keyed on `dn_on`,
+history label "Denoise (profiled)" + field-drift guard, `module_expander` row
+(enable, Y0U0V0/RGB DropDown, Strength 0.001..4.0 / Preserve shadows 0..1.8 /
+Bias ±10 — C soft ranges). Export inherits through to_pipeline. Deviations all
+documented in code + PARITY_AUDIT 2.1: wb=[1,1,1] (post-WB buffer) with the C's
+strength·compensate scaling carried by wb_s into the kernels; generic
+Poissonian a=1e-4 instead of noiseprofiles.json; use_new_vst only; wavelets
+only; clamped indexing refusing the C's narrow-image row bleed.
+
+**Senior review (fork subagent acting as senior reviewer).** fricktrade-
+architect died with OpenRouter API 402 again (fourth increment running);
+substitution documented here per workflow. The fork's run was itself split
+across a session restart and resumed from its saved transcript. Verdict SHIP
+WITH FIXES. Finding 1 (MAJOR): strength was completely inert in RGB mode —
+the v2 kernels take no colour matrix, and the driver passed unit wb where the
+C passes wb scaled by strength·compensate_strength (:1385), which is RGB
+mode's *only* strength carrier; finding 2 (MINOR): same root cause left the
+Y0U0V0 backtransform's bias term at bias·1 instead of bias·s. One shared fix:
+wb_s = [s,s,s,1] into precondition_v2/backtransform_v2/backtransform_yuv,
+matrices stay on pre-strength wb per C order. Finding 3 (MINOR): two stale
+field-doc ranges in preview.rs corrected. Nits (no action): describe_change
+arm placement; whole-frame serial re-render per slider tick is heavy but
+matches every existing whole-frame stage (tick-coalescing noted as a future
+increment).
+
+**Went wrong en route:** my first regression test asserted "higher strength ⇒
+lower residual noise in RGB mode" and FAILED WITH THE FIX IN PLACE — both
+strengths produced identical output. Working through the math: with the
+generic Poissonian profile the transformed-space noise variance sits orders
+of magnitude below σ_band² (=1 at scale 0), so the BayesShrink denominator
+clamps at its 1e-6 floor, thresholds saturate, detail is wiped wholesale, and
+the result reduces to the coarse pyramid — strength-independently. That is
+faithful C behaviour given the same profile (strength only bites once a real
+per-camera profile stabilises variance towards 1), not a port bug. Replaced
+with tests whose premises hold: exact forward/backward cancellation at
+off-default strengths in both modes, and the bias·wb drift being
+strength-dependent (pre-fix the means were exactly equal; measured drift
+≈ 1.9e-5, bounds calibrated 4e-6..1e-3 after a first 1e-4 epsilon proved too
+coarse). Also fumbled one Edit that clipped a test function's closing brace
+and briefly nested a #[test] inside another test — caught on read-back and
+restructured before compiling.
+
+**Verified.** `scripts/ci-local.sh` exit 0 twice (pre-fix tree and final tree)
+— all four CI steps keyed off exit codes; 733 c41-core (+10 new: 4 eaw,
+6 wavelets incl. 2 review regressions) + 254 c41-ui tests green; clippy exit 0
+(pre-existing warning classes only).

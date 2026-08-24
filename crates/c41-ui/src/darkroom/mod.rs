@@ -1877,6 +1877,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color balance RGB" => pg.add(&cbrgb_module_row(ctx)),
                 "Filmic RGB" => pg.add(&filmic_module_row(ctx)),
                 "Highlight reconstruction" => pg.add(&highlights_module_row(ctx)),
+                "Denoise (profiled)" => pg.add(&denoise_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
@@ -1972,7 +1973,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2838,6 +2839,50 @@ fn highlights_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     });
     expander.add_row(&clip.row);
     expander
+}
+
+/// Denoise (profiled) (denoiseprofile.c, wavelets mode): non-local à-trous
+/// wavelet shrinkage after variance stabilisation — iop_order.c pos 9/10, a
+/// normal pipeline stage right after demosaic, so [`module_expander`]'s plain
+/// re-render applies (no re-decode needed).
+///
+/// Slider ranges mirror the C introspection *soft* ranges (`gui_init`,
+/// denoiseprofile.c:3555-3560): strength hard-max is 1000 but the slider
+/// soft-caps at 4.0; bias allows ±1000 but its soft range is ±10; shadows keeps
+/// its full 0..1.8. darktable also exposes the VST profile picker and the
+/// wavelets/nlmeans mode switch — both unwired here (the core implements the
+/// generic-Poissonian-profile wavelets path only), so no control pretends to
+/// change them.
+fn denoise_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Denoise (profiled)", "wavelet noise reduction", p0.dn_on,
+        |p, on| p.dn_on = on,
+        |e, ctx| {
+            // Colour mode: MODE_Y0U0V0 is the C default. DropDown index maps
+            // 0 = Y0U0V0 / 1 = RGB (note the inversion vs the bool).
+            let mode = gtk4::DropDown::from_strings(&["Y0U0V0", "RGB"]);
+            mode.set_margin_start(8);
+            mode.set_margin_end(8);
+            mode.set_margin_top(1);
+            mode.set_margin_bottom(1);
+            mode.set_selected(u32::from(!p0.dn_mode_y0u0v0));
+            mode.set_tooltip_text(Some(
+                "Colour representation within the algorithm:\n\
+                 Y0U0V0 denoises luma and chroma separately",
+            ));
+            let ctx_m = ctx.clone();
+            mode.connect_selected_notify(move |dd| {
+                ctx_m.params.borrow_mut().dn_mode_y0u0v0 = dd.selected() == 0;
+                render_preview(&ctx_m);
+            });
+            e.add_row(&mode);
+            add_param_slider(e, ctx, "Strength", 0.001, 4.0, 0.01, p0.dn_strength as f64,
+                |p, v| p.dn_strength = v);
+            add_param_slider(e, ctx, "Preserve shadows", 0.0, 1.8, 0.01, p0.dn_shadows as f64,
+                |p, v| p.dn_shadows = v);
+            add_param_slider(e, ctx, "Bias correction", -10.0, 10.0, 0.01, p0.dn_bias as f64,
+                |p, v| p.dn_bias = v);
+        })
 }
 
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {

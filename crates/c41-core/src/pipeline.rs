@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -428,6 +428,28 @@ pub enum Stage {
         data: Box<filmicrgb::FilmicData>,
         space: ColorSpace,
     },
+
+    /// Denoise (profiled) (denoiseprofile.c) — wavelets-mode profiled noise
+    /// reduction: variance-stabilising transform, edge-avoiding à-trous
+    /// decomposition with BayesShrink soft thresholds, inverse VST. Holds the
+    /// user sliders; everything else is derived per apply in
+    /// [`denoiseprofile::wavelets_denoise`].
+    ///
+    /// Scope (documented deviations from the C): wavelets mode only with the
+    /// new (v2) VST, generic Poissonian noise profile a=1e-4/b=0 in place of
+    /// the per-camera profiles database, wb=[1,1,1] and in_scale=1 because our
+    /// preview buffer arrives post-white-balance and is always processed whole.
+    /// Works directly in linear RGB (`default_colorspace` = IOP_CS_RGB) — no
+    /// Lab conversion, so `working_space()` returns `None`. **NOT pixel-local**:
+    /// each output pixel reads a 5×5 stride-2^scale neighbourhood across all
+    /// scales, so `process` falls back to the serial whole-buffer path whenever
+    /// this stage is present — same reason as Shadhi/Lowpass/Sharpen.
+    DenoiseProfile {
+        strength: f32,
+        shadows: f32,
+        bias: f32,
+        mode_y0u0v0: bool,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -483,6 +505,7 @@ impl Stage {
             Stage::ToneEqual { .. } => "toneequal",
             Stage::ColorBalanceRgb { .. } => "colorbalancergb",
             Stage::FilmicRgb { .. } => "filmicrgb",
+            Stage::DenoiseProfile { .. } => "denoiseprofile",
         }
     }
 
@@ -587,6 +610,13 @@ impl Stage {
             // (spline coefficients, Yrg matrices). No neighbour reads. The
             // band-parallel path stays available.
             Stage::FilmicRgb { .. } => true,
+            // DenoiseProfile is NOT pixel-local: the à-trous decomposition
+            // reads a 5×5 neighbourhood at stride 2^scale for every output
+            // pixel, so band-splitting would produce wrong-edge artefacts at
+            // every scale. Returning false forces the whole pipeline serial
+            // whenever this stage is present, where (width, height) is the
+            // true image rectangle — same reason as Shadhi/Lowpass/Sharpen.
+            Stage::DenoiseProfile { .. } => false,
         }
     }
 
@@ -647,6 +677,10 @@ impl Stage {
             // selected per working space at apply time, so — like ColorBalanceRgb
             // — it must agree with the other space-aware stages.
             Stage::FilmicRgb { space, .. } => Some(*space),
+            // DenoiseProfile runs on linear RGB straight from the raw decode
+            // (IOP_CS_RGB in the C, no profile dependency in the VST) — no
+            // Lab conversion, no working-space agreement needed.
+            Stage::DenoiseProfile { .. } => None,
             Stage::GraduatedNd { .. } => None,
             _ => None,
         }
@@ -1388,6 +1422,19 @@ impl Stage {
                 let matrices = filmicrgb::matrices_for_space(space);
                 filmicrgb::process_in_space(input, output, data, &matrices);
             }
+            // ── Denoise (profiled) (denoiseprofile.c) ───────────────────
+            // Wavelets-mode profiled noise reduction: variance-stabilising
+            // transform → edge-avoiding à-trous decomposition with BayesShrink
+            // soft thresholds → inverse VST. Works directly in linear RGB — no
+            // Lab round-trip. NOT pixel-local (multi-scale neighbourhood reads),
+            // so `process` guarantees (width, height) here is the true image
+            // rectangle.
+            Stage::DenoiseProfile { strength, shadows, bias, mode_y0u0v0 } => {
+                denoiseprofile::wavelets_denoise(
+                    input, output, width, height,
+                    &denoiseprofile::WaveletsParams { strength, shadows, bias, mode_y0u0v0 },
+                );
+            }
         }
     }
 }
@@ -1824,6 +1871,13 @@ mod tests {
             }
                 .is_pixel_local(),
             "shadhi blurs a spatial neighbourhood ⇒ NOT pixel-local"
+        );
+        // DenoiseProfile is NOT pixel-local: the multi-scale à-trous wavelet
+        // decomposition reads a stride-2^scale neighbourhood per output pixel.
+        assert!(
+            !Stage::DenoiseProfile { strength: 1.0, shadows: 1.0, bias: 0.0, mode_y0u0v0: true }
+                .is_pixel_local(),
+            "denoiseprofile reads wavelet-scale neighbourhoods ⇒ NOT pixel-local"
         );
     }
 

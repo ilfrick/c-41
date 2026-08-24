@@ -440,6 +440,28 @@ pub struct PreviewParams {
     pub hl_opposed: bool,
     /// Clipping threshold (`clip`), 0..2, darktable default 1.0.
     pub hl_clip: f32,
+    // ── Denoise (profiled) (denoiseprofile.c, wavelets mode) ────────────────
+    // A normal pipeline stage (iop_order.c v50 pos 9/10, right after demosaic
+    // 8): non-local à-trous wavelet shrinkage on the whole frame.
+    /// Denoise module enabled. Ships off: denoising is expensive and
+    /// darktable's default preset only auto-enables it via profileled noise
+    /// detection, which we don't replicate (generic Poissonian a=1e-4 only).
+    pub dn_on: bool,
+    /// Colour mode: true = "Y0U0V0" (darktable's default — luma/chroma split),
+    /// false = "RGB". The other C modes are unwired.
+    pub dn_mode_y0u0v0: bool,
+    /// Noise strength (`strength`), C introspection 0.001..1000 with a soft
+    /// slider max of 4.0 (denoiseprofile.c:3555-3556); we expose 0.001..4.0,
+    /// default 1.0. Scales the VST forward/backtransform pair (via the colour
+    /// matrices in Y0U0V0 mode and wb in RGB mode).
+    pub dn_strength: f32,
+    /// Adjustor for blocksize-independent (`shadows`) mixing inside the
+    /// strength compensation, 0..1.8, default 1.0.
+    pub dn_shadows: f32,
+    /// Bias applied to the VST backtransform (`bias`), C hard range ±1000 but
+    /// soft slider range −10..10 (denoiseprofile.c:3559-3560); we expose
+    /// −10..10, default 0. Effective correction is bias·(strength·2.5|1).
+    pub dn_bias: f32,
 }
 
 impl Default for PreviewParams {
@@ -682,6 +704,11 @@ impl Default for PreviewParams {
             hl_on: false,
             hl_opposed: true,
             hl_clip: 1.0,
+            dn_on: false,
+            dn_mode_y0u0v0: true, // darktable reload_defaults: Y0U0V0 mode
+            dn_strength: 1.0,
+            dn_shadows: 1.0,
+            dn_bias: 0.0,
         }
     }
 }
@@ -822,6 +849,10 @@ impl PreviewParams {
         // Highlight reconstruction lives in the raw decode, not the stage list:
         // off = the legacy hard-clip-at-white decoder, on = always re-decodes.
         let hl_identity = !self.hl_on;
+        // Denoise (profiled): a real edge-preserving smoother — no value is a
+        // strict no-op while enabled (even strength 0 leaves the coarse
+        // residual path). The gate mirrors `to_pipeline`: only the enable flag.
+        let dn_identity = !self.dn_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -833,6 +864,7 @@ impl PreviewParams {
             && cb_identity
             && filmic_identity
             && hl_identity
+            && dn_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -951,6 +983,7 @@ impl PreviewParams {
             cb_on: false,
             filmic_on: false,
             hl_on: false,
+            dn_on: false,
             ..*self
         }
     }
@@ -980,13 +1013,14 @@ impl PreviewParams {
     }
 
     /// Serialise to a compact, versioned little-endian blob for DB persistence:
-    /// `[version, 21×bool(u8), 140×f32_le]`. Decoded by [`PreviewParams::decode`].
+    /// `[version, N×bool(u8), M×f32_le]` (see [`ENCODED_LEN`]). Decoded by
+    /// [`PreviewParams::decode`].
     /// This is c41-ui's own layout (NOT a C IOP `op_params`), stored under a
     /// synthetic operation name the C reader ignores.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0] {
             v.push(b as u8);
         }
         for f in [
@@ -1072,6 +1106,10 @@ impl PreviewParams {
             self.filmic_contrast, self.filmic_balance, self.filmic_saturation,
             // Highlight reconstruction (m4-119).
             self.hl_clip,
+            // Denoise (profiled) (m4-120).
+            self.dn_strength,
+            self.dn_shadows,
+            self.dn_bias,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -1254,6 +1292,11 @@ impl PreviewParams {
             hl_on: bools.get(26).map_or(d.hl_on, |&b| b != 0),
             hl_opposed: bools.get(27).map_or(d.hl_opposed, |&b| b != 0),
             hl_clip: f.get(213).copied().unwrap_or(d.hl_clip),
+            dn_on: bools.get(28).map_or(d.dn_on, |&b| b != 0),
+            dn_mode_y0u0v0: bools.get(29).map_or(d.dn_mode_y0u0v0, |&b| b != 0),
+            dn_strength: f.get(214).copied().unwrap_or(d.dn_strength),
+            dn_shadows: f.get(215).copied().unwrap_or(d.dn_shadows),
+            dn_bias: f.get(216).copied().unwrap_or(d.dn_bias),
         })
     }
 
@@ -1306,6 +1349,22 @@ impl PreviewParams {
         {
             p.push(Stage::Temperature {
                 coeffs: [self.temperature_r, self.temperature_g, self.temperature_b, 1.0],
+            });
+        }
+        // Denoise (profiled) (denoiseprofile.c wavelets mode, iop_order.c
+        // v50_order pos 9/10 — immediately after demosaic 8, well before
+        // exposure 21). Noise estimation and shrinkage must see scene-linear,
+        // un-tone-mapped data, so it runs here like every other scene-referred
+        // stage. On-by-itself emits the stage (on is the gate, mirroring
+        // is_identity: even strength 0 leaves the coarse-residual path).
+        // Deviations from the C tracked in c41-core::denoiseprofile (generic
+        // Poissonian profile, wb=[1,1,1] since the buffer arrives post-WB).
+        if self.dn_on {
+            p.push(Stage::DenoiseProfile {
+                strength: self.dn_strength,
+                shadows: self.dn_shadows,
+                bias: self.dn_bias,
+                mode_y0u0v0: self.dn_mode_y0u0v0,
             });
         }
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
@@ -1822,9 +1881,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v19 adds filmicrgb (filmic RGB display transform, 1 bool + 7 f32).
 /// v20 adds highlight reconstruction (2 bools + 1 f32; runs pre-demosaic in
 /// the raw front end, not as a pipeline stage — see [`PreviewParams::hl_opts`]).
-const ENCODE_VERSION: u8 = 20;
-/// 1 version byte + 28 bool bytes + 214 little-endian f32.
-const ENCODED_LEN: usize = 1 + 28 + 214 * 4;
+/// v21 adds denoise profiled (2 bools + 3 f32, normal pipeline stage).
+const ENCODE_VERSION: u8 = 21;
+/// 1 version byte + 30 bool bytes + 217 little-endian f32.
+const ENCODED_LEN: usize = 1 + 30 + 217 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1840,6 +1900,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (18, 25, 206), // v18: colorbalancergb added
     (19, 26, 213), // v19: filmicrgb added
     (20, 28, 214), // v20: highlight reconstruction added
+    (21, 30, 217), // v21: denoise profiled added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2456,6 +2517,11 @@ mod tests {
         let mut nd = PreviewParams::default();
         nd.negadoctor_on = true;
         cfgs.push(nd);
+        // denoise disabled ⇒ identity; enabled ⇒ non-identity (same gate shape)
+        cfgs.push(PreviewParams::default());
+        let mut dn = PreviewParams::default();
+        dn.dn_on = true;
+        cfgs.push(dn);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
@@ -2534,14 +2600,22 @@ mod tests {
         // actually pinned by this test.
         p.gradnd_on = true;
         p.gradnd_density = -2.0;
+        // denoise profiled: pos 9/10 in v50_order — immediately after demosaic
+        // 8, before exposure. On by itself is enough to emit the stage.
+        p.dn_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "levels", "velvia", "colorize", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "levels", "velvia", "colorize", "splittoning"]
         );
+        // Denoise is scene-referred and noise-thresholds against raw-domain
+        // statistics: it must run BEFORE any tone mapping (exposure onwards).
+        let dn_pos = names.iter().position(|n| *n == "denoiseprofile").unwrap();
+        assert!(dn_pos < names.iter().position(|n| *n == "exposure").unwrap(),
+            "denoiseprofile must run before exposure: {names:?}");
         // Color balance RGB is scene-referred (v50_order 41.5): it must run
         // before the sigmoid tone map (45.3), on unbounded linear data.
         let cb = names.iter().position(|n| *n == "colorbalancergb").unwrap();
@@ -2941,6 +3015,13 @@ mod tests {
             hl_on: true,
             hl_opposed: false,
             hl_clip: 1.5,
+            // Denoise (profiled): same pattern — bools flipped from their
+            // (false/true) defaults, floats off-default and distinct.
+            dn_on: true,
+            dn_mode_y0u0v0: false,
+            dn_strength: 0.8,
+            dn_shadows: 1.3,
+            dn_bias: -0.25,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -3017,6 +3098,28 @@ mod tests {
         assert_eq!(decoded.primaries_green_purity, def.primaries_green_purity);
         assert_eq!(decoded.primaries_blue_hue, def.primaries_blue_hue);
         assert_eq!(decoded.primaries_blue_purity, def.primaries_blue_purity);
+    }
+
+    #[test]
+    fn decode_v20_blob_defaults_dn_fields() {
+        // A v20 blob (before denoise was added — 28 bools / 214 f32s) must
+        // decode successfully: the new denoise fields fall back to their
+        // defaults, so a saved style from the pre-denoise era loads cleanly
+        // instead of being silently discarded.
+        let v20 = {
+            let mut b = vec![0u8; 1 + 28 + 214 * 4];
+            b[0] = 20; // version 20
+            b
+        };
+        let decoded = PreviewParams::decode(&v20)
+            .expect("v20 blob must decode (backward compat)");
+        // Denoise fields should be at their defaults, not garbage.
+        let def = PreviewParams::default();
+        assert_eq!(decoded.dn_on, def.dn_on);
+        assert_eq!(decoded.dn_mode_y0u0v0, def.dn_mode_y0u0v0);
+        assert_eq!(decoded.dn_strength, def.dn_strength);
+        assert_eq!(decoded.dn_shadows, def.dn_shadows);
+        assert_eq!(decoded.dn_bias, def.dn_bias);
     }
 
     #[test]

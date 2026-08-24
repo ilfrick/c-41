@@ -13,6 +13,7 @@ pub mod basicadj;
 pub mod bloom;
 pub mod globaltonemap;
 pub mod dither;
+pub mod eaw;
 pub mod highpass;
 pub mod invert;
 pub mod monochrome;

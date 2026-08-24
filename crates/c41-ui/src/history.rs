@@ -506,6 +506,14 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if hl {
         return "Highlight reconstruction";
     }
+    let dn = old.dn_on != new.dn_on
+        || old.dn_mode_y0u0v0 != new.dn_mode_y0u0v0
+        || old.dn_strength != new.dn_strength
+        || old.dn_shadows != new.dn_shadows
+        || old.dn_bias != new.dn_bias;
+    if dn {
+        return "Denoise (profiled)";
+    }
     "Edit"
 }
 
@@ -889,6 +897,11 @@ mod tests {
             hl_on: _,
             hl_opposed: _,
             hl_clip: _,
+            dn_on: _,
+            dn_mode_y0u0v0: _,
+            dn_strength: _,
+            dn_shadows: _,
+            dn_bias: _,
         } = PreviewParams::default();
     }
 
@@ -972,7 +985,8 @@ mod tests {
         // m4-117 (colorbalancergb): 717 → 850 (1 + 25 bools + 206 f32).
         // m4-118 (filmicrgb): 850 → 879 (1 + 26 bools + 213 f32).
         // m4-119 (highlight reconstruction): 879 → 885 (1 + 28 bools + 214 f32).
-        assert_eq!(PreviewParams::default().encode().len(), 885);
+        // m4-120 (denoise profiled): 885 → 899 (1 + 30 bools + 217 f32).
+        assert_eq!(PreviewParams::default().encode().len(), 899);
     }
 
     #[test]
