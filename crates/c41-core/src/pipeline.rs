@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basecurve, basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -193,6 +193,23 @@ pub enum Stage {
         coeffs: [[f32; 3]; 3],
         autoscale: i32,
         preserve_colors: i32,
+    },
+    /// Base curve (basecurve.c): a single user-drawn LUT applied directly on
+    /// the buffer's RGB lanes (IOP_CS_RGB — no Lab sandwich), either plain
+    /// (`fusion == 0`, pixel-local) or blended through an exposure-fusion
+    /// laplacian pyramid (`fusion >= 1`, whole-frame serial). Table/coeffs come
+    /// from [`basecurve::build_table`] (the commit_params port); the kernels
+    /// are the very FFI fns production C calls. `space` selects the Y row the
+    /// LUMINANCE preservation norm consumes (the working profile's matrix_in
+    /// row in C).
+    Basecurve {
+        table: Box<[f32; 65536]>,
+        coeffs: [f32; 3],
+        preserve_colors: i32,
+        fusion: i32,
+        stops: f32,
+        bias: f32,
+        space: ColorSpace,
     },
     /// Black/grey/white point + gamma in Lab (levels.c). `black`/`range` are the
     /// normalised [0,1] stops (`levels[0]`, `levels[2] - levels[0]`) and
@@ -538,6 +555,7 @@ impl Stage {
             Stage::Bloom { .. } => "bloom",
             Stage::ToneCurve { .. } => "tonecurve",
             Stage::RgbCurve { .. } => "rgbcurve",
+            Stage::Basecurve { .. } => "basecurve",
             Stage::Levels { .. } => "levels",
             Stage::Vignette { .. } => "vignette",
             Stage::Lowlight { .. } => "lowlight",
@@ -601,6 +619,10 @@ impl Stage {
             // RgbCurve likewise: pure per-pixel LUT lookups / norm-ratio math,
             // no neighbour reads.
             Stage::RgbCurve { .. } => true,
+            // Basecurve is pixel-local only in its plain process_lut form;
+            // exposure fusion blends a laplacian pyramid over the whole frame
+            // and must run serial (same reason as Bloom/Shadhi).
+            Stage::Basecurve { fusion, .. } => *fusion == 0,
             // Levels is pixel-local: a per-pixel tone-curve lookup on L (with
             // a/b scaled by the same ratio), no neighbour reads.
             Stage::Levels { .. } => true,
@@ -745,6 +767,9 @@ impl Stage {
             // RgbCurve applies its LUTs directly on the working RGB lanes
             // (C default_colorspace: IOP_CS_RGB) — nothing to agree on.
             Stage::RgbCurve { .. } => None,
+            // Basecurve likewise: IOP_CS_RGB in the C, LUT lookups (and the
+            // fusion pyramid) run directly on the working lanes.
+            Stage::Basecurve { .. } => None,
             Stage::GraduatedNd { .. } => None,
             _ => None,
         }
@@ -1160,6 +1185,46 @@ impl Stage {
                     autoscale,
                     preserve_colors,
                 );
+            }
+            // ── Base curve (basecurve.c) ─────────────────────────────────
+            // A single LUT applied straight on the working RGB lanes —
+            // IOP_CS_RGB in the C, so no Lab sandwich. fusion == 0 is the
+            // plain process_lut path (pixel-local, runs on bands under
+            // rayon); fusion >= 1 is exposure fusion: a whole-frame
+            // laplacian-pyramid blend (is_pixel_local returns false, so this
+            // arm only ever sees whole frames in that case). The LUMINANCE
+            // preservation norm consumes the working space's Y row — the
+            // work-profile matrix_in row the C reads.
+            Stage::Basecurve {
+                ref table,
+                ref coeffs,
+                preserve_colors,
+                fusion,
+                stops,
+                bias,
+                space,
+            } => {
+                let y_row = match space {
+                    ColorSpace::Rec2020 => crate::color::REC2020_TO_XYZ_D65_Y_ROW,
+                    ColorSpace::LinearSrgb => crate::color::SRGB_TO_XYZ_D65_Y_ROW,
+                };
+                if fusion == 0 {
+                    basecurve::apply_curve_pixels(input, output, 1.0, &table[..], coeffs, preserve_colors, Some(y_row));
+                } else {
+                    basecurve::process_fusion(
+                        input,
+                        output,
+                        width,
+                        height,
+                        &table[..],
+                        coeffs,
+                        preserve_colors,
+                        stops,
+                        fusion,
+                        bias,
+                        Some(y_row),
+                    );
+                }
             }
             // ── Levels (levels.c) ───────────────────────────────────────
             // Black/grey/white points + gamma applied to Lab L via the
@@ -1956,6 +2021,15 @@ mod tests {
                 coeffs: [[1.0; 3]; 3],
                 autoscale: 0,
                 preserve_colors: 1,
+            },
+            Stage::Basecurve {
+                table: Box::new(std::array::from_fn(|i| i as f32 / 65535.0)),
+                coeffs: [1.0, 1.0, 1.0],
+                preserve_colors: 1,
+                fusion: 0,
+                stops: 1.0,
+                bias: 1.0,
+                space: ColorSpace::LinearSrgb,
             },
             Stage::Lowlight {
                 blueness: 0.0, lut: vec![0.5; 65536], space: ColorSpace::LinearSrgb,

@@ -211,7 +211,9 @@ impl HistoryStack {
 }
 
 /// Version byte for [`HistoryStack::encode`]; bump on any layout change.
-const HISTORY_ENCODE_VERSION: u8 = 5;
+/// m4-124: the wrapped PreviewParams blob grew (v25, base curve) — old v5
+/// history blobs decode fine (decode accepts version-1), but new writes carry 6.
+const HISTORY_ENCODE_VERSION: u8 = 6;
 
 fn read_u32(bytes: &[u8], p: &mut usize) -> Option<u32> {
     let end = p.checked_add(4)?;
@@ -550,6 +552,20 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if rc {
         return "RGB curve";
     }
+    // Base curve (m4-124): single channel, but the exposure-fusion controls
+    // (mode/stops/bias) are part of the module's effect, so they belong in the
+    // group too.
+    let bc = old.bc_on != new.bc_on
+        || old.bc_type != new.bc_type
+        || old.bc_preserve != new.bc_preserve
+        || old.bc_nnodes != new.bc_nnodes
+        || old.bc_exposure_fusion != new.bc_exposure_fusion
+        || old.bc_exposure_stops != new.bc_exposure_stops
+        || old.bc_exposure_bias != new.bc_exposure_bias
+        || old.bc_nodes != new.bc_nodes;
+    if bc {
+        return "Base curve";
+    }
     "Edit"
 }
 
@@ -770,6 +786,24 @@ mod tests {
                 }
             ),
             "RGB curve"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { bc_on: true, ..d() }),
+            "Base curve"
+        );
+        assert_eq!(
+            describe_change(
+                &base,
+                &PreviewParams {
+                    bc_nodes: {
+                        let mut n = [(0.0f32, 0.0f32); 20];
+                        n[1] = (0.5, 0.4);
+                        n
+                    },
+                    ..d()
+                }
+            ),
+            "Base curve"
         );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
@@ -997,6 +1031,14 @@ mod tests {
             rc_nodes_r: _,
             rc_nodes_g: _,
             rc_nodes_b: _,
+            bc_on: _,
+            bc_type: _,
+            bc_preserve: _,
+            bc_nnodes: _,
+            bc_exposure_fusion: _,
+            bc_exposure_stops: _,
+            bc_exposure_bias: _,
+            bc_nodes: _,
         } = PreviewParams::default();
     }
 
@@ -1086,7 +1128,9 @@ mod tests {
         // 40 interleaved L-anchor coordinates).
         // m4-123 (rgbcurve): 1090 → 1603 (1 + 34 bools + 392 f32 — 8 scalars +
         // 3×40 interleaved R/G/B anchor coordinates).
-        assert_eq!(PreviewParams::default().encode().len(), 1603);
+        // m4-124 (basecurve): 1603 → 1788 (1 + 35 bools + 438 f32 — 6 scalars +
+        // 40 interleaved anchor coordinates).
+        assert_eq!(PreviewParams::default().encode().len(), 1788);
     }
 
     #[test]

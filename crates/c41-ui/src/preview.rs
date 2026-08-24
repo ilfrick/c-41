@@ -529,6 +529,34 @@ pub struct PreviewParams {
     pub rc_nodes_r: [(f32, f32); 20],
     pub rc_nodes_g: [(f32, f32); 20],
     pub rc_nodes_b: [(f32, f32); 20],
+    // ── Base curve (m4-124, basecurve) ──────────────────────────────────────
+    /// Base curve module enabled. Ships off: darktable auto-applies its
+    /// "display-referred default" preset to raws, which C41 does not run
+    /// (same documented deviation as filmicrgb).
+    pub bc_on: bool,
+    /// Spline type of channel 0 (`basecurve_type[0]`): 0 = cubic spline,
+    /// 1 = Catmull-Rom, 2 = monotone Hermite (C default). C stores three
+    /// channels but reads only channel 0 (`const int ch = 0`, commit_params).
+    pub bc_type: f32,
+    /// Colour-preservation norm (`preserve_colors`): 0 = none (legacy shared-
+    /// table path), 1 = luminance (C $DEFAULT), 2 max, 3 average, 4 sum,
+    /// 5 norm, 6 power.
+    pub bc_preserve: f32,
+    /// Anchor count in use (2..=20); tail of [`Self::bc_nodes`] beyond this
+    /// count is ignored.
+    pub bc_nnodes: f32,
+    /// Exposure-fusion steps (`exposure_fusion`): 0 = plain LUT (process_lut),
+    /// 1/2 = two/three exposures blended through a laplacian pyramid.
+    pub bc_exposure_fusion: f32,
+    /// Stops between fused exposures (`exposure_stops`, C default 1.0).
+    pub bc_exposure_stops: f32,
+    /// Fusion direction (`exposure_bias`, −1 highlights .. +1 shadows). The C
+    /// *param* default is 1.0; the widget's double-click default is 0. We carry
+    /// the param default.
+    pub bc_exposure_bias: f32,
+    /// Channel-0 anchor positions in curve-box coordinates ([0,1]²),
+    /// x-sorted, first fixed at x=0 and last at x=1.
+    pub bc_nodes: [(f32, f32); 20],
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -813,6 +841,16 @@ impl Default for PreviewParams {
             rc_nodes_r: identity_nodes_20(),
             rc_nodes_g: identity_nodes_20(),
             rc_nodes_b: identity_nodes_20(),
+            // basecurve.c $DEFAULTs: 2-node identity channel-0 curve,
+            // MONOTONE_HERMITE, LUMINANCE preservation, no fusion.
+            bc_on: false,
+            bc_type: 2.0,           // MONOTONE_HERMITE ($DEFAULT annotation)
+            bc_preserve: 1.0,       // DT_RGB_NORM_LUMINANCE ($DEFAULT annotation)
+            bc_nnodes: 2.0,
+            bc_exposure_fusion: 0.0,
+            bc_exposure_stops: 1.0, // $DEFAULT
+            bc_exposure_bias: 1.0,  // $DEFAULT (the slider's double-click default is 0 — GUI quirk only)
+            bc_nodes: identity_nodes_20(),
         }
     }
 }
@@ -968,6 +1006,11 @@ impl PreviewParams {
         // RGB curve: identical policy — commit_params is trivial and process()
         // always rebuilds + applies the LUTs while enabled.
         let rc_identity = !self.rc_on;
+        // Base curve: same flag-only gate (Bloom/ToneCurve/RgbCurve policy).
+        // Note darktable's identity-at-defaults argument doesn't even apply:
+        // the shipped "display-referred default" preset is a real tone curve,
+        // not the 2-node identity.
+        let bc_identity = !self.bc_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -983,6 +1026,7 @@ impl PreviewParams {
             && bl_identity
             && tc_identity
             && rc_identity
+            && bc_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -1105,6 +1149,7 @@ impl PreviewParams {
             bl_on: false,
             tc_on: false,
             rc_on: false,
+            bc_on: false,
             ..*self
         }
     }
@@ -1154,7 +1199,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1286,6 +1331,22 @@ impl PreviewParams {
                 v.extend_from_slice(&x.to_le_bytes());
                 v.extend_from_slice(&y.to_le_bytes());
             }
+        }
+        // Base curve (v25): channel-0 scalars, then its 20 interleaved pairs —
+        // appended after the RGB-curve block, keeping the layout append-only.
+        for s in [
+            self.bc_type,
+            self.bc_preserve,
+            self.bc_nnodes,
+            self.bc_exposure_fusion,
+            self.bc_exposure_stops,
+            self.bc_exposure_bias,
+        ] {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        for &(x, y) in &self.bc_nodes {
+            v.extend_from_slice(&x.to_le_bytes());
+            v.extend_from_slice(&y.to_le_bytes());
         }
         v
     }
@@ -1501,6 +1562,18 @@ impl PreviewParams {
             rc_nodes_r: Self::decode_nodes(&f, 272, d.rc_nodes_r),
             rc_nodes_g: Self::decode_nodes(&f, 312, d.rc_nodes_g),
             rc_nodes_b: Self::decode_nodes(&f, 352, d.rc_nodes_b),
+            // Base curve (m4-124): scalars at floats 392–397, then the
+            // channel-0 node array (40 interleaved values) at 398. v24-and-
+            // earlier blobs end before any of this — every `.get` misses and
+            // each slot keeps its C-default value.
+            bc_on: bools.get(34).map_or(d.bc_on, |&b| b != 0),
+            bc_type: f.get(392).copied().unwrap_or(d.bc_type),
+            bc_preserve: f.get(393).copied().unwrap_or(d.bc_preserve),
+            bc_nnodes: f.get(394).copied().unwrap_or(d.bc_nnodes),
+            bc_exposure_fusion: f.get(395).copied().unwrap_or(d.bc_exposure_fusion),
+            bc_exposure_stops: f.get(396).copied().unwrap_or(d.bc_exposure_stops),
+            bc_exposure_bias: f.get(397).copied().unwrap_or(d.bc_exposure_bias),
+            bc_nodes: Self::decode_nodes(&f, 398, d.bc_nodes),
         })
     }
 
@@ -1824,6 +1897,39 @@ impl PreviewParams {
                 coeffs: luts.unbounded_coeffs,
                 autoscale: self.rc_autoscale as i32,
                 preserve_colors: self.rc_preserve as i32,
+            });
+        }
+        // Base curve (basecurve.c, iop_order.c v50_order pos 44.0 — between
+        // rgblevels 43.0 and sigmoid 45.3). C reads only channel 0 of the curve
+        // table (`const int ch = 0`), so a single LUT + unbounded tail coeffs
+        // suffices. default_colorspace is IOP_CS_RGB with no Lab sandwich: like
+        // rgbcurve we sample at 65536 steps in process() exactly as
+        // basecurve.c:commit_params does. Exposure fusion > 0 switches to the
+        // Laplacian-pyramid exposure-blend path (process_fusion), which is NOT
+        // pixel-local — the stage carries `fusion` so pipeline.rs routes it to
+        // the serial whole-buffer branch.
+        if self.bc_on {
+            let pinned = |count: f32, nodes_in: &[(f32, f32); 20]| -> Vec<(f32, f32)> {
+                let nnodes = (count.round() as usize).clamp(2, 20);
+                let mut nodes = *nodes_in;
+                nodes[..nnodes]
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                nodes[0].0 = 0.0;
+                nodes[nnodes - 1].0 = 1.0;
+                nodes[..nnodes].to_vec()
+            };
+            let lut = c41_core::iop::basecurve::build_table(
+                &pinned(self.bc_nnodes, &self.bc_nodes),
+                self.bc_type as i32 as u32,
+            );
+            p.push(Stage::Basecurve {
+                table: lut.table,
+                coeffs: lut.unbounded_coeffs,
+                preserve_colors: self.bc_preserve as i32,
+                fusion: (self.bc_exposure_fusion.round() as i32).clamp(0, 2),
+                stops: self.bc_exposure_stops,
+                bias: self.bc_exposure_bias,
+                space,
             });
         }
         // Shadows/Highlights (shadhi.c, iop_order.c v50_order pos 50.0 — between
@@ -2190,9 +2296,9 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// coordinates).
 /// v24 adds RGB curve (1 bool + 8 f32 scalars + 3×40 interleaved R/G/B anchor
 /// coordinates).
-const ENCODE_VERSION: u8 = 24;
+const ENCODE_VERSION: u8 = 25;
 /// 1 version byte + 34 bool bytes + 392 little-endian f32.
-const ENCODED_LEN: usize = 1 + 34 + 392 * 4;
+const ENCODED_LEN: usize = 1 + 35 + 438 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2212,6 +2318,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (22, 31, 220), // v22: bloom added
     (23, 33, 264), // v23: tone curve added
     (24, 34, 392), // v24: RGB curve added
+    (25, 35, 438), // v25: base curve added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2734,6 +2841,30 @@ mod tests {
     }
 
     #[test]
+    fn basecurve_darkens_midtones_end_to_end() {
+        // An anchor pulling 0.5 down to 0.35 must darken a mid-grey while it
+        // stays neutral: the default LUMINANCE colour-preservation scales every
+        // channel by table(x)/Y-luma(x), so equal-RGB in → equal-RGB out. The
+        // drawn curve IS the applied curve (both sample the same LUT build).
+        let mut p = PreviewParams::default();
+        p.exposure_on = false; // isolate the curve
+        p.bc_on = true;
+        p.bc_type = 1.0; // Catmull-Rom
+        p.bc_nnodes = 3.0;
+        p.bc_nodes[1] = (0.5, 0.35);
+        p.bc_nodes[2] = (1.0, 1.0);
+        assert!(!p.is_identity());
+        let base = vec![128u8, 128, 128];
+        let out = apply_pipeline(&base, 1, 1, 3, 3, &p);
+        assert!(
+            out.iter().enumerate().all(|(k, &v)| v < base[k]),
+            "every channel must darken, got {out:?} from {base:?}"
+        );
+        assert_eq!(out[0], out[1], "grey must stay neutral under LUMINANCE preservation");
+        assert_eq!(out[1], out[2]);
+    }
+
+    #[test]
     fn monochrome_produces_equal_rgb_from_weighted_mix() {
         // weights (0.2,0.7,0.1) on (1.0, 0.502, 0.0):
         // gray = 0.2 + 0.7*0.502 + 0 = 0.5514 → *255 ≈ 141, R=G=B.
@@ -2981,14 +3112,25 @@ mod tests {
         // colorbalancergb 41.5 and rgblevels 43.0 (the 50.5 entry is in
         // legacy_order, not v50). On by itself is enough to emit the stage.
         p.rc_on = true;
+        // Base curve: pos 44.0 in v50_order ("conversion from scene-referred to
+        // display referred") — after rgblevels 43.0, before sigmoid 45.3. On by
+        // itself is enough to emit the stage.
+        p.bc_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "splittoning"]
         );
+        // Base curve is the scene→display conversion point (iop_order.c pos
+        // 44.0): after rgbcurve/rgblevels, before sigmoid and filmicrgb.
+        let bc_pos = names.iter().position(|n| *n == "basecurve").unwrap();
+        assert!(bc_pos > names.iter().position(|n| *n == "rgbcurve").unwrap(),
+            "basecurve must run after rgbcurve: {names:?}");
+        assert!(bc_pos < names.iter().position(|n| *n == "sigmoid").unwrap(),
+            "basecurve must run before sigmoid: {names:?}");
         // Tone curve sits in the display-referred cluster (iop_order.c pos 48):
         // after the scene-referred tone map, before levels.
         let tc_pos = names.iter().position(|n| *n == "tonecurve").unwrap();
@@ -3477,6 +3619,25 @@ mod tests {
                 n[3] = (1.0, 1.0);
                 n
             },
+            // Base curve: bool flipped from default; every scalar off-default
+            // and pairwise distinct so a wrong offset inside the appended block
+            // shows as a mismatch; node array edited at slots 1..4 (slots 0 and
+            // beyond stay identity) so per-slot offsets can't silently swap.
+            bc_on: true,
+            bc_type: 0.0,     // CUBIC_SPLINE — non-default interpolator
+            bc_preserve: 2.0, // DT_RGB_NORM_MAX
+            bc_nnodes: 5.0,
+            bc_exposure_fusion: 1.0, // two exposures
+            bc_exposure_stops: 1.75,
+            bc_exposure_bias: -0.35,
+            bc_nodes: {
+                let mut n = [(0.0f32, 0.0f32); 20];
+                n[1] = (0.2, 0.15);
+                n[2] = (0.45, 0.55);
+                n[3] = (0.7, 0.8);
+                n[4] = (1.0, 1.0);
+                n
+            },
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -3624,6 +3785,36 @@ mod tests {
         assert_eq!(decoded.rc_nodes_r, def.rc_nodes_r);
         assert_eq!(decoded.rc_nodes_g, def.rc_nodes_g);
         assert_eq!(decoded.rc_nodes_b, def.rc_nodes_b);
+    }
+
+    #[test]
+    fn decode_v24_blob_defaults_bc_fields() {
+        // A v24 blob (before base curve was added — 34 bools / 392 f32s) must
+        // decode successfully: the new base-curve fields fall back to their
+        // defaults, so a saved style from the pre-basecurve era loads cleanly.
+        let v24 = {
+            let mut b = vec![0u8; 1 + 34 + 392 * 4];
+            b[0] = 24; // version 24
+            b
+        };
+        let decoded = PreviewParams::decode(&v24)
+            .expect("v24 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.bc_on, def.bc_on);
+        assert_eq!(decoded.bc_type, def.bc_type);
+        assert_eq!(decoded.bc_preserve, def.bc_preserve);
+        assert_eq!(decoded.bc_nnodes, def.bc_nnodes);
+        assert_eq!(decoded.bc_exposure_fusion, def.bc_exposure_fusion);
+        assert_eq!(decoded.bc_exposure_stops, def.bc_exposure_stops);
+        assert_eq!(decoded.bc_exposure_bias, def.bc_exposure_bias);
+        assert_eq!(decoded.bc_nodes, def.bc_nodes);
+        // and the defaulted module stays out of the pipeline
+        assert!(
+            decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0)
+                .stages.iter()
+                .all(|s| s.name() != "basecurve"),
+            "v24 blob must not emit a basecurve stage: defaults are off"
+        );
     }
 
     #[test]

@@ -1884,6 +1884,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Tone curve" => pg.add(&curve_editor::tonecurve_module_row(ctx)),
                 "RGB curve" => pg.add(&curve_editor::rgbcurve_module_row(ctx)),
+                "Base curve" => pg.add(&curve_editor::basecurve_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
                 "Lowlight vision" => pg.add(&lowlight_module_row(ctx)),
@@ -1978,7 +1979,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Bloom", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Bloom", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure

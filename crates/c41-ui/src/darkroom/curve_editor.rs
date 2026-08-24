@@ -1,5 +1,5 @@
-//! Interactive L-curve editor shared by the Tone curve (m4-122) and RGB curve
-//! (m4-123) modules.
+//! Interactive L-curve editor shared by the Tone curve (m4-122), RGB curve
+//! (m4-123) and Base curve (m4-124) modules.
 //!
 //! A `DrawingArea` painting the curve box — grid, dashed identity diagonal,
 //! the spline itself and draggable anchor nodes — plus click/drag handlers
@@ -70,6 +70,13 @@ const RGBCURVE_STYLES: [ChannelStyle; 3] = [
         ring: (0.35, 0.55, 0.98),
     },
 ];
+
+/// Base curve (m4-124): one neutral channel — C paints this module's curve in
+/// flat grey rather than a lane colour.
+const BASECURVE_STYLE: ChannelStyle = ChannelStyle {
+    line: (0.9, 0.9, 0.9),
+    ring: (0.9, 0.9, 0.9),
+};
 
 /// The plot rectangle inside the widget: `[x, x+w) × [y, y+h)`, with curve
 /// coordinate (0,0) mapping to its bottom-left corner (y flipped).
@@ -265,7 +272,7 @@ fn multi_curve_area(
             let rect = PlotRect::from_widget_size(w, h);
             let ch = draw_state.active_ch();
             // Defensive against a styles slice shorter than the channel count
-            // (both call sites ship matching lengths; this keeps indexing total).
+            // (all call sites ship matching lengths; this keeps indexing total).
             while draw_styles.len() < draw_state.channels.len() {
                 draw_styles.push(*draw_styles.last().unwrap_or(&TONECURVE_STYLE));
             }
@@ -576,6 +583,122 @@ pub(crate) fn rgbcurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             e.add_row(&mode);
             e.add_row(&norm);
             e.add_row(&chan);
+            e.add_row(&area);
+        });
+    expander
+}
+
+/// Build the Base curve module row (m4-124): enable switch, colour-preservation
+/// selector, exposure-fusion selector and the interactive single-channel
+/// editor.
+///
+/// Mirrors basecurve.c's gui_init control order — preserve-colors (:1952), then
+/// fusion (:1955-58) with its two dependent sliders. Those sliders exist but
+/// stay hidden while fusion is "none" (gui_init :1966/:1976, gui_update
+/// :1323-24); we toggle their row visibility the same way. Two deliberate
+/// omissions: C's GUI has NO interpolator dropdown for this module (the spline
+/// type rides in params, defaulting to monotone Hermite — we still *read*
+/// bc_type so a decoded blob with another type draws correctly), and the
+/// log-base graph-scale slider is display-only. The canvas goes last to match
+/// the sibling curve modules' layout.
+pub(crate) fn basecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    // Single channel; channel_nodes/seed_nodes are rgbcurve-specific, so seed
+    // from the bc_ fields directly (first `count` slots).
+    let state = Rc::new(MultiCurveState {
+        channels: vec![(
+            Rc::new(RefCell::new(
+                p0.bc_nodes[..(p0.bc_nnodes.round() as usize).clamp(2, MAX_ANCHORS)].to_vec(),
+            )),
+            Rc::new(Cell::new(None)),
+        )],
+        active: Rc::new(Cell::new(0)),
+    });
+
+    let type_of: TypeFn = Rc::new(|p, _| p.bc_type.round() as i32 as u32);
+    let sync: SyncFn = Rc::new(|ctx, _, nodes| {
+        let mut p = ctx.params.borrow_mut();
+        p.bc_nodes = nodes_to_array(nodes);
+        p.bc_nnodes = nodes.len() as f32;
+    });
+    let area = multi_curve_area(ctx, &state, vec![BASECURVE_STYLE], type_of, sync);
+
+    let expander = super::module_expander(ctx, "Base curve", "scene→display curve", p0.bc_on,
+        |p, on| p.bc_on = on,
+        move |e, ctx| {
+            let p0 = *ctx.params.borrow();
+
+            // Colour-preservation norm (DT_RGB_NORM_*). Always sensitive here —
+            // unlike rgbcurve it is not gated behind a channel-link mode.
+            let norm_labels =
+                ["none", "luminance", "max", "average", "sum", "norm", "power"];
+            let norm = adw::ComboRow::builder()
+                .title("Preserve colors")
+                .model(&gtk4::StringList::new(&norm_labels))
+                .selected((p0.bc_preserve.round() as usize).min(norm_labels.len() - 1) as u32)
+                .build();
+            {
+                let norm_ctx = ctx.clone();
+                norm.connect_selected_notify(move |row| {
+                    norm_ctx.params.borrow_mut().bc_preserve = row.selected() as f32;
+                    super::render_preview(&norm_ctx);
+                });
+            }
+
+            // Exposure fusion: none / two / three exposures (basecurve.c:1956-58).
+            // Non-zero switches the pipeline stage to the Laplacian-pyramid blend.
+            let fusion_labels = ["none", "two exposures", "three exposures"];
+            let fusion = adw::ComboRow::builder()
+                .title("Exposure fusion")
+                .model(&gtk4::StringList::new(&fusion_labels))
+                .selected((p0.bc_exposure_fusion.round() as usize).min(fusion_labels.len() - 1)
+                    as u32)
+                .build();
+
+            // The two fusion sliders (stops 0.01..4.0, bias -1..1 per the C
+            // introspection ranges). Built via labeled_slider directly because
+            // add_param_slider does not return the widget and their rows must
+            // start hidden when fusion is "none".
+            let stops = super::labeled_slider("Exposure shift", 0.01, 4.0, 0.01,
+                p0.bc_exposure_stops as f64);
+            {
+                let stops_ctx = ctx.clone();
+                stops.scale.connect_value_changed(move |v| {
+                    stops_ctx.params.borrow_mut().bc_exposure_stops = v as f32;
+                    super::render_preview(&stops_ctx);
+                });
+            }
+            let bias = super::labeled_slider("Exposure bias", -1.0, 1.0, 0.01,
+                p0.bc_exposure_bias as f64);
+            {
+                let bias_ctx = ctx.clone();
+                bias.scale.connect_value_changed(move |v| {
+                    bias_ctx.params.borrow_mut().bc_exposure_bias = v as f32;
+                    super::render_preview(&bias_ctx);
+                });
+            }
+            // gui_init shows them only when a fusion mode is active.
+            let fusion_active = p0.bc_exposure_fusion.round() as i32 != 0;
+            stops.row.set_visible(fusion_active);
+            bias.row.set_visible(fusion_active);
+
+            {
+                let fusion_ctx = ctx.clone();
+                let stops_row = stops.row.clone();
+                let bias_row = bias.row.clone();
+                fusion.connect_selected_notify(move |row| {
+                    fusion_ctx.params.borrow_mut().bc_exposure_fusion = row.selected() as f32;
+                    let show = row.selected() != 0;
+                    stops_row.set_visible(show);
+                    bias_row.set_visible(show);
+                    super::render_preview(&fusion_ctx);
+                });
+            }
+
+            e.add_row(&norm);
+            e.add_row(&fusion);
+            e.add_row(&stops.row);
+            e.add_row(&bias.row);
             e.add_row(&area);
         });
     expander

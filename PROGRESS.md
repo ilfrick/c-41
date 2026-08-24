@@ -1740,3 +1740,73 @@ now pins colorbalancergb < rgbcurve < sigmoid). Note: an editing race with a
 concurrent worker on preview.rs briefly produced two RgbCurve emission blocks;
 resolved by keeping the concurrent (better-commented) version and dropping the
 duplicate before any build ran.
+
+## 2026-08-24T22:41Z — m4-124: base curve (`basecurve`) live preview module #32
+
+Wired darktable's **base curve** into the live preview, completing the curve
+trio (tone → RGB → base). Core: `basecurve.rs` gained the pipeline-facing layer —
+`build_table` (now a thin delegate over rgbcurve's refactored
+`CurveLut`/`build_single_lut`, so both modules share one LUT builder and one
+estimate_exp tail), `exposure_increment` (verbatim port of basecurve.c:565-569:
+offset = stops·fusion·(bias−1)/2), `apply_curve_pixels` (dispatches legacy
+non-chroma-preserving vs apply_curve kernel with preserve_colors + luminance
+Y-row), and `process_fusion` — the full Laplacian-pyramid exposure-blend
+orchestration over the Phase 2z+56 kernels (compute_features → gauss_reduce →
+weight_update → pyramid blend coarse→fine → normalize/add_layers → copy_output),
+with `level_dims`/`gauss_reduce` helpers. C reads only channel 0 (`const int ch =
+0`) so a single LUT suffices.
+
+**Working-space luminance**: C passes `work_profile->matrix_in` to apply_curve in
+BOTH paths (incl. fusion, basecurve.c:1127) but the kernel consumes only row 1
+(the Y row). Since Bradford chromatic adaptation preserves the Y row exactly,
+`sRGB_TO_XYZ_D65_Y_ROW` / `REC2020_TO_XYZ_D65_Y_ROW` constants were added to
+color.rs and threaded as `Option<[f32;3]>` instead of plumbing ICC profiles. The
+T4 matrices in color.rs are transposed (column-major), so passing them directly
+would have handed the kernel the G *column* — hence the row-extraction API.
+Camera-primaries fallback (None) uses dt_camera_rgb_luminance coefficients.
+
+Pipeline: `Stage::Basecurve { table, coeffs, preserve_colors, fusion, stops,
+bias, space }` at iop_order v50_order pos 44.0 ("conversion from scene-referred
+to display referred"), between rgblevels 43.0 and sigmoid 45.3 — emitted after
+RGB curve, before sigmoid/shadhi (pinned by the ordering test with positional
+asserts). Pixel-locality gate `fusion == 0`: fusion>0 routes to the serial
+whole-buffer path (pyramid reads neighbours); plain-curve mode rides the rayon
+band path like RgbCurve.
+
+UI: params v24→v25 (+1 bool/+6 f32/+40 interleaved node coords, blob
+1603→1788), append-only layout keeps all prior offsets stable. HISTORY_ENCODE_VERSION
+5→6 (old v5 stacks still load via the accepts-version-1 rule; their embedded v24
+params resolve through PARAMS_LAYOUTS). `basecurve_module_row` joins
+`multi_curve_area` as its third client (single neutral-grey channel): preserve-
+colors combo, exposure-fusion combo (none/two/three), and the two fusion sliders
+built via labeled_slider directly because their rows must toggle visibility with
+fusion≠0 (C gui_init :1966/:1976 + gui_update :1323-24). Two documented GUI
+deviations: no interpolator dropdown (C's gui_init has none for this module —
+bc_type still drives the drawn spline so decoded blobs render correctly), and
+log-base graph scaling omitted (display-only).
+
+Senior review: **APPROVE-WITH-NITS** — fricktrade-architect failed again (API
+402), fork subagent stood in per established fallback, explicitly constrained to
+read-only after the m4-123 incident. It independently confirmed all seven C
+claims against source (iop_order placement, ch=0, exposure_increment formula,
+fusion work-profile pass, GUI widget set, $DEFAULTs, Y-row/Bradford soundness)
+and hand-recomputed the fusion grey test expectation (≈0.6726 vs my ≈0.67
+comment). Findings: MINOR doc slip "v4" for "v5" history blobs (fixed); two NITs
+recorded not fixed — corrupt-blob stops/bias reach the kernel unclamped (same
+posture as every sibling module; NaN cannot panic), and the endpoint-pinning
+closure is now duplicated between RgbCurve/Basecurve emission blocks (a third
+curve module would justify hoisting it).
+
+Verification: full `scripts/ci-local.sh` green **by exit code** (0): check +
+clippy (zero new warnings from the m4-124 layer — all flagged lines in touched
+files are pre-existing classes verified line-by-line) + tests under --release
+(c41-core 768, c41-db 92, c41-ui 269, incl. new build_table/exposure_increment/
+Y-row/fusion tests ×18 in core and ordering/v25-roundtrip/v24-fallback/e2e
+darkening tests in ui) + release bin link. En route self-corrections: a stray
+thinking-text paste into basecurve.rs and an inverted split_at_mut were caught
+and fixed pre-review; the pipe-exit-code trap nearly bit again on an early
+Docker test run (`| tail` swallows cargo's status) and was re-run redirect-first.
+
+Process notes: PARITY_AUDIT row 2.1 updated in the same commit (31→32 live;
+only lens correction remains missing, lensfun-blocked). NIT backlog: shared
+endpoint-pinning helper when the next curve module lands.

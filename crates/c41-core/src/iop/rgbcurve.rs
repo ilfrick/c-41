@@ -42,6 +42,44 @@ pub struct RgbCurveLuts {
     pub unbounded_coeffs: [[f32; 3]; 3],
 }
 
+/// One channel's sampled table + tail-extrapolation coefficients — the
+/// per-channel half of [`build_luts`]. The base-curve module builds exactly
+/// one of these per render (its commit_params runs the identical machinery on
+/// channel 0 only; basecurve.c:1287–1301), so the builder lives here and both
+/// modules share it.
+pub struct CurveLut {
+    pub table: Box<[f32; 65536]>,
+    /// Right-hand exponential tail (`unbounded_coeffs`); `xm = 1 / coeffs[0]`
+    /// is derived at apply time, exactly like C's process().
+    pub unbounded_coeffs: [f32; 3],
+}
+
+/// Port of `_generate_curve_lut`'s sampling half (rgbcurve.c:1725-1749) for a
+/// single curve: sample the anchors at 0x10000 resolution through the V1
+/// sampler (`dt_draw_curve_calc_values`), then fit an exponential tail over
+/// x∈{0.7,0.8,0.9,1.0}·xm with lookups mirrored from the table.
+///
+/// Each node slice must be non-empty with its last anchor at x ≤ 1 (the
+/// pipeline pins endpoints before calling, as the editor guarantees).
+pub fn build_single_lut(nodes: &[(f32, f32)], ty: u32) -> CurveLut {
+    let mut raw = vec![0.0f32; 0x1_0000];
+    let mut table = Box::new([0.0f32; 65536]);
+    curve_tools::curve_data_sample(nodes, ty, 0.0, 1.0, &mut raw);
+    table.copy_from_slice(&raw);
+    // Same int-truncation + clamp lookup the pixel loop uses
+    // ((int)(x·0x10000) CLAMPed to [0, 0xffff]).
+    let lut_index =
+        |v: f32| -> usize { ((v * 0x1_0000_u32 as f32) as i64).clamp(0, 0xffff) as usize };
+    // Extrapolation for the unbounded right tail (:1733-1748).
+    let xm = nodes[nodes.len() - 1].0;
+    let xs: Vec<f32> = [0.7f32, 0.8, 0.9, 1.0].iter().map(|m| m * xm).collect();
+    let ys: Vec<f32> = xs.iter().map(|&x| table[lut_index(x)]).collect();
+    CurveLut {
+        table,
+        unbounded_coeffs: estimate_exp(&xs, &ys),
+    }
+}
+
 /// Port of `_generate_curve_lut`'s sampling half (rgbcurve.c:1725-1749): each
 /// channel's anchors are sampled at 0x10000 resolution through the V1 sampler
 /// (`dt_draw_curve_calc_values`), then an exponential tail is fitted over
@@ -59,33 +97,18 @@ pub fn build_luts(
     nodes_b: &[(f32, f32)],
     type_b: u32,
 ) -> RgbCurveLuts {
-    let channels = [(nodes_r, type_r), (nodes_g, type_g), (nodes_b, type_b)];
-    let mut raw = vec![0.0f32; 0x1_0000];
-    let mut tables = [
-        Box::new([0.0f32; 65536]),
-        Box::new([0.0f32; 65536]),
-        Box::new([0.0f32; 65536]),
-    ];
-    let mut coeffs = [[0.0f32; 3]; 3];
-    // Same int-truncation + clamp lookup the pixel loop uses
-    // ((int)(x·0x10000) CLAMPed to [0, 0xffff]).
-    let lut_index =
-        |v: f32| -> usize { ((v * 0x1_0000_u32 as f32) as i64).clamp(0, 0xffff) as usize };
-    for (ch, &(nodes, ty)) in channels.iter().enumerate() {
-        curve_tools::curve_data_sample(nodes, ty, 0.0, 1.0, &mut raw);
-        tables[ch].copy_from_slice(&raw);
-        // Extrapolation for the unbounded right tail (:1733-1748).
-        let xm = nodes[nodes.len() - 1].0;
-        let xs: Vec<f32> = [0.7f32, 0.8, 0.9, 1.0].iter().map(|m| m * xm).collect();
-        let ys: Vec<f32> = xs.iter().map(|&x| tables[ch][lut_index(x)]).collect();
-        coeffs[ch] = estimate_exp(&xs, &ys);
-    }
-    let [table_r, table_g, table_b] = tables;
+    let r = build_single_lut(nodes_r, type_r);
+    let g = build_single_lut(nodes_g, type_g);
+    let b = build_single_lut(nodes_b, type_b);
     RgbCurveLuts {
-        table_r,
-        table_g,
-        table_b,
-        unbounded_coeffs: coeffs,
+        table_r: r.table,
+        table_g: g.table,
+        table_b: b.table,
+        unbounded_coeffs: [
+            r.unbounded_coeffs,
+            g.unbounded_coeffs,
+            b.unbounded_coeffs,
+        ],
     }
 }
 

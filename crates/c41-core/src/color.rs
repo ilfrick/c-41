@@ -207,6 +207,17 @@ pub const SRGB_TO_XYZ_D65_T4: [[f32; 4]; 4] = [
     [0.0, 0.0, 0.0, 0.0],
 ];
 
+/// The **Y row** of the linear-sRGB→XYZ matrix in normal orientation:
+/// `dot(rgb, row) = luminance`. Kernels that consume a work-profile
+/// `matrix_in` read exactly this row (basecurve's LUMINANCE preservation);
+/// it is white-point-invariant under Bradford adaptation, so the D65 values
+/// stand in for darktable's D50-derived ICC matrix row.
+pub const SRGB_TO_XYZ_D65_Y_ROW: [f32; 3] = [
+    SRGB_TO_XYZ_D65_T[0][1],
+    SRGB_TO_XYZ_D65_T[1][1],
+    SRGB_TO_XYZ_D65_T[2][1],
+];
+
 /// Linear **sRGB** (D65) → XYZ (D65). Alpha (ch 3) passes through. The
 /// linear-sRGB working-space twin of [`rec2020_to_xyz_d65`].
 pub fn srgb_to_xyz_d65(rgb: [f32; 4]) -> [f32; 4] {
@@ -243,6 +254,14 @@ pub const REC2020_TO_XYZ_D65_T4: [[f32; 4]; 4] = [
     [REC2020_TO_XYZ_D65_T[1][0], REC2020_TO_XYZ_D65_T[1][1], REC2020_TO_XYZ_D65_T[1][2], 0.0],
     [REC2020_TO_XYZ_D65_T[2][0], REC2020_TO_XYZ_D65_T[2][1], REC2020_TO_XYZ_D65_T[2][2], 0.0],
     [0.0, 0.0, 0.0, 0.0],
+];
+
+/// The **Y row** of the Rec.2020→XYZ matrix in normal orientation — the
+/// Rec.2020 twin of [`SRGB_TO_XYZ_D65_Y_ROW`] (matches `pipeline::REC2020_LUMA`).
+pub const REC2020_TO_XYZ_D65_Y_ROW: [f32; 3] = [
+    REC2020_TO_XYZ_D65_T[0][1],
+    REC2020_TO_XYZ_D65_T[1][1],
+    REC2020_TO_XYZ_D65_T[2][1],
 ];
 
 /// Linear **Rec.2020** (D65) → XYZ (D65). Alpha (ch 3) passes through.
