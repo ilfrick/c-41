@@ -2338,6 +2338,189 @@ pub unsafe extern "C" fn darkroom_highlights_inpaint_bayer_cols(
     }
 }
 
+// ── Preview-pipeline driver (m4-119) ─────────────────────────────────────────
+
+/// Reconstruction method for the preview front end. C41 wires darktable's
+/// default ("inpaint opposed") plus the simple clip fallback; the other C
+/// methods (LCh, guided laplacians, segmentation) remain unwired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HlMode {
+    /// Photosites above their channel's threshold are clamped to it.
+    Clip,
+    /// darktable's default method: rebuild clipped sites from opposing
+    /// channels (refavg + global chrominance estimate).
+    Opposed,
+}
+
+/// Highlight-reconstruction options threaded from the UI's `PreviewParams`
+/// into the raw front end
+/// ([`crate::rawimage::RawImage::to_linear_rgba_with`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HlOpts {
+    pub mode: HlMode,
+    /// darktable's "clipping threshold" slider (0.0..2.0, default 1.0).
+    pub clip: f32,
+}
+
+impl Default for HlOpts {
+    fn default() -> Self {
+        HlOpts { mode: HlMode::Opposed, clip: 1.0 }
+    }
+}
+
+/// Per-method threshold multipliers from highlights.c:56, indexed by the C
+/// method code (CLIP=0 → 1.0, OPPOSED=5 → 0.987).
+fn mode_magic(mode: HlMode) -> f32 {
+    match mode {
+        HlMode::Clip => 1.0,
+        HlMode::Opposed => 0.987,
+    }
+}
+
+/// Reconstruct clipped photosites over a **white-balanced** mosaic in place.
+///
+/// Replicates `_process_opposed`'s keep=FALSE path
+/// (src/iop/hlreconstruct/opposed.c) through the ported kernels called
+/// directly, and the mosaic-domain pass of `process_clip()` for
+/// [`HlMode::Clip`]. The caller must have applied white balance to the mosaic
+/// first ([`crate::rawimage::apply_white_balance_mosaic`]) — the C pipeline
+/// runs temperature before highlights; C41 applies WB right here instead.
+///
+/// Deviation vs upstream C (documented, PROGRESS.md m4-119): Bayer patterns
+/// whose second green encodes as E (colour index 3) take the clip pass — the
+/// kernels mirror the C's three-slot clips indexing, which mis-indexes the
+/// mask planes for a fourth colour.
+pub fn reconstruct_mosaic(
+    mosaic: &mut [f32],
+    width: usize,
+    height: usize,
+    cfa: [[usize; 2]; 2],
+    xtrans: Option<&[[u8; 6]; 6]>,
+    wb: [f32; 4],
+    opts: HlOpts,
+) {
+    // WB ratios normalised by green — the same multipliers
+    // `apply_white_balance` applies post-demosaic on the legacy path, so the
+    // thresholds land at the same scene values either way.
+    let ratio = |c: usize| -> f32 {
+        if wb[1] > 0.0 && wb[1].is_finite() { wb[c] / wb[1] } else { 1.0 }
+    };
+    let clipval = mode_magic(opts.mode) * opts.clip;
+    let clips: [f32; 3] = core::array::from_fn(|c| clipval * ratio(c));
+
+    let filters = if xtrans.is_some() {
+        9_u32
+    } else {
+        crate::rawimage::filters_from_cfa(cfa)
+    };
+
+    // Safe per-channel clip; also the colour-3 fallback for opposed. Second
+    // green (index 3) shares the green threshold.
+    let clip_pass = |mosaic: &mut [f32]| {
+        for row in 0..height {
+            for col in 0..width {
+                let i = row * width + col;
+                let colour = match xtrans {
+                    Some(xt) => raw::fcol(row as i32, col as i32, 9, xt),
+                    None => raw::fc_bayer(row as i32, col as i32, filters),
+                };
+                let c = if colour >= 3 { 1 } else { colour };
+                mosaic[i] = mosaic[i].min(clips[c]);
+            }
+        }
+    };
+
+    let has_e_colour = xtrans.is_none() && cfa.iter().flatten().any(|&c| c == 3);
+
+    match opts.mode {
+        HlMode::Clip => clip_pass(mosaic),
+        HlMode::Opposed if has_e_colour => clip_pass(mosaic),
+        HlMode::Opposed => {
+            // X-Trans passes the real pattern; Bayer a zero table (unused:
+            // fc_bayer ignores it when filters != 9).
+            let xt_table: [[u8; 6]; 6] = xtrans.copied().unwrap_or([[0; 6]; 6]);
+            let mwidth = width / 3;
+            let mheight = height / 3;
+            let round4 = |n: usize| (n + 3) & !3;
+            let msize = round4(mwidth) * round4(mheight);
+            let corr = [1.0_f32; 4]; // no late chrominance correction in C41
+
+            let mut mask = vec![0_u8; 6 * msize];
+            let anyclipped = unsafe {
+                darkroom_highlights_opposed_mask_raw(
+                    mosaic.as_ptr(),
+                    mask.as_mut_ptr(),
+                    width,
+                    mwidth,
+                    mheight,
+                    msize,
+                    filters,
+                    xt_table.as_ptr().cast(),
+                    clips.as_ptr(),
+                )
+            };
+            // Nothing ≥ threshold anywhere ⇒ the output pass would be an
+            // exact copy (its reconstruction branch needs v >= clips): skip it.
+            if anyclipped != 0 {
+                unsafe {
+                    darkroom_highlights_opposed_dilate_raw(
+                        mask.as_mut_ptr(),
+                        mwidth,
+                        mheight,
+                        msize,
+                    );
+                }
+                let mut sums = [0.0_f32; 4];
+                let mut cnts = [0.0_f32; 4];
+                unsafe {
+                    darkroom_highlights_opposed_chroma_raw(
+                        mosaic.as_ptr(),
+                        mask.as_ptr(),
+                        width,
+                        height,
+                        mwidth,
+                        mheight,
+                        msize,
+                        filters,
+                        xt_table.as_ptr().cast(),
+                        clips.as_ptr(),
+                        corr.as_ptr(),
+                        sums.as_mut_ptr(),
+                        cnts.as_mut_ptr(),
+                    )
+                }
+                let chrominance: [f32; 3] = core::array::from_fn(|c| {
+                    if cnts[c] > 100.0 { sums[c] / cnts[c] } else { 0.0 }
+                });
+
+                // Reconstruct into a scratch plane (the kernel takes separate
+                // in/out pointers; aliasing the one slice would be UB), then
+                // copy back over the mosaic.
+                let mut out = vec![0.0_f32; width * height];
+                unsafe {
+                    darkroom_highlights_opposed_output_raw(
+                        mosaic.as_ptr(),
+                        std::ptr::null(),
+                        out.as_mut_ptr(),
+                        width,
+                        height,
+                        0,
+                        0,
+                        width,
+                        height,
+                        filters,
+                        xt_table.as_ptr().cast(),
+                        clips.as_ptr(),
+                        chrominance.as_ptr(),
+                        corr.as_ptr(),
+                    )
+                }
+                mosaic.copy_from_slice(&out);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2353,6 +2536,104 @@ mod tests {
         [1, 2, 1, 1, 0, 1], [1, 0, 1, 1, 2, 1],
         [2, 1, 2, 0, 1, 0], [1, 0, 1, 1, 2, 1],
     ];
+
+    // ── m4-119: preview-pipeline driver ────────────────────────────────────
+
+    const RGGB_CFA: [[usize; 2]; 2] = [[0, 1], [1, 2]];
+
+    #[test]
+    fn clip_mode_caps_photosites_at_channel_thresholds() {
+        let mut m = vec![0.5_f32; 144];
+        m[0] = 2.0; // R site (RGGB row0 col0) over white
+        m[1] = 2.0; // G site
+        m[3] = 2.0; // B site (row1 col1)
+        let wb = [2.0, 1.0, 1.0, 1.0];
+        crate::rawimage::apply_white_balance_mosaic(&mut m, 12, |r, c| RGGB_CFA[r % 2][c % 2], wb);
+        reconstruct_mosaic(
+            &mut m, 12, 12, RGGB_CFA, None, wb,
+            HlOpts { mode: HlMode::Clip, clip: 1.0 },
+        );
+        // Post-WB values capped at clip·magic·ratio: R min(4, 1·1·2), G/B min(2, 1).
+        assert_eq!(m[0], 2.0);
+        assert_eq!(m[1], 1.0);
+        assert_eq!(m[3], 1.0);
+        assert_eq!(m[5], 0.5); // mid-grey untouched
+    }
+
+    #[test]
+    fn opposed_unclipped_field_is_untouched() {
+        // Everything below threshold ⇒ the skip path leaves the buffer intact.
+        let mut m = vec![0.5_f32; 144];
+        let before = m.clone();
+        reconstruct_mosaic(
+            &mut m, 12, 12, RGGB_CFA, None, [2.0, 1.0, 1.0, 1.0],
+            HlOpts { mode: HlMode::Opposed, clip: 1.0 },
+        );
+        assert_eq!(m, before);
+    }
+
+    #[test]
+    fn opposed_raises_saturated_channels_toward_opposing_values() {
+        // Bright field (G/B well over white) with R sites stuck at sensor
+        // white: reconstruction lifts R to what the opposing channels imply —
+        // scene-referred recovery, not a clamp.
+        let mut m = vec![3.0_f32; 144];
+        for row in 0..12 {
+            for col in 0..12 {
+                if RGGB_CFA[row % 2][col % 2] == 0 {
+                    m[row * 12 + col] = 1.0; // R saturated pre-WB
+                }
+            }
+        }
+        let wb = [2.0, 1.0, 1.0, 1.0];
+        crate::rawimage::apply_white_balance_mosaic(&mut m, 12, |r, c| RGGB_CFA[r % 2][c % 2], wb);
+        assert_eq!(m[0], 2.0); // R post-WB saturation reading
+        reconstruct_mosaic(
+            &mut m, 12, 12, RGGB_CFA, None, wb,
+            HlOpts { mode: HlMode::Opposed, clip: 1.0 },
+        );
+        assert!(
+            (m[0] - 3.0).abs() < 1e-3,
+            "R site recovered to {}, want the implied ~3.0",
+            m[0]
+        );
+        assert!((m[1] - 3.0).abs() < 1e-4, "G site stays at {}, already ≥ refavg", m[1]);
+    }
+
+    #[test]
+    fn xtrans_driver_smoke_both_modes() {
+        let xt = XTRANS;
+        let mut m = vec![0.5_f32; 36 * 36];
+        m[0] = 5.0; // guaranteed clipped wherever it sits in the pattern
+        let wb = [1.0; 4];
+        reconstruct_mosaic(
+            &mut m, 36, 36, [[0, 1], [1, 2]], Some(&xt), wb,
+            HlOpts { mode: HlMode::Opposed, clip: 1.0 },
+        );
+        assert_eq!(m.len(), 36 * 36);
+        assert!(m.iter().all(|v| v.is_finite()));
+        reconstruct_mosaic(
+            &mut m, 36, 36, [[0, 1], [1, 2]], Some(&xt), wb,
+            HlOpts { mode: HlMode::Clip, clip: 1.0 },
+        );
+        assert!(m.iter().all(|&v| v <= 1.0 + 1e-6));
+    }
+
+    #[test]
+    fn second_green_as_e_bayer_takes_the_clip_fallback() {
+        // A pattern carrying E (colour index 3): the opposed kernels mirror the
+        // C's three-slot clips indexing and cannot represent a fourth colour,
+        // so the driver substitutes the clip pass (documented deviation).
+        let cfa = [[0usize, 1], [3, 2]];
+        let mut m = vec![0.5_f32; 144];
+        m[2] = 2.0; // row1 col0 ⇒ the E site
+        reconstruct_mosaic(
+            &mut m, 12, 12, cfa, None, [1.0; 4],
+            HlOpts { mode: HlMode::Opposed, clip: 1.0 },
+        );
+        // Second green shares the green threshold: magic(0.987)·clip(1)·ratio(1).
+        assert!((m[2] - 0.987).abs() < 1e-6, "E site clipped to {}", m[2]);
+    }
 
     #[test]
     fn lch_bayer_unclipped_passes_through() {

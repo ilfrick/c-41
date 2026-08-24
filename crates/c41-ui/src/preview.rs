@@ -425,6 +425,21 @@ pub struct PreviewParams {
     pub filmic_balance: f32,
     /// Extreme-luminance saturation in % (`saturation`), −200..200.
     pub filmic_saturation: f32,
+    // ── Highlight reconstruction (highlights.c, raw front end) ─────────────
+    // Runs on the mosaic BEFORE demosaic (darktable's temperature → highlights
+    // → demosaic order), so unlike every other module it is not a pipeline
+    // stage — it threads into the raw decode (`RawImage::to_linear_rgba_with`)
+    // and changing it re-decodes the preview. Raw inputs only: the non-raw
+    // path is an 8-bit pixbuf front end with no float pre-demosaic domain.
+    /// Highlight reconstruction module enabled. Ships off: darktable
+    /// auto-enables "inpaint opposed" via its scene-referred default preset,
+    /// which we don't replicate; off reproduces the legacy hard-clip-at-white.
+    pub hl_on: bool,
+    /// Method: true = "inpaint opposed" (darktable's default), false =
+    /// "clip highlights". The other C methods are unwired.
+    pub hl_opposed: bool,
+    /// Clipping threshold (`clip`), 0..2, darktable default 1.0.
+    pub hl_clip: f32,
 }
 
 impl Default for PreviewParams {
@@ -664,6 +679,9 @@ impl Default for PreviewParams {
             filmic_contrast: 1.0,
             filmic_balance: 0.0,
             filmic_saturation: 0.0,
+            hl_on: false,
+            hl_opposed: true,
+            hl_clip: 1.0,
         }
     }
 }
@@ -801,6 +819,9 @@ impl PreviewParams {
         // Filmic RGB is a display transform (a tone curve) — never a no-op while
         // enabled. The gate mirrors `to_pipeline`: only the enable flag matters.
         let filmic_identity = !self.filmic_on;
+        // Highlight reconstruction lives in the raw decode, not the stage list:
+        // off = the legacy hard-clip-at-white decoder, on = always re-decodes.
+        let hl_identity = !self.hl_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -811,6 +832,26 @@ impl PreviewParams {
             && toneeq_identity
             && cb_identity
             && filmic_identity
+            && hl_identity
+    }
+
+    /// Highlight-reconstruction options for the raw front end; `None` while the
+    /// module is off (the legacy hard-clip-at-white decode). The single mapping
+    /// site shared by the darkroom preview decode and export, so they can never
+    /// disagree about what the controls mean. Non-raw inputs ignore it (no
+    /// float pre-demosaic domain there).
+    pub fn hl_opts(&self) -> Option<c41_core::iop::highlights::HlOpts> {
+        if !self.hl_on {
+            return None;
+        }
+        Some(c41_core::iop::highlights::HlOpts {
+            mode: if self.hl_opposed {
+                c41_core::iop::highlights::HlMode::Opposed
+            } else {
+                c41_core::iop::highlights::HlMode::Clip
+            },
+            clip: self.hl_clip,
+        })
     }
 
     /// The UI fields mapped onto the core's `FilmicParams` — the single
@@ -909,6 +950,7 @@ impl PreviewParams {
             toneeq_on: false,
             cb_on: false,
             filmic_on: false,
+            hl_on: false,
             ..*self
         }
     }
@@ -944,7 +986,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed] {
             v.push(b as u8);
         }
         for f in [
@@ -1028,6 +1070,8 @@ impl PreviewParams {
             self.filmic_black_point_source, self.filmic_white_point_source,
             self.filmic_output_power, self.filmic_latitude,
             self.filmic_contrast, self.filmic_balance, self.filmic_saturation,
+            // Highlight reconstruction (m4-119).
+            self.hl_clip,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -1207,6 +1251,9 @@ impl PreviewParams {
             filmic_contrast: f.get(210).copied().unwrap_or(d.filmic_contrast),
             filmic_balance: f.get(211).copied().unwrap_or(d.filmic_balance),
             filmic_saturation: f.get(212).copied().unwrap_or(d.filmic_saturation),
+            hl_on: bools.get(26).map_or(d.hl_on, |&b| b != 0),
+            hl_opposed: bools.get(27).map_or(d.hl_opposed, |&b| b != 0),
+            hl_clip: f.get(213).copied().unwrap_or(d.hl_clip),
         })
     }
 
@@ -1773,9 +1820,11 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v17 adds toneequalizer (exposure-channel tone mapping).
 /// v18 adds colorbalancergb (colour balance RGB, 1 bool + 33 f32).
 /// v19 adds filmicrgb (filmic RGB display transform, 1 bool + 7 f32).
-const ENCODE_VERSION: u8 = 19;
-/// 1 version byte + 26 bool bytes + 213 little-endian f32.
-const ENCODED_LEN: usize = 1 + 26 + 213 * 4;
+/// v20 adds highlight reconstruction (2 bools + 1 f32; runs pre-demosaic in
+/// the raw front end, not as a pipeline stage — see [`PreviewParams::hl_opts`]).
+const ENCODE_VERSION: u8 = 20;
+/// 1 version byte + 28 bool bytes + 214 little-endian f32.
+const ENCODED_LEN: usize = 1 + 28 + 214 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1790,6 +1839,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (17, 24, 173), // v17: toneequalizer added
     (18, 25, 206), // v18: colorbalancergb added
     (19, 26, 213), // v19: filmicrgb added
+    (20, 28, 214), // v20: highlight reconstruction added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2885,6 +2935,12 @@ mod tests {
             filmic_contrast: 1.7,
             filmic_balance: -25.0,
             filmic_saturation: 60.0,
+            // Highlight reconstruction: both bools distinct from their defaults
+            // (false/true) plus a non-default threshold, so a wrong offset in
+            // the trailing block shows as a mismatch.
+            hl_on: true,
+            hl_opposed: false,
+            hl_clip: 1.5,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -3251,6 +3307,52 @@ mod tests {
         assert_eq!(decoded.filmic_contrast, def.filmic_contrast);
         assert_eq!(decoded.filmic_balance, def.filmic_balance);
         assert_eq!(decoded.filmic_saturation, def.filmic_saturation);
+    }
+
+    #[test]
+    fn decode_v19_blob_defaults_hl_fields() {
+        // A v19 blob (before highlight reconstruction was added — 26 bools /
+        // 213 f32s) must decode successfully: the new hl_* fields fall back to
+        // their defaults (off), so a saved style from the pre-hl era loads
+        // cleanly and — importantly — stays OFF rather than suddenly running
+        // reconstruction over raws that were decoded clamped before.
+        let v19 = {
+            let mut b = vec![0u8; 1 + 26 + 213 * 4];
+            b[0] = 19; // version 19
+            b
+        };
+        let decoded = PreviewParams::decode(&v19)
+            .expect("v19 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.hl_on, def.hl_on);
+        assert_eq!(decoded.hl_opposed, def.hl_opposed);
+        assert_eq!(decoded.hl_clip, def.hl_clip);
+        assert!(decoded.hl_opts().is_none());
+    }
+
+    #[test]
+    fn hl_opts_maps_mode_and_threshold() {
+        // Off → None (no reconstruction, legacy clamped decode path).
+        let mut p = PreviewParams::default();
+        assert!(p.hl_opts().is_none());
+        // On → Some with the UI's method mapping (opposed is the default).
+        p.hl_on = true;
+        use c41_core::iop::highlights::{HlMode, HlOpts};
+        assert_eq!(
+            p.hl_opts(),
+            Some(HlOpts { mode: HlMode::Opposed, clip: 1.0 })
+        );
+        // The dropdown's second entry ("Clip highlights") maps to HlMode::Clip.
+        p.hl_opposed = false;
+        assert_eq!(
+            p.hl_opts(),
+            Some(HlOpts { mode: HlMode::Clip, clip: 1.0 })
+        );
+        p.hl_clip = 1.5;
+        assert_eq!(
+            p.hl_opts(),
+            Some(HlOpts { mode: HlMode::Clip, clip: 1.5 })
+        );
     }
 
     #[test]

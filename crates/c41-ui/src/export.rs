@@ -250,8 +250,9 @@ pub struct ExportEdit {
 /// Render a decoded [`RawImage`] to a packed 8-bit **sRGB RGB** buffer
 /// (`width*height*3`) through the c41-ui pipeline — the full-resolution
 /// twin of the darkroom preview, so a Rust-native export matches what the user
-/// edited. Composition mirrors the preview exactly: demosaic + white-balance +
-/// camera→Rec.2020 ([`RawImage::to_linear_rgba_with`]) → geometry
+/// edited. Composition mirrors the preview exactly: highlight reconstruction +
+/// demosaic + white-balance + camera→Rec.2020
+/// ([`RawImage::to_linear_rgba_with`] with `params.hl_opts()`) → geometry
 /// ([`Geometry::apply`], straighten then crop) → the colour pipeline + Rec.2020→
 /// sRGB display seam + sRGB OETF ([`crate::preview::render_linear_to_srgb8`]).
 /// Returns the geometry-adjusted `(width, height)` and the RGB bytes.
@@ -261,7 +262,7 @@ pub fn render_export_rgb8(
     geometry: c41_core::geometry::Geometry,
     params: &crate::preview::PreviewParams,
 ) -> (usize, usize, Vec<u8>) {
-    let (w, h, linear) = img.to_linear_rgba_with(method);
+    let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
     let rgb = crate::preview::render_linear_to_srgb8(&geom_linear, gw, gh, params);
     (gw, gh, rgb)
@@ -276,7 +277,7 @@ pub fn render_export_rgb16(
     geometry: c41_core::geometry::Geometry,
     params: &crate::preview::PreviewParams,
 ) -> (usize, usize, Vec<u16>) {
-    let (w, h, linear) = img.to_linear_rgba_with(method);
+    let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
     let rgb = crate::preview::render_linear_to_srgb16(&geom_linear, gw, gh, params);
     (gw, gh, rgb)

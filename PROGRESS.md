@@ -1313,3 +1313,90 @@ to the pixel loop; f64-widened spline node storage — kernel never sees x/y).
 **Verified.** `scripts/ci-local.sh` exit 0 — all four CI steps (check, clippy,
 test --release, release link) pass; 716 c41-core + 251 c41-ui tests green;
 zero new clippy warning families.
+
+## 2026-08-24T15:10Z — m4-119: highlight reconstruction (`highlights`) live preview module
+
+**What changed.** Wired darktable's highlight reconstruction as the 27th live
+darkroom module. The defining difference from modules 1–26: it runs on the raw
+CFA mosaic **before demosaicing** (darktable's temperature → highlights →
+demosaic order), so it is *not* a pipeline `Stage`. It threads through
+`RawImage::to_linear_rgba_with(method, hl: Option<HlOpts>)`, and any UI change
+re-decodes the raw (like the demosaic-method selector) instead of re-rendering
+pipeline stages.
+
+- **Decoder change (the real work):** `normalize_cfa`/`normalize_xtrans`
+  previously hard-clamped photosites at 1.0 at load — there was nothing left to
+  reconstruct. They now carry over-range values (`.max(0.0)`); the legacy
+  `None` decode path clamps at 1.0 first, so its output is byte-identical to
+  pre-m4-119 (pinned by `legacy_none_path_matches_clip_mode_at_unity_wb`,
+  an `assert_eq!` on full RGBA). Side effect, flagged by review and kept:
+  NaN now floors to 0.0 instead of propagating (strict improvement — corrupt
+  white-level metadata used to poison the frame).
+- **WB moved for the hl path:** new `apply_white_balance_mosaic` applies WB on
+  the mosaic before reconstruction; the post-demosaic `apply_white_balance` is
+  skipped when hl is on (otherwise applied twice). Thresholds use
+  green-normalised ratios so they land at the same scene values either way.
+- **Driver:** `highlights::reconstruct_mosaic` over the already-ported unsafe
+  kernels (`darkroom_highlights_opposed_{mask,dilate,chroma,output}_raw`),
+  replicating `_process_opposed`'s keep=FALSE path; clip mode is a safe
+  per-channel min. Opposed semantics verified against the kernels before
+  testing: output = `max(inval, refavg + chrominance)` only where
+  `inval >= clips[color]` — it RAISES saturated channels toward what opposing
+  channels imply, never lowers; if nothing is clipped the pass is an exact
+  copy, which justifies the `!anyclipped` skip. `output_raw` takes separate
+  in/out pointers, so the driver reconstructs into a scratch plane and
+  `copy_from_slice`s back (aliasing one slice would be UB).
+- **UI:** `PreviewParams` v19→v20 (+`hl_on`, `hl_opposed` bools; `hl_clip`
+  float #213; blob 879→885), backward-compat decode keeps old blobs loading
+  with hl OFF. `PreviewCtx` gained `decode_path`/`decode_method` so
+  `spawn_decode(ctx)` reads its inputs from ctx — module rows only capture
+  ctx, and the new row needs to trigger decodes. `highlights_module_row` is
+  hand-rolled (not `module_expander`, whose notify handlers re-render stages):
+  enable switch + method DropDown ("Clip highlights"/"Inpaint opposed",
+  index == the `hl_opposed` bool) re-decode immediately; the clipping-threshold
+  slider (0..2, default 1) debounces 160 ms like straighten. Row hidden for
+  non-raw files. Export parity:
+  `render_export_rgb8/16` pass `params.hl_opts()`, so a Rust-native export
+  matches the preview.
+- **Ships OFF** (`hl_on=false` default = exactly the old clamped decode), so no
+  existing image changes appearance until the user opts in.
+
+**Deviations vs upstream C (documented for the next session):**
+(1) Bayer patterns whose second green encodes as colour index E=3 take the
+clip fallback — the ported kernels slice `clips[0..3]`/`[u8;3]` mask planes and
+would panic on a fourth colour, where the C harmlessly reads `clips[3]` from
+its aligned struct. Gated by `has_e_colour`; X-Trans unaffected.
+(2) Two of six methods wired (opposed = C default, plus clip); LCh, guided
+laplacians and segmentation-based remain unwired.
+(3) C compares thresholds against raw temperature coefficients;
+C41 green-normalises both data and thresholds (scaling cancels in the
+comparisons; matches the legacy `apply_white_balance` R/B÷g convention exactly,
+keeping hl-on/off colour balance identical).
+(4) Non-raw inputs are untouched by the module (darktable forces CLIP there —
+a no-op on already-clamped sRGB data).
+
+**Went wrong en route:** the Edit tool garbled two large insertions into
+`highlights.rs` (stray glyphs, prose inside a match arm, a swallowed
+`#[cfg(test)]` opener) — recovered via write-to-/tmp + scripted splice; that's
+the pattern for big blocks now. An early test premise was wrong (assumed
+opposed *lowers* clipped values; re-read the kernels, redesigned the test as a
+bright-field recovery scenario before anything shipped). A garbage dead-loop
+accidentally spliced into `apply_white_balance_mosaic` was caught and removed
+pre-commit.
+
+**Senior review (fork subagent acting as senior reviewer).** fricktrade-
+architect died with the same OpenRouter API 402 credit error as m4-117/m4-118;
+substitution documented here per workflow. Verdict **SHIP**: zero BLOCKER,
+zero should-fix findings across unsafe-call contract checks (kernel signatures,
+scratch-plane aliasing avoidance, null-`tmpout` branch confirmed supported),
+colour-3 panic gate, legacy byte-identity proof, params-blob append-only
+discipline, decode-race/debounce/closure-lifetime review of the UI wiring, and
+export-parity check. Nits recorded, not gated: history label priority order
+(hl checked after filmic though it runs first in the chain — cosmetic);
+a failed decode delays autosave/history arming until the next successful
+render (same exposure as the demosaic dropdown); export transients ~2×W·H·f32
+extra while opposed mode is enabled and something is clipped (same allocation
+class as the existing RGBA result); X-Trans opposed coverage is smoke-only.
+
+**Verified.** `scripts/ci-local.sh` exit 0 — all four CI steps pass keyed off
+exit codes; 723 c41-core (+7 new) + 92 c41-db + 253 c41-ui tests green under `--release`.

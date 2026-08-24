@@ -129,6 +129,14 @@ struct PreviewCtx {
     /// once a decode reveals the sensor is X-Trans (where the method is a no-op).
     /// Empty until the raw-only selector is built below.
     demosaic_row: glib::WeakRef<gtk4::Box>,
+    /// Path of the image being edited. [`spawn_decode`] reads it from here so
+    /// any module row (whose closures only capture `ctx`) can request a full
+    /// re-decode — needed by highlight reconstruction, whose options live in
+    /// `params` but apply before demosaicing.
+    decode_path: Rc<RefCell<String>>,
+    /// The active Bayer demosaic method (raw only), kept so a re-decode
+    /// requested from anywhere re-uses the user's chosen algorithm.
+    decode_method: Rc<std::cell::Cell<DemosaicMethod>>,
 }
 
 /// Debounced recorder that appends one [`HistoryStack`] entry per *settled* edit
@@ -772,28 +780,39 @@ fn apply_geometry_to_base(ctx: &PreviewCtx) {
     render_preview(ctx);
 }
 
-/// Decode + downscale the image off the main thread, then display it. Camera
-/// raws go through the Rust decoder with the chosen Bayer [`DemosaicMethod`]
-/// (`method` is ignored for non-raw files and for X-Trans sensors), are stored
-/// as the un-geometried [`PreviewCtx::pristine`] buffer, and get the current
-/// [`Geometry`] applied to produce `base`; everything else goes through
-/// gdk-pixbuf straight to `base` (no geometry). Re-run to change the demosaic
-/// method — it re-decodes the full raw, unlike the geometry/pipeline changes
-/// which reuse the already-downscaled buffer.
-fn spawn_decode(ctx: &PreviewCtx, path: String, method: DemosaicMethod) {
+/// Decode + downscale the image off the main thread, then display it. Reads its
+/// inputs from `ctx`: [`PreviewCtx::decode_path`], [`PreviewCtx::decode_method`],
+/// and the live params' highlight-reconstruction options
+/// ([`PreviewParams::hl_opts`]). Camera raws go through the Rust decoder with
+/// that method (ignored for X-Trans sensors) and — when enabled — highlight
+/// reconstruction on the white-balanced mosaic BEFORE demosaicing (darktable's
+/// temperature → highlights → demosaic order); the result is stored as the
+/// un-geometried [`PreviewCtx::pristine`] buffer and gets the current
+/// [`Geometry`] applied to produce `base`. Everything else goes through
+/// gdk-pixbuf straight to `base` (no geometry, no reconstruction). Re-run after
+/// changing any decode input — this re-decodes the full raw, unlike the
+/// geometry/pipeline changes which reuse the already-downscaled buffer.
+fn spawn_decode(ctx: &PreviewCtx) {
     // Claim the newest generation; a stale (superseded) decode discards below.
     let generation = ctx.decode_gen.get().wrapping_add(1);
     ctx.decode_gen.set(generation);
+    // Snapshot the decode inputs up front (cheap `Copy`/`String` clones) so the
+    // async block never holds a params/path borrow across an await.
+    let path = ctx.decode_path.borrow().clone();
+    let method = ctx.decode_method.get();
+    let hl = ctx.params.borrow().hl_opts();
     glib::spawn_future_local(clone!(@strong ctx => async move {
         if crate::raw_preview::is_raw_path(&path) {
-            // Decode + demosaic off the main thread (it's heavy); downscale to a
-            // responsive preview size. Keep the un-geometried buffer.
+            // Decode + reconstruct + demosaic off the main thread (it's heavy);
+            // downscale to a responsive preview size. Keep the un-geometried
+            // buffer.
             let p = path.clone();
             let decoded = gio::spawn_blocking(move || {
                 crate::raw_preview::decode_raw_preview_with(
                     &p,
                     crate::raw_preview::PREVIEW_MAX_DIM,
                     method,
+                    hl,
                 )
                 .map(|rp| (rp.width, rp.height, rp.pixels, rp.is_xtrans))
             })
@@ -1009,6 +1028,10 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         history,
         history_rec,
         demosaic_row: glib::WeakRef::new(),
+        decode_path: Rc::new(RefCell::new(file_path.to_string())),
+        decode_method: Rc::new(std::cell::Cell::new(
+            crate::persist::load_demosaic(db_path, file_path),
+        )),
     };
     // Show the seed entry immediately.
     refresh_history_list(&history_list, &ctx.history.borrow());
@@ -1023,8 +1046,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // Load + decode the image asynchronously so the page appears immediately.
     // The saved Bayer demosaic method (raw only) seeds the first decode; the
     // selector below re-runs `spawn_decode` when the user changes it.
-    let demosaic = crate::persist::load_demosaic(db_path, file_path);
-    spawn_decode(&ctx, file_path.to_string(), demosaic);
+    spawn_decode(&ctx);
 
     // ── Crop overlay wiring (draw func + drag gesture) ─────────────────────
     // Aspect lock shared with the selector in the geometry panel below.
@@ -1333,14 +1355,15 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         dropdown.update_property(&[gtk4::accessible::Property::Label("Demosaic algorithm")]);
         // Seed the current selection WITHOUT re-decoding: set before connecting
         // the handler (the initial `spawn_decode` already used this method).
-        dropdown.set_selected(demosaic.as_u8() as u32);
+        dropdown.set_selected(ctx.decode_method.get().as_u8() as u32);
         let dd_ctx = ctx.clone();
         let dd_path = file_path.to_string();
         let dd_db = db_path.to_string();
         dropdown.connect_selected_notify(move |dd| {
             let method = DemosaicMethod::from_u8(dd.selected() as u8);
+            dd_ctx.decode_method.set(method);
             crate::persist::save_demosaic(&dd_db, &dd_path, method);
-            spawn_decode(&dd_ctx, dd_path.clone(), method);
+            spawn_decode(&dd_ctx);
         });
         demosaic_box.append(&demosaic_header);
         demosaic_box.append(&dropdown);
@@ -1853,6 +1876,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Tone equalizer" => pg.add(&toneequal_module_row(ctx)),
                 "Color balance RGB" => pg.add(&cbrgb_module_row(ctx)),
                 "Filmic RGB" => pg.add(&filmic_module_row(ctx)),
+                "Highlight reconstruction" => pg.add(&highlights_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
@@ -1948,7 +1972,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2741,6 +2765,79 @@ fn filmic_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             add_param_slider(e, ctx, "Extreme luminance saturation (%)", -200.0, 200.0, 1.0,
                 p0.filmic_saturation as f64, |p, v| p.filmic_saturation = v);
         })
+}
+
+/// Highlight reconstruction (highlights.c + hlreconstruct/opposed.c): rebuild
+/// photosites clipped at the sensor's white from the opposing channels BEFORE
+/// demosaicing — darktable's temperature → highlights → demosaic order. Unlike
+/// every other live module this is not a pipeline stage, so any change re-runs
+/// [`spawn_decode`] (a full raw re-decode) rather than [`render_preview`];
+/// that is why this row is hand-rolled instead of built from
+/// [`module_expander`] (whose notify handlers re-render pipeline stages over
+/// the existing buffer).
+///
+/// Two of darktable's six methods are wired: "inpaint opposed" (the C default)
+/// and "clip highlights"; LCh, guided laplacians, and segmentation-based remain
+/// unwired. Hidden entirely for non-raw files, where darktable forces CLIP —
+/// a no-op on already-clamped sRGB data.
+fn highlights_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    let expander = adw::ExpanderRow::builder()
+        .title("Highlight reconstruction")
+        .subtitle("recover clipped raw highlights (pre-demosaic)")
+        .show_enable_switch(true)
+        .enable_expansion(p0.hl_on)
+        .build();
+    if !crate::raw_preview::is_raw_path(&ctx.decode_path.borrow()) {
+        expander.set_visible(false);
+        return expander;
+    }
+    let ctx_on = ctx.clone();
+    expander.connect_enable_expansion_notify(move |e| {
+        ctx_on.params.borrow_mut().hl_on = e.enables_expansion();
+        // The decode completion runs render_preview, which arms the debounced
+        // autosave + history snapshot; nothing extra needed here.
+        spawn_decode(&ctx_on);
+    });
+
+    // Method selector: the DropDown index IS the `hl_opposed` bool
+    // (0 = clip, 1 = opposed), so the mapping needs no table.
+    let method = gtk4::DropDown::from_strings(&["Clip highlights", "Inpaint opposed"]);
+    method.set_margin_start(8);
+    method.set_margin_end(8);
+    method.set_margin_top(1);
+    method.set_margin_bottom(1);
+    method.set_selected(u32::from(p0.hl_opposed));
+    let ctx_m = ctx.clone();
+    method.connect_selected_notify(move |dd| {
+        ctx_m.params.borrow_mut().hl_opposed = dd.selected() == 1;
+        spawn_decode(&ctx_m);
+    });
+    expander.add_row(&method);
+
+    // Clipping threshold (highlights.c "clipping threshold": 0..2, default 1).
+    // Every value change re-decodes, so debounce like the straighten slider.
+    let clip = labeled_slider("Clipping threshold", 0.0, 2.0, 0.01, p0.hl_clip as f64);
+    let ctx_c = ctx.clone();
+    let c_debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    clip.scale.connect_value_changed(move |v| {
+        ctx_c.params.borrow_mut().hl_clip = v as f32;
+        // Debounce the re-decode so a drag doesn't queue dozens of decodes;
+        // the last value within the window is the one decoded.
+        if let Some(id) = c_debounce.borrow_mut().take() {
+            id.remove();
+        }
+        let d_ctx = ctx_c.clone();
+        let d_deb = c_debounce.clone();
+        let id =
+            glib::timeout_add_local_once(std::time::Duration::from_millis(160), move || {
+                *d_deb.borrow_mut() = None;
+                spawn_decode(&d_ctx);
+            });
+        *c_debounce.borrow_mut() = Some(id);
+    });
+    expander.add_row(&clip.row);
+    expander
 }
 
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {

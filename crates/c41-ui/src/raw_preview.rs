@@ -92,26 +92,30 @@ pub fn downscale_rgba(
 }
 
 /// Decode a raw file into a linear [`RawPreview`] using the default Bayer
-/// demosaicer ([`DemosaicMethod::Rcd`](c41_core::rawimage::DemosaicMethod)).
-/// See [`decode_raw_preview_with`].
+/// demosaicer ([`DemosaicMethod::Rcd`](c41_core::rawimage::DemosaicMethod)) and
+/// no highlight reconstruction. See [`decode_raw_preview_with`].
 pub fn decode_raw_preview(path: &str, max_dim: usize) -> Option<RawPreview> {
-    decode_raw_preview_with(path, max_dim, Default::default())
+    decode_raw_preview_with(path, max_dim, Default::default(), None)
 }
 
 /// Decode a raw file into a linear [`RawPreview`] with an explicit Bayer
-/// [`DemosaicMethod`](c41_core::rawimage::DemosaicMethod), downscaled so
-/// its longest side is at most `max_dim` (for slider responsiveness). `None` on
-/// decode failure or an unsupported raw (e.g. a CFA period the core decoder
-/// rejects). Changing the method requires re-running this (it re-decodes the
-/// full raw), unlike the pipeline sliders which reuse the downscaled buffer.
+/// [`DemosaicMethod`](c41_core::rawimage::DemosaicMethod) and optional
+/// highlight reconstruction (`hl`, applied on the white-balanced mosaic
+/// *before* demosaicing — darktable's temperature → highlights → demosaic
+/// order), downscaled so its longest side is at most `max_dim` (for slider
+/// responsiveness). `None` on decode failure or an unsupported raw (e.g. a CFA
+/// period the core decoder rejects). Changing the method or the hl options
+/// requires re-running this (it re-decodes the full raw), unlike the pipeline
+/// sliders which reuse the downscaled buffer.
 pub fn decode_raw_preview_with(
     path: &str,
     max_dim: usize,
     method: c41_core::rawimage::DemosaicMethod,
+    hl: Option<c41_core::iop::highlights::HlOpts>,
 ) -> Option<RawPreview> {
     let img = c41_core::rawimage::load(path).ok()?;
     let is_xtrans = img.xtrans.is_some();
-    let (w, h, rgba) = img.to_linear_rgba_with(method);
+    let (w, h, rgba) = img.to_linear_rgba_with(method, hl);
     if w == 0 || h == 0 {
         return None;
     }

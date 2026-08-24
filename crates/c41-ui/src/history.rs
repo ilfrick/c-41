@@ -497,6 +497,15 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if filmic {
         return "Filmic RGB";
     }
+    // Highlight reconstruction (m4-119): runs pre-demosaic in the raw front
+    // end, but the user still edits it as a module, so it needs its own
+    // history label like any other.
+    let hl = old.hl_on != new.hl_on
+        || old.hl_opposed != new.hl_opposed
+        || old.hl_clip != new.hl_clip;
+    if hl {
+        return "Highlight reconstruction";
+    }
     "Edit"
 }
 
@@ -877,6 +886,9 @@ mod tests {
             filmic_contrast: _,
             filmic_balance: _,
             filmic_saturation: _,
+            hl_on: _,
+            hl_opposed: _,
+            hl_clip: _,
         } = PreviewParams::default();
     }
 
@@ -959,7 +971,8 @@ mod tests {
         // m4-116 (toneequalizer): 680 → 717 (1 + 24 bools + 173 f32).
         // m4-117 (colorbalancergb): 717 → 850 (1 + 25 bools + 206 f32).
         // m4-118 (filmicrgb): 850 → 879 (1 + 26 bools + 213 f32).
-        assert_eq!(PreviewParams::default().encode().len(), 879);
+        // m4-119 (highlight reconstruction): 879 → 885 (1 + 28 bools + 214 f32).
+        assert_eq!(PreviewParams::default().encode().len(), 885);
     }
 
     #[test]

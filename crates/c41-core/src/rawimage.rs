@@ -16,10 +16,14 @@
 //! - **Black level from `blacklevels` only.** Cameras that report `0` and expect
 //!   the black point from the masked optical-black border (`blackareas`) get no
 //!   black subtraction yet (slightly lifted shadows).
-//! - **Highlights are hard-clamped at white.** Over-white photosites are clipped
-//!   here, so a future highlight-reconstruction stage would have nothing to
-//!   reconstruct from; revisit (carry over-range float) when that lands.
-//! - **White balance is stored, not applied** — `wb` belongs after demosaic.
+//! - **White balance is stored, not applied** — `wb` belongs after demosaic
+//!   (or into the mosaic when highlight reconstruction runs first, m4-119:
+//!   [`apply_white_balance_mosaic`] / [`iop::highlights::reconstruct_mosaic`]).
+//!
+//! Since m4-119 the normalisation carries over-range photosites (`> 1.0`)
+//! instead of clamping at white, so highlight reconstruction has data to
+//! rebuild from; consumers clamp ([`RawImage::to_linear_rgba_with`]'s legacy
+//! path reproduces the old hard-clip byte-for-byte).
 //!
 //! [`pipeline`]: crate::pipeline
 
@@ -56,9 +60,13 @@ pub struct RawImage {
 }
 
 /// Normalise a raw CFA plane to linear [0,1]: per photosite, subtract the
-/// per-colour black level and divide by the per-colour range (`white - black`),
-/// clamped. `cfa` gives the colour index at `[row % 2][col % 2]`; `black`/`white`
-/// are indexed by that colour (RGBE order). Pure — no decode dependency.
+/// per-colour black level and divide by the per-colour range (`white - black`).
+/// Values below 0 clamp there; **over-range photosites are carried (`> 1.0`)**
+/// since m4-119 so highlight reconstruction has data to rebuild from — the
+/// consumer decides where to clip ([`RawImage::to_linear_rgba_with`] clamps at
+/// white when reconstruction is off). `cfa` gives the colour index at
+/// `[row % 2][col % 2]`; `black`/`white` are indexed by that colour (RGBE
+/// order). Pure — no decode dependency.
 pub fn normalize_cfa(
     data: &[u16],
     width: usize,
@@ -78,7 +86,7 @@ pub fn normalize_cfa(
             // Guard a degenerate level pair so we never divide by ~0.
             let range = (white[color] - b).max(1.0);
             let v = (data[row * width + col] as f32 - b) / range;
-            out[row * width + col] = v.clamp(0.0, 1.0);
+            out[row * width + col] = v.max(0.0);
         }
     }
     out
@@ -106,7 +114,7 @@ pub fn normalize_xtrans(
             let b = black[color];
             let range = (white[color] - b).max(1.0);
             let v = (data[row * width + col] as f32 - b) / range;
-            out[row * width + col] = v.clamp(0.0, 1.0);
+            out[row * width + col] = v.max(0.0);
         }
     }
     out
@@ -1238,31 +1246,100 @@ pub fn apply_white_balance(rgba: &mut [f32], wb: [f32; 4]) {
     }
 }
 
+/// Apply white balance to a **CFA mosaic**: each photosite of colour `c` is
+/// multiplied by `wb[c]/wb[grey]` (RGBE-ordered, normalised by green — the
+/// mosaic-domain twin of [`apply_white_balance`]). Runs before demosaic when
+/// highlight reconstruction is on, mirroring darktable's temperature-before-
+/// highlights pipeline order. Degenerate `wb` leaves the mosaic untouched.
+///
+/// `color_at(row, col)` yields the photosite's RGBE colour index (see
+/// [`classify_cfa`]). Pure — no decode dependency.
+pub fn apply_white_balance_mosaic(
+    mosaic: &mut [f32],
+    width: usize,
+    color_at: impl Fn(usize, usize) -> usize,
+    wb: [f32; 4],
+) {
+    let g = wb[1];
+    if g <= 0.0 || !g.is_finite() {
+        return;
+    }
+    // Per-colour multipliers relative to green; an unfinitable coefficient
+    // degrades to 1.0 so one bad file value cannot nuke a whole channel.
+    let mult: [f32; 4] = core::array::from_fn(|c| {
+        if wb[c].is_finite() { wb[c] / g } else { 1.0 }
+    });
+    for (i, v) in mosaic.iter_mut().enumerate() {
+        let c = color_at(i / width, i % width);
+        *v *= if c < 4 { mult[c] } else { 1.0 };
+    }
+}
+
 impl RawImage {
     /// Demosaic + white-balance this raw into a packed **linear RGBA** `f32`
     /// buffer ready for [`crate::pipeline`], using the default Bayer demosaicer
-    /// ([`DemosaicMethod::Rcd`]). Returns `(width, height, pixels)`.
+    /// ([`DemosaicMethod::Rcd`]) and no highlight reconstruction. Returns
+    /// `(width, height, pixels)`.
     pub fn to_linear_rgba(&self) -> (usize, usize, Vec<f32>) {
-        self.to_linear_rgba_with(DemosaicMethod::default())
+        self.to_linear_rgba_with(DemosaicMethod::default(), None)
     }
 
-    /// Demosaic + white-balance with an explicit Bayer [`DemosaicMethod`].
+    /// Demosaic + white-balance with an explicit Bayer [`DemosaicMethod`] and
+    /// optional highlight reconstruction.
     ///
     /// The method selects the Bayer demosaicer ([`demosaic_rcd`] / [`demosaic_vng`]
     /// / [`demosaic_ppg`]); **X-Trans ignores it** and always uses the Markesteijn
     /// [`demosaic_xtrans`]. RCD/PPG internally fall back to a simpler kernel for
     /// frames too small for their interior.
-    pub fn to_linear_rgba_with(&self, method: DemosaicMethod) -> (usize, usize, Vec<f32>) {
+    ///
+    /// `hl = Some(opts)` runs darktable-style highlight reconstruction
+    /// ([`iop::highlights::reconstruct_mosaic`]): the stored mosaic carries
+    /// over-range photosites (`> 1.0`, see [`normalize_cfa`]), which are
+    /// white-balanced and reconstructed **before** demosaicing — darktable's
+    /// temperature → highlights → demosaic order. Post-demosaic WB is then
+    /// skipped (already in the mosaic). `hl = None` clamps over-range
+    /// photosites at 1.0 first, reproducing the pre-m4-119 decoder exactly.
+    ///
+    /// Works on a copy of the mosaic either way (the stored one stays intact,
+    /// so repeated calls with different options are safe); that transient
+    /// buffer is the same allocation class as the RGBA result itself.
+    pub fn to_linear_rgba_with(
+        &self,
+        method: DemosaicMethod,
+        hl: Option<crate::iop::highlights::HlOpts>,
+    ) -> (usize, usize, Vec<f32>) {
         let (w, h) = (self.width, self.height);
+        let mut work = self.mosaic.clone();
+        match hl {
+            Some(opts) => {
+                apply_white_balance_mosaic(&mut work, w, |row, col| match &self.xtrans {
+                    Some(xt) => {
+                        crate::raw::fcol(row as i32, col as i32, 9, xt)
+                    }
+                    None => self.cfa[row % 2][col % 2],
+                }, self.wb);
+                crate::iop::highlights::reconstruct_mosaic(
+                    &mut work, w, h, self.cfa, self.xtrans.as_ref(), self.wb, opts,
+                );
+            }
+            None => {
+                // Pre-m4-119 behaviour: hard-clip photosites at sensor white.
+                for v in work.iter_mut() {
+                    *v = v.min(1.0);
+                }
+            }
+        }
         let mut rgba = match &self.xtrans {
-            Some(xt) => demosaic_xtrans(&self.mosaic, w, h, xt),
+            Some(xt) => demosaic_xtrans(&work, w, h, xt),
             None => match method {
-                DemosaicMethod::Rcd => demosaic_rcd(&self.mosaic, w, h, self.cfa),
-                DemosaicMethod::Vng => demosaic_vng(&self.mosaic, w, h, self.cfa),
-                DemosaicMethod::Ppg => demosaic_ppg(&self.mosaic, w, h, self.cfa),
+                DemosaicMethod::Rcd => demosaic_rcd(&work, w, h, self.cfa),
+                DemosaicMethod::Vng => demosaic_vng(&work, w, h, self.cfa),
+                DemosaicMethod::Ppg => demosaic_ppg(&work, w, h, self.cfa),
             },
         };
-        apply_white_balance(&mut rgba, self.wb);
+        if hl.is_none() {
+            apply_white_balance(&mut rgba, self.wb);
+        }
         // Camera-native RGB → linear Rec.2020 working space (no-op when the file
         // gave no matrix, so this is the identity for the synthetic/demo path).
         // After WB so the neutral-preserving, row-normalised matrix sees a
@@ -1322,8 +1399,51 @@ mod tests {
         let out = normalize_cfa(&data, 2, 2, cfa, black, white);
         assert_eq!(out[0], 0.0); // (50-100)/1 → -50 → clamp 0
         assert_eq!(out[1], 0.0); // (100-100)/1 → 0
-        assert_eq!(out[2], 1.0); // (150-100)/1 → 50 → clamp 1
+        assert_eq!(out[2], 50.0); // (150-100)/1 → carried over-range (m4-119)
         assert_eq!(out[3], 0.0); // (99-100)/1 → clamp 0
+    }
+
+    #[test]
+    fn normalize_carries_over_range_for_reconstruction() {
+        // m4-119: photosites above sensor white must survive normalisation so
+        // highlight reconstruction has data; negatives still floor at 0.
+        let cfa = [[0usize, 1], [1, 2]]; // RGGB
+        let out = normalize_cfa(
+            &[1100u16, 500, 600, 2100],
+            2,
+            2,
+            cfa,
+            [100.0, 100.0, 100.0, 100.0],
+            [1000.0, 1000.0, 1000.0, 1000.0],
+        );
+        assert!((out[0] - 1000.0 / 900.0).abs() < 1e-5); // R over white: carried
+        assert!((out[1] - 400.0 / 900.0).abs() < 1e-5);
+        assert!((out[3] - 2000.0 / 900.0).abs() < 1e-4); // B way over white: carried
+    }
+
+    #[test]
+    fn legacy_none_path_matches_clip_mode_at_unity_wb() {
+        // m4-119 invariant: with unity white balance, clip-mode reconstruction
+        // performs exactly the legacy decoder's operations (clamp at 1.0) in a
+        // different order — so both entry points must agree bit-for-bit.
+        use crate::iop::highlights::{HlMode, HlOpts};
+        let img = RawImage {
+            width: 12,
+            height: 12,
+            cfa: [[0usize, 1], [1, 2]],
+            xtrans: None,
+            wb: [1.0; 4],
+            orientation: (false, false, false),
+            cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            // Diagonal gradient with over-range photosites carried in.
+            mosaic: (0..144).map(|i| (i % 29) as f32 / 20.0).collect(),
+        };
+        let a = img.to_linear_rgba_with(DemosaicMethod::Ppg, None);
+        let b = img.to_linear_rgba_with(
+            DemosaicMethod::Ppg,
+            Some(HlOpts { mode: HlMode::Clip, clip: 1.0 }),
+        );
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -1475,11 +1595,11 @@ mod tests {
         // The no-arg entry point delegates to RCD, byte-for-byte.
         assert_eq!(
             img.to_linear_rgba(),
-            img.to_linear_rgba_with(DemosaicMethod::Rcd)
+            img.to_linear_rgba_with(DemosaicMethod::Rcd, None)
         );
-        let (_, _, rcd) = img.to_linear_rgba_with(DemosaicMethod::Rcd);
-        let (_, _, vng) = img.to_linear_rgba_with(DemosaicMethod::Vng);
-        let (_, _, ppg) = img.to_linear_rgba_with(DemosaicMethod::Ppg);
+        let (_, _, rcd) = img.to_linear_rgba_with(DemosaicMethod::Rcd, None);
+        let (_, _, vng) = img.to_linear_rgba_with(DemosaicMethod::Vng, None);
+        let (_, _, ppg) = img.to_linear_rgba_with(DemosaicMethod::Ppg, None);
         // Distinct algorithms ⇒ distinct output on a gradient — proves the match
         // arms actually reach different demosaicers, not one aliased path.
         assert_ne!(rcd, vng, "RCD and VNG output must differ");
@@ -1511,9 +1631,9 @@ mod tests {
             cam_to_working: IDENTITY3,
             mosaic,
         };
-        let rcd = img.to_linear_rgba_with(DemosaicMethod::Rcd);
-        assert_eq!(rcd, img.to_linear_rgba_with(DemosaicMethod::Vng));
-        assert_eq!(rcd, img.to_linear_rgba_with(DemosaicMethod::Ppg));
+        let rcd = img.to_linear_rgba_with(DemosaicMethod::Rcd, None);
+        assert_eq!(rcd, img.to_linear_rgba_with(DemosaicMethod::Vng, None));
+        assert_eq!(rcd, img.to_linear_rgba_with(DemosaicMethod::Ppg, None));
     }
 
     #[test]
