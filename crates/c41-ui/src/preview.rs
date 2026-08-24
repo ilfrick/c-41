@@ -401,6 +401,30 @@ pub struct PreviewParams {
     /// Saturation formula selector: 0 = JzAzBz (2021), 1 = dt-UCS (2022, the
     /// darktable default). Encoded as a float to keep the append-only layout.
     pub cb_formula: f32,
+    // ── Filmic RGB (filmicrgb.c, iop_order.c v50_order pos 46.0) ─────────
+    // Scene-referred display transform: log-encodes the exposure range between
+    // the source black/white points and tone-maps it through a five-node spline
+    // into the display targets, with a Yrg gamut map. Like sigmoid (45.3) it is
+    // a tone curve — never a no-op while enabled — but unlike sigmoid there is
+    // no "auto-enable for raws" workflow logic here: darktable turns filmic on
+    // via its scene-referred default preset plus reload_defaults' auto-exposure,
+    // which we don't replicate, so the module ships off like every other stage.
+    /// Filmic RGB module enabled.
+    pub filmic_on: bool,
+    /// Black relative exposure in EV (`black_point_source`), −16..−0.1.
+    pub filmic_black_point_source: f32,
+    /// White relative exposure in EV (`white_point_source`), 0.1..16.
+    pub filmic_white_point_source: f32,
+    /// Display hardness / output power (`output_power`), 1..10, default 4.
+    pub filmic_output_power: f32,
+    /// Linear-region width in % (`latitude`), 0.01..99.
+    pub filmic_latitude: f32,
+    /// Contrast (`contrast`), 0..5 — centre-segment slope via the v3 relation.
+    pub filmic_contrast: f32,
+    /// Shadows ↔ highlights balance in % (`balance`), −50..50.
+    pub filmic_balance: f32,
+    /// Extreme-luminance saturation in % (`saturation`), −200..200.
+    pub filmic_saturation: f32,
 }
 
 impl Default for PreviewParams {
@@ -627,6 +651,19 @@ impl Default for PreviewParams {
             cb_grey_fulcrum: 0.1845,
             cb_contrast: 0.0,
             cb_formula: 1.0, // SaturationFormula::DtUcs
+            // Filmic RGB defaults mirror the $DEFAULTs of
+            // dt_iop_filmicrgb_params_t: black −8 EV, white +4 EV, power 4
+            // ("hard"), latitude 0.01%, contrast 1, balance 0, saturation 0.
+            // Off by default — see the field doc above for why this module has
+            // no identity-at-defaults shortcut.
+            filmic_on: false,
+            filmic_black_point_source: -8.0,
+            filmic_white_point_source: 4.0,
+            filmic_output_power: 4.0,
+            filmic_latitude: 0.01,
+            filmic_contrast: 1.0,
+            filmic_balance: 0.0,
+            filmic_saturation: 0.0,
         }
     }
 }
@@ -761,6 +798,9 @@ impl PreviewParams {
         // C would still run its near-no-op gamut map; we skip it like every
         // other identity module.
         let cb_identity = !self.cb_on || self.cb_is_neutral();
+        // Filmic RGB is a display transform (a tone curve) — never a no-op while
+        // enabled. The gate mirrors `to_pipeline`: only the enable flag matters.
+        let filmic_identity = !self.filmic_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -770,6 +810,26 @@ impl PreviewParams {
             && primaries_identity && negadoctor_identity
             && toneeq_identity
             && cb_identity
+            && filmic_identity
+    }
+
+    /// The UI fields mapped onto the core's `FilmicParams` — the single
+    /// construction site shared by `is_identity` and `to_pipeline`, so they can
+    /// never disagree about what the sliders mean.
+    fn filmic_params(&self) -> c41_core::iop::filmicrgb::FilmicParams {
+        c41_core::iop::filmicrgb::FilmicParams {
+            black_point_source: self.filmic_black_point_source,
+            white_point_source: self.filmic_white_point_source,
+            grey_point_target: 18.45, // not surfaced in the preview UI
+            black_point_target: 0.01517634,
+            white_point_target: 100.0,
+            output_power: self.filmic_output_power,
+            latitude: self.filmic_latitude,
+            contrast: self.filmic_contrast,
+            balance: self.filmic_balance,
+            saturation: self.filmic_saturation,
+            custom_grey: false,
+        }
     }
 
     /// The UI fields mapped onto the core's `CbRgbParams` — the single
@@ -848,6 +908,7 @@ impl PreviewParams {
             negadoctor_on: false,
             toneeq_on: false,
             cb_on: false,
+            filmic_on: false,
             ..*self
         }
     }
@@ -883,7 +944,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on] {
             v.push(b as u8);
         }
         for f in [
@@ -963,6 +1024,10 @@ impl PreviewParams {
             self.cb_mask_grey_fulcrum,
             self.cb_vibrance, self.cb_grey_fulcrum, self.cb_contrast,
             self.cb_formula,
+            // Filmic RGB — field order mirrors dt_iop_filmicrgb_params_t.
+            self.filmic_black_point_source, self.filmic_white_point_source,
+            self.filmic_output_power, self.filmic_latitude,
+            self.filmic_contrast, self.filmic_balance, self.filmic_saturation,
         ] {
             v.extend_from_slice(&f.to_le_bytes());
         }
@@ -1134,6 +1199,14 @@ impl PreviewParams {
             cb_grey_fulcrum: f.get(203).copied().unwrap_or(d.cb_grey_fulcrum),
             cb_contrast: f.get(204).copied().unwrap_or(d.cb_contrast),
             cb_formula: f.get(205).copied().unwrap_or(d.cb_formula),
+            filmic_on: bools.get(25).map_or(d.filmic_on, |&b| b != 0),
+            filmic_black_point_source: f.get(206).copied().unwrap_or(d.filmic_black_point_source),
+            filmic_white_point_source: f.get(207).copied().unwrap_or(d.filmic_white_point_source),
+            filmic_output_power: f.get(208).copied().unwrap_or(d.filmic_output_power),
+            filmic_latitude: f.get(209).copied().unwrap_or(d.filmic_latitude),
+            filmic_contrast: f.get(210).copied().unwrap_or(d.filmic_contrast),
+            filmic_balance: f.get(211).copied().unwrap_or(d.filmic_balance),
+            filmic_saturation: f.get(212).copied().unwrap_or(d.filmic_saturation),
         })
     }
 
@@ -1532,6 +1605,18 @@ impl PreviewParams {
                 white_target, black_target, paper_exp, film_fog, film_power, paper_power,
             });
         }
+        // Filmic RGB (iop_order.c pos 46.0 — display transform cluster: after
+        // sigmoid 45.3, before colisa 47). Another scene-linear → display tone
+        // map; like every spline curve it is never a no-op while enabled, so
+        // the enable flag alone gates the stage.
+        if self.filmic_on {
+            p.push(Stage::FilmicRgb {
+                data: Box::new(c41_core::iop::filmicrgb::FilmicData::from_params(
+                    &self.filmic_params(),
+                )),
+                space,
+            });
+        }
         // Colisa (iop_order.c pos 47 — display-referred, just before tonecurve
         // 48 and levels 49). Its own comment upstream is "edit contrast while
         // damaging colour", which is why it sits in that cluster rather than
@@ -1687,9 +1772,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v16 adds negadoctor (film negative inversion).
 /// v17 adds toneequalizer (exposure-channel tone mapping).
 /// v18 adds colorbalancergb (colour balance RGB, 1 bool + 33 f32).
-const ENCODE_VERSION: u8 = 18;
-/// 1 version byte + 25 bool bytes + 206 little-endian f32.
-const ENCODED_LEN: usize = 1 + 25 + 206 * 4;
+/// v19 adds filmicrgb (filmic RGB display transform, 1 bool + 7 f32).
+const ENCODE_VERSION: u8 = 19;
+/// 1 version byte + 26 bool bytes + 213 little-endian f32.
+const ENCODED_LEN: usize = 1 + 26 + 213 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -1703,6 +1789,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (16, 23, 164), // v16: negadoctor added
     (17, 24, 173), // v17: toneequalizer added
     (18, 25, 206), // v18: colorbalancergb added
+    (19, 26, 213), // v19: filmicrgb added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2390,6 +2477,9 @@ mod tests {
         // rgblevels 43.0.
         p.cb_on = true;
         p.cb_contrast = 0.3;
+        // filmic RGB: pos 46.0 in v50_order — after sigmoid 45.3, before colisa
+        // 47.0. On by itself is enough to emit the stage (on is the gate).
+        p.filmic_on = true;
         // graduatednd enabled too, so the toneequal-before-graduatednd order is
         // actually pinned by this test.
         p.gradnd_on = true;
@@ -2400,20 +2490,24 @@ mod tests {
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "levels", "velvia", "colorize", "splittoning"]
+            ["exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "levels", "velvia", "colorize", "splittoning"]
         );
         // Color balance RGB is scene-referred (v50_order 41.5): it must run
         // before the sigmoid tone map (45.3), on unbounded linear data.
         let cb = names.iter().position(|n| *n == "colorbalancergb").unwrap();
         let sig_pos = names.iter().position(|n| *n == "sigmoid").unwrap();
         assert!(cb < sig_pos, "colorbalancergb must run before sigmoid: {names:?}");
-        // Levels is display-referred (iop_order.c pos 49, after sigmoid 45.3):
-        // it clips at its black point and treats L as 0..100, so running it
-        // before the tone map would crush the scene-linear highlights sigmoid
-        // is there to roll off.
-        let sig = names.iter().position(|n| *n == "sigmoid").unwrap();
+        // Filmic RGB is a display transform at v50_order 46.0: after the
+        // sigmoid tone map (45.3) and still in the display-referred cluster
+        // (before colisa 47 / levels 49).
+        let filmic = names.iter().position(|n| *n == "filmicrgb").unwrap();
+        assert!(filmic > sig_pos, "filmicrgb must run after sigmoid: {names:?}");
+        // Levels is display-referred (iop_order.c pos 49): it clips at its
+        // black point and treats L as 0..100, so running it before a tone map
+        // would crush the scene-linear highlights those maps exist to roll off.
         let lev = names.iter().position(|n| *n == "levels").unwrap();
-        assert!(lev > sig, "levels must run after sigmoid: {names:?}");
+        assert!(lev > sig_pos, "levels must run after sigmoid: {names:?}");
+        assert!(lev > filmic, "levels must run after filmicrgb: {names:?}");
     }
 
     /// Ties PreviewParams::default() (the UI defaults) to the identity matrix in
@@ -2781,6 +2875,16 @@ mod tests {
             cb_grey_fulcrum: 0.31,
             cb_contrast: -0.32,
             cb_formula: 0.0, // JzAzBz — the non-default formula
+            // Filmic RGB: every value off-default and pairwise distinct so a
+            // wrong offset in the trailing block shows as a mismatch.
+            filmic_on: true,
+            filmic_black_point_source: -6.5,
+            filmic_white_point_source: 5.5,
+            filmic_output_power: 3.5,
+            filmic_latitude: 12.5,
+            filmic_contrast: 1.7,
+            filmic_balance: -25.0,
+            filmic_saturation: 60.0,
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
@@ -3124,6 +3228,64 @@ mod tests {
         assert_eq!(decoded.cb_grey_fulcrum, def.cb_grey_fulcrum);
         assert_eq!(decoded.cb_contrast, def.cb_contrast);
         assert_eq!(decoded.cb_formula, def.cb_formula);
+    }
+
+    #[test]
+    fn decode_v18_blob_defaults_filmic_fields() {
+        // A v18 blob (before filmic RGB was added — 25 bools / 206 f32s) must
+        // decode successfully: the new filmic_* fields fall back to their
+        // defaults, so a saved style from the pre-filmicrgb era loads cleanly.
+        let v18 = {
+            let mut b = vec![0u8; 1 + 25 + 206 * 4];
+            b[0] = 18; // version 18
+            b
+        };
+        let decoded = PreviewParams::decode(&v18)
+            .expect("v18 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.filmic_on, def.filmic_on);
+        assert_eq!(decoded.filmic_black_point_source, def.filmic_black_point_source);
+        assert_eq!(decoded.filmic_white_point_source, def.filmic_white_point_source);
+        assert_eq!(decoded.filmic_output_power, def.filmic_output_power);
+        assert_eq!(decoded.filmic_latitude, def.filmic_latitude);
+        assert_eq!(decoded.filmic_contrast, def.filmic_contrast);
+        assert_eq!(decoded.filmic_balance, def.filmic_balance);
+        assert_eq!(decoded.filmic_saturation, def.filmic_saturation);
+    }
+
+    #[test]
+    fn filmic_params_map_into_the_stage_and_gate_holds() {
+        // The UI fields must land on the right FilmicParams slots (positional,
+        // easy to scramble), and an enabled module must emit a Stage::FilmicRgb
+        // carrying finished data in the pipeline's working space.
+        let mut p = PreviewParams::default();
+        p.filmic_on = true;
+        p.filmic_black_point_source = -6.5;
+        p.filmic_white_point_source = 3.5;
+        p.filmic_output_power = 3.0;
+        p.filmic_latitude = 10.0;
+        p.filmic_contrast = 1.4;
+        p.filmic_balance = 20.0;
+        p.filmic_saturation = -50.0;
+        let pipe = p.to_pipeline(ColorSpace::Rec2020, 1.0);
+        let Some(Stage::FilmicRgb { data, space }) =
+            pipe.stages.iter().find(|s| s.name() == "filmicrgb")
+        else {
+            panic!("filmic stage missing: {:?}", pipe.stages.iter().map(|s| s.name()).collect::<Vec<_>>());
+        };
+        assert_eq!(*space, ColorSpace::Rec2020);
+        assert_eq!(data.grey_source, 0.1845);
+        assert_eq!(data.black_source, -6.5);
+        assert_eq!(data.dynamic_range, 10.0); // 3.5 − (−6.5)
+        assert_eq!(data.output_power, 3.0);
+        assert_eq!(data.saturation, -0.5); // −50% → weight
+        // norm endpoints: grey · 2^(dr·{0,1} + black) — min sits at the black
+        // exposure, max one dynamic range above it.
+        assert_eq!(data.norm_min, 0.1845f32 * (-6.5f32).exp2());
+        assert_eq!(data.norm_max, 0.1845f32 * (3.5f32).exp2());
+        // The spline's grey node sits at |black|/dr on the log axis.
+        let spline = c41_core::iop::filmicrgb::compute_spline(&p.filmic_params());
+        assert_eq!(data.spline, spline);
     }
 
     #[test]

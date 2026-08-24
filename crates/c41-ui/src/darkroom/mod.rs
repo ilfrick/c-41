@@ -1852,6 +1852,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Negadoctor" => pg.add(&negadoctor_module_row(ctx)),
                 "Tone equalizer" => pg.add(&toneequal_module_row(ctx)),
                 "Color balance RGB" => pg.add(&cbrgb_module_row(ctx)),
+                "Filmic RGB" => pg.add(&filmic_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Levels" => pg.add(&levels_module_row(ctx)),
                 "Vignetting" => pg.add(&vignette_module_row(ctx)),
@@ -1947,7 +1948,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2710,6 +2711,36 @@ fn cbrgb_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             e.add_row(&formula_row);
         });
     e
+}
+
+/// Filmic RGB module: enable switch gates `filmic_on`; darktable's scene→display
+/// tone-mapping controls in its GUI page order — source exposure range
+/// (black/white), then the spline shape (contrast, linear region, hardness,
+/// shadows↔highlights balance) and extreme-luminance saturation.
+///
+/// Slider ranges are the params-struct $MIN/$MAX (filmicrgb.c:168); the C GUI
+/// narrows some of them with soft ranges (e.g. black −14..−3), which our linear
+/// sliders don't model.
+fn filmic_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Filmic RGB", "scene → display transform", p0.filmic_on,
+        |p, on| p.filmic_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Black relative exposure (EV)", -16.0, -0.1, 0.1,
+                p0.filmic_black_point_source as f64, |p, v| p.filmic_black_point_source = v);
+            add_param_slider(e, ctx, "White relative exposure (EV)", 0.1, 16.0, 0.1,
+                p0.filmic_white_point_source as f64, |p, v| p.filmic_white_point_source = v);
+            add_param_slider(e, ctx, "Contrast", 0.0, 5.0, 0.01,
+                p0.filmic_contrast as f64, |p, v| p.filmic_contrast = v);
+            add_param_slider(e, ctx, "Linear region (%)", 0.01, 99.0, 0.01,
+                p0.filmic_latitude as f64, |p, v| p.filmic_latitude = v);
+            add_param_slider(e, ctx, "Hardness", 1.0, 10.0, 0.05,
+                p0.filmic_output_power as f64, |p, v| p.filmic_output_power = v);
+            add_param_slider(e, ctx, "Shadows ↔ highlights balance (%)", -50.0, 50.0, 1.0,
+                p0.filmic_balance as f64, |p, v| p.filmic_balance = v);
+            add_param_slider(e, ctx, "Extreme luminance saturation (%)", -200.0, 200.0, 1.0,
+                p0.filmic_saturation as f64, |p, v| p.filmic_saturation = v);
+        })
 }
 
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {

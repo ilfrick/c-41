@@ -1165,6 +1165,475 @@ pub unsafe extern "C" fn darkroom_filmicrgb_v5(
     }
 }
 
+// ── Live-preview driver (the commit_params / compute_spline / process trio) ──
+//
+// The kernel above is a faithful port but needs its inputs precomputed: the
+// tone-curve spline derived from ~12 sliders (`dt_iop_filmic_rgb_compute_spline`),
+// the scalar commit_params block, and the six Yrg matrices from
+// `prepare_RGB_Yrg_matrices` (src/common/gamut_mapping.h:157). This section is
+// that caller side, pure Rust, so the pipeline stage can carry one `FilmicData`
+// and per-band applies are pure pixel math.
+
+/// Slider-driven filmic params — the subset of `dt_iop_filmicrgb_params_t` the
+/// preview exposes plus the target greys it derives. Defaults mirror the C
+/// `$DEFAULT` annotations (filmicrgb.c:168-198). Unlike most modules these are
+/// NOT a neutral edit: enabling filmic at defaults produces its full scene →
+/// display S-curve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilmicParams {
+    /// Black relative exposure in EV (`black_point_source`), $MIN −16 $MAX −0.1.
+    pub black_point_source: f32,
+    /// White relative exposure in EV (`white_point_source`), $MIN 0.1 $MAX 16.
+    pub white_point_source: f32,
+    /// Target middle grey in % (`grey_point_target`), default 18.45.
+    pub grey_point_target: f32,
+    /// Target black luminance in % (`black_point_target`).
+    pub black_point_target: f32,
+    /// Target white luminance in % (`white_point_target`), default 100.
+    pub white_point_target: f32,
+    /// Display hardness = output power exponent (`output_power`), 1..10.
+    pub output_power: f32,
+    /// Linear region width in % (`latitude`), 0.01..99.
+    pub latitude: f32,
+    /// Contrast (`contrast`), 0..5 — slope at grey via the v3 hardness relation.
+    pub contrast: f32,
+    /// Shadows ↔ highlights balance in % (`balance`), −50..50.
+    pub balance: f32,
+    /// Extreme-luminance saturation in % (`saturation`), ±200; v5 blends
+    /// naive/max-RGB tone mapping with weights 0.5 ∓ sat/100.
+    pub saturation: f32,
+    /// Use the custom target grey instead of 18.45% (`custom_grey`). The C
+    /// default; the preview UI does not expose it.
+    pub custom_grey: bool,
+}
+
+impl Default for FilmicParams {
+    fn default() -> Self {
+        Self {
+            black_point_source: -8.0,
+            white_point_source: 4.0,
+            grey_point_target: 18.45,
+            black_point_target: 0.01517634,
+            white_point_target: 100.0,
+            output_power: 4.0,
+            latitude: 0.01,
+            contrast: 1.0,
+            balance: 0.0,
+            saturation: 0.0,
+            custom_grey: false,
+        }
+    }
+}
+
+/// SAFETY_MARGIN from filmicrgb.c:62 — keeps the curve's toe/shoulder anchors a
+/// little inside the reachable [black_display, white_display] band.
+const SAFETY_MARGIN: f32 = 0.01;
+/// `DT_FILMIC_CURVE_POLY_4` ("hard") — the `$DEFAULT` shadows/highlights curve
+/// type for both ends. The kernel also implements POLY_3/rational toes via the
+/// same FFI, but no slider reaches them here.
+const CURVE_POLY_4_TYPE: i32 = CURVE_POLY_4;
+
+/// The computed filmic tone curve: five nodes over the log-encoded domain with
+/// per-segment polynomial coefficients M1..M5 (index 0 = toe, 2 = linear
+/// centre, 1 = shoulder), plus the latitudes and curve types the kernel's
+/// `filmic_spline` evaluates with. Matches `dt_iop_filmic_rgb_spline_t`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilmicSpline {
+    pub x: [f64; 5],
+    pub y: [f64; 5],
+    /// Per-segment coefficients; each is `[toe, shoulder, centre]`, matching
+    /// the C `M1[3] .. M5[3]` layout (kernel reads slices of 4 — padded).
+    pub m1: [f32; 4],
+    pub m2: [f32; 4],
+    pub m3: [f32; 4],
+    pub m4: [f32; 4],
+    pub m5: [f32; 4],
+    /// Where the linear segment starts/ends on the log axis (`latitude_min/max`).
+    pub latitude_min: f32,
+    pub latitude_max: f32,
+}
+
+/// Solve `A·x = b` in place by Gaussian elimination with partial pivoting.
+/// `a` is row-major n×n, destroyed; `b` receives the solution. Returns false if
+/// singular. Port of src/iop/gaussian_elimination.h `gauss_make_triangular` +
+/// `gauss_solve_triangular` + `gauss_solve` (f64 throughout, like the C).
+fn gauss_solve(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
+    let mut p = vec![0usize; n];
+    p[n - 1] = n - 1; // we never swap from the last row
+    for k in 0..n {
+        // find pivot element for row swap
+        let mut m = k;
+        for i in k + 1..n {
+            if a[k + n * i].abs() > a[k + n * m].abs() {
+                m = i;
+            }
+        }
+        p[k] = m; // rows k and m are swapped
+        // eliminate elements and swap rows
+        let t1 = a[k + n * m];
+        a[k + n * m] = a[k + n * k];
+        a[k + n * k] = t1; // new diagonal elements are (implicitly) one
+        if t1 == 0.0 {
+            return false; // the matrix is singular
+        }
+        for i in k + 1..n {
+            a[k + n * i] /= -t1;
+        }
+        // swap rows
+        if k != m {
+            for i in k + 1..n {
+                let t2 = a[i + n * m];
+                a[i + n * m] = a[i + n * k];
+                a[i + n * k] = t2;
+            }
+        }
+        for j in k + 1..n {
+            for i in k + 1..n {
+                a[i + n * j] += a[k + j * n] * a[i + k * n];
+            }
+        }
+    }
+    // permute and rescale elements of right-hand-side
+    for k in 0..n - 1 {
+        let m = p[k];
+        b.swap(m, k);
+        for i in k + 1..n {
+            b[i] += a[k + n * i] * b[k];
+        }
+    }
+    // perform backward substitution
+    for k in (1..n).rev() {
+        b[k] /= a[k + n * k];
+        let t = b[k];
+        for i in 0..k {
+            b[i] -= a[k + n * i] * t;
+        }
+    }
+    b[0] /= a[0];
+    true
+}
+
+/// Port of `dt_iop_filmic_rgb_compute_spline` (filmicrgb.c:2445) for the
+/// current colour science: spline version V3 (the only current version) with
+/// POLY_4 toe and shoulder (the `$DEFAULT` curve types). Node math follows the
+/// C's f32 arithmetic; the polynomial solve runs in f64 like `gauss_solve`.
+pub fn compute_spline(p: &FilmicParams) -> FilmicSpline {
+    // grey_display = powf(18.45%, 1/output_power); custom_grey clamps into the
+    // target black/white band first (filmicrgb.c:2457-2459).
+    let grey_display = if p.custom_grey {
+        (p.grey_point_target.clamp(p.black_point_target, p.white_point_target) / 100.0)
+            .powf(1.0 / p.output_power)
+    } else {
+        0.1845f32.powf(1.0 / p.output_power)
+    };
+
+    let white_source = p.white_point_source;
+    let black_source = p.black_point_source;
+    let dynamic_range = white_source - black_source;
+
+    // luminance after log encoding; black_log = 0, white_log = 1 (filmicrgb.c:2469-2471)
+    let black_log = 0.0f64;
+    let grey_log = (p.black_point_source.abs() / dynamic_range) as f64;
+    let white_log = 1.0f64;
+
+    // V2+ fixed targets: powf(target%, 1/output_power) (filmicrgb.c:2479-2485)
+    let black_display =
+        (p.black_point_target.clamp(0.0, p.grey_point_target) / 100.0).powf(1.0 / p.output_power);
+    let white_display =
+        (p.white_point_target.max(p.grey_point_target) / 100.0).powf(1.0 / p.output_power);
+
+    // V3 branch (filmicrgb.c:2506-2560): slope depends only on contrast at the
+    // grey point; latitude positions toe/shoulder inside the safe [xmin, xmax].
+    let hardness = p.output_power;
+    let latitude = p.latitude.clamp(0.0, 100.0) / 100.0;
+    let slope = p.contrast * dynamic_range / 8.0;
+    let mut min_contrast = 1.0f32; // white/black_display must be reachable
+    min_contrast =
+        min_contrast.max((white_display - grey_display) / ((white_log - grey_log) as f32));
+    min_contrast = min_contrast.max((grey_display - black_display) / ((grey_log - black_log) as f32));
+    min_contrast += SAFETY_MARGIN;
+    // contrast = slope / (hardness · grey_display^(hardness−1)), clamped ≥ min.
+    let contrast_raw = slope / (hardness * grey_display.powf(hardness - 1.0));
+    let contrast = contrast_raw.clamp(min_contrast, 100.0);
+
+    let linear_intercept = grey_display - contrast * grey_log as f32;
+
+    // x values where the contrast line hits the safety-margined display bounds
+    let xmin = (black_display + SAFETY_MARGIN * (white_display - black_display) - linear_intercept)
+        / contrast;
+    let xmax = (white_display - SAFETY_MARGIN * (white_display - black_display) - linear_intercept)
+        / contrast;
+
+    // X coordinates: latitude interpolates grey toward xmin/xmax …
+    let mut toe_log = (1.0 - latitude) * grey_log as f32 + latitude * xmin;
+    let mut shoulder_log = (1.0 - latitude) * grey_log as f32 + latitude * xmax;
+
+    // … then balance shifts both along the log axis, clamped back into range.
+    // (C keeps this arithmetic in f32 — spline nodes are floats.)
+    let balance = p.balance.clamp(-50.0, 50.0) / 100.0;
+    let balance_correction = if balance > 0.0 {
+        2.0 * balance * (shoulder_log - grey_log as f32)
+    } else {
+        2.0 * balance * (grey_log as f32 - toe_log)
+    };
+    toe_log = (toe_log - balance_correction).max(xmin);
+    shoulder_log = (shoulder_log - balance_correction).min(xmax);
+
+    // Y coordinates sit on the contrast line.
+    let toe_display = toe_log * contrast + linear_intercept;
+    let shoulder_display = shoulder_log * contrast + linear_intercept;
+
+    let mut sp = FilmicSpline {
+        x: [
+            black_log,
+            toe_log as f64,
+            grey_log,
+            shoulder_log as f64,
+            white_log,
+        ],
+        y: [
+            black_display as f64,
+            toe_display as f64,
+            grey_display as f64,
+            shoulder_display as f64,
+            white_display as f64,
+        ],
+        m1: [0.0; 4],
+        m2: [0.0; 4],
+        m3: [0.0; 4],
+        m4: [0.0; 4],
+        m5: [0.0; 4],
+        latitude_min: toe_log,
+        latitude_max: shoulder_log,
+    };
+
+    // Central linear segment: affine through (grey_log, grey_display) with the
+    // clamped slope (filmicrgb.c:2630-2634).
+    let tl = sp.x[1];
+    let sl = sp.x[3];
+    let tl_f = tl as f32;
+    sp.m2[2] = contrast;
+    sp.m1[2] = sp.y[1] as f32 - sp.m2[2] * tl_f;
+    // m3/m4/m5[2] stay 0.
+
+    // Toe: quartic through (0, y[0]) with zero first+second derivative there,
+    // matching position/slope/curvature at the toe node (filmicrgb.c:2638-2650).
+    let tl2 = tl * tl;
+    let tl3 = tl2 * tl;
+    let tl4 = tl3 * tl;
+    let mut a0 = [
+        0., 0., 0., 0., 1., //
+        0., 0., 0., 1., 0., //
+        tl4, tl3, tl2, tl, 1., //
+        4. * tl3, 3. * tl2, 2. * tl, 1., 0., //
+        12. * tl2, 6. * tl, 2., 0., 0., //
+    ];
+    let mut b0 = [sp.y[0], 0., sp.y[1], sp.m2[2] as f64, 0.];
+    // NOTE: call unconditionally — debug_assert! would not evaluate the solve
+    // under --release and the coefficients would silently stay zero.
+    let solved_toe = gauss_solve(&mut a0, &mut b0, 5);
+    debug_assert!(solved_toe, "toe system singular");
+    sp.m5[0] = b0[0] as f32;
+    sp.m4[0] = b0[1] as f32;
+    sp.m3[0] = b0[2] as f32;
+    sp.m2[0] = b0[3] as f32;
+    sp.m1[0] = b0[4] as f32;
+
+    // Shoulder: quartic pinned to (1, y[4]) with zero first derivative there,
+    // matching position/slope/curvature at the shoulder node
+    // (filmicrgb.c:2704-2719).
+    let sl2 = sl * sl;
+    let sl3 = sl2 * sl;
+    let sl4 = sl3 * sl;
+    let mut a1 = [
+        1., 1., 1., 1., 1., //
+        4., 3., 2., 1., 0., //
+        sl4, sl3, sl2, sl, 1., //
+        4. * sl3, 3. * sl2, 2. * sl, 1., 0., //
+        12. * sl2, 6. * sl, 2., 0., 0., //
+    ];
+    let mut b1 = [sp.y[4], 0., sp.y[3], sp.m2[2] as f64, 0.];
+    let solved_shoulder = gauss_solve(&mut a1, &mut b1, 5);
+    debug_assert!(solved_shoulder, "shoulder system singular");
+    sp.m5[1] = b1[0] as f32;
+    sp.m4[1] = b1[1] as f32;
+    sp.m3[1] = b1[2] as f32;
+    sp.m2[1] = b1[3] as f32;
+    sp.m1[1] = b1[4] as f32;
+
+    sp
+}
+
+/// The committed per-stage data — the scalar subset of
+/// `dt_iop_filmicrgb_data_t` the v5 kernel consumes plus the finished spline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilmicData {
+    /// Middle-grey source luminance (`grey_source`; 18.45% unless custom).
+    pub grey_source: f32,
+    /// Black relative exposure in EV (`black_source`).
+    pub black_source: f32,
+    /// White minus black source EV span (`dynamic_range`).
+    pub dynamic_range: f32,
+    /// Display hardness (`output_power`).
+    pub output_power: f32,
+    /// Extreme saturation weight (`saturation` = param% / 100 for v4+).
+    pub saturation: f32,
+    /// Derived tone curve.
+    pub spline: FilmicSpline,
+    /// exp_tonemapping_v2(0): norm clamp floor (norm clamp guards clipped raws).
+    pub norm_min: f32,
+    /// exp_tonemapping_v2(1): norm clamp ceiling.
+    pub norm_max: f32,
+    /// powf(spline.y[0], output_power): display-referred black target.
+    pub display_black: f32,
+    /// powf(spline.y[4], output_power): display-referred white target.
+    pub display_white: f32,
+}
+
+impl FilmicData {
+    /// commit_params (filmicrgb.c:2744) + the norm/display endpoints from
+    /// `exp_tonemapping_v2`/process(). V3 has no extra contrast clamp
+    /// (compute_spline handles it via min_contrast).
+    pub fn from_params(p: &FilmicParams) -> Self {
+        let grey_source = if p.custom_grey { p.grey_point_target / 100.0 } else { 0.1845 };
+        let dynamic_range = p.white_point_source - p.black_point_source;
+        let spline = compute_spline(p);
+        let norm_min = grey_source * (dynamic_range * 0.0 + p.black_point_source).exp2();
+        let norm_max = grey_source * (dynamic_range * 1.0 + p.black_point_source).exp2();
+        let display_black = spline.y[0].powf(p.output_power as f64) as f32;
+        let display_white = spline.y[4].powf(p.output_power as f64) as f32;
+        FilmicData {
+            grey_source,
+            black_source: p.black_point_source,
+            dynamic_range,
+            output_power: p.output_power,
+            saturation: p.saturation / 100.0,
+            spline,
+            norm_min,
+            norm_max,
+            display_black,
+            display_white,
+        }
+    }
+}
+
+/// Plain 4×4 product over the 3×3 part (row-major arrays), last row/col kept.
+///
+/// Our matrices are stored transposed (`M[in][out]`, applied by
+/// [`color::apply_transposed_color_matrix`] as out[r] = Σ_c M[c][r]·in[c]), and
+/// under that convention chained application composes as the plain array
+/// product: `(A ⊗ B)` applies A, then B. This is the same composition
+/// `dt_colormatrix_mul` performs on darktable's `dt_colormatrix_t`.
+fn mul_mat4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    std::array::from_fn(|r| std::array::from_fn(|c|
+        (0..3).map(|k| a[r][k] * b[k][c]).sum()
+    ))
+}
+
+/// Transpose the 3×3 part of a padded 4×4 (matches dt_colormatrix_transpose).
+fn transpose_mat4(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    std::array::from_fn(|r| std::array::from_fn(|c| m[c][r]))
+}
+
+/// The six matrices `darkroom_filmicrgb_v5` takes. For the preview there is no
+/// export profile, so the export set duplicates the working set and
+/// `use_output_profile` stays 0.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilmicMatrices {
+    /// Working RGB → LMS 2006 D65, stored transposed (for `RGB_to_Ych`).
+    pub input_matrix_trans: [[f32; 4]; 4],
+    /// LMS 2006 D65 → working RGB, standard rows (for chroma clipping bounds).
+    pub output_matrix: [[f32; 4]; 4],
+    /// The transpose of [`FilmicMatrices::output_matrix`] (for `Ych_to_RGB`).
+    pub output_matrix_trans: [[f32; 4]; 4],
+    /// Unused when `use_output_profile == 0`; mirrors input for pointer validity.
+    pub export_input_matrix_trans: [[f32; 4]; 4],
+    pub export_output_matrix: [[f32; 4]; 4],
+    pub export_output_matrix_trans: [[f32; 4]; 4],
+}
+
+/// `prepare_RGB_Yrg_matrices` for our D65-referenced working spaces. C chains
+/// RGB(D50)→XYZ(D50)→XYZ(D65)→LMS because its pipeline RGB is D50-referenced;
+/// our `rgb_to_xyz_*` maps already land on XYZ D65, so the CAT16 legs drop out:
+///
+/// - input  = XYZ_D65→LMS_2006_D65 ∘ rgb_to_xyz_d65
+/// - output = xyz_d65_to_rgb ∘ LMS_2006_D65→XYZ_D65
+pub fn matrices_for_space(space: crate::pipeline::ColorSpace) -> FilmicMatrices {
+    let (rgb_to_xyz_t4, xyz_to_rgb_t4) = match space {
+        crate::pipeline::ColorSpace::Rec2020 => (
+            &color::REC2020_TO_XYZ_D65_T4,
+            &color::XYZ_D65_TO_REC2020_T4,
+        ),
+        crate::pipeline::ColorSpace::LinearSrgb => (
+            &color::SRGB_TO_XYZ_D65_T4,
+            &color::XYZ_D65_TO_SRGB_T4,
+        ),
+    };
+    // Stored-transposed arrays compose left-to-right under plain products.
+    let input_matrix_trans = mul_mat4(rgb_to_xyz_t4, &color::XYZ_D65_TO_LMS_2006_T);
+    let output_matrix_trans = mul_mat4(&color::LMS_2006_TO_XYZ_D65_T, xyz_to_rgb_t4);
+    let output_matrix = transpose_mat4(&output_matrix_trans);
+    FilmicMatrices {
+        export_input_matrix_trans: input_matrix_trans,
+        export_output_matrix: output_matrix,
+        export_output_matrix_trans: output_matrix_trans,
+        input_matrix_trans,
+        output_matrix,
+        output_matrix_trans,
+    }
+}
+
+type Space = crate::pipeline::ColorSpace;
+
+/// Apply filmic RGB v5 to a packed-RGBA scene-linear buffer in the **Rec.2020**
+/// working space (the raw path). See [`process_in_space`] for the buffer
+/// contract.
+pub fn process(input: &[f32], output: &mut [f32], d: &FilmicData) {
+    process_in_space(input, output, d, &matrices_for_space(Space::Rec2020));
+}
+
+/// Apply filmic RGB v5 with caller-chosen Yrg matrices — the raw preview passes
+/// Rec.2020's, the non-raw sRGB's (see [`matrices_for_space`]). Buffers are
+/// packed RGBA f32 of equal length; `output` receives the display-mapped pixels.
+pub fn process_in_space(
+    input: &[f32], output: &mut [f32], d: &FilmicData, m: &FilmicMatrices,
+) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "filmicrgb: input/output buffers must have the same length"
+    );
+    assert_eq!(input.len() % 4, 0, "filmicrgb: buffer must be packed RGBA");
+    if input.is_empty() {
+        return;
+    }
+    // Matrix work profile: nonlinearlut = 0, so the LUT/unbounded pointers are
+    // never dereferenced (make_work_profile leaves trc = None). matrix_in feeds
+    // only the profile-luminance fallback, which wants STANDARD-form rows
+    // (row 1 = Y coefficients) — hence the transpose of our T4 input matrix.
+    let wp_std = transpose_mat4(&m.input_matrix_trans);
+    let npixels = input.len() / 4;
+    unsafe {
+        darkroom_filmicrgb_v5(
+            input.as_ptr(), output.as_mut_ptr(), npixels,
+            1, wp_std.as_ptr().cast(),
+            std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            0, 0,
+            d.grey_source, d.black_source, d.dynamic_range,
+            d.output_power, d.saturation,
+            d.spline.m1.as_ptr(), d.spline.m2.as_ptr(), d.spline.m3.as_ptr(),
+            d.spline.m4.as_ptr(), d.spline.m5.as_ptr(),
+            d.spline.latitude_min, d.spline.latitude_max,
+            CURVE_POLY_4_TYPE, CURVE_POLY_4_TYPE,
+            m.input_matrix_trans.as_ptr().cast(), m.output_matrix.as_ptr().cast(),
+            m.output_matrix_trans.as_ptr().cast(),
+            m.export_input_matrix_trans.as_ptr().cast(), m.export_output_matrix.as_ptr().cast(),
+            m.export_output_matrix_trans.as_ptr().cast(),
+            0, d.norm_min, d.norm_max, d.display_black, d.display_white,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,5 +2094,286 @@ mod tests {
         filmic_desaturate_v4(original, &mut final_ych, 0.0);
         // chroma_final unchanged → c stays 0.2
         assert!((final_ych[1] - 0.2).abs() < 1e-6, "{final_ych:?}");
+    }
+
+    // ── Live-preview driver tests ─────────────────────────────────────────
+
+    #[test]
+    fn gauss_solve_solves_known_systems() {
+        // Identity: x = b.
+        let mut a = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let mut b = vec![3.0, -2.0, 7.0];
+        assert!(gauss_solve(&mut a, &mut b, 3));
+        assert_eq!(b, vec![3.0, -2.0, 7.0]);
+
+        // A permutation-heavy system needing pivoting: rows of A are shuffled
+        // diagonals so partial pivoting must swap.
+        //   [[0,1],[1,0]]·x = [9,4] → x = [4,9]
+        let mut a = vec![0.0, 1.0, 1.0, 0.0];
+        let mut b = vec![9.0, 4.0];
+        assert!(gauss_solve(&mut a, &mut b, 2));
+        assert!((b[0] - 4.0).abs() < 1e-12 && (b[1] - 9.0).abs() < 1e-12, "{b:?}");
+
+        // Singular matrix reports failure.
+        let mut a = vec![1.0, 2.0, 2.0, 4.0];
+        let mut b = vec![1.0, 2.0];
+        assert!(!gauss_solve(&mut a, &mut b, 2));
+    }
+
+    /// The defaults: black −8 EV, white +4 EV ⇒ dynamic_range 12,
+    /// grey_log = 8/12 = 2/3; power 4 ⇒ grey_display = 0.1845^(1/4) ≈ 0.65428…
+    fn default_spline() -> FilmicSpline {
+        compute_spline(&FilmicParams::default())
+    }
+
+    #[test]
+    fn spline_nodes_are_monotone_and_hit_the_display_targets() {
+        let sp = default_spline();
+        for i in 0..4 {
+            assert!(sp.x[i] < sp.x[i + 1], "x not monotone at {i}: {:?}", sp.x);
+            assert!(sp.y[i] <= sp.y[i + 1], "y not monotone at {i}: {:?}", sp.y);
+        }
+        assert_eq!(sp.x[0], 0.0);
+        assert_eq!(sp.x[4], 1.0);
+        // grey_log = |−8|/12 and grey_display = 0.1845^(1/4). x[2] is f32
+        // precision, so compare against the f32-rounded ratio.
+        assert!(
+            (sp.x[2] - (8.0f32 / 12.0) as f64).abs() < 1e-6,
+            "{}",
+            sp.x[2]
+        );
+        assert!((sp.y[2] - 0.1845f32.powf(0.25) as f64).abs() < 1e-6, "{}", sp.y[2]);
+        // black/white display targets from the $DEFAULT target percentages.
+        assert!((sp.y[0] - (0.01517634f64 / 100.0).powf(0.25)).abs() < 1e-9, "{}", sp.y[0]);
+        assert!((sp.y[4] - 1.0f64).abs() < 1e-9, "{}", sp.y[4]);
+        // Latitudes are the toe/shoulder nodes by definition.
+        assert_eq!(sp.latitude_min as f64, sp.x[1]);
+        assert_eq!(sp.latitude_max as f64, sp.x[3]);
+    }
+
+    #[test]
+    fn spline_evaluates_through_its_own_nodes_and_is_monotone() {
+        let sp = default_spline();
+        // The quartic ends are constructed to pass exactly through the end
+        // nodes with zero slope there; check via the kernel's evaluator.
+        for (xi, yi) in [(0.0f32, sp.y[0] as f32), (1.0, sp.y[4] as f32)] {
+            let v = filmic_spline(
+                xi, &sp.m1, &sp.m2, &sp.m3, &sp.m4, &sp.m5,
+                sp.latitude_min, sp.latitude_max, CURVE_POLY_4, CURVE_POLY_4,
+            );
+            assert!((v - yi).abs() < 1e-5, "spline({xi})={v} want {yi}");
+        }
+        // Monotone increasing across the whole domain.
+        let mut prev = -1.0f32;
+        for k in 0..=200 {
+            let x = k as f32 / 200.0;
+            let v = filmic_spline(
+                x, &sp.m1, &sp.m2, &sp.m3, &sp.m4, &sp.m5,
+                sp.latitude_min, sp.latitude_max, CURVE_POLY_4, CURVE_POLY_4,
+            );
+            assert!(v >= prev - 1e-6, "spline decreases at x={x}: {v} after {prev}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn low_contrast_clamps_slope_via_min_contrast() {
+        // contrast 0 would give slope 0; min_contrast must rescue it so the
+        // curve still spans black→white display targets.
+        let p = FilmicParams { contrast: 0.0, ..FilmicParams::default() };
+        let sp = compute_spline(&p);
+        // The centre segment's slope is ≥ min_contrast (> 1 + SAFETY_MARGIN),
+        // i.e. strictly positive — a flat curve could never reach y[4] > y[0].
+        assert!(sp.m2[2] > 1.0 + SAFETY_MARGIN, "slope={}", sp.m2[2]);
+        // And the endpoints still hit their targets through the quartics.
+        let v0 = filmic_spline(0.0, &sp.m1, &sp.m2, &sp.m3, &sp.m4, &sp.m5,
+                               sp.latitude_min, sp.latitude_max, CURVE_POLY_4, CURVE_POLY_4);
+        let v1 = filmic_spline(1.0, &sp.m1, &sp.m2, &sp.m3, &sp.m4, &sp.m5,
+                               sp.latitude_min, sp.latitude_max, CURVE_POLY_4, CURVE_POLY_4);
+        assert!((v0 - sp.y[0] as f32).abs() < 1e-5 && (v1 - sp.y[4] as f32).abs() < 1e-5);
+    }
+
+    #[test]
+    fn balance_shifts_toe_and_shoulder_inside_bounds() {
+        let neutral = compute_spline(&FilmicParams::default());
+        let shadows = compute_spline(&FilmicParams { balance: 40.0, ..FilmicParams::default() });
+        let highlights =
+            compute_spline(&FilmicParams { balance: -40.0, ..FilmicParams::default() });
+        // Positive balance drags both nodes left (compressing shadows), negative
+        // drags them right — but never outside the safe [xmin, xmax] window,
+        // which pins y within [black_display+margin, white_display−margin].
+        assert!(shadows.x[1] < neutral.x[1] && shadows.x[3] < neutral.x[3],);
+        assert!(
+            highlights.x[1] > neutral.x[1] && highlights.x[3] > neutral.x[3],
+        );
+        let black_display = neutral.y[0];
+        let white_display = neutral.y[4];
+        for sp in [&shadows, &highlights] {
+            assert!(sp.y[1] as f64 >= black_display, "toe below black");
+            assert!(sp.y[3] as f64 <= white_display, "shoulder above white");
+        }
+    }
+
+    #[test]
+    fn data_derives_scalars_like_commit_params() {
+        let d = FilmicData::from_params(&FilmicParams::default());
+        assert_eq!(d.grey_source, 0.1845);
+        assert_eq!(d.black_source, -8.0);
+        assert_eq!(d.dynamic_range, 12.0);
+        // saturation% / 100 for v4+.
+        assert_eq!(d.saturation, 0.0);
+        // exp_tonemapping_v2(x) = grey·2^(dr·x + black): bounds at x=0/1.
+        assert!((d.norm_min - 0.1845 * (-8.0f32).exp2()).abs() < 1e-6);
+        assert!((d.norm_max - 0.1845 * (4.0f32).exp2()).abs() < 1e-5);
+        // Display endpoints are powf(y, output_power): 18.45% grey maps to itself.
+        assert!((d.display_white - 1.0).abs() < 1e-6);
+        assert!(
+            (d.display_black - (0.01517634f32 / 100.0)).abs() < 1e-6,
+            "{}",
+            d.display_black
+        );
+    }
+
+    #[test]
+    fn matrices_compose_the_scalar_conversion_chains() {
+        // The stored-transposed composition must reproduce our verified scalar
+        // chains pixel-for-pixel: apply(in) ≡ XYZ_to_LMS ∘ rgb_to_xyz_d65, and
+        // apply(out) ≡ xyz_d65_to_rgb ∘ LMS_to_XYZ.
+        for space in [
+            crate::pipeline::ColorSpace::Rec2020,
+            crate::pipeline::ColorSpace::LinearSrgb,
+        ] {
+            let m = matrices_for_space(space);
+            type Conv = fn([f32; 4]) -> [f32; 4];
+            let (rgb_in, xyz_in) = match space {
+                crate::pipeline::ColorSpace::Rec2020 => {
+                    (color::rec2020_to_xyz_d65 as Conv, color::xyz_to_lms_2006 as Conv)
+                }
+                crate::pipeline::ColorSpace::LinearSrgb => {
+                    (color::srgb_to_xyz_d65 as Conv, color::xyz_to_lms_2006 as Conv)
+                }
+            };
+            let samples = [
+                [0.2f32, 0.5, 0.8, 1.0],
+                [0.9, 0.1, 0.05, 1.0],
+                [0.1845, 0.1845, 0.1845, 1.0],
+            ];
+            for rgb in samples {
+                let via_matrix = color::apply_transposed_color_matrix(&rgb, &m.input_matrix_trans);
+                let via_chain = xyz_in(rgb_in(rgb));
+                for c in 0..3 {
+                    assert!(
+                        (via_matrix[c] - via_chain[c]).abs() < 1e-5,
+                        "{space:?} ch{c}: {} vs {}",
+                        via_matrix[c],
+                        via_chain[c]
+                    );
+                }
+                // …and back: LMS → working RGB round-trips in-gamut pixels.
+                let back = color::apply_transposed_color_matrix(&via_matrix, &m.output_matrix_trans);
+                for c in 0..3 {
+                    assert!((back[c] - rgb[c]).abs() < 1e-4, "round-trip ch{c}: {}", back[c]);
+                }
+            }
+            // output_matrix rows are output_matrix_trans columns (transpose pair).
+            for r in 0..3 {
+                for c in 0..3 {
+                    assert_eq!(m.output_matrix[r][c], m.output_matrix_trans[c][r]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_preserves_middle_grey_and_ordering_rec2020() {
+        // Middle grey maps to middle grey by construction (norm → log 2/3 →
+        // spline grey node → ^power → 0.1845); brighter stays brighter.
+        let d = FilmicData::from_params(&FilmicParams::default());
+        let m = matrices_for_space(crate::pipeline::ColorSpace::Rec2020);
+        let input = [
+            0.1845f32, 0.1845, 0.1845, 1.0, //
+            0.369, 0.369, 0.369, 1.0, //
+            0.09225, 0.09225, 0.09225, 1.0,
+        ];
+        let mut out = vec![0.0f32; input.len()];
+        process_in_space(&input, &mut out, &d, &m);
+        for c in 0..3 {
+            assert!(
+                (out[c] - 0.1845).abs() < 5e-3,
+                "grey drifted: ch{c} = {}",
+                out[c]
+            );
+        }
+        assert!(out[4] > out[0], "brighter input must stay brighter: {}", out[4]);
+        assert!(out[8] < out[0], "dimmer input must stay dimmer: {}", out[8]);
+        // All channels land inside the display range.
+        for &v in out.iter() {
+            assert!(v.is_finite() && v >= 0.0 && v <= d.display_white + 1e-4, "{v}");
+        }
+    }
+
+    #[test]
+    fn process_produces_valid_pixels_in_both_working_spaces() {
+        // Same grid as the colorbalancergb cross-space validity test: every
+        // pixel finite, non-negative and clamped to its own display white.
+        let d = FilmicData::from_params(&FilmicParams::default());
+        let colours = [
+            [0.02f32, 0.03, 0.04, 1.0],
+            [0.5, 0.2, 0.1, 1.0],
+            [1.5, 0.9, 0.2, 1.0], // clipped-raw-style highlight
+            [4.0, 4.0, 4.0, 1.0], // far above norm_max
+        ];
+        for space in [
+            crate::pipeline::ColorSpace::Rec2020,
+            crate::pipeline::ColorSpace::LinearSrgb,
+        ] {
+            let m = matrices_for_space(space);
+            let mut input = Vec::new();
+            for col in colours {
+                input.extend_from_slice(&col);
+            }
+            let mut out = vec![0.0f32; input.len()];
+            process_in_space(&input, &mut out, &d, &m);
+            for &v in out.iter() {
+                assert!(v.is_finite(), "{space:?}: non-finite output {v}");
+                assert!(v >= 0.0, "{space:?}: negative output {v}");
+                assert!(v <= d.display_white + 1e-3, "{space:?}: {v} > display white");
+            }
+        }
+    }
+
+    #[test]
+    fn process_delegates_to_process_in_space_with_the_rec2020_matrices() {
+        let d = FilmicData::from_params(&FilmicParams::default());
+        let input = [0.3f32, 0.45, 0.6, 1.0, 0.11, 0.22, 0.33, 1.0];
+        let mut via_alias = vec![0.0f32; input.len()];
+        let mut direct = vec![0.0f32; input.len()];
+        process(&input, &mut via_alias, &d);
+        process_in_space(
+            &input,
+            &mut direct,
+            &d,
+            &matrices_for_space(crate::pipeline::ColorSpace::Rec2020),
+        );
+        assert_eq!(via_alias, direct);
+    }
+
+    #[test]
+    fn saturation_changes_the_naive_max_blend() {
+        // The v5 blend weights are 0.5 ∓ sat, so ±saturation must move pixels.
+        let base = FilmicParams::default();
+        let pos = FilmicParams { saturation: 100.0, ..base };
+        let neg = FilmicParams { saturation: -100.0, ..base };
+        let m = matrices_for_space(crate::pipeline::ColorSpace::Rec2020);
+        let input = [1.2f32, 0.4, 0.1, 1.0]; // saturated highlight
+        let run = |p: &FilmicParams| {
+            let mut o = vec![0.0f32; 4];
+            process_in_space(&input, &mut o, &FilmicData::from_params(p), &m);
+            o
+        };
+        let (b, p, n) = (run(&base), run(&pos), run(&neg));
+        for c in 0..3 {
+            assert!(p[c] != b[c] || n[c] != b[c], "saturation did nothing ch{c}");
+        }
     }
 }

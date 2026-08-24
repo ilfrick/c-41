@@ -155,13 +155,30 @@ pub fn lab_to_srgb(lab: [f32; 4]) -> [f32; 4] {
     xyz_d50_to_srgb(lab_to_xyz(lab))
 }
 
-/// XYZ D65 → linear sRGB (matches dt_XYZ_to_Rec709_D65).
+/// XYZ D65 → linear sRGB, the exact inverse of [`SRGB_TO_XYZ_D65_T`] (same
+/// transposed M[in][out] storage convention). Named (rather than inlined in
+/// [`xyz_d65_to_srgb`]) so the padded T4 below can be derived from it.
+const XYZ_D65_TO_SRGB_T: [[f32; 3]; 3] = [
+    [ 3.2404542, -0.9692660,  0.0556434],
+    [-1.5371385,  1.8760108, -0.2040259],
+    [-0.4985314,  0.0415560,  1.0572252],
+];
+
+/// [`XYZ_D65_TO_SRGB_T`] padded to `[[f32; 4]; 4]` for
+/// [`apply_transposed_color_matrix`] — the XYZ-D65→RGB output matrix for a
+/// **linear sRGB** working profile (the non-raw pipeline's space). Derived from
+/// the 3×3 so the two can't drift.
+pub const XYZ_D65_TO_SRGB_T4: [[f32; 4]; 4] = [
+    [XYZ_D65_TO_SRGB_T[0][0], XYZ_D65_TO_SRGB_T[0][1], XYZ_D65_TO_SRGB_T[0][2], 0.0],
+    [XYZ_D65_TO_SRGB_T[1][0], XYZ_D65_TO_SRGB_T[1][1], XYZ_D65_TO_SRGB_T[1][2], 0.0],
+    [XYZ_D65_TO_SRGB_T[2][0], XYZ_D65_TO_SRGB_T[2][1], XYZ_D65_TO_SRGB_T[2][2], 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
+/// XYZ D65 → linear sRGB (matches dt_XYZ_to_Rec709_D65). Same transposed
+/// M[in][out] storage convention as [`XYZ_D65_TO_REC2020_T`].
 pub fn xyz_d65_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
-    const M: [[f32; 3]; 3] = [
-        [ 3.2404542, -0.9692660,  0.0556434],
-        [-1.5371385,  1.8760108, -0.2040259],
-        [-0.4985314,  0.0415560,  1.0572252],
-    ];
+    const M: [[f32; 3]; 3] = XYZ_D65_TO_SRGB_T;
     let rgb: [f32; 3] = std::array::from_fn(|r|
         M[0][r]*xyz[0] + M[1][r]*xyz[1] + M[2][r]*xyz[2]
     );
@@ -175,7 +192,7 @@ pub fn xyz_d65_to_srgb(xyz: [f32; 4]) -> [f32; 4] {
 
 const SRGB_TO_XYZ_D65_T: [[f32; 3]; 3] = [
     [0.4124564, 0.2126729, 0.0193339],  // R → X,Y,Z
-    [0.3575761, 0.7151522, 0.0721750],  // G → X,Y,Z
+    [0.3575761, 0.7151522, 0.1191920],  // G → X,Y,Z
     [0.1804375, 0.0721750, 0.9503041],  // B → X,Y,Z
 ];
 
@@ -235,6 +252,17 @@ pub fn rec2020_to_xyz_d65(rgb: [f32; 4]) -> [f32; 4] {
     );
     [xyz[0], xyz[1], xyz[2], rgb[3]]
 }
+
+/// [`XYZ_D65_TO_REC2020_T`] padded to `[[f32; 4]; 4]` for
+/// [`apply_transposed_color_matrix`] — the XYZ-D65→RGB output matrix for the
+/// pipeline's fixed **Rec.2020** working space (the raw path). Derived from the
+/// 3×3 so the two can't drift.
+pub const XYZ_D65_TO_REC2020_T4: [[f32; 4]; 4] = [
+    [XYZ_D65_TO_REC2020_T[0][0], XYZ_D65_TO_REC2020_T[0][1], XYZ_D65_TO_REC2020_T[0][2], 0.0],
+    [XYZ_D65_TO_REC2020_T[1][0], XYZ_D65_TO_REC2020_T[1][1], XYZ_D65_TO_REC2020_T[1][2], 0.0],
+    [XYZ_D65_TO_REC2020_T[2][0], XYZ_D65_TO_REC2020_T[2][1], XYZ_D65_TO_REC2020_T[2][2], 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
 
 /// XYZ (D65) → linear **Rec.2020** (D65). Alpha passes through.
 pub fn xyz_d65_to_rec2020(xyz: [f32; 4]) -> [f32; 4] {
@@ -895,7 +923,9 @@ pub fn ych_to_rgb(ych: [f32; 4], matrix_trans: &[[f32; 4]; 4]) -> [f32; 4] {
 // colorbalancergb process loop (its own conversions are all fixed matrices).
 
 /// CIE 2006 LMS D65 -> CIE 1931 XYZ D65 (transposed), `LMS_2006_D65_to_XYZ_D65_trans`.
-const LMS_2006_TO_XYZ_D65_T: [[f32; 4]; 4] = [
+/// Public: the filmic RGB Yrg-matrix composition composes this with the
+/// working-space output matrix.
+pub const LMS_2006_TO_XYZ_D65_T: [[f32; 4]; 4] = [
     [1.80794659, 0.61783960, -0.12546960, 0.0],
     [-1.29971660, 0.39595453, 0.20478038, 0.0],
     [0.34785879, -0.04104687, 1.74274183, 0.0],
@@ -903,7 +933,9 @@ const LMS_2006_TO_XYZ_D65_T: [[f32; 4]; 4] = [
 ];
 
 /// CIE 1931 XYZ D65 -> CIE 2006 LMS D65 (transposed), `XYZ_D65_to_LMS_2006_D65_trans`.
-const XYZ_D65_TO_LMS_2006_T: [[f32; 4]; 4] = [
+/// Public: the filmic RGB Yrg-matrix composition composes this with the
+/// working-space input matrix.
+pub const XYZ_D65_TO_LMS_2006_T: [[f32; 4]; 4] = [
     [0.257085, -0.394427, 0.064856, 0.0],
     [0.859943, 1.175800, -0.076250, 0.0],
     [-0.031061, 0.106423, 0.559067, 0.0],

@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basicadj, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, exposure, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basicadj, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, shadhi, sharpen, sigmoid, splittoning, temperature, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -419,6 +419,15 @@ pub enum Stage {
         data: Box<colorbalancergb::CbRgbData>,
         space: ColorSpace,
     },
+    /// Filmic RGB (filmicrgb.c) — scene-referred tone mapping, colour science
+    /// v5. The stage carries the committed data (spline + scalars from
+    /// `commit_params`/`compute_spline`, prebuilt once per render) and the
+    /// working space; the Yrg matrices are selected per apply from the same
+    /// space so the gamut map clips against the buffer's own primaries.
+    FilmicRgb {
+        data: Box<filmicrgb::FilmicData>,
+        space: ColorSpace,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -473,6 +482,7 @@ impl Stage {
             Stage::Negadoctor { .. } => "negadoctor",
             Stage::ToneEqual { .. } => "toneequal",
             Stage::ColorBalanceRgb { .. } => "colorbalancergb",
+            Stage::FilmicRgb { .. } => "filmicrgb",
         }
     }
 
@@ -572,6 +582,11 @@ impl Stage {
             // dependence. The gamut LUT it reads is prebuilt and immutable.
             // Band-parallel stays available.
             Stage::ColorBalanceRgb { .. } => true,
+            // FilmicRgb is pixel-local: per-pixel tone mapping + gamut map, all
+            // driven by that pixel's own RGB through immutable prebuilt tables
+            // (spline coefficients, Yrg matrices). No neighbour reads. The
+            // band-parallel path stays available.
+            Stage::FilmicRgb { .. } => true,
         }
     }
 
@@ -628,6 +643,10 @@ impl Stage {
             // primaries at pipeline-build time — so it must agree with the
             // other Lab/space-aware stages exactly like Sharpen/Vibrance do.
             Stage::ColorBalanceRgb { space, .. } => Some(*space),
+            // FilmicRgb's Yrg matrices (input/outputs of the gamut map) are
+            // selected per working space at apply time, so — like ColorBalanceRgb
+            // — it must agree with the other space-aware stages.
+            Stage::FilmicRgb { space, .. } => Some(*space),
             Stage::GraduatedNd { .. } => None,
             _ => None,
         }
@@ -1358,6 +1377,17 @@ impl Stage {
                     };
                 colorbalancergb::process_in_space(input, output, data, to_xyz, from_xyz);
             }
+            // ── FilmicRgb (filmicrgb.c, colour science v5) ───────────────
+            // Scene-referred tone mapping: log encoding → derived spline →
+            // display power, then chroma preservation + gamut map in Yrg. The
+            // committed data (spline coefficients and scalars) is prebuilt by
+            // `PreviewParams::to_pipeline`; the six Yrg matrices are selected
+            // here from the buffer's working space so the gamut clip runs
+            // against the primaries the pixels are actually in.
+            Stage::FilmicRgb { ref data, space } => {
+                let matrices = filmicrgb::matrices_for_space(space);
+                filmicrgb::process_in_space(input, output, data, &matrices);
+            }
         }
     }
 }
@@ -1739,6 +1769,12 @@ mod tests {
                 data: Box::new(colorbalancergb::CbRgbData::from_params(
                     &colorbalancergb::CbRgbParams::default(),
                     &crate::color::REC2020_TO_XYZ_D65_T4,
+                )),
+                space: ColorSpace::Rec2020,
+            },
+            Stage::FilmicRgb {
+                data: Box::new(filmicrgb::FilmicData::from_params(
+                    &filmicrgb::FilmicParams::default(),
                 )),
                 space: ColorSpace::Rec2020,
             },

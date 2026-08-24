@@ -1228,3 +1228,88 @@ immediately from tool feedback and repaired; one E0308 in the new test (fn
 items have unique types — cast to `RgbXyzConv` fn pointers); one genuinely
 wrong test premise (cross-space XYZ identity) replaced twice before landing on
 the invariants above.
+
+## 2026-08-24T07:44Z — m4-118: filmic RGB (`filmicrgb`) live preview module
+
+**What changed.** Filmic RGB wired as the **26th live darkroom preview module**
+(v50_order pos 46.0 — display-transform cluster, after sigmoid 45.3, before
+colisa 47.0; pinned by the canonical-order test).
+
+- `c41-core/iop/filmicrgb.rs` gained the live-preview driver (~350 lines +
+  12 tests): `FilmicParams` (from the `$DEFAULT` introspection annotations),
+  `gauss_solve` (faithful f64 port of `gaussian_elimination.h` incl. partial
+  pivoting and the C's column-swap elimination), `compute_spline` (V3 branch
+  only + POLY_4 toe/shoulder quartics solved in f64 — the current colour
+  science and the default curve types), `FilmicData::from_params`
+  (commit_params scalar subset + `exp_tonemapping_v2` norm endpoints +
+  `powf(y, power)` display endpoints), and `matrices_for_space` —
+  `prepare_RGB_Yrg_matrices` adapted to our D65-referenced working spaces:
+  C chains RGB(D50)→CAT16→LMS because its pipeline is D50-referenced; ours
+  drops both CAT16 legs, which is algebraically exact since our
+  `rgb_to_xyz_*` maps land directly on XYZ D65. Composition uses the
+  stored-transposed plain-array product convention (`M[in][out]`,
+  `out[r]=Σ_c M[c][r]·in[c]` ⇒ A then B composes as `mul_mat4(A,B)`),
+  pinned by a test asserting the matrix path ≡ the scalar converter chains.
+- `Stage::FilmicRgb { data, space }` in pipeline.rs: per-pixel → parallel-path
+  eligible; carries its ColorSpace; `working_space()` reports it. The apply arm
+  calls `process_in_space` with per-space matrices (Rec.2020 raw / linear sRGB
+  non-raw) into the existing `darkroom_filmicrgb_v5` FFI kernel
+  (has_work_profile=1 with a standard-form transposed input matrix,
+  nonlinearlut=0 so LUT pointers are never dereferenced, POLY_4 ×2,
+  use_output_profile=0 with export set duplicating working set).
+- UI: PreviewParams **v19** — append-only bool #26 + trailing f32s f[206..212]
+  (black −16..−0.1 def −8 EV, white 0.1..16 def 4 EV, hardness 1..10 def 4,
+  latitude 0.01..99 def 0.01 %, contrast 0..5 def 1, balance ±50 def 0,
+  saturation ±200 def 0); ENCODED_LEN 879 (pinned-length test updated);
+  PARAMS_LAYOUTS row added; v18 blobs decode with filmic fields defaulted
+  (test). Single-source-of-truth `filmic_params()` mapper shared by
+  `is_identity` (filmic_on-only gate — a tone curve is never a no-op while
+  enabled) and `to_pipeline`. history.rs describe_change "Filmic RGB" group +
+  exhaustive destructure drift-guard extension. darkroom/mod.rs: dispatch arm,
+  LIVE_MODULE_LABELS entry, 7-slider module row using the $MIN/$MAX ranges
+  (C's soft ranges deliberately not modelled — our sliders are linear).
+  Catalog already carried the label, so it went live without catalog changes.
+
+**Documented deviation:** filmic ships OFF at defaults. Darktable auto-enables
+it via the scene-referred preset plus `reload_defaults`' auto-exposure
+adjustment — workflow logic we don't replicate — unlike sigmoid there is no
+identity-at-defaults shortcut either way: enabling it always tone-maps.
+
+**Real defect found & fixed en route (m4-117 follow-up):**
+`color::SRGB_TO_XYZ_D65_T` shipped with G→Z = 0.0721750 (B→Y's value) instead
+of the correct **0.1191920** (confirmed against colorspaces.c:915-922 and by
+inverting the stored XYZ→sRGB matrix), so `srgb_to_xyz_d65` was *not* the
+inverse of `xyz_d65_to_srgb` — non-raw previews ran subtly wrong chroma
+through the pipeline converters and colour-balance-RGB gamut LUTs since m4-117
+(b12067bfc8). One-entry fix; no test pinned the wrong value (full suite stayed
+green post-fix). Caught precisely because the new matrix-composition round-trip
+test refused to pass in the sRGB space.
+
+**Also went wrong, fixed inline:** 12 first-compile errors (f32/f64 mixes in
+the balance block and `from_params`; `[f32;4]` vs `*const f32` matrix pointers;
+fn-item uniqueness in a test match — cast via `type Conv = fn(...)`); and a
+nasty **release-mode trap**: the spline solves were originally wrapped as
+`debug_assert!(gauss_solve(...))`, which under `--release` never evaluates the
+call — coefficients silently stayed zero and five spline/process tests failed
+with degenerate values. Solves now run unconditionally with the result asserted
+separately (NOTE comment left at both sites); swept the touched files for other
+instances — none.
+
+**Senior review (fork subagent acting as senior reviewer).** The named
+fricktrade-architect agent died with the same API 402 credit error as in
+m4-117; after the failure the review was performed by a fork subagent with the
+full eight-point checklist against the C sources (substitution documented here
+per workflow). Verdict **SHIP**: compute_spline verified line-for-line against
+filmicrgb.c:2445-2766 including both quartic systems and coefficient unpack
+order; gauss_solve against gaussian_elimination.h; matrix composition proven
+under the transposed-storage convention; FFI call site argument-for-argument
+against filmicrgb.c:1712-1733; from_params endpoints against commit_params +
+exp_tonemapping_v2; CAT16-leg drop confirmed algebraically exact; sRGB fix
+values confirmed canonical; UI append-only discipline and slider ranges
+verified against the $MIN/$MAX annotations. Zero BLOCKER/MAJOR findings; two
+INFO notes (per-band `matrices_for_space` rebuild ~100 flops — negligible next
+to the pixel loop; f64-widened spline node storage — kernel never sees x/y).
+
+**Verified.** `scripts/ci-local.sh` exit 0 — all four CI steps (check, clippy,
+test --release, release link) pass; 716 c41-core + 251 c41-ui tests green;
+zero new clippy warning families.

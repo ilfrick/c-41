@@ -486,6 +486,17 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if cb {
         return "Color balance RGB";
     }
+    let filmic = old.filmic_on != new.filmic_on
+        || old.filmic_black_point_source != new.filmic_black_point_source
+        || old.filmic_white_point_source != new.filmic_white_point_source
+        || old.filmic_output_power != new.filmic_output_power
+        || old.filmic_latitude != new.filmic_latitude
+        || old.filmic_contrast != new.filmic_contrast
+        || old.filmic_balance != new.filmic_balance
+        || old.filmic_saturation != new.filmic_saturation;
+    if filmic {
+        return "Filmic RGB";
+    }
     "Edit"
 }
 
@@ -858,6 +869,14 @@ mod tests {
             cb_grey_fulcrum: _,
             cb_contrast: _,
             cb_formula: _,
+            filmic_on: _,
+            filmic_black_point_source: _,
+            filmic_white_point_source: _,
+            filmic_output_power: _,
+            filmic_latitude: _,
+            filmic_contrast: _,
+            filmic_balance: _,
+            filmic_saturation: _,
         } = PreviewParams::default();
     }
 
@@ -939,7 +958,8 @@ mod tests {
         // deliberate decision when the length drifts.
         // m4-116 (toneequalizer): 680 → 717 (1 + 24 bools + 173 f32).
         // m4-117 (colorbalancergb): 717 → 850 (1 + 25 bools + 206 f32).
-        assert_eq!(PreviewParams::default().encode().len(), 850);
+        // m4-118 (filmicrgb): 850 → 879 (1 + 26 bools + 213 f32).
+        assert_eq!(PreviewParams::default().encode().len(), 879);
     }
 
     #[test]
