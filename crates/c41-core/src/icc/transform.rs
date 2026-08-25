@@ -8,7 +8,7 @@
 //! to test). A [`Transform`] therefore keeps head/bridge/tail apart and applies
 //! the bridge between them in [`Transform::eval`].
 
-use super::lut::Pipeline;
+use super::lut::{Pipeline, Stage};
 use super::parser::{IccError, Profile};
 
 /// ICC's reference white for the profile connection space: D50, the value the
@@ -93,6 +93,23 @@ impl Transform {
         let head = src.a2b_pipeline(intent)?;
         let tail = dst.b2a_pipeline(intent)?;
 
+        // The band path ([`Pipeline::eval_into3`]) evaluates on stack `[f32; 3]`s,
+        // so every pipeline must be 3-channel throughout. ICC profiles exist in
+        // GRAY/N-channel/CMYK flavours whose LUT tags parse cleanly but would
+        // mis-evaluate here — refuse them at assembly, converting what would be
+        // an out-of-bounds panic (or silently dropped channels) into the FFI
+        // boundary's documented NULL-on-failure contract.
+        for stage in head.stages.iter().chain(tail.stages.iter()) {
+            let three_channel = match stage {
+                Stage::Curves(cs) => cs.len() == 3,
+                Stage::Clut(c) => c.input_channels() == 3 && c.output_channels == 3,
+                Stage::Matrix(_) => true,
+            };
+            if !three_channel {
+                return Err(IccError::WrongTagType);
+            }
+        }
+
         // Absolute intent: scale by the media-white ratio in XYZ PCS. Both
         // whites must be usable (all-positive) — profiles are untrusted bytes,
         // and a zero/negative component would zero/flip a channel.
@@ -122,29 +139,54 @@ impl Transform {
     /// Evaluate on one pixel vector (`src` device channels wide → `dst`'s width —
     /// both 3 for every space C41 transforms today).
     pub fn eval(&self, input: &[f32]) -> Vec<f32> {
-        let mut v = self.head.eval(input);
+        let mut out = [0.0f32; 3];
+        let src: [f32; 3] =
+            input.try_into().expect("Transform evaluates 3-channel vectors only");
+        self.eval_into(&src, &mut out);
+        out.to_vec()
+    }
+
+    /// Evaluate on one 3-channel vector writing into `out`, without allocating.
+    /// Bit-exact to [`Self::eval`] — same order, same arithmetic, only the
+    /// plumbing differs. This is what the FFI apply path calls per pixel (hence
+    /// crate-scoped: `eval` is the public entry point); the allocation-free
+    /// property comes from [`Pipeline::eval_into3`]'s stack intermediates plus
+    /// these stack arrays.
+    pub(crate) fn eval_into(&self, input: &[f32; 3], out: &mut [f32; 3]) {
+        let mut v = [0.0f32; 3];
+        self.head.eval_into3(input, &mut v);
         if self.to_xyz {
-            v = xyz_from_lab(&v).to_vec();
+            v = xyz_from_lab(&v);
         }
         if let Some(s) = &self.abs_scale {
-            v = v.iter().zip(s.iter()).map(|(x, k)| x * k).collect();
+            for i in 0..3 {
+                v[i] *= s[i];
+            }
         }
         if self.from_xyz {
-            v = lab_from_xyz(&v).to_vec();
+            v = lab_from_xyz(&v);
         }
-        self.tail.eval(&v)
+        self.tail.eval_into3(&v, out);
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::icc::lut::{parse_lut_tag, Stage};
     use crate::icc::Curve;
 
+    /// Shared synthetic-profile builders for sibling icc test modules (ffi.rs).
+    /// One definition here; re-exported below so the FFI boundary tests parse
+    /// the exact same bytes the engine tests do.
+    pub(crate) mod test_helpers {
+        pub(crate) use super::{build_profile, curv_gamma_tag, mft1_gray_lut, mft1_identity_lut,
+                               matrix_profile, srgb_like_profile, xyz_tag};
+    }
+
     /// Build a minimal but valid ICC profile (same shape as parser.rs's test
     /// helper): header + tag table + padded tag payloads.
-    fn build_profile(
+    pub(crate) fn build_profile(
         class: &[u8; 4],
         data_space: &[u8; 4],
         pcs: &[u8; 4],
@@ -178,7 +220,7 @@ mod tests {
         b
     }
 
-    fn xyz_tag(x: f32, y: f32, z: f32) -> Vec<u8> {
+    pub(crate) fn xyz_tag(x: f32, y: f32, z: f32) -> Vec<u8> {
         let mut d = vec![0u8; 20];
         d[0..4].copy_from_slice(b"XYZ ");
         for (i, v) in [x, y, z].iter().enumerate() {
@@ -188,7 +230,7 @@ mod tests {
         d
     }
 
-    fn curv_gamma_tag(g: f32) -> Vec<u8> {
+    pub(crate) fn curv_gamma_tag(g: f32) -> Vec<u8> {
         let mut d = vec![0u8; 14];
         d[0..4].copy_from_slice(b"curv");
         d[8..12].copy_from_slice(&1u32.to_be_bytes());
@@ -201,7 +243,7 @@ mod tests {
     /// axis-aligned components of its white point (so device white ⇔ wtpt
     /// exactly, and both matrices involved stay diagonal/invertible), TRC =
     /// pure gamma.
-    fn matrix_profile(pcs: &[u8; 4], wtpt: [f32; 3]) -> Vec<u8> {
+    pub(crate) fn matrix_profile(pcs: &[u8; 4], wtpt: [f32; 3]) -> Vec<u8> {
         build_profile(
             b"mntr",
             b"RGB ",
@@ -285,7 +327,7 @@ mod tests {
     /// Same shape as [`matrix_profile`] but with proper (non-diagonal,
     /// invertible) sRGB-D50 colorants whose columns sum exactly to D50 — so a
     /// white-ratio XYZ scaling cannot cancel against the inverse colorants.
-    fn srgb_like_profile(pcs: &[u8; 4], wtpt: [f32; 3]) -> Vec<u8> {
+    pub(crate) fn srgb_like_profile(pcs: &[u8; 4], wtpt: [f32; 3]) -> Vec<u8> {
         let c = [
             [0.4360f32, 0.3851, 0.1431], // rXYZ (x, y, z)
             [0.2225, 0.7169, 0.0606],    // gXYZ
@@ -367,8 +409,35 @@ mod tests {
         d
     }
 
-    fn mft1_identity_lut() -> Vec<u8> {
+    pub(crate) fn mft1_identity_lut() -> Vec<u8> {
         mft1_lut(false)
+    }
+
+    /// A 1-in/1-out lut8 payload — the A2B0 shape a GRAY ICC profile carries.
+    /// The *parser* accepts it (channel counts are capped at LCMS's 16, not
+    /// pinned to 3), which is exactly why assembly must reject such pipelines.
+    pub(crate) fn mft1_gray_lut() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(b"mft1");
+        d.extend_from_slice(&[0u8; 4]); // reserved
+        d.push(1); // input channels
+        d.push(1); // output channels
+        d.push(2); // grid points per dim
+        d.push(0); // pad
+        // lut8 always carries the 36-byte e-matrix at offsets 12..48 (identity
+        // here) — the parser's table cursor starts at 48 regardless of channels.
+        d.extend_from_slice(&[0u8; 36]);
+        // identity input table ×1 (lut8 stores u8)
+        for i in 0..256u16 {
+            d.push(i as u8);
+        }
+        // CLUT: 2 nodes × 1 output, identity
+        d.extend_from_slice(&[0u8, 255]);
+        // identity output table ×1
+        for i in 0..256u16 {
+            d.push(i as u8);
+        }
+        d
     }
 
     /// Flip a built profile's version-major header byte — exercises the v2
@@ -469,6 +538,29 @@ mod tests {
         assert!(matches!(
             Transform::new(&p, &p, 1),
             Err(crate::icc::IccError::WrongTagType)
+        ));
+    }
+
+    #[test]
+    fn non_three_channel_pipelines_are_rejected_at_assembly() {
+        // A GRAY profile's A2B0 parses cleanly (1-in/1-out is within the
+        // parser's channel caps) but violates the 3-channel contract that the
+        // band path's stack arrays rest on: assembly must refuse it rather than
+        // let the first pixel index out of bounds across the FFI boundary.
+        let bytes = build_profile(b"scnr", b"GRAY", b"XYZ ", &[(b"A2B0", mft1_gray_lut())]);
+        let p = Profile::parse(&bytes).expect("the GRAY fixture itself must parse");
+        assert!(matches!(
+            Transform::new(&p, &p, 1),
+            Err(IccError::WrongTagType)
+        ));
+
+        // The same LUT as a *destination* (B2A side) is equally refused.
+        let dst_bytes = build_profile(b"scnr", b"GRAY", b"Lab ", &[(b"B2A0", mft1_gray_lut())]);
+        let src = Profile::parse(&matrix_profile(b"XYZ ", [0.9642, 1.0, 0.8249])).unwrap();
+        let d = Profile::parse(&dst_bytes).unwrap();
+        assert!(matches!(
+            Transform::new(&src, &d, 1),
+            Err(IccError::WrongTagType)
         ));
     }
 

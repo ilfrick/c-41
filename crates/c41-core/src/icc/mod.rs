@@ -19,15 +19,20 @@
 //!   multi-process) parsed into [`Pipeline`]s of curve/matrix/CLUT stages.
 //! - m4-93a/b: the device→PCS direction ([`Profile::a2b_pipeline`], with the
 //!   appended PCS-decode stage normalising LUT output to raw values).
-//! - **m4-127 (this increment):** the PCS→device direction
-//!   ([`Profile::b2a_pipeline`] — ICC-encode prepend, `B2A{intent}` preference,
-//!   matrix-shaper fallback via the new [`Curve::inverse`]) and full transform
-//!   assembly ([`transform::Transform`]: device→PCS→device across two profiles,
-//!   Lab↔XYZ bridging, rendering intents incl. absolute's white-ratio scaling).
-//!   Wiring colorin/colorout's LUT path through the FFI boundary is the
-//!   follow-up.
+//! - m4-127: the PCS→device direction ([`Profile::b2a_pipeline`] — ICC-encode
+//!   prepend, `B2A{intent}` preference, matrix-shaper fallback via the new
+//!   [`Curve::inverse`]) and full transform assembly ([`transform::Transform`]:
+//!   device→PCS→device across two profiles, Lab↔XYZ bridging, rendering intents
+//!   incl. absolute's white-ratio scaling).
+//! - **m4-129 (this increment):** the C boundary and the band-processing path:
+//!   allocation-free 3-channel evaluation ([`Pipeline::eval_into3`] /
+//!   [`Transform::eval_into`]) plus the `darkroom_icc_transform_*` FFI exports
+//!   ([`ffi`]) that colorin/colorout's LUT path calls in place of LCMS.
+//!   Replacing those C call sites is the follow-up (needs the full-app Docker
+//!   C build).
 
 mod clut;
+mod ffi;
 mod lut;
 mod parser;
 mod transform;

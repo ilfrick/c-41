@@ -59,6 +59,43 @@ impl Pipeline {
         }
         v
     }
+
+    /// Evaluate on a **3-channel** vector writing into `out`, without allocating —
+    /// the band-processing entry point for the FFI layer. The 3-channel shape is
+    /// an invariant enforced upstream by `Transform::new` (every Curves/Clut
+    /// stage is checked 3-in/3-out at assembly — the parser alone accepts GRAY /
+    /// CMYK / N-channel tags), which is what lets intermediates live in stack
+    /// arrays and why this is `pub(crate)`-scoped to the icc module rather than
+    /// a general API. Bit-exact to [`Pipeline::eval`] for the same stages: same
+    /// order, same arithmetic, only the plumbing differs.
+    pub(crate) fn eval_into3(&self, input: &[f32; 3], out: &mut [f32; 3]) {
+        let mut v = *input;
+        let mut o = [0.0f32; 3];
+        for stage in &self.stages {
+            match stage {
+                Stage::Curves(curves) => {
+                    // Component-wise; exactly 3 curves guaranteed by the
+                    // 3-channel invariant `Transform::new` checks at assembly.
+                    for i in 0..3 {
+                        o[i] = curves[i].eval(v[i]);
+                    }
+                    v = o;
+                }
+                Stage::Matrix(m) => {
+                    let (a, b, c) = (v[0], v[1], v[2]);
+                    for i in 0..3 {
+                        o[i] = m[i][0] * a + m[i][1] * b + m[i][2] * c + m[i][3];
+                    }
+                    v = o;
+                }
+                Stage::Clut(clut) => {
+                    clut.eval(&v, &mut o);
+                    v = o;
+                }
+            }
+        }
+        *out = v;
+    }
 }
 
 #[inline]
