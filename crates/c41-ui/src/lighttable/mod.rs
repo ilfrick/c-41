@@ -9,6 +9,7 @@
 pub mod full_preview;
 pub mod rule_stack;
 pub mod timeline;
+pub mod zoomable;
 
 use adw::prelude::*;
 use gtk4::{GridView, ListItem, ScrolledWindow, SignalListItemFactory, SingleSelection};
@@ -41,10 +42,21 @@ pub type LighttableModel = gtk4::StringList;
 /// changes. Returning it makes "the bottom-bar controls always find the grid" hold
 /// by construction — see the m4-98c constraint on [`ViewMode`].
 pub struct LighttablePage {
+    /// The centre slot's root: an `Overlay` holding the grid scroller as its
+    /// child and the zoomable canvas as a hidden overlay child above it (m4-139).
+    /// lib.rs hands THIS to [`full_preview::FullPreview::wrap`], so the preview
+    /// layer still covers every layout; the grid scroller itself never changes
+    /// child — the m4-98c constraint is untouched, the canvas simply sits beside
+    /// it inside one overlay.
+    pub overlay: gtk4::Overlay,
     pub scroll: ScrolledWindow,
     pub grid: GridView,
     pub model: LighttableModel,
     pub selection: SingleSelection,
+    /// The zoomable-mode canvas. Hidden until [`set_view_mode`] enters
+    /// [`ViewMode::Zoomable`]; the bottom-bar stepper reaches its zoom through
+    /// the thread-locals in `lighttable/zoomable.rs`.
+    pub zoom: zoomable::ZoomableCanvas,
 }
 
 /// Build the lighttable widget — see [`LighttablePage`] for what comes back.
@@ -253,7 +265,18 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
         .vexpand(true)
         .build();
 
-    LighttablePage { scroll, grid, model, selection }
+    // Zoomable mode's canvas (m4-139): a hidden overlay sibling of the grid
+    // scroller. The overlay is the centre slot; lib.rs wraps it with the full
+    // preview exactly as it used to wrap the bare scroller.
+    let zoom = zoomable::ZoomableCanvas::new(&selection);
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&scroll));
+    overlay.add_overlay(&zoom.layer);
+    zoom.layer.set_visible(false);
+    overlay.set_hexpand(true);
+    overlay.set_vexpand(true);
+
+    LighttablePage { overlay, scroll, grid, model, selection, zoom }
 }
 
 // ── Rating helpers ────────────────────────────────────────────────────────
@@ -1228,6 +1251,13 @@ impl OverlayMode {
         }
     }
 
+    /// Whether this mode draws filename captions. Shared decision between the
+    /// grid cells (bind-time visibility) and the zoomable canvas (paint-time),
+    /// so the overlay dropdown can never mean different things per layout.
+    pub fn shows_filenames(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
+
     /// The mode's dropdown row label. Kept next to the variants (not in `lib.rs`)
     /// so the control is built from [`Self::ALL`] and the two can't diverge. Kept
     /// terse — the bottom bar's minimum width is contended (see the ~915px
@@ -1317,8 +1347,11 @@ pub enum ViewMode {
     /// Scrolling grid of thumbnails — the layout the lighttable has always had,
     /// and the default.
     FileManager,
-    /// darktable's infinite zoom plane. Not ported: a `GridView` cannot express it
-    /// (see [`ViewMode::is_available`]).
+    /// darktable's infinite zoom plane: a hand-drawn canvas of continuously
+    /// zoomable thumbnails (`lighttable/zoomable.rs`, m4-139). Not a `GridView`
+    /// reconfiguration — the canvas covers the centre slot as an overlay child
+    /// while this mode is active, which is why it's the one mode [`LighttablePage`]
+    /// hands out extra widgets for.
     Zoomable,
     /// A fixed window of N images at a time, paged with ← / →, for side-by-side
     /// comparison — the same grid with a `SliceListModel` over its model.
@@ -1344,8 +1377,7 @@ impl ViewMode {
     /// state — nothing should ever make a mode available conditionally at runtime.
     pub const fn is_available(self) -> bool {
         match self {
-            Self::FileManager | Self::Culling => true,
-            Self::Zoomable => false,
+            Self::FileManager | Self::Culling | Self::Zoomable => true,
         }
     }
 
@@ -1370,7 +1402,7 @@ impl ViewMode {
     pub const fn tooltip(self) -> &'static str {
         match self {
             Self::FileManager => "File manager: scrolling grid of thumbnails",
-            Self::Zoomable => "Zoomable lighttable (not available yet)",
+            Self::Zoomable => "Zoomable: infinite pannable plane — wheel zooms, drag pans",
             // m4-132: the cells now fill the viewport, so this can promise what
             // darktable's culling does — keep the wording in step with the layout.
             Self::Culling => "Culling: compare a screenful side by side (← →)",
@@ -1558,21 +1590,35 @@ fn store_view_mode(mode: ViewMode) -> bool {
     true
 }
 
-/// Apply `mode` to `grid` — reconfiguring it in place, never swapping the
-/// `ScrolledWindow`'s child (see [`ViewMode`]). Separate from the state write so
-/// the startup path can re-apply the restored mode to a freshly built grid without
-/// going through the switcher's handlers.
+/// Apply `mode` to the lighttable — reconfiguring the grid in place for the
+/// GridView-backed layouts (never swapping the `ScrolledWindow`'s child, see
+/// [`ViewMode`]), or swapping the overlay's visible surface for zoomable. Separate
+/// from the state write so the startup path can re-apply the restored mode to a
+/// freshly built lighttable without going through the switcher's handlers.
 ///
 /// `FileManager` is how the grid is built, so entering it means undoing culling.
 /// Returns whether the layout was actually applied — a mode that can't configure
-/// the grid must be *refused*, not half-applied with its button lit (see
+/// the view must be *refused*, not half-applied with its button lit (see
 /// [`set_view_mode`]).
-fn reconfigure_grid_for(grid: &GridView, mode: ViewMode) -> bool {
+fn reconfigure_grid_for(grid: &GridView, zoom: &zoomable::ZoomableCanvas, mode: ViewMode) -> bool {
     match mode {
-        // Zoomable is unreachable while `is_available` says so; the match stays
-        // exhaustive so implementing a mode can't forget to land its layout here.
-        ViewMode::FileManager | ViewMode::Zoomable => leave_culling(grid),
-        ViewMode::Culling => enter_culling(grid),
+        ViewMode::FileManager | ViewMode::Culling => {
+            zoom.layer.set_visible(false);
+            if mode == ViewMode::Culling {
+                enter_culling(grid)
+            } else {
+                leave_culling(grid)
+            }
+        }
+        ViewMode::Zoomable => {
+            // Leave culling FIRST so the selection model is the plain full
+            // collection the canvas indexes into (its items carry base-model
+            // indices; clicking through a window would select the wrong image).
+            leave_culling(grid);
+            zoom.on_enter();
+            zoom.layer.set_visible(true);
+            true
+        }
     }
 }
 
@@ -1680,8 +1726,9 @@ fn refresh_cull_cells(grid: &GridView) {
 /// Scale `(src_w, src_h)` to the largest size that fits inside `(box_w, box_h)`
 /// preserving aspect ratio (each dimension ≥ 1). Upscaling is allowed — a small
 /// source shown in a big culling cell should fill it, blurred, rather than sit in
-/// a corner. `None` when any dimension isn't positive. Pure.
-fn fit_inside(src_w: i32, src_h: i32, box_w: i32, box_h: i32) -> Option<(i32, i32)> {
+/// a corner. `None` when any dimension isn't positive. Pure. `pub(crate)` so the
+/// zoomable canvas reuses the exact same contain math (m4-139).
+pub(crate) fn fit_inside(src_w: i32, src_h: i32, box_w: i32, box_h: i32) -> Option<(i32, i32)> {
     if src_w <= 0 || src_h <= 0 || box_w <= 0 || box_h <= 0 {
         return None;
     }
@@ -1753,8 +1800,9 @@ fn cull_entry_offset(index: u32, window: u32) -> u32 {
 }
 
 /// Every path in `model`, in order. Used to locate an image by path when the index
-/// spaces differ (the window's vs the collection's).
-fn model_paths(model: &gtk4::gio::ListModel) -> Vec<String> {
+/// spaces differ (the window's vs the collection's), and by the zoomable canvas
+/// to read the collection it paints (m4-139).
+pub(crate) fn model_paths(model: &gtk4::gio::ListModel) -> Vec<String> {
     (0..model.n_items())
         .filter_map(|i| {
             model.item(i).and_downcast::<gtk4::StringObject>().map(|o| o.string().to_string())
@@ -1985,21 +2033,28 @@ pub fn cull_stepper_state(grid: &GridView) -> Option<(u32, u32, u32)> {
         .then(|| (cull_effective_window(grid), CULL_MIN_IMAGES, CULL_MAX_IMAGES))
 }
 
-/// Switch the lighttable layout: write the mode, then reconfigure `grid` for it. An
-/// unavailable mode is refused rather than half-applied — and the caller learns
-/// that from the `false` return, so it neither persists nor keeps displaying a mode
-/// that was never entered. Main-thread only.
+/// Switch the lighttable layout: write the mode, then reconfigure the view for
+/// it. An unavailable mode is refused rather than half-applied — and the caller
+/// learns that from the `false` return, so it neither persists nor keeps
+/// displaying a mode that was never entered. Main-thread only.
 #[must_use]
-pub fn set_view_mode(grid: &GridView, mode: ViewMode) -> bool {
+pub fn set_view_mode(
+    grid: &GridView,
+    zoom: &zoomable::ZoomableCanvas,
+    mode: ViewMode,
+) -> bool {
     let previous = current_view_mode();
     if !store_view_mode(mode) {
         return false;
     }
-    if !reconfigure_grid_for(grid, mode) {
-        // The layout didn't take (a grid we can't reconfigure). Put the mode back
+    if !reconfigure_grid_for(grid, zoom, mode) {
+        // The layout didn't take (a view we can't configure). Put the mode back
         // rather than leaving the state claiming a layout that isn't on screen —
         // the caller then rolls its button back and persists nothing.
         store_view_mode(previous);
+        // Undo any layer flip the failed arm already performed, so the widgets
+        // match the restored mode exactly.
+        zoom.layer.set_visible(previous == ViewMode::Zoomable);
         return false;
     }
     true
@@ -4040,7 +4095,8 @@ mod tests {
         // Any other layout ignores the stored size entirely — the recycled cells
         // go back to their file-manager square on leave.
         assert_eq!(cell_px_for(ViewMode::FileManager, measured), (THUMB_SIZE, THUMB_SIZE));
-        // Unavailable mode included: the decision keys off "is culling", nothing else.
+        // Zoomable included: it doesn't use grid cells at all (hand-drawn canvas),
+        // so the decision keys off "is culling", nothing else.
         assert_eq!(cell_px_for(ViewMode::Zoomable, measured), (THUMB_SIZE, THUMB_SIZE));
     }
 

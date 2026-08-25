@@ -45,9 +45,12 @@ Per-increment progress is logged in `PROGRESS.md`.
   belong to later phases. **83 of 93** image-operation modules are ported to
   Rust. (An earlier version of this bullet claimed "4 files / 9 total" — that
   figure was long stale and understated the remainder; corrected here.)
-- **UI (Phase 3): this is the whole remaining gap.** The processing for ~80
-  modules exists in `c41-core` with **no controls attached to it**. The
-  darkroom view exposes about 6 adjustments; darktable exposes 93 modules.
+- **UI (Phase 3): this is the whole remaining gap, and it is closing module by
+  module.** The processing for ~80 modules exists in `c41-core`; as of
+  m4-130 slice 3 **33 of them are live in the darkroom panel** (severity-2 row
+  2.1 below carries the list), with the unwired remainder being niche or
+  blocked-on-plumbing rather than the broad "no controls attached" wall this
+  bullet used to describe.
 
 That asymmetry drives the ordering below: the expensive half is built, so most
 severity-2 items are "attach a panel to code that already works", not new maths.
@@ -81,7 +84,7 @@ severity-2 items are "attach a panel to code that already works", not new maths.
 
 | # | Finding |
 |---|---------|
-| 3.1 | Zoomable view mode is still greyed out (`ViewMode::Zoomable::is_available() == false`). Deferred deliberately: `GridView` can't express an infinite zoom plane. |
+| 3.1 | ~~Zoomable view mode is still greyed out (`ViewMode::Zoomable::is_available() == false`). Deferred deliberately: `GridView` can't express an infinite zoom plane.~~ **Fixed 2026-08-25 (m4-139):** the mode is a hand-drawn `DrawingArea` plane inside its own `ScrolledWindow`, shown/hidden as an overlay child of the lighttable's centre slot (the m4-98c never-swap-the-child invariant preserved — the grid stays live underneath), with continuous wheel zoom anchored at the cursor (m4-133 adjustment discipline), drag-to-pan, single-click select through the shared `SingleSelection`, double-click open, and the bottom-bar stepper repurposed as images-per-row (the culling precedent). Geometry/hit-test/zoom math lives in pure display-free unit tests; thumbnails come from gdk-pixbuf like the file-manager grid, so raws still show empty cells there (recorded follow-up: share the full preview's raw decode). |
 | 3.2 | ~~Panel sections are flat; darktable uses collapsible expanders throughout both panels.~~ **Fixed 2026-08-13** — `collapsible_section()` in `panels/mod.rs`; the left panel's Collections / Colours / Tags now fold from their title rows. The *darkroom* module panel already used `adw::ExpanderRow`. Collapse state persists across sessions (`left_section_*` keys, 2026-08-14). |
 | 3.3 | ~~Theme is libadwaita dark, not darktable's exact greys.~~ **Fixed 2026-08-12** — `c41-ui/src/theme.rs` installs darktable's own palette (`grey_NN` from `data/themes/darktable.css`), flattens the chrome (square corners, no blue accent) and sets the functional canvas greys. Not attempted: bauhaus controls (custom-drawn upstream, not CSS) and panel *layout* (2.2-2.6). |
 | 3.4 | Map / print / tethering views absent — the header's "Other" is a permanent placeholder. |

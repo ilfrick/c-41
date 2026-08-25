@@ -525,10 +525,12 @@ fn build_main_window(app: &Application) {
     // `scroll.child().and_downcast()` would make every one of them silently go
     // inert the day a view mode changes the scroller's child (m4-98c).
     let lighttable::LighttablePage {
+        overlay: lt_overlay,
         scroll,
         grid: lt_grid,
         model: lt_model,
         selection: lt_selection,
+        zoom: lt_zoom,
     } = lighttable::lighttable_page(db_path.clone());
     lighttable::lighttable_load_from_db(&lt_model, &db_path);
 
@@ -610,8 +612,10 @@ fn build_main_window(app: &Application) {
     // goes on one page of a Stack and the preview on the other, so the GridView,
     // its model and every bottom-bar control stay live underneath it. The side
     // panels are outside the stack, as in darktable, where `f` covers the centre
-    // view and leaves the panels up.
-    let (preview_overlay, preview) = lighttable::full_preview::FullPreview::wrap(&scroll);
+    // view and leaves the panels up. Since m4-139 the wrapped widget is the
+    // lighttable's own overlay — grid scroller + hidden zoomable canvas — so the
+    // preview covers every layout alike.
+    let (preview_overlay, preview) = lighttable::full_preview::FullPreview::wrap(&lt_overlay);
 
     // Panels are DRAGGABLE, not fixed (parity audit 1.1). Two nested `Paned`s:
     // [left | [centre | right]]. Separators come from the Paned handles, so the
@@ -1173,12 +1177,25 @@ fn build_main_window(app: &Application) {
                     // first allocation and after every resize (width AND height,
                     // since m4-132). No-op in the file manager.
                     lighttable::cull_resync(&grid);
-                    // In culling the label is the comparison-set size; since
-                    // m4-132 every step in the range is fully visible (cells
-                    // shrink to fit), so it always matches what the stepper asked
-                    // for — no dead zone to explain away.
-                    let (n, lo, hi) = lighttable::cull_stepper_state(&grid)
-                        .unwrap_or((grid.max_columns(), THUMB_COLS_MIN, THUMB_COLS_MAX));
+                    // In zoomable mode (m4-139) the stepper is images-per-row on
+                    // the canvas; before the canvas's first allocation there is
+                    // no meaningful column count, so fall through to the grid's
+                    // own range rather than showing a zero.
+                    let (n, lo, hi) = if lighttable::current_view_mode()
+                        == lighttable::ViewMode::Zoomable
+                    {
+                        lighttable::zoomable::stepper_state().unwrap_or((
+                            grid.max_columns(),
+                            THUMB_COLS_MIN,
+                            THUMB_COLS_MAX,
+                        ))
+                    } else {
+                        lighttable::cull_stepper_state(&grid).unwrap_or((
+                            grid.max_columns(),
+                            THUMB_COLS_MIN,
+                            THUMB_COLS_MAX,
+                        ))
+                    };
                     count.set_label(&n.to_string());
                     zoom_out.set_sensitive(n > lo);
                     zoom_in.set_sensitive(n < hi);
@@ -1275,6 +1292,7 @@ fn build_main_window(app: &Application) {
                     let mode = *mode;
                     btn.connect_toggled({
                         let grid = grid.clone();
+                        let zoom = lt_zoom.clone();
                         let db = db_path.clone();
                         let resync = resync.clone();
                         let syncing = syncing.clone();
@@ -1286,7 +1304,7 @@ fn build_main_window(app: &Application) {
                             if syncing.get() || !b.is_active() {
                                 return;
                             }
-                            if lighttable::set_view_mode(&grid, mode) {
+                            if lighttable::set_view_mode(&grid, &zoom, mode) {
                                 persist::save_ui_pref(
                                     &db,
                                     VIEW_MODE_PREF_KEY,
@@ -1311,7 +1329,7 @@ fn build_main_window(app: &Application) {
                 // FileManager today, load-bearing from the culling increment on:
                 // without it, restoring culling would show a lit culling button over
                 // a file-manager grid, with nothing to say so.
-                if !lighttable::set_view_mode(&grid, lighttable::current_view_mode()) {
+                if !lighttable::set_view_mode(&grid, &lt_zoom, lighttable::current_view_mode()) {
                     tracing::warn!(
                         "restored view mode is not renderable by this build; \
                          lighttable stays in the file-manager layout"
@@ -1359,8 +1377,16 @@ fn build_main_window(app: &Application) {
 
             // Each step also re-applies the culling window (a no-op in the file
             // manager), and clamps into whichever range the current mode uses.
+            // In zoomable mode (m4-139) the stepper drives the canvas's zoom
+            // instead — one images-per-row stop per click — so the grid bound is
+            // left alone entirely.
             let step = |grid: gtk4::GridView, refresh: std::rc::Rc<dyn Fn()>, up: bool| {
                 move |_: &gtk4::Button| {
+                    if lighttable::current_view_mode() == lighttable::ViewMode::Zoomable {
+                        lighttable::zoomable::stepper_step(up);
+                        refresh();
+                        return;
+                    }
                     // Step within whichever range the current mode uses — in
                     // culling that's the comparison-set bounds, and since m4-132
                     // every step there is fully visible (the cells shrink to fit,
@@ -1408,19 +1434,14 @@ fn build_main_window(app: &Application) {
     // Double-click → darkroom page; F1–F5 → toggle colour label on selection.
     {
         let grid = lt_grid.clone();
-        // `pos` is an index into the model the GRID is showing, which is not the
-        // full collection in every layout — culling installs a window over it
-        // (m4-98c b). Resolving through `gv.model()` keeps this handler correct in
-        // both; resolving through the full model would silently open the wrong
-        // image, off by the culling offset.
-        let preview_for_activate = preview.clone();
-        grid.connect_activate(clone!(@weak nav, @strong db_path => move |gv, pos| {
-            if let Some(path) = gv.model()
-                .and_then(|m| m.item(pos))
-                .and_downcast::<gtk4::StringObject>()
-                .map(|o| o.string().to_string())
-                .filter(|p| p.contains('/'))
-            {
+        // The open-the-editor body, shared verbatim by the grid's `activate`
+        // signal and the zoomable canvas's double-click (m4-139), so both entry
+        // points stay behaviourally identical by construction.
+        let open_in_darkroom: std::rc::Rc<dyn Fn(String)> = {
+            let nav = nav.clone();
+            let db_path = db_path.clone();
+            let preview_for_activate = preview.clone();
+            std::rc::Rc::new(move |path| {
                 // Leaving the lighttable closes the preview, or coming back from
                 // the editor would land on a full-screen image of whatever was up
                 // before — over a grid that has since moved on.
@@ -1431,6 +1452,23 @@ fn build_main_window(app: &Application) {
                 // page was dismissed (back button / Escape / swipe gesture).
                 page.set_tag(Some(&path));
                 nav.push(&page);
+            })
+        };
+        lt_zoom.set_activate_callback(open_in_darkroom.clone());
+
+        // `pos` is an index into the model the GRID is showing, which is not the
+        // full collection in every layout — culling installs a window over it
+        // (m4-98c b). Resolving through `gv.model()` keeps this handler correct in
+        // both; resolving through the full model would silently open the wrong
+        // image, off by the culling offset.
+        grid.connect_activate(clone!(@strong open_in_darkroom => move |gv, pos| {
+            if let Some(path) = gv.model()
+                .and_then(|m| m.item(pos))
+                .and_downcast::<gtk4::StringObject>()
+                .map(|o| o.string().to_string())
+                .filter(|p| p.contains('/'))
+            {
+                open_in_darkroom(path);
             }
         }));
 
@@ -1515,12 +1553,22 @@ fn build_main_window(app: &Application) {
             })
         };
 
-        let key = gtk4::EventControllerKey::new();
-        let sel = lt_selection.clone();
-        let db  = db_path.clone();
-        let panel_left_toggle  = left_toggle.clone();
-        let panel_right_toggle = right_toggle.clone();
-        key.connect_key_pressed(clone!(@weak grid => @default-return glib::Propagation::Proceed, move |_, keyval, _, state| {
+        // The whole lighttable keymap, factored into one handler so BOTH input
+        // surfaces can carry it (m4-139 review finding): the grid for
+        // FileManager/Culling, and the zoomable canvas — which is the grid's
+        // SIBLING overlay child and never inherits its controller — for the
+        // zoomable mode. Same map everywhere, so a shortcut can't mean two
+        // things depending on where focus happens to sit.
+        let handle_lt_key: std::rc::Rc<
+            dyn Fn(gtk4::gdk::Key, gtk4::gdk::ModifierType) -> glib::Propagation,
+        > = {
+            let handle_preview_key = handle_preview_key.clone();
+            let sel = lt_selection.clone();
+            let db  = db_path.clone();
+            let panel_left_toggle  = left_toggle.clone();
+            let panel_right_toggle = right_toggle.clone();
+            let grid_w = grid.downgrade();
+            std::rc::Rc::new(move |keyval, state| {
             if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK | gtk4::gdk::ModifierType::SHIFT_MASK) {
                 return glib::Propagation::Proceed;
             }
@@ -1535,6 +1583,9 @@ fn build_main_window(app: &Application) {
             // reports whether the key was culling's at all, so arrow keys keep
             // moving the cursor normally in the file manager instead of being
             // swallowed by a mode that isn't active.
+            let Some(grid) = grid_w.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             if let Some(forward) = lighttable::cull_key_direction(keyval) {
                 if lighttable::cull_step(&grid, forward) {
                     return glib::Propagation::Stop;
@@ -1560,8 +1611,28 @@ fn build_main_window(app: &Application) {
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
-        }));
+            })
+        };
+
+        // Grid surface (the original home of the map).
+        let key = gtk4::EventControllerKey::new();
+        let h = handle_lt_key.clone();
+        key.connect_key_pressed(
+            move |_, keyval, _, state| h(keyval, state),
+        );
         grid.add_controller(key);
+
+        // Zoomable-canvas surface (m4-139): identical map. Focus reaches the
+        // canvas through its focusability plus `on_enter`'s grab, so this fires
+        // exactly when the zoomable view is what the user is working in.
+        {
+            let key = gtk4::EventControllerKey::new();
+            let h = handle_lt_key;
+            key.connect_key_pressed(
+                move |_, keyval, _, state| h(keyval, state),
+            );
+            lt_zoom.area().add_controller(key);
+        }
     }
 
     // ── View switcher (m4-97d) ─────────────────────────────────────────────
