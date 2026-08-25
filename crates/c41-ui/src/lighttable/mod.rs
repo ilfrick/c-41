@@ -11,6 +11,8 @@ pub mod rule_stack;
 pub mod timeline;
 pub mod zoomable;
 
+mod thumbs;
+
 use adw::prelude::*;
 use gtk4::{GridView, ListItem, ScrolledWindow, SignalListItemFactory, SingleSelection};
 use glib::clone;
@@ -163,34 +165,12 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
         // "optimisation" would make a later switch back to `Extended` reveal
         // permanently empty rows on every already-bound cell.
         //
-        // Async thumbnail load
-        glib::spawn_future_local(clone!(@weak thumb => async move {
-            let path = full_path.clone();
-            let bytes = gio::spawn_blocking(move || std::fs::read(&path).ok())
-                .await.ok().flatten();
-            if thumb.widget_name() != full_path { return; } // cell rebound mid-read
-            if let Some(data) = bytes {
-                let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
-                let _ = loader.write(&data);
-                let _ = loader.close();
-                if let Some(raw) = loader.pixbuf() {
-                    // Scale to the CURRENT cell box, preserving aspect (m4-132):
-                    // a fixed THUMB_SIZE square would sit as a blurry postage
-                    // stamp inside a viewport-filling culling cell. The box is
-                    // read once, before scaling — a resize landing mid-decode just
-                    // repaints on its own tick (see `refresh_cull_cells`).
-                    let (bw, bh) = current_cell_px();
-                    let (fw, fh) = fit_inside(
-                        raw.width(), raw.height(), bw, bh,
-                    ).unwrap_or((THUMB_SIZE, THUMB_SIZE));
-                    if let Some(pb) = raw.scale_simple(
-                        fw, fh, gtk4::gdk_pixbuf::InterpType::Bilinear,
-                    ) {
-                        thumb.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&pb)));
-                    }
-                }
-            }
-        }));
+        // Async thumbnail load (m4-140): through the shared thumbnail service —
+        // one decoder + caches behind both this grid and the zoomable canvas.
+        // Camera raws decode now instead of leaving blank cells, cache hits
+        // paint synchronously with no thread hop, and undecodable files cost
+        // one attempt per collection load (the shared negative cache).
+        ensure_grid_thumb(thumb.downgrade(), full_path.clone());
 
         // Async rating load
         let db = db_for_bind.clone();
@@ -1742,6 +1722,79 @@ pub(crate) fn fit_inside(src_w: i32, src_h: i32, box_w: i32, box_h: i32) -> Opti
     ))
 }
 
+/// Paint a decoded thumbnail into a grid cell's Picture: packed RGB8 straight
+/// into an R8G8B8 texture — no pixbuf intermediate. The pixel copy is the price
+/// of painting from the shared cache's `Rc` without moving bytes out from under
+/// it; at thumbnail sizes it's noise next to any decode.
+fn paint_thumb(thumb: &gtk4::Picture, img: &thumbs::ThumbImage) {
+    let bytes = glib::Bytes::from_owned(img.rgb.clone());
+    thumb.set_paintable(Some(&gtk4::gdk::MemoryTexture::new(
+        img.width,
+        img.height,
+        gtk4::gdk::MemoryFormat::R8g8b8,
+        &bytes,
+        img.width as usize * 3,
+    )));
+}
+
+/// Make sure `thumb` (a grid cell's Picture) shows `path`. Cache hit paints
+/// immediately; a known-failed path stays blank until the next collection load
+/// ([`fill_grid`] resets the negative cache); anything else needs a bounded
+/// decode, whose slot is claimed BEFORE any task is spawned — when the gate is
+/// busy this schedules one timed retry instead of queueing, so gio's blocking
+/// pool never holds a parked worker and the rating/colour-label queries sharing
+/// it can't stall behind thumbnail decodes (review MAJOR, m4-140). Every entry
+/// re-checks the stamped widget name: cells recycle, so a retry landing on a
+/// rebound cell is a no-op — that cell's own bind runs a fresh chain.
+fn ensure_grid_thumb(thumb_w: glib::WeakRef<gtk4::Picture>, path: String) {
+    let Some(thumb) = thumb_w.upgrade() else { return };
+    if thumb.widget_name() != path {
+        return; // cell rebound mid-chain; its own bind owns the load now
+    }
+    // Bucket = the CURRENT cell box, quantised exactly like every other
+    // consumer ([`thumbs::bucket_for`]) so pixel-cache entries cross-hit between
+    // the file manager, culling and the zoomable canvas. Re-read per attempt:
+    // a resize landing mid-chain just retargets the next attempt.
+    let (bw, bh) = current_cell_px();
+    let bucket = thumbs::bucket_for(bw.max(bh).max(THUMB_SIZE));
+    if let Some(img) = thumbs::lookup(&path, bucket) {
+        paint_thumb(&thumb, &img);
+        return;
+    }
+    if thumbs::is_failed(&path) {
+        return;
+    }
+    let Some(permit) = thumbs::DecodePermit::try_acquire() else {
+        // Both decoders busy: try again shortly instead of waiting anywhere.
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(150),
+            move || ensure_grid_thumb(thumb_w, path),
+        );
+        return;
+    };
+    glib::spawn_future_local(async move {
+        let p = path.clone();
+        let decoded =
+            gio::spawn_blocking(move || thumbs::decode_with_permit(permit, &p, bucket)).await;
+        match decoded {
+            Ok(Some(img)) => {
+                let cached = thumbs::store(&path, bucket, img);
+                if let Some(t) = thumb_w.upgrade() {
+                    if t.widget_name() == path {
+                        paint_thumb(&t, &cached);
+                    }
+                }
+            }
+            Ok(None) => thumbs::mark_failed(&path),
+            Err(_) => {
+                // A panicked decoder is a bug, not a corrupt file — leave the
+                // path retryable instead of negative-caching it blank.
+                eprintln!("c41-thumbs: grid decode task panicked for {path}");
+            }
+        }
+    });
+}
+
 /// The culling window for `grid` right now: what the stepper asks for. Since
 /// m4-132 the cells resize to fit the viewport, so every clamped window size fits
 /// by construction — the old "cap the window to what 180px cells could fill" logic
@@ -2765,6 +2818,11 @@ fn fill_grid(model: &LighttableModel, rows: Vec<String>, empty_placeholder: &str
     if rows.is_empty() {
         rows.push(empty_placeholder.to_string());
     }
+    // A collection load is also the retry opportunity for undecodable files
+    // (m4-140): the negative cache lives in the shared thumbnail service and
+    // serves both this grid and the zoomable canvas, so it resets exactly where
+    // "the collection changed" happens — here, not per consumer.
+    thumbs::clear_failed();
     let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
     model.splice(0, model.n_items(), &refs);
 }

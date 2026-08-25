@@ -23,17 +23,19 @@
 //! repurposes it as the comparison-set size. One canonical zoom state (a cell
 //! size in px, [`ZOOM_CELL`]); wheel and stepper are two writers of it.
 //!
-//! **Thumbnails come from gdk-pixbuf** — the same source the file-manager grid
-//! uses, with the same known limitation: camera raws get no placeholder here
-//! either (the full preview is where raws become visible; sharing its decode
-//! pipeline with this canvas is a recorded follow-up, not part of this slice).
-//! Decodes are keyed `(path, bucket)` where the bucket quantises the target size
-//! to a power of two ([`texture_bucket`]) — continuous zooming would otherwise
-//! fire a fresh decode per pixel of cell growth. At most one decode per path is
-//! ever in flight, and a newer larger request supersedes an older smaller one.
-//! The cache is an LRU under a byte budget ([`TEXTURE_BUDGET_BYTES`],
-//! [`PixbufCache`]), because a high-zoom thumbnail can be megapixels and an
-//! unbounded map would grow with every visit.
+//! **Thumbnails come from the shared service** ([`super::thumbs`], m4-140): the
+//! same decoder+session-cache the file-manager grid binds through, so camera
+//! raws render here too (routed through the full preview's demosaicing
+//! pipeline) instead of staying blank, and undecodable files cost one attempt
+//! per resync rather than one per frame. On top of that this canvas adds a
+//! second layer: its own pixbuf cache keyed `(path, bucket)` where the bucket
+//! quantises the target size to a power of two ([`texture_bucket`]) —
+//! continuous zooming would otherwise fire a fresh decode per pixel of cell
+//! growth. At most one decode per path is ever in flight, and a newer larger
+//! request supersedes an older smaller one. The pixbuf layer is an LRU under a
+//! byte budget ([`TEXTURE_BUDGET_BYTES`], [`PixbufCache`]), because a high-zoom
+//! thumbnail can be megapixels and an unbounded map would grow with every
+//! visit.
 //!
 //! **Sentinel rows never reach the canvas**: the grid model carries placeholder
 //! entries (empty-state / truncation notices, no `/`) that a cell bind classifies
@@ -53,6 +55,8 @@ use gtk4::{
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+
+use super::thumbs::evict_keep_set;
 
 /// Smallest cell, in px. Below this thumbnails stop being informative even at a
 /// glance — darktable's zoomable bottoms out around the same visual density.
@@ -216,16 +220,11 @@ fn texture_key(path: &str, bucket: u32) -> String {
     format!("{}\u{0}{}", path, bucket)
 }
 
-/// Decode target for a needed pixel size: the smallest power-of-two bucket that
-/// contains it, clamped to sane thumbnail limits. Continuous zoom then fires a
-/// decode at most once per doubling instead of once per pixel.
+/// Decode target for a needed pixel size: the shared power-of-two quantisation
+/// ([`super::thumbs::bucket_for`], m4-140) — same rule for every consumer, so
+/// the pixel cache's keys agree across surfaces and entries genuinely cross-hit.
 fn texture_bucket(px: i32) -> u32 {
-    for b in [128u32, 256, 512, 1024, 2048] {
-        if px <= b as i32 {
-            return b;
-        }
-    }
-    2048
+    super::thumbs::bucket_for(px)
 }
 
 /// Rectangle of the contained image inside a box, centred. `None` for degenerate
@@ -233,22 +232,6 @@ fn texture_bucket(px: i32) -> u32 {
 fn contain_rect(src_w: i32, src_h: i32, box_w: i32, box_h: i32) -> Option<(i32, i32, i32, i32)> {
     let (fw, fh) = super::fit_inside(src_w, src_h, box_w, box_h)?;
     Some(((box_w - fw) / 2, (box_h - fh) / 2, fw, fh))
-}
-
-/// Keep-set of an LRU under a byte budget: walk `entries` newest-first and keep
-/// until the budget is exhausted; everything older is evictable. The first entry
-/// is always kept even when oversized — evicting everything would turn every
-/// frame into a reload storm, and going over budget by one entry beats that.
-fn evict_keep_set(entries: &[(String, u64)], budget: u64) -> Vec<String> {
-    let mut kept = Vec::new();
-    let mut used = 0u64;
-    for (key, bytes) in entries {
-        if used == 0 || used + bytes <= budget {
-            kept.push(key.clone());
-            used += bytes;
-        }
-    }
-    kept
 }
 
 // ── Pixbuf cache ────────────────────────────────────────────────────────────
@@ -377,14 +360,10 @@ struct ZoomItem {
 struct CanvasState {
     items: RefCell<Vec<ZoomItem>>,
     textures: RefCell<PixbufCache>,
-    /// Paths whose decode has failed once (raw formats pixbuf can't parse,
-    /// unreadable files). Without this, every paint re-spawns the decode and a
-    /// screenful of camera raws becomes a permanent read-parse-fail-redraw
-    /// loop. Reset by [`CanvasState::sync_items`], so a genuine fix to the file
-    /// (or collection change) retries.
-    failed: RefCell<HashSet<String>>,
     /// Decodes in flight, `path → bucket`. A newer request supersedes an entry
-    /// with a smaller bucket, so at most one decode per path ever runs.
+    /// with a smaller bucket, so at most one decode per path ever runs. Decode
+    /// failures are NOT tracked here — the shared negative cache in
+    /// [`super::thumbs`] serves both consumers (m4-140).
     inflight: RefCell<HashMap<String, u32>>,
     /// Double-click callback (opens the darkroom page), wired by lib.rs.
     activate: RefCell<Option<ActivateCb>>,
@@ -409,9 +388,9 @@ impl CanvasState {
             .map(|(i, path)| ZoomItem { path, base_index: i as u32 })
             .collect();
         CURRENT_COUNT.with(|c| c.set(items.len()));
-        // A resync is also the retry opportunity for previously failed decodes:
-        // the list changed, so "this path can't be decoded" is re-examined.
-        self.failed.borrow_mut().clear();
+        // Decode-failure retries are NOT reset here: the shared negative cache
+        // clears at [`super::fill_grid`], the single point where a collection
+        // actually changes — a mode entry or model-watch resync doesn't.
         *self.items.borrow_mut() = items;
     }
 
@@ -457,7 +436,6 @@ impl ZoomableCanvas {
         let state = Rc::new(CanvasState {
             items: RefCell::new(Vec::new()),
             textures: RefCell::new(PixbufCache::new()),
-            failed: RefCell::new(HashSet::new()),
             inflight: RefCell::new(HashMap::new()),
             activate: RefCell::new(None),
             selection_w: selection.downgrade(),
@@ -829,80 +807,71 @@ fn zoom_anchored_apply(old_cell: f64, new_cell: f64, anchor: Option<(f64, f64)>)
 /// still a valid cache entry — worst case it warms a thumbnail nobody currently
 /// shows, which the byte-budget eviction absorbs.
 ///
-/// Only the file READ runs on a worker thread — the loader/scale stay on the
-/// main thread, the same split the file-manager cells use (GObjects are not
-/// Send, and this keeps it that way). The loader is told the target size up
-/// front (`connect_size_prepared`, the m4-132 full-preview lesson) so a large
-/// JPEG decodes once at thumbnail scale instead of materialising full size just
-/// to be scaled down — and because misses spawn concurrently, per-decode spikes
-/// would otherwise multiply across a screenful of large images.
+/// The decode itself delegates to [`super::thumbs`] on a worker thread
+/// (m4-140): raws route through the demosaicing pipeline there — seconds-long,
+/// never legal on the main thread — and only owned bytes cross back. The gate
+/// slot is claimed BEFORE anything spawns; when both decoders are busy this
+/// registers nothing and the NEXT FRAME retries, so no worker ever parks
+/// waiting for a slot (review MAJOR). A panicked decoder logs and stays
+/// retryable rather than being negative-cached as a corrupt file.
 fn spawn_decode(state: &Rc<CanvasState>, area: &DrawingArea, path: &str, bucket: u32) {
-    {
+    let permit = {
         let mut inflight = state.inflight.borrow_mut();
-        if state.failed.borrow().contains(path) {
-            return; // known undecodable until the next resync
+        if super::thumbs::is_failed(path) {
+            return; // known undecodable until the next collection load
         }
         if let Some(prev) = inflight.get(path) {
             if *prev >= bucket {
                 return; // equal-or-bigger decode already running
             }
         }
-        inflight.insert(path.to_string(), bucket);
-    }
+        match super::thumbs::DecodePermit::try_acquire() {
+            Some(permit) => {
+                inflight.insert(path.to_string(), bucket);
+                permit
+            }
+            None => return, // decoders busy — retry naturally on a later frame
+        }
+    };
 
     let path_owned = path.to_string();
     let st = Rc::clone(state);
     let area_w = area.downgrade();
     glib::spawn_future_local(async move {
         let p = path_owned.clone();
-        let bytes = gio::spawn_blocking(move || std::fs::read(&p).ok())
-            .await
-            .ok()
-            .flatten();
-
-        let mut decoded = None;
-        if let Some(data) = &bytes {
-            let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
-            loader.connect_size_prepared(move |loader, w, h| {
-                let longest = w.max(h);
-                if longest > bucket as i32 {
-                    // One scale factor on both axes: `set_size` does NOT
-                    // preserve aspect ratio for you.
-                    let scale = f64::from(bucket as i32) / f64::from(longest);
-                    loader.set_size(
-                        ((f64::from(w) * scale) as i32).max(1),
-                        ((f64::from(h) * scale) as i32).max(1),
-                    );
-                }
-            });
-            // Both unconditional: a loader finalized without `close()` emits a
-            // g_warning, so an early return on a rejected header would print one
-            // per retry.
-            let _ = loader.write(data);
-            let _ = loader.close();
-            decoded = loader.pixbuf();
-        }
+        let decoded =
+            gio::spawn_blocking(move || super::thumbs::decode_with_permit(permit, &p, bucket))
+                .await;
 
         match decoded {
-            Some(raw) => {
-                if let Some((fw, fh)) =
-                    super::fit_inside(raw.width(), raw.height(), bucket as i32, bucket as i32)
-                {
-                    if let Some(pb) =
-                        raw.scale_simple(fw, fh, gtk4::gdk_pixbuf::InterpType::Bilinear)
-                    {
-                        let n_bytes = i64::from(pb.width()) * i64::from(pb.height())
-                            * i64::from(pb.n_channels());
-                        st.textures
-                            .borrow_mut()
-                            .insert(texture_key(&path_owned, bucket), pb, n_bytes as u64);
-                    }
-                }
+            Ok(Some(img)) => {
+                // Packed RGB8 → pixbuf: rowstride is width·3 by construction,
+                // alpha never present. `from_bytes` copies, so the owned buffer
+                // dies here; the cache holds only the pixbuf.
+                let n_bytes = img.rgb.len();
+                let bytes = glib::Bytes::from_owned(img.rgb);
+                let pb = gtk4::gdk_pixbuf::Pixbuf::from_bytes(
+                    &bytes,
+                    gtk4::gdk_pixbuf::Colorspace::Rgb,
+                    false,
+                    8,
+                    img.width,
+                    img.height,
+                    img.width * 3,
+                );
+                st.textures.borrow_mut().insert(
+                    texture_key(&path_owned, bucket),
+                    pb,
+                    n_bytes as u64,
+                );
             }
-            None => {
-                // Negative-cache the failure (review CRITICAL): without it every
+            Ok(None) => {
+                // Negative-cache the failure in the SHARED set: without it every
                 // frame re-reads and re-fails on undecodable files forever.
-                st.failed.borrow_mut().insert(path_owned.clone());
+                super::thumbs::mark_failed(&path_owned);
+            }
+            Err(_) => {
+                eprintln!("c41-thumbs: canvas decode task panicked for {path_owned}");
             }
         }
         // Superseded bookkeeping: remove only if THIS decode is still the
@@ -1189,20 +1158,6 @@ mod tests {
         assert_eq!(contain_rect(0, 100, 200, 200), None);
         assert_eq!(contain_rect(100, 0, 200, 200), None);
         assert_eq!(contain_rect(100, 100, 0, 200), None);
-    }
-
-    #[test]
-    fn evict_keep_set_respects_the_budget_but_never_empties() {
-        let k = |n: &str| n.to_string();
-        let entries = [(k("newest"), 40u64), (k("mid"), 40), (k("oldest"), 40)];
-        // Budget fits two: the oldest goes.
-        assert_eq!(evict_keep_set(&entries, 80), vec!["newest", "mid"]);
-        // Budget fits everything.
-        assert_eq!(evict_keep_set(&entries, 120).len(), 3);
-        // Budget fits nothing: keep exactly the MRU entry anyway — an emptied
-        // cache would turn every frame into a reload storm.
-        assert_eq!(evict_keep_set(&entries, 10), vec!["newest"]);
-        assert!(evict_keep_set(&[], 100).is_empty());
     }
 
     #[test]
