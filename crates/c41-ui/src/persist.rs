@@ -63,6 +63,30 @@ const UI_PREFS_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS main.darkroom_ui_prefs \
      (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
 
+/// Open a catalogue connection with the crate-standard 3s `busy_timeout`
+/// (m4-147). The contention-exposed siblings already did this — the rating and
+/// colour-label connections (`lighttable::open_rating_conn`/
+/// `open_colorlabels_conn`), the timeline writer, and `c41-db`'s
+/// `attach_catalog`; `panels::query_exif` is the deliberate 250ms exception,
+/// since it runs per arrow-keypress. The writers that can hold library.db's
+/// lock while a UI thread wants in are OFF-THREAD: the rating/colour-label
+/// `serialized_write` workers (`gio::spawn_blocking`) and the import worker's
+/// bulk transaction. This module's writes — metadata editor included — run on
+/// the main thread and previously opened BARE, i.e. with no busy handler:
+/// SQLite reports BUSY on such a connection's first statement under a held
+/// lock (the open itself takes none), so an instant BUSY here silently skipped
+/// a write or read defaults — worst case, a failed `load_saved` handed back
+/// default params that a later autosave wrote over the stored edit.
+///
+/// NOT to be confused with `c41_db::schema::open_catalog`, which ATTACHes
+/// data.db/memory and ensures the full schema for app bootstrap; this is the
+/// plain per-call open every production path in this module uses.
+fn open_catalog(db_path: &str) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
+    Ok(conn)
+}
+
 /// Resolve a file path to its `images.id` via folder + filename (mirrors the
 /// lighttable's lookup). `None` if the image isn't in the catalogue.
 fn imgid_for_path(conn: &Connection, full_path: &str) -> Option<i32> {
@@ -94,7 +118,7 @@ pub fn load_saved(db_path: &str, full_path: &str) -> Option<PreviewParams> {
     if db_path.is_empty() {
         return None;
     }
-    let conn = Connection::open(db_path).ok()?;
+    let conn = open_catalog(db_path).ok()?;
     let imgid = imgid_for_path(&conn, full_path)?;
     load_saved_conn(&conn, imgid)
 }
@@ -105,7 +129,7 @@ pub fn save_params(db_path: &str, full_path: &str, params: &PreviewParams) {
     if db_path.is_empty() {
         return;
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return;
     };
     if let Some(imgid) = imgid_for_path(&conn, full_path) {
@@ -146,7 +170,7 @@ pub fn load_history(db_path: &str, full_path: &str) -> Option<HistoryStack> {
     if db_path.is_empty() {
         return None;
     }
-    let conn = Connection::open(db_path).ok()?;
+    let conn = open_catalog(db_path).ok()?;
     let imgid = imgid_for_path(&conn, full_path)?;
     load_history_conn(&conn, imgid)
 }
@@ -157,7 +181,7 @@ pub fn save_history(db_path: &str, full_path: &str, history: &HistoryStack) {
     if db_path.is_empty() {
         return;
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return;
     };
     if let Some(imgid) = imgid_for_path(&conn, full_path) {
@@ -202,7 +226,7 @@ pub fn discard_history(db_path: &str, full_path: &str) {
     if db_path.is_empty() {
         return;
     }
-    let Ok(conn) = Connection::open(db_path) else { return };
+    let Ok(conn) = open_catalog(db_path) else { return };
     if let Some(imgid) = imgid_for_path(&conn, full_path) {
         let _ = discard_history_conn(&conn, imgid);
     }
@@ -227,7 +251,7 @@ pub fn load_demosaic(db_path: &str, full_path: &str) -> DemosaicMethod {
     if db_path.is_empty() {
         return DemosaicMethod::default();
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return DemosaicMethod::default();
     };
     match imgid_for_path(&conn, full_path) {
@@ -242,7 +266,7 @@ pub fn save_demosaic(db_path: &str, full_path: &str, method: DemosaicMethod) {
     if db_path.is_empty() {
         return;
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return;
     };
     if let Some(imgid) = imgid_for_path(&conn, full_path) {
@@ -283,7 +307,7 @@ pub fn load_geometry(db_path: &str, full_path: &str) -> Geometry {
     if db_path.is_empty() {
         return Geometry::default();
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return Geometry::default();
     };
     match imgid_for_path(&conn, full_path) {
@@ -306,7 +330,7 @@ pub(crate) fn load_edit_state(
     if db_path.is_empty() {
         return fallback();
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return fallback();
     };
     let Some(imgid) = imgid_for_path(&conn, full_path) else {
@@ -325,7 +349,7 @@ pub fn save_geometry(db_path: &str, full_path: &str, geom: &Geometry) {
     if db_path.is_empty() {
         return;
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return;
     };
     if let Some(imgid) = imgid_for_path(&conn, full_path) {
@@ -398,7 +422,7 @@ pub fn load_lens(db_path: &str, full_path: &str) -> LensChoice {
     if db_path.is_empty() {
         return LensChoice::default();
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return LensChoice::default();
     };
     match imgid_for_path(&conn, full_path) {
@@ -413,7 +437,7 @@ pub fn save_lens(db_path: &str, full_path: &str, choice: &LensChoice) {
     if db_path.is_empty() {
         return;
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    let Ok(conn) = open_catalog(db_path) else {
         return;
     };
     if let Some(imgid) = imgid_for_path(&conn, full_path) {
@@ -467,7 +491,7 @@ pub fn load_ui_pref(db_path: &str, key: &str) -> Option<String> {
     if db_path.is_empty() {
         return None;
     }
-    let conn = Connection::open(db_path).ok()?;
+    let conn = open_catalog(db_path).ok()?;
     load_ui_pref_conn(&conn, key)
 }
 
@@ -477,7 +501,7 @@ pub fn save_ui_pref(db_path: &str, key: &str, value: &str) {
     if db_path.is_empty() {
         return;
     }
-    if let Ok(conn) = Connection::open(db_path) {
+    if let Ok(conn) = open_catalog(db_path) {
         let _ = save_ui_pref_conn(&conn, key, value);
     }
 }
@@ -764,7 +788,7 @@ pub fn save_style(db_path: &str, name: &str, description: &str, params: &Preview
     if db_path.is_empty() || name.is_empty() {
         return false;
     }
-    let Ok(conn) = Connection::open(db_path) else { return false };
+    let Ok(conn) = open_catalog(db_path) else { return false };
     if conn.execute(STYLES_TABLE_DDL, []).is_err() {
         return false;
     }
@@ -783,7 +807,7 @@ pub fn load_styles(db_path: &str) -> Vec<Style> {
     if db_path.is_empty() {
         return Vec::new();
     }
-    let Ok(conn) = Connection::open(db_path) else { return Vec::new() };
+    let Ok(conn) = open_catalog(db_path) else { return Vec::new() };
     let Ok(mut stmt) = conn.prepare(
         "SELECT name, description, params FROM main.c41_styles ORDER BY name COLLATE NOCASE",
     ) else {
@@ -812,7 +836,7 @@ pub fn delete_style(db_path: &str, name: &str) -> bool {
     if db_path.is_empty() {
         return false;
     }
-    let Ok(conn) = Connection::open(db_path) else { return false };
+    let Ok(conn) = open_catalog(db_path) else { return false };
     conn.execute(
         "DELETE FROM main.c41_styles WHERE name = ?1",
         rusqlite::params![name],
@@ -851,7 +875,7 @@ pub fn save_collection_preset(db_path: &str, name: &str, payload: &str) -> bool 
     if db_path.is_empty() || name.is_empty() || payload.is_empty() {
         return false;
     }
-    let Ok(conn) = Connection::open(db_path) else { return false };
+    let Ok(conn) = open_catalog(db_path) else { return false };
     if conn.execute(COLLECTION_PRESETS_TABLE_DDL, []).is_err() {
         return false;
     }
@@ -869,7 +893,7 @@ pub fn load_collection_presets(db_path: &str) -> Vec<(String, String)> {
     if db_path.is_empty() {
         return Vec::new();
     }
-    let Ok(conn) = Connection::open(db_path) else { return Vec::new() };
+    let Ok(conn) = open_catalog(db_path) else { return Vec::new() };
     let Ok(mut stmt) = conn.prepare(
         "SELECT name, payload FROM main.c41_collection_presets ORDER BY name COLLATE NOCASE",
     ) else {
@@ -888,7 +912,7 @@ pub fn delete_collection_preset(db_path: &str, name: &str) -> bool {
     if db_path.is_empty() {
         return false;
     }
-    let Ok(conn) = Connection::open(db_path) else { return false };
+    let Ok(conn) = open_catalog(db_path) else { return false };
     conn.execute(
         "DELETE FROM main.c41_collection_presets WHERE name = ?1",
         rusqlite::params![name],
@@ -911,13 +935,10 @@ pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> us
     if db_path.is_empty() {
         return 0;
     }
-    let Ok(mut conn) = Connection::open(db_path) else { return 0 };
-    // A 3s busy_timeout like the rating/colour-label connections: the
-    // off-thread metadata workers hold the same SQLite file, and without it a
-    // write landing mid-Apply fails instantly with SQLITE_BUSY, silently
-    // shrinking the returned count (m4-146 review MINOR-1 — the count is meant
-    // to report uncatalogued skips, not lock contention).
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
+    // open_catalog's busy_timeout matters double here (m4-146 review MINOR-1):
+    // this loop issues up to N writes, and each one failing instantly under a
+    // held file lock would silently shrink the reported count.
+    let Ok(conn) = open_catalog(db_path) else { return 0 };
     let mut written = 0usize;
     for path in full_paths.iter().filter(|p| !p.is_empty()) {
         if let Some(imgid) = imgid_for_path(&conn, path) {
@@ -1009,7 +1030,7 @@ pub fn load_metadata(db_path: &str, full_path: &str) -> Vec<(MetaField, String)>
     if db_path.is_empty() {
         return Vec::new();
     }
-    let Ok(conn) = Connection::open(db_path) else { return Vec::new() };
+    let Ok(conn) = open_catalog(db_path) else { return Vec::new() };
     load_metadata_conn(&conn, full_path)
 }
 
@@ -1044,7 +1065,7 @@ pub(crate) fn try_load_metadata(
     if db_path.is_empty() {
         return None;
     }
-    let conn = Connection::open(db_path).ok()?;
+    let conn = open_catalog(db_path).ok()?;
     imgid_for_path(&conn, full_path)?;
     Some(load_metadata_conn(&conn, full_path))
 }
@@ -1090,7 +1111,7 @@ pub fn save_metadata_many(
     if db_path.is_empty() || fields.is_empty() {
         return Vec::new();
     }
-    let Ok(mut conn) = Connection::open(db_path) else { return Vec::new() };
+    let Ok(mut conn) = open_catalog(db_path) else { return Vec::new() };
     let mut written = Vec::new();
     for path in full_paths {
         if save_metadata_conn(&mut conn, path, fields).is_ok() {
@@ -1408,6 +1429,20 @@ mod style_tests {
         assert_eq!(styles[0].name, "Punchy");
         assert_eq!(styles[0].description, "high contrast");
         assert_eq!(styles[0].params.ev, 1.5, "params must survive verbatim");
+    }
+
+    #[test]
+    fn open_catalog_installs_the_three_second_busy_timeout() {
+        // The one load-bearing line of m4-147: without this pin, deleting the
+        // busy_timeout call would leave every other test green while silently
+        // reverting the whole increment (review MINOR-3). PRAGMA busy_timeout
+        // reads back exactly what sqlite3_busy_timeout installed.
+        let (_d, db) = tmp_db("busytimeout");
+        let conn = open_catalog(&db).unwrap();
+        let ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 3000);
     }
 
     #[test]

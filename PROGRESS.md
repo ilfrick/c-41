@@ -2270,3 +2270,49 @@ Build & push Docker image both success).
 limit; `modules` column reserved); styles module in the darkroom view;
 RAII/busy-timeout sweep over remaining bare `Connection::open` call sites
 (save_params/save_metadata paths still lack it).
+
+## 2026-08-26 02:25 UTC — m4-147: busy_timeout sweep across persist.rs catalogue connections
+
+**What changed**: `persist.rs` previously opened most of its catalogue
+connections with bare `Connection::open` — no busy handler. New private helper
+`open_catalog` (open + 3s `busy_timeout`) and all ~24 production opens routed
+through it; tests keep their own opens. Motivation: m4-145/146 moved real write
+contention into play (off-thread rating/colour-label `serialized_write` workers,
+import worker's bulk transaction) while this module's writes stayed main-thread;
+a bare open under a held lock fails on its FIRST statement with SQLITE_BUSY,
+silently skipping a write or reading defaults — reviewer's analysis flagged the
+latent data-clobber path: a BUSY-failed `load_saved` returns default params that
+a later autosave then writes over the stored edit.
+
+**Senior review: BLOCK → fixed pre-commit** (fresh general-purpose agent,
+model "opus", read-only mandate). The code was approved as mechanically clean,
+complete (three interleaved test modules verified — every production open
+covered), and semantically safe (`mut` drop in apply_style_to confirmed correct
+against rusqlite 0.31's `busy_timeout(&self)`); it blocked purely on the repo's
+comment-truth gate:
+- **BLOCKER-1 + MINOR-2** — my new doc claimed "the metadata editor's per-image
+  connections" as an existing sibling (none exist; they were bare until THIS
+  diff) and attributed contention to "off-thread metadata workers" when the
+  metadata editor writes ON the main thread. Both rewritten truthfully: real
+  siblings named with their values (rating/colour/timeline/attach_catalog 3s,
+  query_exif's deliberate 250ms exception), off-thread writers identified
+  correctly. Notably the same stale phrase had shipped in m4-146's committed
+  apply_style_to comment — this diff deletes it there too.
+- **MINOR-3** — added a PRAGMA pin: `open_catalog_installs_the_three_second_
+  busy_timeout` reads back `PRAGMA busy_timeout` == 3000; without it, deleting
+  the one load-bearing line left all other tests green.
+- **MINOR-4** — recorded here per review: the sweep is persist.rs-scoped;
+  remaining unswept production site is `panels::load_film_rolls` (bare open,
+  main-thread read — an import-transaction BUSY yields a silently empty film-
+  roll list). Candidate next increment.
+- NIT-5 (BUSY surfaces on first statement, not at open) and NIT-6 (distinguish
+  from `c41_db::schema::open_catalog`'s ATTACH+schema semantics) folded into
+  the same doc rewrite.
+
+**Verification**: 39/39 persist release tests; clippy clean; full local gate
+exit code **0** twice (`gate-m4-147.log`, then post-review-fixes
+`gate-m4-147-postreview.log`). No PARITY_AUDIT change (robustness hardening, no
+parity row).
+
+**Follow-ups recorded**: sweep panels::load_film_rolls (and audit any other
+crate-wide bare opens); per-module style merge; darkroom-view styles module.
