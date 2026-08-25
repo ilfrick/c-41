@@ -10,18 +10,29 @@
 //! rather than LCMS's default 16-bit fixed-point path).
 //!
 //! Increments:
-//! - **m4-89 (this module):** the ICC binary parser — profile header, tag table,
-//!   and the `XYZ `/`curv`/`para` tag types — enough to reconstruct a
-//!   matrix-shaper profile (RGB colorants → 3×3, per-channel TRC curves).
-//! - m4-90: the cLUT tag types (`mft1`/`mft2` v2 LUTs, `mAB `/`mBA ` v4
-//!   multi-process) + N-D LUT interpolation (tetrahedral for 3-in).
-//! - m4-91: transform assembly (device→PCS→device, PCS Lab/XYZ, rendering
-//!   intents, chromatic adaptation) and wiring colorin/colorout's LUT path.
+//! - **m4-89:** the ICC binary parser — profile header, tag table, and the
+//!   `XYZ `/`curv`/`para` tag types — enough to reconstruct a matrix-shaper
+//!   profile (RGB colorants → 3×3, per-channel TRC curves).
+//! - m4-90: the N-D LUT interpolation core ([`clut::Clut`]: LCMS-matched
+//!   tetrahedral for 3-in RGB + general N-linear).
+//! - m4-91/m4-92: the cLUT tag types (`mft1`/`mft2` v2 LUTs, `mAB `/`mBA ` v4
+//!   multi-process) parsed into [`Pipeline`]s of curve/matrix/CLUT stages.
+//! - m4-93a/b: the device→PCS direction ([`Profile::a2b_pipeline`], with the
+//!   appended PCS-decode stage normalising LUT output to raw values).
+//! - **m4-127 (this increment):** the PCS→device direction
+//!   ([`Profile::b2a_pipeline`] — ICC-encode prepend, `B2A{intent}` preference,
+//!   matrix-shaper fallback via the new [`Curve::inverse`]) and full transform
+//!   assembly ([`transform::Transform`]: device→PCS→device across two profiles,
+//!   Lab↔XYZ bridging, rendering intents incl. absolute's white-ratio scaling).
+//!   Wiring colorin/colorout's LUT path through the FFI boundary is the
+//!   follow-up.
 
 mod clut;
 mod lut;
 mod parser;
+mod transform;
 
 pub use clut::Clut;
 pub use lut::{parse_lut_tag, parse_lut_v2, parse_lut_v4, Pipeline, Stage};
 pub use parser::{Curve, IccError, Profile, Xyz};
+pub use transform::Transform;

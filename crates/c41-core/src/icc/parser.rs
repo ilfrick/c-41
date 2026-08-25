@@ -99,6 +99,60 @@ impl Curve {
     }
 }
 
+impl Curve {
+    /// The inverse relation: a curve whose `eval` undoes `Self::eval` over `[0,1]`
+    /// (`inverse().eval(eval(x)) ≈ x`). Needed to run an output profile's TRC
+    /// backwards in [`Profile::b2a_pipeline`]'s matrix-shaper fallback (raw PCS →
+    /// device RGB).
+    ///
+    /// - `Gamma(g)` inverts analytically to `Gamma(1/g)`; a degenerate `g == 0`
+    ///   (`x^0 ≡ 1`, no inverse) falls back to identity.
+    /// - `Identity` inverts to itself.
+    /// - `Table` and `Parametric` invert by **sampling + bisection** (construction
+    ///   time only): entry `j` is the smallest `x` with `fwd(x) ≥ j/(N−1)` — the
+    ///   same convention LCMS's tabular inversion lands on, and how LCMS turns
+    ///   parametric curves into invertible tables. Bottom plateaus (the `para`
+    ///   dead zone below `-b/a`/`d`) therefore map every target they cover onto 0.
+    pub fn inverse(&self) -> Curve {
+        // 4096 entries: worst-case roundtrip error ≈ half a quarter-bit LSB at
+        // 8-bit depth — cheap insurance now that this path feeds production
+        // transforms (construction cost is one pass of bisections).
+        const N: usize = 4096;
+        match self {
+            Curve::Identity => Curve::Identity,
+            Curve::Gamma(g) if *g != 0.0 => Curve::Gamma(1.0 / g),
+            Curve::Gamma(_) => Curve::Identity,
+            _ => {
+                let (lo, hi) = (self.eval(0.0), self.eval(1.0));
+                let mut inv = vec![0u16; N];
+                for (j, slot) in inv.iter_mut().enumerate().skip(1) {
+                    let t = j as f32 / (N - 1) as f32;
+                    if lo >= t {
+                        // a plateau already covering `t` at x=0 maps there
+                        *slot = 0;
+                    } else if hi < t {
+                        // above the curve's maximum → clamp to the domain end
+                        *slot = 65535;
+                    } else {
+                        // monotone ⇒ a unique crossing in [0,1]; bisect it
+                        let (mut a, mut b) = (0.0f32, 1.0f32);
+                        for _ in 0..24 {
+                            let mid = 0.5 * (a + b);
+                            if self.eval(mid) < t {
+                                a = mid;
+                            } else {
+                                b = mid;
+                            }
+                        }
+                        *slot = (0.5 * (a + b) * 65535.0).round() as u16;
+                    }
+                }
+                Curve::Table(inv)
+            }
+        }
+    }
+}
+
 /// Parametric curve evaluation (ICC parametricCurveType, funcs 0–4).
 fn eval_parametric(func: u16, p: &[f32], x: f32) -> f32 {
     // helper for safe param access (missing → 0, defensive)
@@ -353,7 +407,120 @@ fn a2b_tag_sigs(intent: u32) -> Vec<[u8; 4]> {
     }
 }
 
-/// Parse a single tone curve (`curv` or `para`) from the start of `d`, returning
+impl Profile {
+    /// The PCS→device transform for a rendering `intent` — the output-profile
+    /// direction ([`Self::a2b_pipeline`] is the input direction). Prefers the
+    /// `B2A{intent}` LUT tag (falling back to `B2A0`, abs intent 3 → `B2A1`),
+    /// then to the matrix-shaper fallback: invert the colorant matrix and run
+    /// each TRC backwards ([`Curve::inverse`]).
+    ///
+    /// The returned pipeline expects **raw** PCS on input (uniform with
+    /// [`Self::a2b_pipeline`]'s output) and prepends an ICC-*encode* stage so the
+    /// tag's own tables — which consume encoded `[0,1]` values — see what they
+    /// expect.
+    pub fn b2a_pipeline(&self, intent: u32) -> Result<Pipeline, IccError> {
+        for sig in b2a_tag_sigs(intent) {
+            if let Some(tag) = self.tag(&sig) {
+                let mut p = parse_lut_tag(tag)?;
+                p.stages.insert(0, pcs_encode_stage(self.pcs_is_lab(), self.version_major));
+                return Ok(p);
+            }
+        }
+        // matrix-shaper fallback. As with A2B, the shaper path is XYZ-only.
+        if self.pcs_is_lab() {
+            return Err(IccError::WrongTagType);
+        }
+        let m = self.rgb_to_xyz_matrix().ok_or(IccError::WrongTagType)?;
+        let trc = self.rgb_trc().ok_or(IccError::WrongTagType)?;
+        // Singular colorants (malformed profile) fail loudly at assembly rather
+        // than silently rendering garbage — this runs once per transform, so the
+        // error costs nothing.
+        let minv = invert3(&m).ok_or(IccError::WrongTagType)?;
+        // NOTE: no encode stage here — the colorant matrix consumes the same RAW
+        // XYZ D50 the A2B shaper branch produces; encoding is only for LUT tables.
+        Ok(Pipeline {
+            stages: vec![
+                Stage::Matrix([
+                    [minv[0][0], minv[0][1], minv[0][2], 0.0],
+                    [minv[1][0], minv[1][1], minv[1][2], 0.0],
+                    [minv[2][0], minv[2][1], minv[2][2], 0.0],
+                ]),
+                Stage::Curves(trc.iter().map(|c| c.inverse()).collect()),
+            ],
+        })
+    }
+}
+
+/// The inverse of the A2B branch's appended decode stage: raw PCS → the ICC-encoded
+/// `[0,1]` values B2A tables are defined over. Exact algebraic inverse of each
+/// decode line (`raw = n·s + o` ⇔ `n = raw/s − o/s`).
+fn pcs_encode_stage(is_lab: bool, version_major: u8) -> Stage {
+    if is_lab {
+        if version_major >= 4 {
+            Stage::Matrix([
+                [1.0 / 100.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0 / 255.0, 0.0, 128.0 / 255.0],
+                [0.0, 0.0, 1.0 / 255.0, 128.0 / 255.0],
+            ])
+        } else {
+            // legacy v2 Lab: decode used s = 255·(65535/65280) etc.
+            let v2 = 65535.0 / 65280.0;
+            Stage::Matrix([
+                [1.0 / (100.0 * v2), 0.0, 0.0, 0.0],
+                [0.0, 1.0 / (255.0 * v2), 0.0, 128.0 / (255.0 * v2)],
+                [0.0, 0.0, 1.0 / (255.0 * v2), 128.0 / (255.0 * v2)],
+            ])
+        }
+    } else {
+        let k = 32768.0 / 65535.0; // reciprocal of the decode scale
+        Stage::Matrix([[k, 0.0, 0.0, 0.0], [0.0, k, 0.0, 0.0], [0.0, 0.0, k, 0.0]])
+    }
+}
+
+/// The `B2A{intent}` tag signatures to try, in preference order (mirrors
+/// [`a2b_tag_sigs`]).
+fn b2a_tag_sigs(intent: u32) -> Vec<[u8; 4]> {
+    let specific = match intent {
+        1 | 3 => *b"B2A1",
+        2 => *b"B2A2",
+        _ => *b"B2A0",
+    };
+    if specific == *b"B2A0" {
+        vec![*b"B2A0"]
+    } else {
+        vec![specific, *b"B2A0"]
+    }
+}
+
+/// Invert a 3×3 matrix via the adjugate (`None` when singular or non-finite).
+/// Used for the matrix-shaper output fallback — a singular colorant set means a
+/// malformed profile, which the caller reports rather than rendering garbage.
+fn invert3(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if det == 0.0 || !det.is_finite() {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    Some([
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+        ],
+    ])
+}
 /// the curve and the number of bytes it occupies (unpadded). Shared by tag reads
 /// and the v4 `mAB `/`mBA ` inline-curve parsing.
 pub(super) fn parse_curve(d: &[u8]) -> Result<(Curve, usize), IccError> {

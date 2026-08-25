@@ -1909,3 +1909,71 @@ workspace, clippy workspace, tests --release (c41-core 768, c41-db 92, c41-ui 27
 red-labelled images, ALL{red,green} keeps only the both-labelled one, empty mask
 keeps everything), and the release bin link. PARITY_AUDIT row 2.5 closed in this
 commit.
+
+## 2026-08-25T01:15Z — m4-127: ICC B2A direction + full Transform assembly
+
+`c41-core::icc` completes the colour-transform engine: the PCS→device direction
+and the two-profile assembly that chains them.
+
+- `Curve::inverse()` (parser.rs): analytic `Gamma(1/g)` (degenerate g==0 →
+  Identity); Table/Parametric invert by sampling + bisection (N=4096, per-target
+  24-step bisection over [0,1]) following LCMS's tabular-inversion convention —
+  entry j = smallest x with fwd(x) ≥ j/(N−1), so bottom plateaus map covered
+  targets onto 0.
+- `Profile::b2a_pipeline(intent)` (parser.rs): prefers `B2A{intent}` LUT tags
+  with the same A→B fallback scheme (abs intent 3 → B2A1, then B2A0), PREPENDING
+  `pcs_encode_stage` — the exact algebraic inverse of the a2b decode line per
+  version/PCS (v4 Lab: L/100, ab/255+128/255; v2's legacy 65535/65280 scale;
+  XYZ ×32768/65535) so tables consume encoded [0,1] like they were authored for.
+  Matrix-shaper fallback consumes RAW XYZ D50 with NO encode stage: adjugate
+  inverse colorants + inverted TRCs. Review finding: singular/non-finite det now
+  returns Err(WrongTagType) at assembly instead of silently substituting identity
+  (garbage-in-garbage-out became loud-fail; runs once per transform so it costs
+  nothing).
+- NEW `icc/transform.rs`: `Transform::new(src, dst, intent)` = head
+  (src.a2b_pipeline) → optional absolute-intent media-white ratio scaling in XYZ
+  (`wtpt_dst/wtpt_src` componentwise, BOTH whites now required all-positive after
+  review — profiles are untrusted bytes and a zero/negative component would
+  zero/flip a channel; missing/unusable wtpt degrades silently to relative,
+  documented) → Lab↔XYZ bridge → tail (dst.b2a_pipeline). The bridge is three
+  private fields (to_xyz / abs_scale / from_xyz), not an enum: Lab-src/Lab-dst
+  absolute needs convert→scale→convert-back, which a single Bridge variant could
+  not express. D50-referenced lab_from_xyz/xyz_from_lab helpers (ε=216/24389,
+  κ=24389/27). Exported as `icc::Transform`; mod.rs increment history corrected
+  (the earlier engine increments were m4-89..93b per git, not m4-90/91 as the doc
+  claimed).
+
+Numbering note: planned as "m4-91" from the stale mod.rs doc, but git history
+shows m4-89..93b were consumed by the parser/clut-core/tag-parsing/a2b work on
+07-20; this increment is m4-127, continuing from m4-126.
+
+Tests (11 in transform.rs, 779 c41-core total, --release): Lab↔XYZ roundtrip vs
+f64-tight tolerances incl. linear-leg; gamma/table/parametric inverse roundtrips;
+diagonal AND full-matrix profile self-transforms; both bridge directions
+end-to-end (XYZ→Lab dst through v4 encode onto an identity mft1 CLUT; Lab src
+through v4 decode into a matrix-shaper B2A); abs ≡ rel on equal whites, abs ≠
+rel on different whites (with the gotcha documented IN the test: axis-aligned
+primaries make the white-ratio scale cancel exactly against the inverse
+colorants — the first draft was vacuous), wtpt-less degradation; v2 legacy-scale
+encode pinned against v4 (the new tight tolerance exposed that the synthetic
+curv tag quantises γ2.2 to u16 563/256 — expectation fixed, not code); B2A1-
+preferred-over-B2A0 for intent 1 with a flat-zero B2A0 probe, intent 0 landing
+on B2A0; singular colorants → Err.
+
+Review: APPROVE-WITH-FIXES (fork subagent standing in for fricktrade-architect,
+API 402 again; read-only mandate enforced). Findings fixed: MINOR dst-wtpt
+positivity guard; MINOR invert3 fail-loudly (+ test); MINOR test gap — v2
+encode/decode coverage + B2A tag-preference tests added. NITs also applied:
+hoisted eval(0)/eval(1) out of the N-loop; N 1024→4096. Forward note accepted
+for the FFI follow-up: Transform::eval allocates per pixel-vector; band
+processing wants a write-into-scratch variant when colorin/colorout get wired.
+Clippy: one needless_range_loop in my own new loop fixed (zero new diagnostics
+from icc files; the two erasing_op errors under --all-targets are pre-existing
+test-target lints in committed bloom/rawimage code the CI clippy invocation
+never compiles). Full scripts/ci-local.sh GATE_EXIT=0 (check, clippy, test
+--release, release link). En-route failures kept for the record: mft1 helper
+missing byte-11 alignment pad before the e-matrix (everything shifted one byte
+→ Truncated); first Transform draft computed abs_scale but never applied it
+(caught by rewriting eval before ever compiling — the enum-Bridge special case
+for abs+Lab/Lab would ALSO have fed XYZ to a Lab-expecting tail; the field-based
+design replaced it).
