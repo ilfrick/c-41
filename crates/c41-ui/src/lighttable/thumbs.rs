@@ -21,10 +21,14 @@
 //!   which is also the retry opportunity.
 //!
 //! * **One pixel cache** ([`lookup`] / [`store`]), keyed `(path, bucket)` with
-//!   the SAME power-of-two quantisation for every consumer ([`bucket_for`]), so
-//!   an image decoded while scrolling the grid is a cache hit when the zoomable
-//!   canvas opens the same folder, and vice versa. LRU under a byte budget,
-//!   never-empty eviction ([`evict_keep_set`]).
+//!   the SAME power-of-two quantisation for every consumer ([`bucket_for`]).
+//!   Honest scope note (review MINOR-2, m4-143): today only the grid reads and
+//!   fills it; the zoomable canvas keeps its own pixbuf cache because it blits
+//!   through cairo rather than a Picture. So a canvas decode is NOT visible
+//!   here yet, and a sequential re-request from the other surface still pays a
+//!   second demosaic — publishing completions into one shared cache is the
+//!   recorded follow-up. LRU under a byte budget, never-empty eviction
+//!   ([`evict_keep_set`]).
 //!
 //! **Concurrency**: at most [`MAX_CONCURRENT_DECODES`] decodes run at once. A
 //! raw decode materialises a full sensor-resolution linear buffer before
@@ -35,6 +39,16 @@
 //! busy simply doesn't spawn (the next bind/paint retries naturally), so no
 //! worker thread ever parks waiting for a slot and unrelated blocking work
 //! (rating / colour-label queries) can't queue behind parked decoders.
+//!
+//! **One decode per path** (m4-143, m4-141 review N4): before touching the
+//! gate every consumer registers `(path, bucket)` in one shared in-flight map
+//! ([`inflight_register`]) and does nothing while an equal-or-bigger decode for
+//! that path is already running — so a rebound cell, a scroll bounce, or the
+//! canvas racing the grid can never run two demosaics of the same raw at the
+//! same time. Refusals retry on the same bounded 150ms timer as a busy gate,
+//! so the pending request converges once the owner finishes. Sequential
+//! re-decodes across surfaces are a separate gap — see the pixel-cache note
+//! above.
 //!
 //! **Cost honesty**: a raw thumbnail pays one full-resolution demosaic —
 //! seconds of CPU each, serialised two-at-a-time through the gate. Since
@@ -50,7 +64,7 @@
 
 use gtk4::gdk_pixbuf::prelude::*;
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -571,6 +585,49 @@ pub(crate) fn clear_failed() {
     FAILED.with(|f| f.borrow_mut().clear());
 }
 
+// ── In-flight dedupe ────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Decodes currently running, `path → requested bucket`. ONE map shared by
+    /// every consumer (grid cell bind AND zoomable frame, m4-143): an
+    /// equal-or-bigger request for a path that already has a decode running is
+    /// refused, so a cell rebind, a scroll bounce, or the canvas opening while
+    /// the grid fills can never start a second demosaic of the same fresh raw.
+    /// A strictly bigger bucket supersedes the entry (its output dominates for
+    /// cache purposes); the superseded decode keeps running and simply no
+    /// longer owns the slot at completion. Main-thread only, like every other
+    /// piece of session state here; entries are never bulk-cleared — they are
+    /// transient by construction, removed by their own completions.
+    static INFLIGHT: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+}
+
+/// Register `(path, bucket)` as the decode about to spawn. Returns `false` —
+/// having registered nothing — when an equal-or-bigger decode for `path` is
+/// already in flight, meaning the caller must not spawn. Returns `true` having
+/// registered, which obliges the caller to [`inflight_unregister`] with the
+/// same bucket on EVERY exit path (including bailing out before spawning).
+pub(crate) fn inflight_register(path: &str, bucket: u32) -> bool {
+    INFLIGHT.with(|m| {
+        let mut inflight = m.borrow_mut();
+        if inflight.get(path).is_some_and(|prev| *prev >= bucket) {
+            return false;
+        }
+        inflight.insert(path.to_string(), bucket);
+        true
+    })
+}
+
+/// Release a registration — but only if this exact `(path, bucket)` still owns
+/// it: a superseding bigger decode registered after ours must survive ours.
+pub(crate) fn inflight_unregister(path: &str, bucket: u32) {
+    INFLIGHT.with(|m| {
+        let mut inflight = m.borrow_mut();
+        if inflight.get(path).copied() == Some(bucket) {
+            inflight.remove(path);
+        }
+    });
+}
+
 /// Insert/replace under the byte budget, MRU-first. Evicts via the shared
 /// never-empty policy ([`evict_keep_set`]).
 pub(crate) fn store(path: &str, max_dim: u32, img: ThumbImage) -> Rc<ThumbImage> {
@@ -706,6 +763,68 @@ mod tests {
         assert!(is_failed("/x/y.orf"));
         clear_failed();
         assert!(!is_failed("/x/y.orf"));
+    }
+
+    #[test]
+    fn inflight_blocks_equal_and_smaller_until_the_owner_releases() {
+        // Under --test-threads=1 every test shares one thread, so leave the
+        // map as found on every exit path; the unique paths here also keep the
+        // test correct when tests run on parallel threads.
+        assert!(inflight_register("/a/raw.nef", 256), "first claim wins");
+        assert!(
+            !inflight_register("/a/raw.nef", 256),
+            "equal bucket is refused — the running decode covers it"
+        );
+        assert!(
+            !inflight_register("/a/raw.nef", 128),
+            "smaller bucket is refused too: its pixels will be cached anyway"
+        );
+        // Owner-checked release: a stale (superseded-never-happened) bucket
+        // must NOT free the slot.
+        inflight_unregister("/a/raw.nef", 128);
+        assert!(!inflight_register("/a/raw.nef", 128), "stale release is a no-op");
+        inflight_unregister("/a/raw.nef", 256);
+        assert!(inflight_register("/a/raw.nef", 128), "real release frees the path");
+        inflight_unregister("/a/raw.nef", 128);
+    }
+
+    #[test]
+    fn inflight_supersede_takes_over_then_blocks() {
+        assert!(inflight_register("/b/raw.nef", 128));
+        // A strictly bigger bucket supersedes while the smaller keeps running:
+        // its output dominates for cache purposes, so it must be spawnable.
+        assert!(inflight_register("/b/raw.nef", 512));
+        assert!(!inflight_register("/b/raw.nef", 512), "equal to the new owner");
+        // The superseded decode finishes first: releasing ITS bucket must not
+        // evict the entry the bigger decode now owns.
+        inflight_unregister("/b/raw.nef", 128);
+        assert!(!inflight_register("/b/raw.nef", 256), "still owned by the bigger");
+        inflight_unregister("/b/raw.nef", 512);
+        assert!(inflight_register("/b/raw.nef", 256), "path free again after both");
+        inflight_unregister("/b/raw.nef", 256);
+        // Reverse interleaving (review NIT-1): the BIGGER decode completes
+        // first and the stale smaller release lands afterwards — still ends
+        // empty, and the late stale release is a no-op.
+        assert!(inflight_register("/b/raw.nef", 128));
+        assert!(inflight_register("/b/raw.nef", 512));
+        inflight_unregister("/b/raw.nef", 512);
+        assert!(inflight_register("/b/raw.nef", 256), "empty once the owner releases");
+        inflight_unregister("/b/raw.nef", 256);
+        inflight_unregister("/b/raw.nef", 128); // stale latecomer
+    }
+
+    #[test]
+    fn inflight_is_per_path() {
+        // The whole point of m4-143: two surfaces asking for DIFFERENT files
+        // never block each other; only same-path duplicates dedupe.
+        assert!(inflight_register("/c/one.nef", 512));
+        assert!(inflight_register("/d/two.nef", 512));
+        assert!(inflight_register("/e/three.jpg", 256));
+        assert!(!inflight_register("/d/two.nef", 512));
+        inflight_unregister("/c/one.nef", 512);
+        assert!(!inflight_register("/d/two.nef", 256), "unrelated release changed nothing");
+        inflight_unregister("/d/two.nef", 512);
+        inflight_unregister("/e/three.jpg", 256);
     }
 
     #[test]

@@ -1740,12 +1740,17 @@ fn paint_thumb(thumb: &gtk4::Picture, img: &thumbs::ThumbImage) {
 /// Make sure `thumb` (a grid cell's Picture) shows `path`. Cache hit paints
 /// immediately; a known-failed path stays blank until the next collection load
 /// ([`fill_grid`] resets the negative cache); anything else needs a bounded
-/// decode, whose slot is claimed BEFORE any task is spawned — when the gate is
-/// busy this schedules one timed retry instead of queueing, so gio's blocking
-/// pool never holds a parked worker and the rating/colour-label queries sharing
-/// it can't stall behind thumbnail decodes (review MAJOR, m4-140). Every entry
-/// re-checks the stamped widget name: cells recycle, so a retry landing on a
-/// rebound cell is a no-op — that cell's own bind runs a fresh chain.
+/// decode. Before touching the gate this registers `(path, bucket)` in the
+/// shared in-flight registry ([`thumbs::inflight_register`], m4-143): an
+/// equal-or-bigger decode already running for this file — a sibling cell's
+/// rebind, a scroll bounce, or the zoomable canvas — makes this call a no-op,
+/// so a seconds-long raw demosaic is paid once. The gate slot itself is still
+/// claimed BEFORE any task spawns; when it is busy this schedules one timed
+/// retry instead of queueing, so gio's blocking pool never holds a parked
+/// worker and the rating/colour-label queries sharing it can't stall behind
+/// thumbnail decodes (review MAJOR, m4-140). Every entry re-checks the stamped
+/// widget name: cells recycle, so a retry landing on a rebound cell is a
+/// no-op — that cell's own bind runs a fresh chain.
 fn ensure_grid_thumb(thumb_w: glib::WeakRef<gtk4::Picture>, path: String) {
     let Some(thumb) = thumb_w.upgrade() else { return };
     if thumb.widget_name() != path {
@@ -1764,8 +1769,24 @@ fn ensure_grid_thumb(thumb_w: glib::WeakRef<gtk4::Picture>, path: String) {
     if thumbs::is_failed(&path) {
         return;
     }
+    if !thumbs::inflight_register(&path, bucket) {
+        // An equal-or-bigger decode for this path is already running. Unlike
+        // the busy gate there is no completion of OURS to paint the cell
+        // afterwards — the running decode may belong to the other surface,
+        // whose result never reaches this cache — so without a retry the cell
+        // would stay blank until some unrelated rebind (review MAJOR-1,
+        // m4-143). Retry exactly like the busy gate: self-terminating once the
+        // owner finishes, then this chain either cache-hits or registers.
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(150),
+            move || ensure_grid_thumb(thumb_w, path),
+        );
+        return;
+    }
     let Some(permit) = thumbs::DecodePermit::try_acquire() else {
-        // Both decoders busy: try again shortly instead of waiting anywhere.
+        // Both decoders busy: hand back the unused registration and try again
+        // shortly instead of waiting anywhere.
+        thumbs::inflight_unregister(&path, bucket);
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(150),
             move || ensure_grid_thumb(thumb_w, path),
@@ -1776,6 +1797,9 @@ fn ensure_grid_thumb(thumb_w: glib::WeakRef<gtk4::Picture>, path: String) {
         let p = path.clone();
         let decoded =
             gio::spawn_blocking(move || thumbs::decode_with_permit(permit, &p, bucket)).await;
+        // This decode's registration ends here unless a superseding bigger
+        // request took over the path meanwhile (the owner check is inside).
+        thumbs::inflight_unregister(&path, bucket);
         match decoded {
             Ok(Some(img)) => {
                 let cached = thumbs::store(&path, bucket, img);

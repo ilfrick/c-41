@@ -360,11 +360,11 @@ struct ZoomItem {
 struct CanvasState {
     items: RefCell<Vec<ZoomItem>>,
     textures: RefCell<PixbufCache>,
-    /// Decodes in flight, `path → bucket`. A newer request supersedes an entry
-    /// with a smaller bucket, so at most one decode per path ever runs. Decode
-    /// failures are NOT tracked here — the shared negative cache in
-    /// [`super::thumbs`] serves both consumers (m4-140).
-    inflight: RefCell<HashMap<String, u32>>,
+    // Per-path decode dedupe lives in the SHARED registry
+    // ([`super::thumbs::inflight_register`], m4-143): one map serves grid and
+    // canvas alike, so neither can double-demosaic a fresh raw — not even when
+    // both surfaces race on it. Decode failures are likewise shared state
+    // (m4-140).
     /// Double-click callback (opens the darkroom page), wired by lib.rs.
     activate: RefCell<Option<ActivateCb>>,
     selection_w: glib::WeakRef<SingleSelection>,
@@ -436,7 +436,6 @@ impl ZoomableCanvas {
         let state = Rc::new(CanvasState {
             items: RefCell::new(Vec::new()),
             textures: RefCell::new(PixbufCache::new()),
-            inflight: RefCell::new(HashMap::new()),
             activate: RefCell::new(None),
             selection_w: selection.downgrade(),
         });
@@ -725,9 +724,10 @@ fn wire_model_watch(state: &Rc<CanvasState>, selection: &SingleSelection) {
         let st = Rc::clone(state);
         model.connect_items_changed(move |_m, _pos, _removed, _added| {
             st.sync_items();
-            // `inflight` is deliberately NOT cleared here: entries are path-keyed
-            // and removed by their own completions, so clearing would only let a
-            // still-running decode respawn alongside itself on the next frame.
+            // The shared in-flight registry is deliberately NOT cleared here:
+            // entries are path-keyed and removed by their own completions, so
+            // clearing would only let a still-running decode respawn alongside
+            // itself on the next frame.
             relayout_only();
             if let Some(area) = zoom_area() {
                 area.queue_draw();
@@ -815,23 +815,32 @@ fn zoom_anchored_apply(old_cell: f64, new_cell: f64, anchor: Option<(f64, f64)>)
 /// waiting for a slot (review MAJOR). A panicked decoder logs and stays
 /// retryable rather than being negative-cached as a corrupt file.
 fn spawn_decode(state: &Rc<CanvasState>, area: &DrawingArea, path: &str, bucket: u32) {
-    let permit = {
-        let mut inflight = state.inflight.borrow_mut();
-        if super::thumbs::is_failed(path) {
-            return; // known undecodable until the next collection load
-        }
-        if let Some(prev) = inflight.get(path) {
-            if *prev >= bucket {
-                return; // equal-or-bigger decode already running
+    // Dedupe first (m4-143): the shared registry refuses an equal-or-bigger
+    // decode already running for this path — from a sibling frame or the grid —
+    // before any gate slot is touched. Only then is a slot claimed; when both
+    // decoders are busy the registration is handed straight back and the NEXT
+    // FRAME retries, so no worker ever parks waiting for a slot (review MAJOR).
+    if super::thumbs::is_failed(path) {
+        return; // known undecodable until the next collection load
+    }
+    if !super::thumbs::inflight_register(path, bucket) {
+        // Equal-or-bigger decode already running for this path — possibly on
+        // the grid, whose result lands in a cache this canvas never reads.
+        // Without a nudge the cell stays blank until the next damage event
+        // (review MAJOR-1, m4-143): repaint once shortly so the hole fills
+        // from cache when the owner finishes. One shot — later frames retry
+        // on their own schedule.
+        let area_w = area.downgrade();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+            if let Some(a) = area_w.upgrade() {
+                a.queue_draw();
             }
-        }
-        match super::thumbs::DecodePermit::try_acquire() {
-            Some(permit) => {
-                inflight.insert(path.to_string(), bucket);
-                permit
-            }
-            None => return, // decoders busy — retry naturally on a later frame
-        }
+        });
+        return;
+    }
+    let Some(permit) = super::thumbs::DecodePermit::try_acquire() else {
+        super::thumbs::inflight_unregister(path, bucket); // nothing spawned
+        return; // decoders busy — retry naturally on a later frame
     };
 
     let path_owned = path.to_string();
@@ -842,6 +851,11 @@ fn spawn_decode(state: &Rc<CanvasState>, area: &DrawingArea, path: &str, bucket:
         let decoded =
             gio::spawn_blocking(move || super::thumbs::decode_with_permit(permit, &p, bucket))
                 .await;
+        // Release this decode's registration BEFORE touching the result — a
+        // panic in any arm must not leave the entry behind permanently (the
+        // grid releases at the same point; review MINOR-1). Owner check inside:
+        // a superseding larger request owns the slot now otherwise.
+        super::thumbs::inflight_unregister(&path_owned, bucket);
 
         match decoded {
             Ok(Some(img)) => {
@@ -874,13 +888,6 @@ fn spawn_decode(state: &Rc<CanvasState>, area: &DrawingArea, path: &str, bucket:
                 eprintln!("c41-thumbs: canvas decode task panicked for {path_owned}");
             }
         }
-        // Superseded bookkeeping: remove only if THIS decode is still the
-        // registered one — an in-flight larger request owns the slot now.
-        let mut inflight = st.inflight.borrow_mut();
-        if inflight.get(&path_owned).copied() == Some(bucket) {
-            inflight.remove(&path_owned);
-        }
-        drop(inflight);
         if let Some(a) = area_w.upgrade() {
             a.queue_draw();
         }
