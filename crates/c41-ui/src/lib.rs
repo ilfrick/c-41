@@ -488,6 +488,12 @@ fn build_main_window(app: &Application) {
     if let Some(tok) = persist::load_ui_pref(&db_path, lighttable::COLOUR_FILTER_PREF_KEY) {
         lighttable::apply_colour_filter_token(&tok);
     }
+    // And the aspect-ratio quick filter (m4-128), same contract: seed before any
+    // control that mirrors it is built (the left panel's Collection-filters
+    // dropdown reads it back when it builds).
+    if let Some(tok) = persist::load_ui_pref(&db_path, lighttable::ASPECT_FILTER_PREF_KEY) {
+        lighttable::apply_aspect_filter_token(&tok);
+    }
     // Likewise restore the thumbnail overlay mode (m4-98e) before the grid binds
     // its first cells, so they're laid out right the first time (no visible flip).
     if let Some(tok) = persist::load_ui_pref(&db_path, OVERLAY_MODE_PREF_KEY) {
@@ -966,6 +972,21 @@ fn build_main_window(app: &Application) {
                 &db,
                 lighttable::COLOUR_FILTER_PREF_KEY,
                 &lighttable::colour_filter_token(),
+            );
+        });
+    }
+
+    // Aspect quick filter (m4-128) — same one-writer-per-key persistence shape as
+    // the colour filter above: an app-level observer saves the token on every
+    // filter change, so the left-panel dropdown (and any future mirror) never
+    // persists anything itself.
+    {
+        let db = db_path.clone();
+        lighttable::add_filter_observer(move || {
+            crate::persist::save_ui_pref(
+                &db,
+                lighttable::ASPECT_FILTER_PREF_KEY,
+                &lighttable::aspect_filter_token(),
             );
         });
     }

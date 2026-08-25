@@ -548,6 +548,11 @@ pub(crate) fn set_color_dots(colors_box: &gtk4::Box, mask: u8) {
 /// that writes it.
 pub(crate) const COLOUR_FILTER_PREF_KEY: &str = "colour_filter";
 
+/// Where the aspect-ratio quick-filter token persists (m4-128; same store and
+/// same restore/persist split as [`COLOUR_FILTER_PREF_KEY`] — `lib.rs` restores
+/// from this key at startup and runs the persist observer that writes it).
+pub(crate) const ASPECT_FILTER_PREF_KEY: &str = "aspect_filter";
+
 /// The lighttable quick-filter's colour circles (m4-126) — darktable's bar-mounted
 /// colour filter. Five buttons drawn with the SAME Pango dot glyphs as the grid
 /// cells ([`color_dot_markup`], one source of truth for hues), lit per the live
@@ -1115,6 +1120,56 @@ impl FilterPreset {
     }
 }
 
+/// The aspect-ratio quick-filter (m4-128) — the first slice of darktable's
+/// "collection filters" expander (`src/libs/filtering.c`). Its three stock
+/// presets are range rules on the stored `aspect_ratio` column — `square` =
+/// `[1;1]`, `landscape` = `>=1.01`, `portrait` = `<=0.99`. That column is a
+/// float snapped by `dt_usable_aspect` (which is why the thresholds have slop);
+/// we don't materialise one, so the same intent is expressed directly against
+/// the import-time `width`/`height` integers — exact, no snapping thresholds,
+/// and an image with unknown dimensions (a failed probe leaves 0×0) matches
+/// nothing instead of wrongly counting as square.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AspectFilter {
+    /// No aspect restriction.
+    Off,
+    /// Wider than tall (darktable's `landscape` preset).
+    Landscape,
+    /// Taller than wide (darktable's `portrait` preset).
+    Portrait,
+    /// Width equals height, non-zero (darktable's `square` preset).
+    Square,
+}
+
+impl AspectFilter {
+    /// Variants in dropdown-row order — one source of truth for the labels, the
+    /// index ↔ variant mapping and the token roundtrip test.
+    pub const ALL: [AspectFilter; 4] =
+        [Self::Off, Self::Landscape, Self::Portrait, Self::Square];
+
+    /// Map a DropDown selection index back to a filter (out-of-range ⇒ `Off`,
+    /// so a corrupt index can never panic).
+    pub fn from_index(i: u32) -> AspectFilter {
+        *Self::ALL.get(i as usize).unwrap_or(&Self::Off)
+    }
+
+    /// The dropdown-row index (for seeding the DropDown selection).
+    pub fn to_index(self) -> u32 {
+        Self::ALL.iter().position(|&f| f == self).unwrap_or(0) as u32
+    }
+
+    /// Row label, kept beside the variants so the control built from
+    /// [`Self::ALL`] can't drift out of sync with them.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "All aspects",
+            Self::Landscape => "Landscape",
+            Self::Portrait => "Portrait",
+            Self::Square => "Square",
+        }
+    }
+}
+
 /// Which per-thumbnail overlays the grid draws (m4-98e) — our port of darktable's
 /// thumbnail "overlays" setting. Ordered as the bottom-bar dropdown lists them.
 /// `Hidden` is darktable's "no overlays"; named so it can't be confused with
@@ -1410,6 +1465,11 @@ thread_local! {
     /// How [`COLOUR_MASK`] combines when several bits are set: `false` = any (OR),
     /// `true` = all (AND). Sticky across clears.
     static COLOUR_ALL: Cell<bool> = const { Cell::new(false) };
+    /// The aspect-ratio quick-filter (m4-128): darktable's square/landscape/
+    /// portrait collection presets. Composes ON TOP of whatever collection is
+    /// active, like [`MIN_RATING`], [`YEAR_RANGE`] and [`COLOUR_MASK`] — see
+    /// [`current_filters_sql`].
+    static ASPECT_FILTER: Cell<AspectFilter> = const { Cell::new(AspectFilter::Off) };
     /// A closure that re-runs the *current* view's loader. Each loader registers
     /// itself here on every call (capturing its own args), so the sort dropdown
     /// can re-apply the view under a new order without the trigger sites (folder
@@ -1961,17 +2021,63 @@ fn colour_predicate(mask: u8, match_all: bool) -> String {
     )
 }
 
+/// The aspect-ratio quick-filter live right now. `pub` so the left panel can seed
+/// its dropdown from the restored value.
+pub fn current_aspect_filter() -> AspectFilter {
+    ASPECT_FILTER.with(|f| f.get())
+}
+
+/// Set the aspect-ratio quick filter and re-render the current view under it.
+/// Composes with whatever collection is active, like the rating filter.
+/// Main-thread only.
+pub fn set_aspect_filter(f: AspectFilter) {
+    ASPECT_FILTER.with(|a| a.set(f));
+    filter_changed();
+}
+
+/// The aspect quick-filter as one trailing ` AND …` fragment over the row's
+/// import-time `width`/`height` columns. Empty for [`AspectFilter::Off`] (the
+/// no-filter state), so splicing it is always safe. Pure, so the fragment shape
+/// is unit-testable without a display.
+///
+/// Integer comparisons stand in for darktable's float-range presets: `w > h` ⇔
+/// ratio > 1 (landscape), `h > w` ⇔ portrait, `w == h && w > 0` ⇔ square. The
+/// `w > 0` guard matters — a failed dimension probe leaves 0×0, which would
+/// otherwise satisfy `=` and silently match every broken row as square; with it,
+/// unknown-dimension images match no aspect at all, mirroring how they carry no
+/// usable ratio in darktable either.
+///
+/// Two documented deviations vs darktable: (1) its stored ratio is snapped by
+/// `dt_usable_aspect` with a ±0.5 % tolerance band around each canonical value,
+/// so e.g. a true 1.004 ratio stores as exactly 1.0 and its `square` preset
+/// (`[1;1]`) catches it, while our exact comparison classes that row landscape —
+/// the divergence window is only that 0.5 % band around each boundary; we trade
+/// the tolerance for not materialising and snapping a float column at all.
+/// (2) its ratio uses the *developed* preview dimensions (`p_width`/
+/// `p_height`), so an image cropped across the sensor orientation still counts
+/// by its crop there and by its raw sensor here — we have no materialised
+/// post-crop ratio column yet.
+fn aspect_predicate(f: AspectFilter) -> &'static str {
+    match f {
+        AspectFilter::Off => "",
+        AspectFilter::Landscape => " AND i.width > i.height",
+        AspectFilter::Portrait => " AND i.height > i.width",
+        AspectFilter::Square => " AND i.width = i.height AND i.width > 0",
+    }
+}
+
 /// **Every** compose-on-top quick filter as one trailing ` AND …` fragment: the
-/// rating filter (m4-98b/d), the timeline's year range (m4-99), and the colour
-/// quick filter (m4-126). Loaders splice this single string, so adding a filter
-/// never means touching them again — and they can't accidentally apply one but not
-/// another.
+/// rating filter (m4-98b/d), the timeline's year range (m4-99), the colour
+/// quick filter (m4-126), and the aspect-ratio rule (m4-128). Loaders splice this
+/// single string, so adding a filter never means touching them again — and they
+/// can't accidentally apply one but not another.
 fn current_filters_sql() -> String {
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         current_rating_sql(),
         timeline::year_range_and(current_year_range()),
         colour_predicate(current_colour_mask(), current_colour_all()),
+        aspect_predicate(current_aspect_filter()),
     )
 }
 
@@ -2095,6 +2201,52 @@ pub fn apply_colour_filter_token(tok: &str) {
     let (mask, all) = parse_colour_filter_token(tok);
     COLOUR_MASK.with(|m| m.set(mask));
     COLOUR_ALL.with(|a| a.set(all));
+}
+
+/// Persisted aspect-filter tokens — the variant names themselves; there is no
+/// parameterised state to compact away (unlike the rating/colour masks), so a
+/// bare word per row is the whole codec. One source of truth shared by
+/// [`aspect_filter_token_for`] and [`parse_aspect_filter_token`].
+const ASPECT_TOK_OFF: &str = "off";
+const ASPECT_TOK_LANDSCAPE: &str = "landscape";
+const ASPECT_TOK_PORTRAIT: &str = "portrait";
+const ASPECT_TOK_SQUARE: &str = "square";
+
+/// Pure encoder for an [`AspectFilter`] — `off`, `landscape`, `portrait`, or
+/// `square`. Private; [`aspect_filter_token`] is the only external encoding path,
+/// so callers can't encode a stale copy of the state.
+fn aspect_filter_token_for(f: AspectFilter) -> String {
+    match f {
+        AspectFilter::Off => ASPECT_TOK_OFF,
+        AspectFilter::Landscape => ASPECT_TOK_LANDSCAPE,
+        AspectFilter::Portrait => ASPECT_TOK_PORTRAIT,
+        AspectFilter::Square => ASPECT_TOK_SQUARE,
+    }
+    .to_string()
+}
+
+/// Parse a persisted aspect-filter token, falling back to the no-filter state on
+/// anything unrecognised (including `off` itself — same path, one exit). Pure,
+/// so it's unit-testable.
+fn parse_aspect_filter_token(tok: &str) -> AspectFilter {
+    match tok {
+        ASPECT_TOK_LANDSCAPE => AspectFilter::Landscape,
+        ASPECT_TOK_PORTRAIT => AspectFilter::Portrait,
+        ASPECT_TOK_SQUARE => AspectFilter::Square,
+        _ => AspectFilter::Off,
+    }
+}
+
+/// Encode the *current* aspect filter as its persistence token. `pub` so `lib.rs`
+/// — which holds the db path — can store it.
+pub fn aspect_filter_token() -> String {
+    aspect_filter_token_for(current_aspect_filter())
+}
+
+/// Seed the aspect quick-filter from a persisted token *without* reloading —
+/// same startup contract as [`apply_rating_filter_token`]. Main-thread only.
+pub fn apply_aspect_filter_token(tok: &str) {
+    ASPECT_FILTER.with(|a| a.set(parse_aspect_filter_token(tok)));
 }
 
 /// Record how to re-run the current view (called by each loader with a closure
@@ -2526,6 +2678,8 @@ mod tests {
                 current_filters_sql, current_rating_compare, effective_overlay_visibility,
                 filter_sync_in_progress,
                 colour_filter_token_for, colour_predicate, parse_colour_filter_token,
+                aspect_predicate, aspect_filter_token_for, apply_aspect_filter_token,
+                current_aspect_filter, parse_aspect_filter_token, set_aspect_filter,
                 set_colour_filter, set_filter_preset, set_min_rating, set_rating_compare,
                 set_year_range, FilterPreset,
                 flags_with_star_rating, index_of_path, overlay_mode_token_for,
@@ -2536,7 +2690,8 @@ mod tests {
                 cull_capacity, cull_clamp_offset, cull_entry_offset, cull_key_direction,
                 cull_page_offset, cull_window_size, CULL_CELL_WIDTH_PX,
                 CULL_MAX_IMAGES, CULL_MIN_IMAGES,
-                RatingCompare, SortOrder, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX, GRID_CAP};
+                RatingCompare, SortOrder, AspectFilter, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX,
+                GRID_CAP};
     use std::sync::Arc;
 
     fn n_rows(n: usize) -> Vec<String> {
@@ -2621,6 +2776,83 @@ mod tests {
         // A stray high bit can't widen the colour domain.
         assert_eq!(parse_colour_filter_token("any:255"), (255 & 0x1F, false));
         assert_eq!(parse_colour_filter_token("all:31"), (0b11111, true));
+    }
+
+    #[test]
+    fn aspect_predicate_matches_darktables_stock_presets() {
+        // darktable's three stock collection presets as SQL fragments — exact
+        // strings, since the loaders splice them straight after a WHERE term.
+        assert_eq!(aspect_predicate(AspectFilter::Off), "");
+        assert_eq!(aspect_predicate(AspectFilter::Landscape), " AND i.width > i.height");
+        assert_eq!(aspect_predicate(AspectFilter::Portrait), " AND i.height > i.width");
+        assert_eq!(
+            aspect_predicate(AspectFilter::Square),
+            " AND i.width = i.height AND i.width > 0",
+            "the w>0 guard keeps a failed probe's 0×0 row from counting as square"
+        );
+    }
+
+    #[test]
+    fn aspect_filter_token_roundtrips_all_variants() {
+        for f in AspectFilter::ALL {
+            let tok = aspect_filter_token_for(f);
+            if f == AspectFilter::Off {
+                assert_eq!(tok, "off");
+            }
+            assert_eq!(parse_aspect_filter_token(&tok), f, "tok={tok}");
+            assert!(!f.label().is_empty(), "label for {f:?}");
+            // Index mapping is the dropdown's seed/apply path; it must agree
+            // with ALL for every variant and stay panic-free out of range.
+            assert_eq!(AspectFilter::from_index(f.to_index()), f);
+        }
+        assert_eq!(AspectFilter::from_index(99), AspectFilter::Off);
+    }
+
+    #[test]
+    fn aspect_state_seeds_from_persisted_token_without_reload() {
+        // The startup contract: apply_* writes state only — no reload is possible
+        // here anyway (no registered loader on this thread), but `set_*` would go
+        // through filter_changed; apply must not need one to be correct.
+        apply_aspect_filter_token("portrait");
+        assert_eq!(current_aspect_filter(), AspectFilter::Portrait);
+        apply_aspect_filter_token("");
+        assert_eq!(current_aspect_filter(), AspectFilter::Off, "corrupt ⇒ no filter");
+        apply_aspect_filter_token("square");
+        assert_eq!(current_aspect_filter(), AspectFilter::Square);
+        apply_aspect_filter_token("off");
+        assert_eq!(current_aspect_filter(), AspectFilter::Off);
+    }
+
+    #[test]
+    fn quick_filters_include_the_aspect_rule_in_composition_order() {
+        // Splice order is rating → year → colour → aspect, each fragment with its
+        // own leading " AND ". Pinned exactly like quick_filters_compose… above,
+        // because the loaders splice straight after a WHERE term.
+        set_filter_preset(FilterPreset::AllImages);
+        set_year_range(None);
+        set_aspect_filter(AspectFilter::Off);
+        assert_eq!(current_filters_sql(), "", "no filters ⇒ nothing spliced");
+
+        set_aspect_filter(AspectFilter::Square);
+        assert_eq!(current_filters_sql(), " AND i.width = i.height AND i.width > 0");
+
+        set_filter_preset(FilterPreset::AtLeastStars(2));
+        set_colour_filter(0b00001, false); // ANY of {red}
+        assert_eq!(
+            current_filters_sql(),
+            concat!(
+                " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 2 AND 5",
+                " AND ((SELECT COUNT(DISTINCT cl.color) FROM main.color_labels cl",
+                " WHERE cl.imgid = i.id AND cl.color IN (0)) >= 1)",
+                " AND i.width = i.height AND i.width > 0",
+            )
+        );
+        // Clearing the aspect rule alone drops just its fragment.
+        set_aspect_filter(AspectFilter::Off);
+        let rest = current_filters_sql();
+        assert!(rest.contains("color_labels") && !rest.contains("i.width"), "{rest}");
+        set_colour_filter(0, false);
+        set_filter_preset(FilterPreset::AllImages);
     }
 
     #[test]
@@ -2712,6 +2944,44 @@ mod tests {
         assert_eq!(run(colour_predicate(0b00101, true)), vec!["red_green.raw"]);
         // Empty mask → no fragment → the whole collection.
         assert_eq!(run(colour_predicate(0, false)).len(), 3);
+    }
+
+    #[test]
+    fn aspect_filter_keeps_only_matching_orientations_end_to_end() {
+        // Same end-to-end discipline as the colour test above, for the aspect
+        // fragment: run it through real SQLite so alias/syntax/NULL surprises
+        // surface as wrong survivors rather than a passing string comparison.
+        // Seeded with every orientation plus the failed-probe row (0×0) and a
+        // NULL-dims row — together they pin the guard semantics end to end.
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE images (id INTEGER PRIMARY KEY, filename TEXT,
+                                   width INTEGER, height INTEGER);
+             INSERT INTO images VALUES (1, 'landscape.raw', 6000, 4000);
+             INSERT INTO images VALUES (2, 'portrait.raw',  4000, 6000);
+             INSERT INTO images VALUES (3, 'square.raw',    3000, 3000);
+             INSERT INTO images VALUES (4, 'broken.raw',    0,    0);
+             INSERT INTO images VALUES (5, 'unknown.raw',   NULL, NULL);",
+        )
+        .unwrap();
+        let base = "SELECT i.filename FROM images i WHERE 1=1";
+        let run = |frag: &str| -> Vec<String> {
+            let sql = format!("{base}{frag} ORDER BY i.filename");
+            conn.prepare(&sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+
+        assert_eq!(run(aspect_predicate(AspectFilter::Landscape)), vec!["landscape.raw"]);
+        assert_eq!(run(aspect_predicate(AspectFilter::Portrait)), vec!["portrait.raw"]);
+        // Square must NOT catch the 0×0 probe failure (the w>0 guard)…
+        assert_eq!(run(aspect_predicate(AspectFilter::Square)), vec!["square.raw"]);
+        // …and Off keeps everything, broken rows included (no filter ≠ all-match).
+        assert_eq!(run(aspect_predicate(AspectFilter::Off)).len(), 5);
     }
 
     #[test]

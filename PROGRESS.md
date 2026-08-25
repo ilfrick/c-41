@@ -1977,3 +1977,55 @@ missing byte-11 alignment pad before the e-matrix (everything shifted one byte
 (caught by rewriting eval before ever compiling — the enum-Bridge special case
 for abs+Lab/Lab would ALSO have fed XYZ to a Lab-expecting tail; the field-based
 design replaced it).
+
+## 2026-08-25T02:25Z — m4-128: collection filters, first slice (aspect-ratio rule)
+
+First slice of darktable's "collection filters" expander (parity row 2.6,
+upstream src/libs/filtering.c): a collapsible "Collection filters" section in
+the left panel (between Colours and Tags, fold state persisted under
+`left_section_filters`) with one gtk4::DropDown carrying darktable's three
+stock aspect presets — square `[1;1]`, landscape `>=1.01`, portrait `<=0.99`
+(filtering.c:308-322). It drives the canonical quick-filter state through the
+same observer bus as rating/year/colour, so it composes ON TOP of whatever
+collection is active and re-renders the current view once per change.
+
+Design: darktable filters a stored REAL column `main.images.aspect_ratio`
+(snapped by dt_usable_aspect, image.c:1140); our schema has only import-time
+width/height (probe_dims), so `aspect_predicate` expresses the same intent as
+exact integer comparisons — `i.width > i.height` / `i.height > i.width` /
+`i.width = i.height AND i.width > 0`. The `w > 0` guard keeps the failed-probe
+row (0×0) from matching square; NULL dims match nothing under every arm.
+Splice order in current_filters_sql() is now rating → year → colour → aspect;
+empty fragment for Off preserves the nothing-spliced invariant. Token codec is
+bare words (`off|landscape|portrait|square`) under pref key `aspect_filter`;
+lib.rs restores it beside the colour token before any control builds and runs
+one app-level persist observer per change. AspectFilter mirrors the
+FilterPreset shape (ALL/from_index/to_index/label) so the dropdown can't drift.
+
+Documented deviations: exact integer comparison vs upstream's ±0.5 %-tolerance
+snapped float (a true 1.004 ratio stores as 1.0 there and its square preset
+catches it; we class it landscape — divergence confined to that boundary band),
+and sensor dimensions vs developed p_width/p_height (no materialised post-crop
+ratio column yet).
+
+Tests (5 new in lighttable/mod.rs, 281 c41-ui total): exact fragment strings
+per variant; token roundtrip + corruption fallbacks + index mapping; startup
+seeding contract (apply writes state without reload); composed-SQL pin with
+colour+rating proving splice order and clean single-filter drop; end-to-end
+SQLite run seeding {landscape, portrait, square, 0×0, NULL} rows asserting
+survivors per preset (the 0×0-must-not-be-square guard pinned against real
+engine semantics, not just string shapes).
+
+Review: APPROVE-WITH-FIXES (fork subagent standing in for fricktrade-architect
+— API 402 again, credits exhausted mid-launch; read-only mandate enforced).
+All findings fixed: stray duplicated doc-comment line over set_year_range;
+"exactly" overclaim in aspect_predicate doc replaced with both deviation
+sentences; missing executed-SQL test added (the end-to-end above); encoder
+signature aligned with siblings (String, not &'static str) + doc reworded.
+En-route failure kept for the record: the first ci-local attempt ran the
+script INSIDE the container (no docker there → exit 127), then three host-side
+retries all died on the output redirect because the in-container run had left
+target/m4128-cilocal.log root-owned ("Permesso negato" on truncate) — the
+"docker not found" line I kept reading was stale content from the container
+run, not a live diagnosis; rm + rerun fixed it. Full scripts/ci-local.sh
+GATE_EXIT=0 (check, clippy, test --release, release link).

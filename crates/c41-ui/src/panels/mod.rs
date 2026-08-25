@@ -43,9 +43,9 @@ struct TagPanel {
 /// in place via [`LeftPanel::refresh_tags`] after a tag is attached elsewhere
 /// (e.g. from the metadata panel), so newly-created tags and changed counts
 /// appear without restarting the app. The tag list + all tag-mutation logic live
-/// in the [`TagPanel`] field; `LeftPanel` owns the folder filter and the colour
-/// section's widgets, whose state lives in `lighttable`'s canonical quick-filter
-/// (m4-126) rather than here.
+/// in the [`TagPanel`] field; `LeftPanel` owns the folder filter and the colour /
+/// collection-filter sections' widgets, whose state lives in `lighttable`'s
+/// canonical quick-filters (m4-126/m4-128) rather than here.
 ///
 /// All fields are GObject ref-counts (plus the `TagPanel`, itself ref-counts), so
 /// `LeftPanel` is Clone and can be handed to the metadata panel's change callback
@@ -269,6 +269,55 @@ impl LeftPanel {
             true,
             db_path,
             COLOURS_SECTION_PREF_KEY,
+        ));
+
+        // ── Collection filters (m4-128) ───────────────────────────────────
+        // First slice of darktable's "collection filters" expander
+        // (src/libs/filtering.c): quick rules that compose ON TOP of whatever
+        // collection is active. Its three stock aspect presets (square /
+        // landscape / portrait) arrive as one dropdown driving the canonical
+        // `lighttable::set_aspect_filter` state through the same observer bus as
+        // the colour checks above.
+        let filters_header = section_header("Collection filters");
+        let filters_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        let labels: Vec<&str> = lighttable::AspectFilter::ALL.iter().map(|f| f.label()).collect();
+        let aspect_drop = gtk4::DropDown::from_strings(&labels);
+        aspect_drop.set_tooltip_text(Some(
+            "Filter by aspect ratio — darktable's square / landscape / portrait presets",
+        ));
+        aspect_drop.set_margin_start(12);
+        aspect_drop.set_margin_end(12);
+        aspect_drop.set_margin_top(4);
+        aspect_drop.set_margin_bottom(6);
+
+        // Seed from the restored canonical state BEFORE connecting the handler —
+        // same ordering contract as the colour checks: a programmatic write with
+        // no handler connected fires nothing.
+        aspect_drop.set_selected(lighttable::current_aspect_filter().to_index());
+
+        aspect_drop.connect_selected_notify(|dd| {
+            if lighttable::filter_sync_in_progress() { return; }
+            lighttable::set_aspect_filter(lighttable::AspectFilter::from_index(dd.selected()));
+        });
+
+        // Observer half: re-select the row matching the canonical state whenever
+        // ANY control changes a filter. Runs inside the bus's sync pass, so this
+        // write is covered by the guard and the handler above skips it.
+        {
+            let aspect_drop = aspect_drop.clone();
+            lighttable::add_filter_observer(move || {
+                aspect_drop.set_selected(lighttable::current_aspect_filter().to_index());
+            });
+        }
+
+        content.append(&collapsible_section(
+            &filters_header,
+            &[filters_sep.clone().upcast::<gtk4::Widget>(), aspect_drop.clone().upcast()]
+                .iter()
+                .collect::<Vec<_>>(),
+            true,
+            db_path,
+            FILTERS_SECTION_PREF_KEY,
         ));
 
         // ── Tags ──────────────────────────────────────────────────────────
@@ -737,6 +786,8 @@ impl TagPanel {
 const IMPORT_SECTION_PREF_KEY: &str = "left_section_import";
 const COLLECTIONS_SECTION_PREF_KEY: &str = "left_section_collections";
 const COLOURS_SECTION_PREF_KEY: &str = "left_section_colours";
+/// The m4-128 "Collection filters" section's fold state.
+const FILTERS_SECTION_PREF_KEY: &str = "left_section_filters";
 const TAGS_SECTION_PREF_KEY: &str = "left_section_tags";
 
 fn respliced_tag_path(full_name: &str, new_segment: &str) -> Option<String> {
