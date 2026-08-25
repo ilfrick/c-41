@@ -25,6 +25,11 @@ pub const THUMB_SIZE: i32 = 160;
 /// both places name the same constant rather than repeating a literal.
 const GRID_MIN_COLUMNS: u32 = 2;
 
+/// The thumb-size stepper's starting value (m4-98a). Declared here, not in
+/// `lib.rs`, because [`leave_culling`] needs it as the restore fallback — one
+/// definition can't drift into two meanings.
+pub const THUMB_COLS_DEFAULT: u32 = 6;
+
 pub type LighttableModel = gtk4::StringList;
 
 /// The lighttable's widgets, as built by [`lighttable_page`].
@@ -103,6 +108,10 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
         let filename = std::path::Path::new(&full_path)
             .file_name().and_then(|n| n.to_str()).unwrap_or(&full_path).to_string();
         label.set_label(&filename);
+        // Size + content fit BEFORE painting: cells are recycled, so the requests
+        // a previous bind left behind may belong to the other layout (THUMB_SIZE
+        // square in the file manager vs viewport-filling box in culling).
+        apply_cell_size(&thumb);
         thumb.set_paintable(gtk4::gdk::Paintable::NONE);
 
         // Stamp each async-painted widget with the identity it's now bound to,
@@ -152,8 +161,17 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
                 let _ = loader.write(&data);
                 let _ = loader.close();
                 if let Some(raw) = loader.pixbuf() {
+                    // Scale to the CURRENT cell box, preserving aspect (m4-132):
+                    // a fixed THUMB_SIZE square would sit as a blurry postage
+                    // stamp inside a viewport-filling culling cell. The box is
+                    // read once, before scaling — a resize landing mid-decode just
+                    // repaints on its own tick (see `refresh_cull_cells`).
+                    let (bw, bh) = current_cell_px();
+                    let (fw, fh) = fit_inside(
+                        raw.width(), raw.height(), bw, bh,
+                    ).unwrap_or((THUMB_SIZE, THUMB_SIZE));
                     if let Some(pb) = raw.scale_simple(
-                        THUMB_SIZE, THUMB_SIZE, gtk4::gdk_pixbuf::InterpType::Bilinear,
+                        fw, fh, gtk4::gdk_pixbuf::InterpType::Bilinear,
                     ) {
                         thumb.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&pb)));
                     }
@@ -1352,10 +1370,9 @@ impl ViewMode {
         match self {
             Self::FileManager => "File manager: scrolling grid of thumbnails",
             Self::Zoomable => "Zoomable lighttable (not available yet)",
-            // Deliberately modest: the cells are still THUMB_SIZE, so this pages
-            // through a fixed set rather than filling the viewport the way
-            // darktable's culling does. Don't promise what the layout doesn't do.
-            Self::Culling => "Culling: page through a fixed set (← →)",
+            // m4-132: the cells now fill the viewport, so this can promise what
+            // darktable's culling does — keep the wording in step with the layout.
+            Self::Culling => "Culling: compare a screenful side by side (← →)",
         }
     }
 }
@@ -1444,6 +1461,15 @@ thread_local! {
     /// handler doing it — held so it can be disconnected instead of stacking.
     static CULL_BASE_WATCH: RefCell<Option<(gtk4::gio::ListModel, glib::SignalHandlerId)>> =
         const { RefCell::new(None) };
+    /// Per-cell thumbnail box size while culling (m4-132): `(width, height)` the
+    /// cells request so `window` images fill the viewport instead of sitting in
+    /// `THUMB_SIZE` squares. `(0, 0)` = not computed (no allocation yet) — binds
+    /// fall back to [`THUMB_SIZE`] until the first resize tick fills this in.
+    static CULL_CELL_PX: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+    /// The file-manager `max_columns` (the user's chosen thumbnail size) saved
+    /// while culling pins the grid to exactly one row. `0` = nothing saved; a real
+    /// value is always ≥ 1, so the sentinel can't collide.
+    static CULL_SAVED_MAX_COLS: Cell<u32> = const { Cell::new(0) };
     /// Display-refresh closures for the filter controls (m4-97c) — see
     /// [`add_filter_observer`]. Several controls now drive one filter state, so
     /// each change has to push back out to all of them.
@@ -1571,38 +1597,104 @@ fn cull_window_size(max_columns: u32) -> u32 {
     max_columns.clamp(CULL_MIN_IMAGES, CULL_MAX_IMAGES)
 }
 
-/// A cell's natural width: the thumbnail plus the padding GTK puts around it.
-/// Empirical, and checked in the container — a 909px viewport lays out 5 columns,
-/// which is what this predicts. Only ever used to *cap* the culling window, and it
-/// errs on the wide side, so a bad estimate costs one image rather than a wrapped
-/// row.
-const CULL_CELL_WIDTH_PX: i32 = THUMB_SIZE + 20;
+/// Vertical space inside a culling cell that is *not* image: the filename caption,
+/// the star row, the colour-dot row, their spacings and the cell's CSS padding.
+/// Empirical (m4-132), same spirit as the old `CULL_CELL_WIDTH_PX` estimate: it
+/// only decides how tall the image box is, and [`gtk4::ContentFit::Contain`]
+/// letterboxes whatever doesn't fit, so being off by a few pixels costs letterbox
+/// slack, not correctness.
+const CULL_CELL_CHROME_PX: i32 = 84;
 
-/// How many cells fit across `viewport_width`, or `None` when the width isn't
-/// known yet (the grid hasn't been allocated — at startup the mode is restored
-/// before the first layout). `None` means "don't cap", which is why the caller
-/// re-runs once the viewport has a width; capping at that moment would instead pin
-/// the window to the minimum and leave it there.
-///
-/// This caps the culling window because a window bigger than the viewport wraps to
-/// a second row — and two rows is not "one screenful side by side", it is just the
-/// grid again. Pinning `min_columns` instead would force one row and *clip* it (the
-/// scroller has no horizontal bar), which is worse. Never returns less than
-/// [`CULL_MIN_IMAGES`]: below two images there is nothing to compare, so a viewport
-/// that narrow gets a wrapped row rather than a degenerate mode. Pure.
-fn cull_capacity(viewport_width: i32) -> Option<u32> {
-    (viewport_width > 0)
-        .then(|| ((viewport_width / CULL_CELL_WIDTH_PX) as u32).max(CULL_MIN_IMAGES))
+/// The thumbnail box size for a culling cell: `window` columns across the
+/// viewport, each as tall as the viewport affords after [`CULL_CELL_CHROME_PX`].
+/// `None` when any input isn't usable yet — the grid reports 0 until its first
+/// allocation, and at startup the mode is restored before that first layout (callers
+/// re-run on the resize tick, which is why this may legitimately say "not yet").
+/// Pure.
+fn cull_cell_pixels(viewport_w: i32, viewport_h: i32, window: u32) -> Option<(i32, i32)> {
+    if viewport_w <= 0 || viewport_h <= 0 || window == 0 {
+        return None;
+    }
+    let w = (viewport_w / window as i32).max(1);
+    // Never collapse below thumb size: a degenerate viewport gets THUMB_SIZE cells
+    // (which then wrap/clip like the pre-m4-132 grid did) rather than slivers.
+    let h = (viewport_h - CULL_CELL_CHROME_PX).max(THUMB_SIZE);
+    Some((w, h))
 }
 
-/// The culling window for `grid` right now: what the stepper asks for, capped by
-/// what the viewport can actually show in one row.
-fn cull_effective_window(grid: &GridView) -> u32 {
-    let requested = cull_window_size(grid.max_columns());
-    match cull_capacity(grid.width()) {
-        Some(cap) => requested.min(cap),
-        None => requested,
+/// The thumbnail box size a *bind* should request right now: the culling cell
+/// size when culling is live and measured, else the plain file-manager square.
+/// Cells are recycled, so every bind re-applies this rather than trusting the
+/// requests a previous bind left behind. Delegates to [`cell_px_for`], which
+/// carries the whole decision and is unit-tested; this wrapper only supplies the
+/// live thread-local inputs.
+fn current_cell_px() -> (i32, i32) {
+    cell_px_for(current_view_mode(), CULL_CELL_PX.with(Cell::get))
+}
+
+/// Pure core of [`current_cell_px`]: `(mode, stored culling size)` → the box a
+/// cell should request. The stored size counts only while both dimensions are
+/// usable — `(0, 0)` means "not measured yet" (no allocation), which falls back
+/// to the file-manager square rather than collapsing every cell to nothing. Pure.
+fn cell_px_for(mode: ViewMode, stored: (i32, i32)) -> (i32, i32) {
+    if mode == ViewMode::Culling && stored.0 > 0 && stored.1 > 0 {
+        stored
+    } else {
+        (THUMB_SIZE, THUMB_SIZE)
     }
+}
+
+/// Apply [`current_cell_px`] to one cell's thumbnail `Picture`, including the
+/// content fit: `Cover` in the file manager (the familiar square-cropped thumbs)
+/// but `Contain` in culling — comparison exists to judge whole frames, so cropping
+/// edges off would defeat the point.
+fn apply_cell_size(thumb: &gtk4::Picture) {
+    let (w, h) = current_cell_px();
+    thumb.set_width_request(w);
+    thumb.set_height_request(h);
+    thumb.set_content_fit(if current_view_mode() == ViewMode::Culling {
+        gtk4::ContentFit::Contain
+    } else {
+        gtk4::ContentFit::Cover
+    });
+}
+
+/// Re-apply the current cell size to every realized cell of `grid`. Called after
+/// any change to that size — mode switches, window resizes, stepper steps — since
+/// already-bound cells don't get a fresh bind just because the viewport moved.
+/// Same walk [`set_overlay_mode`] uses.
+fn refresh_cull_cells(grid: &GridView) {
+    for_each_cell_vbox(grid.upcast_ref::<gtk4::Widget>(), &mut |vbox| {
+        if let Some(thumb) = vbox.first_child().and_downcast::<gtk4::Picture>() {
+            apply_cell_size(&thumb);
+        }
+    });
+}
+
+/// Scale `(src_w, src_h)` to the largest size that fits inside `(box_w, box_h)`
+/// preserving aspect ratio (each dimension ≥ 1). Upscaling is allowed — a small
+/// source shown in a big culling cell should fill it, blurred, rather than sit in
+/// a corner. `None` when any dimension isn't positive. Pure.
+fn fit_inside(src_w: i32, src_h: i32, box_w: i32, box_h: i32) -> Option<(i32, i32)> {
+    if src_w <= 0 || src_h <= 0 || box_w <= 0 || box_h <= 0 {
+        return None;
+    }
+    let scale = f64::from(box_w) / f64::from(src_w);
+    let scale = scale.min(f64::from(box_h) / f64::from(src_h));
+    // Round, not truncate: a near-exact fit (box - ε) would otherwise land 1px
+    // under the box and read as a sliver of letterbox for no reason.
+    Some((
+        ((f64::from(src_w) * scale).round() as i32).clamp(1, box_w),
+        ((f64::from(src_h) * scale).round() as i32).clamp(1, box_h),
+    ))
+}
+
+/// The culling window for `grid` right now: what the stepper asks for. Since
+/// m4-132 the cells resize to fit the viewport, so every clamped window size fits
+/// by construction — the old "cap the window to what 180px cells could fill" logic
+/// is gone along with its wrapping failure mode.
+fn cull_effective_window(grid: &GridView) -> u32 {
+    cull_window_size(grid.max_columns())
 }
 
 /// Where a page step lands. Paging forward stops on the last whole page rather than
@@ -1700,12 +1792,29 @@ fn enter_culling(grid: &GridView) -> bool {
 
     selection.set_model(Some(&slice));
     reselect_path(&selection, previous.as_deref());
-    // NOTE: `min_columns` is deliberately NOT pinned to the window. The slice holds
-    // at most `window` items, so the grid already lays them out in one row wherever
-    // the width allows — and pinning would instead turn "wrap to a second row" into
-    // "clip", because the scroller's horizontal policy is Never and each cell
-    // requests THUMB_SIZE. The stepper's clamp (see `cull_column_bounds`) is what
-    // keeps `max_columns` and the window agreeing.
+
+    // Pin exactly one row of `window` cells sized to fill the viewport (m4-132).
+    // Pinning min=max is what makes the fill layout safe: with both bounds at the
+    // window size, the grid always lays out that single row and the *cells* absorb
+    // narrow viewports by shrinking — which is only possible because the cell size
+    // below is derived from the viewport instead of being a fixed THUMB_SIZE. The
+    // pre-m4-132 layout couldn't pin (fixed-size cells + no horizontal scrollbar
+    // turned "one row" into "clipped"), which is why it capped the window instead.
+    let had_saved = CULL_SAVED_MAX_COLS.with(|m| m.get()) != 0;
+    if !had_saved {
+        CULL_SAVED_MAX_COLS.with(|m| m.set(grid.max_columns()));
+    }
+    // Max first so the pair is never transiently inverted (min > max).
+    grid.set_max_columns(window);
+    grid.set_min_columns(window);
+
+    // Cell size from the current allocation. Before the first allocation this
+    // stores nothing (`cull_cell_pixels` → None) and binds fall back to
+    // THUMB_SIZE until the resize tick fills it in.
+    if let Some(px) = cull_cell_pixels(grid.width(), grid.height(), window) {
+        CULL_CELL_PX.with(|c| c.set(px));
+    }
+    refresh_cull_cells(grid);
     true
 }
 
@@ -1713,9 +1822,15 @@ fn leave_culling(grid: &GridView) -> bool {
     // Unconditionally, and first: a watch left connected would clamp an offset for
     // a base nobody is showing and keep it alive in a thread-local forever.
     unwatch_base_for_cull_clamp();
+    // Drop the fill sizing FIRST so the walk below restores the realized cells to
+    // their file-manager square rather than re-applying culling sizes.
+    CULL_CELL_PX.with(|c| c.set((0, 0)));
     let Some(selection) = grid.model().and_downcast::<SingleSelection>() else {
         return true; // nothing windowed, so nothing to unwind
     };
+    // Consumed only once the unwind is actually proceeding — bailing above must
+    // not throw away the manager bound the eventual real leave will restore.
+    let saved_max = CULL_SAVED_MAX_COLS.with(Cell::take);
     if let Some(slice) = selection.model().and_downcast::<gtk4::SliceListModel>() {
         if let Some(base) = slice.model() {
             let previous = selected_path(&selection);
@@ -1723,7 +1838,13 @@ fn leave_culling(grid: &GridView) -> bool {
             reselect_path(&selection, previous.as_deref());
         }
     }
+    // Restore both column bounds: enter pinned max too (the file manager keeps its
+    // own chosen thumb size across a culling visit, like darktable). The `.max`
+    // covers unwinding without a matching enter (nothing saved): fall back to the
+    // startup default rather than a degenerate bound.
     grid.set_min_columns(GRID_MIN_COLUMNS);
+    grid.set_max_columns(saved_max.max(THUMB_COLS_DEFAULT));
+    refresh_cull_cells(grid);
     true
 }
 
@@ -1792,15 +1913,15 @@ pub fn cull_key_direction(keyval: gtk4::gdk::Key) -> Option<bool> {
     }
 }
 
-/// Re-apply the culling window after the thumb-size stepper changed `max_columns`
-/// (the stepper doubles as the "how many images to compare" control). A no-op
-/// outside culling, and a no-op *inside* it when the window size hasn't actually
-/// changed.
+/// Re-fit culling to the current viewport and stepper value: re-pins the column
+/// bounds, recomputes the per-cell fill size (`cull_cell_pixels`) onto realized
+/// cells, and resizes the installed window when the count changed. Runs on every
+/// viewport resize tick (both page-size notifies) as well as after stepper steps,
+/// so most invocations only refresh cell pixels. A no-op outside culling.
 ///
 /// Resizes the installed `SliceListModel` in place rather than building a new one:
 /// `SingleSelection::set_model` resets the selection to index 0, so rebuilding on
-/// every ± click would throw away the user's pick — including on the clicks that
-/// change nothing because the stepper is past the culling bounds.
+/// every ± click would throw away the user's pick.
 pub fn cull_resync(grid: &GridView) {
     if current_view_mode() != ViewMode::Culling {
         return;
@@ -1816,6 +1937,21 @@ pub fn cull_resync(grid: &GridView) {
         return;
     };
     let window = cull_effective_window(grid);
+
+    // Keep the fill sizing in sync BEFORE the early return below: this runs on
+    // every viewport resize (the hadjustment/vadjustment page-size ticks), and a
+    // resize that doesn't change the window count still changes the cell pixels.
+    // (No save of `max_columns` here — by this point `enter_culling` has always
+    // run and captured the file-manager bound; reading it now would read the
+    // pinned value instead.)
+    // Max first so the pair is never transiently inverted (min > max).
+    grid.set_max_columns(window);
+    grid.set_min_columns(window);
+    if let Some(px) = cull_cell_pixels(grid.width(), grid.height(), window) {
+        CULL_CELL_PX.with(|c| c.set(px));
+    }
+    refresh_cull_cells(grid);
+
     if window == slice.size() {
         return;
     }
@@ -1832,21 +1968,15 @@ pub fn cull_resync(grid: &GridView) {
 /// `(images on screen, lowest, highest)`. `None` outside culling, meaning "use the
 /// stepper's own range".
 ///
-/// The first element is the window **actually on screen**, not what `max_columns`
-/// asks for, and the last is capped by what the viewport fits. Both matter: with
-/// the raw property the stepper would have a dead zone — steps past the culling
-/// maximum, or past what fits, would count up on the label while nothing on screen
-/// moved. A control that looks live and isn't is this repo's recurring bug shape.
-///
-/// Note this deliberately does *not* rewrite `max_columns` to the capped value:
-/// a temporarily narrow window would then permanently overwrite the user's chosen
-/// thumb size, instead of it coming back when there is room again.
+/// Since m4-132 every clamped window size is fully visible — the cells resize to
+/// fill the viewport instead of wrapping — so the window always equals what the
+/// stepper asked for and the range is simply the comparison-set bounds. The old
+/// viewport-cap dead zone (steps that counted up on the label while nothing moved)
+/// is gone by construction; a control that looks live and isn't is this repo's
+/// recurring bug shape.
 pub fn cull_stepper_state(grid: &GridView) -> Option<(u32, u32, u32)> {
-    (current_view_mode() == ViewMode::Culling).then(|| {
-        let cap = cull_capacity(grid.width()).unwrap_or(CULL_MAX_IMAGES);
-        let highest = CULL_MAX_IMAGES.min(cap).max(CULL_MIN_IMAGES);
-        (cull_effective_window(grid), CULL_MIN_IMAGES, highest)
-    })
+    (current_view_mode() == ViewMode::Culling)
+        .then(|| (cull_effective_window(grid), CULL_MIN_IMAGES, CULL_MAX_IMAGES))
 }
 
 /// Switch the lighttable layout: write the mode, then reconfigure `grid` for it. An
@@ -2687,8 +2817,9 @@ mod tests {
                 path_write_lock, rating_filter_token_for, rating_predicate, OverlayMode,
                 apply_view_mode_token, current_view_mode, parse_view_mode_token,
                 store_view_mode, view_mode_switcher_tooltip, view_mode_token_for, ViewMode,
-                cull_capacity, cull_clamp_offset, cull_entry_offset, cull_key_direction,
-                cull_page_offset, cull_window_size, CULL_CELL_WIDTH_PX,
+                cull_cell_pixels, cull_clamp_offset, cull_entry_offset, cull_key_direction,
+                cull_page_offset, cull_window_size, fit_inside, CULL_CELL_CHROME_PX,
+                THUMB_SIZE,
                 CULL_MAX_IMAGES, CULL_MIN_IMAGES,
                 RatingCompare, SortOrder, AspectFilter, COLOR_COUNT, COLOR_DIM_HEX, COLOR_HEX,
                 GRID_CAP};
@@ -3357,28 +3488,65 @@ mod tests {
     }
 
     #[test]
-    fn cull_capacity_caps_the_window_to_one_row() {
-        // An unallocated grid reports width 0: the cap is *unknown*, not minimal —
-        // capping there would pin the window to two images and leave it pinned,
-        // since the mode is restored before the first layout.
-        assert_eq!(cull_capacity(0), None);
-        assert_eq!(cull_capacity(-1), None);
-        // The real container viewport (909px) fits 5 columns, which is what the
-        // grid itself lays out at that width.
-        assert_eq!(cull_capacity(909), Some(5));
-        // Narrower than one cell still asks for two: culling one image is not
-        // culling, so a viewport that small wraps rather than degenerating.
-        assert_eq!(cull_capacity(10), Some(CULL_MIN_IMAGES));
-        // Whatever it returns fits: `cap * cell width` never exceeds the viewport
-        // (except at the two-image floor, which is deliberate).
-        for w in [200i32, 400, 909, 1600, 3840] {
-            let cap = cull_capacity(w).expect("allocated");
-            assert!(
-                cap == CULL_MIN_IMAGES || (cap as i32) * CULL_CELL_WIDTH_PX <= w,
-                "capacity {cap} does not fit in {w}px"
-            );
-        }
+    fn cull_cell_pixels_fill_the_viewport() {
+        // An unallocated grid reports 0 on either axis: "not yet known", not a
+        // degenerate size — callers re-run on the resize tick.
+        assert_eq!(cull_cell_pixels(0, 600, 4), None);
+        assert_eq!(cull_cell_pixels(909, 0, 4), None);
+        assert_eq!(cull_cell_pixels(-1, 600, 4), None);
+        assert_eq!(cull_cell_pixels(909, 600, 0), None);
+        // The real container viewport: four images across 909px ⇒ ~227px columns,
+        // and the height is what's left after the metadata rows' chrome.
+        let (w, h) = cull_cell_pixels(909, 700, 4).expect("allocated");
+        assert_eq!(w, 227); // 909 / 4, truncated
+        assert_eq!(h, 700 - CULL_CELL_CHROME_PX);
+        // Width always divides down to at least a pixel per cell...
+        let (w2, _) = cull_cell_pixels(3, 600, CULL_MAX_IMAGES).expect("allocated");
+        assert_eq!(w2, 1); // 3 / 8 truncates to 0 — clamped so a cell still draws
+        // ...and a degenerate viewport never collapses below thumb size.
+        let (_, h3) = cull_cell_pixels(400, 20, 2).expect("allocated");
+        assert_eq!(h3, THUMB_SIZE);
     }
+
+    #[test]
+    fn fit_inside_preserves_aspect_ratio() {
+        // Landscape into a square-ish box: width is the binding side.
+        assert_eq!(fit_inside(3000, 2000, 200, 200), Some((200, 133)));
+        // Portrait: height binds.
+        assert_eq!(fit_inside(2000, 3000, 200, 200), Some((133, 200)));
+        // Rectangular box, exact fit along one axis.
+        assert_eq!(fit_inside(900, 600, 450, 500), Some((450, 300)));
+        // Upscaling is allowed — a small source fills a big culling cell.
+        assert_eq!(fit_inside(100, 50, 400, 400), Some((400, 200)));
+        // Degenerate inputs are rejected rather than dividing by zero.
+        assert_eq!(fit_inside(0, 10, 10, 10), None);
+        assert_eq!(fit_inside(10, 10, 0, 10), None);
+        assert_eq!(fit_inside(-1, 10, 10, 10), None);
+    }
+
+    #[test]
+    fn cell_px_follows_the_mode_and_falls_back_until_measured() {
+        use super::cell_px_for;
+        let measured = (454, 616);
+        // Live culling with a real measurement: fill the viewport.
+        assert_eq!(cell_px_for(ViewMode::Culling, measured), measured);
+        // Culling before the first allocation — the (0,0) "not yet" sentinel
+        // must NOT become the requests of every cell; fall back to the square.
+        assert_eq!(cell_px_for(ViewMode::Culling, (0, 0)), (THUMB_SIZE, THUMB_SIZE));
+        // A half-measured state is just as unusable as an unmeasured one.
+        assert_eq!(cell_px_for(ViewMode::Culling, (454, 0)), (THUMB_SIZE, THUMB_SIZE));
+        // Any other layout ignores the stored size entirely — the recycled cells
+        // go back to their file-manager square on leave.
+        assert_eq!(cell_px_for(ViewMode::FileManager, measured), (THUMB_SIZE, THUMB_SIZE));
+        // Unavailable mode included: the decision keys off "is culling", nothing else.
+        assert_eq!(cell_px_for(ViewMode::Zoomable, measured), (THUMB_SIZE, THUMB_SIZE));
+    }
+
+    // Note: `cull_effective_window` has no dedicated test since m4-132 — its body
+    // is a one-line delegation to `cull_window_size(max_columns)` (the viewport cap
+    // is gone), and it takes a display-bound `GridView`, so there is nothing to
+    // assert beyond what `cull_window_size_tracks_the_stepper_within_bounds`
+    // already covers.
 
     #[test]
     fn cull_entry_offset_opens_on_the_selected_image_page() {

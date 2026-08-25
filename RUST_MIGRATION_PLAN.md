@@ -387,20 +387,27 @@ C FFI trampolines for tags. 61 DB tests passing.
           selection-reading closure captures `lt_model` any more, which makes the
           bug class unrepresentable rather than fixed. `connect_activate` resolves
           through `gv.model()` for the same reason.
-        - **The window is capped by what the viewport can show** in one row
-          (`cull_capacity`), because a window wider than the viewport wraps — and
-          two rows is not "one screenful side by side", it is the grid again.
-          Pinning `min_columns` to force one row was tried and rejected: with the
-          scroller's horizontal policy `Never` it converts wrapping into
-          *clipping*. Capacity is `None` while the grid is unallocated (the mode is
-          restored before the first layout), and the scroller's horizontal
-          page-size notify re-fits on allocation and on every resize.
-        - **The thumb stepper doubles as the "how many images" control**, and shows
-          the count **actually on screen** rather than `max_columns` — a narrow
-          viewport holds fewer than asked, and a label counting past what changed
-          would be exactly the inert-control shape this repo keeps hitting. It
-          deliberately does *not* write the capped value back, so a temporarily
-          narrow window doesn't permanently overwrite the chosen thumb size.
+        - **The cells fill the viewport** (amended 2026-08-25, m4-132 — this
+          reverses the original slice's design, kept here because the reversal is
+          the lesson): culling pins `min_columns = max_columns = window` and sizes
+          each cell to `viewport/window` wide by viewport-minus-metadata-chrome
+          tall (`cull_cell_pixels`), so every clamped window size fits one row by
+          construction. The original slice did the opposite — fixed `THUMB_SIZE`
+          cells with the window capped by `cull_capacity`, because pinning bounds
+          with fixed-size cells turned wrapping into clipping — which shipped
+          culling as "a page of postage stamps" rather than darktable's
+          comparison view. The fix that made pinning safe was deriving cell size
+          from the viewport instead of fixing it; the cap, its dead-zone stepper
+          behaviour, and `CULL_CELL_WIDTH_PX` are gone. The scroller's horizontal
+          page-size notify re-fits on allocation and on every resize; since m4-132
+          the vertical page-size notify does too (cell height follows the
+          viewport). The file manager keeps its own `max_columns`: enter saves it,
+          leave restores it.
+        - **The thumb stepper doubles as the "how many images" control**, showing
+          the comparison-set size. Under the original capped design it displayed
+          the count actually on screen because a narrow viewport held fewer than
+          asked; with viewport-fill that dead zone is gone by construction — every
+          step in the range lays out fully — so the label simply reports the window.
         - Selection is carried across every model swap (enter, leave), the entry
           offset is derived from the selected image's page (darktable's behaviour),
           `cull_resync` mutates the installed slice instead of rebuilding it (a

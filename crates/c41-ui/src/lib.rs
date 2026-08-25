@@ -31,10 +31,9 @@ pub const DEFAULT_HEIGHT: i32 = 800;
 /// Lighttable thumb-size control (bottom toolbar, m4-98a): the value is the grid's
 /// *upper* column bound — fewer columns ⇒ larger thumbnails. It caps columns rather
 /// than fixing them (`min_columns` stays low) so a narrow framebuffer still fits
-/// the row instead of clipping. `DEFAULT` mirrors darktable's ~mid density.
+/// the row instead of clipping.
 const THUMB_COLS_MIN:     u32 = 2;
 const THUMB_COLS_MAX:     u32 = 12;
-const THUMB_COLS_DEFAULT: u32 = 6;
 
 /// `darkroom_ui_prefs` key under which the lighttable rating filter (comparator +
 /// floor) is persisted across sessions (m4-98d). The value is the compact token
@@ -1125,7 +1124,7 @@ fn build_main_window(app: &Application) {
             let grid = lt_grid.clone();
             // The grid's own `max-columns` property is the single source of truth
             // for the current thumb size — no separate counter to keep in sync.
-            grid.set_max_columns(THUMB_COLS_DEFAULT);
+            grid.set_max_columns(lighttable::THUMB_COLS_DEFAULT);
 
             // Thumb-size stepper (m4-98a). Built here, ahead of the controls that
             // sit to its left, because the view-mode switcher has to refresh it:
@@ -1135,7 +1134,7 @@ fn build_main_window(app: &Application) {
                 .icon_name("zoom-out-symbolic")
                 .tooltip_text("Larger thumbnails (fewer per row)")
                 .build();
-            let count = gtk4::Label::new(Some(&THUMB_COLS_DEFAULT.to_string()));
+            let count = gtk4::Label::new(Some(&lighttable::THUMB_COLS_DEFAULT.to_string()));
             count.set_width_chars(2);
             let zoom_in = gtk4::Button::builder()
                 .icon_name("zoom-in-symbolic")
@@ -1154,15 +1153,15 @@ fn build_main_window(app: &Application) {
                 let zoom_out = zoom_out.clone();
                 let zoom_in = zoom_in.clone();
                 std::rc::Rc::new(move || {
-                    // Re-fit the culling window first — it depends on the viewport
-                    // width, so this is what fits culling after the first
-                    // allocation and after a resize. Returns immediately when the
-                    // size is already right, and is a no-op in the file manager.
+                    // Re-fit the culling window + cell sizes first — both depend
+                    // on the viewport, so this is what fits culling after the
+                    // first allocation and after every resize (width AND height,
+                    // since m4-132). No-op in the file manager.
                     lighttable::cull_resync(&grid);
-                    // In culling the label is the number of images ACTUALLY on
-                    // screen, which a narrow viewport can hold below what the
-                    // stepper asks for; `max_columns` is left alone so the chosen
-                    // thumb size comes back when there is room again.
+                    // In culling the label is the comparison-set size; since
+                    // m4-132 every step in the range is fully visible (cells
+                    // shrink to fit), so it always matches what the stepper asked
+                    // for — no dead zone to explain away.
                     let (n, lo, hi) = lighttable::cull_stepper_state(&grid)
                         .unwrap_or((grid.max_columns(), THUMB_COLS_MIN, THUMB_COLS_MAX));
                     count.set_label(&n.to_string());
@@ -1172,12 +1171,18 @@ fn build_main_window(app: &Application) {
             };
             refresh(); // sync initial label + sensitivity to the default
 
-            // Re-fit when the viewport width changes. At startup the view mode is
+            // Re-fit when the viewport changes. At startup the view mode is
             // restored before the grid is allocated, so culling's window has no
-            // width to fit to yet; the scroller's horizontal page-size is the
-            // viewport width and notifies on allocation as well as on every later
-            // resize, which covers both cases with one signal.
+            // size to fit to yet; the scroller's page-sizes are the viewport
+            // dimensions and notify on allocation as well as on every later
+            // resize. Two hooks since m4-132: culling cells now derive their
+            // HEIGHT from the viewport too, and a height-only change (e.g. a
+            // header/toolbar toggling) moves only the vertical adjustment.
             scroll.hadjustment().connect_page_size_notify({
+                let refresh = refresh.clone();
+                move |_| refresh()
+            });
+            scroll.vadjustment().connect_page_size_notify({
                 let refresh = refresh.clone();
                 move |_| refresh()
             });
@@ -1341,10 +1346,10 @@ fn build_main_window(app: &Application) {
             // manager), and clamps into whichever range the current mode uses.
             let step = |grid: gtk4::GridView, refresh: std::rc::Rc<dyn Fn()>, up: bool| {
                 move |_: &gtk4::Button| {
-                    // Step from what is on screen, not from the raw property: in
-                    // culling a narrow viewport can hold the window below
-                    // `max_columns`, and stepping from the property would then need
-                    // several clicks before anything visibly changed.
+                    // Step within whichever range the current mode uses — in
+                    // culling that's the comparison-set bounds, and since m4-132
+                    // every step there is fully visible (the cells shrink to fit,
+                    // so window count and `max_columns` always agree).
                     let (cur, lo, hi) = lighttable::cull_stepper_state(&grid)
                         .unwrap_or((grid.max_columns(), THUMB_COLS_MIN, THUMB_COLS_MAX));
                     let n = if up { cur.saturating_add(1) } else { cur.saturating_sub(1) };

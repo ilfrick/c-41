@@ -8,11 +8,22 @@
 //! session that opens straight into a single image is a lighttable that looks
 //! broken) and teaching the switcher a state that isn't a layout.
 //!
-//! **Coverage limit:** images are decoded with gdk-pixbuf, so this shows exactly
-//! what the grid's thumbnails show. Camera raws gdk-pixbuf can't read (`.ORF` and
-//! friends, which render as empty grid cells today) get a "no preview available"
-//! message rather than a blank page. Routing raws through the darkroom view's
-//! pipeline is the follow-up; it would have made this increment un-shippable.
+//! **Decode paths (m4-132):** raster files go through gdk-pixbuf — the same
+//! source the grid's thumbnails show. Camera raws (anything
+//! [`crate::raw_preview::is_raw_path`](crate::raw_preview) claims) decode instead
+//! through the darkroom view's raw pipeline pieces — `raw_preview::
+//! decode_raw_preview` (demosaic + white balance + linear downscale) followed by
+//! [`render_linear_to_srgb8`](crate::preview::render_linear_to_srgb8) at *default*
+//! params — so an `.ORF` renders as the image itself, matching what the darkroom
+//! view shows before any edit ("as shot"), rather than the old "no preview
+//! available" message. No shared-module lift was needed: those two stages were
+//! already free-standing functions outside the darkroom module, unlike the
+//! darkroom's live-preview state (`darkroom::BaseImage` and friends), which is
+//! entangled with per-image editing state a lighttable preview deliberately
+//! doesn't have.
+//!
+//! Still true: the *grid* cells stay gdk-pixbuf-only, so raws keep their empty
+//! thumbnails there; the full preview is where they become visible.
 //!
 //! **The grid is not unmapped.** The preview is an `Overlay` child *over* the
 //! grid, not a `Stack` page beside it. That is load-bearing rather than
@@ -191,6 +202,66 @@ impl FullPreview {
         let target = self.decode_target();
         let picture = self.picture.clone();
         let status = self.status.clone();
+
+        if crate::raw_preview::is_raw_path(&path) {
+            // Raw branch (m4-132): demosaic + white-balance + linear downscale,
+            // then sRGB-encode at default ("as shot") params — everything
+            // off-thread because every intermediate (`RawPreview`, the packed
+            // RGB bytes) is an owned `Send` buffer. A raw demosaic can take
+            // seconds; say so instead of leaving a silent letterbox. Both awaits
+            // below are followed by the same stale guard the pixbuf path uses,
+            // and each arm returns before the other runs, so exactly one decode
+            // can ever paint.
+            self.show_status(&format!(
+                "Decoding {}…",
+                file_display_name(&path)
+            ));
+            glib::spawn_future_local(async move {
+                let p = path.clone();
+                let frame = gtk4::gio::spawn_blocking(move || {
+                    // `target` is already clamped ≥ FULL_PREVIEW_MIN_DIM by
+                    // `decode_target`, so it converts to the decoder's `max_dim`
+                    // as-is.
+                    crate::raw_preview::decode_raw_preview(&p, target as usize).map(|rp| {
+                        let bytes = crate::preview::render_linear_to_srgb8(
+                            &rp.pixels,
+                            rp.width,
+                            rp.height,
+                            &crate::preview::PreviewParams::default(),
+                        );
+                        (rp.width, rp.height, bytes)
+                    })
+                })
+                .await
+                .ok()
+                .flatten();
+                // NOTE: the stale guard covers everything below only because
+                // there is no further `await` — do not add one under this line
+                // without moving the check with it.
+                if picture.widget_name() != path {
+                    return; // the user moved on while this decoded
+                }
+                match frame {
+                    Some((w, h, bytes)) => {
+                        // Same 3-channel upload the darkroom preview uses (see
+                        // `darkroom::cached_render_texture`): tightly-packed RGB8
+                        // straight out of the sRGB encode.
+                        let tex = gtk4::gdk::MemoryTexture::new(
+                            w as i32,
+                            h as i32,
+                            gtk4::gdk::MemoryFormat::R8g8b8,
+                            &glib::Bytes::from_owned(bytes),
+                            w * 3,
+                        );
+                        picture.set_paintable(Some(&tex));
+                        status.set_visible(false);
+                    }
+                    None => show_unavailable(&picture, &status, &path),
+                }
+            });
+            return;
+        }
+
         glib::spawn_future_local(async move {
             // Only the *read* goes off-thread: `Pixbuf` is not `Send`, so it can't
             // cross back from a worker (the grid's thumbnail loader splits the
@@ -235,21 +306,7 @@ impl FullPreview {
                     picture.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&pb)));
                     status.set_visible(false);
                 }
-                None => {
-                    // Raw formats gdk-pixbuf can't read (the grid shows an empty
-                    // cell for these too) and unreadable files land here. Say so:
-                    // a blank preview with no explanation is indistinguishable
-                    // from a hang.
-                    picture.set_paintable(gtk4::gdk::Paintable::NONE);
-                    status.set_label(&format!(
-                        "No preview available for {}",
-                        std::path::Path::new(&path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(&path)
-                    ));
-                    status.set_visible(true);
-                }
+                None => show_unavailable(&picture, &status, &path),
             }
         });
     }
@@ -262,6 +319,31 @@ impl FullPreview {
         let physical = logical.saturating_mul(self.picture.scale_factor().max(1));
         physical.clamp(FULL_PREVIEW_MIN_DIM, FULL_PREVIEW_MAX_DIM)
     }
+
+    /// Show a transient message over the (still-empty) image area — used while a
+    /// raw demosaic runs, which can take seconds on a 20MP file.
+    fn show_status(&self, text: &str) {
+        self.status.set_label(text);
+        self.status.set_visible(true);
+    }
+}
+
+/// The failure paint shared by both decode branches: clear the picture and say
+/// what couldn't be shown. A blank preview with no explanation is
+/// indistinguishable from a hang.
+fn show_unavailable(picture: &gtk4::Picture, status: &gtk4::Label, path: &str) {
+    picture.set_paintable(gtk4::gdk::Paintable::NONE);
+    status.set_label(&format!("No preview available for {}", file_display_name(path)));
+    status.set_visible(true);
+}
+
+/// The file's bare name for user-facing messages, falling back to the whole path
+/// when it isn't valid UTF-8.
+fn file_display_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
 }
 
 /// The index a ← / → step lands on, staying inside `0..n_items`. `None` when there
