@@ -37,6 +37,7 @@
 #include "gui/presets.h"
 #include "gui/color_picker_proxy.h"
 #include "iop/iop_api.h"
+#include "rust_ffi/darkroom_core.h"
 
 //#include <gtk/gtk.h>
 #include <stdlib.h>
@@ -628,319 +629,34 @@ void process(dt_iop_module_t *self,
   dt_colormatrix_t output_matrix_trans;
   dt_colormatrix_transpose(output_matrix_trans, output_matrix);
 
-  const float *const restrict in = DT_IS_ALIGNED(((const float *const restrict)ivoid));
-  float *const restrict out = DT_IS_ALIGNED(((float *const restrict)ovoid));
-  const float *const restrict gamut_LUT = DT_IS_ALIGNED(((const float *const restrict)d->gamut_LUT));
-
-  const float *const restrict global = DT_IS_ALIGNED_PIXEL((const float *const restrict)d->global);
-  const float *const restrict highlights = DT_IS_ALIGNED_PIXEL((const float *const restrict)d->highlights);
-  const float *const restrict shadows = DT_IS_ALIGNED_PIXEL((const float *const restrict)d->shadows);
-  const float *const restrict midtones = DT_IS_ALIGNED_PIXEL((const float *const restrict)d->midtones);
-
-  const float *const restrict chroma = DT_IS_ALIGNED_PIXEL((const float *const restrict)d->chroma);
-  const float *const restrict saturation = DT_IS_ALIGNED_PIXEL((const float *const restrict)d->saturation);
-  const float *const restrict brilliance = DT_IS_ALIGNED_PIXEL((const float *const restrict)d->brilliance);
-
   const gint mask_display
       = dt_pipe_is_full(piece->pipe) && self->dev->gui_attached
          && g && g->mask_display;
 
   // pixel size of the checker background
   const size_t checker_1 = (mask_display) ? DT_PIXEL_APPLY_DPI(d->checker_size) : 0;
-  const size_t checker_2 = 2 * checker_1;
 
-  const float L_white = Y_to_dt_UCS_L_star(d->white_fulcrum);
-
-  const float DT_ALIGNED_ARRAY hue_rotation_matrix[2][2] = {
-    { cosf(d->hue_angle), -sinf(d->hue_angle) },
-    { sinf(d->hue_angle),  cosf(d->hue_angle) },
-  };
+  const float *const restrict in = DT_IS_ALIGNED(((const float *const restrict)ivoid));
+  float *const restrict out = DT_IS_ALIGNED(((float *const restrict)ovoid));
 
   const size_t npixels = (size_t)roi_out->height * roi_out->width;
-  const size_t out_width = roi_out->width;
 
-  DT_OMP_FOR()
-  for(size_t k  = 0; k < 4 * npixels; k += 4)
-  {
-    // clip pipeline RGB
-    dt_aligned_pixel_t RGB;
-    copy_pixel(RGB, in + k);
-    dt_vector_clipneg(RGB);
-
-    // go to CIE 2006 LMS D65
-    dt_aligned_pixel_t LMS;
-    dt_apply_transposed_color_matrix(RGB, input_matrix_trans, LMS);
-
-    /* The previous line is equivalent to :
-      // go to CIE 1931 XYZ 2° D50
-      dot_product(RGB, RGB_to_XYZ, XYZ_D50); // matrice product
-
-      // chroma adapt D50 to D65
-      XYZ_D50_to_65(XYZ_D50, XYZ_D65); // matrice product
-
-      // go to CIE 2006 LMS
-      XYZ_to_LMS(XYZ_D65, LMS); // matrice product
-    */
-
-    // go to Filmlight Yrg
-    dt_aligned_pixel_t Yrg = { 0.f };
-    LMS_to_Yrg(LMS, Yrg);
-
-    // go to Ych
-    dt_aligned_pixel_t Ych = { 0.f };
-    Yrg_to_Ych(Yrg, Ych);
-
-    // Sanitize input : no negative luminance
-    Ych[0] = MAX(Ych[0], 0.f);
-
-    // Opacities for luma masks
-    dt_aligned_pixel_t opacities;
-    dt_aligned_pixel_t opacities_comp;
-    opacity_masks(powf(Ych[0], 0.4101205819200422f), // center middle grey in 50 %
-                  d->shadows_weight, d->highlights_weight, d->midtones_weight,
-                  d->mask_grey_fulcrum, opacities, opacities_comp);
-
-    // Hue shift - do it now because we need the gamut limit at output hue right after
-    // The hue rotation is implemented as a matrix multiplication.
-    const float cos_h = Ych[2];
-    const float sin_h = Ych[3];
-    Ych[2] = hue_rotation_matrix[0][0] * cos_h + hue_rotation_matrix[0][1] * sin_h;
-    Ych[3] = hue_rotation_matrix[1][0] * cos_h + hue_rotation_matrix[1][1] * sin_h;
-
-    // Linear chroma : distance to achromatic at constant luminance in scene-referred
-    const float chroma_boost = d->chroma_global + scalar_product(opacities, chroma);
-    const float vibrance = d->vibrance * (1.0f - powf(Ych[1], fabsf(d->vibrance)));
-    const float chroma_factor = MAX(1.f + chroma_boost + vibrance, 0.f);
-    Ych[1] *= chroma_factor;
-
-    // clip chroma at constant hue and Y if needed
-    gamut_check_Yrg(Ych);
-
-    // go to Yrg for real
-    Ych_to_Yrg(Ych, Yrg);
-
-    // Go to LMS
-    Yrg_to_LMS(Yrg, LMS);
-
-    // Go to Filmlight RGB
-    LMS_to_gradingRGB(LMS, RGB);
-
-    // Color balance
-    for_four_channels(c, aligned(RGB, global))
-    {
-      // global : offset
-      RGB[c] += global[c];
-    }
-    for_four_channels(c, aligned(RGB, opacities, opacities_comp, shadows, midtones, highlights:16))
-    {
-      //  highlights, shadows : 2 slopes with masking
-      RGB[c] *= opacities_comp[2] * (opacities_comp[0] + opacities[0] * shadows[c]) + opacities[2] * highlights[c];
-      // factorization of : (RGB[c] * (1.f - alpha) + RGB[c] * d->shadows[c] * alpha) * (1.f - beta)  + RGB[c] * d->highlights[c] * beta;
-    }
-    dt_aligned_pixel_t sign;
-    for_each_channel(c)
-      sign[c] = (RGB[c] < 0.f) ? -1.f : 1.f;
-    dt_aligned_pixel_t abs_RGB;
-    for_each_channel(c)
-      abs_RGB[c] = fabsf(RGB[c]);
-    dt_aligned_pixel_t scaled_RGB;
-    for_each_channel(c)
-      scaled_RGB[c] = abs_RGB[c] /d->white_fulcrum;
-    dt_vector_powf(scaled_RGB, midtones, RGB);
-    for_each_channel(c)
-      RGB[c] = RGB[c] * sign[c] * d->white_fulcrum;
-
-    // for the non-linear ops we need to go in Yrg again because RGB doesn't preserve color
-    gradingRGB_to_LMS(RGB, LMS);
-    LMS_to_Yrg(LMS, Yrg);
-
-    // Y midtones power (gamma)
-    Yrg[0] = powf(MAX(Yrg[0] / d->white_fulcrum, 0.f), d->midtones_Y) * d->white_fulcrum;
-
-    // Y fulcrumed contrast
-    Yrg[0] = d->grey_fulcrum * powf(Yrg[0] / d->grey_fulcrum, d->contrast);
-
-    Yrg_to_LMS(Yrg, LMS);
-    dt_aligned_pixel_t XYZ_D65 = { 0.f };
-    LMS_to_XYZ(LMS, XYZ_D65);
-
-    // Perceptual color adjustments
-    if(d->saturation_formula == DT_COLORBALANCE_SATURATION_JZAZBZ)
-    {
-      dt_aligned_pixel_t Jab = { 0.f };
-      dt_XYZ_2_JzAzBz(XYZ_D65, Jab);
-
-      // Convert to JCh
-      float JC[2] = { Jab[0], dt_fast_hypotf(Jab[1], Jab[2]) };   // brightness/chroma vector
-      const float h = atan2f(Jab[2], Jab[1]);  // hue : (a, b) angle
-
-      // Project JC onto S, the saturation eigenvector, with orthogonal vector O.
-      // Note : O should be = (C * cosf(T) - J * sinf(T)) = 0 since S is the eigenvector,
-      // so we add the chroma projected along the orthogonal axis to get some control value
-      const float T = atan2f(JC[1], JC[0]); // angle of the eigenvector over the hue plane
-      const float sin_T = sinf(T);
-      const float cos_T = cosf(T);
-      const float DT_ALIGNED_PIXEL M_rot_dir[2][2] = { {  cos_T,  sin_T },
-                                                      { -sin_T,  cos_T } };
-      const float DT_ALIGNED_PIXEL M_rot_inv[2][2] = { {  cos_T, -sin_T },
-                                                      {  sin_T,  cos_T } };
-      float SO[2];
-
-      // brilliance & Saturation : mix of chroma and luminance
-      const float boosts[2] = { 1.f + d->brilliance_global + scalar_product(opacities, brilliance),     // move in S direction
-                                d->saturation_global + scalar_product(opacities, saturation) }; // move in O direction
-
-      SO[0] = JC[0] * M_rot_dir[0][0] + JC[1] * M_rot_dir[0][1];
-      SO[1] = SO[0] * MIN(MAX(T * boosts[1], -T), M_PI_2f - T);
-      SO[0] = MAX(SO[0] * boosts[0], 0.f);
-
-      // Project back to JCh, that is rotate back of -T angle
-      JC[0] = MAX(SO[0] * M_rot_inv[0][0] + SO[1] * M_rot_inv[0][1], 0.f);
-      JC[1] = MAX(SO[0] * M_rot_inv[1][0] + SO[1] * M_rot_inv[1][1], 0.f);
-
-      // Gamut mapping
-      const float out_max_sat_h = lookup_gamut(gamut_LUT, h);
-      // if JC[0] == 0.f, the saturation / luminance ratio is infinite - assign the largest practical value we have
-      const float sat = (JC[0] > 0.f) ? soft_clip(JC[1] / JC[0], 0.8f * out_max_sat_h, out_max_sat_h)
-                                      : out_max_sat_h;
-      const float max_C_at_sat = JC[0] * sat;
-      // if sat == 0.f, the chroma is zero - assign the original luminance because there's no need to gamut map
-      const float max_J_at_sat = (sat > 0.f) ? JC[1] / sat : JC[0];
-      JC[0] = (JC[0] + max_J_at_sat) / 2.f;
-      JC[1] = (JC[1] + max_C_at_sat) / 2.f;
-
-      // Gamut-clip in Jch at constant hue and lightness,
-      // e.g. find the max chroma available at current hue that doesn't
-      // yield negative L'M'S' values, which will need to be clipped during conversion
-      const float cos_H = cosf(h);
-      const float sin_H = sinf(h);
-
-      const float d0 = 1.6295499532821566e-11f;
-      const float dd = -0.56f;
-      float Iz = JC[0] + d0;
-      Iz /= (1.f + dd - dd * Iz);
-      Iz = MAX(Iz, 0.f);
-
-      static const dt_colormatrix_t AI_trans
-          = { {  1.0f,                 1.0f,                                1.0f, 0.0f },
-              {  0.1386050432715393f, -0.1386050432715393f, -0.0960192420263190f, 0.0f },
-              {  0.0580473161561189f, -0.0580473161561189f, -0.8118918960560390f, 0.0f } };
-
-      // Do a test conversion to L'M'S'
-      const dt_aligned_pixel_t IzAzBz = { Iz, JC[1] * cos_H, JC[1] * sin_H, 0.f };
-      dt_apply_transposed_color_matrix(IzAzBz, AI_trans, LMS);
-
-      // Clip chroma
-      float max_C = JC[1];
-      if(LMS[0] < 0.f)
-        max_C = MIN(-Iz / (AI_trans[1][0] * cos_H + AI_trans[2][0] * sin_H), max_C);
-
-      if(LMS[1] < 0.f)
-        max_C = MIN(-Iz / (AI_trans[1][1] * cos_H + AI_trans[2][1] * sin_H), max_C);
-
-      if(LMS[2] < 0.f)
-        max_C = MIN(-Iz / (AI_trans[1][2] * cos_H + AI_trans[2][2] * sin_H), max_C);
-
-      // Project back to JzAzBz for real
-      Jab[0] = JC[0];
-      Jab[1] = max_C * cos_H;
-      Jab[2] = max_C * sin_H;
-
-      dt_JzAzBz_2_XYZ(Jab, XYZ_D65);
-    }
-    else
-    {
-      dt_aligned_pixel_t xyY, JCH, HCB;
-      dt_D65_XYZ_to_xyY(XYZ_D65, xyY);
-      xyY_to_dt_UCS_JCH(xyY, L_white, JCH);
-      dt_UCS_JCH_to_HCB(JCH, HCB);
-
-      const float radius = dt_fast_hypotf(HCB[1], HCB[2]);
-      const float sin_T = (radius > 0.f) ? HCB[1] / radius : 0.f;
-      const float cos_T = (radius > 0.f) ? HCB[2] / radius : 0.f;
-      const float DT_ALIGNED_PIXEL M_rot_inv[2][2] = { { cos_T,  sin_T }, { -sin_T, cos_T } };
-      // This would be the full matrice of direct rotation if we didn't need only its last row
-      //const float DT_ALIGNED_PIXEL M_rot_dir[2][2] = { { cos_T, -sin_T }, {  sin_T, cos_T } };
-
-      const float P = MAX(FLT_MIN, HCB[1]); // as HCB[1] is at least zero we don't fiddle with sign
-      const float W = sin_T * HCB[1] + cos_T * HCB[2];
-
-      float a = MAX(1.f + d->saturation_global + scalar_product(opacities, saturation), 0.f);
-      const float b = MAX(1.f + d->brilliance_global + scalar_product(opacities, brilliance), 0.f);
-
-      const float max_a = dt_fast_hypotf(P, W) / P;
-      a = soft_clip(a, 0.5f * max_a, max_a);
-
-      const float P_prime = (a - 1.f) * P;
-      const float W_prime = sqrtf(sqf(P) * (1.f - sqf(a)) + sqf(W)) * b;
-
-      HCB[1] = MAX(M_rot_inv[0][0] * P_prime + M_rot_inv[0][1] * W_prime, 0.f);
-      HCB[2] = MAX(M_rot_inv[1][0] * P_prime + M_rot_inv[1][1] * W_prime, 0.f);
-
-      dt_UCS_HCB_to_JCH(HCB, JCH);
-
-      // Gamut mapping
-      const float max_colorfulness = lookup_gamut(gamut_LUT, JCH[2]); // WARNING : this is M²
-      const float max_chroma = (15.932993652962535f * powf(JCH[0] * L_white, 0.6523997524738018f)
-                                * powf(max_colorfulness, 0.6007557017508491f) / L_white);
-      const dt_aligned_pixel_t JCH_gamut_boundary = { JCH[0], max_chroma, JCH[2], 0.f };
-      dt_aligned_pixel_t HSB_gamut_boundary;
-      dt_UCS_JCH_to_HSB(JCH_gamut_boundary, HSB_gamut_boundary);
-
-      // Clip saturation at constant brightness
-      dt_aligned_pixel_t HSB = { HCB[0], (HCB[2] > 0.f) ? HCB[1] / HCB[2] : 0.f, HCB[2], 0.f };
-      HSB[1] = soft_clip(HSB[1], 0.8f * HSB_gamut_boundary[1], HSB_gamut_boundary[1]);
-
-      dt_UCS_HSB_to_JCH(HSB, JCH);
-      dt_UCS_JCH_to_xyY(JCH, L_white, xyY);
-      dt_xyY_to_XYZ(xyY, XYZ_D65);
-    }
-
-    // Project back to D50 pipeline RGB
-    dt_aligned_pixel_t pix_out;
-    dt_apply_transposed_color_matrix(XYZ_D65, output_matrix_trans, pix_out);
-
-    /* The previous line is equivalent to :
-      XYZ_D65_to_50(XYZ_D65, XYZ_D50);           // matrix product
-      dot_product(XYZ_D50, XYZ_to_RGB, pix_out); // matrix product
-    */
-
-    if(mask_display)
-    {
-      // draw checkerboard
-      dt_aligned_pixel_t color;
-      const size_t i = (k / 4) / out_width;
-      const size_t j = (k / 4) % out_width;
-      if(i % checker_1 < i % checker_2)
-      {
-        if(j % checker_1 < j % checker_2)
-          copy_pixel(color, d->checker_color_2);
-        else
-          copy_pixel(color, d->checker_color_1);
-      }
-      else
-      {
-        if(j % checker_1 < j % checker_2)
-          copy_pixel(color, d->checker_color_1);
-        else
-          copy_pixel(color, d->checker_color_2);
-      }
-
-      float opacity = opacities[g->mask_type];
-      const float opacity_comp = 1.0f - opacity;
-
-      dt_vector_clipneg(pix_out);
-      for_four_channels(c, aligned(pix_out, color:16))
-        pix_out[c] = opacity_comp * color[c] + opacity * pix_out[c];
-      pix_out[3] = 1.0f; // alpha is opaque, we need to preview it
-    }
-    else
-    {
-      dt_vector_clipneg(pix_out);
-    }
-    copy_pixel_nontemporal(out + k, pix_out);
-  }
-  dt_omploop_sfence();	// ensure all nontemporal writes complete before we use them
+  /* The per-pixel grading loop (premultiplied-matrix form, GUI mask-display
+   * checkerboard included) runs in Rust: crates/c41-core/src/iop/
+   * colorbalancergb.rs, darkroom_colorbalancergb_process(). Serial scalar;
+   * replaces the former DT_OMP_FOR over all pixels. */
+  darkroom_colorbalancergb_process(in, out, npixels, roi_out->width,
+      (const float *)input_matrix_trans, (const float *)output_matrix_trans,
+      d->global, d->shadows, d->highlights, d->midtones,
+      d->chroma, d->saturation, d->brilliance,
+      d->chroma_global, d->vibrance, d->contrast,
+      d->saturation_global, d->brilliance_global,
+      d->midtones_Y, d->hue_angle,
+      d->shadows_weight, d->highlights_weight, d->midtones_weight,
+      d->mask_grey_fulcrum, d->white_fulcrum,
+      d->grey_fulcrum, (int)d->saturation_formula, d->gamut_LUT,
+      mask_display, g ? g->mask_type : MASK_NONE, checker_1,
+      d->checker_color_1, d->checker_color_2);
 }
 
 
@@ -1193,46 +909,11 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     // make RGB values vary between [0; 1] in working space, convert to Ych and get the max(c(h)))
     if(p->saturation_formula == DT_COLORBALANCE_SATURATION_JZAZBZ)
     {
-      float *const restrict sampler = dt_calloc_align_float(LUT_ELEM);
-      DT_OMP_FOR(reduction(max: sampler[:LUT_ELEM]) collapse(3))
-      for(size_t r = 0; r < STEPS; r++)
-        for(size_t g = 0; g < STEPS; g++)
-          for(size_t b = 0; b < STEPS; b++)
-          {
-            const dt_aligned_pixel_t rgb = { (float)r / (float)(STEPS - 1), (float)g / (float)(STEPS - 1),
-                                            (float)b / (float)(STEPS - 1), 0.f };
-            dt_aligned_pixel_t XYZ = { 0.f };
-            float saturation = 0.f;
-            float hue = 0.f;
-
-            dot_product(rgb, input_matrix, XYZ); // Go from D50 pipeline RGB to D65 XYZ in one step
-
-            dt_aligned_pixel_t Jab, Jch;
-            dt_XYZ_2_JzAzBz(XYZ, Jab);           // this one expects D65 XYZ
-
-            Jch[0] = Jab[0];
-            Jch[1] = dt_fast_hypotf(Jab[2], Jab[1]);
-            Jch[2] = atan2f(Jab[2], Jab[1]);
-
-            saturation = (Jch[0] > 0.f) ? Jch[1] / Jch[0] : 0.f;
-            hue = Jch[2];
-
-            int index = roundf((LUT_ELEM - 1) * (hue + M_PI_F) / DT_2PI_F);
-            index += (index < 0) ? LUT_ELEM : 0;
-            index -= (index >= LUT_ELEM) ? LUT_ELEM : 0;
-            sampler[index] = fmaxf(sampler[index], saturation);
-          }
-
-     // anti-aliasing on the LUT (simple 5-taps 1D box average)
-      for(size_t k = 2; k < LUT_ELEM - 2; k++)
-        d->gamut_LUT[k] = (sampler[k - 2] + sampler[k - 1] + sampler[k] + sampler[k + 1] + sampler[k + 2]) / 5.f;
-
-      // handle bounds
-      d->gamut_LUT[0] = (sampler[LUT_ELEM - 2] + sampler[LUT_ELEM - 1] + sampler[0] + sampler[1] + sampler[2]) / 5.f;
-      d->gamut_LUT[1] = (sampler[LUT_ELEM - 1] + sampler[0] + sampler[1] + sampler[2] + sampler[3]) / 5.f;
-      d->gamut_LUT[LUT_ELEM - 1] = (sampler[LUT_ELEM - 3] + sampler[LUT_ELEM - 2] + sampler[LUT_ELEM - 1] + sampler[0] + sampler[1]) / 5.f;
-      d->gamut_LUT[LUT_ELEM - 2] = (sampler[LUT_ELEM - 4] + sampler[LUT_ELEM - 3] + sampler[LUT_ELEM - 2] + sampler[LUT_ELEM - 1] + sampler[0]) / 5.f;
-      dt_free_align(sampler);
+      /* The STEPS³ cube sweep (max-saturation per hue bin) plus its 5-tap cyclic
+       * box average run in Rust: crates/c41-core/src/iop/colorbalancergb.rs,
+       * darkroom_colorbalancergb_build_gamut_lut_jzazbz(). Serial scalar; the C
+       * reduction(max:) was order-independent so this is bit-identical. */
+      darkroom_colorbalancergb_build_gamut_lut_jzazbz((const float *)input_matrix, d->gamut_LUT);
     }
     else if(p->saturation_formula == DT_COLORBALANCE_SATURATION_DTUCS)
       dt_UCS_22_build_gamut_LUT(input_matrix, gamut_LUT);
@@ -1506,29 +1187,12 @@ static gboolean dt_iop_tonecurve_draw(GtkWidget *widget, cairo_t *crf, const dt_
   cairo_surface_t *surface = cairo_image_surface_create_for_data(data, CAIRO_FORMAT_ARGB32, (size_t)line_height, (size_t)graph_height, stride);
 
   const size_t checker_1 = DT_PIXEL_APPLY_DPI(6);
-  const size_t checker_2 = 2 * checker_1;
 
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < (size_t)graph_height; i++)
-    for(size_t j = 0; j < (size_t)line_height; j++)
-    {
-      const size_t k = ((i * (size_t)line_height) + j) * 4;
-      unsigned char color;
-      const float alpha = (float)i / graph_height;
-      if(i % checker_1 < i % checker_2)
-      {
-        if(j % checker_1 < j % checker_2) color = 150;
-        else color = 100;
-      }
-      else
-      {
-        if(j % checker_1 < j % checker_2) color = 100;
-        else color = 150;
-      }
-
-      for(size_t c = 0; c < 4; ++c) data[k + c] = color * alpha;
-      data[k+3] = alpha * 255;
-    }
+  /* The checkerboard fill runs in Rust: crates/c41-core/src/iop/
+   * colorbalancergb.rs, darkroom_colorbalancergb_checkerboard_fill(). Serial
+   * scalar; replaces the former collapse(2) OpenMP loop. */
+  darkroom_colorbalancergb_checkerboard_fill(
+      data, (size_t)graph_height, (size_t)line_height, checker_1);
 
   cairo_set_source_surface(cr, surface, 0, margin_top);
   cairo_paint(cr);
@@ -1545,21 +1209,15 @@ static gboolean dt_iop_tonecurve_draw(GtkWidget *widget, cairo_t *crf, const dt_
   cairo_clip(cr);
 
   // from https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.583.3007&rep=rep1&type=pdf
-  const float midtones_weight
-      = sqf(shadows_weight) * sqf(highlights_weight) / (sqf(shadows_weight) + sqf(highlights_weight));
-  const float mask_grey_fulcrum = powf(p->mask_grey_fulcrum, 0.4101205819200422f);
-
+  // (midtones_weight and the powered mask_grey_fulcrum are derived inside Rust)
   float *LUT[3];
   for(size_t c = 0; c < 3; c++) LUT[c] = dt_alloc_align_float(LUT_ELEM);
 
-  DT_OMP_FOR()
-  for(size_t k = 0 ; k < LUT_ELEM; k++)
-  {
-    const float Y = k / (float)(LUT_ELEM - 1);
-    dt_aligned_pixel_t output;
-    opacity_masks(Y, shadows_weight, highlights_weight, midtones_weight, mask_grey_fulcrum, output, NULL);
-    for(size_t c = 0; c < 3; c++) LUT[c][k] = output[c];
-  }
+  /* The opacity-mask LUT build runs in Rust: crates/c41-core/src/iop/
+   * colorbalancergb.rs, darkroom_colorbalancergb_opacity_luts(). Serial scalar;
+   * replaces the former DT_OMP_FOR over LUT_ELEM. */
+  darkroom_colorbalancergb_opacity_luts(
+      LUT[0], LUT[1], LUT[2], shadows_weight, highlights_weight, p->mask_grey_fulcrum);
 
   const GdkRGBA fg_color = darktable.bauhaus->graph_fg;
   cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(2.));

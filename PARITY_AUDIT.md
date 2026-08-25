@@ -31,9 +31,15 @@ Per-increment progress is logged in `PROGRESS.md`.
 
 ## Where the port actually stands
 
-- **Pipeline (Phase 1): effectively done.** 4 files still contain OpenMP loops
-  (9 total), and 2 of those aren't pipeline code (`tests/cache.c`,
-  `sidecar_jobs.c`). **83 of 93** image-operation modules are ported to Rust.
+- **Pipeline (Phase 1): effectively done.** The tracked migration metric — live
+  `DT_OMP_FOR` loop sites in `src/iop/*.c` — stands at **13 across 8 files**
+  (recounted 2026-08-25 after m4-137 replaced colorbalancergb's four; see the
+  table in `RUST_MIGRATION_PLAN.md`, which is kept current per increment). The
+  full `src/` tree holds ~223 further loop sites, but those sit outside the
+  pipeline boundary (develop/masks, blend, common helpers, imageio, chart) and
+  belong to later phases. **83 of 93** image-operation modules are ported to
+  Rust. (An earlier version of this bullet claimed "4 files / 9 total" — that
+  figure was long stale and understated the remainder; corrected here.)
 - **UI (Phase 3): this is the whole remaining gap.** The processing for ~80
   modules exists in `c41-core` with **no controls attached to it**. The
   darkroom view exposes about 6 adjustments; darktable exposes 93 modules.

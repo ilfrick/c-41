@@ -852,6 +852,88 @@ void darkroom_colorin_cmatrix_bm(const float *in_buf,
                                  int clipping);
 
 /*
+ * ColorBalanceRGB IOP -- the four OMP loops of colorbalancergb.c (m4-137).
+ *
+ * darkroom_colorbalancergb_process replaces the DT_OMP_FOR pixel loop in
+ * process() (:662). input_matrix_trans/output_matrix_trans are the premultiplied
+ * RGB->LMS(2006 D65) / XYZ(D65)->pipeline-RGB matrices, 16 floats each, passed
+ * exactly as stored (dt_colormatrix_t; the Rust side applies them transposed).
+ * global/shadows/highlights/midtones/chroma/saturation_v/brilliance: dt_aligned_pixel_t.
+ * scalars are the commit_params-derived dt_iop_colorbalancergb_data_t fields
+ * (hue_angle already in radians; contrast already 1+p). gamut_lut: LUT_ELEM
+ * floats. saturation_formula: 0 = JzAzBz, anything else = dt UCS. mask_display
+ * gates the checkerboard branch; mask_type is 0..3 (MASK_SHADOWS..MASK_NONE);
+ * checker_1 is the DPI-scaled checker cell size. Output alpha lane follows the C
+ * (0 normally, 1.0 under mask display).
+ */
+void darkroom_colorbalancergb_process(const float *in_buf,
+                                      float *out_buf,
+                                      size_t npixels,
+                                      size_t out_width,
+                                      const float *input_matrix_trans,
+                                      const float *output_matrix_trans,
+                                      const float *global,
+                                      const float *shadows,
+                                      const float *highlights,
+                                      const float *midtones,
+                                      const float *chroma,
+                                      const float *saturation_v,
+                                      const float *brilliance,
+                                      float chroma_global,
+                                      float vibrance,
+                                      float contrast,
+                                      float saturation_global,
+                                      float brilliance_global,
+                                      float midtones_y,
+                                      float hue_angle,
+                                      float shadows_weight,
+                                      float highlights_weight,
+                                      float midtones_weight,
+                                      float mask_grey_fulcrum,
+                                      float white_fulcrum,
+                                      float grey_fulcrum,
+                                      int saturation_formula,
+                                      const float *gamut_lut,
+                                      int mask_display,
+                                      int mask_type,
+                                      size_t checker_1,
+                                      const float *checker_color_1,
+                                      const float *checker_color_2);
+
+/*
+ * Replaces the JzAzBz-branch gamut-LUT build in commit_params (:1197): samples
+ * the STEPS^3 RGB cube through input_matrix (premultiplied RGB->XYZ D65, passed
+ * exactly as stored) keeping max saturation per hue bin, then a 5-tap cyclic box
+ * average. Serial == any OpenMP thread count (reduction(max:) order-independent).
+ * gamut_lut receives LUT_ELEM floats.
+ */
+void darkroom_colorbalancergb_build_gamut_lut_jzazbz(const float *input_matrix,
+                                                     float *gamut_lut);
+
+/*
+ * Fills data (packed ARGB32 bytes, graph_height*line_height*4 -- cairo's stride
+ * for ARGB32 is width*4) with the vertical-alpha-fading checkerboard gradient
+ * used by the GUI graph draw (:1511). No-op when checker_1 is 0.
+ */
+void darkroom_colorbalancergb_checkerboard_fill(unsigned char *data,
+                                                size_t graph_height,
+                                                size_t line_height,
+                                                size_t checker_1);
+
+/*
+ * Fills the three opacity-mask curve LUTs (LUT_ELEM floats each) shown under the
+ * zone sliders (:1555). Derives midtones_weight and the powered mask fulcrum
+ * from shadows_weight/highlights_weight (already 2+2p) and the raw params
+ * mask_grey_fulcrum, exactly as the draw callback did.
+ */
+void darkroom_colorbalancergb_opacity_luts(float *lut_shadows,
+                                           float *lut_midtones,
+                                           float *lut_highlights,
+                                           float shadows_weight,
+                                           float highlights_weight,
+                                           float mask_grey_fulcrum_param);
+
+/*
  * ChannelMixerRGB IOP -- per-pixel chromatic adaptation + mix + luma/chroma.
  *
  * Replaces the DT_OMP_FOR pixel loop inside _loop_switch() in channelmixerrgb.c.
