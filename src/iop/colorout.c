@@ -53,8 +53,51 @@ typedef struct dt_iop_colorout_data_t
   float lut[3][LUT_SAMPLES];
   dt_colormatrix_t cmatrix;
   cmsHTRANSFORM *xform;
+  /* m4-129 slice 2: pure-Rust ICC engine transform, preferred over the lcms2
+   * one above in normal (non-softproof) mode; NULL there means "engine
+   * refused the pair" and lcms2 is built instead. The byte buffers are the
+   * profiles serialized once for the engine's own parser. */
+  void *rs_xform;
+  void *rs_icc_lab;
+  size_t rs_icc_lab_len;
+  void *rs_icc_out;
+  size_t rs_icc_out_len;
   float unbounded_coeffs[3][3]; // for extrapolation of shaper curves
 } dt_iop_colorout_data_t;
+
+/* serialize a profile to raw ICC bytes for the Rust engine's parser
+ * (cmsSaveProfileToMem twice: size query, then fill). NULL on failure. */
+static void *_colorout_profile_bytes(cmsHPROFILE prof, size_t *len)
+{
+  *len = 0;
+  if(!prof) return NULL;
+  cmsUInt32Number size = 0;
+  if(!cmsSaveProfileToMem(prof, NULL, &size) || size == 0) return NULL;
+  void *data = g_malloc(size);
+  if(!cmsSaveProfileToMem(prof, data, &size))
+  {
+    g_free(data);
+    return NULL;
+  }
+  *len = size;
+  return data;
+}
+
+/* free every Rust-engine resource in d, leaving the fields NULL/0 */
+static void _colorout_rs_cleanup(dt_iop_colorout_data_t *d)
+{
+  if(d->rs_xform)
+  {
+    darkroom_icc_transform_free(d->rs_xform);
+    d->rs_xform = NULL;
+  }
+  g_free(d->rs_icc_lab);
+  d->rs_icc_lab = NULL;
+  d->rs_icc_lab_len = 0;
+  g_free(d->rs_icc_out);
+  d->rs_icc_out = NULL;
+  d->rs_icc_out_len = 0;
+}
 
 typedef struct dt_iop_colorout_global_data_t
 {
@@ -430,7 +473,12 @@ static void _transform_lcms(const dt_iop_colorout_data_t *const d,
     size_t count = MIN(chunkstart + chunksize, npixels) - chunkstart;
     float *const outp = out + 4 * chunkstart;
 
-    cmsDoTransform(d->xform, in + 4*chunkstart, outp, count);
+    // m4-129 slice 2: the Rust engine owns the transform in normal mode;
+    // gamutcheck can't be set then, so that branch stays lcms2-only.
+    if(d->rs_xform)
+      darkroom_icc_transform_apply_rgba(d->rs_xform, in + 4*chunkstart, outp, count);
+    else
+      cmsDoTransform(d->xform, in + 4*chunkstart, outp, count);
 
     if(gamutcheck)
     {
@@ -501,6 +549,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     cmsDeleteTransform(d->xform);
     d->xform = NULL;
   }
+  _colorout_rs_cleanup(d);
   dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
   d->lut[0][0] = -1.0f;
   d->lut[1][0] = -1.0f;
@@ -625,6 +674,11 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
    * to use our matrix codepath when softproof is enabled, this seemed redundant.
    */
 
+  /* m4-129 slice 2: serialize the profiles once for the pure-Rust ICC engine's
+   * own parser; it owns the transform in normal (non-softproof) mode. */
+  d->rs_icc_lab = _colorout_profile_bytes(Lab, &d->rs_icc_lab_len);
+  d->rs_icc_out = _colorout_profile_bytes(output, &d->rs_icc_out_len);
+
   /* get matrix from profile, if softproofing or high quality exporting always go xform codepath */
   if(d->mode != DT_PROFILE_NORMAL || force_lcms2
      || dt_colorspaces_get_matrix_from_output_profile(output, d->cmatrix,
@@ -632,12 +686,20 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   {
     dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
     piece->process_cl_ready = FALSE;
-    d->xform = cmsCreateProofingTransform(Lab, TYPE_LabA_FLT, output, output_format, softproof,
-                                          out_intent, INTENT_RELATIVE_COLORIMETRIC, transformFlags);
+    // softproofing/bpc/gamutcheck are lcms2 features we don't replace, and an
+    // explicit "force lcms2" preference must keep doing what it says: only a
+    // plain normal-mode transform without that pin goes through the engine.
+    if(d->mode == DT_PROFILE_NORMAL && !force_lcms2)
+      d->rs_xform = darkroom_icc_transform_new(
+          d->rs_icc_lab, d->rs_icc_lab_len, d->rs_icc_out, d->rs_icc_out_len,
+          (unsigned int)out_intent);
+    if(!d->rs_xform)
+      d->xform = cmsCreateProofingTransform(Lab, TYPE_LabA_FLT, output, output_format, softproof,
+                                            out_intent, INTENT_RELATIVE_COLORIMETRIC, transformFlags);
   }
 
   // user selected a non-supported output profile, check that:
-  if(!d->xform && !dt_is_valid_colormatrix(d->cmatrix[0][0]))
+  if(!d->xform && !d->rs_xform && !dt_is_valid_colormatrix(d->cmatrix[0][0]))
   {
     dt_control_log(_("unsupported output profile has been replaced by sRGB!"));
     dt_print(DT_DEBUG_ALWAYS,
@@ -652,8 +714,19 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
       dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
       piece->process_cl_ready = FALSE;
 
-      d->xform = cmsCreateProofingTransform(Lab, TYPE_LabA_FLT, output, output_format, softproof,
-                                            out_intent, INTENT_RELATIVE_COLORIMETRIC, transformFlags);
+      if(d->mode == DT_PROFILE_NORMAL && !force_lcms2)
+      {
+        // the output changed: refresh the engine's bytes before rebuilding
+        g_free(d->rs_icc_out);
+        d->rs_icc_out_len = 0;
+        d->rs_icc_out = _colorout_profile_bytes(output, &d->rs_icc_out_len);
+        d->rs_xform = darkroom_icc_transform_new(
+            d->rs_icc_lab, d->rs_icc_lab_len, d->rs_icc_out, d->rs_icc_out_len,
+            (unsigned int)out_intent);
+      }
+      if(!d->rs_xform)
+        d->xform = cmsCreateProofingTransform(Lab, TYPE_LabA_FLT, output, output_format, softproof,
+                                              out_intent, INTENT_RELATIVE_COLORIMETRIC, transformFlags);
     }
   }
 
@@ -691,6 +764,11 @@ void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe
   piece->data = calloc(1, sizeof(dt_iop_colorout_data_t));
   dt_iop_colorout_data_t *d = piece->data;
   d->xform = NULL;
+  d->rs_xform = NULL;
+  d->rs_icc_lab = NULL;
+  d->rs_icc_lab_len = 0;
+  d->rs_icc_out = NULL;
+  d->rs_icc_out_len = 0;
 }
 
 void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
@@ -701,6 +779,7 @@ void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelp
     cmsDeleteTransform(d->xform);
     d->xform = NULL;
   }
+  _colorout_rs_cleanup(d);
 
   free(piece->data);
   piece->data = NULL;

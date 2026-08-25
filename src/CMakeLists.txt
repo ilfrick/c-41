@@ -1012,8 +1012,8 @@ if(USE_XMLLINT)
 endif(USE_XMLLINT)
 
 #
-# Rust: darkroom-core cdylib
-# Produces target/{release,debug}/libdarkroom_core.so, linked into lib_darktable
+# Rust: c41-core cdylib
+# Produces target/{release,debug}/libc41_core.so, linked into lib_darktable
 # so every IOP module can call its extern "C" entry points.
 #
 find_program(CARGO cargo)
@@ -1027,117 +1027,117 @@ if(CARGO)
   endif()
 
   set(_cargo_target_dir "${CMAKE_BINARY_DIR}/cargo-target")
-  set(_darkroom_core_lib
-      "${_cargo_target_dir}/${_rust_profile}/libdarkroom_core.so")
+  set(_c41_core_lib
+      "${_cargo_target_dir}/${_rust_profile}/libc41_core.so")
 
   # Rust cdylibs have no SONAME by default; without one CMake records the
   # absolute build-tree path in the dependent's NEEDED entry, which then
   # fails to load at runtime. Pass -soname through rustc's linker so the
-  # resulting .so carries SONAME=libdarkroom_core.so and the loader can
+  # resulting .so carries SONAME=libc41_core.so and the loader can
   # resolve it through libdarktable.so's RUNPATH ($ORIGIN).
   add_custom_command(
-    OUTPUT  "${_darkroom_core_lib}"
+    OUTPUT  "${_c41_core_lib}"
     COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${_cargo_target_dir}"
-            "RUSTFLAGS=-C link-arg=-Wl,-soname,libdarkroom_core.so"
-            "${CARGO}" build ${_cargo_flags} -p darkroom-core
+            "RUSTFLAGS=-C link-arg=-Wl,-soname,libc41_core.so"
+            "${CARGO}" build ${_cargo_flags} -p c41-core
             --manifest-path "${CMAKE_SOURCE_DIR}/Cargo.toml"
-    DEPENDS "${CMAKE_SOURCE_DIR}/crates/darkroom-core/Cargo.toml"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/lib.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/exposure.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorcontrast.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/vibrance.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/velvia.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colisa.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/relight.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorize.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorcorrection.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/levels.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/color.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/splittoning.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/negadoctor.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/channelmixer.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/lowlight.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/tonecurve.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/primaries.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/profile_gamma.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/graduatednd.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/grain.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/rgbcurve.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorzones.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/vignette.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/sigmoid.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/rgblevels.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/basicadj.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/zonesystem.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/overlay.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/filmic.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/soften.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/shadhi.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/lowpass.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorbalance.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/bloom.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/globaltonemap.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/monochrome.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/highpass.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/invert.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/dither.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/agx.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/temperature.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorout.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/watermark.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/lut3d.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/atrous.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorin.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/channelmixerrgb.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/basecurve.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/hazeremoval.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/censorize.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/overexposed.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/hotpixels.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/clahe.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/rawprepare.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/highlights.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/defringe.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorchecker.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/rasterfile.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/diffuse.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colortransfer.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/cacorrectrgb.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/rawdenoise.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colormapping.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorequal.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/toneequal.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/useless.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/gamma.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/blurs.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/filmicrgb.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/cacorrect.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/geometry.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/iop/colorharmonizer.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/math.rs"
-            "${CMAKE_SOURCE_DIR}/crates/darkroom-core/src/raw.rs"
+    DEPENDS "${CMAKE_SOURCE_DIR}/crates/c41-core/Cargo.toml"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/lib.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/exposure.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorcontrast.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/vibrance.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/velvia.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colisa.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/relight.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorize.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorcorrection.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/levels.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/color.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/splittoning.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/negadoctor.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/channelmixer.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/lowlight.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/tonecurve.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/primaries.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/profile_gamma.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/graduatednd.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/grain.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/rgbcurve.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorzones.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/vignette.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/sigmoid.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/rgblevels.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/basicadj.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/zonesystem.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/overlay.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/filmic.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/soften.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/shadhi.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/lowpass.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorbalance.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/bloom.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/globaltonemap.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/monochrome.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/highpass.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/invert.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/dither.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/agx.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/temperature.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorout.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/watermark.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/lut3d.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/atrous.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorin.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/channelmixerrgb.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/basecurve.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/hazeremoval.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/censorize.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/overexposed.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/hotpixels.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/clahe.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/rawprepare.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/highlights.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/defringe.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorchecker.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/rasterfile.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/diffuse.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colortransfer.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/cacorrectrgb.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/rawdenoise.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colormapping.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorequal.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/toneequal.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/useless.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/gamma.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/blurs.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/filmicrgb.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/cacorrect.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/geometry.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/iop/colorharmonizer.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/math.rs"
+            "${CMAKE_SOURCE_DIR}/crates/c41-core/src/raw.rs"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Building Rust crate darkroom-core"
+    COMMENT "Building Rust crate c41-core"
     VERBATIM
   )
-  add_custom_target(darkroom_core_rust ALL DEPENDS "${_darkroom_core_lib}")
+  add_custom_target(c41_core_rust ALL DEPENDS "${_c41_core_lib}")
 
-  add_library(darkroom_core SHARED IMPORTED GLOBAL)
-  set_target_properties(darkroom_core PROPERTIES
-      IMPORTED_LOCATION "${_darkroom_core_lib}"
+  add_library(c41_core SHARED IMPORTED GLOBAL)
+  set_target_properties(c41_core PROPERTIES
+      IMPORTED_LOCATION "${_c41_core_lib}"
       # Rust cdylibs have no embedded SONAME, so without this CMake records
       # the absolute cargo build-tree path in libdarktable.so's NEEDED entry
       # and the loader fails at runtime. Force a plain SONAME so the dynamic
       # linker resolves the dependency relative to RUNPATH ($ORIGIN of
-      # libdarktable.so), where libdarkroom_core.so is installed alongside it.
-      IMPORTED_SONAME "libdarkroom_core.so"
+      # libdarktable.so), where libc41_core.so is installed alongside it.
+      IMPORTED_SONAME "libc41_core.so"
   )
-  add_dependencies(darkroom_core darkroom_core_rust)
+  add_dependencies(c41_core c41_core_rust)
 
-  install(FILES "${_darkroom_core_lib}"
+  install(FILES "${_c41_core_lib}"
           DESTINATION "${CMAKE_INSTALL_LIBDIR}/darktable")
 else()
-  message(WARNING "cargo not found — darkroom-core Rust library will not be built")
+  message(WARNING "cargo not found — c41-core Rust library will not be built")
 endif()
 
 #
@@ -1182,18 +1182,18 @@ target_link_libraries(lib_darktable PUBLIC ${STATIC_LIBS})
 target_link_libraries(lib_darktable PRIVATE whereami)
 target_link_libraries(lib_darktable PUBLIC ${LIBS})
 
-if(CARGO AND TARGET darkroom_core)
-  add_dependencies(lib_darktable darkroom_core_rust)
+if(CARGO AND TARGET c41_core)
+  add_dependencies(lib_darktable c41_core_rust)
   # IOP plugin .so files reference Rust FFI symbols (darkroom_*) but are linked
-  # only against lib_darktable. We need libdarkroom_core.so to be loaded at
+  # only against lib_darktable. We need libc41_core.so to be loaded at
   # program startup so the dynamic linker can resolve those symbols. Since
   # libdarktable.so itself doesn't call any darkroom_* symbol directly, the
   # default --as-needed linker behaviour would drop the NEEDED entry. Force it.
   if(UNIX AND NOT APPLE)
     target_link_libraries(lib_darktable PRIVATE
-      -Wl,--no-as-needed darkroom_core -Wl,--as-needed)
+      -Wl,--no-as-needed c41_core -Wl,--as-needed)
   else()
-    target_link_libraries(lib_darktable PRIVATE darkroom_core)
+    target_link_libraries(lib_darktable PRIVATE c41_core)
   endif()
   target_include_directories(lib_darktable PRIVATE "${CMAKE_SOURCE_DIR}/src")
 endif()

@@ -348,6 +348,12 @@ impl Profile {
         }
         // matrix-shaper fallback (RGB matrix profiles → raw XYZ D50). The shaper
         // path is XYZ-only; a Lab-PCS profile with only colorants is malformed.
+        // A colour-space conversion profile (device space == PCS — e.g. the bare
+        // Lab profile darktable links colorout's transforms through) transforms
+        // identity instead: its device space *is* the connection space.
+        if self.data_space == self.pcs {
+            return Ok(Pipeline { stages: Vec::new() });
+        }
         if self.pcs_is_lab() {
             return Err(IccError::WrongTagType);
         }
@@ -426,7 +432,13 @@ impl Profile {
                 return Ok(p);
             }
         }
-        // matrix-shaper fallback. As with A2B, the shaper path is XYZ-only.
+        // matrix-shaper fallback. As with A2B, the shaper path is XYZ-only. A
+        // colour-space conversion profile (device space == PCS) transforms
+        // identity — this is what lets the engine link through darktable's bare
+        // Lab profile exactly like LCMS's cmsCreateLab4Profile does.
+        if self.data_space == self.pcs {
+            return Ok(Pipeline { stages: Vec::new() });
+        }
         if self.pcs_is_lab() {
             return Err(IccError::WrongTagType);
         }

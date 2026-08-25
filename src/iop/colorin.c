@@ -102,6 +102,20 @@ typedef struct dt_iop_colorin_data_t
   cmsHTRANSFORM *xform_cam_Lab;
   cmsHTRANSFORM *xform_cam_nrgb;
   cmsHTRANSFORM *xform_nrgb_Lab;
+  /* m4-129 slice 2: pure-Rust ICC engine transforms, preferred over the lcms2
+   * ones above; NULL there means "engine refused the pair", and the lcms2
+   * transform is built instead (identical behaviour for anything the engine
+   * doesn't handle). The byte buffers are the profiles serialized once for
+   * the engine's own parser. */
+  void *rs_xform_cam_Lab;
+  void *rs_xform_cam_nrgb;
+  void *rs_xform_nrgb_Lab;
+  void *rs_icc_input;
+  size_t rs_icc_input_len;
+  void *rs_icc_nrgb;
+  size_t rs_icc_nrgb_len;
+  void *rs_icc_lab;
+  size_t rs_icc_lab_len;
   float lut[3][LUT_SAMPLES];
   dt_colormatrix_t cmatrix;
   dt_colormatrix_t nmatrix;
@@ -114,6 +128,65 @@ typedef struct dt_iop_colorin_data_t
   char filename[DT_IOP_COLOR_ICC_LEN];
   char filename_work[DT_IOP_COLOR_ICC_LEN];
 } dt_iop_colorin_data_t;
+
+/* serialize a profile to raw ICC bytes for the Rust engine's parser
+ * (cmsSaveProfileToMem twice: size query, then fill). NULL on failure. */
+static void *_colorin_profile_bytes(cmsHPROFILE prof, size_t *len)
+{
+  *len = 0;
+  if(!prof) return NULL;
+  cmsUInt32Number size = 0;
+  if(!cmsSaveProfileToMem(prof, NULL, &size) || size == 0) return NULL;
+  void *data = g_malloc(size);
+  if(!cmsSaveProfileToMem(prof, data, &size))
+  {
+    g_free(data);
+    return NULL;
+  }
+  *len = size;
+  return data;
+}
+
+/* free every Rust-engine resource in d (handles + profile bytes), leaving the
+ * fields NULL/0. Safe to call repeatedly; mirrors the xform deletion blocks. */
+static void _colorin_rs_cleanup(dt_iop_colorin_data_t *d)
+{
+  if(d->rs_xform_cam_Lab)
+  {
+    darkroom_icc_transform_free(d->rs_xform_cam_Lab);
+    d->rs_xform_cam_Lab = NULL;
+  }
+  if(d->rs_xform_cam_nrgb)
+  {
+    darkroom_icc_transform_free(d->rs_xform_cam_nrgb);
+    d->rs_xform_cam_nrgb = NULL;
+  }
+  if(d->rs_xform_nrgb_Lab)
+  {
+    darkroom_icc_transform_free(d->rs_xform_nrgb_Lab);
+    d->rs_xform_nrgb_Lab = NULL;
+  }
+  g_free(d->rs_icc_input);
+  d->rs_icc_input = NULL;
+  d->rs_icc_input_len = 0;
+  g_free(d->rs_icc_nrgb);
+  d->rs_icc_nrgb = NULL;
+  d->rs_icc_nrgb_len = 0;
+  g_free(d->rs_icc_lab);
+  d->rs_icc_lab = NULL;
+  d->rs_icc_lab_len = 0;
+}
+
+/* apply one stride-4 row through the Rust engine when it owns this transform,
+ * else through lcms2 as before */
+static inline void _icc_apply(void *rs_handle, cmsHTRANSFORM *lcms_handle,
+                              const float *in, float *out, size_t npixels)
+{
+  if(rs_handle)
+    darkroom_icc_transform_apply_rgba(rs_handle, in, out, npixels);
+  else
+    cmsDoTransform(lcms_handle, in, out, npixels);
+}
 
 
 const char *name()
@@ -1018,16 +1091,16 @@ static void process_lcms2_bm(dt_iop_module_t *self,
     // convert to (L,a/L,b/L) to be able to change L without changing saturation.
     if(!d->nrgb)
     {
-      cmsDoTransform(d->xform_cam_Lab, out, out, width);
+      _icc_apply(d->rs_xform_cam_Lab, d->xform_cam_Lab, out, out, width);
     }
     else
     {
-      cmsDoTransform(d->xform_cam_nrgb, out, out, width);
+      _icc_apply(d->rs_xform_cam_nrgb, d->xform_cam_nrgb, out, out, width);
 
       for(int j = 0; j < width; j++)
         dt_vector_clip(&out[4*j]);
 
-      cmsDoTransform(d->xform_nrgb_Lab, out, out, width);
+      _icc_apply(d->rs_xform_nrgb_Lab, d->xform_nrgb_Lab, out, out, width);
     }
   }
 }
@@ -1065,16 +1138,16 @@ static void process_lcms2_proper(dt_iop_module_t *self,
     // convert to (L,a/L,b/L) to be able to change L without changing saturation.
     if(!d->nrgb)
     {
-      cmsDoTransform(d->xform_cam_Lab, in, out, width);
+      _icc_apply(d->rs_xform_cam_Lab, d->xform_cam_Lab, in, out, width);
     }
     else
     {
-      cmsDoTransform(d->xform_cam_nrgb, in, out, width);
+      _icc_apply(d->rs_xform_cam_nrgb, d->xform_cam_nrgb, in, out, width);
 
       for(int j = 0; j < width; j++)
         dt_vector_clip(&out[4*j]);
 
-      cmsDoTransform(d->xform_nrgb_Lab, out, out, width);
+      _icc_apply(d->rs_xform_nrgb_Lab, d->xform_nrgb_Lab, out, out, width);
     }
   }
   dt_free_align(scratchlines);
@@ -1205,6 +1278,7 @@ void commit_params(dt_iop_module_t *self,
     cmsDeleteTransform(d->xform_nrgb_Lab);
     d->xform_nrgb_Lab = NULL;
   }
+  _colorin_rs_cleanup(d);
 
   dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
   dt_mark_colormatrix_invalid(&d->nmatrix[0][0]);
@@ -1360,6 +1434,12 @@ void commit_params(dt_iop_module_t *self,
                                     // fallback
   }
 
+  // m4-129 slice 2: serialize the profiles once for the pure-Rust ICC engine's
+  // own parser; it is tried first at each transform build site below.
+  _colorin_rs_cleanup(d);   // drop stale bytes before re-serializing
+  d->rs_icc_input = _colorin_profile_bytes(d->input, &d->rs_icc_input_len);
+  d->rs_icc_lab = _colorin_profile_bytes(Lab, &d->rs_icc_lab_len);
+
   // prepare transformation matrix or lcms2 transforms as fallback
   if(d->nrgb)
   {
@@ -1370,12 +1450,27 @@ void commit_params(dt_iop_module_t *self,
     {
       piece->process_cl_ready = FALSE;
       dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
-      d->xform_cam_Lab = cmsCreateTransform(d->input, input_format, Lab,
-                                            TYPE_LabA_FLT, p->intent, 0);
-      d->xform_cam_nrgb = cmsCreateTransform(d->input, input_format, d->nrgb,
-                                             TYPE_RGBA_FLT, p->intent, 0);
-      d->xform_nrgb_Lab = cmsCreateTransform(d->nrgb, TYPE_RGBA_FLT, Lab,
-                                             TYPE_LabA_FLT, p->intent, 0);
+      g_free(d->rs_icc_nrgb);
+      d->rs_icc_nrgb_len = 0;
+      d->rs_icc_nrgb = _colorin_profile_bytes(d->nrgb, &d->rs_icc_nrgb_len);
+      d->rs_xform_cam_Lab = darkroom_icc_transform_new(
+          d->rs_icc_input, d->rs_icc_input_len, d->rs_icc_lab, d->rs_icc_lab_len,
+          (unsigned int)p->intent);
+      d->rs_xform_cam_nrgb = darkroom_icc_transform_new(
+          d->rs_icc_input, d->rs_icc_input_len, d->rs_icc_nrgb, d->rs_icc_nrgb_len,
+          (unsigned int)p->intent);
+      d->rs_xform_nrgb_Lab = darkroom_icc_transform_new(
+          d->rs_icc_nrgb, d->rs_icc_nrgb_len, d->rs_icc_lab, d->rs_icc_lab_len,
+          (unsigned int)p->intent);
+      if(!d->rs_xform_cam_Lab)
+        d->xform_cam_Lab = cmsCreateTransform(d->input, input_format, Lab,
+                                              TYPE_LabA_FLT, p->intent, 0);
+      if(!d->rs_xform_cam_nrgb)
+        d->xform_cam_nrgb = cmsCreateTransform(d->input, input_format, d->nrgb,
+                                               TYPE_RGBA_FLT, p->intent, 0);
+      if(!d->rs_xform_nrgb_Lab)
+        d->xform_nrgb_Lab = cmsCreateTransform(d->nrgb, TYPE_RGBA_FLT, Lab,
+                                               TYPE_LabA_FLT, p->intent, 0);
     }
     else
     {
@@ -1396,30 +1491,46 @@ void commit_params(dt_iop_module_t *self,
     {
       piece->process_cl_ready = FALSE;
       dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
-      d->xform_cam_Lab = cmsCreateTransform(d->input, input_format, Lab,
-                                            TYPE_LabA_FLT, p->intent, 0);
+      d->rs_xform_cam_Lab = darkroom_icc_transform_new(
+          d->rs_icc_input, d->rs_icc_input_len, d->rs_icc_lab, d->rs_icc_lab_len,
+          (unsigned int)p->intent);
+      if(!d->rs_xform_cam_Lab)
+        d->xform_cam_Lab = cmsCreateTransform(d->input, input_format, Lab,
+                                              TYPE_LabA_FLT, p->intent, 0);
     }
   }
 
   // we might have failed generating the clipping transformations, check that:
-  if(d->nrgb && ((!d->xform_cam_nrgb && !dt_is_valid_colormatrix(d->nmatrix[0][0]))
-                 || (!d->xform_nrgb_Lab && !dt_is_valid_colormatrix(d->lmatrix[0][0]))))
+  if(d->nrgb && ((!d->xform_cam_nrgb && !d->rs_xform_cam_nrgb
+                  && !dt_is_valid_colormatrix(d->nmatrix[0][0]))
+                 || (!d->xform_nrgb_Lab && !d->rs_xform_nrgb_Lab
+                     && !dt_is_valid_colormatrix(d->lmatrix[0][0]))))
   {
     if(d->xform_cam_nrgb)
     {
       cmsDeleteTransform(d->xform_cam_nrgb);
       d->xform_cam_nrgb = NULL;
     }
+    if(d->rs_xform_cam_nrgb)
+    {
+      darkroom_icc_transform_free(d->rs_xform_cam_nrgb);
+      d->rs_xform_cam_nrgb = NULL;
+    }
     if(d->xform_nrgb_Lab)
     {
       cmsDeleteTransform(d->xform_nrgb_Lab);
       d->xform_nrgb_Lab = NULL;
     }
+    if(d->rs_xform_nrgb_Lab)
+    {
+      darkroom_icc_transform_free(d->rs_xform_nrgb_Lab);
+      d->rs_xform_nrgb_Lab = NULL;
+    }
     d->nrgb = NULL;
   }
 
   // user selected a non-supported input profile, check that:
-  if(!d->xform_cam_Lab && !dt_is_valid_colormatrix(d->cmatrix[0][0]))
+  if(!d->xform_cam_Lab && !d->rs_xform_cam_Lab && !dt_is_valid_colormatrix(d->cmatrix[0][0]))
   {
     if(p->type == DT_COLORSPACE_FILE)
       dt_print(DT_DEBUG_ALWAYS, "[colorin] unsupported input profile `%s' has"
@@ -1433,14 +1544,22 @@ void commit_params(dt_iop_module_t *self,
     d->input = dt_colorspaces_get_profile(DT_COLORSPACE_LIN_REC709, "",
                                           DT_PROFILE_DIRECTION_IN)->profile;
     d->clear_input = FALSE;
+    // the input changed: refresh the engine's bytes before rebuilding
+    g_free(d->rs_icc_input);
+    d->rs_icc_input_len = 0;
+    d->rs_icc_input = _colorin_profile_bytes(d->input, &d->rs_icc_input_len);
     if(dt_colorspaces_get_matrix_from_input_profile(d->input, d->cmatrix,
                                                     d->lut[0], d->lut[1], d->lut[2],
                                                     LUT_SAMPLES))
     {
       piece->process_cl_ready = FALSE;
       dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
-      d->xform_cam_Lab = cmsCreateTransform(d->input, TYPE_RGBA_FLT, Lab,
-                                            TYPE_LabA_FLT, p->intent, 0);
+      d->rs_xform_cam_Lab = darkroom_icc_transform_new(
+          d->rs_icc_input, d->rs_icc_input_len, d->rs_icc_lab, d->rs_icc_lab_len,
+          (unsigned int)p->intent);
+      if(!d->rs_xform_cam_Lab)
+        d->xform_cam_Lab = cmsCreateTransform(d->input, TYPE_RGBA_FLT, Lab,
+                                              TYPE_LabA_FLT, p->intent, 0);
     }
   }
 
@@ -1486,6 +1605,18 @@ void init_pipe(dt_iop_module_t *self,
   d->xform_cam_Lab = NULL;
   d->xform_cam_nrgb = NULL;
   d->xform_nrgb_Lab = NULL;
+  /* malloc, not calloc: every field must be initialized here — the Rust-engine
+   * handles/buffers below are freed unconditionally by _colorin_rs_cleanup()
+   * at the top of commit_params, before any of them is ever assigned. */
+  d->rs_xform_cam_Lab = NULL;
+  d->rs_xform_cam_nrgb = NULL;
+  d->rs_xform_nrgb_Lab = NULL;
+  d->rs_icc_input = NULL;
+  d->rs_icc_input_len = 0;
+  d->rs_icc_nrgb = NULL;
+  d->rs_icc_nrgb_len = 0;
+  d->rs_icc_lab = NULL;
+  d->rs_icc_lab_len = 0;
 }
 
 void cleanup_pipe(dt_iop_module_t *self,
@@ -1509,6 +1640,7 @@ void cleanup_pipe(dt_iop_module_t *self,
     cmsDeleteTransform(d->xform_nrgb_Lab);
     d->xform_nrgb_Lab = NULL;
   }
+  _colorin_rs_cleanup(d);
 
   free(piece->data);
   piece->data = NULL;

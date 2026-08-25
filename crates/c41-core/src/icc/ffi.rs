@@ -14,9 +14,10 @@ use super::{Profile, Transform};
 /// 2 saturation, 3 abs-colourimetric; anything above 3 is refused with NULL,
 /// mirroring `cmsCreateTransform` failing on an unknown intent). Returns an
 /// owned handle, or NULL when either profile fails to parse or the assembly is
-/// impossible (e.g. no B2A tags and singular matrix-shaper colorants, or a
-/// non-3-channel GRAY/CMYK/N-colour profile, which this RGB engine does not
-/// evaluate) — the caller must fall back exactly as it would have for a failed
+/// impossible (e.g. no B2A tags and singular matrix-shaper colorants, a
+/// non-3-channel GRAY/CMYK/N-colour profile, or a device colour space that is
+/// neither RGB nor XYZ nor equal to the PCS — none of which this RGB engine
+/// evaluates) — the caller must fall back exactly as it would have for a failed
 /// `cmsCreateTransform`.
 ///
 /// # Safety
@@ -167,7 +168,7 @@ mod tests {
             darkroom_icc_transform_new(std::ptr::null(), 10, std::ptr::null(), 10, 0).is_null()
         });
         // Garbage bytes → parse error → null handle (never a panic across FFI).
-        let junk = vec![0u8; 64];
+        let junk = [0u8; 64];
         let ok_bytes = srgb_pair_bytes();
         assert!(unsafe {
             darkroom_icc_transform_new(junk.as_ptr(), junk.len(), ok_bytes.as_ptr(), ok_bytes.len(), 0)

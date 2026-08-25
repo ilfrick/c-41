@@ -90,6 +90,19 @@ impl Transform {
     /// documented deviation). If either profile lacks a usable `wtpt`, absolute
     /// degrades silently to the relative result rather than failing.
     pub fn new(src: &Profile, dst: &Profile, intent: u32) -> Result<Transform, IccError> {
+        // The pipelines below interpret device values as RGB (or as XYZ/Lab for
+        // colour-space-conversion profiles whose device space *is* the PCS).
+        // Any other colour-space signature — say a device-`Lab ` profile with
+        // `XYZ ` PCS and full matrix-shaper tags — would slide into the XYZ
+        // shaper path and evaluate to plausible garbage instead of failing.
+        // Refuse such profiles outright so the C caller falls back to LCMS.
+        for p in [src, dst] {
+            let conversion = p.data_space == p.pcs;
+            let rgb_or_xyz = p.data_space == *b"RGB " || p.data_space == *b"XYZ ";
+            if !conversion && !rgb_or_xyz {
+                return Err(IccError::WrongTagType);
+            }
+        }
         let head = src.a2b_pipeline(intent)?;
         let tail = dst.b2a_pipeline(intent)?;
 
@@ -178,8 +191,10 @@ pub(crate) mod tests {
 
     /// Shared synthetic-profile builders for sibling icc test modules (ffi.rs).
     /// One definition here; re-exported below so the FFI boundary tests parse
-    /// the exact same bytes the engine tests do.
+    /// the exact same bytes the engine tests do. Not every importer consumes
+    /// every builder — that is what makes it a shared kit.
     pub(crate) mod test_helpers {
+        #![allow(unused_imports)]
         pub(crate) use super::{build_profile, curv_gamma_tag, mft1_gray_lut, mft1_identity_lut,
                                matrix_profile, srgb_like_profile, xyz_tag};
     }
@@ -541,6 +556,54 @@ pub(crate) mod tests {
         ));
     }
 
+    /// The bare Lab colour-space profile darktable links colorin/colorout
+    /// transforms through (LCMS's `cmsCreateLab4Profile` equivalent): device
+    /// space == PCS, no transform tags.
+    pub(crate) fn lab_identity_profile() -> Vec<u8> {
+        build_profile(b"mntr", b"Lab ", b"Lab ", &[])
+    }
+
+    #[test]
+    fn colourspace_conversion_profiles_transform_identity() {
+        // Device space == PCS ⇒ both directions are empty pipelines, and a full
+        // Transform between two such profiles passes raw values through.
+        let p = Profile::parse(&lab_identity_profile()).unwrap();
+        assert!(p.a2b_pipeline(1).unwrap().stages.is_empty());
+        assert!(p.b2a_pipeline(1).unwrap().stages.is_empty());
+        let t = Transform::new(&p, &p, 1).unwrap();
+        for lab in [[50.0f32, 4.0, -6.0], [100.0, 0.0, 0.0], [0.0, -128.0, 127.0]] {
+            assert_eq!(t.eval(&lab), lab, "Lab passthrough {lab:?}");
+        }
+
+        let xyz = Profile::parse(&build_profile(b"mntr", b"XYZ ", b"XYZ ", &[])).unwrap();
+        assert!(xyz.b2a_pipeline(1).unwrap().stages.is_empty());
+        let t = Transform::new(&xyz, &xyz, 1).unwrap();
+        assert_eq!(
+            t.eval(&[0.31, 0.51, 0.17]),
+            vec![0.31, 0.51, 0.17],
+            "XYZ passthrough"
+        );
+    }
+
+    #[test]
+    fn lab_conversion_profile_links_to_device_profiles() {
+        // colorout's shape: raw Lab in through the bare Lab source profile,
+        // sRGB-like device out. Neutral Lab must land on neutral device RGB.
+        let src = Profile::parse(&lab_identity_profile()).unwrap();
+        let dst = Profile::parse(&srgb_like_profile(b"XYZ ", [0.9642, 1.0, 0.8249])).unwrap();
+        let t = Transform::new(&src, &dst, 1).unwrap();
+
+        let white = t.eval(&[100.0, 0.0, 0.0]);
+        for o in &white {
+            assert!((*o - 1.0).abs() < 5e-3, "D50 white → device white: {white:?}");
+        }
+        let grey = t.eval(&[50.0, 0.0, 0.0]);
+        assert!(
+            (grey[0] - grey[1]).abs() < 1e-4 && (grey[1] - grey[2]).abs() < 1e-4,
+            "neutral stays neutral: {grey:?}"
+        );
+    }
+
     #[test]
     fn non_three_channel_pipelines_are_rejected_at_assembly() {
         // A GRAY profile's A2B0 parses cleanly (1-in/1-out is within the
@@ -560,6 +623,35 @@ pub(crate) mod tests {
         let d = Profile::parse(&dst_bytes).unwrap();
         assert!(matches!(
             Transform::new(&src, &d, 1),
+            Err(IccError::WrongTagType)
+        ));
+    }
+
+    #[test]
+    fn odd_device_space_signatures_are_rejected_even_with_full_shaper_tags() {
+        // A device-`Lab ` profile whose PCS is `XYZ ` is neither RGB nor XYZ
+        // nor a colour-space conversion (data_space ≠ pcs). Its matrix-shaper
+        // tags are all individually valid — the pipelines would build and
+        // evaluate to plausible garbage by reading them as if the device were
+        // XYZ. Assembly must refuse it so the C caller falls back to LCMS
+        // instead of grading through nonsense.
+        let bytes = build_profile(
+            b"mntr",
+            b"Lab ",
+            b"XYZ ",
+            &[
+                (b"wtpt", xyz_tag(0.9642, 1.0, 0.8249)),
+                (b"rXYZ", xyz_tag(0.9642, 0.0, 0.0)),
+                (b"gXYZ", xyz_tag(0.0, 1.0, 0.0)),
+                (b"bXYZ", xyz_tag(0.0, 0.0, 0.8249)),
+                (b"rTRC", curv_gamma_tag(2.2)),
+                (b"gTRC", curv_gamma_tag(2.2)),
+                (b"bTRC", curv_gamma_tag(2.2)),
+            ],
+        );
+        let p = Profile::parse(&bytes).expect("the fixture itself must parse");
+        assert!(matches!(
+            Transform::new(&p, &p, 1),
             Err(IccError::WrongTagType)
         ));
     }

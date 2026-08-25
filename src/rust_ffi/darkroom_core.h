@@ -1,11 +1,11 @@
 #pragma once
 /*
- * C declarations for functions exported by the darkroom-core Rust crate
- * (crates/darkroom-core/src/iop/exposure.rs).
+ * C declarations for functions exported by the c41-core Rust crate
+ * (crates/c41-core/src/iop/exposure.rs).
  *
  * This header is hand-maintained for now. When more IOPs migrate to Rust,
  * regenerate it with:
- *   cbindgen --config crates/darkroom-core/cbindgen.toml \
+ *   cbindgen --config crates/c41-core/cbindgen.toml \
  *             --output src/rust_ffi/darkroom_core.h
  */
 
@@ -2857,6 +2857,27 @@ void darkroom_xtrans_markesteijn(float *out, const float *in, int width, int hei
  * C-side from ISO vs the fdc_xover_iso config). Writes the RGBA `out`. */
 void darkroom_xtrans_fdc(float *out, const float *in, int width, int height,
                          const unsigned char *xtrans, float hybrid0, float hybrid1);
+
+/*
+ * ICC engine (c41-core::icc) -- pure-Rust replacement for the LCMS
+ * cmsCreateTransform/cmsDoTransform pixel paths in colorin/colorout.
+ * One handle = one (src, dst, intent) transform assembled from raw ICC profile
+ * bytes; built once in commit_params, applied per band row, freed in cleanup --
+ * mirroring the cmsHTRANSFORM lifetime it sits beside. Colour lanes carry raw
+ * Lab (L in [0,100], a/b in [-128,127]) or raw D50-referenced XYZ floats --
+ * the same domain as LCMS's TYPE_LabA_FLT / TYPE_XYZA_FLT / TYPE_RGBA_FLT
+ * float formats. Handles may be used concurrently from multiple band threads;
+ * apply supports in==out (each pixel's triplet is read before its write).
+ * darkroom_icc_transform_new returns NULL when either profile fails to parse,
+ * the pair is not 3-channel RGB/XYZ/Lab, or intent > 3 -- callers fall back to
+ * cmsCreateTransform exactly as before for anything the engine refuses.
+ */
+void *darkroom_icc_transform_new(const unsigned char *src, size_t src_len,
+                                 const unsigned char *dst, size_t dst_len,
+                                 unsigned int intent);
+void darkroom_icc_transform_free(void *t);
+void darkroom_icc_transform_apply_rgba(const void *t, const float *in_buf,
+                                       float *out_buf, size_t npixels);
 
 #ifdef __cplusplus
 } /* extern "C" */
