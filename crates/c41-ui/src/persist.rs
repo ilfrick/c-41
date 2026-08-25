@@ -1053,15 +1053,45 @@ pub(crate) fn try_load_metadata(
 /// The XMP sidecar is synchronised by the CALLER after a successful write
 /// (`crate::xmp::sync_sidecar`, m4-142) — mirroring upstream, where
 /// `dt_metadata_set_list` is followed by `dt_image_synch_xmps`
-/// (`src/libs/metadata.c:383`). This function stays storage-only so both
+/// (`src/libs/metadata.c:393`). This function stays storage-only so both
 /// stores keep a clear order: catalogue first (authoritative), sidecar second
 /// (a failed sidecar write is reported, never rolled back).
 pub fn save_metadata(db_path: &str, full_path: &str, fields: &[(MetaField, String)]) -> bool {
     if db_path.is_empty() || fields.is_empty() {
         return false;
     }
-    let Ok(mut conn) = Connection::open(db_path) else { return false };
-    save_metadata_conn(&mut conn, full_path, fields).is_ok()
+    let path = full_path.to_string();
+    save_metadata_many(db_path, std::slice::from_ref(&path), fields).len() == 1
+}
+
+/// Write `fields` to EVERY image in `full_paths`, returning the paths that were
+/// actually written. An image with no catalogue row has no imgid to key
+/// metadata against and is skipped — it is simply absent from the return, so
+/// callers compare its length against `full_paths.len()` to surface the skip
+/// (the panel reports `Saved … for K of N images`, m4-145 review BLOCKER-1).
+///
+/// m4-145: darktable's metadata editor writes each edited field to the WHOLE
+/// lighttable selection (`dt_metadata_set_list` over the selected ids), so the
+/// panel hands its snapshotted target list here. Each image keeps its own
+/// transaction ([`save_metadata_conn`]) so one unresolvable or failing image
+/// cannot roll back the others; sharing ONE connection across the loop simply
+/// removes N−1 opens.
+pub fn save_metadata_many(
+    db_path: &str,
+    full_paths: &[String],
+    fields: &[(MetaField, String)],
+) -> Vec<String> {
+    if db_path.is_empty() || fields.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut conn) = Connection::open(db_path) else { return Vec::new() };
+    let mut written = Vec::new();
+    for path in full_paths {
+        if save_metadata_conn(&mut conn, path, fields).is_ok() {
+            written.push(path.clone());
+        }
+    }
+    written
 }
 
 fn save_metadata_conn(
@@ -1230,6 +1260,65 @@ mod metadata_tests {
         let (db, _) = catalogued_db("uncatalogued");
         assert!(!save_metadata(&db, "/photos/missing.raw", &[(MetaField::Title, "x".into())]));
         assert!(load_metadata(&db, "/photos/missing.raw").is_empty());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn save_many_fans_out_and_reports_skips_by_absence() {
+        // m4-145: the panel's whole-selection commit. Every catalogued target
+        // gets the write; an uncatalogued path is skipped and REPORTED by its
+        // absence from the return value — it must not abort the rest, and it
+        // must not be silently counted as done.
+        let (db, img) = catalogued_db("many");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO main.images (id, film_id, filename) VALUES (8, 1, 'b.raw')", [])
+            .unwrap();
+        conn.execute("INSERT INTO main.images (id, film_id, filename) VALUES (9, 1, 'c.raw')", [])
+            .unwrap();
+        drop(conn);
+        let targets = vec![
+            img.clone(),
+            "/photos/b.raw".to_string(),
+            "/photos/gone.raw".to_string(),
+            "/photos/c.raw".to_string(),
+        ];
+        let written =
+            save_metadata_many(&db, &targets, &[(MetaField::Title, "batch".into())]);
+        assert_eq!(
+            written,
+            vec![img.clone(), "/photos/b.raw".into(), "/photos/c.raw".into()],
+            "the uncatalogued path is reported by absence, in input order"
+        );
+        for path in [img, "/photos/b.raw".to_string(), "/photos/c.raw".to_string()] {
+            let meta = load_metadata(&db, &path);
+            let title = meta
+                .iter()
+                .find(|(f, _)| *f == MetaField::Title)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            assert_eq!(title, "batch", "{path} missed the fan-out");
+        }
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn save_metadata_is_save_many_on_a_single_path() {
+        // Delegation pin: since m4-145 the single-image API is
+        // save_metadata_many over a one-element slice. If they ever drift,
+        // single edits and selection fan-outs would disagree about what a
+        // successful write even is.
+        let (db, img) = catalogued_db("delegate");
+        assert!(save_metadata(&db, &img, &[(MetaField::Creator, "Ansel".into())]));
+        assert_eq!(
+            save_metadata_many(&db, &[img.clone()], &[(MetaField::Creator, "Ansel".into())]),
+            vec![img.clone()]
+        );
+        let creator = load_metadata(&db, &img)
+            .iter()
+            .find(|(f, _)| *f == MetaField::Creator)
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(creator, "Ansel");
         let _ = std::fs::remove_file(&db);
     }
 

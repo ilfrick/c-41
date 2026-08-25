@@ -1629,9 +1629,89 @@ fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {
 pub type StyleParamsGetter =
     std::rc::Rc<dyn Fn() -> Option<(String, crate::preview::PreviewParams)>>;
 
-/// Per-entry editing baseline for the metadata editor: `(path, db_path, original
-/// text)` captured when the entry gained focus. See `MetadataPanel::new`.
-type MetaTarget = std::rc::Rc<std::cell::RefCell<(String, String, String)>>;
+/// Per-entry editing target for the metadata editor: `(paths, db_path,
+/// original text)` captured when the entry gained focus. m4-145: `paths` is
+/// the lighttable multi-selection (darktable's semantics — an edit lands on
+/// every selected image), or the active image alone — see
+/// `metadata_target_paths` for exactly which. A snapshot may briefly outlive a
+/// collection prune (filter/folder change) until the reload-triggered
+/// `update()` re-baselines; that matches upstream, which likewise acts on ids
+/// captured at its last gui_update. See `MetadataPanel::new`.
+type MetaTarget = std::rc::Rc<std::cell::RefCell<(Vec<String>, String, String)>>;
+
+/// The images an edit made RIGHT NOW would land on: the whole multi-selection
+/// WHEN it contains the image on screen, else just that image alone.
+///
+/// Why the containment rule (m4-145 review MAJOR-2): the grid cursor can move
+/// without the selection following — native GridView keynav drives the
+/// SingleSelection directly, and preview stepping sets it programmatically —
+/// so a bare snapshot-else-cursor can bind edits to a set that EXCLUDES the
+/// image whose text is on screen. Binding to the displayed image then is the
+/// only rule under which the panel never shows one image while writing to
+/// others (upstream gets this for free: its `last_act_on` drives both display
+/// and write). Rating/colour keys deliberately keep the plain
+/// snapshot-else-cursor read — they act on grid focus, not on text under it.
+/// Shared by focus-enter and `update()`'s re-baseline so every snapshot site
+/// agrees on what a target list looks like.
+fn metadata_target_paths(cursor_path: &str) -> Vec<String> {
+    let mut targets = crate::lighttable::selection::paths_snapshot();
+    if cursor_path.is_empty() || !targets.iter().any(|p| p == cursor_path) {
+        targets.clear();
+        if !cursor_path.is_empty() {
+            targets.push(cursor_path.to_string());
+        }
+    }
+    targets
+}
+
+/// Text for the scope hint under the metadata entries: `None` hides it (the
+/// single-image case must look exactly as before), otherwise the honest count.
+/// Pure so the wording is pinned display-free.
+fn meta_scope_hint_text(n: usize) -> Option<String> {
+    match n {
+        0 | 1 => None,
+        k => Some(format!("Edits apply to all {k} selected images")),
+    }
+}
+
+/// One honest line describing a commit's outcome — `None` when everything
+/// landed, which must look exactly as before (no toast on plain success):
+///   nothing written              -> "Could not save {what}"
+///   some targets were skipped    -> "Saved {what} for K of N images"
+///   sidecar writes failed        -> "Could not update X XMP sidecar(s)"
+/// both non-silent cases combine with "; ". Pure so every wording is pinned
+/// display-free. Exists because m4-145's first draft CLAIMED in comments that
+/// uncatalogued skips were reported when the code silently dropped them
+/// (review BLOCKER-1) — this makes the report real and testable instead.
+fn metadata_commit_report(
+    what: &str,
+    written: usize,
+    total: usize,
+    xmp_failed: usize,
+) -> Option<String> {
+    if written == 0 {
+        return Some(format!("Could not save {what}"));
+    }
+    let mut msg = String::new();
+    if written < total {
+        msg = format!("Saved {what} for {written} of {total} images");
+    }
+    if xmp_failed > 0 {
+        let tail = format!("could not update {xmp_failed} XMP sidecar(s)");
+        if msg.is_empty() {
+            // Standalone sidecar line starts the sentence: capitalise it.
+            let mut cs = tail.chars();
+            if let Some(c) = cs.next() {
+                msg.extend(c.to_uppercase());
+                msg.push_str(cs.as_str());
+            }
+        } else {
+            msg.push_str("; ");
+            msg.push_str(&tail);
+        }
+    }
+    if msg.is_empty() { None } else { Some(msg) }
+}
 
 /// A copied edit: the saved params blob plus the image's undo-stack, and the
 /// source path it came from. Plain data so clipboard semantics are testable
@@ -1760,8 +1840,13 @@ pub struct MetadataPanel {
     meta_entries: Vec<gtk4::Entry>,
     /// Editing baselines, index-aligned with `meta_entries`. Held so `update()`
     /// can re-baseline an entry it repaints, and so a focused entry is never left
-    /// showing one image's text while `ctx` points at another.
+    /// showing one image's text while `ctx` points at another. Each target now
+    /// carries the whole multi-selection (m4-145), not just one path.
     meta_targets: Vec<MetaTarget>,
+    /// Dim hint under the entries, shown only when more than one image is
+    /// selected: commits fan out, and typing without knowing that is how
+    /// "I only meant to rename this one" disasters happen.
+    meta_scope_lbl: gtk4::Label,
     /// Optional user-visible notifier, used to report a metadata save that could
     /// not land. Same shape as `on_tags_changed`; set via [`set_on_notify`].
     on_notify: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(String)>>>>,
@@ -2155,6 +2240,19 @@ impl MetadataPanel {
         }
         panel.append(&meta_grid);
 
+        // Scope hint (m4-145): with a multi-selection active, commits land on
+        // every selected image — darktable's behaviour, but silent fan-out is
+        // exactly the kind of power that must be VISIBLE. Hidden at ≤1 so the
+        // single-image panel looks unchanged.
+        let meta_scope_lbl = gtk4::Label::builder()
+            .halign(gtk4::Align::Start)
+            .wrap(true)
+            .margin_start(12).margin_end(12).margin_bottom(4)
+            .build();
+        meta_scope_lbl.add_css_class("dim-label");
+        meta_scope_lbl.set_visible(false);
+        panel.append(&meta_scope_lbl);
+
         // ── Tags section ──────────────────────────────────────────────────
         let tags_header = gtk4::Label::builder()
             .label("Tags")
@@ -2451,26 +2549,29 @@ impl MetadataPanel {
         //
         // Two guards, both taken from upstream, because either alone is not enough:
         //
-        //  1. The target image is snapshotted when the entry GAINS focus, not read
+        //  1. The target images are snapshotted when the entry GAINS focus, not read
         //     at save time — clicking a different thumbnail moves focus AND changes
         //     the selection, and `update()` rewrites `ctx`, so reading ctx on
         //     focus-out could save image A's text onto image B.
-        //  2. The ORIGINAL text is snapshotted alongside it, and an unchanged entry
+        //  2. The ORIGINAL text is snapshotted alongside them, and an unchanged entry
         //     never writes at all (`src/libs/metadata.c:360`).
         //
         // (2) is what makes this correct rather than merely lucky: GTK4's ordering
         // of focus-leave against selection-changed is not contractual, and (1)
         // alone would depend on it.
+        //
+        // m4-145: the snapshot is darktable's whole-selection semantics — every
+        // image in the lighttable multi-selection gets the write
+        // (`dt_metadata_set_list` over the selected ids), falling back to the
+        // active image alone when nothing is multi-selected. The dim hint label
+        // states the count at focus-enter, the moment targets actually bind.
         let meta_targets: Vec<MetaTarget> = Vec::new();
         let mut meta_targets = meta_targets;
         for (i, entry) in meta_entries.iter().enumerate() {
             let field = crate::persist::MetaField::ALL[i];
-            // (path, db_path, original text) as they were when editing began.
-            let target: MetaTarget = std::rc::Rc::new(std::cell::RefCell::new((
-                String::new(),
-                String::new(),
-                String::new(),
-            )));
+            // (target paths, db_path, original text) as they were when editing began.
+            let target: MetaTarget =
+                std::rc::Rc::new(std::cell::RefCell::new((Vec::new(), String::new(), String::new())));
             meta_targets.push(target.clone());
 
             let focus = gtk4::EventControllerFocus::new();
@@ -2478,9 +2579,18 @@ impl MetadataPanel {
                 let ctx = ctx.clone();
                 let target = target.clone();
                 let entry = entry.clone();
+                let scope = meta_scope_lbl.clone();
                 focus.connect_enter(move |_| {
                     let (p, d) = ctx.borrow().clone();
-                    *target.borrow_mut() = (p, d, entry.text().to_string());
+                    let targets = metadata_target_paths(&p);
+                    match meta_scope_hint_text(targets.len()) {
+                        Some(text) => {
+                            scope.set_text(&text);
+                            scope.set_visible(true);
+                        }
+                        None => scope.set_visible(false),
+                    }
+                    *target.borrow_mut() = (targets, d, entry.text().to_string());
                 });
             }
 
@@ -2488,8 +2598,8 @@ impl MetadataPanel {
                 let target = target.clone();
                 let notify = on_notify.clone();
                 std::rc::Rc::new(move |e: &gtk4::Entry| {
-                    let (path, db, orig) = target.borrow().clone();
-                    if path.is_empty() || db.is_empty() {
+                    let (paths, db, orig) = target.borrow().clone();
+                    if paths.is_empty() || db.is_empty() {
                         return;
                     }
                     let value = e.text().to_string();
@@ -2499,30 +2609,50 @@ impl MetadataPanel {
                     // to the write list). An entry the user never touched can then
                     // never write, so even a stale focus-leave — one that fires
                     // after the selection moved on — is a no-op instead of copying
-                    // one image's text onto another.
+                    // one image's text onto another. With fan-out this check
+                    // matters more, not less: it is the only thing standing
+                    // between an idle tab-through and N rewritten titles.
                     if value == orig {
                         return;
                     }
                     // Only this field is passed, so the other four are untouched.
-                    if crate::persist::save_metadata(&db, &path, &[(field, value.clone())]) {
+                    // Images that are no longer in the catalogue drop out of
+                    // `written`; `metadata_commit_report` counts them against
+                    // `paths` ("Saved … for K of N images") instead of letting
+                    // the skip pass silently (m4-145 review BLOCKER-1).
+                    let written = crate::persist::save_metadata_many(
+                        &db,
+                        &paths,
+                        &[(field, value.clone())],
+                    );
+                    if !written.is_empty() {
                         // Re-baseline, so the focus-leave that follows an Enter
                         // does not write the same value a second time.
                         target.borrow_mut().2 = value;
-                        // Mirror the edit into the image's `.xmp` sidecar
-                        // (upstream's `dt_image_synch_xmps`,
-                        // src/libs/metadata.c:383). The sync reads all five
-                        // fields back from the catalogue, so the sidecar always
-                        // lands as one consistent set even though this commit
-                        // wrote one field. Catalogue first, sidecar second: a
-                        // failed sidecar write must not roll back or block the
-                        // authoritative store, only be reported.
-                        if !crate::xmp::sync_sidecar(&db, &path) {
-                            if let Some(n) = notify.borrow().as_ref() {
-                                n("Could not update the XMP sidecar".into());
-                            }
+                    }
+                    // Mirror the edit into each written image's `.xmp`
+                    // sidecar (upstream's `dt_image_synch_xmps`,
+                    // src/libs/metadata.c:393, which also loops the whole
+                    // selection). The sync reads all five fields back from
+                    // the catalogue, so every sidecar lands as one
+                    // consistent set even though this commit wrote one
+                    // field. Catalogue first, sidecars second: a failed
+                    // sidecar write must not roll back or block the
+                    // authoritative store, only be reported — aggregated
+                    // into one toast, since N identical popups help nobody.
+                    let failed = written
+                        .iter()
+                        .filter(|p| !crate::xmp::sync_sidecar(&db, p))
+                        .count();
+                    if let Some(msg) = metadata_commit_report(
+                        &field.label().to_lowercase(),
+                        written.len(),
+                        paths.len(),
+                        failed,
+                    ) {
+                        if let Some(n) = notify.borrow().as_ref() {
+                            n(msg);
                         }
-                    } else if let Some(n) = notify.borrow().as_ref() {
-                        n(format!("Could not save {}", field.label().to_lowercase()));
                     }
                 })
             };
@@ -2563,7 +2693,7 @@ impl MetadataPanel {
                style_delete_btn,
                history_copy_btn, history_paste_btn, history_discard_btn,
                history_lbl, history_clipboard,
-               meta_entries, meta_targets, on_notify,
+               meta_entries, meta_targets, on_notify, meta_scope_lbl,
                styles_wired: std::rc::Rc::new(std::cell::Cell::new(false)),
                filename_lbl, folder_lbl, dims_lbl, size_lbl,
                camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
@@ -2602,17 +2732,24 @@ impl MetadataPanel {
     /// Idempotent: it re-baselines each entry it writes, so calling it twice does
     /// not write twice.
     pub fn flush_metadata_edits(&self) {
-        // Collect dirty entries grouped per image first: several fields are
+        // Collect dirty entries grouped by target set first: several fields are
         // often dirty at once (window close after a burst of edits), and each
-        // group becomes ONE catalogue transaction + ONE sidecar rewrite
-        // instead of five of each. Entries can in principle target different
-        // images if the selection moved mid-edit, so grouping is by (db, path).
-        let mut groups: Vec<(String, String, Vec<(crate::persist::MetaField, String)>, Vec<(usize, String)>)> =
-            Vec::new();
+        // group becomes ONE fan-out write + ONE sidecar pass per image instead
+        // of five of each. Since m4-145 a target is a LIST of paths, and two
+        // entries can carry different lists if the selection moved between
+        // their focus sessions — so the group key is (db, sorted-paths-as-Vec),
+        // not just (db, path). A Vec rather than a join keeps distinct path
+        // lists distinct even if a filename contained the join separator.
+        // Entries with identical lists merge; different lists deliberately do
+        // not.
+        let mut groups: std::collections::HashMap<
+            (String, Vec<String>),
+            (Vec<(crate::persist::MetaField, String)>, Vec<(usize, String)>),
+        > = std::collections::HashMap::new();
         for (i, entry) in self.meta_entries.iter().enumerate() {
             let Some(target) = self.meta_targets.get(i) else { continue };
-            let (path, db, orig) = target.borrow().clone();
-            if path.is_empty() || db.is_empty() {
+            let (paths, db, orig) = target.borrow().clone();
+            if paths.is_empty() || db.is_empty() {
                 continue;
             }
             let value = entry.text().to_string();
@@ -2620,34 +2757,44 @@ impl MetadataPanel {
                 continue;
             }
             let field = crate::persist::MetaField::ALL[i];
-            match groups.last_mut() {
-                Some((p, d, fields, _)) if *p == path && *d == db => {
-                    fields.push((field, value.clone()));
-                }
-                _ => groups.push((
-                    path,
-                    db,
-                    vec![(field, value.clone())],
-                    vec![(i, value)],
-                )),
-            }
+            let mut key_paths = paths.clone();
+            key_paths.sort();
+            let (fields, baselines) = groups
+                .entry((db, key_paths))
+                .or_insert_with(|| (Vec::new(), Vec::new()));
+            fields.push((field, value.clone()));
+            baselines.push((i, value));
         }
-        for (path, db, fields, baselines) in groups {
+        // Deterministic write order regardless of HashMap iteration order.
+        let mut groups: Vec<_> = groups.into_iter().collect();
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((db, _), (fields, baselines)) in groups {
+            // Every entry in a group shares one target list by construction of
+            // the key; recover it from any member rather than storing it twice.
+            let Some(targets) = self.meta_targets.get(baselines[0].0) else { continue };
+            let paths = targets.borrow().0.clone();
             let labels: Vec<&str> = fields.iter().map(|(f, _)| f.label()).collect();
-            if crate::persist::save_metadata(&db, &path, &fields) {
+            let written = crate::persist::save_metadata_many(&db, &paths, &fields);
+            if !written.is_empty() {
                 for (i, value) in baselines {
                     if let Some(t) = self.meta_targets.get(i) {
                         t.borrow_mut().2 = value;
                     }
                 }
-                // Same sidecar mirror as the interactive commit path above.
-                if !crate::xmp::sync_sidecar(&db, &path) {
-                    if let Some(n) = self.on_notify.borrow().as_ref() {
-                        n("Could not update the XMP sidecar".into());
-                    }
+            }
+            // Same honest outcome line as the interactive commit path above —
+            // skips and sidecar failures are counted here too, never dropped
+            // silently (m4-145 review BLOCKER-1). One pass per written image,
+            // failures aggregated into the single line.
+            let what = labels.join(", ").to_lowercase();
+            let failed =
+                written.iter().filter(|p| !crate::xmp::sync_sidecar(&db, p)).count();
+            if let Some(msg) =
+                metadata_commit_report(&what, written.len(), paths.len(), failed)
+            {
+                if let Some(n) = self.on_notify.borrow().as_ref() {
+                    n(msg);
                 }
-            } else if let Some(n) = self.on_notify.borrow().as_ref() {
-                n(format!("Could not save {}", labels.join(", ").to_lowercase()));
             }
         }
     }
@@ -2696,12 +2843,31 @@ impl MetadataPanel {
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
             entry.set_text(text);
-            // Re-baseline to the newly shown image, so a subsequent focus-leave
-            // compares against THIS image's value.
+            // Re-baseline to the current targets, so a subsequent focus-leave
+            // compares against THIS image's value and writes to THIS selection.
+            // m4-145: the target list is the whole multi-selection (or the
+            // cursor image alone), exactly what focus-enter would snapshot — a
+            // defensive fallback for a leave that never saw an enter.
             if let Some(t) = self.meta_targets.get(i) {
+                let targets = metadata_target_paths(full_path);
                 let mut t = t.borrow_mut();
-                *t = (full_path.to_string(), db_path.to_string(), text.to_string());
+                *t = (targets, db_path.to_string(), text.to_string());
             }
+        }
+        // The scope hint tracks the live count too, not just the focus-enter
+        // moment: a ctrl-click toggles the set AND moves the cursor (GridView's
+        // native handling proceeds after our gesture), which lands here via
+        // selection-changed → update() — the one hook guaranteed to fire
+        // without an entry refocusing. Refreshing from both sites is
+        // idempotent, so the label never outlives the set it describes
+        // (m4-145 review MINOR-3: the first draft claimed ctrl-click did NOT
+        // move the cursor — it does).
+        match meta_scope_hint_text(metadata_target_paths(full_path).len()) {
+            Some(text) => {
+                self.meta_scope_lbl.set_text(&text);
+                self.meta_scope_lbl.set_visible(true);
+            }
+            None => self.meta_scope_lbl.set_visible(false),
         }
 
         // NOTE: the styles list is deliberately NOT refreshed here. It is
@@ -3337,6 +3503,90 @@ mod exif_format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_scope_hint_hides_for_zero_and_one_and_counts_above() {
+        // The single-image case must look exactly as it did before m4-145, so
+        // 0 and 1 hide the hint; anything more states the fan-out honestly.
+        assert_eq!(meta_scope_hint_text(0), None);
+        assert_eq!(meta_scope_hint_text(1), None);
+        assert_eq!(meta_scope_hint_text(2).as_deref(), Some("Edits apply to all 2 selected images"));
+        assert_eq!(
+            meta_scope_hint_text(17).as_deref(),
+            Some("Edits apply to all 17 selected images")
+        );
+    }
+
+    #[test]
+    fn metadata_target_paths_fall_back_to_the_cursor_only_without_a_set() {
+        // The selection thread-local is empty in a fresh test process (and each
+        // test thread gets its own), so this pins the fallback half of the
+        // contract: no multi-selection means exactly the cursor image. The
+        // set-populated half is exercised by lighttable::selection's own tests
+        // plus the Docker pass; this one only needs to stay display-free.
+        assert_eq!(metadata_target_paths("/d/only.nef"), vec!["/d/only.nef"]);
+        assert!(metadata_target_paths("").is_empty(), "no image showing → nothing to target");
+    }
+
+    #[test]
+    fn metadata_target_paths_bind_to_the_displayed_image_over_a_foreign_set() {
+        // m4-145 review MAJOR-2: the grid cursor can leave the selection set
+        // (native keynav, preview stepping) without the set following. When it
+        // does, the DISPLAYED image must win — binding edits to a set that
+        // excludes the text on screen would write where the user isn't looking.
+        crate::lighttable::selection::clear();
+        crate::lighttable::selection::toggle("/d/a.nef");
+        crate::lighttable::selection::toggle("/d/b.nef");
+        // Cursor inside the set: the whole set binds (the fan-out case).
+        assert_eq!(
+            metadata_target_paths("/d/b.nef"),
+            vec!["/d/a.nef", "/d/b.nef"]
+        );
+        // Cursor outside the set: display wins, nothing smears onto {a, b}.
+        assert_eq!(metadata_target_paths("/d/c.nef"), vec!["/d/c.nef"]);
+        crate::lighttable::selection::clear();
+    }
+
+    #[test]
+    fn commit_report_is_silent_only_when_everything_landed() {
+        // Plain success must look exactly as before m4-145: no toast at all.
+        assert_eq!(metadata_commit_report("title", 3, 3, 0), None);
+    }
+
+    #[test]
+    fn commit_report_counts_uncatalogued_skips_instead_of_dropping_them() {
+        // Review BLOCKER-1's scenario: a 100-image batch where 99 rows lost
+        // their catalogue entries must SAY so, not pretend the batch landed.
+        assert_eq!(
+            metadata_commit_report("title", 1, 100, 0),
+            Some("Saved title for 1 of 100 images".to_string())
+        );
+    }
+
+    #[test]
+    fn commit_report_keeps_the_could_not_save_line_when_nothing_lands() {
+        assert_eq!(
+            metadata_commit_report("title", 0, 2, 0),
+            Some("Could not save title".to_string())
+        );
+    }
+
+    #[test]
+    fn commit_report_joins_sidecar_failures_and_combines_parts() {
+        // Standalone sidecar failure reads exactly as the pre-review toast did:
+        assert_eq!(
+            metadata_commit_report("creator", 3, 3, 2),
+            Some("Could not update 2 XMP sidecar(s)".to_string())
+        );
+        // Skip and sidecar failure combine into ONE line, not two popups:
+        assert_eq!(
+            metadata_commit_report("title", 2, 5, 1),
+            Some(
+                "Saved title for 2 of 5 images; could not update 1 XMP sidecar(s)"
+                    .to_string()
+            )
+        );
+    }
 
     #[test]
     fn section_pref_keys_are_distinct_and_namespaced() {

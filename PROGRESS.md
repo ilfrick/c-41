@@ -2166,3 +2166,66 @@ Failures en route, kept for the record: first draft had seven known-broken spots
 **Verification:** 11/11 `lighttable::selection` release tests after fixes (incl. new anchor pin); full `scripts/ci-local.sh` **GATE_EXIT=0** post-fixes (log target/cbuild/gate-m4-144-postfix.log) — judged by exit code, not output greps.
 
 **Follow-ups recorded:** metadata editor panel still single-image (fan-out there is the natural slice 3, needs multi-target commit semantics for text fields); keyboard/click rating+label writes remain catalogue-only (no XMP sidecar sync on those paths); cross-surface shared decode cache (m4-143 follow-up) would also serve selection-heavy scrolling; RAII InflightGuard.
+
+## 2026-08-26 00:40 UTC — m4-145: the metadata editor fans out over the lighttable multi-selection
+
+**What changed** (c41-ui only): `persist.rs` gained `save_metadata_many(db,
+&[paths], fields) -> Vec<String>` returning the paths that actually landed —
+one connection for the loop, one transaction per image via the existing
+`save_metadata_conn`, uncatalogued images skipped and reported by absence
+(`save_metadata` is now a one-path delegation, pinned by test). `panels/mod.rs`:
+each metadata entry's commit target became a snapshotted LIST of paths —
+darktable's `dt_metadata_set_list`-over-the-selection semantics — captured at
+focus-enter and re-baselined in `update()`; a dim scope hint states the count
+while more than one image is bound; `flush_metadata_edits` groups dirty entries
+by identical target list into ONE fan-out write + sidecar pass; XMP sidecars
+sync over every written path with failures aggregated into one line.
+
+**Senior review: BLOCK → all findings fixed pre-commit.** Review ran on a fresh
+general-purpose agent, model "opus", carrying an explicit read-only mandate
+(standing substitution: the named `fricktrade-architect` agent API-402s in this
+environment). Findings and fixes:
+- **BLOCKER-1** — my comment claimed uncatalogued skips were "counted into the
+  sidecar-failure report"; the code silently dropped them (the m4-144
+  false-comment class again). Fixed by making the claim TRUE instead of
+  weakening it: new pure `metadata_commit_report(what, written, total,
+  xmp_failed)` produces the honest line ("Could not save …" / "Saved … for K of
+  N images" / sidecar aggregation, joined "; "), wired into BOTH the interactive
+  and flush paths, four display-free tests pin every wording.
+- **MAJOR-2** — snapshot-else-cursor target binding let the panel DISPLAY image
+  C while edits landed on {A,B}: the grid cursor can leave the selection via
+  native keynav or preview stepping without the set following. Fixed with a
+  containment rule in `metadata_target_paths`: whole set when it contains the
+  displayed image, else the displayed image alone (upstream's `last_act_on`
+  drives both display and write). Rating/colour keys deliberately keep the
+  plain read — they act on grid focus, not text under it; unification recorded
+  as follow-up. Pinned by test.
+- **MINOR-3** — comment claimed ctrl-click changes the selection "without moving
+  the cursor" and update() is "the only hook that fires": false, GridView's
+  native handling moves the SingleSelection cursor too. Comment corrected;
+  refresh-from-both-sites stays (idempotent).
+- **MINOR-4** — documented at `MetaTarget` that snapshots may outlive a prune
+  until the next `update()` (upstream-parity posture).
+- **NIT-5** — flush group key `(db, paths.join("\n"))` had a newline-collision;
+  key is now `(db, Vec<String>)`.
+- **NIT-6** — carried-forward citation `metadata.c:383` corrected to `:393`
+  (panels + persist + PARITY_AUDIT row 2.3).
+- **NIT-7** — flush toasts stay per-group (rare divergent-list case); accepted.
+
+**Verification**: targeted release tests 13/13 metadata + 28/28 panels (5 new);
+full local gate `scripts/ci-local.sh` exit code **0**
+(`target/cbuild/gate-m4-145-postreview.log`, post-review-fixes run — the
+pre-review GATE_EXIT=0 log was superseded by design). Clippy locators in touched
+files are the known pre-existing style items.
+
+**Went wrong along the way**: an Edit old_string mismatch on
+`flush_metadata_edits` (line-wrap difference) cost one retry after re-reading
+the exact region; an E0716 temporary-lifetime error in the new persist test was
+fixed by binding `load_metadata(...)` first; the first `cargo test -p c41-ui
+metadata panels::tests` invocation failed on cargo's single-filter CLI rule and
+was split into two runs.
+
+**Follow-ups recorded**: unify rating/colour action targeting with the new
+containment rule (or document why they differ); extract the flush collect phase
+into a pure fn so grouping gets display-free tests; catalogue-only rating/
+colour actions still skip XMP sync.
