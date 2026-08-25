@@ -30,6 +30,13 @@
 //! "stealing" in the C `process`) — that is pipeline plumbing, not grid algorithm —
 //! and all OpenCL. `hue_conversion` (GUI HSL-hue → LCH hue) is also left to the
 //! caller: pass the already-converted hue into [`Precedence::Hue`].
+//!
+//! **m4-138**: the C IOP's three former OpenMP loops now call the
+//! `darkroom_colorreconstruct_{splat,blur_line,slice}` exports below instead of
+//! running in C (m4-86 convention). The exports share the exact loop bodies with
+//! the methods via [`splat_cells`]/[`slice_cells`]/[`blur_line`] over a
+//! `#[repr(C)]`-aliased cell buffer, so method-level tests pin both callers at
+//! once; dedicated FFI parity tests re-drive each export against its method.
 
 use crate::roi::RoiIn;
 
@@ -40,8 +47,11 @@ const MAX_RES_R: i32 = 100;
 const L_RANGE: f32 = 100.0;
 
 /// One grid cell: accumulated `{L, a, b, weight}` (matches
-/// `dt_iop_colorreconstruct_Lab_t`).
+/// `dt_iop_colorreconstruct_Lab_t`). `repr(C)` pins the field order so the
+/// FFI exports below can alias the C-side cell buffer directly — pinned by
+/// [`tests::cell_layout_matches_the_c_struct_for_ffi_aliasing`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
 struct Cell {
     l: f32,
     a: f32,
@@ -90,6 +100,49 @@ fn clamps(v: f32, lo: f32, hi: f32) -> f32 {
     } else {
         lo
     }
+}
+
+/// The scalar part of the grid (the `b->…` fields of
+/// `dt_iop_colorreconstruct_bilateral_t`), shared by the [`ColorReconstruct`]
+/// methods and the FFI exports so both run ONE implementation of each loop body.
+#[derive(Clone, Copy, Debug)]
+struct GridHeader {
+    size_x: usize,
+    size_y: usize,
+    size_z: usize,
+    /// init-roi origin (`b->x`, `b->y`) — used by slice's grid_rescale.
+    x: i32,
+    y: i32,
+    /// `iscale / roi.scale` at init (`b->scale`).
+    scale: f32,
+    sigma_s: f32,
+    sigma_r: f32,
+    /// init-roi dimensions, for splat.
+    width: usize,
+    height: usize,
+}
+
+/// Grid coordinates `(x, y, z)` for image position `(i, j)` and luma `l`
+/// (matches `image_to_grid`; `i`/`j` are floats so slice can pass its rescaled,
+/// fractional positions).
+#[inline]
+fn image_to_grid_h(h: &GridHeader, i: f32, j: f32, l: f32) -> (f32, f32, f32) {
+    (
+        clamps(i / h.sigma_s, 0.0, (h.size_x - 1) as f32),
+        clamps(j / h.sigma_s, 0.0, (h.size_y - 1) as f32),
+        clamps(l / h.sigma_r, 0.0, (h.size_z - 1) as f32),
+    )
+}
+
+/// Image position `(i, j)` in the slice ROI → grid-space `(px, py)` accounting
+/// for a possibly different ROI/scale than the grid was built at (matches
+/// `grid_rescale`).
+#[inline]
+fn grid_rescale_h(h: &GridHeader, i: usize, j: usize, roi: RoiIn, rescale: f32) -> (f32, f32) {
+    (
+        (roi.x + i as i32) as f32 * rescale - h.x as f32,
+        (roi.y + j as i32) as f32 * rescale - h.y as f32,
+    )
 }
 
 /// The `colorreconstruction` 4-field bilateral grid.
@@ -141,16 +194,19 @@ impl ColorReconstruct {
         }
     }
 
-    /// Grid coordinates `(x, y, z)` for image position `(i, j)` and luma `l`
-    /// (matches `image_to_grid`; `i`/`j` are floats so [`Self::slice`] can pass
-    /// its rescaled, fractional positions).
-    #[inline]
-    fn image_to_grid(&self, i: f32, j: f32, l: f32) -> (f32, f32, f32) {
-        (
-            clamps(i / self.sigma_s, 0.0, (self.size_x - 1) as f32),
-            clamps(j / self.sigma_s, 0.0, (self.size_y - 1) as f32),
-            clamps(l / self.sigma_r, 0.0, (self.size_z - 1) as f32),
-        )
+    fn header(&self) -> GridHeader {
+        GridHeader {
+            size_x: self.size_x,
+            size_y: self.size_y,
+            size_z: self.size_z,
+            x: self.x,
+            y: self.y,
+            scale: self.scale,
+            sigma_s: self.sigma_s,
+            sigma_r: self.sigma_r,
+            width: self.width,
+            height: self.height,
+        }
     }
 
     /// Scatter every sub-threshold pixel of the packed-Lab input (`width*height*4`
@@ -159,48 +215,8 @@ impl ColorReconstruct {
     /// threads with atomic adds into one grid; a serial accumulation writes the
     /// same additive payloads to the same cells, equal up to float add order).
     pub fn splat(&mut self, input: &[f32], threshold: f32, precedence: Precedence) {
-        for j in 0..self.height {
-            for i in 0..self.width {
-                let index = 4 * (j * self.width + i);
-                let lin = input[index];
-                let ain = input[index + 1];
-                let bin = input[index + 2];
-                // deliberately ignore pixels above threshold (the clipped ones)
-                if lin > threshold {
-                    continue;
-                }
-
-                let weight = match precedence {
-                    Precedence::None => 1.0,
-                    Precedence::Chroma => (ain * ain + bin * bin).sqrt(),
-                    Precedence::Hue { hue, sigma_sq } => {
-                        let mut m = bin.atan2(ain) - hue;
-                        // readjust m into [-pi, +pi]
-                        m = if m > core::f32::consts::PI {
-                            m - core::f32::consts::TAU
-                        } else if m < -core::f32::consts::PI {
-                            m + core::f32::consts::TAU
-                        } else {
-                            m
-                        };
-                        (-m * m / sigma_sq).exp()
-                    }
-                };
-
-                let (x, y, z) = self.image_to_grid(i as f32, j as f32, lin);
-                // closest-integer splatting
-                let xi = (x.round() as i32).clamp(0, self.size_x as i32 - 1) as usize;
-                let yi = (y.round() as i32).clamp(0, self.size_y as i32 - 1) as usize;
-                let zi = (z.round() as i32).clamp(0, self.size_z as i32 - 1) as usize;
-                let gi = xi + self.size_x * (yi + self.size_y * zi);
-
-                let cell = &mut self.buf[gi];
-                cell.l += lin * weight;
-                cell.a += ain * weight;
-                cell.b += bin * weight;
-                cell.weight += weight;
-            }
-        }
+        let h = self.header();
+        splat_cells(&mut self.buf, &h, input, threshold, precedence);
     }
 
     /// Separable `[1 4 6 4 1]/16` Gaussian over x, then y, then z (matches
@@ -215,96 +231,349 @@ impl ColorReconstruct {
         blur_line(&mut self.buf, 1, sx, sx * sy, sx, sy, sz);
     }
 
-    /// Image position `(i, j)` in the slice ROI → grid-space `(px, py)` accounting
-    /// for a possibly different ROI/scale than the grid was built at (matches
-    /// `grid_rescale`).
-    #[inline]
-    fn grid_rescale(&self, i: usize, j: usize, roi: RoiIn, rescale: f32) -> (f32, f32) {
-        (
-            (roi.x + i as i32) as f32 * rescale - self.x as f32,
-            (roi.y + j as i32) as f32 * rescale - self.y as f32,
-        )
-    }
-
     /// Trilinear read-back: reconstruct the a/b of near/above-threshold pixels from
     /// the blurred grid (matches `dt_iop_colorreconstruct_bilateral_slice`). `input`
     /// and `output` are packed Lab (`roi.width*roi.height*4`). L and alpha are
     /// copied straight through; only a/b are rewritten, and only where `blend > 0`.
     ///
     /// `roi`/`iscale` are the *slice-time* ROI and `piece->iscale`; when they match
-    /// the ROI the grid was built at, `rescale == 1` and `grid_rescale` is identity.
+    /// the ROI the grid was built at, `rescale == 1` and [`grid_rescale_h`] is identity.
     pub fn slice(&self, input: &[f32], output: &mut [f32], threshold: f32, roi: RoiIn, iscale: f32) {
-        let rescale = iscale / (roi.scale * self.scale);
-        let ox = 1usize;
-        let oy = self.size_x;
-        let oz = self.size_y * self.size_x;
-        let rw = roi.width.max(0) as usize;
-        let rh = roi.height.max(0) as usize;
+        slice_cells(&self.buf, &self.header(), input, output, threshold, roi, iscale);
+    }
+}
 
-        for j in 0..rh {
-            for i in 0..rw {
-                let index = 4 * (j * rw + i);
-                let lin = input[index];
-                let ain = input[index + 1];
-                let bin = input[index + 2];
-                // pass L, a, b, alpha through first (a/b may be overwritten below)
-                output[index] = lin;
-                output[index + 1] = ain;
-                output[index + 2] = bin;
-                output[index + 3] = input[index + 3];
-
-                let blend = clamps(20.0 / threshold * lin - 19.0, 0.0, 1.0);
-                if blend == 0.0 {
-                    continue;
-                }
-
-                let (px, py) = self.grid_rescale(i, j, roi, rescale);
-                let (x, y, z) = self.image_to_grid(px, py, lin);
-                // trilinear lookup base cell + fractions
-                let xi = (x as i32).clamp(0, self.size_x as i32 - 2) as usize;
-                let yi = (y as i32).clamp(0, self.size_y as i32 - 2) as usize;
-                let zi = (z as i32).clamp(0, self.size_z as i32 - 2) as usize;
-                let xf = x - xi as f32;
-                let yf = y - yi as f32;
-                let zf = z - zi as f32;
-                let gi = xi + self.size_x * (yi + self.size_y * zi);
-
-                let out = self.interp(gi, ox, oy, oz, xf, yf, zf);
-                let lout = out.l.max(0.01);
-                if out.weight > 0.0 {
-                    output[index + 1] = ain * (1.0 - blend) + out.a * lin / lout * blend;
-                    output[index + 2] = bin * (1.0 - blend) + out.b * lin / lout * blend;
-                }
-                // out.weight <= 0: a/b keep the passed-through input (already set)
+/// Scatter pass — the loop body shared by [`ColorReconstruct::splat`] and the
+/// `darkroom_colorreconstruct_splat` FFI export.
+fn splat_cells(
+    cells: &mut [Cell],
+    h: &GridHeader,
+    input: &[f32],
+    threshold: f32,
+    precedence: Precedence,
+) {
+    for j in 0..h.height {
+        for i in 0..h.width {
+            let index = 4 * (j * h.width + i);
+            let lin = input[index];
+            let ain = input[index + 1];
+            let bin = input[index + 2];
+            // deliberately ignore pixels above threshold (the clipped ones)
+            if lin > threshold {
+                continue;
             }
+
+            let weight = match precedence {
+                Precedence::None => 1.0,
+                Precedence::Chroma => (ain * ain + bin * bin).sqrt(),
+                Precedence::Hue { hue, sigma_sq } => {
+                    let mut m = bin.atan2(ain) - hue;
+                    // readjust m into [-pi, +pi]
+                    m = if m > core::f32::consts::PI {
+                        m - core::f32::consts::TAU
+                    } else if m < -core::f32::consts::PI {
+                        m + core::f32::consts::TAU
+                    } else {
+                        m
+                    };
+                    (-m * m / sigma_sq).exp()
+                }
+            };
+
+            let (x, y, z) = image_to_grid_h(h, i as f32, j as f32, lin);
+            // closest-integer splatting
+            let xi = (x.round() as i32).clamp(0, h.size_x as i32 - 1) as usize;
+            let yi = (y.round() as i32).clamp(0, h.size_y as i32 - 1) as usize;
+            let zi = (z.round() as i32).clamp(0, h.size_z as i32 - 1) as usize;
+            let gi = xi + h.size_x * (yi + h.size_y * zi);
+
+            let cell = &mut cells[gi];
+            cell.l += lin * weight;
+            cell.a += ain * weight;
+            cell.b += bin * weight;
+            cell.weight += weight;
         }
     }
+}
 
-    /// 8-tap trilinear read of the blurred grid at base cell `gi` with fractions
-    /// `(xf, yf, zf)`, returning the interpolated `{L, a, b, weight}` cell.
-    ///
-    /// The 8 taps are summed in the **exact C order** (`gi, +ox, +oy, +ox+oy, +oz,
-    /// +ox+oz, +oy+oz, +ox+oy+oz`). Within each tap we factor the weight product
-    /// once (`Cell * (wx·wy·wz)`) whereas the C multiplies field-first and
-    /// left-associatively (`buf[gi].L * (1-xf) * (1-yf) * (1-zf)`). IEEE mul is
-    /// commutative but not associative, so this can differ by ~1 ULP per tap.
-    /// This is intentional and immaterial: **bit-exact parity with the shipped C
-    /// is not achievable for this grid anyway** — its splat uses non-deterministic
-    /// atomic float-add ordering across threads, so the grid contents already vary
-    /// run-to-run by far more than a slicing ULP. Keeping the `Cell * scalar` form
-    /// buys readability at no meaningful accuracy cost.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn interp(&self, gi: usize, ox: usize, oy: usize, oz: usize, xf: f32, yf: f32, zf: f32) -> Cell {
-        self.buf[gi] * ((1.0 - xf) * (1.0 - yf) * (1.0 - zf))
-            + self.buf[gi + ox] * (xf * (1.0 - yf) * (1.0 - zf))
-            + self.buf[gi + oy] * ((1.0 - xf) * yf * (1.0 - zf))
-            + self.buf[gi + ox + oy] * (xf * yf * (1.0 - zf))
-            + self.buf[gi + oz] * ((1.0 - xf) * (1.0 - yf) * zf)
-            + self.buf[gi + ox + oz] * (xf * (1.0 - yf) * zf)
-            + self.buf[gi + oy + oz] * ((1.0 - xf) * yf * zf)
-            + self.buf[gi + ox + oy + oz] * (xf * yf * zf)
+/// Read-back pass — the loop body shared by [`ColorReconstruct::slice`] and the
+/// `darkroom_colorreconstruct_slice` FFI export.
+fn slice_cells(
+    cells: &[Cell],
+    h: &GridHeader,
+    input: &[f32],
+    output: &mut [f32],
+    threshold: f32,
+    roi: RoiIn,
+    iscale: f32,
+) {
+    let rescale = iscale / (roi.scale * h.scale);
+    let ox = 1usize;
+    let oy = h.size_x;
+    let oz = h.size_y * h.size_x;
+    let rw = roi.width.max(0) as usize;
+    let rh = roi.height.max(0) as usize;
+
+    for j in 0..rh {
+        for i in 0..rw {
+            let index = 4 * (j * rw + i);
+            let lin = input[index];
+            let ain = input[index + 1];
+            let bin = input[index + 2];
+            // pass L, a, b, alpha through first (a/b may be overwritten below)
+            output[index] = lin;
+            output[index + 1] = ain;
+            output[index + 2] = bin;
+            output[index + 3] = input[index + 3];
+
+            let blend = clamps(20.0 / threshold * lin - 19.0, 0.0, 1.0);
+            if blend == 0.0 {
+                continue;
+            }
+
+            let (px, py) = grid_rescale_h(h, i, j, roi, rescale);
+            let (x, y, z) = image_to_grid_h(h, px, py, lin);
+            // trilinear lookup base cell + fractions
+            let xi = (x as i32).clamp(0, h.size_x as i32 - 2) as usize;
+            let yi = (y as i32).clamp(0, h.size_y as i32 - 2) as usize;
+            let zi = (z as i32).clamp(0, h.size_z as i32 - 2) as usize;
+            let xf = x - xi as f32;
+            let yf = y - yi as f32;
+            let zf = z - zi as f32;
+            let gi = xi + h.size_x * (yi + h.size_y * zi);
+
+            let out = interp_cells(cells, gi, ox, oy, oz, xf, yf, zf);
+            let lout = out.l.max(0.01);
+            if out.weight > 0.0 {
+                output[index + 1] = ain * (1.0 - blend) + out.a * lin / lout * blend;
+                output[index + 2] = bin * (1.0 - blend) + out.b * lin / lout * blend;
+            }
+            // out.weight <= 0: a/b keep the passed-through input (already set)
+        }
     }
+}
+
+/// 8-tap trilinear read of the blurred grid at base cell `gi` with fractions
+/// `(xf, yf, zf)`, returning the interpolated `{L, a, b, weight}` cell.
+///
+/// The 8 taps are summed in the **exact C order** (`gi, +ox, +oy, +ox+oy, +oz,
+/// +ox+oz, +oy+oz, +ox+oy+oz`). Within each tap we factor the weight product
+/// once (`Cell * (wx·wy·wz)`) whereas the C multiplies field-first and
+/// left-associatively (`buf[gi].L * (1-xf) * (1-yf) * (1-zf)`). IEEE mul is
+/// commutative but not associative, so this can differ by ~1 ULP per tap.
+/// This is intentional and immaterial: **bit-exact parity with the shipped C
+/// is not achievable for this grid anyway** — its splat uses non-deterministic
+/// atomic float-add ordering across threads, so the grid contents already vary
+/// run-to-run by far more than a slicing ULP. Keeping the `Cell * scalar` form
+/// buys readability at no meaningful accuracy cost.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn interp_cells(
+    cells: &[Cell],
+    gi: usize,
+    ox: usize,
+    oy: usize,
+    oz: usize,
+    xf: f32,
+    yf: f32,
+    zf: f32,
+) -> Cell {
+    cells[gi] * ((1.0 - xf) * (1.0 - yf) * (1.0 - zf))
+        + cells[gi + ox] * (xf * (1.0 - yf) * (1.0 - zf))
+        + cells[gi + oy] * ((1.0 - xf) * yf * (1.0 - zf))
+        + cells[gi + ox + oy] * (xf * yf * (1.0 - zf))
+        + cells[gi + oz] * ((1.0 - xf) * (1.0 - yf) * zf)
+        + cells[gi + ox + oz] * (xf * (1.0 - yf) * zf)
+        + cells[gi + oy + oz] * ((1.0 - xf) * yf * zf)
+        + cells[gi + ox + oy + oz] * (xf * yf * zf)
+}
+
+// ── FFI boundary (m4-138): src/iop/colorreconstruction.c calls these instead of
+// running its former OpenMP loops; each export is the SAME serial scalar code
+// the methods above use (splat_cells / blur_line / slice_cells), over a cell
+// buffer aliased in place via `#[repr(C)]` Cell ≡ `dt_iop_colorreconstruct_Lab_t`.
+
+fn map_precedence(precedence: i32, hue: f32, sigma_sq: f32) -> Precedence {
+    match precedence {
+        // C enum: NONE=0, CHROMA=1, HUE=2; the switch's `default:` arm weights
+        // every unknown value like NONE
+        1 => Precedence::Chroma,
+        2 => Precedence::Hue { hue, sigma_sq },
+        _ => Precedence::None,
+    }
+}
+
+/// # Safety
+/// `grid_buf` must hold `4·size_x·size_y·size_z` floats laid out as consecutive
+/// `{L, a, b, weight}` cells (`dt_iop_colorreconstruct_Lab_t`, layout pinned by
+/// test); `input` must hold `4·width·height` floats of packed Lab. Aliasing rules
+/// as in C: `input` may not overlap `grid_buf`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorreconstruct_splat(
+    grid_buf: *mut f32,
+    size_x: usize,
+    size_y: usize,
+    size_z: usize,
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    scale: f32,
+    sigma_s: f32,
+    sigma_r: f32,
+    input: *const f32,
+    threshold: f32,
+    precedence: i32,
+    hue: f32,
+    hue_sigma_sq: f32,
+) {
+    if grid_buf.is_null()
+        || input.is_null()
+        || width == 0
+        || height == 0
+        // real grids are always ≥5 per axis (`init` clamps to 4+1); refuse
+        // corrupt callers instead of panicking on an inverted clamp range
+        || size_x == 0
+        || size_y == 0
+        || size_z == 0
+        // the loop bodies cast cell counts to i32 for clamping; refuse dims a
+        // real grid can never have rather than wrap (real grids are ≤501/axis)
+        || size_x > i32::MAX as usize
+        || size_y > i32::MAX as usize
+        || size_z > i32::MAX as usize
+        || width > i32::MAX as usize
+        || height > i32::MAX as usize
+    {
+        return;
+    }
+    let n = match size_x.checked_mul(size_y).and_then(|v| v.checked_mul(size_z)) {
+        Some(n) => n,
+        None => return,
+    };
+    let cells = std::slice::from_raw_parts_mut(grid_buf.cast::<Cell>(), n);
+    let input = std::slice::from_raw_parts(input, width * height * 4);
+    let h = GridHeader {
+        size_x,
+        size_y,
+        size_z,
+        x,
+        y,
+        scale,
+        sigma_s,
+        sigma_r,
+        width,
+        height,
+    };
+    splat_cells(cells, &h, input, threshold, map_precedence(precedence, hue, hue_sigma_sq));
+}
+
+/// # Safety
+/// `buf` must hold at least
+/// `offset1·(size1−1) + offset2·(size2−1) + offset3·(size3−1) + 1` cells — the
+/// highest index the line loop touches. Cells are mutated strictly in place.
+///
+/// The bound is sound for every input *because* [`blur_line`] early-returns
+/// when `size3 < 4`: with fewer than four cells on the innermost axis the
+/// [1 4 6 4 1] stencil has no valid centre, so no wider indexing occurs.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorreconstruct_blur_line(
+    buf: *mut f32,
+    offset1: usize,
+    offset2: usize,
+    offset3: usize,
+    size1: usize,
+    size2: usize,
+    size3: usize,
+) {
+    if buf.is_null() || size1 == 0 || size2 == 0 || size3 == 0 {
+        return;
+    }
+    let max_index = match offset1
+        .checked_mul(size1 - 1)
+        .and_then(|a| a.checked_add(offset2.checked_mul(size2 - 1)?))
+        .and_then(|b| b.checked_add(offset3.checked_mul(size3 - 1)?))
+    {
+        Some(m) => m,
+        None => return,
+    };
+    let cells = std::slice::from_raw_parts_mut(buf.cast::<Cell>(), max_index + 1);
+    blur_line(cells, offset1, offset2, offset3, size1, size2, size3);
+}
+
+/// # Safety
+/// `grid_buf` holds `4·size_x·size_y·size_z` cells (const); `input`/`output`
+/// each hold `4·roi_width·roi_height` floats; `output` may alias `input` (each
+/// pixel is fully read before any write, and pass-through writes only touch the
+/// current pixel).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorreconstruct_slice(
+    grid_buf: *const f32,
+    size_x: usize,
+    size_y: usize,
+    size_z: usize,
+    x: i32,
+    y: i32,
+    scale: f32,
+    sigma_s: f32,
+    sigma_r: f32,
+    input: *const f32,
+    output: *mut f32,
+    threshold: f32,
+    roi_x: i32,
+    roi_y: i32,
+    roi_width: i32,
+    roi_height: i32,
+    roi_scale: f32,
+    iscale: f32,
+) {
+    if grid_buf.is_null()
+        || input.is_null()
+        || output.is_null()
+        // trilinear taps need ≥2 cells per axis; real grids are always ≥5
+        // (`init` clamps to 4+1) — this only guards corrupt callers
+        || size_x < 2
+        || size_y < 2
+        || size_z < 2
+        // same i32-cast wrap guard as splat (roi dims are i32 already)
+        || size_x > i32::MAX as usize
+        || size_y > i32::MAX as usize
+        || size_z > i32::MAX as usize
+    {
+        return;
+    }
+    let n = match size_x.checked_mul(size_y).and_then(|v| v.checked_mul(size_z)) {
+        Some(n) => n,
+        None => return,
+    };
+    if roi_width <= 0 || roi_height <= 0 {
+        return;
+    }
+    let cells = std::slice::from_raw_parts(grid_buf.cast::<Cell>(), n);
+    let input = std::slice::from_raw_parts(input, roi_width as usize * roi_height as usize * 4);
+    let output =
+        std::slice::from_raw_parts_mut(output, roi_width as usize * roi_height as usize * 4);
+    let h = GridHeader {
+        size_x,
+        size_y,
+        size_z,
+        x,
+        y,
+        scale,
+        sigma_s,
+        sigma_r,
+        // splat-only fields, unused on this path
+        width: 0,
+        height: 0,
+    };
+    slice_cells(
+        cells,
+        &h,
+        input,
+        output,
+        threshold,
+        RoiIn { x: roi_x, y: roi_y, width: roi_width, height: roi_height, scale: roi_scale },
+        iscale,
+    );
 }
 
 /// Separable `[1 4 6 4 1]/16` Gaussian along the `offset3` axis (`size3` cells),
@@ -500,5 +769,198 @@ mod tests {
         assert_eq!(clamps(7.0, 0.0, 5.0), 5.0);
         assert_eq!(clamps(-1.0, 0.0, 5.0), 0.0);
         assert_eq!(clamps(3.0, 0.0, 5.0), 3.0);
+    }
+
+    // ── m4-138 FFI parity ──
+
+    /// The method grid's cells as the flat float layout the C buffer uses.
+    fn cells_as_f32(g: &ColorReconstruct) -> Vec<f32> {
+        let n = g.size_x * g.size_y * g.size_z * 4;
+        unsafe { std::slice::from_raw_parts(g.buf.as_ptr() as *const f32, n) }.to_vec()
+    }
+
+    #[test]
+    fn cell_layout_matches_the_c_struct_for_ffi_aliasing() {
+        // repr(C) pins size and field order: {L, a, b, weight} as 4 f32s
+        assert_eq!(std::mem::size_of::<Cell>(), 16);
+        let c = Cell { l: 1.0, a: 2.0, b: 3.0, weight: 4.0 };
+        let raw = unsafe { std::slice::from_raw_parts(&c as *const Cell as *const f32, 4) };
+        assert_eq!(raw, &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn ffi_splat_matches_the_method_for_every_precedence() {
+        let (w, h) = (23usize, 17usize);
+        let input = img(w, h, |i, j| {
+            (((i * 7 + j * 3) % 100) as f32,
+             ((i as i64 * 5 - j as i64 * 11).rem_euclid(40)) as f32 - 20.0,
+             ((j as i64 * 13 - i as i64 * 2).rem_euclid(40)) as f32 - 20.0)
+        });
+        let cases = [
+            Precedence::None,
+            Precedence::Chroma,
+            // hue chosen to exercise the [-π, π] wrap-around branch
+            Precedence::Hue { hue: -2.9, sigma_sq: HUE_SIGMA_SQ },
+            Precedence::Hue { hue: 0.7, sigma_sq: HUE_SIGMA_SQ },
+        ];
+        for prec in cases {
+            let mut m = ColorReconstruct::new(roi(w as i32, h as i32), 1.0, 8.0, 20.0);
+            m.splat(&input, 90.0, prec);
+            let want = cells_as_f32(&m);
+
+            let n = m.size_x * m.size_y * m.size_z;
+            let mut raw = vec![0f32; n * 4];
+            unsafe {
+                darkroom_colorreconstruct_splat(
+                    raw.as_mut_ptr(), m.size_x, m.size_y, m.size_z,
+                    m.width, m.height, m.x, m.y, m.scale, m.sigma_s, m.sigma_r,
+                    input.as_ptr(), 90.0,
+                    match prec {
+                        Precedence::None => 0,
+                        Precedence::Chroma => 1,
+                        Precedence::Hue { .. } => 2,
+                    },
+                    if let Precedence::Hue { hue, .. } = prec { hue } else { 0.0 },
+                    HUE_SIGMA_SQ,
+                );
+            }
+            assert_eq!(raw.len(), want.len(), "{prec:?}");
+            for (k, (a, b)) in raw.iter().zip(&want).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "cell float {k} diverged ({prec:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn ffi_blur_line_matches_the_method_blur_bit_exact() {
+        let (w, h) = (19usize, 14usize);
+        let input = img(w, h, |i, j| (((i * 11 + j) % 95) as f32, (i % 17) as f32 - 8.0,
+                                     (j % 15) as f32 - 7.0));
+        // method path
+        let mut m = ColorReconstruct::new(roi(w as i32, h as i32), 1.0, 6.0, 25.0);
+        m.splat(&input, 90.0, Precedence::Chroma);
+        m.blur();
+        let want = cells_as_f32(&m);
+
+        // FFI path over a byte-copy of the pre-blur grid
+        let mut pre = ColorReconstruct::new(roi(w as i32, h as i32), 1.0, 6.0, 25.0);
+        pre.splat(&input, 90.0, Precedence::Chroma);
+        let mut raw = cells_as_f32(&pre);
+        let (sx, sy, sz) = (pre.size_x, pre.size_y, pre.size_z);
+        unsafe {
+            darkroom_colorreconstruct_blur_line(raw.as_mut_ptr(), sx * sy, sx, 1, sz, sy, sx);
+            darkroom_colorreconstruct_blur_line(raw.as_mut_ptr(), sx * sy, 1, sx, sz, sx, sy);
+            darkroom_colorreconstruct_blur_line(raw.as_mut_ptr(), 1, sx, sx * sy, sx, sy, sz);
+        }
+        assert_eq!(raw.len(), want.len());
+        for (k, (a, b)) in raw.iter().zip(&want).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "cell float {k} diverged after blur");
+        }
+    }
+
+    #[test]
+    fn ffi_slice_matches_the_method_bit_exact_incl_rescaled_roi() {
+        let (w, h) = (21usize, 16usize);
+        let input = img(w, h, |i, j| (((i * 9 + j * 5) % 100) as f32, ((i * 3) % 30) as f32 - 15.0,
+                                      ((j * 7) % 30) as f32 - 15.0));
+        // NONZERO init origin so grid_rescale_h's `- h.x`/`- h.y` subtrahends
+        // are actually exercised (roi() builds x:0,y:0)
+        let mut g = ColorReconstruct::new(
+            RoiIn { x: 5, y: 7, width: w as i32, height: h as i32, scale: 1.0 },
+            1.0,
+            7.0,
+            18.0,
+        );
+        g.splat(&input, 88.0, Precedence::Chroma);
+        g.blur();
+
+        // slice ROI differs from the init ROI → rescale ≠ 1 and an offset origin
+        let sroi = RoiIn { x: 3, y: 2, width: w as i32 - 5, height: h as i32 - 4, scale: 0.8 };
+        let mut out_m = vec![0f32; sroi.width as usize * sroi.height as usize * 4];
+        g.slice(&input, &mut out_m, 88.0, sroi, 1.0);
+
+        let mut out_f = vec![0f32; out_m.len()];
+        // slice indexes its input LINEARLY over the roi dims (rw×rh packed Lab),
+        // exactly like the C hands it a roi-sized buffer
+        let sinput = input[..out_m.len()].to_vec();
+        unsafe {
+            darkroom_colorreconstruct_slice(
+                g.buf.as_ptr() as *const f32, g.size_x, g.size_y, g.size_z,
+                g.x, g.y, g.scale, g.sigma_s, g.sigma_r,
+                sinput.as_ptr(), out_f.as_mut_ptr(),
+                88.0, sroi.x, sroi.y, sroi.width, sroi.height, sroi.scale, 1.0,
+            );
+        }
+        assert_eq!(out_f.len(), out_m.len());
+        for (k, (a, b)) in out_f.iter().zip(&out_m).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "output float {k} diverged");
+        }
+
+        // aliased in==out leg: the safety doc permits it (per-pixel
+        // read-before-write); pin it so a future tiling/vectorising refactor of
+        // slice_cells cannot silently break the contract
+        let mut alias = sinput.clone();
+        unsafe {
+            darkroom_colorreconstruct_slice(
+                g.buf.as_ptr() as *const f32, g.size_x, g.size_y, g.size_z,
+                g.x, g.y, g.scale, g.sigma_s, g.sigma_r,
+                alias.as_ptr(), alias.as_mut_ptr(),
+                88.0, sroi.x, sroi.y, sroi.width, sroi.height, sroi.scale, 1.0,
+            );
+        }
+        assert_eq!(alias.len(), out_m.len());
+        for (k, (a, b)) in alias.iter().zip(&out_m).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "aliased output float {k} diverged");
+        }
+    }
+
+    #[test]
+    fn ffi_splat_unknown_precedence_behaves_like_none() {
+        // the C switch's default arm weights every out-of-enum value like NONE
+        let (w, h) = (11usize, 9usize);
+        let input = img(w, h, |i, j| {
+            (((i * 3 + j) % 90) as f32, (i % 13) as f32 - 6.0, (j % 11) as f32 - 5.0)
+        });
+        let g = ColorReconstruct::new(roi(w as i32, h as i32), 1.0, 8.0, 20.0);
+        let mut unknown = vec![0f32; g.buf.len() * 4];
+        let mut none = vec![0f32; g.buf.len() * 4];
+        unsafe {
+            for (buf, prec) in [(&mut unknown, 7i32), (&mut none, 0i32)] {
+                darkroom_colorreconstruct_splat(
+                    buf.as_mut_ptr(), g.size_x, g.size_y, g.size_z, w, h,
+                    g.x, g.y, g.scale, g.sigma_s, g.sigma_r,
+                    input.as_ptr(), 90.0, prec, 1.5, HUE_SIGMA_SQ,
+                );
+            }
+        }
+        assert_eq!(unknown, none);
+    }
+
+    #[test]
+    fn ffi_exports_reject_null_and_degenerate_args_without_panicking() {
+        unsafe {
+            darkroom_colorreconstruct_splat(
+                std::ptr::null_mut(), 1, 1, 1, 1, 1, 0, 0, 1.0, 1.0, 1.0,
+                std::ptr::null(), 100.0, 0, 0.0, HUE_SIGMA_SQ,
+            );
+            darkroom_colorreconstruct_blur_line(std::ptr::null_mut(), 1, 1, 1, 1, 1, 1);
+            darkroom_colorreconstruct_slice(
+                std::ptr::null(), 1, 1, 1, 0, 0, 1.0, 1.0, 1.0,
+                std::ptr::null(), std::ptr::null_mut(), 100.0,
+                0, 0, 0, 0, 1.0, 1.0,
+            );
+            // zero/overflowing dims must not construct slices either
+            let mut buf = [0f32; 16];
+            let inp = [50f32; 4];
+            darkroom_colorreconstruct_splat(
+                buf.as_mut_ptr(), 0, 0, 0, 1, 1, 0, 0, 1.0, 1.0, 1.0,
+                inp.as_ptr(), 100.0, 0, 0.0, HUE_SIGMA_SQ,
+            );
+            darkroom_colorreconstruct_slice(
+                buf.as_ptr(), 1, 1, 1, 0, 0, 1.0, 1.0, 1.0,
+                inp.as_ptr(), buf.as_mut_ptr(), 100.0,
+                0, 0, 0, -3, 1.0, 1.0,
+            );
+        }
     }
 }

@@ -934,6 +934,60 @@ void darkroom_colorbalancergb_opacity_luts(float *lut_shadows,
                                            float mask_grey_fulcrum_param);
 
 /*
+ * ColorReconstruction IOP -- the bespoke 4-field bilateral grid
+ * (dt_iop_colorreconstruct_Lab_t = { float L, a, b, weight; }, 16 bytes, x-fastest
+ * index xi + size_x*(yi + size_y*zi)).  The three exports replace this IOP's
+ * former OpenMP loops (splat / blur_line / slice) and run the SAME serial scalar
+ * code as the pure-Rust module.  All three refuse NULL buffers and degenerate
+ * dims (real grids are always >= 5 cells per axis) instead of crashing.
+ *
+ * darkroom_colorreconstruct_splat: scatters every sub-threshold pixel of `in`
+ *   (packed Lab, width*height*4 floats -- width/height are the INIT roi dims
+ *   stored in b->width/b->height) into grid_buf (size_x*size_y*size_z cells)
+ *   by nearest-integer cell with per-pixel weight from precedence:
+ *   0=NONE (weight 1), 1=CHROMA (sqrt(a^2+b^2)), 2=HUE (gaussian around `hue`
+ *   [radians] with variance hue_sigma_sq; unknown values behave like NONE).
+ *   sigma_s/sigma_r are the grid header fields; width/height/x/y/scale are
+ *   passed for header symmetry with the C struct -- only width/height are
+ *   read on this path (splat never rescales or offsets).
+ *
+ * darkroom_colorreconstruct_blur_line: one separable [1 4 6 4 1]/16 pass along
+ *   offset3 over size3 cells for each of size1 x size2 lines.  buf must hold at
+ *   least the highest touched cell -- index
+ *   offset1*(size1-1) + offset2*(size2-1) + offset3*(size3-1) -- plus one.
+ *   Call it three times to reproduce dt_iop_colorreconstruct_bilateral_blur
+ *   (x, then y, then z axes).
+ *
+ * darkroom_colorreconstruct_slice: trilinear read-back; rewrites only a/b where
+ *   blend > 0, passing L and alpha through.  in/out hold roi_width*roi_height*4
+ *   packed-Lab floats each (out may alias in).  The roi_ fields and iscale are
+ *   the SLICE-time roi and piece->iscale; grid header fields as above.
+ */
+void darkroom_colorreconstruct_splat(float *grid_buf,
+                                     size_t size_x, size_t size_y, size_t size_z,
+                                     size_t width, size_t height,
+                                     int x, int y,
+                                     float scale, float sigma_s, float sigma_r,
+                                     const float *in,
+                                     float threshold,
+                                     int precedence,
+                                     float hue, float hue_sigma_sq);
+
+void darkroom_colorreconstruct_blur_line(float *buf,
+                                         size_t offset1, size_t offset2, size_t offset3,
+                                         size_t size1, size_t size2, size_t size3);
+
+void darkroom_colorreconstruct_slice(const float *grid_buf,
+                                     size_t size_x, size_t size_y, size_t size_z,
+                                     int x, int y,
+                                     float scale, float sigma_s, float sigma_r,
+                                     const float *in, float *out,
+                                     float threshold,
+                                     int roi_x, int roi_y, int roi_width, int roi_height,
+                                     float roi_scale,
+                                     float iscale);
+
+/*
  * ChannelMixerRGB IOP -- per-pixel chromatic adaptation + mix + luma/chroma.
  *
  * Replaces the DT_OMP_FOR pixel loop inside _loop_switch() in channelmixerrgb.c.

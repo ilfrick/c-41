@@ -32,9 +32,14 @@ Per-increment progress is logged in `PROGRESS.md`.
 ## Where the port actually stands
 
 - **Pipeline (Phase 1): effectively done.** The tracked migration metric — live
-  `DT_OMP_FOR` loop sites in `src/iop/*.c` — stands at **13 across 8 files**
-  (recounted 2026-08-25 after m4-137 replaced colorbalancergb's four; see the
-  table in `RUST_MIGRATION_PLAN.md`, which is kept current per increment). The
+  `DT_OMP_FOR` loop sites in `src/iop/*.c` — stands at **10 across 7 files**
+  (recounted 2026-08-25 after m4-137/m4-138 replaced colorbalancergb's four and
+  colorreconstruction's three; see the table in `RUST_MIGRATION_PLAN.md`, which
+  is kept current per increment). Each remaining iop site is GUI-only,
+  LCMS-bound pending the lcms2-retirement decision, dead `#ifdef` code, or —
+  for colortransfer's k-means — live but non-portable-in-principle (its
+  xorshift-seeded atomic accumulation makes any serial port cluster
+  differently than some C run; see the RUST_MIGRATION_PLAN row). The
   full `src/` tree holds ~223 further loop sites, but those sit outside the
   pipeline boundary (develop/masks, blend, common helpers, imageio, chart) and
   belong to later phases. **83 of 93** image-operation modules are ported to

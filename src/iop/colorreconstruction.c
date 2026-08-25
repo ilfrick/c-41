@@ -31,6 +31,8 @@
 #include "gui/presets.h"
 #include "iop/iop_api.h"
 
+#include "rust_ffi/darkroom_core.h"
+
 #include <assert.h>
 #include <gtk/gtk.h>
 #include <inttypes.h>
@@ -230,21 +232,6 @@ static inline float hue_conversion(const float HSL_Hue)
 }
 
 
-static inline void image_to_grid(const dt_iop_colorreconstruct_bilateral_t *const b, const float i, const float j, const float L, float *x,
-                          float *y, float *z)
-{
-  *x = CLAMPS(i / b->sigma_s, 0, b->size_x - 1);
-  *y = CLAMPS(j / b->sigma_s, 0, b->size_y - 1);
-  *z = CLAMPS(L / b->sigma_r, 0, b->size_z - 1);
-}
-
-static inline void grid_rescale(const dt_iop_colorreconstruct_bilateral_t *const b, const int i, const int j, const dt_iop_roi_t *roi,
-                         const float scale, float *px, float *py)
-{
-  *px = (roi->x + i) * scale - b->x;
-  *py = (roi->y + j) * scale - b->y;
-}
-
 static void dt_iop_colorreconstruct_bilateral_dump(dt_iop_colorreconstruct_bilateral_frozen_t *bf)
 {
   if(!bf) return;
@@ -382,62 +369,12 @@ static void dt_iop_colorreconstruct_bilateral_splat(
 {
   if(!b) return;
 
-  // splat into downsampled grid
-  DT_OMP_FOR()
-  for(int j = 0; j < b->height; j++)
-  {
-    size_t index = (size_t)4 * j * b->width;
-    for(int i = 0; i < b->width; i++, index += 4)
-    {
-      float x, y, z, weight, m;
-      const float Lin = in[index];
-      const float ain = in[index + 1];
-      const float bin = in[index + 2];
-      // we deliberately ignore pixels above threshold
-      if(Lin > threshold) continue;
-
-      switch(precedence)
-      {
-        case COLORRECONSTRUCT_PRECEDENCE_CHROMA:
-          weight = sqrtf(ain * ain + bin * bin);
-          break;
-
-        case COLORRECONSTRUCT_PRECEDENCE_HUE:
-          m = atan2f(bin, ain) - params[0];
-          // readjust m into [-pi, +pi] interval
-          m = m > M_PI_F ? m - DT_2PI_F : (m < -M_PI_F ? m + DT_2PI_F : m);
-          weight = expf(-m*m/params[1]);
-          break;
-
-        case COLORRECONSTRUCT_PRECEDENCE_NONE:
-        default:
-          weight = 1.0f;
-          break;
-      }
-
-      image_to_grid(b, i, j, Lin, &x, &y, &z);
-
-      // closest integer splatting:
-      const int xi = CLAMPS((int)round(x), 0, b->size_x - 1);
-      const int yi = CLAMPS((int)round(y), 0, b->size_y - 1);
-      const int zi = CLAMPS((int)round(z), 0, b->size_z - 1);
-      const size_t grid_index = xi + b->size_x * (yi + b->size_y * zi);
-
-      DT_OMP_PRAGMA(atomic)
-      b->buf[grid_index].L += Lin * weight;
-
-      DT_OMP_PRAGMA(atomic)
-      b->buf[grid_index].a += ain * weight;
-
-      DT_OMP_PRAGMA(atomic)
-      b->buf[grid_index].b += bin * weight;
-
-      DT_OMP_PRAGMA(atomic)
-      b->buf[grid_index].weight += weight;
-    }
-  }
+  // splat into downsampled grid; runs in Rust
+  darkroom_colorreconstruct_splat((float *)b->buf, b->size_x, b->size_y, b->size_z,
+                                  b->width, b->height, b->x, b->y, b->scale,
+                                  b->sigma_s, b->sigma_r, in, threshold,
+                                  (int)precedence, params[0], params[1]);
 }
-
 
 static void blur_line(dt_iop_colorreconstruct_Lab_t *buf,
                       const int offset1,
@@ -449,59 +386,11 @@ static void blur_line(dt_iop_colorreconstruct_Lab_t *buf,
 {
   if(!buf) return;
 
-  const float w0 = 6.f / 16.f;
-  const float w1 = 4.f / 16.f;
-  const float w2 = 1.f / 16.f;
-  DT_OMP_FOR()
-  for(int k = 0; k < size1; k++)
-  {
-    size_t index = (size_t)k * offset1;
-    for(int j = 0; j < size2; j++)
-    {
-      dt_iop_colorreconstruct_Lab_t tmp1 = buf[index];
-      buf[index].L      = buf[index].L      * w0 + w1 * buf[index + offset3].L      + w2 * buf[index + 2 * offset3].L;
-      buf[index].a      = buf[index].a      * w0 + w1 * buf[index + offset3].a      + w2 * buf[index + 2 * offset3].a;
-      buf[index].b      = buf[index].b      * w0 + w1 * buf[index + offset3].b      + w2 * buf[index + 2 * offset3].b;
-      buf[index].weight = buf[index].weight * w0 + w1 * buf[index + offset3].weight + w2 * buf[index + 2 * offset3].weight;
-      index += offset3;
-      dt_iop_colorreconstruct_Lab_t tmp2 = buf[index];
-      buf[index].L      = buf[index].L      * w0 + w1 * (buf[index + offset3].L      + tmp1.L)      + w2 * buf[index + 2 * offset3].L;
-      buf[index].a      = buf[index].a      * w0 + w1 * (buf[index + offset3].a      + tmp1.a)      + w2 * buf[index + 2 * offset3].a;
-      buf[index].b      = buf[index].b      * w0 + w1 * (buf[index + offset3].b      + tmp1.b)      + w2 * buf[index + 2 * offset3].b;
-      buf[index].weight = buf[index].weight * w0 + w1 * (buf[index + offset3].weight + tmp1.weight) + w2 * buf[index + 2 * offset3].weight;
-      index += offset3;
-      for(int i = 2; i < size3 - 2; i++)
-      {
-        const dt_iop_colorreconstruct_Lab_t tmp3 = buf[index];
-        buf[index].L      = buf[index].L      * w0 + w1 * (buf[index + offset3].L      + tmp2.L)
-                     + w2 * (buf[index + 2 * offset3].L      + tmp1.L);
-        buf[index].a      = buf[index].a      * w0 + w1 * (buf[index + offset3].a      + tmp2.a)
-                     + w2 * (buf[index + 2 * offset3].a      + tmp1.a);
-        buf[index].b      = buf[index].b      * w0 + w1 * (buf[index + offset3].b      + tmp2.b)
-                     + w2 * (buf[index + 2 * offset3].b      + tmp1.b);
-        buf[index].weight = buf[index].weight * w0 + w1 * (buf[index + offset3].weight + tmp2.weight)
-                     + w2 * (buf[index + 2 * offset3].weight + tmp1.weight);
-
-        index += offset3;
-        tmp1 = tmp2;
-        tmp2 = tmp3;
-      }
-      const dt_iop_colorreconstruct_Lab_t tmp3 = buf[index];
-      buf[index].L      = buf[index].L      * w0 + w1 * (buf[index + offset3].L      + tmp2.L)      + w2 * tmp1.L;
-      buf[index].a      = buf[index].a      * w0 + w1 * (buf[index + offset3].a      + tmp2.a)      + w2 * tmp1.a;
-      buf[index].b      = buf[index].b      * w0 + w1 * (buf[index + offset3].b      + tmp2.b)      + w2 * tmp1.b;
-      buf[index].weight = buf[index].weight * w0 + w1 * (buf[index + offset3].weight + tmp2.weight) + w2 * tmp1.weight;
-      index += offset3;
-      buf[index].L      = buf[index].L      * w0 + w1 * tmp3.L      + w2 * tmp2.L;
-      buf[index].a      = buf[index].a      * w0 + w1 * tmp3.a      + w2 * tmp2.a;
-      buf[index].b      = buf[index].b      * w0 + w1 * tmp3.b      + w2 * tmp2.b;
-      buf[index].weight = buf[index].weight * w0 + w1 * tmp3.weight + w2 * tmp2.weight;
-      index += offset3;
-      index += offset2 - offset3 * size3;
-    }
-  }
+  // separable [1 4 6 4 1]/16 gaussian along offset3; runs in Rust
+  darkroom_colorreconstruct_blur_line((float *)buf, (size_t)offset1, (size_t)offset2,
+                                      (size_t)offset3, (size_t)size1, (size_t)size2,
+                                      (size_t)size3);
 }
-
 
 static void dt_iop_colorreconstruct_bilateral_blur(dt_iop_colorreconstruct_bilateral_t *b)
 {
@@ -522,79 +411,13 @@ static void dt_iop_colorreconstruct_bilateral_slice(const dt_iop_colorreconstruc
 {
   if(!b) return;
 
-  const float rescale = iscale / (roi->scale * b->scale);
-  const int ox = 1;
-  const int oy = b->size_x;
-  const int oz = b->size_y * b->size_x;
-  DT_OMP_FOR()
-  for(int j = 0; j < roi->height; j++)
-  {
-    size_t index = (size_t)4 * j * roi->width;
-    for(int i = 0; i < roi->width; i++, index += 4)
-    {
-      float x, y, z;
-      float px, py;
-      const float Lin = out[index + 0] = in[index + 0];
-      const float ain = out[index + 1] = in[index + 1];
-      const float bin = out[index + 2] = in[index + 2];
-      out[index + 3] = in[index + 3];
-      const float blend = CLAMPS(20.0f / threshold * Lin - 19.0f, 0.0f, 1.0f);
-      if(blend == 0.0f) continue;
-      grid_rescale(b, i, j, roi, rescale, &px, &py);
-      image_to_grid(b, px, py, Lin, &x, &y, &z);
-      // trilinear lookup:
-      const int xi = MIN((int)x, b->size_x - 2);
-      const int yi = MIN((int)y, b->size_y - 2);
-      const int zi = MIN((int)z, b->size_z - 2);
-      const float xf = x - xi;
-      const float yf = y - yi;
-      const float zf = z - zi;
-      const size_t gi = xi + b->size_x * (yi + b->size_y * zi);
-
-      const float Lout =   b->buf[gi].L * (1.0f - xf) * (1.0f - yf) * (1.0f - zf)
-                         + b->buf[gi + ox].L * (xf) * (1.0f - yf) * (1.0f - zf)
-                         + b->buf[gi + oy].L * (1.0f - xf) * (yf) * (1.0f - zf)
-                         + b->buf[gi + ox + oy].L * (xf) * (yf) * (1.0f - zf)
-                         + b->buf[gi + oz].L * (1.0f - xf) * (1.0f - yf) * (zf)
-                         + b->buf[gi + ox + oz].L * (xf) * (1.0f - yf) * (zf)
-                         + b->buf[gi + oy + oz].L * (1.0f - xf) * (yf) * (zf)
-                         + b->buf[gi + ox + oy + oz].L * (xf) * (yf) * (zf);
-
-      const float aout =   b->buf[gi].a * (1.0f - xf) * (1.0f - yf) * (1.0f - zf)
-                         + b->buf[gi + ox].a * (xf) * (1.0f - yf) * (1.0f - zf)
-                         + b->buf[gi + oy].a * (1.0f - xf) * (yf) * (1.0f - zf)
-                         + b->buf[gi + ox + oy].a * (xf) * (yf) * (1.0f - zf)
-                         + b->buf[gi + oz].a * (1.0f - xf) * (1.0f - yf) * (zf)
-                         + b->buf[gi + ox + oz].a * (xf) * (1.0f - yf) * (zf)
-                         + b->buf[gi + oy + oz].a * (1.0f - xf) * (yf) * (zf)
-                         + b->buf[gi + ox + oy + oz].a * (xf) * (yf) * (zf);
-
-
-      const float bout =   b->buf[gi].b * (1.0f - xf) * (1.0f - yf) * (1.0f - zf)
-                         + b->buf[gi + ox].b * (xf) * (1.0f - yf) * (1.0f - zf)
-                         + b->buf[gi + oy].b * (1.0f - xf) * (yf) * (1.0f - zf)
-                         + b->buf[gi + ox + oy].b * (xf) * (yf) * (1.0f - zf)
-                         + b->buf[gi + oz].b * (1.0f - xf) * (1.0f - yf) * (zf)
-                         + b->buf[gi + ox + oz].b * (xf) * (1.0f - yf) * (zf)
-                         + b->buf[gi + oy + oz].b * (1.0f - xf) * (yf) * (zf)
-                         + b->buf[gi + ox + oy + oz].b * (xf) * (yf) * (zf);
-
-      const float weight = b->buf[gi].weight * (1.0f - xf) * (1.0f - yf) * (1.0f - zf)
-                         + b->buf[gi + ox].weight * (xf) * (1.0f - yf) * (1.0f - zf)
-                         + b->buf[gi + oy].weight * (1.0f - xf) * (yf) * (1.0f - zf)
-                         + b->buf[gi + ox + oy].weight * (xf) * (yf) * (1.0f - zf)
-                         + b->buf[gi + oz].weight * (1.0f - xf) * (1.0f - yf) * (zf)
-                         + b->buf[gi + ox + oz].weight * (xf) * (1.0f - yf) * (zf)
-                         + b->buf[gi + oy + oz].weight * (1.0f - xf) * (yf) * (zf)
-                         + b->buf[gi + ox + oy + oz].weight * (xf) * (yf) * (zf);
-
-      const float lout = fmax(Lout, 0.01f);
-      out[index + 1] = (weight > 0.0f) ? ain * (1.0f - blend) + aout * Lin/lout * blend : ain;
-      out[index + 2] = (weight > 0.0f) ? bin * (1.0f - blend) + bout * Lin/lout * blend : bin;
-    }
-  }
+  // trilinear read-back with chroma reconstruction; runs in Rust
+  darkroom_colorreconstruct_slice((const float *)b->buf, b->size_x, b->size_y, b->size_z,
+                                  b->x, b->y, b->scale, b->sigma_s, b->sigma_r,
+                                  in, out, threshold,
+                                  roi->x, roi->y, roi->width, roi->height, roi->scale,
+                                  iscale);
 }
-
 
 void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
              void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
