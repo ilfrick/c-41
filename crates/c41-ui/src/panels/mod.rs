@@ -2508,6 +2508,19 @@ impl MetadataPanel {
                         // Re-baseline, so the focus-leave that follows an Enter
                         // does not write the same value a second time.
                         target.borrow_mut().2 = value;
+                        // Mirror the edit into the image's `.xmp` sidecar
+                        // (upstream's `dt_image_synch_xmps`,
+                        // src/libs/metadata.c:383). The sync reads all five
+                        // fields back from the catalogue, so the sidecar always
+                        // lands as one consistent set even though this commit
+                        // wrote one field. Catalogue first, sidecar second: a
+                        // failed sidecar write must not roll back or block the
+                        // authoritative store, only be reported.
+                        if !crate::xmp::sync_sidecar(&db, &path) {
+                            if let Some(n) = notify.borrow().as_ref() {
+                                n("Could not update the XMP sidecar".into());
+                            }
+                        }
                     } else if let Some(n) = notify.borrow().as_ref() {
                         n(format!("Could not save {}", field.label().to_lowercase()));
                     }
@@ -2589,6 +2602,13 @@ impl MetadataPanel {
     /// Idempotent: it re-baselines each entry it writes, so calling it twice does
     /// not write twice.
     pub fn flush_metadata_edits(&self) {
+        // Collect dirty entries grouped per image first: several fields are
+        // often dirty at once (window close after a burst of edits), and each
+        // group becomes ONE catalogue transaction + ONE sidecar rewrite
+        // instead of five of each. Entries can in principle target different
+        // images if the selection moved mid-edit, so grouping is by (db, path).
+        let mut groups: Vec<(String, String, Vec<(crate::persist::MetaField, String)>, Vec<(usize, String)>)> =
+            Vec::new();
         for (i, entry) in self.meta_entries.iter().enumerate() {
             let Some(target) = self.meta_targets.get(i) else { continue };
             let (path, db, orig) = target.borrow().clone();
@@ -2600,10 +2620,34 @@ impl MetadataPanel {
                 continue;
             }
             let field = crate::persist::MetaField::ALL[i];
-            if crate::persist::save_metadata(&db, &path, &[(field, value.clone())]) {
-                target.borrow_mut().2 = value;
+            match groups.last_mut() {
+                Some((p, d, fields, _)) if *p == path && *d == db => {
+                    fields.push((field, value.clone()));
+                }
+                _ => groups.push((
+                    path,
+                    db,
+                    vec![(field, value.clone())],
+                    vec![(i, value)],
+                )),
+            }
+        }
+        for (path, db, fields, baselines) in groups {
+            let labels: Vec<&str> = fields.iter().map(|(f, _)| f.label()).collect();
+            if crate::persist::save_metadata(&db, &path, &fields) {
+                for (i, value) in baselines {
+                    if let Some(t) = self.meta_targets.get(i) {
+                        t.borrow_mut().2 = value;
+                    }
+                }
+                // Same sidecar mirror as the interactive commit path above.
+                if !crate::xmp::sync_sidecar(&db, &path) {
+                    if let Some(n) = self.on_notify.borrow().as_ref() {
+                        n("Could not update the XMP sidecar".into());
+                    }
+                }
             } else if let Some(n) = self.on_notify.borrow().as_ref() {
-                n(format!("Could not save {}", field.label().to_lowercase()));
+                n(format!("Could not save {}", labels.join(", ").to_lowercase()));
             }
         }
     }

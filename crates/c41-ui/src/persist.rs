@@ -1025,6 +1025,24 @@ fn load_metadata_conn(conn: &Connection, full_path: &str) -> Vec<(MetaField, Str
         .collect()
 }
 
+/// Like [`load_metadata`], but distinguishes failure from genuine blank:
+/// `None` means the catalogue could not be consulted (database missing or
+/// unreadable, image not catalogued); `Some` carries all five fields even
+/// when every one is empty. Callers about to *erase* sidecar content from
+/// these values must use this one — an all-empty read that is really a failed
+/// lookup must not be mistaken for "the user blanked everything".
+pub(crate) fn try_load_metadata(
+    db_path: &str,
+    full_path: &str,
+) -> Option<Vec<(MetaField, String)>> {
+    if db_path.is_empty() {
+        return None;
+    }
+    let conn = Connection::open(db_path).ok()?;
+    imgid_for_path(&conn, full_path)?;
+    Some(load_metadata_conn(&conn, full_path))
+}
+
 /// Write metadata for an image. Returns whether the write landed.
 ///
 /// Only the fields named in `fields` are touched, so a caller editing one entry
@@ -1032,15 +1050,12 @@ fn load_metadata_conn(conn: &Connection, full_path: &str) -> Vec<(MetaField, Str
 /// storing `''` — that is upstream's convention, and it keeps "no title" as one
 /// state instead of two that compare unequal in a filter.
 ///
-/// **Known gap — the XMP sidecar is not written.** darktable's own editor
-/// follows `dt_metadata_set_list` with `dt_image_synch_xmps`
-/// (`src/libs/metadata.c:383`, `:393`), so upstream metadata lands in *both* the
-/// catalogue and the image's `.xmp`. This writes the catalogue only, which means
-/// a value set here is invisible to other tools and does not travel with the
-/// file until darktable rewrites that sidecar itself. The catalogue is the
-/// source of truth either way — `dt_exif_xmp_read` reads sidecars back *into*
-/// this table — so nothing is lost or corrupted; it is unexported, not wrong.
-/// Closing the gap means an XMP writer, which is its own increment.
+/// The XMP sidecar is synchronised by the CALLER after a successful write
+/// (`crate::xmp::sync_sidecar`, m4-142) — mirroring upstream, where
+/// `dt_metadata_set_list` is followed by `dt_image_synch_xmps`
+/// (`src/libs/metadata.c:383`). This function stays storage-only so both
+/// stores keep a clear order: catalogue first (authoritative), sidecar second
+/// (a failed sidecar write is reported, never rolled back).
 pub fn save_metadata(db_path: &str, full_path: &str, fields: &[(MetaField, String)]) -> bool {
     if db_path.is_empty() || fields.is_empty() {
         return false;

@@ -18,3 +18,6 @@ walkdir       = { workspace = true }
 # Rust-native export encode (8/16-bit PNG/TIFF, 8-bit JPEG) + resize. Only the
 # formats we emit, to keep the dependency light.
 image         = { version = "0.25", default-features = false, features = ["png", "tiff", "jpeg"] }
+# XMP sidecar writing (m4-142): event-stream XML reader/writer for merge-preserving
+# updates of darktable-compatible sidecars next to image files.
+quick-xml     = "0.38"
