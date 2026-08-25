@@ -38,6 +38,10 @@ pub struct RawPreview {
     /// The UI uses this to hide the Bayer demosaic-method selector, which is a
     /// no-op for X-Trans files.
     pub is_xtrans: bool,
+    /// Cleaned-up camera maker/model from the decoder's table — seeds the
+    /// lens-correction module's camera dropdown. Empty when unknown.
+    pub clean_make: String,
+    pub clean_model: String,
 }
 
 /// File extensions we route through the raw decoder rather than gdk-pixbuf.
@@ -115,6 +119,8 @@ pub fn decode_raw_preview_with(
 ) -> Option<RawPreview> {
     let img = c41_core::rawimage::load(path).ok()?;
     let is_xtrans = img.xtrans.is_some();
+    let clean_make = img.clean_make.clone();
+    let clean_model = img.clean_model.clone();
     let (w, h, rgba) = img.to_linear_rgba_with(method, hl);
     if w == 0 || h == 0 {
         return None;
@@ -127,6 +133,8 @@ pub fn decode_raw_preview_with(
         height: h2,
         pixels: small,
         is_xtrans,
+        clean_make,
+        clean_model,
     })
 }
 

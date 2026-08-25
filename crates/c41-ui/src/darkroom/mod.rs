@@ -64,13 +64,26 @@ struct CachedRender {
 }
 
 impl BaseImage {
+    /// `(width, height)` of either backing variant.
+    fn dims(&self) -> (usize, usize) {
+        match self {
+            BaseImage::Srgb8 { width, height, .. } => (*width as usize, *height as usize),
+            BaseImage::Linear { width, height, .. } => (*width, *height),
+        }
+    }
+
     /// Run the live pipeline and return the 8-bit sRGB image to display.
-    fn render(&self, params: &PreviewParams) -> Rendered {
+    /// `lens_gear` is the resolved lens-correction gear (see
+    /// [`crate::preview::LensGear`]) — passed through so an enabled lens module
+    /// actually applies; `None` omits it.
+    fn render(&self, params: &PreviewParams, lens_gear: Option<&crate::preview::LensGear>) -> Rendered {
         match self {
             BaseImage::Srgb8 { bytes, width, height, rowstride, nch } => {
                 let (w, h) = (*width as usize, *height as usize);
                 Rendered {
-                    bytes: crate::preview::apply_pipeline(bytes, w, h, *rowstride, *nch, params),
+                    bytes: crate::preview::apply_pipeline_gear(
+                        bytes, w, h, *rowstride, *nch, params, lens_gear,
+                    ),
                     width: *width,
                     height: *height,
                     rowstride: *rowstride,
@@ -78,7 +91,9 @@ impl BaseImage {
                 }
             }
             BaseImage::Linear { width, height, pixels } => Rendered {
-                bytes: crate::preview::render_linear_to_srgb8(pixels, *width, *height, params),
+                bytes: crate::preview::render_linear_to_srgb8_gear(
+                    pixels, *width, *height, params, lens_gear,
+                ),
                 width: *width as i32,
                 height: *height as i32,
                 rowstride: width * 3,
@@ -139,6 +154,26 @@ struct PreviewCtx {
     /// The active Bayer demosaic method (raw only), kept so a re-decode
     /// requested from anywhere re-uses the user's chosen algorithm.
     decode_method: Rc<std::cell::Cell<DemosaicMethod>>,
+    /// Cleaned-up camera maker/model from the most recent raw decode (empty for
+    /// JPEGs and pre-decode). Seeds the lens module's camera dropdown when the
+    /// user hasn't picked one yet.
+    cam_meta: Rc<RefCell<(String, String)>>,
+    /// Resolved lens-correction gear for the current camera/lens choice, shared
+    /// with the export path (the same `Arc` bakes into [`crate::export::ExportEdit`])
+    /// so an export matches the preview. `None` = nothing selected/unresolved.
+    lens_gear: Rc<RefCell<Option<std::sync::Arc<crate::preview::LensGear>>>>,
+    /// The lens module's camera dropdown; a completed decode re-seeds it from
+    /// [`PreviewCtx::cam_meta`] while nothing is selected. Empty until the lens
+    /// module row is built.
+    lens_cam_dd: glib::WeakRef<gtk4::DropDown>,
+    /// Re-entrancy guard for the lens dropdowns: programmatic list/selection
+    /// updates (`set_model` autoselects, `set_selected` fires handlers) must not
+    /// commit through the nested `notify::selected` path — only the outermost,
+    /// user-visible transition does. Set around every [`lens_fill_lens_dd`] call.
+    lens_syncing: Rc<std::cell::Cell<bool>>,
+    /// Catalogue database path (`""` = no db), for per-image lens-choice
+    /// persistence ([`crate::persist::save_lens`]). Set once, never mutated.
+    db_path: Rc<str>,
 }
 
 /// Debounced recorder that appends one [`HistoryStack`] entry per *settled* edit
@@ -698,8 +733,11 @@ fn effective_params(ctx: &PreviewCtx) -> PreviewParams {
 fn render_preview(ctx: &PreviewCtx) {
     let Some(picture) = ctx.picture.upgrade() else { return };
     let params = effective_params(ctx);
+    // Snapshot the gear Arc (a refcount bump, no resolution work) so no borrow
+    // is held across the render.
+    let lens_gear = ctx.lens_gear.borrow().clone();
     if let Some(b) = ctx.base.borrow().as_ref() {
-        let r = b.render(&params);
+        let r = b.render(&params, lens_gear.as_deref());
 
         *ctx.hist.borrow_mut() = crate::preview::compute_histogram(
             &r.bytes, r.width as usize, r.height as usize, r.rowstride, r.nch,
@@ -816,7 +854,16 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     method,
                     hl,
                 )
-                .map(|rp| (rp.width, rp.height, rp.pixels, rp.is_xtrans))
+                .map(|rp| {
+                    (
+                        rp.width,
+                        rp.height,
+                        rp.pixels,
+                        rp.is_xtrans,
+                        rp.clean_make,
+                        rp.clean_model,
+                    )
+                })
             })
             .await
             .ok()
@@ -827,7 +874,7 @@ fn spawn_decode(ctx: &PreviewCtx) {
                 return;
             }
             match decoded {
-                Some((w, h, px, is_xtrans)) => {
+                Some((w, h, px, is_xtrans, clean_make, clean_model)) => {
                     // The Bayer demosaic selector is a no-op for X-Trans
                     // (Markesteijn is fixed) — hide the section for those files.
                     // Runs on every decode, including Bayer method-change
@@ -835,6 +882,10 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     if let Some(row) = ctx.demosaic_row.upgrade() {
                         row.set_visible(!is_xtrans);
                     }
+                    // Camera identity from the decoder's table seeds the lens
+                    // module's camera dropdown (only while nothing is picked).
+                    *ctx.cam_meta.borrow_mut() = (clean_make, clean_model);
+                    lens_seed_camera_from_meta(&ctx);
                     *ctx.pristine.borrow_mut() = Some((w, h, px));
                     apply_geometry_to_base(&ctx); // sets base + renders
                 }
@@ -1034,6 +1085,11 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         decode_method: Rc::new(std::cell::Cell::new(
             crate::persist::load_demosaic(db_path, file_path),
         )),
+        cam_meta: Rc::new(RefCell::new((String::new(), String::new()))),
+        lens_gear: Rc::new(RefCell::new(None)),
+        lens_cam_dd: glib::WeakRef::new(),
+        lens_syncing: Rc::new(std::cell::Cell::new(false)),
+        db_path: Rc::from(db_path),
     };
     // Show the seed entry immediately.
     refresh_history_list(&history_list, &ctx.history.borrow());
@@ -1695,6 +1751,9 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
                 method: crate::persist::load_demosaic(&ex_db, &path_for_export),
                 geometry: ex_ctx.geometry.get(),
                 params: *ex_ctx.params.borrow(),
+                // The same Arc the preview renders with, so the export matches
+                // (a refcount bump; no re-resolution).
+                lens: ex_ctx.lens_gear.borrow().clone(),
             };
             // Surface the export result as a toast (the callback runs back on the
             // main thread after the export future resolves).
@@ -1880,6 +1939,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Filmic RGB" => pg.add(&filmic_module_row(ctx)),
                 "Highlight reconstruction" => pg.add(&highlights_module_row(ctx)),
                 "Denoise (profiled)" => pg.add(&denoise_module_row(ctx)),
+                "Lens correction" => pg.add(&lens_module_row(ctx)),
                 "Bloom" => pg.add(&bloom_module_row(ctx)),
                 "Color zones" => pg.add(&colorzones_module_row(ctx)),
                 "Tone curve" => pg.add(&curve_editor::tonecurve_module_row(ctx)),
@@ -1979,7 +2039,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Bloom", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2847,6 +2907,455 @@ fn highlights_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     expander
 }
 
+// ── Lens correction (lens.c via the lensfun database) ──────────────────────
+
+/// `DropDown` sentinel for "nothing selected" (GTK_INVALID_LIST_POSITION).
+const LENS_DD_NONE: u32 = gtk4::INVALID_LIST_POSITION;
+
+/// Corrections selector: display rows in `dt_iop_lens_modflag_t` DECLARATION
+/// order (the order darktable's generated combo lists them), each carrying its
+/// enum VALUE — a non-contiguous bitmask (`MODIFY_FLAG_TCA=1`,
+/// `VIGNETTING=2`, `DISTORTION=4`, combined 3|5|6|7). The combo index is
+/// positional and must never be written into the bitmask parameter directly.
+/// Built from the c41-core constants so the two crates cannot drift.
+const CORRECTIONS: [(&str, i32); 8] = [
+    ("none", 0),
+    ("all", c41_core::iop::lens::MODFLAG_ALL),
+    (
+        "distortion & TCA",
+        c41_core::iop::lens::MODIFY_FLAG_DISTORTION | c41_core::iop::lens::MODIFY_FLAG_TCA,
+    ),
+    (
+        "distortion & vignetting",
+        c41_core::iop::lens::MODIFY_FLAG_DISTORTION | c41_core::iop::lens::MODIFY_FLAG_VIGNETTING,
+    ),
+    (
+        "TCA & vignetting",
+        c41_core::iop::lens::MODIFY_FLAG_TCA | c41_core::iop::lens::MODIFY_FLAG_VIGNETTING,
+    ),
+    ("only distortion", c41_core::iop::lens::MODIFY_FLAG_DISTORTION),
+    ("only TCA", c41_core::iop::lens::MODIFY_FLAG_TCA),
+    ("only vignetting", c41_core::iop::lens::MODIFY_FLAG_VIGNETTING),
+];
+
+/// Target-geometry selector rows: `lfLensType` values 1..=8 in enum order.
+/// Unlike the C introspection combo this omits UNKNOWN (0) — darktable's
+/// generated combobox has no `$DESCRIPTION` for it either, and target 0 flips
+/// the NaN guard on for most lenses. Index ≠ value here (values start at 1),
+/// hence the same table treatment as [`CORRECTIONS`].
+const GEOMS: [(&str, i32); 8] = [
+    ("rectilinear", 1),
+    ("fisheye", 2),
+    ("panoramic", 3),
+    ("equirectangular", 4),
+    ("orthographic", 5),
+    ("stereographic", 6),
+    ("equisolid angle", 7),
+    ("Thoby fisheye", 8),
+];
+
+/// Position of value `v` in one of the tables above (first match).
+fn table_pos(table: &[(&str, i32)], v: i32) -> Option<u32> {
+    table.iter().position(|(_, val)| *val == v).map(|i| i as u32)
+}
+
+/// Index of `(maker, model)` in a `list_cameras` table, for dropdown seeding.
+fn camera_index(cams: &[(String, String)], maker: &str, model: &str) -> Option<u32> {
+    cams.iter()
+        .position(|(m, d)| m == maker && d == model)
+        .map(|i| i as u32)
+}
+
+/// Margins shared by every dropdown row inside the lens expander (same inset
+/// as [`labeled_slider`]'s rows).
+fn inset_dropdown(dd: &gtk4::DropDown) {
+    dd.set_margin_start(8);
+    dd.set_margin_end(8);
+    dd.set_margin_top(1);
+    dd.set_margin_bottom(1);
+}
+
+/// Persist `choice`, resolve it into [`PreviewCtx::lens_gear`] (clearing gear
+/// when the pair is unselected or unmatched — the stage then emits nothing,
+/// like darktable's "no data"), and re-render. The single commit path for gear
+/// changes; idempotent, so double-firing handlers are harmless.
+fn lens_commit_choice(
+    ctx: &PreviewCtx,
+    choice: &crate::persist::LensChoice,
+) {
+    crate::persist::save_lens(&ctx.db_path, &ctx.decode_path.borrow(), choice);
+    *ctx.lens_gear.borrow_mut() = crate::preview::resolve_gear(choice);
+    render_preview(ctx);
+}
+
+/// Populate the lens dropdown with the selected camera's mount-compatible
+/// lenses (`cam_sel` = [`LENS_DD_NONE`] empties it) and select `want` (the
+/// persisted `(maker, model)` identity pair) when present. Reads only identity
+/// fields from the database.
+fn lens_fill_lens_dd(
+    cams: &[(String, String)],
+    lenses: &RefCell<Vec<(String, String)>>,
+    lens_dd: &gtk4::DropDown,
+    cam_sel: u32,
+    want: (&str, &str),
+) {
+    if cam_sel == LENS_DD_NONE {
+        *lenses.borrow_mut() = Vec::new();
+    } else {
+        let (maker, model) = &cams[cam_sel as usize];
+        // One cheap resolution to learn the mount; an unknown camera yields an
+        // empty mount → the unfiltered list rather than nothing at all.
+        let mount = c41_core::iop::lens::resolve_camera(maker, model)
+            .map(|c| c.mount)
+            .unwrap_or_default();
+        *lenses.borrow_mut() = c41_core::iop::lens::list_lenses(
+            (!mount.is_empty()).then_some(mount.as_str()),
+        );
+    }
+    let pairs = lenses.borrow().clone();
+    let labels: Vec<String> = pairs
+        .iter()
+        .map(|(m, d)| c41_core::iop::lens::lens_label(m, d))
+        .collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    lens_dd.set_model(Some(&gtk4::StringList::new(&refs)));
+    let sel = pairs
+        .iter()
+        .position(|(m, d)| m == want.0 && d == want.1);
+    lens_dd.set_selected(sel.map(|i| i as u32).unwrap_or(LENS_DD_NONE));
+}
+
+/// Lens correction (lens.c): radial distortion/TCA/vignetting correction driven
+/// by the lensfun database for a user-selected camera + lens pair. darktable
+/// auto-fills both from EXIF; rawloader doesn't decode the lens name, so the
+/// **camera** is pre-selected from the decoder's cleaned-up table while the
+/// **lens** stays user-picked — the one deliberate deviation.
+///
+/// Gear identity is persisted per image in `main.darkroom_lens_choice` (strings
+/// can't join the PreviewParams blob) and resolved into
+/// [`PreviewCtx::lens_gear`], which every pipeline build site consumes — so the
+/// export matches the preview. Slider ranges follow the C introspection where
+/// one exists (scale 0.1..2.0); focal/aperture/distance are free-entry combo
+/// boxes in C listing common values, and become plain sliders covering the same
+/// domain. The corrections/target-geometry rows carry their C enum VALUES in
+/// tables ([`CORRECTIONS`]/[`GEOMS`]) because neither combo's index equals its
+/// value (bitmasks; lfLensType starts at 1).
+///
+/// Documented limitations: (1) darktable runs lens at iop_order 13, before
+/// crop/rotate; our separate-pass geometry applies first, so the correction is
+/// measured against the post-crop frame and is only geometrically exact without
+/// crop/straighten (a lens pre-pass on the pristine buffer is the follow-up).
+/// (2) Gear identity sits outside the history stack — undo/redo reverts params
+/// but not a camera/lens swap, and Reset leaves the choice in place so
+/// re-enabling the module resurrects it (identity, not an edit). The focal
+/// slider is not clamped to the selected lens's focal range either (C forces
+/// primes to MinFocal) — a parity nicety deferred with the dynamic-range work.
+fn lens_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    let path = ctx.decode_path.borrow().clone();
+    let choice = crate::persist::load_lens(&ctx.db_path, &path);
+
+    // Parallel arrays behind the two dropdowns: display label ↔ identity. A
+    // label alone can't be split back reliably (models contain spaces).
+    let cams: Rc<RefCell<Vec<(String, String)>>> =
+        Rc::new(RefCell::new(c41_core::iop::lens::list_cameras()));
+    let cam_labels: Vec<String> =
+        cams.borrow().iter().map(|(m, d)| format!("{m} {d}")).collect();
+    // Lens identity pairs (maker, model) exactly as the database spells them —
+    // the dropdown shows [`c41_core::iop::lens::lens_label`] of these, but the
+    // persisted choice is the structured pair, which `resolve_lens` re-finds
+    // exactly (a display label can't be split back reliably).
+    let lenses: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let expander = module_expander(
+        ctx,
+        "Lens correction",
+        "distortion · TCA · vignetting (lensfun)",
+        p0.lens_on,
+        |p, on| p.lens_on = on,
+        |e, ctx| {
+            // ── corrections selector (C modflag combobox; rows carry values) ──
+            let corr_labels: Vec<&str> = CORRECTIONS.iter().map(|(l, _)| *l).collect();
+            let corr = gtk4::DropDown::from_strings(&corr_labels);
+            inset_dropdown(&corr);
+            corr.set_selected(
+                table_pos(&CORRECTIONS, p0.lens_modify_flags as i32).unwrap_or(1), // "all"
+            );
+            corr.set_tooltip_text(Some("Which calibrated corrections to apply"));
+            let c_ctx = ctx.clone();
+            corr.connect_selected_notify(move |dd| {
+                if let Some((_, v)) = CORRECTIONS.get(dd.selected() as usize) {
+                    c_ctx.params.borrow_mut().lens_modify_flags = *v as f32;
+                    render_preview(&c_ctx);
+                }
+            });
+            e.add_row(&corr);
+
+            // ── camera dropdown (seeded from the persisted choice, else the
+            // decoded camera identity once it arrives) ──
+            let cam_refs: Vec<&str> = cam_labels.iter().map(String::as_str).collect();
+            let cam_dd = gtk4::DropDown::from_strings(&cam_refs);
+            inset_dropdown(&cam_dd);
+            cam_dd.set_tooltip_text(Some(
+                if cams.borrow().is_empty() {
+                    "Camera as known to the lensfun database — DATABASE NOT FOUND \
+                     (is liblensfun-data installed?)"
+                } else {
+                    "Camera as known to the lensfun database (auto-filled from the file)"
+                },
+            ));
+            cam_dd.update_property(&[gtk4::accessible::Property::Label("Camera")]);
+            let seeded = camera_index(&cams.borrow(), &choice.camera_maker, &choice.camera_model)
+                .or_else(|| {
+                    let (mk, md) = ctx.cam_meta.borrow().clone();
+                    (!md.is_empty())
+                        .then(|| camera_index(&cams.borrow(), &mk, &md))
+                        .flatten()
+                });
+            // Set before connecting the handler (the populate_modules invariant):
+            // seeding must not commit or re-render.
+            cam_dd.set_selected(seeded.unwrap_or(LENS_DD_NONE));
+
+            // ── lens dropdown (population follows the selected camera's mount) ──
+            let lens_dd = gtk4::DropDown::builder().build();
+            inset_dropdown(&lens_dd);
+            lens_dd.set_tooltip_text(Some(
+                "Lens as known to the lensfun database — pick yours to enable correction",
+            ));
+            lens_dd.update_property(&[gtk4::accessible::Property::Label("Lens")]);
+            // Guarded like the runtime refills: set_model autoselects and
+            // set_selected fires handlers once connected (they aren't yet here,
+            // but keep every fill site uniform).
+            ctx.lens_syncing.set(true);
+            lens_fill_lens_dd(
+                &cams.borrow(),
+                &lenses,
+                &lens_dd,
+                cam_dd.selected(),
+                (&choice.lens_maker, &choice.lens_model),
+            );
+            ctx.lens_syncing.set(false);
+            ctx.lens_cam_dd.set(Some(&cam_dd));
+
+            // Restore persisted gear without touching widgets (handlers below
+            // aren't connected yet; this mirrors what they would commit).
+            *ctx.lens_gear.borrow_mut() = crate::preview::resolve_gear(&choice);
+
+            // Camera change ⇒ different mount ⇒ refill the lens list and drop
+            // any stale pick. The empty-lens commit also clears gear. The sync
+            // guard swallows the notify storms that `set_model` autoselect and
+            // the explicit re-`set_selected` fire inside the refill; only the
+            // outermost transition commits, exactly once.
+            let cc_ctx = ctx.clone();
+            let cc_cams = cams.clone();
+            let cc_lens = lenses.clone();
+            let cc_lens_dd = lens_dd.clone();
+            cam_dd.connect_selected_notify(move |dd| {
+                if cc_ctx.lens_syncing.get() {
+                    return;
+                }
+                cc_ctx.lens_syncing.set(true);
+                let sel = dd.selected();
+                lens_fill_lens_dd(&cc_cams.borrow(), &cc_lens, &cc_lens_dd, sel, ("", ""));
+                cc_ctx.lens_syncing.set(false);
+                let (maker, model) = if sel == LENS_DD_NONE {
+                    (String::new(), String::new())
+                } else {
+                    cc_cams
+                        .borrow()
+                        .get(sel as usize)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                lens_commit_choice(
+                    &cc_ctx,
+                    &crate::persist::LensChoice {
+                        camera_maker: maker,
+                        camera_model: model,
+                        lens_maker: String::new(),
+                        lens_model: String::new(),
+                    },
+                );
+            });
+
+            // Lens picked ⇒ persist the full choice and resolve the gear.
+            // Guarded for the same reason: programmatic selections made while
+            // `lens_syncing` is set (refills) must not commit.
+            let lc_ctx = ctx.clone();
+            let lc_cams = cams.clone();
+            let lc_lens = lenses.clone();
+            let lc_cam_dd = cam_dd.clone();
+            lens_dd.connect_selected_notify(move |dd| {
+                if lc_ctx.lens_syncing.get() {
+                    return;
+                }
+                let cam_sel = lc_cam_dd.selected();
+                let (maker, model) = if cam_sel == LENS_DD_NONE {
+                    (String::new(), String::new())
+                } else {
+                    lc_cams
+                        .borrow()
+                        .get(cam_sel as usize)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                let lens_sel = dd.selected();
+                let (lens_maker, lens_model) = if lens_sel == LENS_DD_NONE {
+                    (String::new(), String::new())
+                } else {
+                    lc_lens
+                        .borrow()
+                        .get(lens_sel as usize)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                lens_commit_choice(
+                    &lc_ctx,
+                    &crate::persist::LensChoice {
+                        camera_maker: maker,
+                        camera_model: model,
+                        lens_maker,
+                        lens_model,
+                    },
+                );
+            });
+            e.add_row(&cam_dd);
+            e.add_row(&lens_dd);
+
+            add_param_slider(e, ctx, "Focal (mm)", 1.0, 1000.0, 0.1, p0.lens_focal as f64,
+                |p, v| p.lens_focal = v);
+            add_param_slider(e, ctx, "Aperture (f-number)", 1.0, 32.0, 0.1, p0.lens_aperture as f64,
+                |p, v| p.lens_aperture = v);
+            add_param_slider(e, ctx, "Distance (m)", 0.1, 1000.0, 0.1, p0.lens_distance as f64,
+                |p, v| p.lens_distance = v);
+
+            // Target geometry ([`GEOMS`] rows carry lfLensType values; UNKNOWN
+            // omitted like darktable's own combo). A stored 0/unknown falls
+            // back to rectilinear.
+            let geom_labels: Vec<&str> = GEOMS.iter().map(|(l, _)| *l).collect();
+            let geom = gtk4::DropDown::from_strings(&geom_labels);
+            inset_dropdown(&geom);
+            geom.set_selected(
+                table_pos(&GEOMS, p0.lens_target_geom as i32).unwrap_or(0), // rectilinear
+            );
+            geom.set_tooltip_text(Some("Target projection of the corrected image"));
+            let g_ctx = ctx.clone();
+            geom.connect_selected_notify(move |dd| {
+                if let Some((_, v)) = GEOMS.get(dd.selected() as usize) {
+                    g_ctx.params.borrow_mut().lens_target_geom = *v as f32;
+                    render_preview(&g_ctx);
+                }
+            });
+            e.add_row(&geom);
+
+            // Inverse direction ("correct" vs "distort" in the C combo).
+            const INVERSE_LABELS: [&str; 2] = ["correct", "distort"];
+            let inv = gtk4::DropDown::from_strings(&INVERSE_LABELS);
+            inset_dropdown(&inv);
+            inv.set_tooltip_text(Some(
+                "Correct the defects, or apply them (simulate an uncorrected lens)",
+            ));
+            inv.set_selected(u32::from(p0.lens_inverse));
+            let i_ctx = ctx.clone();
+            inv.connect_selected_notify(move |dd| {
+                i_ctx.params.borrow_mut().lens_inverse = dd.selected() == 1;
+                render_preview(&i_ctx);
+            });
+            e.add_row(&inv);
+
+            // Manual scale + autoscale button (the C slider's quad action).
+            // Kept out of add_param_slider so the button can reflect its value.
+            let sc = labeled_slider("Scale", 0.1, 2.0, 0.001, p0.lens_scale as f64);
+            sc.scale.widget.set_tooltip_text(Some("Scale applied after correction"));
+            let s_ctx = ctx.clone();
+            sc.scale.connect_value_changed(move |v| {
+                s_ctx.params.borrow_mut().lens_scale = v as f32;
+                render_preview(&s_ctx);
+            });
+            e.add_row(&sc.row);
+
+            let auto_btn = gtk4::Button::builder()
+                .label("Auto scale")
+                .tooltip_text(
+                    "Scale to the largest image size the calibration data covers",
+                )
+                .margin_start(8)
+                .margin_end(8)
+                .margin_bottom(6)
+                .build();
+            let a_ctx = ctx.clone();
+            let a_scale = sc.scale.clone(); // BauhausSlider is Rc-backed + Clone
+            auto_btn.connect_clicked(move |_| {
+                let gear = a_ctx.lens_gear.borrow().clone();
+                let Some(gear) = gear.as_deref() else {
+                    return; // no gear resolved — nothing to measure against
+                };
+                // Measure against the un-geometried pristine frame when there
+                // is one (darktable's _get_autoscale_lf uses the full
+                // p_width/p_height, not the cropped display buffer); fall back
+                // to the base frame for the JPEG path.
+                let pristine = a_ctx.pristine.borrow();
+                let dims = if let Some((w, h, _)) = pristine.as_ref() {
+                    Some((*w, *h))
+                } else {
+                    let base = a_ctx.base.borrow();
+                    base.as_ref().map(|b| b.dims())
+                };
+                drop(pristine);
+                let Some((w, h)) = dims else {
+                    return;
+                };
+                let p = *a_ctx.params.borrow();
+                let Some(s) = c41_core::iop::lens::autoscale(
+                    &gear.1,
+                    &p.lens_params(&gear.0, &gear.1),
+                    w,
+                    h,
+                ) else {
+                    return;
+                };
+                // Single commit path: set_value fires value_changed, which
+                // stores the quantised value in params and renders. No explicit
+                // params write here — the quantised slider value is the only
+                // one that should ever land.
+                a_scale.set_value(s as f64);
+            });
+            e.add_row(&auto_btn);
+        },
+    );
+    expander
+}
+
+/// Seed the lens module's camera dropdown from the freshly-decoded camera
+/// identity — only while NOTHING is selected, checked both on the widget AND
+/// against the persisted choice. The widget check alone is not enough: when a
+/// persisted camera no longer exists in the current database (a lensfun-data
+/// update renamed or dropped it), the dropdown sits at "nothing selected"
+/// while a perfectly good lens pick is still saved — auto-seeding here would
+/// fire the camera handler and overwrite that persisted lens with nothing.
+/// Runs on every decode completion; a match fires the dropdown's own handler,
+/// which refills the lens list and persists the camera-only choice.
+fn lens_seed_camera_from_meta(ctx: &PreviewCtx) {
+    let Some(dd) = ctx.lens_cam_dd.upgrade() else {
+        return;
+    };
+    if dd.selected() != LENS_DD_NONE {
+        return;
+    }
+    let path = ctx.decode_path.borrow().clone();
+    if !crate::persist::load_lens(&ctx.db_path, &path).is_empty() {
+        return; // a persisted user pick always wins, even an unresolved one
+    }
+    let (maker, model) = ctx.cam_meta.borrow().clone();
+    if maker.is_empty() && model.is_empty() {
+        return;
+    }
+    let cams = c41_core::iop::lens::list_cameras();
+    if let Some(i) = camera_index(&cams, &maker, &model) {
+        dd.set_selected(i);
+    }
+}
+
 /// Denoise (profiled) (denoiseprofile.c, wavelets mode): non-local à-trous
 /// wavelet shrinkage after variance stabilisation — iop_order.c pos 9/10, a
 /// normal pipeline stage right after demosaic, so [`module_expander`]'s plain
@@ -3052,7 +3561,7 @@ mod tests {
             height: 1,
             pixels: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         };
-        let r = b.render(&PreviewParams::default());
+        let r = b.render(&PreviewParams::default(), None);
         assert_eq!((r.width, r.height), (2, 1));
         assert_eq!(r.nch, 3);
         assert_eq!(r.rowstride, 2 * 3);

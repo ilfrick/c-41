@@ -55,6 +55,12 @@ pub struct RawImage {
     /// matrix. Rec.2020 is the working space (m4-35); the display seam converts it
     /// to sRGB via [`REC2020_TO_SRGB`].
     pub cam_to_working: [[f32; 3]; 3],
+    /// Cleaned-up camera maker/model from the decoder's camera table (e.g.
+    /// "Canon" / "Canon EOS 5D Mark II") — seeds the lens-correction module's
+    /// camera selection. Empty when unknown. The *lens* name is NOT carried:
+    /// rawloader doesn't read that EXIF tag (darktable gets it via exiv2).
+    pub clean_make: String,
+    pub clean_model: String,
     /// Black/white-normalised photosites, row-major, `width * height` long.
     pub mosaic: Vec<f32>,
 }
@@ -261,6 +267,8 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<RawImage> {
         wb: raw.wb_coeffs,
         orientation: raw.orientation.to_flips(),
         cam_to_working: rec2020_from_cam_matrix(raw.xyz_to_cam),
+        clean_make: raw.clean_make.clone(),
+        clean_model: raw.clean_model.clone(),
         mosaic,
     })
 }
@@ -1436,6 +1444,8 @@ mod tests {
             orientation: (false, false, false),
             cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             // Diagonal gradient with over-range photosites carried in.
+            clean_make: String::new(),
+            clean_model: String::new(),
             mosaic: (0..144).map(|i| (i % 29) as f32 / 20.0).collect(),
         };
         let a = img.to_linear_rgba_with(DemosaicMethod::Ppg, None);
@@ -1557,6 +1567,8 @@ mod tests {
             wb: [2.0, 1.0, 4.0, 1.0],
             orientation: (false, false, false),
             cam_to_working: IDENTITY3, // colour matrix is a no-op for this fixture
+            clean_make: String::new(),
+            clean_model: String::new(),
             mosaic: vec![0.4, 0.6, 0.2, 0.8],
         };
         let (w, h, rgba) = img.to_linear_rgba();
@@ -1590,6 +1602,8 @@ mod tests {
             wb: [1.0, 1.0, 1.0, 1.0],
             orientation: (false, false, false),
             cam_to_working: IDENTITY3,
+            clean_make: String::new(),
+            clean_model: String::new(),
             mosaic,
         };
         // The no-arg entry point delegates to RCD, byte-for-byte.
@@ -1629,6 +1643,8 @@ mod tests {
             wb: [1.0, 1.0, 1.0, 1.0],
             orientation: (false, false, false),
             cam_to_working: IDENTITY3,
+            clean_make: String::new(),
+            clean_model: String::new(),
             mosaic,
         };
         let rcd = img.to_linear_rgba_with(DemosaicMethod::Rcd, None);

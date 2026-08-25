@@ -142,7 +142,12 @@ pub struct ResolvedCamera {
     pub(crate) ptr: *const lfCamera,
     pub maker: String,
     pub model: String,
-    /// Crop factor relative to 35 mm (always defined for a match).
+    /// Mount id ("Canon EF", "Nikon F", …) — the key [`list_lenses`] filters
+    /// the lens database by.
+    pub mount: String,
+    /// Crop factor relative to 35 mm (always defined for a match). This is
+    /// what feeds `LensParams::crop` — darktable's commit_params takes it from
+    /// the camera (`p->crop = cam->CropFactor`), never from the lens.
     pub crop_factor: f32,
 }
 unsafe impl Send for ResolvedCamera {}
@@ -193,6 +198,7 @@ pub fn resolve_camera(maker: &str, model: &str) -> Option<ResolvedCamera> {
                 ptr: cam,
                 maker: str_of(cam.Maker),
                 model: str_of(cam.Model),
+                mount: str_of(cam.Mount),
                 crop_factor: cam.CropFactor,
             }
         });
@@ -201,54 +207,154 @@ pub fn resolve_camera(maker: &str, model: &str) -> Option<ResolvedCamera> {
     }
 }
 
-/// Resolve a lens for `camera` by maker/model substring (the same
-/// sort-and-uniquify search darktable's "find lens" dialog uses).
-pub fn resolve_lens(camera: &ResolvedCamera, maker: &str, model: &str) -> Option<ResolvedLens> {
-    let maker_c = cstr(maker);
-    let model_c = cstr(model);
-    let _g = DB_LOCK.lock().unwrap();
+/// Does this database lens fit `mount`? (A lens lists every mount it works
+/// on — adapters included, e.g. an M42 screw lens under "Canon EF".)
+fn mount_fits(lens: &lfLens, mount: &str) -> bool {
+    if mount.is_empty() || lens.Mounts.is_null() {
+        return false;
+    }
     unsafe {
-        let list = lf_db_find_lenses_hd(
-            db()?.0,
-            camera.ptr,
-            maker_c.as_ptr(),
-            model_c.as_ptr(),
-            LF_SEARCH_SORT_AND_UNIQUIFY,
-        );
-        if list.is_null() {
-            return None;
-        }
-        let lens = *list;
-        let resolved = (!lens.is_null()).then(|| {
-            let l = &*lens;
-            ResolvedLens {
-                ptr: l,
-                maker: str_of(l.Maker),
-                model: str_of(l.Model),
-                crop_factor: l.CropFactor,
-                lens_type: l.Type,
-                min_focal: l.MinFocal,
-                max_focal: l.MaxFocal,
+        let mut m = lens.Mounts;
+        while !(*m).is_null() {
+            if str_of(*m) == mount {
+                return true;
             }
-        });
-        lf_free(list as *mut _);
-        resolved
+            m = m.add(1);
+        }
+    }
+    false
+}
+
+/// Resolve a lens for `camera` by exact identity: `maker` and `model` must
+/// byte-equal the database entry's fields, and the lens must fit the camera's
+/// mount. This round-trips [`list_lenses`]' structured pairs — deliberately
+/// NOT `lf_db_find_lenses_hd`, whose substring scoring is a lossy "did you
+/// mean" search (measured against this database it fails outright on ~half of
+/// all real entries when fed their exact maker+model), so a persisted pick
+/// could never be re-found through it.
+pub fn resolve_lens(camera: &ResolvedCamera, maker: &str, model: &str) -> Option<ResolvedLens> {
+    let _g = DB_LOCK.lock().unwrap();
+    let db = db()?;
+    unsafe {
+        // The database holds several entries per model (one per mount family)
+        // under identical Maker/Model strings; among the mount-compatible ones
+        // prefer the crop factor closest to the camera's, so the picked entry
+        // is independent of the database's enumeration order.
+        let mut list = lf_db_get_lenses(db.0);
+        let mut best: Option<(&lfLens, f32)> = None;
+        while !(*list).is_null() {
+            let l = &**list;
+            if !camera.mount.is_empty()
+                && str_of(l.Maker) == maker
+                && str_of(l.Model) == model
+                && mount_fits(l, &camera.mount)
+            {
+                let diff = (l.CropFactor - camera.crop_factor).abs();
+                if best.map_or(true, |(_, d)| diff < d) {
+                    best = Some((l, diff));
+                }
+            }
+            list = list.add(1);
+        }
+        best.map(|(l, _)| ResolvedLens {
+            ptr: l,
+            maker: str_of(l.Maker),
+            model: str_of(l.Model),
+            crop_factor: l.CropFactor,
+            lens_type: l.Type,
+            min_focal: l.MinFocal,
+            max_focal: l.MaxFocal,
+        })
     }
 }
 
-/// Full resolution helper: camera by maker/model, then the named lens.
-///
-/// An empty `lens_name` would wildcard-match (like C's NULL) and return an
-/// arbitrary mount lens, so callers must pass a real name — asserted in debug
-/// builds. (The camera-side `""` wildcard below is deliberate: darktable
-/// passes NULL there when the user overrides only the lens.)
-pub fn resolve(maker: &str, model: &str, lens_name: &str) -> Option<(ResolvedCamera, ResolvedLens)> {
-    debug_assert!(!lens_name.is_empty(), "empty lens name would wildcard-match");
-    let cam = resolve_camera(maker, model)?;
-    let lens = resolve_lens(&cam, "", lens_name)?;
+/// Full resolution helper: camera by maker/model, then the lens by exact
+/// identity (see [`resolve_lens`]). Both lens fields must be the database's
+/// own spelling; an empty `lens_model` never matches anything.
+pub fn resolve(
+    cam_maker: &str,
+    cam_model: &str,
+    lens_maker: &str,
+    lens_model: &str,
+) -> Option<(ResolvedCamera, ResolvedLens)> {
+    debug_assert!(!lens_model.is_empty(), "empty lens model matches nothing");
+    let cam = resolve_camera(cam_maker, cam_model)?;
+    let lens = resolve_lens(&cam, lens_maker, lens_model)?;
     Some((cam, lens))
 }
 
+/// Every camera in the database as sorted, deduplicated `(maker, model)`
+/// pairs — the population of the UI's camera dropdown. The database holds one
+/// entry per mount/variant of a model; display collapses those like
+/// darktable's combo does.
+pub fn list_cameras() -> Vec<(String, String)> {
+    let Some(db) = db() else { return Vec::new() };
+    unsafe {
+        let mut list = lf_db_get_cameras(db.0);
+        let mut out: Vec<(String, String)> = Vec::new();
+        while !(*list).is_null() {
+            let cam = &**list;
+            out.push((str_of(cam.Maker), str_of(cam.Model)));
+            list = list.add(1);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// Display label for a lens: the model, prefixed with the maker unless the
+/// model string already carries it. Display only — identity never round-trips
+/// through this label; callers keep the structured `(maker, model)` pair and
+/// re-resolve it with [`resolve_lens`].
+pub fn lens_label(maker: &str, model: &str) -> String {
+    if maker.is_empty() || model.starts_with(maker) {
+        model.to_string()
+    } else {
+        format!("{maker} {model}")
+    }
+}
+
+/// Lenses in the database as sorted structured `(maker, model)` pairs,
+/// optionally restricted to lenses that fit `mount` (a
+/// [`ResolvedCamera::mount`] value). The database's own enumeration order is
+/// unspecified, so the result is explicitly sorted; render the pairs with
+/// [`lens_label`]. Reads only identity fields (`Maker/Model/Mounts`) from
+/// database-owned objects — never the `Score` that concurrent lookups write —
+/// so no lock is needed.
+///
+/// Every returned pair round-trips exactly through [`resolve_lens`] for a
+/// camera with that mount.
+pub fn list_lenses(mount: Option<&str>) -> Vec<(String, String)> {
+    let Some(db) = db() else { return Vec::new() };
+    unsafe {
+        let mut list = lf_db_get_lenses(db.0);
+        let mut out: Vec<(String, String)> = Vec::new();
+        while !(*list).is_null() {
+            let lens = &**list;
+            let fits = match mount {
+                None => true,
+                Some(m) => mount_fits(lens, m),
+            };
+            if fits {
+                out.push((str_of(lens.Maker), str_of(lens.Model)));
+            }
+            list = list.add(1);
+        }
+        out.sort();
+        // Adapter-listed lenses can appear once per mount family under the same
+        // name; the display collapses them like the camera list does.
+        out.dedup();
+        out
+    }
+}
+
+/// Read one C string. For `lfLens`/`lfCamera` name fields this deliberately
+/// reads the raw `lfMLstr` pointer — lensfun's multi-language struct starts
+/// with the default-language string, so this yields the same bytes regardless
+/// of locale, which is what the identity round-trip (list → persist →
+/// [`resolve_lens`]) depends on. Switching to locale-aware `lf_mlstr_get`
+/// would silently unresolve every persisted pick.
 unsafe fn str_of(p: *const std::ffi::c_char) -> String {
     if p.is_null() {
         String::new()
@@ -497,7 +603,12 @@ mod tests {
         if !std::path::Path::new("/usr/share/lensfun").is_dir() {
             return None;
         }
-        let (_, lens) = resolve("Canon", "Canon EOS 5D Mark II", "Canon EF 24-70mm f/2.8L USM")?;
+        let (_, lens) = resolve(
+            "Canon",
+            "Canon EOS 5D Mark II",
+            "Canon",
+            "Canon EF 24-70mm f/2.8L USM",
+        )?;
         Some(lens)
     }
 
@@ -541,11 +652,69 @@ mod tests {
     }
 
     #[test]
+    fn database_lists_cameras_and_mount_filtered_lenses() {
+        if !std::path::Path::new("/usr/share/lensfun").is_dir() {
+            return;
+        }
+        let cams = list_cameras();
+        assert!(cams.len() > 100, "database should hold many cameras");
+        assert!(
+            cams.iter().any(|(m, mo)| m == "Canon" && mo.contains("EOS 5D Mark II")),
+            "known camera missing from enumeration"
+        );
+        // Sorted, deduplicated: adjacent duplicates impossible.
+        for pair in cams.windows(2) {
+            assert!(pair[0] <= pair[1], "camera list not sorted: {pair:?}");
+        }
+
+        let cam = resolve_camera("Canon", "Canon EOS 5D Mark II").expect("test camera");
+        assert!(!cam.mount.is_empty(), "matched camera carries its mount");
+
+        let lenses = list_lenses(Some(&cam.mount));
+        assert!(!lenses.is_empty(), "no lenses enumerated for mount {}", cam.mount);
+        // Sorted, and every listed pair must re-resolve EXACTLY — the identity
+        // round-trip persistence depends on. (The old fuzzy
+        // lf_db_find_lenses_hd search failed outright on ~half of these.)
+        for pair in lenses.windows(2) {
+            assert!(pair[0] <= pair[1], "lens list not sorted: {pair:?}");
+        }
+        for (maker, model) in &lenses {
+            let back = resolve_lens(&cam, maker, model)
+                .unwrap_or_else(|| panic!("listed lens '{maker} | {model}' must resolve"));
+            assert_eq!(back.maker, *maker, "maker mismatch for '{model}'");
+            assert_eq!(back.model, *model, "model mismatch");
+        }
+        // Near-miss identities don't resolve (exactness, not fuzzy search).
+        assert!(resolve_lens(&cam, "Canon", "Canon EF 24-70mm f/2.8L").is_none());
+        assert!(resolve_lens(&cam, "", "Canon EF 24-70mm f/2.8L USM").is_none());
+    }
+
+    #[test]
     fn unknown_camera_resolves_nothing() {
         if !std::path::Path::new("/usr/share/lensfun").is_dir() {
             return;
         }
         assert!(resolve_camera("Definitely Not A Camera", "Nor Is This").is_none());
+    }
+
+    #[test]
+    fn listed_cameras_resolve_exactly() {
+        // Same invariant as the lens round-trip above, for the camera side:
+        // everything the dropdown offers must re-resolve, or a persisted pick
+        // would silently stop correcting. Sampling keeps the
+        // enumeration×find cost bounded while covering the whole list.
+        if !std::path::Path::new("/usr/share/lensfun").is_dir() {
+            return;
+        }
+        let cams = list_cameras();
+        assert!(cams.len() > 100, "database should hold many cameras");
+        let step = cams.len().div_ceil(250).max(1);
+        for (mk, md) in cams.iter().step_by(step) {
+            assert!(
+                resolve_camera(mk, md).is_some(),
+                "listed camera '{mk} | {md}' must resolve"
+            );
+        }
     }
 
     #[test]

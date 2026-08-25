@@ -557,6 +557,38 @@ pub struct PreviewParams {
     /// Channel-0 anchor positions in curve-box coordinates ([0,1]²),
     /// x-sorted, first fixed at x=0 and last at x=1.
     pub bc_nodes: [(f32, f32); 20],
+    /// Lens correction (lens.cc LENSFUN method) stage enabled. Ships off:
+    /// darktable auto-fills gear from EXIF and only corrects once the user
+    /// picks a lens; C41 has no EXIF lens tag, so the module starts neutral
+    /// until a camera+lens are chosen (the choice persists per image in
+    /// `main.darkroom_lens_choice`, not here — the blob carries no strings).
+    pub lens_on: bool,
+    /// Correct ↔ distort direction swap (`inverse`): off = correct an image
+    /// shot with this lens (default), on = simulate the lens on an image.
+    pub lens_inverse: bool,
+    /// Corrections combo (`modify_flags`), darktable's dropdown *value*:
+    /// 7 = all (default), 5 = distortion & TCA, 6 = distortion & vignetting,
+    /// 3 = TCA & vignetting, 4 = only distortion, 1 = only TCA, 2 = only
+    /// vignetting.
+    pub lens_modify_flags: f32,
+    /// Manual scale factor (`scale`, C introspection `$DEFAULT: 1.0`). The
+    /// camera's crop factor is supplied at pipeline-build time from the
+    /// resolved gear (darktable takes it from the camera, never a slider).
+    pub lens_scale: f32,
+    /// Focal length in mm at capture (`focal`). No C introspection default —
+    /// darktable's reload_defaults fills it from EXIF, and C41 has no EXIF
+    /// lens tags, so this is a chosen neutral value (documented deviation).
+    pub lens_focal: f32,
+    /// Aperture as f-number (`aperture`). Same story as [`Self::lens_focal`] —
+    /// EXIF-driven in C, a neutral chosen value here.
+    pub lens_aperture: f32,
+    /// Focus distance in metres (`distance`). C's no-EXIF fallback is 1000.0
+    /// (lens.cc:3455); C41 has no EXIF focus distance at all, so that fallback
+    /// IS our default — it feeds lensfun's vignetting interpolation.
+    pub lens_distance: f32,
+    /// Target projection (`target_geom`, `lfLensType` value; C default 1 =
+    /// rectilinear).
+    pub lens_target_geom: f32,
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -851,6 +883,18 @@ impl Default for PreviewParams {
             bc_exposure_stops: 1.0, // $DEFAULT
             bc_exposure_bias: 1.0,  // $DEFAULT (the slider's double-click default is 0 — GUI quirk only)
             bc_nodes: identity_nodes_20(),
+            // lens.cc defaults where introspection provides one (flags/scale/
+            // target_geom); focal/aperture/distance are EXIF-driven in C with
+            // no $DEFAULT — see the field docs. The module ships off (no gear
+            // selected yet).
+            lens_on: false,
+            lens_inverse: false,
+            lens_modify_flags: 7.0, // DT_IOP_LENS_MODFLAG_ALL
+            lens_scale: 1.0,
+            lens_focal: 50.0,
+            lens_aperture: 3.5,
+            lens_distance: 1000.0, // C's no-EXIF fallback (lens.cc:3455)
+            lens_target_geom: 1.0, // LF_RECTILINEAR
         }
     }
 }
@@ -1011,6 +1055,11 @@ impl PreviewParams {
         // the shipped "display-referred default" preset is a real tone curve,
         // not the 2-node identity.
         let bc_identity = !self.bc_on;
+        // Lens correction: flag-only gate (same policy). A warp is never a
+        // no-op while enabled; with gear unresolved the stage is skipped but
+        // reporting non-identity only costs one unchanged re-render — it can
+        // never mask an applied edit.
+        let lens_identity = !self.lens_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1027,6 +1076,7 @@ impl PreviewParams {
             && tc_identity
             && rc_identity
             && bc_identity
+            && lens_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -1046,6 +1096,32 @@ impl PreviewParams {
             },
             clip: self.hl_clip,
         })
+    }
+
+    /// The UI fields + resolved gear mapped onto the core's `LensParams` —
+    /// the single construction site shared by `to_pipeline_with` and the lens
+    /// module's autoscale button, so they can never disagree about what the
+    /// controls mean. The camera supplies the crop factor (`p->crop =
+    /// cam->CropFactor`, lens.c commit_params); the numeric sliders come from
+    /// `self`.
+    pub(crate) fn lens_params(
+        &self,
+        cam: &c41_core::iop::lens::ResolvedCamera,
+        lens: &c41_core::iop::lens::ResolvedLens,
+    ) -> c41_core::iop::lens::LensParams {
+        c41_core::iop::lens::LensParams {
+            camera_maker: cam.maker.clone(),
+            camera_model: cam.model.clone(),
+            lens: lens.model.clone(),
+            modify_flags: self.lens_modify_flags as i32,
+            inverse: self.lens_inverse,
+            scale: self.lens_scale,
+            crop: cam.crop_factor,
+            focal: self.lens_focal,
+            aperture: self.lens_aperture,
+            distance: self.lens_distance,
+            target_geom: self.lens_target_geom as i32,
+        }
     }
 
     /// The UI fields mapped onto the core's `FilmicParams` — the single
@@ -1150,6 +1226,7 @@ impl PreviewParams {
             tc_on: false,
             rc_on: false,
             bc_on: false,
+            lens_on: false,
             ..*self
         }
     }
@@ -1199,7 +1276,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse] {
             v.push(b as u8);
         }
         for f in [
@@ -1347,6 +1424,19 @@ impl PreviewParams {
         for &(x, y) in &self.bc_nodes {
             v.extend_from_slice(&x.to_le_bytes());
             v.extend_from_slice(&y.to_le_bytes());
+        }
+        // Lens correction (v26): combo/scalars appended after the base-curve
+        // block. The gear identity (camera/lens names) is NOT here — it lives
+        // in `main.darkroom_lens_choice` (strings can't join the f32 blob).
+        for s in [
+            self.lens_modify_flags,
+            self.lens_scale,
+            self.lens_focal,
+            self.lens_aperture,
+            self.lens_distance,
+            self.lens_target_geom,
+        ] {
+            v.extend_from_slice(&s.to_le_bytes());
         }
         v
     }
@@ -1574,6 +1664,16 @@ impl PreviewParams {
             bc_exposure_stops: f.get(396).copied().unwrap_or(d.bc_exposure_stops),
             bc_exposure_bias: f.get(397).copied().unwrap_or(d.bc_exposure_bias),
             bc_nodes: Self::decode_nodes(&f, 398, d.bc_nodes),
+            // Lens correction (m4-130): bools 35–36, floats 438–443. v25-and-
+            // earlier blobs end before any of this — defaults hold.
+            lens_on: bools.get(35).map_or(d.lens_on, |&b| b != 0),
+            lens_inverse: bools.get(36).map_or(d.lens_inverse, |&b| b != 0),
+            lens_modify_flags: f.get(438).copied().unwrap_or(d.lens_modify_flags),
+            lens_scale: f.get(439).copied().unwrap_or(d.lens_scale),
+            lens_focal: f.get(440).copied().unwrap_or(d.lens_focal),
+            lens_aperture: f.get(441).copied().unwrap_or(d.lens_aperture),
+            lens_distance: f.get(442).copied().unwrap_or(d.lens_distance),
+            lens_target_geom: f.get(443).copied().unwrap_or(d.lens_target_geom),
         })
     }
 
@@ -1608,6 +1708,24 @@ impl PreviewParams {
     /// and clamp — sigmoid is off for already-display-referred JPEGs, where that
     /// assumption holds, and on for raws, where it is what saves the highlights.
     pub fn to_pipeline(&self, space: ColorSpace, scale: f32) -> Pipeline {
+        self.to_pipeline_with(space, scale, None)
+    }
+
+    /// [`Self::to_pipeline`] with resolved lens-correction gear. The darkroom
+    /// view passes the per-image `(camera, lens)` pair it resolved against the
+    /// lensfun database (cached on the preview context); export passes the same
+    /// pair so full-res output matches the preview. `None` simply omits the
+    /// stage — as does `lens_on` without gear (darktable shows "no data" and
+    /// does the same).
+    pub fn to_pipeline_with(
+        &self,
+        space: ColorSpace,
+        scale: f32,
+        lens_gear: Option<&(
+            c41_core::iop::lens::ResolvedCamera,
+            c41_core::iop::lens::ResolvedLens,
+        )>,
+    ) -> Pipeline {
         let mut p = Pipeline::new();
         // Invert (film-camera negative, iop_order.c pos 2, before temperature 3) —
         // per-channel `out = color - in` on the decoded linear buffer. Unlike
@@ -1643,6 +1761,22 @@ impl PreviewParams {
                 bias: self.dn_bias,
                 mode_y0u0v0: self.dn_mode_y0u0v0,
             });
+        }
+        // Lens correction (lens.c, iop_order.c v50_order pos 13 — after
+        // denoiseprofile 9/10, before exposure 21): a coordinate warp +
+        // per-pixel vignetting gain driven by the lensfun calibration for the
+        // selected camera/lens pair. The gear identity is NOT part of
+        // PreviewParams (strings can't join the f32 blob) — it lives in
+        // `main.darkroom_lens_choice` and arrives here pre-resolved; the camera
+        // crop factor rides along at build time (`p->crop = cam->CropFactor`,
+        // lens.c commit_params).
+        if self.lens_on {
+            if let Some((cam, lens)) = lens_gear {
+                p.push(Stage::LensCorrection {
+                    lens: lens.clone(),
+                    params: self.lens_params(cam, lens),
+                });
+            }
         }
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
@@ -2296,9 +2430,12 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// coordinates).
 /// v24 adds RGB curve (1 bool + 8 f32 scalars + 3×40 interleaved R/G/B anchor
 /// coordinates).
-const ENCODE_VERSION: u8 = 25;
-/// 1 version byte + 34 bool bytes + 392 little-endian f32.
-const ENCODED_LEN: usize = 1 + 35 + 438 * 4;
+/// v25 adds base curve (1 bool + 6 f32 scalars + 40 interleaved node coords).
+/// v26 adds lens correction (2 bools + 6 f32; the camera/lens identity lives
+/// in `main.darkroom_lens_choice` — the blob carries no strings).
+const ENCODE_VERSION: u8 = 26;
+/// 1 version byte + 37 bool bytes + 444 little-endian f32.
+const ENCODED_LEN: usize = 1 + 37 + 444 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2319,6 +2456,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (23, 33, 264), // v23: tone curve added
     (24, 34, 392), // v24: RGB curve added
     (25, 35, 438), // v25: base curve added
+    (26, 37, 444), // v26: lens correction added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2328,6 +2466,35 @@ pub(crate) fn encoded_len_for_version(version: u8) -> Option<usize> {
         .iter()
         .find(|(v, _, _)| *v == version)
         .map(|(_, nb, nf)| 1 + nb + nf * 4)
+}
+
+/// Resolved lens-correction gear: the `(camera, lens)` pair behind a
+/// [`Stage`](c41_core::pipeline::Stage)::LensCorrection. The camera/lens
+/// identity can't join the [`PreviewParams`] blob (strings), so callers that
+/// have it resolved pass it alongside the params — the darkroom view caches an
+/// `Arc` of this per image, export carries the same `Arc` — and every pipeline
+/// build site takes it via the `_gear` variants below, so previews and exports
+/// can never disagree about the correction being applied.
+pub type LensGear = (
+    c41_core::iop::lens::ResolvedCamera,
+    c41_core::iop::lens::ResolvedLens,
+);
+
+/// Resolve a persisted [`crate::persist::LensChoice`] into pipeline-ready
+/// gear. `None` when nothing is selected (`lens_model` empty — nothing chosen
+/// yet) or the identity doesn't match the database exactly (then the module
+/// shows "no data", like darktable).
+pub fn resolve_gear(choice: &crate::persist::LensChoice) -> Option<std::sync::Arc<LensGear>> {
+    if choice.lens_model.is_empty() {
+        return None;
+    }
+    c41_core::iop::lens::resolve(
+        &choice.camera_maker,
+        &choice.camera_model,
+        &choice.lens_maker,
+        &choice.lens_model,
+    )
+    .map(std::sync::Arc::new)
 }
 
 /// Run the preview pipeline over an 8-bit interleaved image buffer, preserving
@@ -2347,6 +2514,21 @@ pub fn apply_pipeline(
     nch: usize,
     params: &PreviewParams,
 ) -> Vec<u8> {
+    apply_pipeline_gear(base, width, height, rowstride, nch, params, None)
+}
+
+/// [`Self::apply_pipeline`] with resolved lens-correction gear — the variant
+/// every caller that has gear cached must use, so an enabled lens module
+/// actually applies. See [`LensGear`].
+pub fn apply_pipeline_gear(
+    base: &[u8],
+    width: usize,
+    height: usize,
+    rowstride: usize,
+    nch: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+) -> Vec<u8> {
     // Degenerate input: nothing to process (also guards `colour - 1` below
     // against underflow when nch == 0).
     if nch == 0 || width == 0 || height == 0 {
@@ -2359,7 +2541,7 @@ pub fn apply_pipeline(
     }
     // No active stage ⇒ return the source untouched (byte-exact; also avoids a
     // pointless sRGB linearise/encode round-trip that could drift ±1 LSB).
-    let pipeline = params.to_pipeline(ColorSpace::LinearSrgb, 1.0);
+    let pipeline = params.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, lens_gear);
     if pipeline.stages.is_empty() {
         return base.to_vec();
     }
@@ -2418,11 +2600,23 @@ pub fn apply_pipeline_rgb16(
     height: usize,
     params: &PreviewParams,
 ) -> Vec<u16> {
+    apply_pipeline_rgb16_gear(base, width, height, params, None)
+}
+
+/// [`Self::apply_pipeline_rgb16`] with resolved lens-correction gear. See
+/// [`LensGear`].
+pub fn apply_pipeline_rgb16_gear(
+    base: &[u16],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+) -> Vec<u16> {
     let n = width.saturating_mul(height);
     if width == 0 || height == 0 || base.len() < n * 3 {
         return base.to_vec();
     }
-    let pipeline = params.to_pipeline(ColorSpace::LinearSrgb, 1.0);
+    let pipeline = params.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, lens_gear);
     if pipeline.stages.is_empty() {
         return base.to_vec(); // no edit ⇒ lossless 16-bit passthrough
     }
@@ -2462,11 +2656,24 @@ pub fn render_linear_to_srgb8(
     height: usize,
     params: &PreviewParams,
 ) -> Vec<u8> {
+    render_linear_to_srgb8_gear(linear, width, height, params, None)
+}
+
+/// [`Self::render_linear_to_srgb8`] with resolved lens-correction gear — the
+/// variant the darkroom preview and the export path both use so a lens
+/// correction applies identically in both. See [`LensGear`].
+pub fn render_linear_to_srgb8_gear(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+) -> Vec<u8> {
     let n = width.saturating_mul(height);
     if linear.len() < n * 4 {
         return vec![0u8; n * 3];
     }
-    srgb_encode_rgb(linear, width, height, params)
+    srgb_encode_rgb(linear, width, height, params, lens_gear)
         .iter()
         .map(|&e| (e.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
         .collect()
@@ -2482,11 +2689,23 @@ pub fn render_linear_to_srgb16(
     height: usize,
     params: &PreviewParams,
 ) -> Vec<u16> {
+    render_linear_to_srgb16_gear(linear, width, height, params, None)
+}
+
+/// [`Self::render_linear_to_srgb16`] with resolved lens-correction gear. See
+/// [`LensGear`].
+pub fn render_linear_to_srgb16_gear(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+) -> Vec<u16> {
     let n = width.saturating_mul(height);
     if linear.len() < n * 4 {
         return vec![0u16; n * 3];
     }
-    srgb_encode_rgb(linear, width, height, params)
+    srgb_encode_rgb(linear, width, height, params, lens_gear)
         .iter()
         .map(|&e| (e.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16)
         .collect()
@@ -2497,9 +2716,16 @@ pub fn render_linear_to_srgb16(
 /// (`width*height*3`, pre-quantisation — values may fall outside `[0,1]` for
 /// out-of-gamut colours, which the callers clamp). `linear` must be
 /// `width*height*4` (callers guard the short case).
-fn srgb_encode_rgb(linear: &[f32], width: usize, height: usize, params: &PreviewParams) -> Vec<f32> {
+fn srgb_encode_rgb(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+) -> Vec<f32> {
     let n = width.saturating_mul(height);
-    let mut processed = params.to_pipeline(ColorSpace::Rec2020, 1.0).process(&linear[..n * 4], width, height);
+    let mut processed =
+        params.to_pipeline_with(ColorSpace::Rec2020, 1.0, lens_gear).process(&linear[..n * 4], width, height);
     // Working space (Rec.2020) → sRGB before the display OETF (m4-35).
     c41_core::rawimage::apply_color_matrix(
         &mut processed,
@@ -3177,6 +3403,49 @@ mod tests {
         assert!(rc < sig_pos, "rgbcurve must run before sigmoid: {names:?}");
     }
 
+    #[test]
+    fn to_pipeline_orders_lens_between_denoise_and_exposure() {
+        // lens.c sits at v50_order pos 13 — after denoiseprofile 9/10, before
+        // exposure 21. The stage carries a database-resolved lens, so this needs
+        // the real lensfun data and skips where the package is absent (the
+        // canonical-order test above can't pin it for the same reason).
+        let Some(gear) = c41_core::iop::lens::resolve(
+            "Canon",
+            "Canon EOS 5D Mark II",
+            "Canon",
+            "Canon EF 50mm f/1.4 USM",
+        ) else {
+            eprintln!("skip: lensfun database unavailable");
+            return;
+        };
+        let mut p = PreviewParams::default();
+        p.lens_on = true;
+        p.dn_on = true;
+        p.exposure_on = true;
+        p.ev = 0.5; // off-default so exposure is emitted
+        let names: Vec<&str> = p
+            .to_pipeline_with(ColorSpace::LinearSrgb, 1.0, Some(&gear))
+            .stages
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(names, ["denoiseprofile", "lens", "exposure"], "{names:?}");
+    }
+
+    #[test]
+    fn lens_stage_omitted_without_gear() {
+        // `lens_on` with no resolved gear emits nothing (darktable's module
+        // shows "no data" and does the same) — but `is_identity` still reports
+        // non-identity, which only costs one unchanged re-render.
+        let mut p = PreviewParams::default();
+        p.lens_on = true;
+        assert!(!p.is_identity());
+        assert!(p
+            .to_pipeline_with(ColorSpace::LinearSrgb, 1.0, None)
+            .stages
+            .is_empty());
+    }
+
     /// Ties PreviewParams::default() (the UI defaults) to the identity matrix in
     /// core. This is the cross-crate invariant that M1 (the duplicated "neutral"
     /// predicate) is designed to protect: if someone changes a default in preview.rs
@@ -3638,6 +3907,18 @@ mod tests {
                 n[4] = (1.0, 1.0);
                 n
             },
+            // Lens correction: both bools flipped from their defaults, every
+            // float off-default and pairwise distinct so a wrong offset in the
+            // trailing block shows as a mismatch. modify_flags/target_geom are
+            // enum dropdowns — kept at exact small integers.
+            lens_on: true,
+            lens_inverse: true,
+            lens_modify_flags: 5.0, // DIST_TCA
+            lens_scale: 1.15,
+            lens_focal: 85.0,
+            lens_aperture: 5.6,
+            lens_distance: 7.5,
+            lens_target_geom: 3.0, // fisheye
         };
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);

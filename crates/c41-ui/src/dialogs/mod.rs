@@ -39,7 +39,16 @@ fn load_export_edit(db_path: &str, path: &str) -> Option<crate::export::ExportEd
     }
 
     let params = crate::darkroom::initial_params(saved, true);
-    Some(crate::export::ExportEdit { method, geometry, params })
+    // Lens-correction gear: resolve the persisted camera/lens choice while the
+    // module is enabled, so a corrected preview exports corrected. An
+    // unselected/unresolvable pair yields `None`, omitting the stage exactly
+    // like the preview does.
+    let lens = if params.lens_on {
+        crate::preview::resolve_gear(&crate::persist::load_lens(db_path, path))
+    } else {
+        None
+    };
+    Some(crate::export::ExportEdit { method, geometry, params, lens })
 }
 
 /// The export edit for an **unedited** raw: exactly the seed the darkroom preview
@@ -53,6 +62,7 @@ fn default_raw_export_edit() -> crate::export::ExportEdit {
         method: c41_core::rawimage::DemosaicMethod::default(),
         geometry: c41_core::geometry::Geometry::default(),
         params: crate::darkroom::initial_params(None, true),
+        lens: None, // a fresh raw has no lens choice to resolve
     }
 }
 
@@ -92,6 +102,9 @@ pub fn show_export_dialog(
         let n         = out_paths.len();
         let tf        = toast_fn.clone();
         let db        = db_path.clone();
+        // Shadow with an owned clone so the (non-Copy) fixed edit can move into
+        // the async block while the response closure itself stays `Fn`.
+        let edit = edit.clone();
 
         glib::spawn_future_local(async move {
             match export_images_async(out_paths, settings, template, edit, db).await {
@@ -163,6 +176,7 @@ async fn export_images_async(
             // catalog (lighttable multi-export).
             if crate::raw_preview::is_raw_path(path) {
                 let img_edit = edit
+                    .clone()
                     .or_else(|| db_path.as_deref().and_then(|db| load_export_edit(db, path)))
                     .unwrap_or_else(default_raw_export_edit);
                 if let Err(e) = render_raw_export(path, &dest, &settings, img_edit) {
@@ -180,11 +194,28 @@ async fn export_images_async(
             // else the per-path persisted params seeded like the preview (sigmoid
             // off). Only formats with no Rust decoder (heic/heif/avif) still use cli.
             if is_rust_image_path(path) {
-                let params = edit.map(|e| e.params).unwrap_or_else(|| {
-                    let saved = db_path.as_deref().and_then(|db| crate::persist::load_saved(db, path));
-                    crate::darkroom::initial_params(saved, false)
-                });
-                if let Err(e) = render_nonraw_export(path, &dest, &settings, &params) {
+                let (params, lens) = match &edit {
+                    Some(e) => (e.params, e.lens.clone()),
+                    None => {
+                        let saved =
+                            db_path.as_deref().and_then(|db| crate::persist::load_saved(db, path));
+                        let params = crate::darkroom::initial_params(saved, false);
+                        // Same gear resolution as the raw path: a persisted
+                        // camera/lens choice with the module enabled exports
+                        // corrected, matching the preview.
+                        let lens = if params.lens_on {
+                            db_path
+                                .as_deref()
+                                .and_then(|db| {
+                                    crate::preview::resolve_gear(&crate::persist::load_lens(db, path))
+                                })
+                        } else {
+                            None
+                        };
+                        (params, lens)
+                    }
+                };
+                if let Err(e) = render_nonraw_export(path, &dest, &settings, &params, lens.as_deref()) {
                     eprintln!("darkroom export: Rust render failed for {path}: {e}");
                     failed += 1;
                 }
@@ -237,10 +268,16 @@ fn render_raw_export(
     // prior good file (File::create / the encoder truncate up front). The decode
     // above already fails before any file is touched, so a bad raw leaves nothing.
     atomic_write(&dest_ext, |out| {
+        let lens_gear = edit.lens.as_deref();
         match settings.format {
             ExportFormat::Jpeg => {
-                let (w, h, rgb) =
-                    crate::export::render_export_rgb8(&img, edit.method, edit.geometry, &edit.params);
+                let (w, h, rgb) = crate::export::render_export_rgb8_gear(
+                    &img,
+                    edit.method,
+                    edit.geometry,
+                    &edit.params,
+                    lens_gear,
+                );
                 let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
                     .ok_or_else(|| anyhow::anyhow!("empty render"))?;
                 if let Some((tw, th)) = target(w, h) {
@@ -249,8 +286,13 @@ fn render_raw_export(
                 write_jpeg_rgb8(&buf, settings.quality, out)?;
             }
             ExportFormat::Png | ExportFormat::Tiff => {
-                let (w, h, rgb) =
-                    crate::export::render_export_rgb16(&img, edit.method, edit.geometry, &edit.params);
+                let (w, h, rgb) = crate::export::render_export_rgb16_gear(
+                    &img,
+                    edit.method,
+                    edit.geometry,
+                    &edit.params,
+                    lens_gear,
+                );
                 let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
                     .ok_or_else(|| anyhow::anyhow!("empty render"))?;
                 if let Some((tw, th)) = target(w, h) {
@@ -388,6 +430,7 @@ fn render_nonraw_export(
     dest: &str,
     settings: &crate::export::ExportSettings,
     params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
 ) -> Result<()> {
     use crate::export::ExportFormat;
     use image::{imageops::FilterType, ImageBuffer, Rgb};
@@ -409,7 +452,8 @@ fn render_nonraw_export(
         // JPEG is an 8-bit container — decode + process at 8-bit.
         ExportFormat::Jpeg => {
             let rgb = composite_rgba8_over_white(&decoded.to_rgba8());
-            let processed = crate::preview::apply_pipeline(&rgb, w, h, w * 3, 3, params);
+            let processed =
+                crate::preview::apply_pipeline_gear(&rgb, w, h, w * 3, 3, params, lens_gear);
             atomic_write(&dest_ext, move |out| {
                 let mut buf: ImageBuffer<Rgb<u8>, _> =
                     ImageBuffer::from_raw(w as u32, h as u32, processed)
@@ -425,7 +469,8 @@ fn render_nonraw_export(
         // is a lossless passthrough via apply_pipeline_rgb16).
         ExportFormat::Png | ExportFormat::Tiff => {
             let rgb = composite_rgba16_over_white(&decoded.to_rgba16());
-            let processed = crate::preview::apply_pipeline_rgb16(&rgb, w, h, params);
+            let processed =
+                crate::preview::apply_pipeline_rgb16_gear(&rgb, w, h, params, lens_gear);
             let fmt = match settings.format {
                 ExportFormat::Png => image::ImageFormat::Png,
                 _ => image::ImageFormat::Tiff,
@@ -753,6 +798,7 @@ mod tests {
             dest.to_str().unwrap(),
             &settings,
             &crate::preview::PreviewParams::default(),
+            None,
         )
         .unwrap();
 
@@ -796,6 +842,7 @@ mod tests {
             dest.to_str().unwrap(),
             &settings,
             &params,
+            None,
         )
         .unwrap();
 
@@ -852,6 +899,7 @@ mod tests {
                 dest.to_str().unwrap(),
                 &settings,
                 &crate::preview::PreviewParams::default(),
+                None,
             )
             .unwrap();
 

@@ -236,15 +236,23 @@ pub fn cli_args(input: &str, output_dest: &str, s: &ExportSettings) -> Vec<Strin
 }
 
 /// The c41-ui edit to bake into a Rust-native export so the output matches
-/// the preview: the Bayer demosaic method, the geometry (straighten + crop), and
-/// the colour-pipeline params. Plain `Copy` data (safe to send to the export
-/// thread). Passed as `Some` for the single-image darkroom export; `None` for the
-/// lighttable multi-export, which stays on `darktable-cli`.
-#[derive(Clone, Copy)]
+/// the preview: the Bayer demosaic method, the geometry (straighten + crop),
+/// the colour-pipeline params, and the resolved lens-correction gear
+/// ([`crate::preview::LensGear`] — `None` when the module is off or nothing is
+/// selected). `Clone` but no longer `Copy` (the gear is an `Arc` of
+/// pointer-backed database objects); still plain Rust data, safe to move to the
+/// export thread. Passed as `Some` for the single-image darkroom export;
+/// `None` for the lighttable multi-export, which resolves each image's edit
+/// from the catalog instead.
+#[derive(Clone)]
 pub struct ExportEdit {
     pub method: c41_core::rawimage::DemosaicMethod,
     pub geometry: c41_core::geometry::Geometry,
     pub params: crate::preview::PreviewParams,
+    /// Resolved `(camera, lens)` for `params.lens_on`, shared with the preview's
+    /// cache when exporting from the darkroom view. `None` omits the stage —
+    /// exactly what the preview does without gear.
+    pub lens: Option<std::sync::Arc<crate::preview::LensGear>>,
 }
 
 /// Render a decoded [`RawImage`] to a packed 8-bit **sRGB RGB** buffer
@@ -262,9 +270,22 @@ pub fn render_export_rgb8(
     geometry: c41_core::geometry::Geometry,
     params: &crate::preview::PreviewParams,
 ) -> (usize, usize, Vec<u8>) {
+    render_export_rgb8_gear(img, method, geometry, params, None)
+}
+
+/// [`Self::render_export_rgb8`] with resolved lens-correction gear — the form
+/// the export loop calls with the edit's cached gear so a corrected preview
+/// exports corrected. See [`crate::preview::LensGear`].
+pub fn render_export_rgb8_gear(
+    img: &c41_core::rawimage::RawImage,
+    method: c41_core::rawimage::DemosaicMethod,
+    geometry: c41_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
+) -> (usize, usize, Vec<u8>) {
     let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
-    let rgb = crate::preview::render_linear_to_srgb8(&geom_linear, gw, gh, params);
+    let rgb = crate::preview::render_linear_to_srgb8_gear(&geom_linear, gw, gh, params, lens_gear);
     (gw, gh, rgb)
 }
 
@@ -277,9 +298,21 @@ pub fn render_export_rgb16(
     geometry: c41_core::geometry::Geometry,
     params: &crate::preview::PreviewParams,
 ) -> (usize, usize, Vec<u16>) {
+    render_export_rgb16_gear(img, method, geometry, params, None)
+}
+
+/// 16-bit twin of [`render_export_rgb8_gear`]: identical pipeline (including
+/// the lens-correction gear), quantised to 16 bits.
+pub fn render_export_rgb16_gear(
+    img: &c41_core::rawimage::RawImage,
+    method: c41_core::rawimage::DemosaicMethod,
+    geometry: c41_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
+) -> (usize, usize, Vec<u16>) {
     let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
-    let rgb = crate::preview::render_linear_to_srgb16(&geom_linear, gw, gh, params);
+    let rgb = crate::preview::render_linear_to_srgb16_gear(&geom_linear, gw, gh, params, lens_gear);
     (gw, gh, rgb)
 }
 
@@ -301,6 +334,8 @@ mod tests {
             wb: [1.0, 1.0, 1.0, 1.0],
             orientation: (false, false, false),
             cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            clean_make: String::new(),
+            clean_model: String::new(),
             mosaic,
         }
     }

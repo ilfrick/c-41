@@ -566,6 +566,25 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if bc {
         return "Base curve";
     }
+    // Lens correction (m4-130): only the numeric correction params live in
+    // the blob and hence in this stack. The camera/lens IDENTITY lives in
+    // `main.darkroom_lens_choice` OUTSIDE the history: undo/redo reverts the
+    // numbers but not a gear swap, and a gear change with identical numerics
+    // records no entry. (darktable keeps the strings in its params, so its
+    // undo does revert gear — closing that gap means widening every history
+    // entry with an optional choice sidecar; deferred, documented in
+    // lens_module_row.)
+    let lens = old.lens_on != new.lens_on
+        || old.lens_inverse != new.lens_inverse
+        || old.lens_modify_flags != new.lens_modify_flags
+        || old.lens_scale != new.lens_scale
+        || old.lens_focal != new.lens_focal
+        || old.lens_aperture != new.lens_aperture
+        || old.lens_distance != new.lens_distance
+        || old.lens_target_geom != new.lens_target_geom;
+    if lens {
+        return "Lens correction";
+    }
     "Edit"
 }
 
@@ -805,6 +824,20 @@ mod tests {
             ),
             "Base curve"
         );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { lens_on: true, ..d() }),
+            "Lens correction"
+        );
+        assert_eq!(
+            describe_change(
+                &base,
+                &PreviewParams {
+                    lens_focal: 135.0,
+                    ..d()
+                }
+            ),
+            "Lens correction"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -1039,6 +1072,14 @@ mod tests {
             bc_exposure_stops: _,
             bc_exposure_bias: _,
             bc_nodes: _,
+            lens_on: _,
+            lens_inverse: _,
+            lens_modify_flags: _,
+            lens_scale: _,
+            lens_focal: _,
+            lens_aperture: _,
+            lens_distance: _,
+            lens_target_geom: _,
         } = PreviewParams::default();
     }
 
@@ -1130,7 +1171,9 @@ mod tests {
         // 3×40 interleaved R/G/B anchor coordinates).
         // m4-124 (basecurve): 1603 → 1788 (1 + 35 bools + 438 f32 — 6 scalars +
         // 40 interleaved anchor coordinates).
-        assert_eq!(PreviewParams::default().encode().len(), 1788);
+        // m4-130 (lens correction): 1788 → 1814 (1 + 37 bools + 444 f32). The
+        // camera/lens *identity* stays out of the blob (darkroom_lens_choice).
+        assert_eq!(PreviewParams::default().encode().len(), 1814);
     }
 
     #[test]

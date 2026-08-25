@@ -161,6 +161,14 @@ extern "C" {
 
     /// Frees memory allocated by lensfun helpers (returned lists, strings).
     pub fn lf_free(data: *mut core::ffi::c_void);
+
+    /// All cameras in the database, database-owned and NULL-terminated (no
+    /// free). Order is the database's own; callers sort/dedupe for display.
+    pub fn lf_db_get_cameras(db: *const lfDatabase) -> *const *const lfCamera;
+
+    /// All lenses in the database, database-owned and NULL-terminated (no
+    /// free). Includes every mount; filter by `lfLens.Mounts` for a camera.
+    pub fn lf_db_get_lenses(db: *const lfDatabase) -> *const *const lfLens;
 }
 
 // ── Modifier (per-image correction state) ────────────────────────────────────

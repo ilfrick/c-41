@@ -359,6 +359,107 @@ fn save_geometry_conn(conn: &Connection, imgid: i32, geom: &Geometry) -> rusqlit
     Ok(())
 }
 
+/// DDL for the per-image lens-correction gear choice (same private-table
+/// rationale as the others). Separate from the params blob for the same reason
+/// as demosaic — it's *identity* state feeding a resolve step, not a pipeline
+/// scalar — and because the blob format carries no strings. The lens is stored
+/// as its structured `(maker, model)` identity pair exactly as the lensfun
+/// database spells it (a display label can't be split back reliably, and the
+/// database's fuzzy search can't re-find even half of its own entries from
+/// their exact names). All four string columns empty = "no gear chosen"
+/// (module can't resolve → no stage).
+const LENS_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS main.darkroom_lens_choice \
+     (imgid INTEGER PRIMARY KEY, camera_maker TEXT NOT NULL DEFAULT '', \
+      camera_model TEXT NOT NULL DEFAULT '', lens_maker TEXT NOT NULL DEFAULT '', \
+      lens_model TEXT NOT NULL DEFAULT '')";
+
+/// The per-image lens-correction gear selection.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LensChoice {
+    pub camera_maker: String,
+    pub camera_model: String,
+    /// Lens maker exactly as `c41_core::iop::lens::list_lenses` spells it.
+    pub lens_maker: String,
+    /// Lens model exactly as `c41_core::iop::lens::list_lenses` spells it.
+    pub lens_model: String,
+}
+
+impl LensChoice {
+    /// True when nothing is selected yet — no correction is possible.
+    pub fn is_empty(&self) -> bool {
+        self.camera_model.is_empty() && self.lens_model.is_empty()
+    }
+}
+
+/// Load the saved lens-correction gear choice for the image at `full_path`,
+/// or the default (nothing selected) on any miss.
+pub fn load_lens(db_path: &str, full_path: &str) -> LensChoice {
+    if db_path.is_empty() {
+        return LensChoice::default();
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return LensChoice::default();
+    };
+    match imgid_for_path(&conn, full_path) {
+        Some(imgid) => load_lens_conn(&conn, imgid).unwrap_or_default(),
+        None => LensChoice::default(),
+    }
+}
+
+/// Persist the lens-correction gear choice for the image at `full_path`.
+/// Best-effort like the rest of this module.
+pub fn save_lens(db_path: &str, full_path: &str, choice: &LensChoice) {
+    if db_path.is_empty() {
+        return;
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return;
+    };
+    if let Some(imgid) = imgid_for_path(&conn, full_path) {
+        let _ = save_lens_conn(&conn, imgid, choice);
+    }
+}
+
+/// Testable core of [`load_lens`]: no row / no table ⇒ `None` (→ default).
+fn load_lens_conn(conn: &Connection, imgid: i32) -> Option<LensChoice> {
+    conn.query_row(
+        "SELECT camera_maker, camera_model, lens_maker, lens_model \
+         FROM main.darkroom_lens_choice WHERE imgid = ?1",
+        rusqlite::params![imgid],
+        |row| {
+            Ok(LensChoice {
+                camera_maker: row.get(0)?,
+                camera_model: row.get(1)?,
+                lens_maker: row.get(2)?,
+                lens_model: row.get(3)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// Testable core of [`save_lens`]: upsert the single choice row.
+fn save_lens_conn(conn: &Connection, imgid: i32, choice: &LensChoice) -> rusqlite::Result<()> {
+    conn.execute(LENS_TABLE_DDL, [])?;
+    conn.execute(
+        "INSERT INTO main.darkroom_lens_choice \
+           (imgid, camera_maker, camera_model, lens_maker, lens_model) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(imgid) DO UPDATE SET camera_maker = excluded.camera_maker, \
+         camera_model = excluded.camera_model, lens_maker = excluded.lens_maker, \
+         lens_model = excluded.lens_model",
+        rusqlite::params![
+            imgid,
+            choice.camera_maker,
+            choice.camera_model,
+            choice.lens_maker,
+            choice.lens_model
+        ],
+    )?;
+    Ok(())
+}
+
 /// Read a global UI preference by `key`, or `None` if there's no db, no table
 /// (old/rebuilt catalog), or no row. Best-effort: any error ⇒ `None` ⇒ the call
 /// site's default.
