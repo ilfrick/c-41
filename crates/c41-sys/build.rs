@@ -3,6 +3,13 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    // liblensfun (src/lensfun.rs): distro-provided shared library, found via
+    // the linker's default search paths — no C toolchain needed to build, only
+    // `liblensfun-dev` installed in the dev/CI image (runtime images ship
+    // liblensfun1 + liblensfun-data-v1).
+    println!("cargo:rustc-link-lib=dylib=lensfun");
+    println!("cargo:rerun-if-changed=build.rs");
+
     // Default: copy the pre-generated bindings committed in src/bindings.rs.
     // Set DARKROOM_GENERATE_BINDINGS=1 to regenerate from headers via bindgen.
     // Also set LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu (or wherever libclang is).

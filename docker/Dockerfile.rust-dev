@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # commonly needed by FFI crates that the workspace will accrete
     libsqlite3-dev libssl-dev zlib1g-dev libclang-dev clang \
     libfontconfig-dev libfreetype-dev \
+    # c41-sys links liblensfun (m4-130); data lets its probe test find gear
+    liblensfun-dev liblensfun-data-v1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust stable

@@ -3,6 +3,10 @@ name = "c41-sys"
 version = "0.1.0"
 edition = "2021"
 description = "Raw FFI bindings to the Darkroom C core"
+# Declares that this crate links liblensfun (see src/lensfun.rs): one link
+# target per graph, and the dev/CI images must ship `liblensfun-dev` so the
+# prebuilt .so is present at link time — no C toolchain is invoked for it.
+links = "lensfun"
 
 [build-dependencies]
 bindgen = "0.70"

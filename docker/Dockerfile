@@ -32,6 +32,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config git curl ca-certificates \
     libgtk-4-dev libadwaita-1-dev libgraphene-1.0-dev \
     libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
+    # c41-sys links liblensfun (lens-correction stage, m4-130): the dev
+    # package's .so is needed at link time only; the runtime stage below ships
+    # the calibration database (liblensfun-data-v1).
+    liblensfun-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the toolchain WITH the components rust-toolchain.toml pins (rustfmt,
@@ -91,6 +95,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-4-1 libadwaita-1-0 adwaita-icon-theme gsettings-desktop-schemas \
     librsvg2-common \
     libgdk-pixbuf2.0-bin shared-mime-info python3-xdg xkb-data \
+    # liblensfun runtime + calibration database (lens-correction stage)
+    liblensfun1 liblensfun-data-v1 \
     && rm -rf /var/lib/apt/lists/* \
     # Regenerate the GDK pixbuf loader cache so SVG icons load (binary not in PATH)
     && (/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache || true) \
