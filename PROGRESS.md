@@ -2229,3 +2229,44 @@ was split into two runs.
 containment rule (or document why they differ); extract the flush collect phase
 into a pure fn so grouping gets display-free tests; catalogue-only rating/
 colour actions still skip XMP sync.
+
+## 2026-08-26 01:35 UTC — m4-146: Styles Apply fans out over the lighttable multi-selection
+
+**What changed**: parity-audit row 2.4's second deliberate limit closed. The
+right-panel Styles section's Apply (button + row double-click) now targets the
+lighttable multi-selection through the SAME containment rule the metadata editor
+uses — `edit_target_paths` (renamed from m4-145's `metadata_target_paths`, docs
+now name both consumers): whole set when it contains the displayed image, else
+the displayed image alone; read at click time since Apply's moment of intent IS
+the click (no snapshot needed — verified atomic on the GTK main loop).
+`persist::apply_style_to` already accepted a path slice (three existing tests
+pin fan-out + writes-not-attempts); new pure `style_apply_report` reports
+writes against attempts ("Applied \"X\" to 3 of 7 images") while keeping the
+pre-146 single-image wording byte-identical.
+
+**Senior review: APPROVE** (fresh general-purpose agent, model "opus", explicit
+read-only mandate — standing substitution for API-402ing fricktrade-architect).
+Two review findings folded in pre-commit:
+- MINOR-1: `apply_style_to` opened its connection with no `busy_timeout`; a
+  rating/colour off-thread write holding the file lock at Apply-click time made
+  each save fail instantly with SQLITE_BUSY and silently shrank the count.
+  Now sets the crate-standard 3s timeout with rationale comment.
+- NIT: closed-catalogue Apply said "Select an image first" — aligned with
+  History paste/discard's honest "No catalogue open".
+Left as-is per reviewer: the unreachable-in-practice `targets.is_empty()` guard
+(defense against future contract drift). Reviewer verified comment-truth across
+all changed lines (repo gating standard), rename cleanliness (zero stale
+references), concurrency posture (main-thread serialisation makes m4-144's lock
+registry unnecessary here), and the no-invalidation posture (thumbnails are
+params-agnostic by design).
+
+**Verification**: 30/30 panels + 38/38 persist release tests after fixes; full
+local gate `scripts/ci-local.sh` exit code **0**
+(`target/cbuild/gate-m4-146.log`). PARITY_AUDIT row 2.4 amended in this commit;
+m4-145's GitHub CI confirmed fully green earlier tonight (check+test+clippy and
+Build & push Docker image both success).
+
+**Follow-ups recorded**: per-module style merge (the remaining all-or-nothing
+limit; `modules` column reserved); styles module in the darkroom view;
+RAII/busy-timeout sweep over remaining bare `Connection::open` call sites
+(save_params/save_metadata paths still lack it).

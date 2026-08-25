@@ -911,7 +911,13 @@ pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> us
     if db_path.is_empty() {
         return 0;
     }
-    let Ok(conn) = Connection::open(db_path) else { return 0 };
+    let Ok(mut conn) = Connection::open(db_path) else { return 0 };
+    // A 3s busy_timeout like the rating/colour-label connections: the
+    // off-thread metadata workers hold the same SQLite file, and without it a
+    // write landing mid-Apply fails instantly with SQLITE_BUSY, silently
+    // shrinking the returned count (m4-146 review MINOR-1 — the count is meant
+    // to report uncatalogued skips, not lock contention).
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
     let mut written = 0usize;
     for path in full_paths.iter().filter(|p| !p.is_empty()) {
         if let Some(imgid) = imgid_for_path(&conn, path) {

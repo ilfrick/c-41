@@ -1633,27 +1633,29 @@ pub type StyleParamsGetter =
 /// original text)` captured when the entry gained focus. m4-145: `paths` is
 /// the lighttable multi-selection (darktable's semantics — an edit lands on
 /// every selected image), or the active image alone — see
-/// `metadata_target_paths` for exactly which. A snapshot may briefly outlive a
+/// `edit_target_paths` for exactly which. A snapshot may briefly outlive a
 /// collection prune (filter/folder change) until the reload-triggered
 /// `update()` re-baselines; that matches upstream, which likewise acts on ids
 /// captured at its last gui_update. See `MetadataPanel::new`.
 type MetaTarget = std::rc::Rc<std::cell::RefCell<(Vec<String>, String, String)>>;
 
-/// The images an edit made RIGHT NOW would land on: the whole multi-selection
-/// WHEN it contains the image on screen, else just that image alone.
+/// The images a panel edit made RIGHT NOW would land on: the whole
+/// multi-selection WHEN it contains the image on screen, else just that image
+/// alone. Shared by BOTH panel consumers so they can never disagree about what
+/// an edit targets: the metadata editor (snapshot at focus-enter / re-baseline)
+/// and the Styles section's Apply (read at click time — its intent IS the
+/// click).
 ///
 /// Why the containment rule (m4-145 review MAJOR-2): the grid cursor can move
 /// without the selection following — native GridView keynav drives the
 /// SingleSelection directly, and preview stepping sets it programmatically —
 /// so a bare snapshot-else-cursor can bind edits to a set that EXCLUDES the
-/// image whose text is on screen. Binding to the displayed image then is the
+/// image whose content is on screen. Binding to the displayed image then is the
 /// only rule under which the panel never shows one image while writing to
 /// others (upstream gets this for free: its `last_act_on` drives both display
 /// and write). Rating/colour keys deliberately keep the plain
-/// snapshot-else-cursor read — they act on grid focus, not on text under it.
-/// Shared by focus-enter and `update()`'s re-baseline so every snapshot site
-/// agrees on what a target list looks like.
-fn metadata_target_paths(cursor_path: &str) -> Vec<String> {
+/// snapshot-else-cursor read — they act on grid focus, not on panel content.
+fn edit_target_paths(cursor_path: &str) -> Vec<String> {
     let mut targets = crate::lighttable::selection::paths_snapshot();
     if cursor_path.is_empty() || !targets.iter().any(|p| p == cursor_path) {
         targets.clear();
@@ -1711,6 +1713,25 @@ fn metadata_commit_report(
         }
     }
     if msg.is_empty() { None } else { Some(msg) }
+}
+
+/// The line a Styles Apply ALWAYS reports (unlike the metadata commit report,
+/// silence is not an option here — darktable confirms every apply). Single-
+/// image wording matches what shipped in 2.4 verbatim; multi-image wording
+/// counts writes against attempts so an uncatalogued skip can never read as a
+/// complete batch. Pure, pinned display-free.
+fn style_apply_report(name: &str, written: usize, total: usize) -> Option<String> {
+    if total <= 1 {
+        return match written {
+            0 => Some("Could not apply the style to this image".to_string()),
+            _ => Some(format!("Applied style \"{name}\"")),
+        };
+    }
+    Some(match written {
+        0 => format!("Could not apply \"{name}\" to any of the {total} selected images"),
+        w if w == total => format!("Applied \"{name}\" to {total} images"),
+        w => format!("Applied \"{name}\" to {w} of {total} images"),
+    })
 }
 
 /// A copied edit: the saved params blob plus the image's undo-stack, and the
@@ -2066,8 +2087,14 @@ impl MetadataPanel {
                     notify("Select an image first".into());
                     return;
                 };
-                if path.is_empty() || db.is_empty() {
+                if path.is_empty() {
                     notify("Select an image first".into());
+                    return;
+                }
+                if db.is_empty() {
+                    // Same honesty as History paste/discard: the writes would
+                    // no-op, so name THAT state instead of blaming the image.
+                    notify("No catalogue open".into());
                     return;
                 }
                 let Some(style) =
@@ -2076,13 +2103,30 @@ impl MetadataPanel {
                     notify(format!("Style \"{name}\" is no longer available"));
                     return;
                 };
+                // m4-146: Apply fans out over the lighttable selection under the
+                // SAME containment rule as the metadata editor (shared
+                // `edit_target_paths`): whole set when it contains the displayed
+                // image, else the displayed image alone. The read happens at
+                // CLICK time on purpose — unlike a metadata entry's commit,
+                // Apply's moment of intent IS this click, so there is nothing to
+                // snapshot earlier. Writes stay synchronous on the UI thread,
+                // exactly as the single-image path always was; only the list got
+                // longer.
+                let targets = edit_target_paths(&path);
+                if targets.is_empty() {
+                    notify("Select an image first".into());
+                    return;
+                }
                 // apply_style_to counts WRITES: an uncatalogued path has no
-                // imgid to store an edit against, so 0 here means "nothing
-                // happened", not "applied to zero of one".
-                if crate::persist::apply_style_to(&db, &[path], &style) > 0 {
-                    notify(format!("Applied style \"{name}\""));
-                } else {
-                    notify("Could not apply the style to this image".into());
+                // imgid to store an edit against and drops out of the count —
+                // `style_apply_report` says so instead of letting a partial
+                // batch read as complete (same honesty contract as the
+                // metadata editor's commit report).
+                let written = crate::persist::apply_style_to(&db, &targets, &style);
+                if let Some(msg) =
+                    style_apply_report(&name, written, targets.len())
+                {
+                    notify(msg);
                 }
             })
         };
@@ -2582,7 +2626,7 @@ impl MetadataPanel {
                 let scope = meta_scope_lbl.clone();
                 focus.connect_enter(move |_| {
                     let (p, d) = ctx.borrow().clone();
-                    let targets = metadata_target_paths(&p);
+                    let targets = edit_target_paths(&p);
                     match meta_scope_hint_text(targets.len()) {
                         Some(text) => {
                             scope.set_text(&text);
@@ -2849,7 +2893,7 @@ impl MetadataPanel {
             // cursor image alone), exactly what focus-enter would snapshot — a
             // defensive fallback for a leave that never saw an enter.
             if let Some(t) = self.meta_targets.get(i) {
-                let targets = metadata_target_paths(full_path);
+                let targets = edit_target_paths(full_path);
                 let mut t = t.borrow_mut();
                 *t = (targets, db_path.to_string(), text.to_string());
             }
@@ -2862,7 +2906,7 @@ impl MetadataPanel {
         // idempotent, so the label never outlives the set it describes
         // (m4-145 review MINOR-3: the first draft claimed ctrl-click did NOT
         // move the cursor — it does).
-        match meta_scope_hint_text(metadata_target_paths(full_path).len()) {
+        match meta_scope_hint_text(edit_target_paths(full_path).len()) {
             Some(text) => {
                 self.meta_scope_lbl.set_text(&text);
                 self.meta_scope_lbl.set_visible(true);
@@ -3518,18 +3562,18 @@ mod tests {
     }
 
     #[test]
-    fn metadata_target_paths_fall_back_to_the_cursor_only_without_a_set() {
+    fn edit_target_paths_fall_back_to_the_cursor_only_without_a_set() {
         // The selection thread-local is empty in a fresh test process (and each
         // test thread gets its own), so this pins the fallback half of the
         // contract: no multi-selection means exactly the cursor image. The
         // set-populated half is exercised by lighttable::selection's own tests
         // plus the Docker pass; this one only needs to stay display-free.
-        assert_eq!(metadata_target_paths("/d/only.nef"), vec!["/d/only.nef"]);
-        assert!(metadata_target_paths("").is_empty(), "no image showing → nothing to target");
+        assert_eq!(edit_target_paths("/d/only.nef"), vec!["/d/only.nef"]);
+        assert!(edit_target_paths("").is_empty(), "no image showing → nothing to target");
     }
 
     #[test]
-    fn metadata_target_paths_bind_to_the_displayed_image_over_a_foreign_set() {
+    fn edit_target_paths_bind_to_the_displayed_image_over_a_foreign_set() {
         // m4-145 review MAJOR-2: the grid cursor can leave the selection set
         // (native keynav, preview stepping) without the set following. When it
         // does, the DISPLAYED image must win — binding edits to a set that
@@ -3539,11 +3583,11 @@ mod tests {
         crate::lighttable::selection::toggle("/d/b.nef");
         // Cursor inside the set: the whole set binds (the fan-out case).
         assert_eq!(
-            metadata_target_paths("/d/b.nef"),
+            edit_target_paths("/d/b.nef"),
             vec!["/d/a.nef", "/d/b.nef"]
         );
         // Cursor outside the set: display wins, nothing smears onto {a, b}.
-        assert_eq!(metadata_target_paths("/d/c.nef"), vec!["/d/c.nef"]);
+        assert_eq!(edit_target_paths("/d/c.nef"), vec!["/d/c.nef"]);
         crate::lighttable::selection::clear();
     }
 
@@ -3585,6 +3629,38 @@ mod tests {
                 "Saved title for 2 of 5 images; could not update 1 XMP sidecar(s)"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn style_apply_report_keeps_the_single_image_wording() {
+        // The one-image lines are byte-identical to what shipped in parity 2.4:
+        assert_eq!(style_apply_report("Moody", 1, 1), Some("Applied style \"Moody\"".to_string()));
+        assert_eq!(
+            style_apply_report("Moody", 0, 1),
+            Some("Could not apply the style to this image".to_string())
+        );
+        assert_eq!(
+            style_apply_report("Moody", 0, 0),
+            Some("Could not apply the style to this image".to_string())
+        );
+    }
+
+    #[test]
+    fn style_apply_report_counts_writes_against_attempts() {
+        // m4-146: a fan-out where some paths lost their catalogue rows must say
+        // so, and the count is WRITES, never attempts.
+        assert_eq!(
+            style_apply_report("B&W", 4, 4),
+            Some("Applied \"B&W\" to 4 images".to_string())
+        );
+        assert_eq!(
+            style_apply_report("B&W", 3, 7),
+            Some("Applied \"B&W\" to 3 of 7 images".to_string())
+        );
+        assert_eq!(
+            style_apply_report("B&W", 0, 5),
+            Some("Could not apply \"B&W\" to any of the 5 selected images".to_string())
         );
     }
 
