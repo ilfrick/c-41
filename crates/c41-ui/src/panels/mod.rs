@@ -1600,7 +1600,11 @@ fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {
             Err(_) => return Vec::new(),
         }
     } else {
-        match rusqlite::Connection::open(db_path) {
+        // open_catalog rather than a bare open (m4-148): this runs on the main
+        // thread while the off-thread rating/colour/import writers hold
+        // library.db's lock — an instant BUSY here read as an empty film-roll
+        // list instead of waiting out the holder.
+        match crate::persist::open_catalog(db_path) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         }

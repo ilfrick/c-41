@@ -66,7 +66,7 @@ const UI_PREFS_TABLE_DDL: &str =
 /// Open a catalogue connection with the crate-standard 3s `busy_timeout`
 /// (m4-147). The contention-exposed siblings already did this — the rating and
 /// colour-label connections (`lighttable::open_rating_conn`/
-/// `open_colorlabels_conn`), the timeline writer, and `c41-db`'s
+/// `open_colorlabels_conn`), the timeline histogram reader, and `c41-db`'s
 /// `attach_catalog`; `panels::query_exif` is the deliberate 250ms exception,
 /// since it runs per arrow-keypress. The writers that can hold library.db's
 /// lock while a UI thread wants in are OFF-THREAD: the rating/colour-label
@@ -80,8 +80,12 @@ const UI_PREFS_TABLE_DDL: &str =
 ///
 /// NOT to be confused with `c41_db::schema::open_catalog`, which ATTACHes
 /// data.db/memory and ensures the full schema for app bootstrap; this is the
-/// plain per-call open every production path in this module uses.
-fn open_catalog(db_path: &str) -> rusqlite::Result<Connection> {
+/// plain per-call open every production path in this module uses. `pub(crate)`
+/// since m4-148 so formerly-bare opens outside this module
+/// (`panels::load_film_rolls`, the lighttable name-filter loaders) share it;
+/// four direct opens deliberately remain elsewhere (timeline + rating/colour +
+/// query_exif), each installing its own timeout inline.
+pub(crate) fn open_catalog(db_path: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
     Ok(conn)

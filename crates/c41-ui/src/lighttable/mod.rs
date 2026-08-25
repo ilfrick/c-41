@@ -3017,7 +3017,10 @@ pub fn lighttable_load_by_folder(model: &LighttableModel, db_path: &str, folder:
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
-        rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
+        // open_catalog (m4-148): same busy_timeout rationale as every other
+        // catalogue read — a held off-thread write lock must wait out, not
+        // read as an empty result.
+        crate::persist::open_catalog(db_path).unwrap_or_else(|_| open_demo_db())
     };
 
     let order = current_sort().order_clause(current_reverse());
@@ -3071,7 +3074,10 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
     let conn = if db_path.is_empty() {
         open_demo_db()
     } else {
-        rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
+        // open_catalog (m4-148): same busy_timeout rationale as every other
+        // catalogue read — a held off-thread write lock must wait out, not
+        // read as an empty result.
+        crate::persist::open_catalog(db_path).unwrap_or_else(|_| open_demo_db())
     };
     let order = current_sort().order_clause(current_reverse());
     let rating = current_filters_sql();
@@ -3101,9 +3107,10 @@ pub fn lighttable_filter_by_name(model: &LighttableModel, db_path: &str, query: 
 /// Matching `prefix` requires `data.tags` (tag names live only there); that is
 /// the same connection-reachability contract the left-panel tag tree already
 /// relies on — the clicked node was produced by `tag_list_with_counts`
-/// (panels::load_tags_with_counts), which queries `data.tags` over the same bare
-/// `Connection::open`, so whenever a clickable node exists this JOIN is reachable
-/// too. If the tag tree is ever re-sourced (e.g. cached), revisit this. `prefix` is
+/// (panels::load_tags_with_counts), which queries `data.tags` through
+/// `c41_db::schema::open_catalog_session`, an attached-catalog connection, so
+/// whenever a clickable node exists this JOIN is reachable too. If the tag tree
+/// is ever re-sourced (e.g. cached), revisit this. `prefix` is
 /// matched literally: its LIKE metacharacters are escaped (see [`escape_like`])
 /// so a tag containing `%`/`_` can't widen the descendant match.
 pub fn lighttable_load_by_tag_prefix(model: &LighttableModel, db_path: &str, prefix: &str) {

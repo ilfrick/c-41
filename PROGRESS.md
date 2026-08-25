@@ -2316,3 +2316,36 @@ parity row).
 
 **Follow-ups recorded**: sweep panels::load_film_rolls (and audit any other
 crate-wide bare opens); per-module style merge; darkroom-view styles module.
+
+## 2026-08-26 03:05 UTC — m4-148: finish the busy_timeout sweep
+
+**What changed**: `persist::open_catalog` made `pub(crate)`; the three last
+bare production opens in c41-ui now share it — `panels::load_film_rolls`
+(non-empty branch; a BUSY during the import transaction previously rendered as
+a silently empty film-roll list) and both lighttable name-filter loaders
+(`lighttable_load_by_folder` / `lighttable_filter_by_name`, keeping their
+demo-db fallback shape verbatim).
+
+**Senior review: APPROVE** (fresh general-purpose agent, model "opus",
+read-only mandate). Reviewer independently verified crate-wide completeness
+(every non-test open now has a busy handler; inventory: persist helper,
+timeline reader + rating/colour conns inline at 3s, query_exif's deliberate
+250ms), that demo-fallback semantics are unchanged (busy_timeout's discarded
+Result keeps open_catalog's Err set identical to Connection::open's, and
+transient BUSY cannot trigger the fallback — no shared-cache flag anywhere),
+and that all new comments are true. Folded in per review:
+- MAJOR (inherited from m4-147's committed doc): "the timeline writer" → "the
+  timeline histogram reader" — timeline.rs only ever reads (load_histogram).
+- MINOR: doc now states the four direct opens that deliberately remain outside
+  persist.rs, each with its own inline timeout.
+- MINOR: stale doc on lighttable_load_by_tag_prefix corrected — the tag tree
+  queries data.tags via c41_db::schema::open_catalog_session (attached catalog),
+  not "the same bare Connection::open" (pre-m4-147 wording).
+Recorded as follow-up (NIT): open_rating_conn/open_colorlabels_conn could
+delegate to open_catalog.
+
+**Verification**: full c41-ui release suite 380/0 before review; clippy
+--all-targets clean; full local gate exit code **0** twice (`gate-m4-148.log`,
+post-fold-ins `gate-m4-148-postreview.log`). m4-147's GitHub CI confirmed fully
+green earlier (check+test+clippy and Build & push Docker image success). No
+PARITY_AUDIT change (robustness hardening).
