@@ -6,9 +6,13 @@
 
 use adw::prelude::*;
 use glib::clone;
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::lighttable::{
     self, LighttableModel, lighttable_load_by_folder,
-    lighttable_load_by_tag_prefix, color_dot_markup, COLOR_COUNT,
+    lighttable_load_by_tag_prefix, color_dot_markup,
+    rule_stack::{self, Combinator, Rule, RuleProperty, TextCmp},
+    COLOR_COUNT,
 };
 use c41_db;
 
@@ -310,15 +314,233 @@ impl LeftPanel {
             });
         }
 
+        // ── Rule stack (m4-134) ────────────────────────────────────────────
+        // The arbitrary half of darktable's filtering expander: N rules joined
+        // by AND / OR / AND NOT, composing on top of the collection like the
+        // dropdown above. One writer shape throughout: widget change → collect →
+        // `set_rule_stack`; the observer rebuilds rows ONLY when canonical state
+        // diverges from what they show, because a rebuild on every keystroke
+        // would destroy the Entry being typed in.
+        //
+        // Nested fns, not closures, for the shared plumbing — they take their
+        // state as parameters, which keeps the add/delete/rebuild paths honest
+        // about what each of them touches.
+        struct RuleRow {
+            comb: gtk4::DropDown,
+            prop: gtk4::DropDown,
+            cmp: gtk4::DropDown,
+            entry: gtk4::Entry,
+        }
+
+        type Rows = Rc<RefCell<Vec<RuleRow>>>;
+
+        fn string_dropdown(labels: &[&str], selected: u32) -> gtk4::DropDown {
+            let dd = gtk4::DropDown::from_strings(labels);
+            dd.set_selected(selected);
+            dd
+        }
+
+        /// A fresh row with `rule`'s state preselected (defaults for the add
+        /// path), WIRED before it returns. Handlers connect exactly once, here —
+        /// rows are reused across add/delete rebuild passes (only the observer's
+        /// wholesale replacement mints widgets), so wiring inside a layout pass
+        /// would stack duplicate handlers on every surviving widget and multiply
+        /// reload cycles per edit. Preselection happens BEFORE connecting so
+        /// construction writes fire nothing.
+        fn new_rule_row(rule: Option<&Rule>, rows: &Rows) -> RuleRow {
+            let (prop_i, cmp_i, comb_i, value) = match rule {
+                Some(r) => (
+                    r.property.to_index(),
+                    r.cmp.to_index(),
+                    r.comb.to_index(),
+                    r.value.clone(),
+                ),
+                None => (0, 0, 0, String::new()),
+            };
+            let comb = string_dropdown(&Combinator::ALL.map(|c| c.label()), comb_i);
+            let prop = string_dropdown(&RuleProperty::ALL.map(|p| p.label()), prop_i);
+            let cmp = string_dropdown(&TextCmp::ALL.map(|c| c.label()), cmp_i);
+            let entry = {
+                let e = gtk4::Entry::new();
+                e.set_text(&value);
+                e
+            };
+            // Every widget funnels through apply_from; its sync-guard makes the
+            // programmatic writes below inert during observer passes.
+            let rows_comb = rows.clone();
+            comb.connect_selected_notify(move |_| {
+                apply_from(&rows_comb);
+            });
+            let rows_prop = rows.clone();
+            prop.connect_selected_notify(move |_| {
+                apply_from(&rows_prop);
+            });
+            let rows_cmp = rows.clone();
+            cmp.connect_selected_notify(move |_| {
+                apply_from(&rows_cmp);
+            });
+            let rows_entry = rows.clone();
+            entry.connect_changed(move |_| {
+                apply_from(&rows_entry);
+            });
+            RuleRow { comb, prop, cmp, entry }
+        }
+
+        /// Read every row's widgets into canonical `Rule`s. Blank values are
+        /// legal state — the SQL composer skips them — so "what the controls
+        /// show" round-trips without surprises.
+        fn collect(rows: &[RuleRow]) -> Vec<Rule> {
+            rows.iter()
+                .map(|r| Rule {
+                    property: RuleProperty::from_index(r.prop.selected()),
+                    cmp: TextCmp::from_index(r.cmp.selected()),
+                    comb: Combinator::from_index(r.comb.selected()),
+                    value: r.entry.text().to_string(),
+                })
+                .collect()
+        }
+
+        /// Apply what the widgets currently show, unless we're inside an
+        /// observer sync (then this write was programmatic and must not recurse).
+        fn apply_from(rows: &Rows) {
+            if lighttable::filter_sync_in_progress() {
+                return;
+            }
+            lighttable::set_rule_stack(collect(&rows.borrow()));
+        }
+
+        /// Lay out every row (wiring lives in `new_rule_row`; this pass only
+        /// positions widgets and mints each row's fresh delete button). Runs on
+        /// the add path, the delete path and the observer-rebuild path; never
+        /// mid-keystroke.
+        fn rebuild_rows(rules_box: &gtk4::Box, rows: &Rows, add_btn: &gtk4::Button) {
+            while let Some(child) = rules_box.first_child() {
+                rules_box.remove(&child);
+            }
+            let borrowed = rows.borrow();
+            for (i, row) in borrowed.iter().enumerate() {
+                let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                // Row 0 has nothing to combine with yet; its dropdown hides and
+                // reappears automatically as rows come and go.
+                row.comb.set_visible(i > 0);
+                if i > 0 {
+                    row.comb.set_margin_start(12);
+                }
+                for w in [&row.comb, &row.prop, &row.cmp] {
+                    w.set_size_request(84, -1);
+                    b.append(w);
+                }
+                row.entry.set_hexpand(true);
+                row.entry.set_placeholder_text(Some("substring…"));
+                b.append(&row.entry);
+                let del = gtk4::Button::from_icon_name("window-close-symbolic");
+                del.add_css_class("flat");
+                // Delete: drop our row, then lay out + apply the remainder.
+                // Capturing `i` is sound because every mutation that shifts
+                // indices (add / delete / observer replace) ends in a full
+                // rebuild_rows — this button (minted fresh each layout pass)
+                // never outlives its own.
+                {
+                    let rows_del = rows.clone();
+                    let rules_box_del = rules_box.clone();
+                    let add_btn_del = add_btn.clone();
+                    del.connect_clicked(move |_| {
+                        debug_assert!(
+                            i < rows_del.borrow().len(),
+                            "stale rule-row index at delete time",
+                        );
+                        if i < rows_del.borrow().len() {
+                            rows_del.borrow_mut().remove(i);
+                            rebuild_rows(&rules_box_del, &rows_del, &add_btn_del);
+                            apply_from(&rows_del);
+                        }
+                    });
+                }
+                b.append(&del);
+                rules_box.append(&b);
+            }
+            add_btn.set_sensitive(borrowed.len() < rule_stack::MAX_RULES);
+        }
+
+        let rules_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        let rows: Rows = Rc::new(RefCell::new(Vec::new()));
+
+        let add_btn = gtk4::Button::with_label("+ Add rule");
+        add_btn.add_css_class("flat");
+        add_btn.set_tooltip_text(Some(
+            "Add a rule — rules combine with AND / OR / AND NOT and compose on top of the active collection",
+        ));
+        add_btn.set_halign(gtk4::Align::Start);
+        add_btn.set_margin_start(12);
+        add_btn.set_margin_end(12);
+
+        {
+            let rows_c = rows.clone();
+            let rules_box_c = rules_box.clone();
+            let add_btn_c = add_btn.clone();
+            add_btn.connect_clicked(move |_| {
+                if rows_c.borrow().len() >= rule_stack::MAX_RULES {
+                    return;
+                }
+                let fresh = new_rule_row(None, &rows_c);
+                rows_c.borrow_mut().push(fresh);
+                rebuild_rows(&rules_box_c, &rows_c, &add_btn_c);
+                // An added blank rule is inert SQL-wise (the composer skips
+                // it), but applying anyway is what keeps state == widgets: if
+                // we skipped it, the next unrelated filter change would see a
+                // divergence and rebuild — silently deleting the row the user
+                // just added.
+                apply_from(&rows_c);
+            });
+        }
+
         content.append(&collapsible_section(
             &filters_header,
-            &[filters_sep.clone().upcast::<gtk4::Widget>(), aspect_drop.clone().upcast()]
-                .iter()
-                .collect::<Vec<_>>(),
+            &[
+                filters_sep.clone().upcast::<gtk4::Widget>(),
+                aspect_drop.clone().upcast(),
+                rules_box.clone().upcast(),
+                add_btn.clone().upcast(),
+            ]
+            .iter()
+            .collect::<Vec<_>>(),
             true,
             db_path,
             FILTERS_SECTION_PREF_KEY,
         ));
+
+        // Seed whatever the startup token restored (applied in lib.rs BEFORE
+        // this panel was built — same restore-before-build contract as the other
+        // filters), so a persisted stack shows up without needing an observer
+        // pass that would never otherwise fire.
+        {
+            let restored = lighttable::current_rule_stack();
+            if !restored.is_empty() {
+                let seeded: Vec<RuleRow> =
+                    restored.iter().map(|r| new_rule_row(Some(r), &rows)).collect();
+                *rows.borrow_mut() = seeded;
+                rebuild_rows(&rules_box, &rows, &add_btn);
+            }
+        }
+
+        // Observer half: only act on real divergence between the controls and
+        // canonical state (e.g. some future second editor of the stack). Equal
+        // state — including after our own apply — must not trigger a rebuild,
+        // or typing would lose the Entry under the cursor.
+        {
+            let rows_obs = rows.clone();
+            let rules_box_obs = rules_box.clone();
+            let add_btn_obs = add_btn.clone();
+            lighttable::add_filter_observer(move || {
+                if collect(&rows_obs.borrow()) != lighttable::current_rule_stack() {
+                    let canonical = lighttable::current_rule_stack();
+                    let replaced: Vec<RuleRow> =
+                        canonical.iter().map(|r| new_rule_row(Some(r), &rows_obs)).collect();
+                    *rows_obs.borrow_mut() = replaced;
+                    rebuild_rows(&rules_box_obs, &rows_obs, &add_btn_obs);
+                }
+            });
+        }
 
         // ── Tags ──────────────────────────────────────────────────────────
         // The header/separator/box are always present; their visibility tracks

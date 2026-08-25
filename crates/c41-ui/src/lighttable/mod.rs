@@ -7,6 +7,7 @@
 //! `c41_db::colorlabels` DAO, resolving the image id by path.
 
 pub mod full_preview;
+pub mod rule_stack;
 pub mod timeline;
 
 use adw::prelude::*;
@@ -1496,6 +1497,11 @@ thread_local! {
     /// active, like [`MIN_RATING`], [`YEAR_RANGE`] and [`COLOUR_MASK`] — see
     /// [`current_filters_sql`].
     static ASPECT_FILTER: Cell<AspectFilter> = const { Cell::new(AspectFilter::Off) };
+    /// The collection rule stack (m4-134, parity 2.6 slice 2): arbitrary
+    /// AND/OR/AND-NOT rules composing on top of the active collection like the
+    /// single-state filters around it — see [`current_filters_sql`] and
+    /// [`rule_stack`]. `RefCell<Vec>` because rules carry a value string.
+    static RULE_STACK: RefCell<Vec<rule_stack::Rule>> = const { RefCell::new(Vec::new()) };
     /// A closure that re-runs the *current* view's loader. Each loader registers
     /// itself here on every call (capturing its own args), so the sort dropdown
     /// can re-apply the view under a new order without the trigger sites (folder
@@ -2196,6 +2202,14 @@ fn aspect_predicate(f: AspectFilter) -> &'static str {
     }
 }
 
+/// The rule stack (m4-134) as one fragment, via [`rule_stack::rule_stack_sql`].
+/// Empty when no rule has a value; the combinators stay parenthesized inside,
+/// so splicing is safe wherever the other filters' fragments go.
+fn rule_stack_fragment() -> String {
+    let stack = RULE_STACK.with(|s| s.borrow().clone());
+    rule_stack::rule_stack_sql(&stack)
+}
+
 /// **Every** compose-on-top quick filter as one trailing ` AND …` fragment: the
 /// rating filter (m4-98b/d), the timeline's year range (m4-99), the colour
 /// quick filter (m4-126), and the aspect-ratio rule (m4-128). Loaders splice this
@@ -2203,12 +2217,48 @@ fn aspect_predicate(f: AspectFilter) -> &'static str {
 /// can't accidentally apply one but not another.
 fn current_filters_sql() -> String {
     format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         current_rating_sql(),
         timeline::year_range_and(current_year_range()),
         colour_predicate(current_colour_mask(), current_colour_all()),
         aspect_predicate(current_aspect_filter()),
+        rule_stack_fragment(),
     )
+}
+
+/// The rule stack's live state — a clone, so callers can compare against what
+/// their widgets show without holding the [`RULE_STACK`] borrow.
+pub fn current_rule_stack() -> Vec<rule_stack::Rule> {
+    RULE_STACK.with(|s| s.borrow().clone())
+}
+
+/// Replace the whole stack and re-render the current view under it, through the
+/// same observer bus as every other filter (so the persistence observer in
+/// `lib.rs` fires and all controls re-sync). Main-thread only. Blank-valued
+/// rules are legal state — [`rule_stack::rule_stack_sql`] skips them.
+pub fn set_rule_stack(stack: Vec<rule_stack::Rule>) {
+    RULE_STACK.with(|s| *s.borrow_mut() = stack);
+    filter_changed();
+}
+
+/// Persisted token pieces for the rule stack — same one-source-of-truth shape
+/// as the rating/aspect tokens.
+pub const RULE_STACK_PREF_KEY: &str = "rule_stack";
+
+/// Encode the live stack for persistence. Pure passthrough to
+/// [`rule_stack::rule_stack_token_for`].
+pub fn rule_stack_token() -> String {
+    rule_stack::rule_stack_token_for(&current_rule_stack())
+}
+
+/// Restore the stack from a persisted token (lenient; garbage ⇒ empty). Called
+/// once at startup BEFORE any control is built, like the other tokens — a
+/// programmatic write with no handler connected fires nothing.
+pub fn apply_rule_stack_token(tok: &str) {
+    let parsed = rule_stack::parse_rule_stack_token(tok);
+    if !parsed.is_empty() {
+        RULE_STACK.with(|s| *s.borrow_mut() = parsed);
+    }
 }
 
 /// Set the timeline's year-range filter (`None` clears it) and re-render the
@@ -2810,6 +2860,7 @@ mod tests {
                 colour_filter_token_for, colour_predicate, parse_colour_filter_token,
                 aspect_predicate, aspect_filter_token_for, apply_aspect_filter_token,
                 current_aspect_filter, parse_aspect_filter_token, set_aspect_filter,
+                current_rule_stack, rule_stack_token, apply_rule_stack_token, set_rule_stack,
                 set_colour_filter, set_filter_preset, set_min_rating, set_rating_compare,
                 set_year_range, FilterPreset,
                 flags_with_star_rating, index_of_path, overlay_mode_token_for,
@@ -2987,6 +3038,62 @@ mod tests {
     }
 
     #[test]
+    fn rule_stack_splices_into_composition_order() {
+        // The stack composes AFTER the single-state filters (m4-134 splice
+        // order: rating → year → colour → aspect → rules), and an empty/blank
+        // stack splices nothing — pinned here because the loaders append this
+        // string straight after a WHERE term.
+        use crate::lighttable::rule_stack::{Combinator, Rule, RuleProperty, TextCmp};
+        set_filter_preset(FilterPreset::AllImages);
+        set_rule_stack(Vec::new());
+        assert_eq!(current_filters_sql(), "", "empty stack ⇒ nothing spliced");
+
+        // A blank-valued row is state but not SQL: still nothing.
+        set_rule_stack(vec![Rule::new(
+            Combinator::And, RuleProperty::FileName, TextCmp::Contains, " ",
+        )]);
+        assert_eq!(current_filters_sql(), "", "all-blank stack ⇒ nothing spliced");
+
+        // One real rule lands as the leading-AND fragment…
+        set_rule_stack(vec![Rule::new(
+            Combinator::And, RuleProperty::FileName, TextCmp::Contains, "img",
+        )]);
+        assert_eq!(
+            current_filters_sql(),
+            " AND (i.filename LIKE '%img%' ESCAPE '\\')"
+        );
+
+        // …and combines with the quick filters in declared order (the rating
+        // fragment carries its own not-rejected term).
+        set_min_rating(2);
+        assert_eq!(
+            current_filters_sql(),
+            concat!(
+                " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 2 AND 5",
+                " AND (i.filename LIKE '%img%' ESCAPE '\\')",
+            )
+        );
+        // Restore: the thread-local must not leak into other tests.
+        set_rule_stack(Vec::new());
+        set_filter_preset(FilterPreset::AllImages);
+        assert_eq!(current_filters_sql(), "");
+    }
+
+    #[test]
+    fn rule_stack_token_roundtrips_through_the_live_state() {
+        use crate::lighttable::rule_stack::{Combinator, Rule, RuleProperty, TextCmp};
+        let original = vec![
+            Rule::new(Combinator::And, RuleProperty::FileName, TextCmp::Contains, "keep"),
+            Rule::new(Combinator::AndNot, RuleProperty::FilmRoll, TextCmp::Excludes, "raw"),
+        ];
+        set_rule_stack(original.clone());
+        let tok = rule_stack_token();
+        apply_rule_stack_token(&tok);
+        assert_eq!(current_rule_stack(), original);
+        set_rule_stack(Vec::new());
+    }
+
+    #[test]
     fn sort_order_clauses_are_stable() {
         assert_eq!(SortOrder::Filename.order_clause(false), "f.folder ASC, i.filename ASC");
         // Undated (NULL/0) sorts last via the leading boolean key.
@@ -3113,6 +3220,71 @@ mod tests {
         assert_eq!(run(aspect_predicate(AspectFilter::Square)), vec!["square.raw"]);
         // …and Off keeps everything, broken rows included (no filter ≠ all-match).
         assert_eq!(run(aspect_predicate(AspectFilter::Off)).len(), 5);
+    }
+
+    #[test]
+    fn rule_stack_keeps_only_matching_filenames_end_to_end() {
+        // Same end-to-end discipline as the colour/aspect tests above, for the
+        // rule-stack fragment: real SQLite, so a wrong property column (the
+        // hand-written `i.filename`/`f.folder` strings), invalid ESCAPE syntax,
+        // or an unneutralised quote/wildcard shows up as wrong survivors or a
+        // prepare error rather than a passing string comparison.
+        use crate::lighttable::rule_stack::{self, Combinator, Rule, RuleProperty, TextCmp};
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder TEXT);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT);
+             INSERT INTO film_rolls VALUES (1, '/rolls/2024');
+             INSERT INTO film_rolls VALUES (2, '/rolls/raw');
+             INSERT INTO images VALUES (1, 1, 'img_0001.raw');
+             INSERT INTO images VALUES (2, 1, 'img_0002.raw');
+             INSERT INTO images VALUES (3, 2, 'other.jpg');",
+        )
+        .unwrap();
+        let base = "SELECT i.filename FROM images i \
+                    JOIN film_rolls f ON f.id = i.film_id WHERE 1=1";
+        let run = |stack: &[Rule]| -> Vec<String> {
+            let sql = format!("{base}{}", rule_stack::rule_stack_sql(stack));
+            conn.prepare(&sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        use Combinator::{And, AndNot, Or};
+        use RuleProperty::{FilmRoll, FileName};
+        use TextCmp::{Contains, Excludes};
+
+        // A plain filename rule hits exactly its match…
+        assert_eq!(
+            run(&[Rule::new(And, FileName, Contains, "0001")]),
+            vec!["img_0001.raw"]
+        );
+        // …and the film-roll property goes through ITS column, not filename.
+        assert_eq!(run(&[Rule::new(And, FilmRoll, Contains, "raw")]), vec!["other.jpg"]);
+        // Excludes flips to NOT LIKE over the same pattern shape.
+        assert_eq!(
+            run(&[Rule::new(And, FileName, Excludes, "0001")]),
+            vec!["img_0002.raw", "other.jpg"]
+        );
+        // A % in the value is a LITERAL: nothing seeded contains one. Broken
+        // escaping would leave it a wildcard and every row would survive.
+        assert_eq!(run(&[Rule::new(And, FileName, Contains, "%")]).len(), 0);
+        // The classic injection stays an inert literal (quote doubled): zero
+        // matches, not the whole table.
+        assert_eq!(run(&[Rule::new(And, FileName, Contains, "x' OR 1=1 --")]).len(), 0);
+        // Left-assoc composition survives the database too: (has-img AND NOT
+        // raw-roll) OR named-other — the trailing OR binds to the whole group.
+        assert_eq!(
+            run(&[
+                Rule::new(And, FileName, Contains, "img"),
+                Rule::new(AndNot, FilmRoll, Contains, "raw"),
+                Rule::new(Or, FileName, Contains, "other"),
+            ]),
+            vec!["img_0001.raw", "img_0002.raw", "other.jpg"]
+        );
     }
 
     #[test]

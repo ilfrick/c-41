@@ -493,6 +493,11 @@ fn build_main_window(app: &Application) {
     if let Some(tok) = persist::load_ui_pref(&db_path, lighttable::ASPECT_FILTER_PREF_KEY) {
         lighttable::apply_aspect_filter_token(&tok);
     }
+    // And the arbitrary rule stack (m4-134), same restore-before-build contract:
+    // the left panel seeds its rule rows from canonical state when it builds.
+    if let Some(tok) = persist::load_ui_pref(&db_path, lighttable::RULE_STACK_PREF_KEY) {
+        lighttable::apply_rule_stack_token(&tok);
+    }
     // Likewise restore the thumbnail overlay mode (m4-98e) before the grid binds
     // its first cells, so they're laid out right the first time (no visible flip).
     if let Some(tok) = persist::load_ui_pref(&db_path, OVERLAY_MODE_PREF_KEY) {
@@ -986,6 +991,16 @@ fn build_main_window(app: &Application) {
                 &db,
                 lighttable::ASPECT_FILTER_PREF_KEY,
                 &lighttable::aspect_filter_token(),
+            );
+        });
+        // The rule stack persists through the same one-writer-per-key observer
+        // (m4-134): every filter change re-saves its token.
+        let db = db_path.clone();
+        lighttable::add_filter_observer(move || {
+            crate::persist::save_ui_pref(
+                &db,
+                lighttable::RULE_STACK_PREF_KEY,
+                &lighttable::rule_stack_token(),
             );
         });
     }
