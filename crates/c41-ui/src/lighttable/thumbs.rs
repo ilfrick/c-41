@@ -36,18 +36,26 @@
 //! worker thread ever parks waiting for a slot and unrelated blocking work
 //! (rating / colour-label queries) can't queue behind parked decoders.
 //!
-//! **Cost honesty**: a raw thumbnail pays one full-resolution demosaic per
-//! bucket per session — seconds of CPU each, serialised two-at-a-time through
-//! the gate. Most raws carry an embedded preview JPEG that would decode orders
-//! of magnitude faster (that is darktable's mipmap approach); routing raws to
-//! embedded-previews-first-with-demosaic-fallback is the recorded follow-up,
-//! alongside persistent on-disk thumbnails.
+//! **Cost honesty**: a raw thumbnail pays one full-resolution demosaic —
+//! seconds of CPU each, serialised two-at-a-time through the gate. Since
+//! m4-141 that cost is paid once per (file, bucket) per *machine*, not per
+//! session: finished decodes persist to a darktable-mipmap-style on-disk
+//! store (see the "Persistent disk cache" section) keyed by path + bucket,
+//! with the source's mtime sealed inside every entry — a replaced or re-saved
+//! raw invalidates itself, while a DELETED file keeps showing its last known
+//! render (darktable behaves the same until a refresh). Only the very first view of
+//! each file stays expensive; serving that from the camera's own embedded
+//! preview JPEG is still the recorded follow-up (rawloader exposes no
+//! thumbnail parser, and large-preview placement is vendor-specific).
 
 use gtk4::gdk_pixbuf::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// Cache byte budget. A 512² RGB8 thumbnail is ~0.75 MB, so this holds tens of
 /// thousands of grid thumbs or hundreds of culling-sized ones; eviction keeps
@@ -142,23 +150,9 @@ fn decode_uncapped(path: &str, max_dim: u32) -> Option<ThumbImage> {
     // passes (current callers: ≤ 2048 buckets, ≤ viewport-sized cells).
     let max = max_dim.clamp(1, 8192) as usize;
     if crate::raw_preview::is_raw_path(path) {
-        // Raw branch (m4-140): the full preview's decode at thumbnail scale.
-        // Demosaicing runs at sensor resolution regardless — the bound only
-        // caps the integer-factor box-average downscale afterwards — but the
-        // session caches mean that cost is paid once per (path, bucket).
-        let rp = crate::raw_preview::decode_raw_preview(path, max)?;
-        let rgb = crate::preview::render_linear_to_srgb8(
-            &rp.pixels,
-            rp.width,
-            rp.height,
-            &crate::preview::PreviewParams::default(),
-        );
-        Some(ThumbImage {
-            width: rp.width as i32,
-            height: rp.height as i32,
-            rgb,
-        })
-    } else {
+        return decode_raw_thumb(path, max);
+    }
+    {
         let data = std::fs::read(path).ok()?;
         let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
         loader.connect_size_prepared(move |loader, w, h| {
@@ -248,6 +242,286 @@ fn pixbuf_to_rgb8(pb: &gtk4::gdk_pixbuf::Pixbuf) -> Vec<u8> {
         }
     }
     out
+}
+
+// ── Persistent disk cache (raw decodes survive sessions) ───────────────────
+
+/// Byte budget for the on-disk raw-thumbnail store. A raw decode costs
+/// seconds of CPU; paying that once per machine instead of once per session
+/// is what makes re-opening a large catalogue instant. [`prune_disk_dir`]
+/// keeps the total under this regardless of catalogue age.
+const DISK_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Entry file format: magic + version + packed-RGB dims + source mtime (all
+/// little-endian), then exactly `w*h*3` payload bytes. No encoder sits in the
+/// loop, so what loads back is bit-identical to what was decoded — the
+/// thumbnail a cache hit paints is the thumbnail the one expensive decode
+/// produced.
+const DISK_MAGIC: &[u8; 4] = b"C41T";
+const DISK_VERSION: u32 = 1;
+const DISK_HEADER_LEN: usize = 32;
+const DISK_EXT: &str = "c41thumb";
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: when set, [`disk_cache_dir`] returns this instead of the
+    /// user-wide directory, so tests never read or pollute a real cache.
+    /// Each test runs on its own thread, which makes this per-test isolation
+    /// (a process-global env var could not be set safely from parallel tests).
+    static TEST_DISK_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Where decoded raw thumbnails persist. `C41_THUMB_CACHE_DIR` overrides
+/// wholesale (tests use the thread-local above; this env var exists for
+/// container experiments), otherwise the XDG cache dir — the same
+/// `~/.cache/...` convention darktable's mipmap store uses.
+fn disk_cache_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(d) = TEST_DISK_DIR.with(|t| t.borrow().clone()) {
+        return Some(d);
+    }
+    if let Some(d) = std::env::var_os("C41_THUMB_CACHE_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(d));
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("c41").join("thumbs"))
+}
+
+/// FNV-1a 64-bit — deterministic across processes, which std's `DefaultHasher`
+/// is NOT (it is keyed randomly per process, so hashed filenames would orphan
+/// every cached entry at every launch). Not cryptographic: the input is our
+/// own path string, and a collision can at worst serve another file's render
+/// when their sealed mtimes also coincide — any mtime difference rejects the
+/// hit and the next decode overwrites the entry.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Source-file mtime in nanoseconds since the epoch, `None` when it cannot be
+/// read (file vanished between listing and decode). Sealed into every entry:
+/// a load whose stored mtime differs from a readable current one is stale and
+/// is re-decoded; an unreadable current mtime serves the last known render
+/// (the collection still lists the image — a blank cell would be worse).
+/// Known boundary, shared with darktable's own mtime invalidation: a
+/// replacement that deliberately PRESERVES the mtime (`cp -p`,
+/// restore-from-backup) defeats staleness — the seal has no way to see it.
+fn source_mtime_nanos(path: &str) -> Option<u128> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+}
+
+/// Deterministic filename for `(path, bucket)` — short and filesystem-safe
+/// regardless of how deep the source path is. The mtime is deliberately NOT
+/// part of the name: it lives inside the entry so that a vanished source can
+/// still resolve to (and be served from) its old file.
+fn entry_file_name(hash: u64, bucket: u32) -> String {
+    format!("{hash:016x}-{bucket}.{DISK_EXT}")
+}
+
+/// Full path of the cache entry for one raw decode request.
+fn disk_key(dir: &Path, path: &str, bucket: u32) -> PathBuf {
+    dir.join(entry_file_name(fnv1a(path.as_bytes()), bucket))
+}
+
+/// Serialise a thumbnail plus its source mtime into the on-disk format (see
+/// [`DISK_MAGIC`]). An unreadable mtime seals as 0 — consistent because loads
+/// compare `Some(current)` against the sealed value only when a current value
+/// exists at all.
+fn encode_disk_entry(img: &ThumbImage, mtime_nanos: Option<u128>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(DISK_HEADER_LEN + img.rgb.len());
+    out.extend_from_slice(DISK_MAGIC);
+    out.extend_from_slice(&DISK_VERSION.to_le_bytes());
+    out.extend_from_slice(&img.width.to_le_bytes());
+    out.extend_from_slice(&img.height.to_le_bytes());
+    out.extend_from_slice(&mtime_nanos.unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&img.rgb);
+    out
+}
+
+/// Parse back what [`encode_disk_entry`] wrote, returning the payload and its
+/// sealed mtime. Anything off — magic, version, non-positive dims, byte count
+/// not matching the declared dims (truncated or corrupt file) — is a miss,
+/// never a panic: the next successful decode overwrites the entry via rename
+/// anyway. Dims are trusted only after the length check pins them to the
+/// payload size; this is the user's own cache directory, same trust level as
+/// darktable's mipmap store.
+fn decode_disk_entry(bytes: &[u8]) -> Option<(ThumbImage, u128)> {
+    if bytes.len() < DISK_HEADER_LEN || &bytes[0..4] != DISK_MAGIC {
+        return None;
+    }
+    let ver = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    if ver != DISK_VERSION {
+        return None;
+    }
+    let w = i32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let h = i32::from_le_bytes(bytes[12..16].try_into().ok()?);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let mtime = u128::from_le_bytes(bytes[16..32].try_into().ok()?);
+    let n = (w as usize).checked_mul(h as usize)?.checked_mul(3)?;
+    if bytes.len() != DISK_HEADER_LEN + n {
+        return None;
+    }
+    Some((ThumbImage { width: w, height: h, rgb: bytes[DISK_HEADER_LEN..].to_vec() }, mtime))
+}
+
+/// Load one validated entry. `current_mtime` is the SOURCE file's mtime now:
+/// `Some(x)` with a differently-sealed x means the raw was replaced or
+/// re-saved → miss; `None` (source unreadable/absent) serves the last known
+/// render. Any IO problem is likewise just a miss — never surfaced as an
+/// error.
+fn disk_load(entry: &Path, current_mtime: Option<u128>) -> Option<ThumbImage> {
+    let bytes = std::fs::read(entry).ok()?;
+    let (img, sealed) = decode_disk_entry(&bytes)?;
+    if let Some(cur) = current_mtime {
+        if sealed != cur {
+            return None;
+        }
+    }
+    Some(img)
+}
+
+/// Uniqueness for tmp files during atomic writes: pid separates concurrent
+/// processes, the counter separates threads within one, and a nanosecond
+/// timestamp covers even separate containers sharing a volume with distinct
+/// pid namespaces (both would otherwise be "pid 42, counter 0").
+static DISK_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes appended since the last prune sweep. Pruning is a full directory
+/// stat-and-sort — measurable churn at five-figure entry counts — so it runs
+/// only after this much NEW data has landed, not on every store. At most
+/// 1/16th of the budget overruns between sweeps; regenerable cache, fine.
+static DISK_BYTES_SINCE_PRUNE: AtomicU64 = AtomicU64::new(0);
+
+/// Persist one entry atomically — write a tmp file in the SAME directory,
+/// then rename over any existing entry (same-directory rename is atomic), so
+/// concurrent writers of one key race to identical bytes and readers never
+/// observe a half-written file — then prune the store back toward its budget
+/// once enough new data accumulated ([`DISK_BYTES_SINCE_PRUNE`]). Every
+/// failure path is silently skipped: a full disk must degrade to "no
+/// caching", never break thumbnails.
+fn disk_store(dir: &Path, entry: &Path, img: &ThumbImage, mtime_nanos: Option<u128>) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let payload = encode_disk_entry(img, mtime_nanos);
+    let seq = DISK_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".tmp-{}-{seq:x}-{now_nanos:x}.{DISK_EXT}", std::process::id()));
+    if std::fs::write(&tmp, &payload).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, entry).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    let added = payload.len() as u64;
+    if DISK_BYTES_SINCE_PRUNE.fetch_add(added, Ordering::Relaxed) + added
+        > DISK_BUDGET_BYTES / 16
+    {
+        DISK_BYTES_SINCE_PRUNE.store(0, Ordering::Relaxed);
+        prune_disk_dir(dir, DISK_BUDGET_BYTES, Some(entry));
+    }
+}
+
+/// Delete oldest-mtime entries until the directory fits `budget`, never
+/// deleting `keep` (the entry just written; needed because equal mtimes tie
+/// in arbitrary `read_dir` order and could push the fresh entry out of the
+/// greedy keep-set). Newest-first keep policy is the shared [`evict_keep_set`]
+/// walk, same as the session LRU: newest entries survive, the regenerable
+/// tail goes. Entries whose metadata cannot even be read are deleted outright
+/// rather than silently exempting them from every future sweep. Pure
+/// selection math lives in [`prune_plan`], pinned by tests there.
+fn prune_disk_dir(dir: &Path, budget: u64, keep: Option<&Path>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut unstatable: Vec<PathBuf> = Vec::new();
+    let entries: Vec<(PathBuf, u64, SystemTime)> = rd
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(DISK_EXT))
+        .filter_map(|e| {
+            let p = e.path();
+            match e.metadata() {
+                Ok(md) => md.modified().ok().map(|mt| (p.clone(), md.len(), mt)),
+                // A transiently unstatable entry costs one regenerate later;
+                // keeping it around would put it outside the budget forever.
+                Err(_) => {
+                    unstatable.push(p);
+                    None
+                }
+            }
+        })
+        .collect();
+    for p in unstatable {
+        let _ = std::fs::remove_file(p);
+    }
+    for victim in prune_plan(entries, budget) {
+        if keep.is_some_and(|k| k == victim) {
+            continue;
+        }
+        let _ = std::fs::remove_file(victim);
+    }
+}
+
+/// Which entries exceed `budget`: walk newest-first keeping greedily until the
+/// next entry no longer fits (the first always survives, mirroring
+/// [`evict_keep_set`]'s never-empty rule — here it merely avoids deleting the
+/// freshest work); everything older is a victim.
+fn prune_plan(entries: Vec<(PathBuf, u64, SystemTime)>, budget: u64) -> Vec<PathBuf> {
+    let mut newest_first = entries.clone();
+    newest_first.sort_by_key(|(_, _, m)| std::cmp::Reverse(*m));
+    let sized: Vec<(&Path, u64)> =
+        newest_first.iter().map(|(p, s, _)| (p.as_path(), *s)).collect();
+    let keep: HashSet<&Path> = evict_keep_set(&sized, budget).into_iter().collect();
+    entries
+        .into_iter()
+        .filter(|(p, _, _)| !keep.contains(p.as_path()))
+        .map(|(p, _, _)| p)
+        .collect()
+}
+
+/// The raw branch of [`decode_uncapped`]: the persistent store is consulted
+/// first (a hit skips demosaicing entirely — this is what makes the second
+/// session over a folder instant), then the full preview decode runs and its
+/// result is persisted for every future session. Both surfaces' requests land
+/// here through their buckets, so one visit warms every bucket it touched.
+fn decode_raw_thumb(path: &str, max: usize) -> Option<ThumbImage> {
+    let dir = disk_cache_dir();
+    let mtime = source_mtime_nanos(path);
+    let entry = dir.as_deref().map(|d| disk_key(d, path, max as u32));
+    if let Some(e) = &entry {
+        if let Some(hit) = disk_load(e, mtime) {
+            return Some(hit);
+        }
+    }
+    // Demosaicing runs at sensor resolution regardless — `max` only caps the
+    // integer-factor box-average downscale afterwards.
+    let rp = crate::raw_preview::decode_raw_preview(path, max)?;
+    let rgb = crate::preview::render_linear_to_srgb8(
+        &rp.pixels,
+        rp.width,
+        rp.height,
+        &crate::preview::PreviewParams::default(),
+    );
+    let img = ThumbImage { width: rp.width as i32, height: rp.height as i32, rgb };
+    if let (Some(d), Some(e)) = (&dir, &entry) {
+        disk_store(d, e, &img, mtime);
+    }
+    Some(img)
 }
 
 // ── Session pixel cache ─────────────────────────────────────────────────────
@@ -514,6 +788,30 @@ mod tests {
         assert_eq!(bucket_for(-5), 128);
     }
 
+    /// Run `f` with [`TEST_DISK_DIR`] pointed at a fresh per-test temp dir, so
+    /// raw-branch decodes never touch the real user cache. The name keeps
+    /// parallel tests on one machine from colliding; the guard removes the
+    /// dir even when `f` panics.
+    fn with_test_disk_dir<T>(name: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
+        struct Cleanup<'a>(&'a std::path::Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(self.0);
+            }
+        }
+        let dir = std::env::temp_dir()
+            .join(format!("c41_thumbcache_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = Cleanup(&dir);
+        TEST_DISK_DIR.with(|t| *t.borrow_mut() = Some(dir.clone()));
+        let out = f(&dir);
+        // Normal-path seam reset; a panicking thread takes its thread-local
+        // with it, so the seam can never leak across tests either way.
+        TEST_DISK_DIR.with(|t| *t.borrow_mut() = None);
+        out
+    }
+
     #[test]
     fn raw_decode_produces_bounded_nontrivial_pixels() {
         // testdata/ is untracked (local + Docker-gate only); skip cleanly where
@@ -525,13 +823,163 @@ mod tests {
         if !raw.exists() {
             return;
         }
-        let raw = raw.to_str().unwrap();
-        let img = decode_uncapped(raw, 256).expect("real raw must decode");
-        // The raw branch downscales by an integer box-average factor, so the
-        // bound is a ceiling, not a target — only "fits within" is contractual.
-        assert!(img.width.max(img.height) <= 256, "longest side bounded");
-        assert!(img.width > 0 && img.height > 0);
-        assert!(img.rgb.chunks(3).any(|px| px != [0, 0, 0]));
+        with_test_disk_dir("bounded", |_| {
+            let raw = raw.to_str().unwrap();
+            let img = decode_uncapped(raw, 256).expect("real raw must decode");
+            // The raw branch downscales by an integer box-average factor, so
+            // the bound is a ceiling, not a target — only "fits within" is
+            // contractual.
+            assert!(img.width.max(img.height) <= 256, "longest side bounded");
+            assert!(img.width > 0 && img.height > 0);
+            assert!(img.rgb.chunks(3).any(|px| px != [0, 0, 0]));
+        });
+    }
+
+    #[test]
+    fn fnv1a_matches_published_vectors() {
+        // Canonical FNV-1a 64 test vectors (empty = offset basis) pin the
+        // exact variant; determinism across processes is the property the
+        // cache filenames depend on.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn entry_name_is_deterministic_and_sensitive_to_every_key_part() {
+        let h = fnv1a(b"/x/img.orf");
+        assert_eq!(
+            entry_file_name(h, 256),
+            entry_file_name(h, 256),
+            "same inputs, same filename"
+        );
+        assert_ne!(entry_file_name(h, 256), entry_file_name(h, 512), "bucket in key");
+        assert_ne!(
+            entry_file_name(h, 256),
+            entry_file_name(fnv1a(b"/y/img.orf"), 256),
+            "path in key"
+        );
+        assert!(
+            entry_file_name(h, 2048).len() < 64,
+            "filename stays short whatever the inputs"
+        );
+    }
+
+    #[test]
+    fn disk_entry_round_trips_and_load_validates_the_sealed_mtime() {
+        let img = ThumbImage { width: 244, height: 71, rgb: (0..244 * 71 * 3).map(|i| i as u8).collect() };
+        let bytes = encode_disk_entry(&img, Some(12345));
+        let (back, sealed) = decode_disk_entry(&bytes).expect("valid entry parses");
+        assert_eq!((back.width, back.height), (img.width, img.height));
+        assert_eq!(sealed, 12345, "mtime survives the round trip");
+        assert_eq!(back.rgb, img.rgb, "bit-identical payload");
+
+        // Corrupt shapes are misses, never panics: truncated tail, appended
+        // byte (length check), bad magic, unknown version (a future format
+        // change invalidates old files wholesale), zero dims, header alone.
+        assert!(decode_disk_entry(&bytes[..bytes.len() - 1]).is_none());
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(decode_disk_entry(&extra).is_none());
+        let mut magic = bytes.clone();
+        magic[0] = b'X';
+        assert!(decode_disk_entry(&magic).is_none());
+        let mut ver = bytes.clone();
+        ver[4] = 99;
+        assert!(decode_disk_entry(&ver).is_none());
+        let mut zero = bytes.clone();
+        zero[8..12].copy_from_slice(&0i32.to_le_bytes());
+        assert!(decode_disk_entry(&zero).is_none());
+        assert!(decode_disk_entry(&bytes[..DISK_HEADER_LEN]).is_none());
+
+        // Load-time staleness contract: matching mtime hits, a different one
+        // (replaced/re-saved source) misses, an unreadable current mtime
+        // (source vanished) serves the last known render.
+        let entry_path = std::env::temp_dir()
+            .join(format!("c41_{}_mtcheck.{DISK_EXT}", std::process::id()));
+        std::fs::write(&entry_path, &bytes).unwrap();
+        assert!(disk_load(&entry_path, Some(12345)).is_some(), "matching mtime hits");
+        assert!(disk_load(&entry_path, Some(54321)).is_none(), "changed mtime is stale");
+        assert!(disk_load(&entry_path, None).is_some(), "vanished source still serves");
+        let _ = std::fs::remove_file(&entry_path);
+    }
+
+    #[test]
+    fn raw_decode_survives_source_deletion_via_disk_cache() {
+        // testdata/ untracked — skip where absent (see bounded test).
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/portrait.orf");
+        if !src.exists() {
+            return;
+        }
+        with_test_disk_dir("survives", |cache| {
+            // Work on a copy so deleting the "source" can't hurt other tests
+            // that read the fixture concurrently.
+            let copy = std::env::temp_dir()
+                .join(format!("c41_{}_delme.orf", std::process::id()));
+            std::fs::copy(&src, &copy).unwrap();
+            let path = copy.to_str().unwrap().to_string();
+
+            let first = decode_uncapped(&path, 256).expect("first view decodes for real");
+            // Exactly one entry persisted for this request.
+            let entries: Vec<_> = std::fs::read_dir(cache)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(DISK_EXT))
+                .collect();
+            assert_eq!(entries.len(), 1, "one bucket, one file");
+
+            // Delete the SOURCE. The second request can now only be served by
+            // the disk store — this is the proof that hits skip the decoder.
+            std::fs::remove_file(&copy).unwrap();
+            let second = decode_uncapped(&path, 256).expect("disk cache serves it");
+            assert_eq!((second.width, second.height), (first.width, first.height));
+            assert_eq!(second.rgb, first.rgb, "bit-identical to the original decode");
+        });
+    }
+
+    #[test]
+    fn prune_plan_keeps_the_newest_tail_and_victims_are_the_rest() {
+        let t = |s: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let e = |n: &str, sz: u64, m: u64| (PathBuf::from(n), sz, t(m));
+        // Budget 25, sizes 10/20/30: newest-first keep walk holds 30 (first,
+        // always kept), then nothing else fits — both older entries go, even
+        // though keeping {10} or none would fit strictly. Mirrors the session
+        // LRU's over-budget-by-one-entry trade-off on the freshest work.
+        let victims = prune_plan(
+            vec![e("old", 10, 1), e("mid", 20, 2), e("new", 30, 3)],
+            25,
+        );
+        assert_eq!(victims.len(), 2);
+        assert!(victims.contains(&PathBuf::from("old")));
+        assert!(victims.contains(&PathBuf::from("mid")));
+
+        // Under budget: nobody is a victim regardless of order.
+        assert!(prune_plan(vec![e("a", 5, 1), e("b", 5, 2)], 100).is_empty());
+    }
+
+    #[test]
+    fn prune_disk_dir_enforces_budget_on_real_files() {
+        with_test_disk_dir("prune", |dir| {
+            let mk = |n: u8| {
+                ThumbImage { width: 200, height: 200, rgb: vec![n; 200 * 200 * 3] } // 120 KB each
+            };
+            let key = |name: &str| disk_key(dir, name, 256);
+            disk_store(dir, &key("a.orf"), &mk(1), Some(1));
+            disk_store(dir, &key("b.orf"), &mk(2), Some(2));
+            disk_store(dir, &key("c.orf"), &mk(3), Some(3)); // ~360 KB total
+            // 150 KB budget fits exactly one 120 KB entry.
+            prune_disk_dir(dir, 150_000, None);
+            let left: Vec<_> =
+                std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+            assert_eq!(left.len(), 1, "two entries pruned, newest survives");
+            assert_eq!(
+                std::fs::metadata(&left[0]).unwrap().len(),
+                (DISK_HEADER_LEN + 200 * 200 * 3) as u64
+            );
+            // A hit after pruning still validates end-to-end.
+            assert!(disk_load(&left[0], None).is_some());
+        });
     }
 
     #[test]
