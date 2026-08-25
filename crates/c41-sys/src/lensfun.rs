@@ -44,6 +44,41 @@ pub const LF_NO_DATABASE: lfError = 2;
 /// 2`; newer lensfun headers renamed it with an `_ECS` suffix, same value).
 pub const LF_SEARCH_SORT_AND_UNIQUIFY: i32 = 2;
 
+// ── Correction-selection flags (`enum lfModifyFlags`) ────────────────────────
+
+pub const LF_MODIFY_TCA: i32 = 0x0000_0001;
+pub const LF_MODIFY_VIGNETTING: i32 = 0x0000_0002;
+pub const LF_MODIFY_DISTORTION: i32 = 0x0000_0008;
+pub const LF_MODIFY_GEOMETRY: i32 = 0x0000_0010;
+pub const LF_MODIFY_SCALE: i32 = 0x0000_0020;
+/// `LF_MODIFY_ALL = ~0` — every correction bit.
+pub const LF_MODIFY_ALL: i32 = !0;
+
+// ── Pixel formats & component roles (`lfPixelFormat`, `lfComponentRole`) ─────
+
+/// `LF_PF_F32`: 32-bit floating-point R,G,B — what our f32 buffers use.
+pub const LF_PF_F32: i32 = 3;
+
+/// `LF_CR_3(RED, GREEN, BLUE)` — tightly packed RGB, stride 3.
+pub const LF_CR_3_RGB: i32 =
+    (4 /*RED*/) | (5 /*GREEN*/ << 4) | (6 /*BLUE*/ << 8);
+/// `LF_CR_4(RED, GREEN, BLUE, UNKNOWN)` — RGBA where the fourth lane (alpha)
+/// must be left untouched by colour modification.
+pub const LF_CR_4_RGB_UNKNOWN: i32 =
+    (4 /*RED*/) | (5 /*GREEN*/ << 4) | (6 /*BLUE*/ << 8) | (2 /*UNKNOWN*/ << 12);
+
+// ── Projection types (`enum lfLensType`) ─────────────────────────────────────
+
+pub const LF_UNKNOWN: i32 = 0;
+pub const LF_RECTILINEAR: i32 = 1;
+pub const LF_FISHEYE: i32 = 2;
+pub const LF_PANORAMIC: i32 = 3;
+pub const LF_EQUIRECTANGULAR: i32 = 4;
+pub const LF_FISHEYE_ORTHOGRAPHIC: i32 = 5;
+pub const LF_FISHEYE_STEREOGRAPHIC: i32 = 6;
+pub const LF_FISHEYE_EQUISOLID: i32 = 7;
+pub const LF_FISHEYE_THOBY: i32 = 8;
+
 // ── Opaque handles ───────────────────────────────────────────────────────────
 
 #[repr(C)]
@@ -126,4 +161,74 @@ extern "C" {
 
     /// Frees memory allocated by lensfun helpers (returned lists, strings).
     pub fn lf_free(data: *mut core::ffi::c_void);
+}
+
+// ── Modifier (per-image correction state) ────────────────────────────────────
+//
+// `cbool` is lensfun's `#define cbool int`; `lfPixelFormat`/`lfLensType`/
+// component-role values are the i32 constants declared above. The modifier is
+// created for one image geometry, initialized once, then applied per row —
+// apply calls are treated as thread-safe const reads (darktable runs its row
+// loops in parallel over a shared modifier).
+
+extern "C" {
+    /// Builds a modifier for `lens` at image size `width × height` with crop
+    /// factor `crop` (the *camera's* crop; coordinates are expressed on that
+    /// normalised film plane). Returns NULL on allocation failure.
+    pub fn lf_modifier_new(
+        lens: *const lfLens,
+        crop: f32,
+        width: i32,
+        height: i32,
+    ) -> *mut lfModifier;
+    pub fn lf_modifier_destroy(modifier: *mut lfModifier);
+
+    /// Enables the corrections selected by `flags` (LF_MODIFY_* bits) for
+    /// pixel format `format` at shooting parameters focal/aperture/distance.
+    /// `targeom` selects projection conversion when LF_MODIFY_GEOMETRY is set;
+    /// `reverse` swaps correct↔distort direction. Returns the subset of
+    /// `flags` actually enabled (calibration may be missing for some).
+    pub fn lf_modifier_initialize(
+        modifier: *mut lfModifier,
+        lens: *const lfLens,
+        format: i32,
+        focal: f32,
+        aperture: f32,
+        distance: f32,
+        scale: f32,
+        targeom: i32,
+        flags: i32,
+        reverse: i32,
+    ) -> i32;
+
+    /// Scale that keeps the corrected image inside the frame (≥ 1 usually).
+    /// Non-const in the header (lensfun.h), though it only reads — keep `*mut`.
+    pub fn lf_modifier_get_auto_scale(modifier: *mut lfModifier, reverse: i32)
+        -> f32;
+
+    /// Per-channel source-coordinate mapping (TCA + distortion + geometry +
+    /// scale). Fills `res` with `width × height` × 6 floats: for each pixel,
+    /// (x,y) for R, G, B in that order. Coordinates are absolute image-space.
+    pub fn lf_modifier_apply_subpixel_geometry_distortion(
+        modifier: *mut lfModifier,
+        xu: f32,
+        yu: f32,
+        width: i32,
+        height: i32,
+        res: *mut f32,
+    ) -> i32;
+
+    /// Per-pixel colour scaling (vignetting). `pixels` points at interleaved
+    /// data described by `comp_role` (see [`LF_CR_4_RGB_UNKNOWN`]);
+    /// `row_stride` is in **floats** between successive rows.
+    pub fn lf_modifier_apply_color_modification(
+        modifier: *mut lfModifier,
+        pixels: *mut f32,
+        x: f32,
+        y: f32,
+        width: i32,
+        height: i32,
+        comp_role: i32,
+        row_stride: i32,
+    ) -> i32;
 }

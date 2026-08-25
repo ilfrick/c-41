@@ -35,6 +35,7 @@ pub mod colorzones;
 pub mod exposure;
 pub mod grain;
 pub mod graduatednd;
+pub mod lens;
 pub mod levels;
 pub mod lut3d;
 pub mod lowlight;

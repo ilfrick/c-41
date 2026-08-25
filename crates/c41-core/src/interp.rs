@@ -155,7 +155,30 @@ pub fn compute_sample_1c(
     linestride: i32,
     interp: u32,
 ) -> f32 {
-    let hw  = half_width(interp);
+    compute_sample_strided(in_buf, x, y, img_width, img_height, 1, linestride, interp)
+}
+
+/// Compute one interpolated sample of a **single channel** of an interleaved
+/// buffer at fractional coordinate (x, y) — the exact shape darktable's
+/// `dt_interpolation_compute_sample(interp, buf + c, x, y, width, height,
+/// samplestride, linestride)` call takes, which per-channel warps need (lens
+/// correction resamples R/G/B each at its own distorted coordinate).
+///
+/// `linestride` is floats per row (`width * channels`); the pixel step within
+/// a row is `samplestride`. Edge handling matches [`compute_pixel4c`]
+/// (mirror-clamp, darktable's slow path). `interp`: 0 = bilinear, 1 = bicubic,
+/// 2 = Lanczos-2, 3 = Lanczos-3.
+pub fn compute_sample_strided(
+    in_buf: &[f32],
+    x: f32,
+    y: f32,
+    img_width: i32,
+    img_height: i32,
+    samplestride: i32,
+    linestride: i32,
+    interp: u32,
+) -> f32 {
+    let hw = half_width(interp);
     let ksz = 2 * hw;
     let mut kh = [0.0f32; 6];
     let mut kv = [0.0f32; 6];
@@ -163,18 +186,19 @@ pub fn compute_sample_1c(
     let iy = y.floor() as i32;
     let norm_h = make_kernel(&mut kh[..ksz], x - (ix - hw as i32 + 1) as f32, hw, interp);
     let norm_v = make_kernel(&mut kv[..ksz], y - (iy - hw as i32 + 1) as f32, hw, interp);
-    let oonorm  = 1.0 / (norm_h * norm_v);
+    let oonorm = 1.0 / (norm_h * norm_v);
     let start_x = ix - hw as i32 + 1;
     let start_y = iy - hw as i32 + 1;
-    let max_x   = img_width  - 1;
-    let max_y   = img_height - 1;
+    let max_x = img_width - 1;
+    let max_y = img_height - 1;
     let mut acc = 0.0f32;
     for i in 0..ksz {
-        let py   = mirror(start_y + i as i32, max_y) as usize;
+        let py = mirror(start_y + i as i32, max_y) as usize;
+        let base = py * linestride as usize;
         let mut h = 0.0f32;
         for j in 0..ksz {
-            let px  = mirror(start_x + j as i32, max_x) as usize;
-            h += kh[j] * in_buf[py * linestride as usize + px];
+            let px = mirror(start_x + j as i32, max_x) as usize;
+            h += kh[j] * in_buf[base + px * samplestride as usize];
         }
         acc += kv[i] * h;
     }

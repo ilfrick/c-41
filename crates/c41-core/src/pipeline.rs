@@ -510,6 +510,22 @@ pub enum Stage {
         bias: f32,
         mode_y0u0v0: bool,
     },
+
+    /// Lens correction via liblensfun (lens.cc LENSFUN method) — the one
+    /// stage backed by an external C library (distro `liblensfun`, bound in
+    /// `c41-sys::lensfun`). Carries the database-resolved lens plus the
+    /// user parameters; [`crate::iop::lens::process`] runs vignetting +
+    /// per-channel coordinate warp over the whole frame. **NOT pixel-local**
+    /// (a coordinate-warp resampling — every output pixel reads a
+    /// neighbourhood), so it takes the serial whole-buffer path.
+    ///
+    /// Works directly on the linear buffer (`working_space()` = `None`); it
+    /// is colour-agnostic geometry + per-pixel gain. Alpha is carried
+    /// through untouched.
+    LensCorrection {
+        lens: crate::iop::lens::ResolvedLens,
+        params: crate::iop::lens::LensParams,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -570,6 +586,7 @@ impl Stage {
             Stage::ColorBalanceRgb { .. } => "colorbalancergb",
             Stage::FilmicRgb { .. } => "filmicrgb",
             Stage::DenoiseProfile { .. } => "denoiseprofile",
+            Stage::LensCorrection { .. } => "lens",
         }
     }
 
@@ -695,6 +712,11 @@ impl Stage {
             // whenever this stage is present, where (width, height) is the
             // true image rectangle — same reason as Shadhi/Lowpass/Sharpen.
             Stage::DenoiseProfile { .. } => false,
+            // LensCorrection is NOT pixel-local: it is a coordinate warp —
+            // every output pixel resamples a neighbourhood (per channel!) at
+            // its distorted source coordinate, so band-splitting would hand
+            // the sampler the wrong rectangle. Serial whole-frame only.
+            Stage::LensCorrection { .. } => false,
         }
     }
 
@@ -1645,6 +1667,14 @@ impl Stage {
                     &denoiseprofile::WaveletsParams { strength, shadows, bias, mode_y0u0v0 },
                 );
             }
+            // ── Lens correction (lens.cc LENSFUN method) ───────────────
+            // Vignetting gain + per-channel coordinate warp through the
+            // distro liblensfun. NOT pixel-local (a resampling warp), so
+            // `process` guarantees (width, height) is the whole frame here.
+            // The destructure names avoid shadowing the `lens` module.
+            Stage::LensCorrection { lens: ref resolved, ref params } => {
+                crate::iop::lens::process(input, output, width, height, resolved, params);
+            }
         }
     }
 }
@@ -2121,6 +2151,24 @@ mod tests {
             !Stage::DenoiseProfile { strength: 1.0, shadows: 1.0, bias: 0.0, mode_y0u0v0: true }
                 .is_pixel_local(),
             "denoiseprofile reads wavelet-scale neighbourhoods ⇒ NOT pixel-local"
+        );
+        // LensCorrection is NOT pixel-local: every output pixel resamples a
+        // per-channel neighbourhood at its warped source coordinate.
+        assert!(
+            !Stage::LensCorrection {
+                lens: crate::iop::lens::ResolvedLens {
+                    ptr: std::ptr::null(),
+                    maker: String::new(),
+                    model: String::new(),
+                    crop_factor: 1.0,
+                    lens_type: c41_sys::lensfun::LF_RECTILINEAR,
+                    min_focal: 24.0,
+                    max_focal: 70.0,
+                },
+                params: crate::iop::lens::LensParams::default(),
+            }
+            .is_pixel_local(),
+            "lens correction warps coordinates ⇒ NOT pixel-local"
         );
     }
 
