@@ -8,6 +8,7 @@
 
 pub mod full_preview;
 pub mod rule_stack;
+pub(crate) mod selection;
 pub mod timeline;
 pub mod zoomable;
 
@@ -102,6 +103,45 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
         vbox.append(&stars_box);
         vbox.append(&colors_box);
         item.set_child(Some(&vbox));
+
+        // Selection clicks (m4-144): plain = exclusive, ctrl = toggle, shift =
+        // range from the anchor. The handler reads the thumb's stamped widget
+        // name at event time, so a recycled cell always acts on its CURRENT
+        // image — no stale-path closure to strip on rebind. The gesture only
+        // observes: it never claims the sequence, so GridView's own handling
+        // (cursor move; double-click activation into darkroom) proceeds.
+        //
+        // Primary button ONLY (senior review MINOR-5): GridView's native
+        // gestures are primary-only, so without this a right-click would
+        // silently rewrite the selection; darktable reserves it for a context
+        // menu. Acted on RELEASE, like the zoomable canvas's click handler
+        // (MINOR-7): a touch/touchpad pan starting on a cell is recognised as
+        // a drag before release and never mutates the selection at press time.
+        let sel_click = gtk4::GestureClick::new();
+        sel_click.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        sel_click.connect_released(|gesture, n_press, _x, _y| {
+            if n_press != 1 {
+                return; // multi-press belongs to activate (open darkroom)
+            }
+            let Some(w) = gesture.widget() else { return };
+            let Some(thumb) = w.downcast::<gtk4::Picture>().ok() else { return };
+            let path = thumb.widget_name().to_string();
+            if !path.contains('/') {
+                return; // placeholder rows are not selectable
+            }
+            let state = gesture.current_event_state();
+            let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+            if shift {
+                selection::range_from_anchor(&selection::current_view_paths(), &path);
+            } else if ctrl {
+                selection::toggle(&path);
+            } else {
+                selection::select_exclusive(&path);
+            }
+            selection::notify_changed();
+        });
+        thumb.add_controller(sel_click);
     });
 
     // ── Bind: fill data + start async loads ────────────────────────────────
@@ -152,6 +192,11 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
             &vbox,
             effective_overlay_visibility(is_placeholder, current_overlay_mode()),
         );
+        // Selection frame (m4-144): re-applied on EVERY bind — cells recycle,
+        // so a class a previous image left behind must be re-decided here, and
+        // this is also what repaints off-screen-selected cells when they
+        // scroll back in.
+        apply_selection_frame(&thumb, selection::contains(&full_path));
 
         if is_placeholder {
             set_stars(&stars_box, 0);
@@ -237,6 +282,9 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
     // lighttable_bg_color (grey_40) — see `crate::theme`.
     grid.add_css_class("c41-lighttable-canvas");
     grid.add_css_class("lighttable-grid");
+    // Multi-selection state's handle on the grid (m4-144): lets the parameter-
+    // free `selection::notify_changed()` repaint realized frames from anywhere.
+    selection::set_grid(&grid);
 
     let scroll = ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -249,6 +297,11 @@ pub fn lighttable_page(db_path: String) -> LighttablePage {
     // scroller. The overlay is the centre slot; lib.rs wraps it with the full
     // preview exactly as it used to wrap the bare scroller.
     let zoom = zoomable::ZoomableCanvas::new(&selection);
+    // The canvas paints selection frames lazily from the shared set (m4-144),
+    // so set-only mutations — Esc, ctrl+A, a click in the OTHER surface — must
+    // queue it a redraw or stale frames linger until the next scroll/zoom/
+    // click (senior review MINOR-6).
+    selection::set_canvas(zoom.area());
     let overlay = gtk4::Overlay::new();
     overlay.set_child(Some(&scroll));
     overlay.add_overlay(&zoom.layer);
@@ -746,33 +799,60 @@ pub(crate) fn fkey_to_color(keyval: gtk4::gdk::Key) -> Option<u8> {
     }
 }
 
-/// Toggle colour label `color` on the grid's currently-selected image and repaint
-/// that one cell's dot row in place (no full reload, so scroll position and the
-/// other cells' in-flight async loads are untouched). No-op when nothing real is
-/// selected (a placeholder row carries no `/`, so `selected_path` returns `None`).
+/// Toggle colour label `color` on every selected image and repaint each
+/// realized cell's dot row in place (no full reload, so scroll position and the
+/// other cells' in-flight async loads are untouched). Since m4-144 the action
+/// fans out over the WHOLE multi-selection — upstream toggles the label bit per
+/// selected image (`dt_colorlabels_toggle_label` per id), which can leave mixed
+/// masks when the selection's labels disagree; that is faithful, not a bug.
+/// Falls back to the cursor image alone when the set is empty.
 ///
-/// The DB write runs off the main thread; the in-place repaint then targets the
-/// realized cell still bound to `path` — matched exactly like `wire_color_clicks`,
-/// except the keyboard path holds no `colors_box` reference, so it must *find* the
-/// row among the grid's cells (see [`repaint_color_dots_for_path`]). If the cell
-/// was recycled or scrolled off-screen by the time the toggle resolves, the
-/// repaint is a no-op and the next bind paints the new mask from the DB.
+/// The DB writes run off the main thread as one serialised write PER IMAGE,
+/// each under that image's own [`path_write_lock`] (senior review MAJOR-3: a
+/// whole-batch-under-the-anchor's-lock shape would run concurrently with a
+/// dot-click on any other selected cell, and the toggle is read-modify-write
+/// in the DB — exactly the race the per-image lock exists to prevent). Each
+/// in-place repaint then targets the realized cell still bound to that path —
+/// matched exactly like `wire_color_clicks`, except the keyboard path holds no
+/// `colors_box` reference, so it must *find* rows among the grid's cells
+/// ([`repaint_color_dots_for_path`]). Cells recycled or scrolled off-screen by
+/// the time the toggle resolves simply miss the repaint; their next bind paints
+/// the new mask from the DB.
 pub fn toggle_selected_color(
     grid: &GridView,
     selection: &SingleSelection,
     db_path: &str,
     color: u8,
 ) {
-    let Some(path) = selected_path(selection) else { return };
+    let mut targets = selection::paths_snapshot();
+    if targets.is_empty() {
+        // darktable parity: with nothing multi-selected, keys act on the
+        // active image.
+        if let Some(path) = selected_path(selection) {
+            targets.push(path);
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
     let db = db_path.to_string();
     glib::spawn_future_local(clone!(@weak grid => async move {
-        let p   = path.clone();
-        let db2 = db.clone();
-        // Skip the repaint on a worker panic (mask unknown — don't clear labels
-        // still in the DB); the next rebind paints the row from the DB.
-        if let Some(mask) =
-            serialized_write(path.clone(), move || toggle_color_label(&p, &db2, color)).await
-        {
+        // Sequential per-target writes: N blocking-pool hops is nothing at
+        // input rates, and a worker panic now costs only the remaining
+        // images' repaints instead of the whole batch.
+        let mut masks = Vec::with_capacity(targets.len());
+        for path in &targets {
+            let p   = path.clone();
+            let db2 = db.clone();
+            let Some(mask) =
+                serialized_write(path.clone(), move || toggle_color_label(&p, &db2, color))
+                    .await
+            else {
+                break; // worker panic: later masks unknown, stop writing AND repainting
+            };
+            masks.push(mask);
+        }
+        for (path, mask) in targets.into_iter().zip(masks) {
             repaint_color_dots_for_path(&grid, &path, mask);
         }
     }));
@@ -844,30 +924,48 @@ pub(crate) fn digit_to_rating(keyval: gtk4::gdk::Key) -> Option<u8> {
     }
 }
 
-/// Set the star `rating` on the grid's currently-selected image and repaint that
+/// Set the star `rating` on every selected image and repaint each realized
 /// cell's star row in place (m4-29). Star sibling of [`toggle_selected_color`],
 /// except ratings are an ABSOLUTE set (digit `k` → rating `k`, matching the star
-/// click handler and darktable) rather than a toggle. No-op when nothing real is
-/// selected. The DB write runs off the main thread; the in-place repaint then
-/// targets the realized cell still bound to `path` (a no-op if it was recycled /
-/// scrolled off, the next bind painting from the DB).
+/// click handler and darktable) rather than a toggle — and since m4-144 the set
+/// fans out over the WHOLE multi-selection, falling back to the cursor image
+/// when nothing is multi-selected. No-op when neither yields a real target.
+/// One serialised write PER IMAGE under its own [`path_write_lock`] — same
+/// shape as [`toggle_selected_color`] (senior review MAJOR-3); per-path
+/// in-place repaints only where the write committed, a no-op for any cell
+/// recycled or scrolled off-screen (its next bind paints from the DB).
 pub fn set_selected_rating(
     grid: &GridView,
     selection: &SingleSelection,
     db_path: &str,
     rating: u8,
 ) {
-    let Some(path) = selected_path(selection) else { return };
+    let mut targets = selection::paths_snapshot();
+    if targets.is_empty() {
+        if let Some(path) = selected_path(selection) {
+            targets.push(path);
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
     let db = db_path.to_string();
     glib::spawn_future_local(clone!(@weak grid => async move {
-        let p   = path.clone();
-        let db2 = db.clone();
-        serialized_write(path.clone(), move || {
-            if let Err(e) = save_rating(&p, &db2, rating) {
-                eprintln!("darkroom: save rating failed for {p}: {e}");
+        let mut written = Vec::with_capacity(targets.len());
+        for path in &targets {
+            let p   = path.clone();
+            let db2 = db.clone();
+            match serialized_write(path.clone(), move || save_rating(&p, &db2, rating)).await {
+                Some(Ok(())) => written.push(path.clone()),
+                Some(Err(e)) => eprintln!("darkroom: save rating failed for {path}: {e}"),
+                None => break, // worker panic: stop writing and repainting
             }
-        }).await;
-        repaint_stars_for_path(&grid, &path, rating);
+        }
+        // Repaint only what committed — stars must never show a value the DB
+        // rejected; the next bind would correct it, but why show it at all.
+        for path in &written {
+            repaint_stars_for_path(&grid, path, rating);
+        }
     }));
 }
 
@@ -924,6 +1022,50 @@ fn find_cell_row_for_path(root: &gtk4::Widget, path: &str, child_index: usize) -
 /// Colour-dot row (4th child, index 3) of the realized cell bound to `path`.
 fn find_color_box_for_path(root: &gtk4::Widget, path: &str) -> Option<gtk4::Box> {
     find_cell_row_for_path(root, path, 3)
+}
+
+// ── Multi-image selection frames (m4-144) ──────────────────────────────────
+
+/// CSS class marking a selected cell's thumbnail; styled as an inset outline
+/// in `theme.rs`, mirroring darktable's selection border without shifting the
+/// layout.
+const SEL_CSS_CLASS: &str = "c41-cell-selected";
+
+fn apply_selection_frame(thumb: &gtk4::Picture, selected: bool) {
+    if selected {
+        thumb.add_css_class(SEL_CSS_CLASS);
+    } else {
+        thumb.remove_css_class(SEL_CSS_CLASS);
+    }
+}
+
+/// Set every REALIZED cell's frame to match the live selection set. Off-screen
+/// cells aren't realized; their next bind applies the frame straight from
+/// [`selection::contains`], which is what makes this walk safe to skip them.
+fn refresh_selection_frames(grid: &GridView) {
+    for_each_realized_cell(grid.upcast_ref::<gtk4::Widget>(), &mut |thumb, path| {
+        apply_selection_frame(thumb, selection::contains(&path));
+    });
+}
+
+/// Visit every realized cell's stamped thumbnail `(thumb, path)` among root's
+/// descendants. A cell is recognised exactly like [`find_cell_row_for_path`]:
+/// a `Box` whose first child is the bind-stamped thumb `Picture`; placeholders
+/// (no `/`) never visit.
+fn for_each_realized_cell(root: &gtk4::Widget, f: &mut dyn FnMut(&gtk4::Picture, String)) {
+    let mut child = root.first_child();
+    while let Some(w) = child {
+        if let Some(vbox) = w.downcast_ref::<gtk4::Box>() {
+            if let Some(thumb) = vbox.first_child().and_downcast::<gtk4::Picture>() {
+                let name = thumb.widget_name().to_string();
+                if name.contains('/') {
+                    f(&thumb, name);
+                }
+            }
+        }
+        for_each_realized_cell(&w, f);
+        child = w.next_sibling();
+    }
 }
 
 /// Star-rating row (3rd child, index 2) of the realized cell bound to `path`.
@@ -1860,7 +2002,7 @@ fn cull_clamp_offset(offset: u32, n_items: u32, window: u32) -> u32 {
 
 /// The grid's *unwindowed* model: the slice's base while culling, the selection's
 /// own model otherwise. Entering culling twice must not stack a window on a window.
-fn cull_base_model(selection: &SingleSelection) -> Option<gtk4::gio::ListModel> {
+pub(crate) fn cull_base_model(selection: &SingleSelection) -> Option<gtk4::gio::ListModel> {
     let model = selection.model()?;
     match model.downcast::<gtk4::SliceListModel>() {
         Ok(slice) => slice.model(),
@@ -2847,6 +2989,15 @@ fn fill_grid(model: &LighttableModel, rows: Vec<String>, empty_placeholder: &str
     // serves both this grid and the zoomable canvas, so it resets exactly where
     // "the collection changed" happens — here, not per consumer.
     thumbs::clear_failed();
+    // Multi-selection reload sweep (m4-144): every collection change funnels
+    // through this single fill — search, rating/colour/sort filter changes,
+    // folder switches, imports (senior review MAJOR-2: reselect_path only sees
+    // the tag-filter and culling paths). Intersecting here keeps the count
+    // label honest on EVERY reload surface and stops stale entries from
+    // receiving keyboard metadata writes while invisible. Placeholder and
+    // notice rows carry no `/`, so they can never match a selected path.
+    selection::prune_to(&rows);
+    selection::sync_count_label();
     let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
     model.splice(0, model.n_items(), &refs);
 }
@@ -3046,7 +3197,6 @@ pub fn selected_path(selection: &SingleSelection) -> Option<String> {
 /// otherwise a reload would silently lose the selection whenever the image sits off
 /// the current page.
 pub fn reselect_path(selection: &SingleSelection, prev: Option<&str>) {
-    let Some(prev) = prev else { return };
     let Some(model) = selection.model() else { return };
     let slice = model.clone().downcast::<gtk4::SliceListModel>().ok();
     let Some(base) = (match &slice {
@@ -3055,7 +3205,9 @@ pub fn reselect_path(selection: &SingleSelection, prev: Option<&str>) {
     }) else {
         return;
     };
-    let Some(idx) = index_of_path(&model_paths(&base), prev) else { return };
+    let base_paths = model_paths(&base);
+    let Some(prev) = prev else { return };
+    let Some(idx) = index_of_path(&base_paths, prev) else { return };
     match &slice {
         Some(slice) => {
             let offset = cull_entry_offset(idx, slice.size());

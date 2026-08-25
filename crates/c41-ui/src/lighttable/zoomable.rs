@@ -556,8 +556,18 @@ fn paint(state: &Rc<CanvasState>, area: &DrawingArea, cr: &gtk4::cairo::Context)
 
                 // The selection frame paints OVER the thumbnail: an image that
                 // fills its contain-rect would otherwise hide three of the four
-                // bars, and "what is selected" is this mode's core affordance.
-                if selected == Some(item.base_index) {
+                // bars. Since m4-144 EVERY selected image gets a frame (the
+                // multi-selection is shared state with the grid); the cursor
+                // keeps its own frame even when nothing else is selected —
+                // "what is active" remains visible when the set is empty.
+                // Deliberate divergence (review NIT): this surface frames the
+                // bare CURSOR too, so after a keyboard cursor move the canvas
+                // can show one more frame than the count label counts — here
+                // "what is active" must stay visible; the grid, which always
+                // shows the cursor natively, doesn't add a second marker.
+                if selected == Some(item.base_index)
+                    || super::selection::contains(&item.path)
+                {
                     draw_frame(cr, cx, cy, cell_i);
                 }
             }
@@ -691,6 +701,11 @@ fn wire_gestures(area: &DrawingArea, scroller: &ScrolledWindow, state: &Rc<Canva
             if let Some(sel) = st.selection_w.upgrade() {
                 sel.set_selected(base_index);
             }
+            // Plain click selects exclusively in the multi-selection too
+            // (m4-144), matching the grid's cells: the canvas and the file
+            // manager show ONE selection, not two.
+            super::selection::select_exclusive(&item_path);
+            super::selection::notify_changed();
         });
         area.add_controller(click);
     }

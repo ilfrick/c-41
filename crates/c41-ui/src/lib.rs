@@ -1024,6 +1024,21 @@ fn build_main_window(app: &Application) {
         let bottom = gtk4::CenterBox::new();
         bottom.add_css_class("toolbar");
 
+        // Selection count (m4-144), centre of the bar. Hidden while the
+        // multi-selection is empty so the idle bar looks exactly as before;
+        // `selection::sync_count_label` owns its text and visibility.
+        {
+            let sel_count = gtk4::Label::new(None);
+            sel_count.set_visible(false);
+            sel_count.add_css_class("caption");
+            sel_count.set_tooltip_text(Some(
+                "Selected images — ctrl+click toggles, shift+click ranges, \
+                 ctrl+A selects all, Esc clears",
+            ));
+            bottom.set_center_widget(Some(&sel_count));
+            lighttable::selection::set_count_label(&sel_count);
+        }
+
         // Rating filter (m4-98b/d). The comparator dropdown picks how the star
         // count is applied; clicking star N sets the count (re-clicking the current
         // floor drops it to 0). Both the lit stars and the dropdown selection read
@@ -1570,6 +1585,27 @@ fn build_main_window(app: &Application) {
             let panel_right_toggle = right_toggle.clone();
             let grid_w = grid.downgrade();
             std::rc::Rc::new(move |keyval, state| {
+            // Multi-select select-all (m4-144) runs BEFORE the modifier bail-out
+            // below — it carries ctrl by definition — and self-guards shift/alt
+            // off (senior review BLOCKER-1: an earlier draft placed this arm
+            // after the bail-out, where ctrl+A could never reach it). With the
+            // full preview up it still acts on the collection underneath: the
+            // preview has no use for the key, and the selection is view-global
+            // state, like darktable's. It spans the WHOLE collection — the
+            // culling base model, not just the visible window.
+            if keyval == gtk4::gdk::Key::A
+                && state.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                && !state.intersects(
+                    gtk4::gdk::ModifierType::SHIFT_MASK | gtk4::gdk::ModifierType::ALT_MASK,
+                )
+            {
+                let paths = lighttable::cull_base_model(&sel)
+                    .map(|m| lighttable::model_paths(&m))
+                    .unwrap_or_default();
+                lighttable::selection::select_all(&paths);
+                lighttable::selection::notify_changed();
+                return glib::Propagation::Stop;
+            }
             if state.intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK | gtk4::gdk::ModifierType::SHIFT_MASK) {
                 return glib::Propagation::Proceed;
             }
@@ -1591,6 +1627,26 @@ fn build_main_window(app: &Application) {
                 if lighttable::cull_step(&grid, forward) {
                     return glib::Propagation::Stop;
                 }
+            }
+            // Bare Escape clears the multi-selection (m4-144). Lock bits are
+            // deliberately ignored — NumLock arrives as MOD2_MASK, CapsLock as
+            // LOCK_MASK, so an exact `is_empty()` test would strand exactly the
+            // keypad users `digit_to_rating` documents support for (senior
+            // review MAJOR-4). Modified Escape propagates, and this arm stays
+            // AFTER the preview handler above so an open preview keeps Escape
+            // for closing.
+            if keyval == gtk4::gdk::Key::Escape
+                && !state.intersects(
+                    gtk4::gdk::ModifierType::CONTROL_MASK
+                        | gtk4::gdk::ModifierType::ALT_MASK
+                        | gtk4::gdk::ModifierType::SHIFT_MASK
+                        | gtk4::gdk::ModifierType::SUPER_MASK
+                        | gtk4::gdk::ModifierType::META_MASK,
+                )
+            {
+                lighttable::selection::clear();
+                lighttable::selection::notify_changed();
+                return glib::Propagation::Stop;
             }
             // Panel toggles (parity audit 1.2). Driven through the header buttons so
             // the key and the click share one path and the button can't be left

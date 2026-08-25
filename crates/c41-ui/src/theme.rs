@@ -212,6 +212,15 @@ popover > contents, menu, .menu {{
 /* ── Tooltips ────────────────────────────────────────────────────────── */
 tooltip {{ background-color: {g10}; color: {g80}; border-radius: 0; }}
 
+/* ── Multi-image selection frame (m4-144) ───────────────────────────── */
+/* Inset outline on the selected cell's thumbnail — darktable's selection
+   border, kept INSIDE the cell box so selecting never shifts the layout.
+   g75 is the theme's accent (same family as the star/label highlights). */
+.c41-cell-selected {{
+  outline: 2px solid {g75};
+  outline-offset: -2px;
+}}
+
 /* ── Canvas backgrounds ──────────────────────────────────────────────── */
 /* THESE TWO ARE FUNCTIONAL, NOT DECORATIVE. darktable puts the darkroom canvas
    at a true middle grey so the surround does not skew your perception of the
