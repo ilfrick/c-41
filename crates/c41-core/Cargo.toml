@@ -16,3 +16,7 @@ rayon        = { workspace = true }
 # Pinned exactly: Cargo.lock is gitignored (CI resolves fresh), and a silent
 # minor bump in the raw decoder must not change how irreplaceable raws decode.
 rawloader    = "=0.37.1"
+# Import-time EXIF probe (m4-135): feeds the collection rule-stack's numeric
+# properties. Pinned for the same reason — parsed values land in the catalogue.
+# Published as `kamadak-exif`; its lib target is named `exif`.
+kamadak-exif = "=0.6.1"

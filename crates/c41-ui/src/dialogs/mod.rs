@@ -555,7 +555,7 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
     // file's header (slow I/O), so it must run before we hold a write lock: doing
     // it inside the insert transaction would pin library.db's write lock across
     // all that I/O and block the rating/colour-label writers for the whole import.
-    let mut pending: Vec<(String, i32, i32)> = Vec::new();
+    let mut pending: Vec<(String, i32, i32, c41_core::exif::ExifMeta)> = Vec::new();
     for entry in walkdir::WalkDir::new(folder)
         .max_depth(1)        // one level; use max_depth(usize::MAX) for recursive
         .into_iter()
@@ -574,7 +574,10 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
         };
         // Probe image dimensions (fall back to 0×0 if unreadable).
         let (w, h) = probe_dims(path).unwrap_or((0, 0));
-        pending.push((filename, w, h));
+        // Probe the EXIF numeric subset for the rule-stack's properties
+        // (m4-135): unreadable/absent tags stay NULL — see ExifMeta's doc.
+        let meta = c41_core::exif::probe_or_none(path);
+        pending.push((filename, w, h, meta));
     }
 
     // Route through open_catalog rather than a bare Connection::open: it
@@ -595,8 +598,14 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
     let tx = conn.unchecked_transaction().ok()?;
     let film_id = film::film_new(&conn, folder).ok()??;
     let mut count = 0usize;
-    for (filename, w, h) in &pending {
-        match image::image_insert(&conn, film_id, filename, *w, *h) {
+    for (filename, w, h, meta) in &pending {
+        let exif = image::ImageExif {
+            exposure: meta.exposure,
+            aperture: meta.aperture,
+            iso: meta.iso,
+            focal_length: meta.focal_length,
+        };
+        match image::image_insert(&conn, film_id, filename, *w, *h, exif) {
             Ok(_) => count += 1,
             Err(e) => {
                 eprintln!("darkroom import: image_insert failed for {filename:?}: {e}");

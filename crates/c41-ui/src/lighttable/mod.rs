@@ -2833,18 +2833,27 @@ fn open_demo_db() -> rusqlite::Connection {
     // `color_labels` is present even though the demo seeds no labels: the m4-126
     // quick filter's fragment references the table unconditionally, and without it
     // a live click would make every subsequent load fail its query into an empty
-    // grid (senior-review MAJOR-1). An empty table yields the correct "(No images)"
-    // placeholder instead. The demo never restores persisted filters (empty prefs
-    // path), so only deliberate clicks can arm the fragment here.
+    // grid (senior-review MAJOR-1). Same class as the m4-135 EXIF columns: a live
+    // numeric rule-stack row splices `(i.exposure<…)` into every loader query, and
+    // without the columns that prepare fails into an empty grid for ALL rows —
+    // including ones a text rule composed via OR should keep (senior-review
+    // MAJOR-1, second occurrence). NULLs seed nothing: unprobed is the truthful
+    // demo state, and NULL never satisfies a comparison. The demo never restores
+    // persisted filters (empty prefs path), so only deliberate clicks can arm the
+    // fragments here.
     conn.execute_batch(
         "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder VARCHAR, access_timestamp INTEGER);
          CREATE TABLE images    (id INTEGER PRIMARY KEY, film_id INTEGER, filename VARCHAR,
-                                 width INTEGER, height INTEGER, flags INTEGER, datetime_taken INTEGER);
+                                 width INTEGER, height INTEGER, flags INTEGER, datetime_taken INTEGER,
+                                 exposure REAL, aperture REAL, iso REAL, focal_length REAL);
          CREATE TABLE color_labels (imgid INTEGER, color INTEGER);
          INSERT INTO film_rolls VALUES (1, '/photos/demo', 0);
-         INSERT INTO images VALUES (1, 1, 'DSC_0001.jpg', 6000, 4000, 0, 100);
-         INSERT INTO images VALUES (2, 1, 'DSC_0002.jpg', 6000, 4000, 0, 200);
-         INSERT INTO images VALUES (3, 1, 'DSC_0003.jpg', 6000, 4000, 0, 300);",
+         INSERT INTO images VALUES (1, 1, 'DSC_0001.jpg', 6000, 4000, 0, 100,
+                                    NULL, NULL, NULL, NULL);
+         INSERT INTO images VALUES (2, 1, 'DSC_0002.jpg', 6000, 4000, 0, 200,
+                                    NULL, NULL, NULL, NULL);
+         INSERT INTO images VALUES (3, 1, 'DSC_0003.jpg', 6000, 4000, 0, 300,
+                                    NULL, NULL, NULL, NULL);",
     )
     .expect("demo data");
     conn
@@ -3043,20 +3052,20 @@ mod tests {
         // order: rating → year → colour → aspect → rules), and an empty/blank
         // stack splices nothing — pinned here because the loaders append this
         // string straight after a WHERE term.
-        use crate::lighttable::rule_stack::{Combinator, Rule, RuleProperty, TextCmp};
+        use crate::lighttable::rule_stack::{Combinator, Rule, RuleProperty, RuleCmp};
         set_filter_preset(FilterPreset::AllImages);
         set_rule_stack(Vec::new());
         assert_eq!(current_filters_sql(), "", "empty stack ⇒ nothing spliced");
 
         // A blank-valued row is state but not SQL: still nothing.
         set_rule_stack(vec![Rule::new(
-            Combinator::And, RuleProperty::FileName, TextCmp::Contains, " ",
+            Combinator::And, RuleProperty::FileName, RuleCmp::Contains, " ",
         )]);
         assert_eq!(current_filters_sql(), "", "all-blank stack ⇒ nothing spliced");
 
         // One real rule lands as the leading-AND fragment…
         set_rule_stack(vec![Rule::new(
-            Combinator::And, RuleProperty::FileName, TextCmp::Contains, "img",
+            Combinator::And, RuleProperty::FileName, RuleCmp::Contains, "img",
         )]);
         assert_eq!(
             current_filters_sql(),
@@ -3080,11 +3089,45 @@ mod tests {
     }
 
     #[test]
+    fn numeric_rule_prepares_against_the_demo_schema() {
+        // Senior-review MAJOR-1 (m4-135): a live numeric rule splices
+        // `(i.exposure<…)` into every loader query, and the demo catalogue's DDL
+        // must carry those columns — without them `prepare` fails and the grid
+        // degrades to empty for ALL rows, including ones an OR-composed text rule
+        // should keep. Same failure class as m4-126's missing `color_labels`.
+        // Prepared against the real demo connection, so a dropped column fails
+        // here rather than at user time; NULL rows match no comparison, so zero
+        // survivors is also the CORRECT answer, not just a non-crashing one.
+        use crate::lighttable::rule_stack::{Combinator, Rule, RuleProperty, RuleCmp};
+        set_filter_preset(FilterPreset::AllImages);
+        set_rule_stack(vec![Rule::new(
+            Combinator::And,
+            RuleProperty::Iso,
+            RuleCmp::Gte,
+            "100",
+        )]);
+        let sql = format!(
+            "SELECT i.filename FROM images i \
+             JOIN film_rolls f ON f.id = i.film_id WHERE 1=1{}",
+            current_filters_sql()
+        );
+        let n = super::open_demo_db()
+            .prepare(&sql)
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .count();
+        assert_eq!(n, 0, "all-NULL demo rows satisfy no comparison");
+        set_rule_stack(Vec::new());
+    }
+
+    #[test]
     fn rule_stack_token_roundtrips_through_the_live_state() {
-        use crate::lighttable::rule_stack::{Combinator, Rule, RuleProperty, TextCmp};
+        use crate::lighttable::rule_stack::{Combinator, Rule, RuleProperty, RuleCmp};
         let original = vec![
-            Rule::new(Combinator::And, RuleProperty::FileName, TextCmp::Contains, "keep"),
-            Rule::new(Combinator::AndNot, RuleProperty::FilmRoll, TextCmp::Excludes, "raw"),
+            Rule::new(Combinator::And, RuleProperty::FileName, RuleCmp::Contains, "keep"),
+            Rule::new(Combinator::AndNot, RuleProperty::FilmRoll, RuleCmp::Excludes, "raw"),
         ];
         set_rule_stack(original.clone());
         let tok = rule_stack_token();
@@ -3229,7 +3272,7 @@ mod tests {
         // hand-written `i.filename`/`f.folder` strings), invalid ESCAPE syntax,
         // or an unneutralised quote/wildcard shows up as wrong survivors or a
         // prepare error rather than a passing string comparison.
-        use crate::lighttable::rule_stack::{self, Combinator, Rule, RuleProperty, TextCmp};
+        use crate::lighttable::rule_stack::{self, Combinator, Rule, RuleProperty, RuleCmp};
         use rusqlite::Connection;
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -3255,7 +3298,7 @@ mod tests {
         };
         use Combinator::{And, AndNot, Or};
         use RuleProperty::{FilmRoll, FileName};
-        use TextCmp::{Contains, Excludes};
+        use RuleCmp::{Contains, Excludes, Gte, Lt};
 
         // A plain filename rule hits exactly its match…
         assert_eq!(
@@ -3285,6 +3328,59 @@ mod tests {
             ]),
             vec!["img_0001.raw", "img_0002.raw", "other.jpg"]
         );
+
+        // ── Numeric properties over the m4-135 EXIF columns ──
+        // Same in-memory db gains the four nullable columns: two probed rows,
+        // one row WITHOUT exif (NULL) — pinning that NULLs never satisfy a
+        // comparison (unknowns stay out of numeric-rule results).
+        conn.execute_batch(
+            "ALTER TABLE images ADD COLUMN exposure REAL;
+             ALTER TABLE images ADD COLUMN aperture REAL;
+             ALTER TABLE images ADD COLUMN iso REAL;
+             ALTER TABLE images ADD COLUMN focal_length REAL;
+             UPDATE images SET exposure = 0.016, iso = 1600, aperture = 4.0 WHERE id = 1;
+             UPDATE images SET exposure = 2.5,  iso = 100,  aperture = 2.8 WHERE id = 2;",
+        )
+        .unwrap();
+        use crate::lighttable::rule_stack::PropertyKind;
+        use RuleProperty::{Exposure as PExp, Iso as PIso};
+        assert_eq!(
+            run(&[Rule::new(And, PIso, Gte, "800")]),
+            vec!["img_0001.raw"]
+        );
+        // Fraction syntax parses before it reaches SQL.
+        assert_eq!(
+            run(&[Rule::new(And, PExp, Lt, "1/60")]),
+            vec!["img_0001.raw"]
+        );
+        // Aperture goes through ITS column too (senior-review m1: a typo in the
+        // stringly-typed column() would otherwise only surface as an M1-style
+        // empty grid at user time).
+        assert_eq!(
+            run(&[Rule::new(And, RuleProperty::Aperture, Gte, "2.8")]),
+            vec!["img_0001.raw", "img_0002.raw"]
+        );
+        assert_eq!(
+            run(&[Rule::new(And, RuleProperty::Aperture, Gte, "3")]),
+            vec!["img_0001.raw"]
+        );
+        // NULL never satisfies ANY comparison: no row has focal_length, so
+        // even the most generous bound keeps nothing.
+        let anyone_wide = [Rule::new(And, RuleProperty::FocalLength, Lt, "100000")];
+        assert_eq!(run(&anyone_wide), Vec::<String>::new());
+        // Probed rows still answer numeric rules normally (0.016 < 1 < 2.5).
+        assert_eq!(run(&[Rule::new(And, PExp, Lt, "1")]), vec!["img_0001.raw"]);
+        // …and the same rows still answer TEXT rules: exclusion is per-rule,
+        // not per-image.
+        assert_eq!(
+            run(&[Rule::new(And, FileName, Contains, ".")]).len(),
+            3
+        );
+        // Kind/comparator mismatch is inert against the real engine too: the
+        // composer SKIPS the rule, so no fragment lands and the whole table
+        // answers — an unusable rule never narrows or errors the query.
+        assert_eq!(run(&[Rule::new(And, PIso, Excludes, "100")]).len(), 3);
+        assert_eq!(PIso.kind(), PropertyKind::Numeric);
     }
 
     #[test]

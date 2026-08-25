@@ -138,6 +138,19 @@ pub fn image_get_id_by_path(
     .optional()
 }
 
+/// The EXIF numeric subset stored alongside an image row (m4-135). Owned here
+/// rather than borrowed from `c41-core` so this crate keeps its dependency
+/// graph minimal; the importer maps its probe struct onto this one-for-one.
+/// `None` fields insert NULL — never 0, because 0 would match numeric rules
+/// (`exposure < 1`) that unknown values must not satisfy.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct ImageExif {
+    pub exposure: Option<f64>,
+    pub aperture: Option<f64>,
+    pub iso: Option<f64>,
+    pub focal_length: Option<f64>,
+}
+
 /// Insert a new image record. Returns the new image id.
 /// Skips insertion if an image with the same film_id and filename already exists.
 pub fn image_insert(
@@ -146,6 +159,7 @@ pub fn image_insert(
     filename: &str,
     width: i32,
     height: i32,
+    exif: ImageExif,
 ) -> rusqlite::Result<dt_imgid_t> {
     // Return existing id if already present
     let existing: Option<dt_imgid_t> = conn
@@ -159,9 +173,19 @@ pub fn image_insert(
         return Ok(id);
     }
     conn.execute(
-        "INSERT INTO main.images (film_id, filename, width, height, flags) \
-         VALUES (?1, ?2, ?3, ?4, 0)",
-        params![film_id, filename, width, height],
+        "INSERT INTO main.images (film_id, filename, width, height, flags, \
+         exposure, aperture, iso, focal_length) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
+        params![
+            film_id,
+            filename,
+            width,
+            height,
+            exif.exposure,
+            exif.aperture,
+            exif.iso,
+            exif.focal_length,
+        ],
     )?;
     Ok(conn.last_insert_rowid() as dt_imgid_t)
 }

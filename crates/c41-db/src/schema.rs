@@ -59,7 +59,33 @@ pub fn ensure_base_schema(conn: &Connection) -> rusqlite::Result<()> {
             ON meta_data (id, key, value);
          CREATE INDEX IF NOT EXISTS main.metadata_index_key ON meta_data (key);
          CREATE INDEX IF NOT EXISTS main.metadata_index_value ON meta_data (value);",
-    )
+    )?;
+    ensure_exif_columns(conn)
+}
+
+/// The four numeric EXIF columns darktable's collection rules filter on
+/// (m4-135). `CREATE TABLE IF NOT EXISTS` can't widen a table an older C-41 or
+/// C-app database already created, so these are idempotent `ADD COLUMN`s: each
+/// runs only when `pragma_table_info` says it's missing. Nullable throughout —
+/// existing rows and unprobed imports keep NULL, which numeric rules treat as
+/// not-matching (see `c41-ui`'s `rule_stack`).
+fn ensure_exif_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for (name, decl) in [
+        ("exposure", "exposure REAL"),
+        ("aperture", "aperture REAL"),
+        ("iso", "iso REAL"),
+        ("focal_length", "focal_length REAL"),
+    ] {
+        let have = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('images') WHERE name = ?1",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if !have {
+            conn.execute(&format!("ALTER TABLE main.images ADD COLUMN {decl}"), [])?;
+        }
+    }
+    Ok(())
 }
 
 /// Create the **durable** tag catalog in the on-disk `data` schema
@@ -178,7 +204,8 @@ mod tests {
 
         // Now the core import path works end to end.
         let film_id = film::film_new(&conn, "/photos/a").unwrap().unwrap();
-        let img = image::image_insert(&conn, film_id, "IMG_0001.dng", 4000, 3000).unwrap();
+        let img = image::image_insert(&conn, film_id, "IMG_0001.dng", 4000, 3000,
+                            image::ImageExif::default()).unwrap();
         assert!(img > 0);
         assert_eq!(image::image_count_all(&conn).unwrap(), 1);
     }
@@ -188,7 +215,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         ensure_base_schema(&conn).unwrap();
         let film_id = film::film_new(&conn, "/photos/a").unwrap().unwrap();
-        image::image_insert(&conn, film_id, "IMG_0001.dng", 100, 100).unwrap();
+        image::image_insert(&conn, film_id, "IMG_0001.dng", 100, 100,
+                            image::ImageExif::default()).unwrap();
 
         // Calling again must not error nor drop the existing row.
         ensure_base_schema(&conn).unwrap();
@@ -242,7 +270,8 @@ mod tests {
 
         // And the full flow works against real files: import + tag.
         let film_id = film::film_new(&conn, "/photos/x").unwrap().unwrap();
-        image::image_insert(&conn, film_id, "a.dng", 10, 10).unwrap();
+        image::image_insert(&conn, film_id, "a.dng", 10, 10,
+                            image::ImageExif::default()).unwrap();
         let tid = tags::tag_new(&conn, "sunset").unwrap().unwrap();
         assert!(tags::tag_attach(&conn, tid, 1).unwrap());
         assert_eq!(tags::tag_list_with_counts(&conn).unwrap().len(), 1);

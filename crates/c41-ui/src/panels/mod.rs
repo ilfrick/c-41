@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::lighttable::{
     self, LighttableModel, lighttable_load_by_folder,
     lighttable_load_by_tag_prefix, color_dot_markup,
-    rule_stack::{self, Combinator, Rule, RuleProperty, TextCmp},
+    rule_stack::{self, Combinator, PropertyKind, Rule, RuleCmp, RuleProperty},
     COLOR_COUNT,
 };
 use c41_db;
@@ -328,7 +328,12 @@ impl LeftPanel {
         struct RuleRow {
             comb: gtk4::DropDown,
             prop: gtk4::DropDown,
-            cmp: gtk4::DropDown,
+            /// Comparator dropdown for textual properties (`contains`/`excludes`).
+            cmp_text: gtk4::DropDown,
+            /// Comparator dropdown for numeric properties (`<`…`>`). Exactly one
+            /// of the two is visible at a time, following the selected property's
+            /// kind — the same visibility-switch pattern the combinator uses.
+            cmp_num: gtk4::DropDown,
             entry: gtk4::Entry,
         }
 
@@ -340,6 +345,17 @@ impl LeftPanel {
             dd
         }
 
+        /// One kind's comparator dropdown: its set's labels, with `cmp`
+        /// preselected (position 0 when `cmp` belongs to the other kind —
+        /// canonical state never carries that combination, but a defensive
+        /// fallback beats a panic).
+        fn cmp_dropdown(set: &[RuleCmp], cmp: RuleCmp) -> gtk4::DropDown {
+            let labels: Vec<&str> = set.iter().map(|c| c.label()).collect();
+            let dd = gtk4::DropDown::from_strings(&labels);
+            dd.set_selected(cmp.position_in(set).unwrap_or(0));
+            dd
+        }
+
         /// A fresh row with `rule`'s state preselected (defaults for the add
         /// path), WIRED before it returns. Handlers connect exactly once, here —
         /// rows are reused across add/delete rebuild passes (only the observer's
@@ -348,54 +364,99 @@ impl LeftPanel {
         /// reload cycles per edit. Preselection happens BEFORE connecting so
         /// construction writes fire nothing.
         fn new_rule_row(rule: Option<&Rule>, rows: &Rows) -> RuleRow {
-            let (prop_i, cmp_i, comb_i, value) = match rule {
+            let (prop_i, rule_cmp, comb_i, value) = match rule {
                 Some(r) => (
                     r.property.to_index(),
-                    r.cmp.to_index(),
+                    r.cmp,
                     r.comb.to_index(),
                     r.value.clone(),
                 ),
-                None => (0, 0, 0, String::new()),
+                None => (0, RuleCmp::Contains, 0, String::new()),
             };
+            // The property decides which comparator family this row shows; each
+            // dropdown preselects `rule_cmp` within its own set (position 0 if
+            // it belongs to the other family).
+            let property = RuleProperty::from_index(prop_i);
+            let numeric = property.kind() == PropertyKind::Numeric;
+            let placeholder = if numeric { "e.g. 1/60, 2.8, 1600…" } else { "substring…" };
             let comb = string_dropdown(&Combinator::ALL.map(|c| c.label()), comb_i);
             let prop = string_dropdown(&RuleProperty::ALL.map(|p| p.label()), prop_i);
-            let cmp = string_dropdown(&TextCmp::ALL.map(|c| c.label()), cmp_i);
+            let cmp_text = cmp_dropdown(&RuleCmp::TEXT_SET, rule_cmp);
+            let cmp_num = cmp_dropdown(&RuleCmp::NUMERIC_SET, rule_cmp);
+            cmp_text.set_visible(!numeric);
+            cmp_num.set_visible(numeric);
             let entry = {
                 let e = gtk4::Entry::new();
                 e.set_text(&value);
+                e.set_placeholder_text(Some(placeholder));
                 e
             };
             // Every widget funnels through apply_from; its sync-guard makes the
-            // programmatic writes below inert during observer passes.
+            // programmatic writes below inert during observer passes. The
+            // property handler additionally flips the comparator visibility so
+            // a kind change swaps families in place.
             let rows_comb = rows.clone();
             comb.connect_selected_notify(move |_| {
                 apply_from(&rows_comb);
             });
-            let rows_prop = rows.clone();
-            prop.connect_selected_notify(move |_| {
-                apply_from(&rows_prop);
+            {
+                let rows_prop = rows.clone();
+                let cmp_text = cmp_text.clone();
+                let cmp_num = cmp_num.clone();
+                let entry = entry.clone();
+                prop.connect_selected_notify(move |p| {
+                    let numeric =
+                        RuleProperty::from_index(p.selected()).kind() == PropertyKind::Numeric;
+                    cmp_text.set_visible(!numeric);
+                    cmp_num.set_visible(numeric);
+                    entry.set_placeholder_text(Some(if numeric {
+                        "e.g. 1/60, 2.8, 1600…"
+                    } else {
+                        "substring…"
+                    }));
+                    apply_from(&rows_prop);
+                });
+            }
+            let rows_cmptext = rows.clone();
+            cmp_text.connect_selected_notify(move |_| {
+                apply_from(&rows_cmptext);
             });
-            let rows_cmp = rows.clone();
-            cmp.connect_selected_notify(move |_| {
-                apply_from(&rows_cmp);
+            let rows_cmpnum = rows.clone();
+            cmp_num.connect_selected_notify(move |_| {
+                apply_from(&rows_cmpnum);
             });
             let rows_entry = rows.clone();
             entry.connect_changed(move |_| {
                 apply_from(&rows_entry);
             });
-            RuleRow { comb, prop, cmp, entry }
+            RuleRow { comb, prop, cmp_text, cmp_num, entry }
         }
 
         /// Read every row's widgets into canonical `Rule`s. Blank values are
         /// legal state — the SQL composer skips them — so "what the controls
-        /// show" round-trips without surprises.
+        /// show" round-trips without surprises. The comparator comes from the
+        /// row's VISIBLE dropdown, mapped back through its kind's set (the
+        /// hidden sibling is ignored, so its stale position never leaks).
         fn collect(rows: &[RuleRow]) -> Vec<Rule> {
             rows.iter()
-                .map(|r| Rule {
-                    property: RuleProperty::from_index(r.prop.selected()),
-                    cmp: TextCmp::from_index(r.cmp.selected()),
-                    comb: Combinator::from_index(r.comb.selected()),
-                    value: r.entry.text().to_string(),
+                .map(|r| {
+                    let property = RuleProperty::from_index(r.prop.selected());
+                    let cmp = match property.kind() {
+                        PropertyKind::Text => {
+                            let i = r.cmp_text.selected() as usize;
+                            RuleCmp::TEXT_SET.get(i).copied().unwrap_or(RuleCmp::TEXT_SET[0])
+                        }
+                        PropertyKind::Numeric => {
+                            let i = r.cmp_num.selected() as usize;
+                            RuleCmp::NUMERIC_SET.get(i).copied().unwrap_or(RuleCmp::NUMERIC_SET[0])
+                        }
+                    };
+                    Rule {
+                        property,
+                        cmp,
+                        comb: Combinator::from_index(r.comb.selected()),
+                        value: r.entry.text().to_string(),
+                    }
                 })
                 .collect()
         }
@@ -426,12 +487,21 @@ impl LeftPanel {
                 if i > 0 {
                     row.comb.set_margin_start(12);
                 }
-                for w in [&row.comb, &row.prop, &row.cmp] {
+                // Both comparator dropdowns ride every layout; exactly one is
+                // visible (set in new_rule_row and flipped by the property
+                // handler) — visibility survives reparenting, so the layout
+                // pass never needs to re-derive it.
+                for w in [&row.comb, &row.prop, &row.cmp_text, &row.cmp_num] {
                     w.set_size_request(84, -1);
                     b.append(w);
                 }
                 row.entry.set_hexpand(true);
-                row.entry.set_placeholder_text(Some("substring…"));
+                // Placeholder NOT touched here: it's kind-dependent (numeric
+                // examples vs "substring…") and its owners are `new_rule_row`
+                // and the property handler — the only two paths that can change
+                // a row's kind. Re-asserting a text placeholder on every layout
+                // pass would clobber a numeric row's (senior-review MAJOR-2,
+                // m4-135). Like visibility, the property survives reparenting.
                 b.append(&row.entry);
                 let del = gtk4::Button::from_icon_name("window-close-symbolic");
                 del.add_css_class("flat");

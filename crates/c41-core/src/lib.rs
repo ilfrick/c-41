@@ -9,6 +9,7 @@ pub mod curve_tools;
 pub mod colorreconstruct;
 pub mod dwt;
 pub mod error;
+pub mod exif;
 pub mod gaussian;
 pub mod geometry;
 pub mod icc;
