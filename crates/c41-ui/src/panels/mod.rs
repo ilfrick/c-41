@@ -7,7 +7,7 @@
 use adw::prelude::*;
 use glib::clone;
 use crate::lighttable::{
-    LighttableModel, lighttable_load_by_color_mask, lighttable_load_by_folder,
+    self, LighttableModel, lighttable_load_by_folder,
     lighttable_load_by_tag_prefix, color_dot_markup, COLOR_COUNT,
 };
 use c41_db;
@@ -17,7 +17,7 @@ use c41_db;
 /// The tag-section state a tag rename/delete popover needs, split out of
 /// `LeftPanel` (m4-27) so the per-row secondary-click gesture reconstructs
 /// exactly these fields on demand rather than a whole `LeftPanel` (which would
-/// otherwise have to supply the folder/colour-filter fields the menu ignores).
+/// otherwise drag along the folder filter and colour section the menu ignores).
 /// All fields are GObject ref-counts (plus a `String`), so it is `Clone` and cheap
 /// to hand to the deferred rename/delete closures. Owns every tag-mutation method
 /// (refresh / append-row / rename / delete); `LeftPanel` delegates to it.
@@ -43,8 +43,9 @@ struct TagPanel {
 /// in place via [`LeftPanel::refresh_tags`] after a tag is attached elsewhere
 /// (e.g. from the metadata panel), so newly-created tags and changed counts
 /// appear without restarting the app. The tag list + all tag-mutation logic live
-/// in the [`TagPanel`] field; `LeftPanel` owns the folder + colour filters and
-/// delegates the tag operations.
+/// in the [`TagPanel`] field; `LeftPanel` owns the folder filter and the colour
+/// section's widgets, whose state lives in `lighttable`'s canonical quick-filter
+/// (m4-126) rather than here.
 ///
 /// All fields are GObject ref-counts (plus the `TagPanel`, itself ref-counts), so
 /// `LeftPanel` is Clone and can be handed to the metadata panel's change callback
@@ -55,15 +56,6 @@ pub struct LeftPanel {
     /// Film-roll (folder) list box, incl. the "All images" row. Held so
     /// [`LeftPanel::clear_filter_highlights`] can drop a stale highlight.
     list_box:    gtk4::ListBox,
-    /// Colour-label filter box: five independent `CheckButton`s (multi-select,
-    /// unlike the Single-selection folder/tag lists), so a filter can combine
-    /// several colours. Held so [`LeftPanel::clear_filter_highlights`] can reset
-    /// the checks when something outside the panel takes over the grid.
-    color_box:   gtk4::Box,
-    /// Guards the colour `CheckButton`s' `connect_toggled` while we reset them
-    /// programmatically (mutual-exclusion / clear), so a batch of unchecks fires
-    /// no grid reload. Shared with the colour handlers built in `new`.
-    color_suppress: std::rc::Rc<std::cell::Cell<bool>>,
     /// Tag section (list + all tag-mutation methods), split out so its rename/
     /// delete popover doesn't reconstruct the whole panel — see [`TagPanel`].
     tags:        TagPanel,
@@ -149,21 +141,19 @@ impl LeftPanel {
             .build();
         tag_box.add_css_class("navigation-sidebar");
 
-        // Colour-label filter box, built up-front for the same reason as `tag_box`
-        // (the folder handler below clears it on a folder click). UNLIKE the folder
-        // and tag Single-selection lists, this is a multi-select set of independent
-        // `CheckButton`s (m4-26): a colour filter can combine several colours under
-        // an Any (OR) / All (AND) combine mode (the `mode_toggle` below). Picking a
-        // folder or tag still clears every colour check (mutual exclusion — no stale
-        // check implying a colour filter that isn't running), via `clear_color_checks`
-        // under `color_suppress` so the batch unchecks fire no grid reload.
+        // Colour-label quick-filter box (m4-126 reconcile): a multi-select set of
+        // independent `CheckButton`s plus an Any/All mode toggle (m4-26), now ONE
+        // MIRROR of the canonical filter state that lives in
+        // `lighttable::set_colour_filter` alongside the rating/year filters — so it
+        // composes ON TOP of whatever collection is active (folder / tag / search /
+        // all) exactly like darktable's bar-mounted filters, and the top/bottom
+        // bars' circles (lib.rs) drive the same state through the observer bus.
+        // Collection switches therefore leave this filter alone (as they do the
+        // stars); there is no mutual-exclusion clearing any more, because the AND
+        // it implies really is running.
         let color_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .build();
-        let color_suppress = std::rc::Rc::new(std::cell::Cell::new(false));
-        // Combine mode: false = Any (OR, the default), true = All (AND). Shared with
-        // the colour handlers; sticky across clears (clearing resets checks, not mode).
-        let color_mode = std::rc::Rc::new(std::cell::Cell::new(false));
         for idx in 0..COLOR_COUNT {
             append_color_check(&color_box, idx);
         }
@@ -178,12 +168,13 @@ impl LeftPanel {
             .build();
 
         // Activate: reload lighttable with folder filter, dropping any tag filter.
+        // The colour quick-filter is NOT dropped: like the star filter, it composes
+        // on top of whatever collection this click selects (m4-126).
         let db = db_path.to_string();
         let at_folder = active_tag.clone();
         list_box.connect_row_activated(
-            clone!(@weak lt_model, @weak tag_box, @weak color_box, @strong color_suppress => move |_, row| {
+            clone!(@weak lt_model, @weak tag_box => move |_, row| {
             tag_box.unselect_all();
-            clear_color_checks(&color_box, &color_suppress);   // drop any colour filter
             *at_folder.borrow_mut() = None;   // a folder/all view is not a tag filter
             let folder_filter: Option<String> = row
                 .widget_name()
@@ -209,64 +200,61 @@ impl LeftPanel {
             COLLECTIONS_SECTION_PREF_KEY,
         ));
 
-        // ── Colours (colour-label filter) ─────────────────────────────────
+        // ── Colours (colour-label quick filter) ───────────────────────────
         // The five colour labels as independent checks plus an Any/All combine
-        // toggle; checking any subset shows the images matching that colour mask
-        // (m4-26). Always present (the colour domain is fixed, not data-driven), so
-        // no refresh/visibility toggle is needed. The `color_box` + checks were
-        // built above; here we wire the shared reload and append the widgets.
+        // toggle (m4-26), driving the CANONICAL compose-on-top filter state
+        // (`lighttable::set_colour_filter`, m4-126) rather than a collection of
+        // their own. Always present (the colour domain is fixed, not data-driven),
+        // so no refresh/visibility toggle is needed. The `color_box` + checks were
+        // built above.
         let colours_header = section_header("Colours");
         let colours_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
 
-        // Shared reload: read the current colour mask off the checks, clear the
-        // folder/tag highlights + active tag (a colour view is not a tag filter, so
-        // a later tag mutation must not re-run the tag-prefix loader here), and load
-        // by mask + mode. An empty mask loads all images (handled in the loader), so
-        // unchecking the last colour cleanly returns to the full library.
-        let db_colors = db_path.to_string();
-        let at_color = active_tag.clone();
-        let reload_colors: std::rc::Rc<dyn Fn()> = {
-            let lt_w = lt_model.downgrade();
-            let list_box_w = list_box.downgrade();
-            let tag_box_w = tag_box.downgrade();
-            let color_box_w = color_box.downgrade();
-            let mode = color_mode.clone();
-            std::rc::Rc::new(move || {
-                let (Some(lt), Some(color_box)) = (lt_w.upgrade(), color_box_w.upgrade())
-                else { return };
-                if let Some(lb) = list_box_w.upgrade() { lb.unselect_all(); }
-                if let Some(tb) = tag_box_w.upgrade() { tb.unselect_all(); }
-                *at_color.borrow_mut() = None;
-                let mask = color_mask_from_box(&color_box);
-                lighttable_load_by_color_mask(&lt, &db_colors, mask, mode.get());
-            })
-        };
+        // Seed the mirrors from the restored canonical state BEFORE connecting any
+        // handler — same ordering contract as the bottom bar's comparator seeding:
+        // a programmatic write with no handler connected fires nothing.
+        seed_colour_controls(&color_box, &mode_toggle);
 
-        // Each colour check reloads when toggled (unless we're resetting them).
-        let mut child = color_box.first_child();
-        while let Some(w) = child {
-            if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
-                let r = reload_colors.clone();
-                let supp = color_suppress.clone();
-                check.connect_toggled(move |_| {
-                    if !supp.get() { r(); }
-                });
+        // Each check pushes the box's full mask into the canonical state. An empty
+        // mask means "no colour restriction" there, so unchecking the last colour
+        // cleanly drops just this filter off the current view. Programmatic writes
+        // (the sync observer below) are skipped via the shared guard.
+        {
+            let color_box = color_box.clone();
+            let mut child = color_box.first_child();
+            while let Some(w) = child {
+                if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
+                    let color_box = color_box.clone();
+                    check.connect_toggled(move |_| {
+                        if lighttable::filter_sync_in_progress() { return; }
+                        lighttable::set_colour_filter(
+                            color_mask_from_box(&color_box),
+                            lighttable::current_colour_all(),
+                        );
+                    });
+                }
+                child = w.next_sibling();
             }
-            child = w.next_sibling();
         }
 
-        // Any/All toggle flips the combine mode and re-runs the filter (only if a
-        // colour is actually selected — flipping mode with none checked is a no-op).
+        // Any/All toggle flips the combine mode in the canonical state. Flipping
+        // with no colours selected changes nothing on screen (empty fragment), but
+        // writing it anyway keeps the state exactly what the controls show.
+        mode_toggle.connect_toggled(move |btn| {
+            if lighttable::filter_sync_in_progress() { return; }
+            lighttable::set_colour_filter(lighttable::current_colour_mask(), btn.is_active());
+        });
+
+        // Observer half: repaint these mirrors whenever ANY control changes the
+        // filter (this panel's own checks, either bar's circles). The bus invokes
+        // this inside its sync pass, so these programmatic writes are covered by
+        // the guard and the handlers above skip them — no guard consultation in
+        // here (the pass itself guarantees it), only in the handlers.
         {
-            let r = reload_colors.clone();
-            let mode = color_mode.clone();
-            let color_box_w = color_box.downgrade();
-            mode_toggle.connect_toggled(move |btn| {
-                mode.set(btn.is_active());
-                btn.set_label(if btn.is_active() { "Match all" } else { "Match any" });
-                if let Some(color_box) = color_box_w.upgrade() {
-                    if color_mask_from_box(&color_box) != 0 { r(); }
-                }
+            let color_box = color_box.clone();
+            let mode_toggle = mode_toggle.clone();
+            lighttable::add_filter_observer(move || {
+                sync_colour_controls_display(&color_box, &mode_toggle);
             });
         }
         content.append(&collapsible_section(
@@ -293,9 +281,10 @@ impl LeftPanel {
         let db_tags = db_path.to_string();
         let at_tag = active_tag.clone();
         tag_box.connect_row_activated(
-            clone!(@weak lt_model, @weak list_box, @weak color_box, @strong color_suppress => move |_, row| {
+            clone!(@weak lt_model, @weak list_box => move |_, row| {
             list_box.unselect_all();
-            clear_color_checks(&color_box, &color_suppress);   // drop any colour filter
+            // The colour quick-filter is NOT dropped here either: like the star
+            // filter it composes on top of the collection (m4-126).
             // The full `parent|child` path is encoded in the row's widget name
             // (see append_tag_tree_row) for both real and virtual nodes. Clicking
             // either filters to that tag plus its whole hierarchical subtree.
@@ -333,29 +322,29 @@ impl LeftPanel {
         let lp = Self {
             widget: panel,
             list_box,
-            color_box,
-            color_suppress,
             tags,
         };
         lp.tags.refresh_tags();
         lp
     }
 
-    /// Drop the selection highlight from all three filter boxes (folders / tags /
-    /// colours). Called from lib.rs when something *outside* the left panel takes
-    /// over the grid — a name search or an import/reset — so a highlighted row
-    /// doesn't outlive the filter it stood for. The in-panel folder/tag/colour
-    /// handlers already cross-clear each other on click; this covers the paths
-    /// that can't reach the boxes (they only hold the shared `active_tag`).
+    /// Drop the selection highlight from the folder and tag list boxes — the two
+    /// COLLECTION selectors. Called from lib.rs when something *outside* the left
+    /// panel takes over the grid — a name search or an import/reset — so a
+    /// highlighted row doesn't outlive the collection it stood for.
+    ///
+    /// The colour quick-filter is deliberately NOT touched: since m4-126 it is a
+    /// compose-on-top filter (like the bottom bar's stars), not a collection, so
+    /// it stays in force across these reloads and its mirrors keep telling the
+    /// truth.
     ///
     /// Invariant: call this exactly on the paths that *supersede* the active
-    /// filter (i.e. null `active_tag`). Do NOT call it from a path that reloads
-    /// the grid while *preserving* the filter (e.g. `reapply_tag_filter`), or the
-    /// highlight would be wrongly cleared from a filter that's still in force.
+    /// collection (i.e. null `active_tag`). Do NOT call it from a path that reloads
+    /// the grid while *preserving* the collection (e.g. `reapply_tag_filter`), or
+    /// the highlight would be wrongly cleared from a filter that's still in force.
     pub fn clear_filter_highlights(&self) {
         self.list_box.unselect_all();
         self.tags.tag_box.unselect_all();
-        clear_color_checks(&self.color_box, &self.color_suppress);
     }
 
     /// Register a callback fired after a tag is renamed or deleted here, so the
@@ -1059,7 +1048,7 @@ fn append_color_check(color_box: &gtk4::Box, idx: u8) {
 /// check for colour `c` is ticked. The index is parsed from each check's widget
 /// name (stamped by [`append_color_check`]); an unparseable name is skipped (it
 /// can't occur from `append_color_check`, but we never want a stray child to panic
-/// the mask read). Thin GTK glue over the pure `build_color_mask_query` seam.
+/// the mask read).
 fn color_mask_from_box(color_box: &gtk4::Box) -> u8 {
     let mut mask = 0u8;
     let mut child = color_box.first_child();
@@ -1076,23 +1065,40 @@ fn color_mask_from_box(color_box: &gtk4::Box) -> u8 {
     mask
 }
 
-/// Uncheck every colour check in `color_box` without firing a grid reload — the
-/// caller is switching to a folder/tag filter (or clearing all filters), which
-/// loads the grid itself. `suppress` gates the checks' `connect_toggled` reload
-/// for the duration of the programmatic unticks.
-fn clear_color_checks(color_box: &gtk4::Box, suppress: &std::cell::Cell<bool>) {
-    // Save/restore (not a bare set-false) so this stays correct if a future caller
-    // ever wraps it inside its own suppressed batch — the outer window isn't
-    // prematurely re-armed. No caller nests it today; this just removes the footgun.
-    let prev = suppress.replace(true);
+/// Repaint the colour section's mirrors (checks + Any/All toggle) from the
+/// canonical quick-filter state. The single display-write shared by the startup
+/// seed ([`seed_colour_controls`]) and the filter observer, so both stay in exact
+/// step with `lighttable::current_colour_mask/_all`. Runs under the observer bus's
+/// sync guard whenever the bus invokes it; called bare at startup only because no
+/// handler is connected yet at that point.
+///
+/// Colour indices come from each check's widget name (stamped by
+/// [`append_color_check`]), the same source [`color_mask_from_box`] reads — one
+/// indexing strategy over the children, so a stray non-check child could never
+/// silently misalign the two directions.
+fn sync_colour_controls_display(color_box: &gtk4::Box, mode_toggle: &gtk4::ToggleButton) {
+    let mask = lighttable::current_colour_mask();
+    let all = lighttable::current_colour_all();
     let mut child = color_box.first_child();
     while let Some(w) = child {
         if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
-            check.set_active(false);
+            if let Ok(idx) = check.widget_name().parse::<u8>() {
+                check.set_active(mask & (1 << idx) != 0);
+            }
         }
         child = w.next_sibling();
     }
-    suppress.set(prev);
+    mode_toggle.set_label(if all { "Match all" } else { "Match any" });
+    // Fires `toggled` only on change; the handlers skip it regardless when the bus
+    // is mid-pass.
+    mode_toggle.set_active(all);
+}
+
+/// Seed the colour mirrors from the restored canonical state BEFORE any handler is
+/// connected (the bottom-bar comparator's seeding contract: a programmatic write
+/// with nothing listening fires nothing).
+fn seed_colour_controls(color_box: &gtk4::Box, mode_toggle: &gtk4::ToggleButton) {
+    sync_colour_controls_display(color_box, mode_toggle);
 }
 
 fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {

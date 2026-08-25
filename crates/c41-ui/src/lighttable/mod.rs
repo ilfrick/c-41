@@ -542,6 +542,95 @@ pub(crate) fn set_color_dots(colors_box: &gtk4::Box, mask: u8) {
     }
 }
 
+/// Where the colour quick-filter token persists (same store as
+/// `lib.rs`'s `RATING_FILTER_PREF_KEY`). `pub(crate)` because `lib.rs` owns the db
+/// path: it restores from this key at startup and runs the single persist observer
+/// that writes it.
+pub(crate) const COLOUR_FILTER_PREF_KEY: &str = "colour_filter";
+
+/// The lighttable quick-filter's colour circles (m4-126) — darktable's bar-mounted
+/// colour filter. Five buttons drawn with the SAME Pango dot glyphs as the grid
+/// cells ([`color_dot_markup`], one source of truth for hues), lit per the live
+/// [`current_colour_mask`]; clicking one toggles that colour's bit through
+/// [`set_colour_filter`]. The left panel's checks and this row are two mirrors of
+/// one state — [`add_filter_observer`] keeps them in step in both directions, and
+/// persists the compact token (`db_path`) so the filter survives a restart.
+///
+/// Built twice (top bar + bottom bar); each instance registers its own
+/// display-refresh observer, so a change through any control repaints both rows.
+/// Persistence is deliberately NOT here — it lives in one app-level observer in
+/// `lib.rs` (`COLOUR_FILTER_PREF_KEY`), so N mirrors still mean one write per
+/// change. Main-thread only.
+pub fn colour_circles_row() -> gtk4::Box {
+    let row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(0)
+        .build();
+    row.add_css_class("linked");
+    row.set_tooltip_text(Some("Filter by colour label"));
+    // Accessibility: same treatment as the grid cells' dot rows above.
+    row.set_accessible_role(gtk4::AccessibleRole::Group);
+    row.update_property(&[gtk4::accessible::Property::Label("Colour label filter")]);
+
+    let circles: std::rc::Rc<Vec<gtk4::Button>> = std::rc::Rc::new(
+        (0..COLOR_COUNT)
+            .map(|idx| {
+                let b = gtk4::Button::new();
+                let lbl = gtk4::Label::new(None);
+                lbl.set_markup(&color_dot_markup(idx, false));
+                b.set_child(Some(&lbl));
+                let c = format!("colour {idx}");
+                b.set_tooltip_text(Some(&c));
+                // The only text content is the Pango dot glyph, so give assistive
+                // tech a real name (the tooltip alone isn't one).
+                let name = format!("Filter colour {idx}");
+                b.update_property(&[gtk4::accessible::Property::Label(name.as_str())]);
+                b
+            })
+            .collect(),
+    );
+    for b in circles.iter() {
+        row.append(b);
+    }
+
+    // Lit-state repaint from the live mask. Registered as an observer so changes
+    // made anywhere else (left panel checks, the OTHER bar's circles) land here.
+    let refresh: std::rc::Rc<dyn Fn()> = {
+        let circles = circles.clone();
+        Rc::new(move || {
+            let mask = current_colour_mask();
+            for (i, b) in circles.iter().enumerate() {
+                let Some(lbl) = b.child().and_downcast::<gtk4::Label>() else { continue };
+                lbl.set_markup(&color_dot_markup(i as u8, mask & (1 << i) != 0));
+            }
+        })
+    };
+
+    for (i, b) in circles.iter().enumerate() {
+        b.connect_clicked(move |_| {
+            // Consult the sync guard like every other filter control: inert today
+            // (plain Buttons only emit `clicked` on real input), but it stops being
+            // inert the moment these become toggles an observer sets — see the
+            // bottom-bar stars' identical comment. No explicit repaint needed:
+            // `set_colour_filter` fans out through the observer bus, which
+            // includes this row's own refresh.
+            if filter_sync_in_progress() {
+                return;
+            }
+            set_colour_filter(current_colour_mask() ^ (1 << i), current_colour_all());
+        });
+    }
+    refresh(); // sync to whatever was restored at startup
+
+    {
+        let refresh = refresh.clone();
+        add_filter_observer(move || {
+            refresh();
+        });
+    }
+    row
+}
+
 /// Attach a GestureClick to each dot so clicking colour `c` toggles that label
 /// and repaints the row from the resulting mask (see `wire_star_clicks` for the
 /// once-per-bind-cycle rationale).
@@ -1312,6 +1401,15 @@ thread_local! {
     /// writes those observers make aren't mistaken for user edits — see
     /// [`filter_sync_in_progress`] and [`FilterSyncGuard`].
     static FILTER_SYNC_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// The colour-label quick-filter bitmask (m4-126): bit `c` = colour `c`, 0 =
+    /// no colour filter. Composes ON TOP of whatever collection is active (folder /
+    /// tag / search / all), like [`MIN_RATING`] and [`YEAR_RANGE`] — it is no longer
+    /// a collection selector itself; the left panel's checks and both bars' circles
+    /// are three mirrors of this one state.
+    static COLOUR_MASK: Cell<u8> = const { Cell::new(0) };
+    /// How [`COLOUR_MASK`] combines when several bits are set: `false` = any (OR),
+    /// `true` = all (AND). Sticky across clears.
+    static COLOUR_ALL: Cell<bool> = const { Cell::new(false) };
     /// A closure that re-runs the *current* view's loader. Each loader registers
     /// itself here on every call (capturing its own args), so the sort dropdown
     /// can re-apply the view under a new order without the trigger sites (folder
@@ -1811,20 +1909,69 @@ fn current_rating_sql() -> String {
     rating_predicate(current_min_rating(), current_rating_compare())
 }
 
-/// The year range the timeline is filtering to right now (`None` = all years).
+/// The year range the timeline is filtering to now (`None` = all years).
 pub fn current_year_range() -> Option<(i32, i32)> {
     YEAR_RANGE.with(|r| r.get())
 }
 
+/// The colour quick-filter mask live right now (bit `c` = colour `c`, 0 = none).
+/// `pub` so the left panel and both bars' circles can seed/refresh their displays.
+pub fn current_colour_mask() -> u8 {
+    COLOUR_MASK.with(|m| m.get())
+}
+
+/// Whether the colour filter combines several selected colours with AND (`true`)
+/// or OR (`false`). `pub` so the left panel's Any/All toggle can seed itself.
+pub fn current_colour_all() -> bool {
+    COLOUR_ALL.with(|a| a.get())
+}
+
+/// Set the colour-label quick filter (`mask` bit `c` = colour `c`, 0 = no colour
+/// restriction; `match_all` = require every selected colour) and re-render the
+/// current view under it. Composes with whatever collection is active, like the
+/// rating filter. Main-thread only.
+pub fn set_colour_filter(mask: u8, match_all: bool) {
+    COLOUR_MASK.with(|m| m.set(mask & 0x1F));
+    COLOUR_ALL.with(|a| a.set(match_all));
+    filter_changed();
+}
+
+/// The colour quick-filter as one trailing ` AND …` fragment over the row's `id`
+/// column — a correlated subquery counting which of the selected colours the image
+/// carries. `>= 1` is OR semantics ("any"), `= N` is AND ("all"). Empty when
+/// `mask` is 0 (the no-filter state), so splicing it is always safe. Pure, so the
+/// fragment shape is unit-testable without a display.
+///
+/// References `main.color_labels` unconditionally, so it must only splice into
+/// queries run against a real catalogue (which always has the table — darktable's
+/// schema); the in-memory demo db does not, but it also has no prefs store, so a
+/// persisted filter can never be restored there.
+fn colour_predicate(mask: u8, match_all: bool) -> String {
+    let colors = colors_from_mask(mask);
+    if colors.is_empty() {
+        return String::new();
+    }
+    let in_list = colors.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+    let n = colors.len();
+    // ANY = at least one of the chosen colours; ALL = every one of them.
+    let (op, bound) = if match_all { ("=", n) } else { (">=", 1) };
+    format!(
+        " AND ((SELECT COUNT(DISTINCT cl.color) FROM main.color_labels cl \
+         WHERE cl.imgid = i.id AND cl.color IN ({in_list})) {op} {bound})"
+    )
+}
+
 /// **Every** compose-on-top quick filter as one trailing ` AND …` fragment: the
-/// rating filter (m4-98b/d) plus the timeline's year range (m4-99). Loaders splice
-/// this single string, so adding a filter never means touching them again — and
-/// they can't accidentally apply one but not another.
+/// rating filter (m4-98b/d), the timeline's year range (m4-99), and the colour
+/// quick filter (m4-126). Loaders splice this single string, so adding a filter
+/// never means touching them again — and they can't accidentally apply one but not
+/// another.
 fn current_filters_sql() -> String {
     format!(
-        "{}{}",
+        "{}{}{}",
         current_rating_sql(),
         timeline::year_range_and(current_year_range()),
+        colour_predicate(current_colour_mask(), current_colour_all()),
     )
 }
 
@@ -1887,7 +2034,50 @@ fn parse_rating_filter_token(tok: &str) -> (RatingCompare, u8) {
             }
         }
     }
-    (RatingCompare::AtLeast, 0) // "off" and anything unrecognised ⇒ no filter
+    (RatingCompare::AtLeast, 0) // "off" and sibling tokens' fallback ⇒ no filter
+}
+
+/// Colour quick-filter token pieces — same compact scheme as the rating filter's
+/// ([`RATING_TOK_OFF`]): `off`, or `any:M` / `all:M` with the 5-bit mask in decimal.
+const COLOUR_TOK_OFF: &str = "off";
+const COLOUR_TOK_ANY: &str = "any:";
+const COLOUR_TOK_ALL: &str = "all:";
+
+/// Pure encoder for `(mask, match_all)` — `off`, `any:M`, or `all:M`. Mask 0
+/// canonicalises to `off` regardless of mode (mode with no colours selected is not
+/// a state worth persisting).
+fn colour_filter_token_for(mask: u8, all: bool) -> String {
+    let mask = mask & 0x1F;
+    if mask == 0 {
+        return COLOUR_TOK_OFF.to_string();
+    }
+    format!("{}{mask}", if all { COLOUR_TOK_ALL } else { COLOUR_TOK_ANY })
+}
+
+/// Parse a persisted colour-filter token back into `(mask, all)`, clamping to the
+/// 5-bit domain and falling back to the no-filter state on anything unrecognised.
+/// Pure, so it's unit-testable.
+fn parse_colour_filter_token(tok: &str) -> (u8, bool) {
+    if tok == COLOUR_TOK_OFF {
+        return (0, false);
+    }
+    if let Some(rest) = tok.strip_prefix(COLOUR_TOK_ANY) {
+        if let Ok(m) = rest.parse::<u8>() {
+            return (m & 0x1F, false);
+        }
+    }
+    if let Some(rest) = tok.strip_prefix(COLOUR_TOK_ALL) {
+        if let Ok(m) = rest.parse::<u8>() {
+            return (m & 0x1F, true);
+        }
+    }
+    (0, false)
+}
+
+/// Encode the *current* colour quick-filter as its persistence token. `pub` so
+/// `lib.rs` — which holds the db path — can store it.
+pub fn colour_filter_token() -> String {
+    colour_filter_token_for(current_colour_mask(), current_colour_all())
 }
 
 /// Seed the rating filter from a persisted token *without* reloading — called at
@@ -1897,6 +2087,14 @@ pub fn apply_rating_filter_token(tok: &str) {
     let (cmp, stars) = parse_rating_filter_token(tok);
     MIN_RATING.with(|r| r.set(stars));
     RATING_COMPARE.with(|c| c.set(cmp));
+}
+
+/// Seed the colour quick-filter from a persisted token *without* reloading —
+/// same startup contract as [`apply_rating_filter_token`]. Main-thread only.
+pub fn apply_colour_filter_token(tok: &str) {
+    let (mask, all) = parse_colour_filter_token(tok);
+    COLOUR_MASK.with(|m| m.set(mask));
+    COLOUR_ALL.with(|a| a.set(all));
 }
 
 /// Record how to re-run the current view (called by each loader with a closure
@@ -2237,91 +2435,6 @@ fn colors_from_mask(mask: u8) -> Vec<u8> {
 /// DISTINCT` (an image with several selected colours would otherwise repeat).
 /// `ORDER BY`/`LIMIT` mirror the other loaders. Pure (returns a string) so the
 /// AND/OR shape is unit-testable under the display-free discipline.
-fn build_color_mask_query(
-    mask: u8,
-    match_all: bool,
-    sort: SortOrder,
-    reverse: bool,
-    rating: &str,
-) -> Option<String> {
-    let colors = colors_from_mask(mask);
-    if colors.is_empty() {
-        return None;
-    }
-    let in_list = colors.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
-    let limit = GRID_CAP + 1;
-    let order = sort.order_clause(reverse);
-    // The rating filter fragment (built by the caller from the current comparator)
-    // composes with the colour selection in the pre-GROUP WHERE.
-    let sql = if match_all {
-        format!(
-            "SELECT f.folder || '/' || i.filename \
-             FROM main.images i \
-             JOIN main.film_rolls f ON f.id = i.film_id \
-             JOIN main.color_labels cl ON cl.imgid = i.id \
-             WHERE cl.color IN ({in_list}){rating} \
-             GROUP BY i.id HAVING COUNT(DISTINCT cl.color) = {n} \
-             ORDER BY {order} LIMIT {limit}",
-            n = colors.len(),
-        )
-    } else {
-        format!(
-            "SELECT DISTINCT f.folder || '/' || i.filename \
-             FROM main.images i \
-             JOIN main.film_rolls f ON f.id = i.film_id \
-             JOIN main.color_labels cl ON cl.imgid = i.id \
-             WHERE cl.color IN ({in_list}){rating} \
-             ORDER BY {order} LIMIT {limit}",
-        )
-    };
-    Some(sql)
-}
-
-/// Reload the grid to show images matching a colour-label `mask` under AND
-/// (`match_all`) / OR semantics — see [`build_color_mask_query`]. An **empty mask
-/// shows all images** (the no-colour-filter state), so the left panel can route
-/// every colour-filter change here without special-casing "nothing selected".
-/// The single-colour case is just a one-bit mask, so this is the sole colour
-/// loader the panel needs (m4-26).
-pub fn lighttable_load_by_color_mask(
-    model: &LighttableModel,
-    db_path: &str,
-    mask: u8,
-    match_all: bool,
-) {
-    register_reload({
-        let m = model.clone();
-        let db = db_path.to_string();
-        move || lighttable_load_by_color_mask(&m, &db, mask, match_all)
-    });
-    let Some(sql) = build_color_mask_query(
-        mask, match_all, current_sort(), current_reverse(), &current_filters_sql(),
-    ) else {
-        lighttable_load_from_db(model, db_path);
-        return;
-    };
-    let conn = if db_path.is_empty() {
-        open_demo_db()
-    } else {
-        rusqlite::Connection::open(db_path).unwrap_or_else(|_| open_demo_db())
-    };
-    let rows: Vec<String> = match conn
-        .prepare(&sql)
-        .and_then(|mut s| {
-            s.query_map([], |r| r.get::<_, String>(0))
-                .map(|it| it.flatten().collect())
-        }) {
-        Ok(rows) => rows,
-        Err(e) => {
-            eprintln!(
-                "darkroom: colour-mask filter query failed (mask {mask:05b}, all={match_all}): {e}"
-            );
-            Vec::new()
-        }
-    };
-    fill_grid(model, rows, "(No images with these colour labels)");
-}
-
 /// Escape the SQL `LIKE` metacharacters (`%`, `_`) and the escape char itself
 /// (`\`) in `s`, for use as a literal segment in a `LIKE … ESCAPE '\'` pattern.
 /// Backslash is escaped first so the escapes we add for `%`/`_` aren't re-escaped.
@@ -2385,10 +2498,17 @@ fn index_of_path(paths: &[String], target: &str) -> Option<u32> {
 fn open_demo_db() -> rusqlite::Connection {
     use rusqlite::Connection;
     let conn = Connection::open_in_memory().expect("in-memory db");
+    // `color_labels` is present even though the demo seeds no labels: the m4-126
+    // quick filter's fragment references the table unconditionally, and without it
+    // a live click would make every subsequent load fail its query into an empty
+    // grid (senior-review MAJOR-1). An empty table yields the correct "(No images)"
+    // placeholder instead. The demo never restores persisted filters (empty prefs
+    // path), so only deliberate clicks can arm the fragment here.
     conn.execute_batch(
         "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder VARCHAR, access_timestamp INTEGER);
          CREATE TABLE images    (id INTEGER PRIMARY KEY, film_id INTEGER, filename VARCHAR,
                                  width INTEGER, height INTEGER, flags INTEGER, datetime_taken INTEGER);
+         CREATE TABLE color_labels (imgid INTEGER, color INTEGER);
          INSERT INTO film_rolls VALUES (1, '/photos/demo', 0);
          INSERT INTO images VALUES (1, 1, 'DSC_0001.jpg', 6000, 4000, 0, 100);
          INSERT INTO images VALUES (2, 1, 'DSC_0002.jpg', 6000, 4000, 0, 200);
@@ -2400,11 +2520,13 @@ fn open_demo_db() -> rusqlite::Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_color_mask_query, cap_rows, color_dot_markup, colors_from_mask,
+    use super::{cap_rows, color_dot_markup, colors_from_mask,
                 digit_to_rating, escape_like, fkey_to_color, flags_star_rating,
                 add_filter_observer, apply_overlay_mode_token, current_overlay_mode,
-                current_rating_compare, effective_overlay_visibility, filter_sync_in_progress,
-                current_filters_sql, set_filter_preset, set_min_rating, set_rating_compare,
+                current_filters_sql, current_rating_compare, effective_overlay_visibility,
+                filter_sync_in_progress,
+                colour_filter_token_for, colour_predicate, parse_colour_filter_token,
+                set_colour_filter, set_filter_preset, set_min_rating, set_rating_compare,
                 set_year_range, FilterPreset,
                 flags_with_star_rating, index_of_path, overlay_mode_token_for,
                 overlay_visibility, parse_overlay_mode_token, parse_rating_filter_token,
@@ -2448,35 +2570,57 @@ mod tests {
     }
 
     #[test]
-    fn build_color_mask_query_none_for_empty_mask() {
-        assert!(build_color_mask_query(0, false, SortOrder::Filename, false, "").is_none());
-        assert!(build_color_mask_query(0, true, SortOrder::Filename, false, "").is_none());
+    fn colour_predicate_empty_for_no_filter() {
+        assert_eq!(colour_predicate(0, false), "");
+        assert_eq!(colour_predicate(0, true), "");
     }
 
     #[test]
-    fn build_color_mask_query_or_uses_distinct_no_having() {
-        let sql = build_color_mask_query(0b10101, false, SortOrder::Filename, false, "").expect("non-empty mask");
-        assert!(sql.contains("SELECT DISTINCT"), "{sql}");
+    fn colour_predicate_any_requires_at_least_one_selected_colour() {
+        let sql = colour_predicate(0b10101, false);
+        // Correlated subquery over the row's id; >= 1 is OR ("any") semantics.
+        assert!(sql.contains("FROM main.color_labels cl WHERE cl.imgid = i.id"), "{sql}");
         assert!(sql.contains("cl.color IN (0,2,4)"), "{sql}");
-        assert!(!sql.contains("HAVING"), "OR must not group/having: {sql}");
-        assert!(sql.contains(&format!("LIMIT {}", GRID_CAP + 1)), "{sql}");
+        assert!(sql.contains(">= 1"), "{sql}");
     }
 
     #[test]
-    fn build_color_mask_query_and_groups_and_counts_selected() {
-        let sql = build_color_mask_query(0b01010, true, SortOrder::Filename, false, "").expect("non-empty mask");
+    fn colour_predicate_all_counts_every_selected_colour() {
+        let sql = colour_predicate(0b01010, true);
         assert!(sql.contains("cl.color IN (1,3)"), "{sql}");
-        // AND => image must carry both selected colours; N = popcount(mask).
-        assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 2"), "{sql}");
-        assert!(!sql.contains("SELECT DISTINCT"), "AND path must not DISTINCT: {sql}");
+        // AND => image must carry ALL N selected colours.
+        assert!(sql.contains("= 2"), "{sql}");
     }
 
     #[test]
-    fn build_color_mask_query_single_colour_counts_one() {
-        // The single-colour case (one-bit mask) collapses to N=1 under AND.
-        let sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, "").expect("non-empty mask");
+    fn colour_predicate_single_bit_collapses_to_count_one() {
+        let sql = colour_predicate(0b00100, true);
         assert!(sql.contains("cl.color IN (2)"), "{sql}");
-        assert!(sql.contains("HAVING COUNT(DISTINCT cl.color) = 1"), "{sql}");
+        assert!(sql.contains("= 1"), "{sql}");
+    }
+
+    #[test]
+    fn colour_filter_token_roundtrips_with_canonicalisations() {
+        // encode∘decode identity for every mask the UI can produce, in both modes,
+        // modulo the codec's one canonicalisation: mask 0 is always "off".
+        for m in [0u8, 1, 0b00100, 0b10101, 0x1F] {
+            for all in [false, true] {
+                let tok = colour_filter_token_for(m, all);
+                let want = if m == 0 { (0, false) } else { (m & 0x1F, all) };
+                assert_eq!(parse_colour_filter_token(&tok), want, "tok={tok}");
+            }
+        }
+    }
+
+    #[test]
+    fn colour_token_parse_falls_back_to_off_on_corruption() {
+        assert_eq!(parse_colour_filter_token(""), (0, false));
+        assert_eq!(parse_colour_filter_token("sometimes"), (0, false));
+        assert_eq!(parse_colour_filter_token("any:"), (0, false));
+        assert_eq!(parse_colour_filter_token("any:zz"), (0, false));
+        // A stray high bit can't widen the colour domain.
+        assert_eq!(parse_colour_filter_token("any:255"), (255 & 0x1F, false));
+        assert_eq!(parse_colour_filter_token("all:31"), (0b11111, true));
     }
 
     #[test]
@@ -2512,12 +2656,62 @@ mod tests {
     }
 
     #[test]
-    fn color_mask_query_applies_sort_order() {
-        let sql = build_color_mask_query(0b00100, false, SortOrder::Rating, false, "").expect("mask");
-        assert!(
-            sql.contains("ORDER BY CASE WHEN (i.flags & 8) = 8 OR (i.flags & 7) > 5 THEN -1 ELSE (i.flags & 7) END DESC"),
-            "{sql}"
+    fn colour_predicate_composes_with_rating_in_where() {
+        // The loaders splice rating + year + colour fragments in sequence onto
+        // their WHERE; pin the concatenation shape for two of them (the same seam
+        // current_filters_sql assembles).
+        let composed = format!(
+            "{}{}",
+            rating_predicate(3, RatingCompare::AtLeast),
+            colour_predicate(0b00100, true),
         );
+        assert!(
+            composed.contains("AND (i.flags & 7) BETWEEN 3 AND 5 AND ((SELECT COUNT(DISTINCT cl.color)"),
+            "{composed}"
+        );
+    }
+
+    #[test]
+    fn colour_filter_keeps_only_labelled_matches_end_to_end() {
+        // End-to-end over a real SQLite catalogue: the composed fragment must keep
+        // exactly the images whose colour labels satisfy OR/AND semantics, on top
+        // of the collection's own WHERE (here: everything). Seeded with the same
+        // table shape ensure_base_schema creates.
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder TEXT);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename TEXT);
+             CREATE TABLE color_labels (imgid INTEGER, color INTEGER);
+             INSERT INTO film_rolls VALUES (1, '/f');
+             INSERT INTO images VALUES (1, 1, 'red.raw');
+             INSERT INTO images VALUES (2, 1, 'red_green.raw');
+             INSERT INTO images VALUES (3, 1, 'unlabelled.raw');
+             INSERT INTO color_labels VALUES (1, 0);
+             INSERT INTO color_labels VALUES (2, 0);
+             INSERT INTO color_labels VALUES (2, 2);",
+        )
+        .unwrap();
+        // NOTE: the real loaders run against `main.images`; the in-memory db here
+        // IS main, so the fragment's `main.color_labels` reference resolves the
+        // same way it does in the app (same unqualified-table semantics).
+        let base = "SELECT i.filename FROM images i \
+                    JOIN film_rolls f ON f.id = i.film_id WHERE 1=1";
+        let run = |frag: String| -> Vec<String> {
+            let sql = format!("{base}{frag} ORDER BY i.filename");
+            let mut s = conn.prepare(&sql).unwrap();
+            s.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+
+        // ANY of {red} → both red-labelled images; unlabelled drops out.
+        assert_eq!(run(colour_predicate(0b00001, false)), vec!["red.raw", "red_green.raw"]);
+        // ALL of {red (bit 0), green (bit 2)} → only the image carrying both.
+        assert_eq!(run(colour_predicate(0b00101, true)), vec!["red_green.raw"]);
+        // Empty mask → no fragment → the whole collection.
+        assert_eq!(run(colour_predicate(0, false)).len(), 3);
     }
 
     #[test]
@@ -2611,11 +2805,34 @@ mod tests {
             )
         );
 
-        // Clearing one leaves the other intact (they're independent).
+        // Clearing one leaves the others intact (they're independent).
         set_filter_preset(FilterPreset::AllImages);
         let year_only = current_filters_sql();
         assert!(!year_only.contains("i.flags"), "{year_only}");
         assert!(year_only.contains("BETWEEN 2018 AND 2020"), "{year_only}");
+        set_year_range(None);
+
+        // All three at once, pinned exactly (m4-126): splice order is rating →
+        // year → colour, each fragment carrying its own leading " AND ".
+        set_filter_preset(FilterPreset::AtLeastStars(2));
+        set_year_range(Some((2018, 2020)));
+        set_colour_filter(0b00101, true); // ALL of {red, green}
+        assert_eq!(
+            current_filters_sql(),
+            concat!(
+                " AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 2 AND 5",
+                " AND i.datetime_taken > 0 AND CAST(strftime('%Y',",
+                " (i.datetime_taken / 1000000 - 62135596800), 'unixepoch') AS INTEGER)",
+                " BETWEEN 2018 AND 2020",
+                " AND ((SELECT COUNT(DISTINCT cl.color) FROM main.color_labels cl",
+                " WHERE cl.imgid = i.id AND cl.color IN (0,2)) = 2)",
+            )
+        );
+        // Disarming the colour filter alone drops just its fragment.
+        set_colour_filter(0, false);
+        let two_way = current_filters_sql();
+        assert!(two_way.contains("BETWEEN 2018 AND 2020") && !two_way.contains("color_labels"),
+                "{two_way}");
         set_year_range(None);
     }
 
@@ -3022,28 +3239,6 @@ mod tests {
         // A legacy `flags & 7` of 6/7 clamps to 5 stars, never over-fills the row.
         assert_eq!(flags_star_rating(6), 5);
         assert_eq!(flags_star_rating(7), 5);
-    }
-
-    #[test]
-    fn color_mask_query_composes_rating_in_where() {
-        // The rating guard sits in the pre-GROUP WHERE of BOTH AND/OR colour paths.
-        let and_sql = build_color_mask_query(
-            0b00100, true, SortOrder::Filename, false, &rating_predicate(3, RatingCompare::AtLeast),
-        ).expect("mask");
-        assert!(
-            and_sql.contains("WHERE cl.color IN (2) AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 3 AND 5 GROUP BY"),
-            "{and_sql}"
-        );
-        let or_sql = build_color_mask_query(
-            0b10100, false, SortOrder::Filename, false, &rating_predicate(2, RatingCompare::AtLeast),
-        ).expect("mask");
-        assert!(
-            or_sql.contains("WHERE cl.color IN (2,4) AND (i.flags & 8) = 0 AND (i.flags & 7) BETWEEN 2 AND 5 ORDER BY"),
-            "{or_sql}"
-        );
-        // No rating filter → no rating guard at all.
-        let none_sql = build_color_mask_query(0b00100, true, SortOrder::Filename, false, "").expect("mask");
-        assert!(!none_sql.contains("BETWEEN"), "{none_sql}");
     }
 
     #[test]

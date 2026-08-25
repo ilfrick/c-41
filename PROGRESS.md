@@ -1852,3 +1852,60 @@ borrow that lifts the basename to owned String. En route self-correction: the
 first discard test draft also had a redundant table-wipe (tmp_db already starts
 clean). Full scripts/ci-local.sh gate then ran green by exit code.
 PARITY_AUDIT row 2.2 closed in this commit.
+
+## 2026-08-25T00:15Z — m4-126: colour-label quick filters in the top + bottom bars (parity row 2.5)
+
+darktable has colour circles in BOTH lighttable bars; we only had the left panel's
+checks — and those were a *collection selector* (GROUP BY/HAVING query) that
+competed with folder/tag/search and was mutually exclusive with them (clicking a
+folder wiped the checks and vice versa). m4-126 pays the audit's "reconcile first"
+debt by DELETING that competing selector and converting colour into a compose-on-top
+quick filter exactly like stars (m4-98d) and year range (m4-99):
+
+- Canonical thread-local state `COLOUR_MASK` (5 bits) / `COLOUR_ALL` in
+  lighttable/mod.rs; `set_colour_filter(mask, match_all)` fans out through the
+  filter-observer bus. `current_filters_sql()` now splices rating → year → colour,
+  so every view loader gets it for free; fragment is
+  `AND ((SELECT COUNT(DISTINCT cl.color) FROM main.color_labels cl WHERE cl.imgid =
+  i.id AND cl.color IN (...)) >= 1)` for ANY, `= N` for ALL.
+- Three mirrors of one state: left-panel checks + Any/All toggle (panels/mod.rs),
+  top-bar circles after the preset dropdown, bottom-bar circles right of the star
+  box (both from `colour_circles_row()`, same Pango dot glyphs as grid cells).
+  Handlers consult `filter_sync_in_progress()`; observers only repaint. Folder/tag
+  clicks and search/import no longer clear colours — the AND genuinely runs.
+- Persistence: token `off` / `any:M` / `all:M` under pref key `colour_filter`,
+  written by ONE app-level observer in lib.rs (not per-widget — two bar rows would
+  otherwise double-write), restored at startup beside the rating token BEFORE any
+  control builds. Demo db can't restore (empty prefs path) but now carries an empty
+  `color_labels` table anyway.
+- Deleted: `build_color_mask_query`, `lighttable_load_by_color_mask`,
+  `clear_color_checks`, the left panel's color_suppress plumbing.
+
+Review findings all fixed (fork subagent standing in as senior reviewer after the
+fricktrade-architect 402 again; APPROVE-WITH-NITS): MAJOR-1 demo-db blank-grid — a
+live circle click in demo mode spliced the colour fragment against a db with no
+color_labels table, so every subsequent load failed its query into an empty grid;
+fixed by adding the table to open_demo_db's DDL (one line). MINOR-2 duplicate
+persist writes → single app-level observer (colour_circles_row lost its db_path
+parameter entirely). MINOR-3 stale "post-import shows all images" comments →
+"shows the quick-filtered collection". NIT-4 unified child-indexing strategy
+(widget-name parsing on both read and write paths of the left-panel checks).
+NIT-5 accessible labels on the circle buttons. NIT-6 composition test extended to
+pin the exact three-way rating+year+colour string.
+
+The gates caught two real bugs en route, both kept here as the record: (1) the
+first predicate draft emitted `>= N` in ANY mode — requiring EVERY selected colour
+under OR semantics, contradicting the function's own doc contract; my new unit
+test failed and the fix is `(op, bound) = match_all ? ("=", n) : (">=", 1)` — the
+test did its job. (2) My three-way exact-string assertion forgot to re-arm the
+rating preset after an earlier clear in the same test (left != right made it
+obvious); fixed the test, not the code. Also one E0308 (accessible Label wants
+&str not String) and one E0433/E0425 import round (panels needed `self` in the
+lighttable use; test module had lost current_filters_sql).
+
+Verification: full scripts/ci-local.sh green BY EXIT CODE (CILEXIT=0): cargo check
+workspace, clippy workspace, tests --release (c41-core 768, c41-db 92, c41-ui 276
+— including the end-to-end SQLite colour-semantics test: ANY{red} keeps both
+red-labelled images, ALL{red,green} keeps only the both-labelled one, empty mask
+keeps everything), and the release bin link. PARITY_AUDIT row 2.5 closed in this
+commit.

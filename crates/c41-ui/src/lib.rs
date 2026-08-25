@@ -482,6 +482,12 @@ fn build_main_window(app: &Application) {
     if let Some(tok) = persist::load_ui_pref(&db_path, RATING_FILTER_PREF_KEY) {
         lighttable::apply_rating_filter_token(&tok);
     }
+    // And the colour-label quick filter (m4-126), same contract: seed the
+    // thread-local mask before anything builds a control that mirrors it. Both
+    // bars' circles and the left-panel checks read it back when they build.
+    if let Some(tok) = persist::load_ui_pref(&db_path, lighttable::COLOUR_FILTER_PREF_KEY) {
+        lighttable::apply_colour_filter_token(&tok);
+    }
     // Likewise restore the thumbnail overlay mode (m4-98e) before the grid binds
     // its first cells, so they're laid out right the first time (no visible flip).
     if let Some(tok) = persist::load_ui_pref(&db_path, OVERLAY_MODE_PREF_KEY) {
@@ -786,8 +792,8 @@ fn build_main_window(app: &Application) {
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
                 clone!(@weak lt_model, @strong db_inner, @strong at => move || {
-                    lp_inner.clear_filter_highlights();   // post-import view shows all images
-                    *at.borrow_mut() = None;   // post-import view shows all images
+                    lp_inner.clear_filter_highlights();   // post-import shows the quick-filtered collection
+                    *at.borrow_mut() = None;   // (quick filters like stars/colours stay armed)
                     lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
                 toast_inner,
@@ -946,6 +952,24 @@ fn build_main_window(app: &Application) {
         lt_header.pack_end(&sort_box);
     }
 
+    // Colour-label quick filter (m4-126) — darktable's top-bar colour circles.
+    // Toggling a circle composes an AND-on-top predicate with whatever collection
+    // is active; the row observes the bus, so it re-dots itself on every change.
+    // The bottom bar builds a second mirror of the same state below — both stay in
+    // step through the filter-observer bus, and ONE persist observer (registered
+    // right after both rows exist) saves the token once per change.
+    lt_header.pack_start(&lighttable::colour_circles_row());
+    {
+        let db = db_path.clone();
+        lighttable::add_filter_observer(move || {
+            crate::persist::save_ui_pref(
+                &db,
+                lighttable::COLOUR_FILTER_PREF_KEY,
+                &lighttable::colour_filter_token(),
+            );
+        });
+    }
+
     let lt_toolbar = adw::ToolbarView::new();
     lt_toolbar.add_top_bar(&lt_header);
     lt_toolbar.set_content(Some(&hbox));
@@ -953,10 +977,9 @@ fn build_main_window(app: &Application) {
     // ── Bottom toolbar (m4-98a/b/d) ────────────────────────────────────────
     // darktable's lighttable bottom bar. Right (m4-98a): the thumb-size stepper
     // (its "images per row" ± control) driving the grid's max-column bound live —
-    // fewer columns ⇒ bigger thumbnails. Left (m4-98b/d): a star-rating filter —
-    // a comparator dropdown (≥ / = / ≤ / rejected) plus five star buttons — that
-    // composes with whatever collection is active (folder / tag / colour / search)
-    // and persists across sessions. Later: colour filter + view-mode switcher.
+    // fewer columns ⇒ bigger thumbnails. Left (m4-98b/d): a star-rating filter
+    // plus the m4-126 colour circles — both compose on top of whatever collection
+    // is active and persist across sessions. Later: view-mode switcher.
     {
         let bottom = gtk4::CenterBox::new();
         bottom.add_css_class("toolbar");
@@ -1069,6 +1092,11 @@ fn build_main_window(app: &Application) {
 
             filter_box.append(&compare);
             filter_box.append(&star_box);
+            // Colour circles (m4-126): a second mirror of the same thread-local
+            // mask the top bar's row drives. Both rows observe the bus, so a
+            // click in either bar re-dots both; persistence is the single
+            // app-level observer registered with the top row above.
+            filter_box.append(&lighttable::colour_circles_row());
             bottom.set_start_widget(Some(&filter_box));
         }
 
@@ -1559,8 +1587,8 @@ fn build_main_window(app: &Application) {
                 window.upcast_ref::<gtk4::Window>(),
                 db.clone(),
                 clone!(@weak lt_model, @strong db_inner, @strong at => move || {
-                    lp_inner.clear_filter_highlights();   // post-import view shows all images
-                    *at.borrow_mut() = None;   // post-import view shows all images
+                    lp_inner.clear_filter_highlights();   // post-import shows the quick-filtered collection
+                    *at.borrow_mut() = None;   // (quick filters like stars/colours stay armed)
                     lighttable::lighttable_load_from_db(&lt_model, &db_inner);
                 }),
                 toast_inner,
