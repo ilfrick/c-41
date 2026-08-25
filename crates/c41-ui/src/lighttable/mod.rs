@@ -2269,6 +2269,119 @@ pub fn set_year_range(range: Option<(i32, i32)>) {
     filter_changed();
 }
 
+// ── Named collection presets (parity 2.6 close, m4-136) ─────────────────────
+//
+// A preset captures the WHOLE filter set as one payload string: version tag,
+// then the five persisted tokens in fixed order — rating, colour, aspect,
+// year-range, rule stack — whitespace-separated. Fixed positions keep the
+// format self-describing without inventing a key=value grammar; every
+// component token is already space-free (the rule token is pct-encoded by
+// construction), and each component decoder is lenient on its own, so a
+// corrupt field degrades to no-filter rather than poisoning the rest.
+//
+// The year range has NO persistence token of its own (session-only state), so
+// `off` / `<from>:<to>` here is its first codec.
+
+/// Sentinel for the rules field when the stack is empty. An empty STRING would
+/// vanish under the payload's whitespace splitting (five fields instead of
+/// six); a real stack's token always carries its `:`/`/` separators, so a bare
+/// `-` can never collide with one.
+const COLLECTION_RULES_EMPTY: &str = "-";
+
+/// Encode the current filter state as a collection-preset payload (see the
+/// module-group comment above for the format).
+pub fn collection_filter_payload() -> String {
+    let year = match current_year_range() {
+        Some((a, b)) => format!("{a}:{b}"),
+        None => "off".to_string(),
+    };
+    let rules = rule_stack_token();
+    let rules = if rules.is_empty() { COLLECTION_RULES_EMPTY } else { &rules };
+    format!(
+        "v1 {} {} {} {} {}",
+        rating_filter_token(),
+        colour_filter_token(),
+        aspect_filter_token(),
+        year,
+        rules,
+    )
+}
+
+/// One parsed preset payload: the five component tokens plus the decoded year
+/// range. Component tokens stay strings — their own decoders own the leniency.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollectionFilterState {
+    pub rating: String,
+    pub colour: String,
+    pub aspect: String,
+    pub year: Option<(i32, i32)>,
+    pub rules: String,
+}
+
+/// Pure decoder for a payload written by [`collection_filter_payload`].
+/// Strict about STRUCTURE (version tag, six fields, ordered years) because a
+/// structurally different payload means a writer we can't reason about;
+/// lenient about CONTENT, because every component token's own parser already
+/// falls back to no-filter on garbage.
+pub fn parse_collection_payload(payload: &str) -> Option<CollectionFilterState> {
+    let fields: Vec<&str> = payload.split_whitespace().collect();
+    if fields.len() != 6 || fields[0] != "v1" {
+        return None;
+    }
+    let year = if fields[4] == "off" {
+        None
+    } else {
+        let (a, b) = fields[4].split_once(':')?;
+        let (a, b) = (a.parse::<i32>().ok()?, b.parse::<i32>().ok()?);
+        if a > b {
+            return None;
+        }
+        Some((a, b))
+    };
+    Some(CollectionFilterState {
+        rating: fields[1].to_string(),
+        colour: fields[2].to_string(),
+        aspect: fields[3].to_string(),
+        year,
+        // Normalise the empty-stack sentinel so callers see "" — the same
+        // representation [`current_rule_stack`] implies for no rules.
+        rules: {
+            let r = fields[5].to_string();
+            if r == COLLECTION_RULES_EMPTY { String::new() } else { r }
+        },
+    })
+}
+
+/// Apply a saved preset's payload, landing the whole filter set as ONE view
+/// reload: end state is exactly what hand-clicking each control would produce
+/// (controls re-sync via the bus, the grid reloads, the per-key persistence
+/// observers rewrite the live pref tokens — an applied preset BECOMES current
+/// state), but without firing the bus once per setter. Rating/colour/aspect
+/// already apply silently; year and the rule stack are written through their
+/// silent in-module paths too (their pub setters each fire [`filter_changed`],
+/// which would otherwise show an intermediate half-applied grid — senior-review
+/// MINOR-2, m4-136). Returns false (applying nothing) when the payload doesn't
+/// parse at all.
+pub fn apply_collection_payload(payload: &str) -> bool {
+    let Some(state) = parse_collection_payload(payload) else {
+        return false;
+    };
+    apply_rating_filter_token(&state.rating);
+    apply_colour_filter_token(&state.colour);
+    apply_aspect_filter_token(&state.aspect);
+    YEAR_RANGE.with(|r| r.set(state.year));
+    if state.rules.is_empty() {
+        // `apply_rule_stack_token` deliberately ignores empty parses ("garbage
+        // must not clobber"), but a preset whose stack is EMPTY must clear the
+        // live one — recalling a no-rules preset while rules are active.
+        RULE_STACK.with(|s| *s.borrow_mut() = Vec::new());
+    } else {
+        apply_rule_stack_token(&state.rules);
+    }
+    filter_changed();
+    true
+}
+
 /// Persisted rating-filter token pieces — one source of truth shared by the
 /// encoder ([`rating_filter_token_for`]) and decoder ([`parse_rating_filter_token`])
 /// so a prefix typo can't make them silently disagree.
@@ -2870,6 +2983,8 @@ mod tests {
                 aspect_predicate, aspect_filter_token_for, apply_aspect_filter_token,
                 current_aspect_filter, parse_aspect_filter_token, set_aspect_filter,
                 current_rule_stack, rule_stack_token, apply_rule_stack_token, set_rule_stack,
+                collection_filter_payload, parse_collection_payload, apply_collection_payload,
+                current_min_rating, current_colour_mask, current_colour_all, current_year_range,
                 set_colour_filter, set_filter_preset, set_min_rating, set_rating_compare,
                 set_year_range, FilterPreset,
                 flags_with_star_rating, index_of_path, overlay_mode_token_for,
@@ -3134,6 +3249,125 @@ mod tests {
         apply_rule_stack_token(&tok);
         assert_eq!(current_rule_stack(), original);
         set_rule_stack(Vec::new());
+    }
+
+    #[test]
+    fn collection_payload_round_trips_the_whole_filter_set() {
+        // m4-136: a preset payload captures ALL five filters; applying one lands
+        // the same end state as hand-clicking each control, with ONE view
+        // reload at the end (see apply_collection_payload). Reset first, then
+        // set every filter, capture, wipe, apply, compare state.
+        use crate::lighttable::rule_stack::{Combinator, Rule, RuleProperty, RuleCmp};
+        set_filter_preset(FilterPreset::AllImages);
+        set_min_rating(0);
+        set_colour_filter(0, false);
+        set_aspect_filter(AspectFilter::Off);
+        set_year_range(None);
+        set_rule_stack(Vec::new());
+        let base = parse_collection_payload(&collection_filter_payload()).unwrap();
+        assert_eq!(
+            (base.rating.as_str(), base.colour.as_str(), base.aspect.as_str()),
+            ("off", "off", "off"),
+            "no-filter payload carries the no-filter tokens"
+        );
+        assert_eq!(base.year, None);
+        assert_eq!(base.rules, "");
+
+        set_min_rating(3);
+        set_colour_filter(0b0_0011, false);
+        set_aspect_filter(AspectFilter::Landscape);
+        set_year_range(Some((2020, 2023)));
+        set_rule_stack(vec![
+            Rule::new(Combinator::And, RuleProperty::Iso, RuleCmp::Gte, "800"),
+        ]);
+        let payload = collection_filter_payload();
+
+        // Wipe everything back to no-filter…
+        set_min_rating(0);
+        set_colour_filter(0, false);
+        set_aspect_filter(AspectFilter::Off);
+        set_year_range(None);
+        set_rule_stack(Vec::new());
+
+        // …apply the captured payload, and every filter comes back.
+        assert!(apply_collection_payload(&payload));
+        assert_eq!(current_min_rating(), 3);
+        assert_eq!(current_colour_mask(), 0b0_0011);
+        assert!(!current_colour_all());
+        assert_eq!(current_aspect_filter(), AspectFilter::Landscape);
+        assert_eq!(current_year_range(), Some((2020, 2023)));
+        assert_eq!(
+            current_rule_stack(),
+            vec![Rule::new(Combinator::And, RuleProperty::Iso, RuleCmp::Gte, "800")]
+        );
+
+        // A space inside a rule VALUE must survive the whitespace-separated
+        // payload: pct-encoding maps it to %20 before split_whitespace ever
+        // sees it (senior-review m3a, m4-136).
+        let spaced = vec![Rule::new(
+            Combinator::And,
+            RuleProperty::FileName,
+            RuleCmp::Contains,
+            "new year",
+        )];
+        set_rule_stack(spaced.clone());
+        assert!(apply_collection_payload(&collection_filter_payload()));
+        assert_eq!(current_rule_stack(), spaced);
+
+        // A preset saved with NO rules must CLEAR active rules when applied —
+        // the generic token applier deliberately ignores empty parses ("garbage
+        // must not clobber"), so the explicit-clear path is pinned separately.
+        let no_rules_payload = {
+            set_rule_stack(Vec::new());
+            let p = collection_filter_payload();
+            set_rule_stack(vec![
+                Rule::new(Combinator::And, RuleProperty::Iso, RuleCmp::Gte, "800"),
+            ]);
+            p
+        };
+        assert!(apply_collection_payload(&no_rules_payload));
+        assert!(
+            current_rule_stack().is_empty(),
+            "a no-rules preset clears the active stack"
+        );
+
+        // Restore ALL five thread-locals — each test runs on its own thread, so
+        // nothing actually leaks, but leaving this block honest beats leaving a
+        // comment implying more than it does (senior-review m3b, m4-136).
+        set_min_rating(0);
+        set_colour_filter(0, false);
+        set_aspect_filter(AspectFilter::Off);
+        set_year_range(None);
+        set_rule_stack(Vec::new());
+    }
+
+    #[test]
+    fn collection_payload_parser_is_strict_on_structure_lenient_on_content() {
+        // Structure errors reject the WHOLE payload: wrong arity, unknown
+        // version (a future writer we can't reason about), missing/malformed
+        // year pair, years out of order.
+        assert!(parse_collection_payload("v1 off off off off").is_none());
+        assert!(parse_collection_payload("v2 off off off off off").is_none());
+        assert!(parse_collection_payload("").is_none());
+        assert!(parse_collection_payload("v1 off off off 2035:1990 off").is_none());
+        assert!(parse_collection_payload("v1 off off off 2000:x off").is_none());
+        // Content garbage still parses: each component's own decoder falls back
+        // to no-filter when it's applied, so one corrupt field can't poison a
+        // preset by making it unusable wholesale.
+        let st =
+            parse_collection_payload("v1 junk any:99 nosuch 1:2 pct%3Aok").unwrap();
+        assert_eq!(st.rating, "junk");
+        assert_eq!(st.colour, "any:99");
+        assert_eq!(st.aspect, "nosuch");
+        assert_eq!(st.year, Some((1, 2)));
+        assert_eq!(st.rules, "pct%3Aok");
+        // The empty-stack sentinel normalises to "" so callers see the same
+        // representation `current_rule_stack` implies for no rules.
+        let empty = parse_collection_payload("v1 off off off off -").unwrap();
+        assert_eq!(empty.rules, "");
+        // An unparsable payload applies NOTHING (not even the fallbacks) — the
+        // caller surfaces it instead of silently clearing the user's filters.
+        assert!(!apply_collection_payload("nonsense"));
     }
 
     #[test]

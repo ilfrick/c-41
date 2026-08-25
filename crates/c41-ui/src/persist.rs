@@ -821,6 +821,82 @@ pub fn delete_style(db_path: &str, name: &str) -> bool {
     .unwrap_or(false)
 }
 
+// ── Named collection presets (parity 2.6 close, m4-136) ─────────────────────
+//
+// darktable's collection module can store the current filter set under a name
+// and recall it later. Here the "filter set" is exactly the five persisted
+// quick-filter/rule tokens (rating, colour, aspect, year range, rule stack), so
+// a preset stores their combined payload string — see
+// `lighttable::collection_filter_payload`, which is the only writer of that
+// format and its only interpreter. This module treats payloads as opaque text
+// on purpose: decoding lives next to the codecs it composes. Rejection of a
+// corrupt payload therefore happens at APPLY time in
+// `lighttable::parse_collection_payload` — all-or-nothing on structure, with
+// per-field leniency below that (each component token's own decoder falls back
+// to no-filter); this module returns every stored row unfiltered.
+//
+// Same lazily-created table as styles: the DDL runs inside the save path and a
+// missing table reads back as "no presets", so demo mode (empty db path) needs
+// no special casing.
+
+const COLLECTION_PRESETS_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS main.c41_collection_presets \
+     (name TEXT PRIMARY KEY, payload TEXT NOT NULL)";
+
+/// Save (or overwrite) a collection preset. `payload` must come from
+/// `lighttable::collection_filter_payload()`; blank names/payloads are refused
+/// so an empty row can never shadow a real one.
+pub fn save_collection_preset(db_path: &str, name: &str, payload: &str) -> bool {
+    let name = name.trim();
+    if db_path.is_empty() || name.is_empty() || payload.is_empty() {
+        return false;
+    }
+    let Ok(conn) = Connection::open(db_path) else { return false };
+    if conn.execute(COLLECTION_PRESETS_TABLE_DDL, []).is_err() {
+        return false;
+    }
+    conn.execute(
+        "INSERT INTO main.c41_collection_presets (name, payload) VALUES (?1, ?2) \
+         ON CONFLICT(name) DO UPDATE SET payload = excluded.payload",
+        rusqlite::params![name, payload],
+    )
+    .is_ok()
+}
+
+/// All saved collection presets, name-ordered. Empty on any failure — a missing
+/// table just means none have been saved yet.
+pub fn load_collection_presets(db_path: &str) -> Vec<(String, String)> {
+    if db_path.is_empty() {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open(db_path) else { return Vec::new() };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT name, payload FROM main.c41_collection_presets ORDER BY name COLLATE NOCASE",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten().collect()
+}
+
+/// Delete a collection preset by name. Returns whether a row was removed.
+pub fn delete_collection_preset(db_path: &str, name: &str) -> bool {
+    if db_path.is_empty() {
+        return false;
+    }
+    let Ok(conn) = Connection::open(db_path) else { return false };
+    conn.execute(
+        "DELETE FROM main.c41_collection_presets WHERE name = ?1",
+        rusqlite::params![name],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
 /// Apply a style's params to every image in `full_paths`, returning how many
 /// were **actually written**.
 ///
@@ -1370,5 +1446,28 @@ mod style_tests {
         discard_history(&db, "/photos/never-seen.raw"); // must not panic
         assert!(load_saved(&db, "/photos/never-seen.raw").is_none());
         assert!(load_history(&db, "/photos/never-seen.raw").is_none());
+    }
+
+    #[test]
+    fn collection_presets_round_trip_upsert_and_delete() {
+        let (_d, db) = tmp_db("colpresets");
+        // Blank/whitespace names and payloads are refused, and nothing exists yet.
+        assert!(!save_collection_preset(&db, "", "v1 off off off off"));
+        assert!(!save_collection_preset(&db, "  ", "v1 off off off off"));
+        assert!(!save_collection_preset(&db, "x", ""));
+        assert!(load_collection_presets(&db).is_empty());
+        // Upsert by name: a collision replaces rather than duplicating.
+        assert!(save_collection_preset(&db, " S ", "p1"));
+        assert!(save_collection_preset(&db, "S", "p2"));
+        assert_eq!(load_collection_presets(&db), vec![("S".into(), "p2".into())]);
+        // Name-ordered case-insensitively, like styles.
+        save_collection_preset(&db, "zebra", "z");
+        save_collection_preset(&db, "Apple", "a");
+        let names: Vec<_> = load_collection_presets(&db).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["Apple", "S", "zebra"]);
+        // Delete removes exactly the named row; a second delete reports false.
+        assert!(delete_collection_preset(&db, "S"));
+        assert!(!delete_collection_preset(&db, "S"), "second delete removes nothing");
+        assert_eq!(load_collection_presets(&db).len(), 2);
     }
 }

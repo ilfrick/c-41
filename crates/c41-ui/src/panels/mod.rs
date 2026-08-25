@@ -564,21 +564,6 @@ impl LeftPanel {
             });
         }
 
-        content.append(&collapsible_section(
-            &filters_header,
-            &[
-                filters_sep.clone().upcast::<gtk4::Widget>(),
-                aspect_drop.clone().upcast(),
-                rules_box.clone().upcast(),
-                add_btn.clone().upcast(),
-            ]
-            .iter()
-            .collect::<Vec<_>>(),
-            true,
-            db_path,
-            FILTERS_SECTION_PREF_KEY,
-        ));
-
         // Seed whatever the startup token restored (applied in lib.rs BEFORE
         // this panel was built — same restore-before-build contract as the other
         // filters), so a persisted stack shows up without needing an observer
@@ -611,6 +596,170 @@ impl LeftPanel {
                 }
             });
         }
+
+        // ── Presets (m4-136): save / recall / delete the WHOLE filter set ──
+        // darktable's collection module stores named presets; here one captures
+        // all five filter tokens in a single payload string and applying it
+        // goes through the real setters, so every control, the grid and the
+        // per-key persistence observers fan out exactly as if each control had
+        // been clicked by hand.
+        //
+        // Rows are rebuilt wholesale on every change and their Apply/Delete
+        // buttons are minted fresh per pass — same soundness argument as
+        // `rebuild_rows`: fresh buttons cannot accumulate handlers.
+        fn refresh_preset_rows(list: &gtk4::ListBox, db_path: &str) {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            let presets = crate::persist::load_collection_presets(db_path);
+            if presets.is_empty() {
+                let row = gtk4::ListBoxRow::new();
+                let lbl = gtk4::Label::builder()
+                    .label("(no presets saved)")
+                    .halign(gtk4::Align::Start)
+                    .margin_start(8).margin_end(8).margin_top(2).margin_bottom(2)
+                    .build();
+                lbl.add_css_class("dim-label");
+                row.set_child(Some(&lbl));
+                row.set_selectable(false);
+                row.set_widget_name("");
+                list.append(&row);
+                return;
+            }
+            for (name, payload) in presets {
+                let row = gtk4::ListBoxRow::new();
+                row.set_selectable(false);
+                let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+                b.set_margin_start(8);
+                b.set_margin_end(8);
+                b.set_margin_top(2);
+                b.set_margin_bottom(2);
+                let lbl = gtk4::Label::builder()
+                    .label(&name)
+                    .halign(gtk4::Align::Start)
+                    .hexpand(true)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .build();
+                b.append(&lbl);
+                let apply = gtk4::Button::from_icon_name("object-select-symbolic");
+                apply.add_css_class("flat");
+                // A structurally corrupt payload (hand-edited/truncated db row)
+                // would otherwise fail at apply time with zero feedback — the
+                // same silent-failure class the styles section routes through a
+                // toast. Here: judge BEFORE wiring and leave a visibly inert
+                // button; per-field content garbage still applies (each
+                // component decoder falls back to no-filter).
+                if lighttable::parse_collection_payload(&payload).is_none() {
+                    apply.set_sensitive(false);
+                    apply.set_tooltip_text(Some("Preset data unreadable — delete and re-save"));
+                } else {
+                    apply.set_tooltip_text(Some("Apply this preset to the current filters"));
+                }
+                {
+                    let payload = payload.clone();
+                    apply.connect_clicked(move |_| {
+                        lighttable::apply_collection_payload(&payload);
+                    });
+                }
+                b.append(&apply);
+                let del = gtk4::Button::from_icon_name("window-close-symbolic");
+                del.add_css_class("flat");
+                del.set_tooltip_text(Some("Delete this preset"));
+                {
+                    let db_del = db_path.to_string();
+                    let name = name.clone();
+                    let list_del = list.clone();
+                    del.connect_clicked(move |_| {
+                        if crate::persist::delete_collection_preset(&db_del, &name) {
+                            refresh_preset_rows(&list_del, &db_del);
+                        }
+                    });
+                }
+                b.append(&del);
+                row.set_child(Some(&b));
+                list.append(&row);
+            }
+        }
+
+        let presets_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        let preset_entry = gtk4::Entry::builder()
+            .placeholder_text("Save filters as…")
+            .hexpand(true)
+            .build();
+        let preset_save_btn = gtk4::Button::with_label("Save");
+        preset_save_btn.add_css_class("flat");
+        // Insensitive while blank: "no name" is the ONLY input failure, and a
+        // dead button documents it without needing a toast channel up here.
+        preset_save_btn.set_sensitive(false);
+        {
+            let btn = preset_save_btn.clone();
+            preset_entry.connect_changed(move |e| {
+                btn.set_sensitive(!e.text().trim().is_empty());
+            });
+        }
+
+        let presets_list = gtk4::ListBox::new();
+        presets_list.add_css_class("boxed");
+        presets_list.set_selection_mode(gtk4::SelectionMode::None);
+        refresh_preset_rows(&presets_list, db_path);
+
+        let preset_save_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        preset_save_row.set_margin_start(12);
+        preset_save_row.set_margin_end(12);
+        preset_save_row.append(&preset_entry);
+        preset_save_row.append(&preset_save_btn);
+
+        {
+            let entry_c = preset_entry.clone();
+            let list_c = presets_list.clone();
+            let db_c = db_path.to_string();
+            preset_save_btn.connect_clicked(move |_| {
+                let name = entry_c.text().trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                // Upserts on name collision, matching styles' documented
+                // behaviour. A `false` here means no catalogue is open (demo
+                // mode's empty prefs path) — the button was reachable but there
+                // is nowhere to store; that state also shows "(no presets
+                // saved)" forever, which says the same thing. Known gap until
+                // this panel gains a toast channel: a locked or read-only
+                // catalogue file fails just as silently (senior-review m4,
+                // m4-136).
+                if crate::persist::save_collection_preset(
+                    &db_c,
+                    &name,
+                    &lighttable::collection_filter_payload(),
+                ) {
+                    entry_c.set_text("");
+                    refresh_preset_rows(&list_c, &db_c);
+                }
+            });
+        }
+        {
+            let btn_act = preset_save_btn.clone();
+            preset_entry.connect_activate(move |_| {
+                btn_act.emit_clicked();
+            });
+        }
+
+        content.append(&collapsible_section(
+            &filters_header,
+            &[
+                filters_sep.clone().upcast::<gtk4::Widget>(),
+                aspect_drop.clone().upcast(),
+                rules_box.clone().upcast(),
+                add_btn.clone().upcast(),
+                presets_sep.clone().upcast(),
+                preset_save_row.clone().upcast(),
+                presets_list.clone().upcast(),
+            ]
+            .iter()
+            .collect::<Vec<_>>(),
+            true,
+            db_path,
+            FILTERS_SECTION_PREF_KEY,
+        ));
 
         // ── Tags ──────────────────────────────────────────────────────────
         // The header/separator/box are always present; their visibility tracks
