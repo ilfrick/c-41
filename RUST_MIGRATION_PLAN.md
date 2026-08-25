@@ -475,16 +475,25 @@ C FFI trampolines for tags. 61 DB tests passing.
         - Decode size comes from the widget allocation × scale factor (bounded
           512..4096), not a constant — full preview exists to judge focus, and a
           fixed 2048 has the user inspecting resampling artefacts on a 4K display.
+          (m4-133: measured from the *scroller's* allocation — once zoomed, the
+          picture's is the scaled content size and would feed back.)
           `PixbufLoader::connect_size_prepared` scales *during* decode; `write` and
           `close` are both unconditional, since a loader finalized without `close`
           emits a `g_warning` on every keypress that lands on a rejected file.
-        - **Coverage limit, stated rather than hidden:** gdk-pixbuf decoding, so
+        - ~~**Coverage limit, stated rather than hidden:** gdk-pixbuf decoding, so
           the preview shows exactly what the grid's thumbnails show. Raws it can't
           read (`.ORF`) get a centred "No preview available for …" instead of a
           blank page. Follow-up: lift the darkroom view's `BaseImage`/`render()`
           out of `darkroom/mod.rs` into something both views call, decoded
           off-thread (`gdk::Texture` is `Send`, `Pixbuf` is not), then add
-          darktable's 100 % zoom/pan.
+          darktable's 100 % zoom/pan.~~ Both halves closed: m4-132 gave the preview
+          real raw decoding (see its PARITY_AUDIT entry — no `BaseImage` lift was
+          needed), and m4-133 added darktable-style zoom/pan — wheel stops fit →
+          100 % → 8× anchored at the cursor inside a `ScrolledWindow` host,
+          drag-to-pan, double-click fit ↔ 100 % toggle, zoom reset per image
+          change/close. The grid *thumbnails* remain gdk-pixbuf-only by choice
+          (raws still show empty grid cells; the full preview is where they're
+          judged).
         - 4 pure tests (key gating, the swallow set, the target rule, step bounds
           incl. `INVALID_LIST_POSITION` — clamping that sentinel would silently
           select the second-to-last image). 198 total.
