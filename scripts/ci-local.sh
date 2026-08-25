@@ -61,7 +61,10 @@ run_step() {
 
 failed=()
 run_step "cargo check"   "cargo check --workspace"                             || failed+=("check")
-run_step "cargo clippy"  "cargo clippy --workspace"                            || failed+=("clippy")
+# --all-targets: without it, #[cfg(test)] code is never linted — two
+# deny-by-default erasing_op errors sat in c41-core tests undetected until the
+# m4-131 session ran a stricter local clippy (review MINOR, fixed same day).
+run_step "cargo clippy"  "cargo clippy --workspace --all-targets"              || failed+=("clippy")
 run_step "cargo test"    "cargo test --workspace --release"                    || failed+=("test")
 run_step "release build" "cargo build --release -p c41 --bin c41-rs" || failed+=("build")
 

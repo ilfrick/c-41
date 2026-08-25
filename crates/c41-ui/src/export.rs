@@ -284,6 +284,9 @@ pub fn render_export_rgb8_gear(
     lens_gear: Option<&crate::preview::LensGear>,
 ) -> (usize, usize, Vec<u8>) {
     let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
+    // Lens pre-pass on the FULL frame, before crop/straighten — darktable runs
+    // lens at iop_order 13, before the geometry modules (m4-131).
+    let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
     let rgb = crate::preview::render_linear_to_srgb8_gear(&geom_linear, gw, gh, params, lens_gear);
     (gw, gh, rgb)
@@ -311,6 +314,9 @@ pub fn render_export_rgb16_gear(
     lens_gear: Option<&crate::preview::LensGear>,
 ) -> (usize, usize, Vec<u16>) {
     let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
+    // Lens pre-pass on the FULL frame, before crop/straighten — darktable runs
+    // lens at iop_order 13, before the geometry modules (m4-131).
+    let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
     let rgb = crate::preview::render_linear_to_srgb16_gear(&geom_linear, gw, gh, params, lens_gear);
     (gw, gh, rgb)
@@ -374,6 +380,79 @@ mod tests {
         );
         assert_eq!((w, h), (20, 30));
         assert_eq!(rgb.len(), 20 * 30 * 3);
+    }
+
+    #[test]
+    fn lens_correction_runs_precrop_and_commutes_with_crop() {
+        // m4-131: the warp + vignette run on the FULL frame before the geometry
+        // pass (darktable's iop_order-13 placement). Because the correction is
+        // purely coordinate-driven, cropping afterwards must commute exactly:
+        // a cropped export equals the same region of the uncropped export,
+        // bit-for-bit. Under the pre-m4-131 placement (stage inside the
+        // pipeline, i.e. after crop) the cropped frame was corrected around its
+        // own centre and this equality failed.
+        use c41_core::geometry::{Crop, Geometry};
+        use c41_core::rawimage::DemosaicMethod;
+        let Some(gear) = c41_core::iop::lens::resolve(
+            "Canon",
+            "Canon EOS 5D Mark II",
+            "Canon",
+            "Canon EF 50mm f/1.4 USM",
+        ) else {
+            eprintln!("skip: lensfun database unavailable");
+            return;
+        };
+        let img = synthetic_raw(40, 30);
+        let mut p = crate::preview::PreviewParams::default();
+        p.lens_on = true; // defaults carry MODFLAG_ALL, focal 50 mm, f/3.5
+
+        let full = render_export_rgb16_gear(
+            &img,
+            DemosaicMethod::Rcd,
+            Geometry::default(),
+            &p,
+            Some(&gear),
+        );
+        let cropped = render_export_rgb16_gear(
+            &img,
+            DemosaicMethod::Rcd,
+            Geometry {
+                crop: Crop { left: 0.25, top: 0.0, right: 0.75, bottom: 1.0 },
+                angle: 0.0,
+            },
+            &p,
+            Some(&gear),
+        );
+        assert_eq!((cropped.0, cropped.1), (20, 30));
+
+        // Precondition: the gear's calibration actually alters pixels here —
+        // otherwise the commutation below would hold trivially even for a
+        // wrongly-placed correction.
+        let plain = render_export_rgb16_gear(
+            &img,
+            DemosaicMethod::Rcd,
+            Geometry::default(),
+            &p,
+            None,
+        );
+        assert!(
+            full.2.iter().zip(plain.2.iter()).any(|(a, b)| a != b),
+            "correction was a no-op at these params; the test proves nothing",
+        );
+
+        // The commutation itself, exact.
+        for y in 0..30usize {
+            for x in 0..20usize {
+                for c in 0..3usize {
+                    let a = cropped.2[(y * 20 + x) * 3 + c];
+                    let b = full.2[(y * 40 + (x + 10)) * 3 + c];
+                    assert_eq!(
+                        a, b,
+                        "crop/lens mismatch at ({x},{y}) ch{c}: cropped {a} vs full {b}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

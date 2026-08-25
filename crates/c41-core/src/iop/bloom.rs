@@ -186,7 +186,8 @@ mod tests {
         assert!(output[nb] > input[nb], "nearby neighbour must gain L");
         // …the far corner receives less than the near neighbour (monotone
         // decay of the blurred light with distance)…
-        let corner = (0 * w + 0) * 4;
+        let (cx, cy) = (0usize, 0usize);
+        let corner = (cy * w + cx) * 4;
         assert!(
             output[corner] < output[nb],
             "glow decays: corner {} must trail neighbour {}",

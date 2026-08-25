@@ -1717,6 +1717,14 @@ impl PreviewParams {
     /// pair so full-res output matches the preview. `None` simply omits the
     /// stage — as does `lens_on` without gear (darktable shows "no data" and
     /// does the same).
+    ///
+    /// This is the variant for buffers where **geometry has not run yet** —
+    /// today the non-raw funnels (`apply_pipeline_gear`,
+    /// [`Self::apply_pipeline_rgb16_gear`]), whose 8-bit sources are never
+    /// cropped, so a full-frame warp inside the pipeline is exactly
+    /// darktable's pre-crop placement. The raw funnels must use
+    /// [`Self::to_pipeline_lens_preapplied`] instead: their geometry pass has
+    /// already cropped the frame by the time the pipeline runs (m4-131).
     pub fn to_pipeline_with(
         &self,
         space: ColorSpace,
@@ -1725,6 +1733,39 @@ impl PreviewParams {
             c41_core::iop::lens::ResolvedCamera,
             c41_core::iop::lens::ResolvedLens,
         )>,
+    ) -> Pipeline {
+        self.to_pipeline_inner(space, scale, lens_gear, true)
+    }
+
+    /// [`Self::to_pipeline_with`] for buffers the lens warp has **already been
+    /// applied to** upstream — the raw preview/export paths run
+    /// [`apply_lens_prepass`] on the full-frame decoded buffer *before* the
+    /// crop/straighten pass (darktable runs lens at iop_order 13, before crop),
+    /// so emitting the stage here would re-warp the already-cropped frame
+    /// around a shifted centre and vignette against the wrong frame edges.
+    pub fn to_pipeline_lens_preapplied(
+        &self,
+        space: ColorSpace,
+        scale: f32,
+        lens_gear: Option<&(
+            c41_core::iop::lens::ResolvedCamera,
+            c41_core::iop::lens::ResolvedLens,
+        )>,
+    ) -> Pipeline {
+        self.to_pipeline_inner(space, scale, lens_gear, false)
+    }
+
+    /// Shared builder; `lens_stage` selects whether the lens-correction stage
+    /// is emitted (see the two public wrappers for which callers want which).
+    fn to_pipeline_inner(
+        &self,
+        space: ColorSpace,
+        scale: f32,
+        lens_gear: Option<&(
+            c41_core::iop::lens::ResolvedCamera,
+            c41_core::iop::lens::ResolvedLens,
+        )>,
+        lens_stage: bool,
     ) -> Pipeline {
         let mut p = Pipeline::new();
         // Invert (film-camera negative, iop_order.c pos 2, before temperature 3) —
@@ -1770,7 +1811,10 @@ impl PreviewParams {
         // `main.darkroom_lens_choice` and arrives here pre-resolved; the camera
         // crop factor rides along at build time (`p->crop = cam->CropFactor`,
         // lens.c commit_params).
-        if self.lens_on {
+        //
+        // Only for pipelines whose input geometry has NOT been cropped yet —
+        // see [`Self::to_pipeline_with`] vs [`Self::to_pipeline_lens_preapplied`].
+        if lens_stage && self.lens_on {
             if let Some((cam, lens)) = lens_gear {
                 p.push(Stage::LensCorrection {
                     lens: lens.clone(),
@@ -2659,6 +2703,44 @@ pub fn render_linear_to_srgb8(
     render_linear_to_srgb8_gear(linear, width, height, params, None)
 }
 
+/// The lens-correction **pre-pass** (m4-131): warp + vignette `linear` on the
+/// full, un-cropped frame — darktable runs lens at iop_order 13, *before*
+/// crop/straighten, so the distortion centre and the vignetting falloff are
+/// measured against the whole sensor frame. Every raw path calls this right
+/// after decode and feeds the result through its geometry pass; the pipeline
+/// builders for those paths then skip the stage
+/// ([`PreviewParams::to_pipeline_lens_preapplied`]). The non-raw funnels keep
+/// the in-pipeline stage instead — their sources are never cropped, so a
+/// full-frame warp inside the pipeline is exactly this placement.
+///
+/// Gate mirrors the pipeline emission exactly: `lens_on` plus resolved gear.
+/// Returns an owned buffer either way (the active arm is a full-frame warp).
+pub fn apply_lens_prepass(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+) -> Vec<f32> {
+    if let Some((cam, lens)) = lens_gear.filter(|_| params.lens_on) {
+        // `process` fully overwrites its output in every branch (warp_into
+        // writes all four lanes of every pixel), so zero-init beats cloning
+        // the input into the destination first.
+        let mut out = vec![0.0f32; linear.len()];
+        c41_core::iop::lens::process(
+            linear,
+            &mut out,
+            width,
+            height,
+            lens,
+            &params.lens_params(cam, lens),
+        );
+        out
+    } else {
+        linear.to_vec()
+    }
+}
+
 /// [`Self::render_linear_to_srgb8`] with resolved lens-correction gear — the
 /// variant the darkroom preview and the export path both use so a lens
 /// correction applies identically in both. See [`LensGear`].
@@ -2724,8 +2806,11 @@ fn srgb_encode_rgb(
     lens_gear: Option<&LensGear>,
 ) -> Vec<f32> {
     let n = width.saturating_mul(height);
+    // The raw funnels feed an already-lens-warped buffer (the pre-pass ran on
+    // the full frame before geometry), so the pipeline must NOT emit the lens
+    // stage again — see [`PreviewParams::to_pipeline_lens_preapplied`].
     let mut processed =
-        params.to_pipeline_with(ColorSpace::Rec2020, 1.0, lens_gear).process(&linear[..n * 4], width, height);
+        params.to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, lens_gear).process(&linear[..n * 4], width, height);
     // Working space (Rec.2020) → sRGB before the display OETF (m4-35).
     c41_core::rawimage::apply_color_matrix(
         &mut processed,
@@ -3430,6 +3515,39 @@ mod tests {
             .map(|s| s.name())
             .collect();
         assert_eq!(names, ["denoiseprofile", "lens", "exposure"], "{names:?}");
+    }
+
+    #[test]
+    fn to_pipeline_lens_preapplied_omits_only_the_lens_stage() {
+        // The raw funnels receive an already-warped buffer (the m4-131 pre-pass
+        // ran on the full frame before geometry), so their builder must drop
+        // exactly the lens stage and nothing else.
+        let Some(gear) = c41_core::iop::lens::resolve(
+            "Canon",
+            "Canon EOS 5D Mark II",
+            "Canon",
+            "Canon EF 50mm f/1.4 USM",
+        ) else {
+            eprintln!("skip: lensfun database unavailable");
+            return;
+        };
+        let mut p = PreviewParams::default();
+        p.lens_on = true;
+        p.dn_on = true;
+        p.exposure_on = true;
+        p.ev = 0.5; // off-default so exposure is emitted
+        let with = p.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, Some(&gear));
+        assert!(with.stages.iter().any(|s| s.name() == "lens"));
+        let without = p.to_pipeline_lens_preapplied(ColorSpace::LinearSrgb, 1.0, Some(&gear));
+        assert!(!without.stages.iter().any(|s| s.name() == "lens"), "{:?}", without.stages.len());
+        let kept: Vec<&str> = without.stages.iter().map(|s| s.name()).collect();
+        let expected: Vec<&str> = with
+            .stages
+            .iter()
+            .map(|s| s.name())
+            .filter(|n| *n != "lens")
+            .collect();
+        assert_eq!(kept, expected, "{kept:?} vs {expected:?}");
     }
 
     #[test]

@@ -103,6 +103,49 @@ impl BaseImage {
     }
 }
 
+/// The cached post-lens-warp pristine frame plus the inputs it was computed
+/// from ([`LensFrame::matches`] re-validates it cheaply instead of re-warping
+/// on every render).
+struct LensFrame {
+    width: usize,
+    height: usize,
+    pixels: Vec<f32>,
+    /// Decode generation of the `pristine` this was warped from.
+    gen: u64,
+    /// Whether the module was enabled when this was computed.
+    on: bool,
+    /// The gear (Arc identity) used for the warp.
+    gear: Option<std::sync::Arc<crate::preview::LensGear>>,
+    /// The numeric lens parameters used for the warp.
+    params: c41_core::iop::lens::LensParams,
+}
+
+impl LensFrame {
+    /// True when this cached frame is still valid for `(gen, on, gear, params)`
+    /// — i.e. recomposing `base` needs no fresh warp.
+    ///
+    /// `params` is only ever inspected when both sides have `on == true`
+    /// (frames are stored only while enabled); callers holding no params may
+    /// pass anything — the `unwrap_or(&self.params)` self-compare at the call
+    /// site is deliberately inert, not a bug to "fix".
+    fn matches(
+        &self,
+        gen: u64,
+        on: bool,
+        gear: &Option<std::sync::Arc<crate::preview::LensGear>>,
+        params: &c41_core::iop::lens::LensParams,
+    ) -> bool {
+        if self.gen != gen || self.on != on {
+            return false;
+        }
+        match (&self.gear, gear) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b) && self.params == *params,
+            _ => false,
+        }
+    }
+}
+
 /// Shared live-preview state, cloned into every widget callback. Widgets are
 /// held as `glib::WeakRef` to avoid widget→closure→widget reference cycles
 /// (the page is dropped on navigation); the `Rc<RefCell<…>>` data is shared
@@ -119,6 +162,16 @@ struct PreviewCtx {
     /// so a straighten/crop change re-applies [`Geometry`] to it without a full
     /// re-decode. `None` for the JPEG path (no geometry there yet).
     pristine: Rc<RefCell<Option<(usize, usize, Vec<f32>)>>>,
+    /// Counts [`PreviewCtx::pristine`] writes so the cached lens warp
+    /// ([`PreviewCtx::lens_frame`]) is invalidated by a re-decode.
+    pristine_gen: Rc<std::cell::Cell<u64>>,
+    /// `pristine` after the lens-correction warp (m4-131): the warp runs on the
+    /// FULL frame before crop/straighten — darktable's iop_order-13 position —
+    /// and is cached between renders, so only lens-input changes pay for it.
+    /// [`apply_geometry_to_base`] composes `base` from this when present,
+    /// else from `pristine`. `None` = no warp applies (non-raw path, module
+    /// off, or unresolved gear).
+    lens_frame: Rc<RefCell<Option<LensFrame>>>,
     /// Current per-image geometry (straighten + crop), applied to `pristine` to
     /// produce the displayed `base`.
     geometry: Rc<std::cell::Cell<Geometry>>,
@@ -726,12 +779,62 @@ fn effective_params(ctx: &PreviewCtx) -> PreviewParams {
     }
 }
 
+/// Recompute the cached post-lens frame ([`PreviewCtx::lens_frame`]) when any
+/// warp input changed — a re-decode, the enable toggle, a gear swap, or one of
+/// the numeric lens params. Returns `true` when the cache was rewritten and
+/// `base` must be recomposed before painting. Called at the top of
+/// [`render_preview`], which every lens-affecting trigger funnels through, so
+/// no call site needs to know the warp exists. Cheap no-op (one small struct
+/// compare) when nothing changed.
+fn refresh_lens_frame(ctx: &PreviewCtx) -> bool {
+    let gen = ctx.pristine_gen.get();
+    // Non-raw path: there is no full-frame buffer to warp (the Srgb8 funnel
+    // keeps the in-pipeline lens stage); just drop any stale cached frame.
+    if ctx.pristine.borrow().is_none() {
+        if ctx.lens_frame.borrow().is_some() {
+            *ctx.lens_frame.borrow_mut() = None;
+        }
+        return false;
+    }
+    let params = effective_params(ctx);
+    let gear = ctx.lens_gear.borrow().clone();
+    let on = gear.is_some() && params.lens_on;
+    let lp = on.then(|| {
+        let g = gear.as_ref().unwrap();
+        params.lens_params(&g.0, &g.1)
+    });
+    if let Some(f) = ctx.lens_frame.borrow().as_ref() {
+        if f.matches(gen, on, &gear, lp.as_ref().unwrap_or(&f.params)) {
+            return false;
+        }
+    } else if !on {
+        return false;
+    }
+    // (Re)compute the warp on the pristine frame.
+    let frame = if let (true, Some(g), Some(lp)) = (on, gear.as_ref(), lp.as_ref()) {
+        let (w, h, px) = ctx.pristine.borrow().as_ref().unwrap().clone();
+        let pixels = crate::preview::apply_lens_prepass(&px, w, h, &params, Some(g));
+        Some(LensFrame { width: w, height: h, pixels, gen, on, gear, params: lp.clone() })
+    } else {
+        None
+    };
+    *ctx.lens_frame.borrow_mut() = frame;
+    true
+}
+
 /// Re-run the pipeline over the base preview, refresh the histogram, and repaint
 /// both the image and the histogram. Reads the current params (a `Copy`
 /// snapshot, so no borrow is held across `apply_pipeline`). A no-op until the
 /// image has decoded or if the page widgets have been dropped.
 fn render_preview(ctx: &PreviewCtx) {
     let Some(picture) = ctx.picture.upgrade() else { return };
+    // Lens pre-pass first (m4-131): if a warp input changed, recompose `base`
+    // from the new lens frame and come back through here once — by then the
+    // cache matches and this body paints it.
+    if refresh_lens_frame(ctx) {
+        apply_geometry_to_base(ctx);
+        return;
+    }
     let params = effective_params(ctx);
     // Snapshot the gear Arc (a refcount bump, no resolution work) so no borrow
     // is held across the render.
@@ -795,26 +898,36 @@ fn straighten_rad_to_deg(rad: f32) -> f64 {
 }
 
 /// Apply the current [`PreviewCtx::geometry`] to the cached un-geometried raw
-/// buffer ([`PreviewCtx::pristine`]) to produce the displayed `base`, then
-/// re-render. No-op when there is no pristine buffer (the JPEG path, or before
-/// the first decode). Cheap enough to re-run on every geometry change (a
-/// downscaled-buffer resample), unlike a full re-decode.
+/// buffer ([`PreviewCtx::pristine`], or its post-lens-warp form
+/// [`PreviewCtx::lens_frame`] when the pre-pass has run) to produce the
+/// displayed `base`, then re-render. No-op when there is no pristine buffer
+/// (the JPEG path, or before the first decode). Cheap enough to re-run on every
+/// geometry change (a downscaled-buffer resample), unlike a full re-decode.
 fn apply_geometry_to_base(ctx: &PreviewCtx) {
     let geom = ctx.geometry.get();
     let editing = ctx.crop_editing.get();
-    let base = {
-        let pristine = ctx.pristine.borrow();
-        let Some((w, h, pixels)) = pristine.as_ref() else {
-            return;
-        };
+    let compose = |pixels: &[f32], w: usize, h: usize| -> BaseImage {
         // Crop-edit mode shows the rotated-but-uncropped frame (the overlay draws
         // the crop rect on top); otherwise the actual cropped result.
         let (gw, gh, gpixels) = if editing {
-            c41_core::geometry::apply_rotate(pixels, *w, *h, geom.angle)
+            c41_core::geometry::apply_rotate(pixels, w, h, geom.angle)
         } else {
-            geom.apply(pixels, *w, *h)
+            geom.apply(pixels, w, h)
         };
         BaseImage::Linear { width: gw, height: gh, pixels: gpixels }
+    };
+    let base = {
+        let lens_frame = ctx.lens_frame.borrow();
+        if let Some(lf) = lens_frame.as_ref() {
+            compose(&lf.pixels, lf.width, lf.height)
+        } else {
+            drop(lens_frame);
+            let pristine = ctx.pristine.borrow();
+            let Some((w, h, pixels)) = pristine.as_ref() else {
+                return;
+            };
+            compose(pixels, *w, *h)
+        }
     };
     *ctx.base.borrow_mut() = Some(base);
     render_preview(ctx);
@@ -887,6 +1000,7 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     *ctx.cam_meta.borrow_mut() = (clean_make, clean_model);
                     lens_seed_camera_from_meta(&ctx);
                     *ctx.pristine.borrow_mut() = Some((w, h, px));
+                    ctx.pristine_gen.set(ctx.pristine_gen.get().wrapping_add(1));
                     apply_geometry_to_base(&ctx); // sets base + renders
                 }
                 // Don't make a failed decode an invisible blank — log it.
@@ -1070,6 +1184,8 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         picker: picker_label.downgrade(),
         base: Rc::new(RefCell::new(None)),
         pristine: Rc::new(RefCell::new(None)),
+        pristine_gen: Rc::new(std::cell::Cell::new(0)),
+        lens_frame: Rc::new(RefCell::new(None)),
         geometry: Rc::new(std::cell::Cell::new(geometry0)),
         crop_editing: Rc::new(std::cell::Cell::new(false)),
         decode_gen: Rc::new(std::cell::Cell::new(0)),
@@ -3041,11 +3157,13 @@ fn lens_fill_lens_dd(
 /// tables ([`CORRECTIONS`]/[`GEOMS`]) because neither combo's index equals its
 /// value (bitmasks; lfLensType starts at 1).
 ///
-/// Documented limitations: (1) darktable runs lens at iop_order 13, before
-/// crop/rotate; our separate-pass geometry applies first, so the correction is
-/// measured against the post-crop frame and is only geometrically exact without
-/// crop/straighten (a lens pre-pass on the pristine buffer is the follow-up).
-/// (2) Gear identity sits outside the history stack — undo/redo reverts params
+/// The correction is a **pre-pass on the full decoded frame** (m4-131): like
+/// darktable's iop_order 13 it runs BEFORE crop/straighten — the warp result is
+/// cached on [`PreviewCtx::lens_frame`] and geometry composes over it, so the
+/// distortion centre and vignetting falloff are measured against the whole
+/// sensor frame and cropping commutes with the correction (pinned by an export
+/// test). Documented limitations: (1) gear identity sits outside the history
+/// stack — undo/redo reverts params
 /// but not a camera/lens swap, and Reset leaves the choice in place so
 /// re-enabling the module resurrects it (identity, not an edit). The focal
 /// slider is not clamped to the selected lens's focal range either (C forces

@@ -1510,7 +1510,8 @@ mod tests {
         let (w, h, o) = apply_orientation(&img, 2, 3, (true, false, false));
         assert_eq!((w, h), (3, 2)); // dims swapped
         assert_eq!(o[0], 0.0); // out(0,0) = src(0,0)
-        assert_eq!(o[(0 * 3 + 2) * 4], 4.0); // out(2,0) = src(0,2) = row2col0 = 4
+        let (px, py) = (2usize, 0usize); // out(2,0)
+        assert_eq!(o[(py * 3 + px) * 4], 4.0); // = src(0,2) = row2col0 = 4
 
         // Rotate270 = (transpose, flip_x, flip_y) = (true, true, false): the
         // exact path of the verified EXIF-8 portrait ORF. flips run in source
