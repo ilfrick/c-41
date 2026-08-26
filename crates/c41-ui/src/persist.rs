@@ -974,16 +974,19 @@ pub fn delete_collection_preset(db_path: &str, name: &str) -> bool {
 /// edit yet merges onto defaults; a group name nothing knows about is simply
 /// skipped.
 ///
-/// Why no live-editor invalidation is needed: styles are applied only from
-/// the lighttable's metadata panel, and every darkroom activation builds a
-/// fresh page that seeds itself from this table — lib.rs constructs
-/// `darkroom_page` anew at each entry site and retains nothing after pop,
-/// while the page's AutoSave flushes on hide — so an apply always wins and is
-/// visible on the next visit. This deliberately rests on that page-per-visit
-/// wiring: if darkroom pages were ever cached across visits, a cached page's
-/// autosave would clobber what this wrote, pre-existing for whole styles but
-/// sharper for partial merges because the user believes their other modules
-/// survived. Cross-page invalidation has to come with any such caching.
+/// Why no live-editor invalidation is needed. There are two apply surfaces:
+/// the lighttable's metadata panel (this function) and the darkroom Styles
+/// section (m4-151), which mutates the open page's live params directly and
+/// lets autosave persist them — nothing to invalidate there. For a
+/// lighttable-side apply, every darkroom activation builds a fresh page that
+/// seeds itself from this table — lib.rs constructs `darkroom_page` anew at
+/// each entry site and retains nothing after pop, while the page's AutoSave
+/// flushes on hide — so an apply always wins and is visible on the next visit.
+/// That deliberately rests on page-per-visit wiring: if darkroom pages were
+/// ever cached across visits, a cached page's autosave would clobber what a
+/// lighttable-side apply wrote — pre-existing for whole styles but sharper for
+/// partial merges because the user believes their other modules survived.
+/// Cross-page invalidation has to come with any such caching.
 pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> usize {
     if db_path.is_empty() {
         return 0;
@@ -995,16 +998,12 @@ pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> us
     let mut written = 0usize;
     for path in full_paths.iter().filter(|p| !p.is_empty()) {
         if let Some(imgid) = imgid_for_path(&conn, path) {
-            let outcome = match &style.modules {
-                None => save_params_conn(&conn, imgid, &style.params),
-                Some(groups) => {
-                    let base = load_saved_conn(&conn, imgid).unwrap_or_default();
-                    let names: Vec<&str> = groups.iter().map(String::as_str).collect();
-                    let merged = crate::stylemodules::merge_modules(&base, &style.params, &names);
-                    save_params_conn(&conn, imgid, &merged)
-                }
-            };
-            if outcome.is_ok() {
+            // The same apply semantic as the darkroom surface (m4-151 review):
+            // whole-edit styles replace outright regardless of what the target
+            // had, partial ones merge their listed groups over it.
+            let base = load_saved_conn(&conn, imgid).unwrap_or_default();
+            let merged = crate::stylemodules::apply_style(&base, style);
+            if save_params_conn(&conn, imgid, &merged).is_ok() {
                 written += 1;
             }
         }

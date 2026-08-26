@@ -1671,6 +1671,16 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     right_box.append(&snapshot_section);
     right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     right_box.append(&modules_panel);
+    right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    // Saved styles (m4-151), deliberately outside the rebuilt modules box so
+    // Reset/undo leave this row — its selection and feedback — alone. Needs
+    // this scope's panel/history/toggle handles, hence built here.
+    right_box.append(&styles_module_group(
+        &ctx,
+        &panel_box.downgrade(),
+        &before_after_btn.downgrade(),
+        &history_list.downgrade(),
+    ));
 
     // ── Split view: image | (history / modules) ────────────────────────────
     let content = gtk4::Box::builder()
@@ -2081,6 +2091,104 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
         }
         panel.append(&pg);
     }
+}
+
+/// Saved-style application inside the darkroom (m4-151), pinned below the
+/// scrollable module list. darktable keeps this lib module in the same
+/// right-centre panel (`src/libs/styles.c`, container
+/// DT_UI_CONTAINER_PANEL_RIGHT_CENTER, position 599; views LIGHTTABLE|MULTI
+/// since 4.9 so it can be added to darkroom via the add-module menu) without
+/// belonging to any iop group — hence no catalogue entry here either.
+///
+/// Built OUTSIDE `panel_box` on purpose: Reset/undo rebuilds clear that box,
+/// and this row must survive them with its selection and feedback intact.
+/// Applying mirrors the Reset handler exactly — write params, record an
+/// explicitly labelled history entry, rebuild the module sliders so they show
+/// the applied values (a slider still reading its pre-style value would commit
+/// that stale value over the style on its next drag), re-render — mapping onto
+/// `dt_styles_apply_to_dev` writing pending edits, then recording one undo
+/// step. The render arms autosave + the history recorder like any slider edit.
+fn styles_module_group(
+    ctx: &PreviewCtx,
+    panel_w: &glib::WeakRef<gtk4::Box>,
+    ba_w: &glib::WeakRef<gtk4::ToggleButton>,
+    list_w: &glib::WeakRef<gtk4::ListBox>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Styles")
+        .description("Apply a saved style to this image")
+        .build();
+    let styles = crate::persist::load_styles(&ctx.db_path);
+    if styles.is_empty() {
+        // Same philosophy as inert_module_row: show state, not a dead control.
+        let row = adw::ActionRow::builder()
+            .title("No saved styles")
+            .subtitle(if ctx.db_path.is_empty() {
+                "no catalogue open"
+            } else {
+                "create one from the lighttable's metadata panel"
+            })
+            .build();
+        row.add_css_class("dim-label");
+        row.set_activatable(false);
+        group.add(&row);
+        return group;
+    }
+    let names: Vec<&str> = styles.iter().map(|s| s.name.as_str()).collect();
+    let dd = gtk4::DropDown::from_strings(&names);
+    let apply_btn = gtk4::Button::with_label("Apply");
+    apply_btn.add_css_class("flat");
+    dd.set_valign(gtk4::Align::Center);
+    apply_btn.set_valign(gtk4::Align::Center);
+    let row = adw::ActionRow::builder()
+        .title("Apply style")
+        .subtitle("whole styles replace the edit; partial ones merge their modules")
+        .build();
+    row.add_suffix(&dd);
+    row.add_suffix(&apply_btn);
+    group.add(&row);
+
+    // Weak widget captures only: this closure is owned by apply_btn, which the
+    // group owns — strong widget handles back into that chain would be the
+    // same GObject refcount cycle the save dialog hit in m4-150. `ctx`, the
+    // style list and the three WeakRefs are non-owning or non-widget state.
+    let ctx_cl = ctx.clone();
+    let panel_w = panel_w.clone();
+    let ba_w = ba_w.clone();
+    let list_w = list_w.clone();
+    let dd_w = dd.downgrade();
+    let group_w = group.downgrade();
+    apply_btn.connect_clicked(move |_| {
+        let Some(dd) = dd_w.upgrade() else { return };
+        let Some(style) = styles.get(dd.selected() as usize) else { return };
+        let merged = crate::stylemodules::apply_style(&ctx_cl.params.borrow(), style);
+        *ctx_cl.params.borrow_mut() = merged;
+        ctx_cl.bypass.set(false); // applying exits the before/after peek, like Reset
+        if let Some(ba) = ba_w.upgrade() {
+            ba.set_active(false); // keep the toggle visual in sync with bypass
+        }
+        // Explicitly labelled entry: describe_change would otherwise name just
+        // the first differing group of a possibly 33-group restyle; the
+        // render's debounced recorder dedups against this.
+        let changed =
+            ctx_cl.history.borrow_mut().record(format!("Style: {}", style.name), merged);
+        if changed {
+            if let Some(list) = list_w.upgrade() {
+                refresh_history_list(&list, &ctx_cl.history.borrow());
+            }
+        }
+        if let Some(panel) = panel_w.upgrade() {
+            while let Some(child) = panel.first_child() {
+                panel.remove(&child);
+            }
+            populate_modules(&panel, &ctx_cl);
+        }
+        render_preview(&ctx_cl);
+        if let Some(g) = group_w.upgrade() {
+            g.set_description(Some(&format!("Applied \u{201c}{}\u{201d}", style.name)));
+        }
+    });
+    group
 }
 
 /// A placeholder for a module whose processing exists in `c41-core` but has

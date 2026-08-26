@@ -2448,3 +2448,47 @@ final link step) — treated as no-result and re-run to completion.
 **Verification**: `scripts/ci-local.sh` GATE_EXIT=0 (fresh log gate-m4-150.log,
 gitignored); style/apply test groups green (39 tests). No PARITY_AUDIT change —
 polish on 2.4's implementation, no parity item resolved.
+
+## 2026-08-26 08:52 UTC — m4-151: styles applied from inside the darkroom
+
+Closes the last recorded 2.4 absence (PARITY_AUDIT updated in the same
+commit): a Styles section pinned below the darkroom module list — style
+dropdown + Apply, empty-state row when there is no catalogue or no saved
+styles. Ground truth taken from our own darktable tree:
+src/libs/styles.c is a lib module in DT_UI_CONTAINER_PANEL_RIGHT_CENTER at
+position 599 (views LIGHTTABLE|MULTI since 4.9, i.e. addable to darkroom),
+and the darkroom path dt_styles_apply_to_dev writes pending edits then
+records one undo step around the apply.
+
+Design: stylemodules::apply_style(current, style) is now the single apply
+semantic — None replaces outright, Some(groups) merges listed groups over
+current; persist::apply_style_to was collapsed onto it too (review MAJOR-2)
+so the lighttable and darkroom surfaces cannot drift. The darkroom Apply
+mirrors the Reset handler exactly: write params → clear bypass (+ sync the
+toggle) → record an explicitly labelled "Style: <name>" history entry →
+rebuild the module sliders so they show applied values → render_preview.
+That rebuild is review MAJOR-1's fix: without it every slider kept its
+pre-style value and the next drag would silently clobber styled fields.
+
+Placement lesson: the first cut appended the Styles group INSIDE the rebuilt
+panel box. Review flagged that this both wipes the row on every Reset/undo
+and re-queries the DB per rebuild; it now lives outside panel_box (appended
+to right_box after the module list), so rebuilds leave selection + feedback
+intact and load_styles runs once per page. Retain-cycle discipline held:
+closure captures dd/group weakly plus three WeakRefs passed in
+(panel/before_after/history_list); ctx and Vec<Style> strong non-widget.
+
+Review findings fixed: MAJOR-1 stale-widget commit hazard (rebuild after
+apply), MAJOR-2 duplicated apply semantic (persist now calls apply_style),
+MINOR wording fixes ("flushing" → writing pending edits + one undo step;
+container name; "addable since 4.9"; stale "lighttable-only" caveat in
+persist.rs rewritten to describe both surfaces), MINOR redundant empty-db
+guard dropped, NIT explicit history label. Senior review again via the
+established substitution (fricktrade-architect API-402s; general-purpose
+agent, model:"opus", read-only mandate) — it verified claims against source
+AND upstream darktable fetched from GitHub.
+
+Verification: cargo check clean; style/apply test groups green (29+14);
+scripts/ci-local.sh GATE_EXIT=0 (gate-m4-151.log, gitignored).
+Follow-ups recorded: ActionRow crowding at width_request(320) is cosmetic;
+populate_modules' per-rebuild cost noted by reviewer as do-not-copy pattern.

@@ -417,6 +417,27 @@ pub fn merge_modules(base: &PreviewParams, overlay: &PreviewParams, groups: &[&s
     merged
 }
 
+/// The params an image takes when `style` is applied onto its current edit
+/// `current`. Both apply surfaces call this — the lighttable's
+/// [`crate::persist::apply_style_to`] and the darkroom Styles section — so
+/// they cannot drift apart: a whole-edit style (`modules == None`) replaces
+/// outright (`current` is irrelevant to that arm); a partial style merges only
+/// its listed groups over what is already there. Unknown group names are
+/// skipped (see [`merge_modules`]).
+///
+/// Note the whole-edit arm really is replace even though merging all 33 groups
+/// would compute the same value — [`MODULE_GROUPS`] partitions every field —
+/// because "replace" is the intent and the direct copy says so.
+pub fn apply_style(current: &PreviewParams, style: &crate::persist::Style) -> PreviewParams {
+    match &style.modules {
+        None => style.params,
+        Some(groups) => {
+            let names: Vec<&str> = groups.iter().map(String::as_str).collect();
+            merge_modules(current, &style.params, &names)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +533,33 @@ mod tests {
         assert_eq!(merged.ev, base.ev, "Exposure is not listed");
         assert_eq!(merged.cb_contrast, base.cb_contrast, "Color balance RGB is not listed");
         assert_eq!(merged.lens_focal, base.lens_focal, "Lens correction is not listed");
+    }
+
+    fn style_with(params: PreviewParams, modules: Option<Vec<String>>) -> crate::persist::Style {
+        crate::persist::Style {
+            name: "test".into(),
+            description: String::new(),
+            params,
+            modules,
+        }
+    }
+
+    #[test]
+    fn applying_a_whole_style_replaces_the_current_edit() {
+        let current = crate::preview::fully_populated_params();
+        let out = apply_style(&current, &style_with(PreviewParams::default(), None));
+        assert_eq!(out, PreviewParams::default());
+    }
+
+    #[test]
+    fn applying_a_partial_style_merges_over_the_current_edit() {
+        let current = crate::preview::fully_populated_params();
+        let out = apply_style(
+            &current,
+            &style_with(PreviewParams::default(), Some(vec!["Velvia".into(), "Garbage".into()])),
+        );
+        assert_eq!(out.velvia_strength, PreviewParams::default().velvia_strength);
+        assert_eq!(out.ev, current.ev, "Exposure is not in the style");
+        assert_eq!(out.lens_focal, current.lens_focal, "Lens correction is not in the style");
     }
 }
