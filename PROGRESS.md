@@ -2548,3 +2548,57 @@ Verified: scripts/ci-local.sh exit code 0 (check, clippy, test --workspace
 --release, c41-rs link) on a fresh log; 835 c41-core release tests pass.
 PARITY_AUDIT.md untouched — porting alone resolves no listed item there; the
 audit item moves when the module is wired into the live pipeline (slice 2).
+
+## 2026-08-26 11:25 UTC — m4-152 slice 2: live Local Contrast darkroom module (bilat wired)
+
+Wired the slice-1 local-laplacian engine into the live preview pipeline as a
+"Local contrast" module, mirroring darktable's bilat.c in its LL mode ($DEFAULT:1
+— the engine every bilat preset and default uses; the bilateral-grid variant is
+future work). Pipeline: new `Stage::LocalContrast { midtone, shadows, highlights,
+detail, space }`, name "bilat", not pixel-local (LL runs untiled like C),
+working_space = the Lab sandwich it needs. Apply arm converts RGB↔Lab via the
+existing LabConv pair by space, then calls local_laplacian with the verified
+positional mapping from bilat.c process(): sigma=midtone, shadows=sigma_s,
+highlights=sigma_r, clarity=detail. Pushed between Lowpass and ColorCorrection —
+C's iop_order constraint 40 < 54 < 55 holds; comment quotes C's own rationale
+("improve clarity/local contrast after all the bad things we have done to it with
+tonemapping"). Identity is flag-only: curve_scalar has no neutral pass (verified
+against C lines 313-340 — it bends inside ±2σ and only flattens toward g±σ when
+the knobs are 0), so an enabled module must never be treated as identity.
+
+UI/params: PreviewParams v27 (+1 bool idx 37, +4 f32 at 444-447; ENCODED_LEN
+1814→1831, pin updated with m4-152 comment); defaults mirror bilat.c gui_init
+(midtone .5, shadows/highlights .5, detail .25) with C's LL-mode hard-max slider
+ranges (Detail −1..4, Highlights/Shadows 0..2, Midtone 0.001..1) in C's widget
+order; history describe_change arm + coverage destructure; catalog Tone group;
+stylemodules copy group + MODULE_GROUPS 33→34; canonical-order test extended;
+new decode_v26_blob_defaults_lc_fields guards old-blob compat.
+
+Review: fricktrade-architect API-402'd as always → standing workaround (fresh
+general-purpose agent, model opus, READ-ONLY mandate + senior-reviewer framing).
+Verdict SHIP, zero functional defects; five P2s dispositioned: two doc
+corrections applied (bezier-knee wording; no-neutral-identity rationale), one
+accepted as house-style (chunks_exact test loops identical to sibling shadhi
+tests), one closed with a new inversion-guard regression test
+(localcontrast_shadows_and_highlights_are_distinct_controls: vertical step edge,
+midtone-only vs shadows/highlights-only params must differ >1e-3), one recorded
+in PARITY_AUDIT (% unit suffixes need add_param_slider support we lack — cosmetic).
+
+Failures/corrections along the way (kept): E0614 ×4 — dereferenced Copy-bound
+match fields that needed none. An Edit accidentally consumed two doc-comment
+lines of the neighbouring lowpass_module_row leaving broken mid-sentence text;
+caught on read-back and restored. Pinned encode length failed as designed
+(1814 vs 1831). Memory-figure saga: my slice-1 doc claimed "~11 GB padded
+level-0 for 20k×20k"; the reviewer countered "~42 GB"; BOTH were wrong —
+measured ground truth via locallaplacian_memory_use: level-0 single buffer
+5.295 GB, total 56.48 GB at 20k² (14.12 GB at 10k², ~141 B/px), figures now in
+the docs. Lesson re-learned: measure, don't trust even a reviewer's arithmetic.
+Also: first green gate predated the review fixes → full gate re-run post-fixes
+(this entry's verification below) per the rule that the gate must cover what
+ships.
+
+Verified: scripts/ci-local.sh exit code 0 AFTER all fixes (fresh log, exit-code
+keyed — check, clippy --workspace, test --workspace --release, c41-rs link);
+localcontrast pipeline tests incl. tone+chroma, distinct-controls and hue
+preservation all pass; 393 c41-ui release tests pass. PARITY_AUDIT.md updated in
+this commit with the wiring evidence for the local-contrast item.

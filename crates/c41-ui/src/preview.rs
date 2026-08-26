@@ -240,6 +240,24 @@ pub struct PreviewParams {
     pub shadhi_shadows_ccorrect: f32,
     /// Highlights colour correction, 0..100 (C `highlights_ccorrect` slider, default 50).
     pub shadhi_highlights_ccorrect: f32,
+    // ── Local contrast (bilat.c, local-laplacian mode; iop_order.c v50_order
+    // pos 54) ────────────────────────────────────────────────────────────────
+    /// Laplacian-pyramid local contrast on Lab L ("local contrast" / clarity
+    /// module). Only the LL engine is exposed — it is the C `$DEFAULT:1` mode
+    /// and both shipped presets use it; the bilateral-grid mode is future work.
+    pub lc_on: bool,
+    /// Midtone range, 0.001..1.0 default 0.5 (C `midtone`; feeds the engine's
+    /// sigma — lower compresses dynamic range harder, higher boosts local
+    /// contrast).
+    pub lc_midtone: f32,
+    /// Shadow contrast, 0..2 default 0.5 (C `sigma_s`; darktable's LL-mode GUI
+    /// caps the introspection range at a hard max of 2.0 and formats as %).
+    pub lc_shadows: f32,
+    /// Highlight contrast, 0..2 default 0.5 (C `sigma_r`, same GUI treatment).
+    pub lc_highlights: f32,
+    /// Detail strength, -1..4 default 0.25 (C `detail`; negative smooths,
+    /// positive adds local contrast).
+    pub lc_detail: f32,
     // ── Primaries (primaries.c, iop_order.c v50_order pos 28.5) ──────────
     // RGB chromaticity adjustment: rotates each working-space primary
     // around the white point and scales its distance from it. Hue is stored
@@ -743,6 +761,14 @@ impl Default for PreviewParams {
             shadhi_compress: 50.0,
             shadhi_shadows_ccorrect: 100.0,
             shadhi_highlights_ccorrect: 50.0,
+            // Local contrast defaults mirror dt_iop_bilat_params_t (bilat.c
+            // lines 49-55): mode $DEFAULT 1 (local laplacian — the only engine
+            // we ship), sigma_r/sigma_s 0.5, detail 0.25, midtone 0.5. Off.
+            lc_on: false,
+            lc_midtone: 0.5,
+            lc_shadows: 0.5,
+            lc_highlights: 0.5,
+            lc_detail: 0.25,
             // Primaries defaults: off, all hues at 0, all RGB purities at 1.0
             // (unchanged), achromatic tint purity at 0 (white point fixed).
             primaries_on: false,
@@ -1060,6 +1086,11 @@ impl PreviewParams {
         // reporting non-identity only costs one unchanged re-render — it can
         // never mask an applied edit.
         let lens_identity = !self.lens_on;
+        // Local contrast: flag-only gate. The LL curve is a knee compressor —
+        // even at detail 0 / shadows 0 / highlights 0 it bends inside ±2σ and
+        // runs flat toward g±σ outside, so no slider combination while
+        // enabled is a pass-through (see the Stage::LocalContrast docs).
+        let lc_identity = !self.lc_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1077,6 +1108,7 @@ impl PreviewParams {
             && rc_identity
             && bc_identity
             && lens_identity
+            && lc_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -1227,6 +1259,7 @@ impl PreviewParams {
             rc_on: false,
             bc_on: false,
             lens_on: false,
+            lc_on: false,
             ..*self
         }
     }
@@ -1276,7 +1309,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1436,6 +1469,11 @@ impl PreviewParams {
             self.lens_distance,
             self.lens_target_geom,
         ] {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        // Local contrast (v27): the four LL-mode sliders, appended after the
+        // lens block so the layout stays append-only.
+        for s in [self.lc_midtone, self.lc_shadows, self.lc_highlights, self.lc_detail] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -1674,6 +1712,13 @@ impl PreviewParams {
             lens_aperture: f.get(441).copied().unwrap_or(d.lens_aperture),
             lens_distance: f.get(442).copied().unwrap_or(d.lens_distance),
             lens_target_geom: f.get(443).copied().unwrap_or(d.lens_target_geom),
+            // Local contrast (m4-152): bool 37, floats 444–447. v26-and-earlier
+            // blobs end before any of this — defaults hold.
+            lc_on: bools.get(37).map_or(d.lc_on, |&b| b != 0),
+            lc_midtone: f.get(444).copied().unwrap_or(d.lc_midtone),
+            lc_shadows: f.get(445).copied().unwrap_or(d.lc_shadows),
+            lc_highlights: f.get(446).copied().unwrap_or(d.lc_highlights),
+            lc_detail: f.get(447).copied().unwrap_or(d.lc_detail),
         })
     }
 
@@ -2162,6 +2207,25 @@ impl PreviewParams {
                 space,
             });
         }
+        // Local contrast (bilat.c local-laplacian mode, iop_order.c v50_order
+        // pos 54 — "improve clarity/local contrast after all the bad things we
+        // have done to it with tonemapping": after shadhi 50 / our lowpass
+        // placement, before colorcorrection 55). Laplacian-pyramid tone remap
+        // of Lab L. Flag-only gate (mirrors `is_identity`): the LL curve is a
+        // knee compressor even at neutral-looking sliders, so while enabled it
+        // always does real work. Slider values pass through unchanged — the
+        // engine consumes them raw (midtone→sigma, sigma_s→shadows,
+        // sigma_r→highlights, detail→clarity), exactly as bilat.c's process()
+        // forwards them; like the C we ignore scale and run untiled.
+        if self.lc_on {
+            p.push(Stage::LocalContrast {
+                midtone: self.lc_midtone,
+                shadows: self.lc_shadows,
+                highlights: self.lc_highlights,
+                detail: self.lc_detail,
+                space,
+            });
+        }
         // Color correction (iop_order.c pos 55, after sharpen 53, before colorcontrast
         // 56) — luminance-dependent Lab a/b scaling + global saturation. The HSL-
         // style params (loa/hia/lob/hib/saturation) are converted to the core's
@@ -2477,9 +2541,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v25 adds base curve (1 bool + 6 f32 scalars + 40 interleaved node coords).
 /// v26 adds lens correction (2 bools + 6 f32; the camera/lens identity lives
 /// in `main.darkroom_lens_choice` — the blob carries no strings).
-const ENCODE_VERSION: u8 = 26;
-/// 1 version byte + 37 bool bytes + 444 little-endian f32.
-const ENCODED_LEN: usize = 1 + 37 + 444 * 4;
+/// v27 adds local contrast (1 bool + 4 f32, the LL-mode sliders).
+const ENCODE_VERSION: u8 = 27;
+/// 1 version byte + 38 bool bytes + 448 little-endian f32.
+const ENCODED_LEN: usize = 1 + 38 + 448 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2501,6 +2566,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (24, 34, 392), // v24: RGB curve added
     (25, 35, 438), // v25: base curve added
     (26, 37, 444), // v26: lens correction added
+    (27, 38, 448), // v27: local contrast added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3044,6 +3110,9 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         shadhi_highlights: -30.0, shadhi_whitepoint: 2.0,
         shadhi_radius: 80.0, shadhi_compress: 60.0,
         shadhi_shadows_ccorrect: 75.0, shadhi_highlights_ccorrect: 40.0,
+        lc_on: true,
+        lc_midtone: 0.375, lc_shadows: 1.25,
+        lc_highlights: 1.75, lc_detail: -0.5,
         primaries_on: true,
         primaries_achromatic_tint_hue: 10.0,
         primaries_achromatic_tint_purity: 0.3,
@@ -3669,13 +3738,17 @@ mod tests {
         // display referred") — after rgblevels 43.0, before sigmoid 45.3. On by
         // itself is enough to emit the stage.
         p.bc_on = true;
+        // Local contrast: pos 54 in v50_order — after shadhi 50 (and our lowpass
+        // placement), before colorcorrection 55. On by itself is enough to emit
+        // the stage.
+        p.lc_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "lowpass", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "lowpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "splittoning"]
         );
         // Base curve is the scene→display conversion point (iop_order.c pos
         // 44.0): after rgbcurve/rgblevels, before sigmoid and filmicrgb.
@@ -4194,6 +4267,34 @@ mod tests {
         assert_eq!(decoded.rc_nodes_r, def.rc_nodes_r);
         assert_eq!(decoded.rc_nodes_g, def.rc_nodes_g);
         assert_eq!(decoded.rc_nodes_b, def.rc_nodes_b);
+    }
+
+    #[test]
+    fn decode_v26_blob_defaults_lc_fields() {
+        // A v26 blob (before local contrast was added — 37 bools / 444 f32s)
+        // must decode successfully: the new bilat fields fall back to their
+        // C defaults, so a saved style from the pre-local-contrast era loads
+        // cleanly.
+        let v26 = {
+            let mut b = vec![0u8; 1 + 37 + 444 * 4];
+            b[0] = 26; // version 26
+            b
+        };
+        let decoded = PreviewParams::decode(&v26)
+            .expect("v26 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.lc_on, def.lc_on);
+        assert_eq!(decoded.lc_midtone, def.lc_midtone);
+        assert_eq!(decoded.lc_shadows, def.lc_shadows);
+        assert_eq!(decoded.lc_highlights, def.lc_highlights);
+        assert_eq!(decoded.lc_detail, def.lc_detail);
+        // and the defaulted module stays out of the pipeline
+        assert!(
+            decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0)
+                .stages.iter()
+                .all(|s| s.name() != "bilat"),
+            "v26 blob must not emit a bilat stage: defaults are off"
+        );
     }
 
     #[test]

@@ -390,9 +390,10 @@ fn num_levels_for(min_dim: usize) -> usize {
 /// call sites should gate on the smaller side being at least 4.
 ///
 /// Memory: unlike C's graceful copy-through on allocation failure, Rust aborts
-/// on OOM — peak need is [`local_laplacian_memory_use`] (~11 GB padded level-0
-/// alone for a 20k×20k input), so callers wiring this into a pipeline should
-/// pre-check it against a budget, as darktable's tiling code does.
+/// on OOM — peak need is [`local_laplacian_memory_use`] (~141 bytes/px: about
+/// 14 GB total at 10k×10k, 57 GB at 20k×20k, measured), so callers wiring this
+/// into a pipeline should pre-check it against a budget, as darktable's tiling
+/// code does.
 pub fn local_laplacian(
     input: &[f32],
     out: &mut [f32],

@@ -163,6 +163,36 @@ pub enum Stage {
         strength: f32,
         space: ColorSpace,
     },
+    /// Local contrast (bilat.c, local-laplacian mode — the C `$DEFAULT:1`
+    /// engine): a laplacian-pyramid remapping of Lab L driven by the tone
+    /// curve in [`crate::locallaplacian::curve_scalar`], with a/b passed
+    /// through untouched. Params are the raw slider values; the mapping to
+    /// engine scalars happens here exactly as bilat.c's process() passes them
+    /// to `local_laplacian()`: sigma = midtone, shadows = sigma_s,
+    /// highlights = sigma_r, clarity = detail. Like the C call we pass
+    /// use_tiling = 0 and ignore the pipeline scale — darktable's LL branch
+    /// runs on `roi_in->width/height` with no scale factor.
+    ///
+    /// **NOT pixel-local** (the pyramid reads neighbours across the whole
+    /// frame), so it runs on whole frames only. There is no neutral-params
+    /// identity: even at detail 0 / shadows 0 / highlights 0 the per-level
+    /// tone curve is a quadratic-bezier knee over ±2σ around each level's
+    /// pivot, continuing outside with slope shadows/highlights (flat at g±σ
+    /// only when those two are 0) — so `to_pipeline` gates this stage on its
+    /// enable flag alone.
+    LocalContrast {
+        /// Midtone range, 0.001..1.0 (C `midtone`, "what counts as mid-tones").
+        midtone: f32,
+        /// Shadow contrast, 0..100 introspection / GUI hard-max 2.0
+        /// (C `sigma_s`; displayed as % by darktable).
+        shadows: f32,
+        /// Highlight contrast, same range (C `sigma_r`).
+        highlights: f32,
+        /// Detail/local-contrast strength, -1..4 (C `detail`; clarity).
+        detail: f32,
+        /// Buffer working colour space (Rec2020 for raws, LinearSrgb for JPEGs).
+        space: ColorSpace,
+    },
     /// Tone curve (tonecurve.c): 3-channel Lab LUT built from spline nodes via
     /// [`crate::tonecurve::build_lut`] (the V1 `dt_draw_curve_*` sampler),
     /// applied per pixel by [`tonecurve::process_pixels`]. The L table is in
@@ -569,6 +599,9 @@ impl Stage {
             Stage::ColorCorrection { .. } => "colorcorrection",
             Stage::ColorZones { .. } => "colorzones",
             Stage::Bloom { .. } => "bloom",
+            // bilat is the C op short name for darktable's "local contrast"
+            // module (aliases: "clarity").
+            Stage::LocalContrast { .. } => "bilat",
             Stage::ToneCurve { .. } => "tonecurve",
             Stage::RgbCurve { .. } => "rgbcurve",
             Stage::Basecurve { .. } => "basecurve",
@@ -629,6 +662,9 @@ impl Stage {
             // Bloom is NOT pixel-local: the box blur reads a spatial
             // neighbourhood up to radius 256, so it must run on whole frames.
             Stage::Bloom { .. } => false,
+            // LocalContrast is NOT pixel-local: the laplacian pyramid reduce/
+            // expand mixes pixels across the entire frame at every level.
+            Stage::LocalContrast { .. } => false,
             // ToneCurve is pixel-local: three pure per-pixel LUT lookups
             // (plus an optional a/b re-derivation that only touches the same
             // pixel), no neighbour reads.
@@ -740,6 +776,9 @@ impl Stage {
             // Bloom converts RGB↔Lab (it operates on L) and must agree with
             // the other Lab stages.
             Stage::Bloom { space, .. } => Some(*space),
+            // LocalContrast remaps Lab L through the pyramid and copies a/b,
+            // so it must agree with the other Lab stages too.
+            Stage::LocalContrast { space, .. } => Some(*space),
             // ToneCurve works on Lab (L + a/b LUTs), so it must agree too.
             Stage::ToneCurve { space, .. } => Some(*space),
             // Levels works on Lab L (+ proportional a/b), so it too must agree.
@@ -1149,6 +1188,55 @@ impl Stage {
                 bloom::process(
                     &lab_in, &mut lab_out, width, height, size, threshold, strength,
                 );
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
+            // ── Local contrast (bilat.c local-laplacian mode) ───────────
+            // Laplacian-pyramid tone remapping of Lab L (a/b pass through).
+            // Same RGB↔Lab sandwich as the other Lab-domain stages. NOT
+            // pixel-local (the pyramid reads the whole frame), so `process`
+            // guarantees (width, height) here is the true image rectangle.
+            //
+            // Param mapping mirrors bilat.c process(): midtone feeds sigma,
+            // sigma_s → shadows, sigma_r → highlights, detail → clarity; the
+            // C passes use_tiling = 0 and no scale factor, and so do we — a
+            // preview at half resolution gets the same look scaled with the
+            // image, exactly as darktable's LL branch does.
+            //
+            // Memory: the engine allocates ~(2+NUM_GAMMA) pyramid levels over
+            // PADDED dimensions — roughly 90–120 bytes per pixel depending on
+            // aspect and size (padding dominates at smaller sizes; measured via
+            // locallaplacian::local_laplacian_memory_use) — the same order
+            // darktable's non-tiled path needs.
+            Stage::LocalContrast { midtone, shadows, highlights, detail, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                crate::locallaplacian::local_laplacian(
+                    &lab_in, &mut lab_out, width, height,
+                    crate::locallaplacian::LocalLaplacianParams {
+                        sigma: midtone,
+                        shadows,
+                        highlights,
+                        clarity: detail,
+                    },
+                );
+                // L is remapped by the pyramid; a/b are copied untouched by
+                // local_laplacian itself (channels 2/3 of lab_out), and alpha
+                // comes from the input like every other stage.
                 for p in 0..n {
                     let i = p * 4;
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
@@ -2145,6 +2233,16 @@ mod tests {
                 .is_pixel_local(),
             "shadhi blurs a spatial neighbourhood ⇒ NOT pixel-local"
         );
+        // LocalContrast is NOT pixel-local: the laplacian pyramid reduce/
+        // expand mixes pixels across the whole frame at every level.
+        assert!(
+            !Stage::LocalContrast {
+                midtone: 0.5, shadows: 0.5, highlights: 0.5, detail: 0.25,
+                space: ColorSpace::Rec2020,
+            }
+                .is_pixel_local(),
+            "localcontrast builds a whole-frame pyramid ⇒ NOT pixel-local"
+        );
         // DenoiseProfile is NOT pixel-local: the multi-scale à-trous wavelet
         // decomposition reads a stride-2^scale neighbourhood per output pixel.
         assert!(
@@ -2588,5 +2686,98 @@ mod tests {
         let bot = (h - 1) * w * 4;
         let diff = (lo[bot + 2] - hi[bot + 2]).abs();
         assert!(diff > 1e-5, "highlights_ccorrect sign does not affect blue: diff={diff}");
+    }
+
+    #[test]
+    fn localcontrast_changes_tone_and_keeps_chroma() {
+        // The LL curve is a knee compressor even at "zero" knobs (a bezier
+        // knee over ±2σ, wings of slope shadows/highlights outside — flat at
+        // g±σ when those are 0), so unlike Shadhi there is no neutral
+        // pass to compare against. Instead pin the two invariants that matter:
+        // (1) a grey ramp stays grey — a/b stay 0 and hue is preserved; and
+        // (2) different detail settings produce different tone mapping.
+        let (w, h) = (32usize, 24usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let v = 0.05 + 0.9 * (x as f32) / ((w - 1) as f32);
+                img[i] = v; img[i + 1] = v; img[i + 2] = v; img[i + 3] = 1.0;
+            }
+        }
+        let mk = |detail| {
+            Pipeline::with_stages(vec![Stage::LocalContrast {
+                midtone: 0.5, shadows: 0.5, highlights: 0.5, detail,
+                space: ColorSpace::LinearSrgb,
+            }])
+        };
+        let out = mk(0.25).process(&img, w, h);
+        // Grey ramp must remain exactly grey (a/b of Lab round-trip ≈ 0) and
+        // alpha untouched.
+        for px in out.chunks_exact(4) {
+            assert!((px[3] - 1.0).abs() < 1e-6, "alpha preserved");
+            assert!((px[0] - px[1]).abs() < 1e-4 && (px[1] - px[2]).abs() < 1e-4,
+                "grey must stay grey: {:?}", &px[..3]);
+        }
+        // Tone map actually did something: the darkest column differs from its
+        // input by more than float noise.
+        let first_changed = (out[0] - img[0]).abs() > 1e-4 || (out[(h / 2) * w * 4] - img[(h / 2) * w * 4]).abs() > 1e-4;
+        assert!(first_changed, "local contrast left the ramp's tones untouched");
+        // Clarity alters the result (the whole point of the module).
+        let flat_detail = mk(-1.0).process(&img, w, h);
+        let max_diff: f32 = out.chunks_exact(4).zip(flat_detail.chunks_exact(4))
+            .map(|(a, b)| (a[0] - b[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(max_diff > 1e-4, "detail slider has no effect: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn localcontrast_shadows_and_highlights_are_distinct_controls() {
+        // Inversion guard: shadows and highlights feed DIFFERENT wings of the
+        // per-level curve (positive offsets vs negative), so (shadows=2,
+        // highlights=0) and (0, 2) must produce different output. If a future
+        // edit swaps the two in the param mapping, this fails loudly instead
+        // of silently mirroring the effect.
+        let (w, h) = (48usize, 32usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        for y in 0..h {
+            // Vertical step edge: dark half, bright half — both wings active.
+            let v = if y < h / 2 { 0.1 } else { 0.9 };
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                img[i] = v; img[i + 1] = v; img[i + 2] = v; img[i + 3] = 1.0;
+            }
+        }
+        let mk = |shadows, highlights| {
+            Pipeline::with_stages(vec![Stage::LocalContrast {
+                midtone: 0.5, shadows, highlights, detail: 0.25,
+                space: ColorSpace::LinearSrgb,
+            }])
+        };
+        let sh = mk(2.0, 0.0).process(&img, w, h);
+        let hg = mk(0.0, 2.0).process(&img, w, h);
+        let max_diff: f32 = sh.iter().zip(hg.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(max_diff > 1e-3,
+            "swapping shadows/highlights does not change output (max_diff={max_diff}) — controls are mirrored");
+    }
+
+    #[test]
+    fn localcontrast_preserves_coloured_hue() {
+        // A saturated red patch keeps its chroma direction: R stays ≥ G,B
+        // after the L-only remap.
+        let (w, h) = (16usize, 16usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        for i in 0..w * h {
+            img[i * 4] = 0.8; img[i * 4 + 1] = 0.15; img[i * 4 + 2] = 0.1; img[i * 4 + 3] = 1.0;
+        }
+        let p = Pipeline::with_stages(vec![Stage::LocalContrast {
+            midtone: 0.5, shadows: 0.5, highlights: 0.5, detail: 0.25,
+            space: ColorSpace::LinearSrgb,
+        }]);
+        let out = p.process(&img, w, h);
+        for px in out.chunks_exact(4) {
+            assert!(px[0] > px[1] && px[0] > px[2],
+                "red dominance lost: {:?}", &px[..3]);
+        }
     }
 }

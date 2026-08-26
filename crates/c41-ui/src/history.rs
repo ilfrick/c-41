@@ -406,6 +406,14 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if shadhi {
         return "Shadows/Highlights";
     }
+    let localcontrast = old.lc_on != new.lc_on
+        || old.lc_midtone != new.lc_midtone
+        || old.lc_shadows != new.lc_shadows
+        || old.lc_highlights != new.lc_highlights
+        || old.lc_detail != new.lc_detail;
+    if localcontrast {
+        return "Local contrast";
+    }
     let primaries = old.primaries_on != new.primaries_on
         || old.primaries_achromatic_tint_hue != new.primaries_achromatic_tint_hue
         || old.primaries_achromatic_tint_purity != new.primaries_achromatic_tint_purity
@@ -759,6 +767,10 @@ mod tests {
             "Shadows/Highlights"
         );
         assert_eq!(
+            describe_change(&base, &PreviewParams { lc_detail: 1.0, ..d() }),
+            "Local contrast"
+        );
+        assert_eq!(
             describe_change(&base, &PreviewParams { primaries_red_hue: 10.0, ..d() }),
             "Primaries"
         );
@@ -955,6 +967,11 @@ mod tests {
             shadhi_compress: _,
             shadhi_shadows_ccorrect: _,
             shadhi_highlights_ccorrect: _,
+            lc_on: _,
+            lc_midtone: _,
+            lc_shadows: _,
+            lc_highlights: _,
+            lc_detail: _,
             primaries_on: _,
             primaries_achromatic_tint_hue: _,
             primaries_achromatic_tint_purity: _,
@@ -1173,7 +1190,9 @@ mod tests {
         // 40 interleaved anchor coordinates).
         // m4-130 (lens correction): 1788 → 1814 (1 + 37 bools + 444 f32). The
         // camera/lens *identity* stays out of the blob (darkroom_lens_choice).
-        assert_eq!(PreviewParams::default().encode().len(), 1814);
+        // m4-152 (local contrast): 1814 → 1831 (1 + 38 bools + 448 f32 — the
+        // four LL-mode sliders).
+        assert_eq!(PreviewParams::default().encode().len(), 1831);
     }
 
     #[test]

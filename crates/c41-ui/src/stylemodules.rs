@@ -47,6 +47,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Basic adjustments",
     "Lowpass",
     "Shadows/Highlights",
+    "Local contrast",
     "Primaries",
     "Negadoctor",
     "Tone equalizer",
@@ -235,6 +236,14 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.shadhi_compress = src.shadhi_compress;
             target.shadhi_shadows_ccorrect = src.shadhi_shadows_ccorrect;
             target.shadhi_highlights_ccorrect = src.shadhi_highlights_ccorrect;
+            true
+        }
+        "Local contrast" => {
+            target.lc_on = src.lc_on;
+            target.lc_midtone = src.lc_midtone;
+            target.lc_shadows = src.lc_shadows;
+            target.lc_highlights = src.lc_highlights;
+            target.lc_detail = src.lc_detail;
             true
         }
         "Primaries" => {
@@ -444,7 +453,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 33);
+        assert_eq!(MODULE_GROUPS.len(), 34);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();

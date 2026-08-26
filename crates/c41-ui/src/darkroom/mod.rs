@@ -2078,6 +2078,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Contrast brightness saturation" => pg.add(&colisa_module_row(ctx)),
                 "Basic adjustments" => pg.add(&basicadj_module_row(ctx)),
                 "Shadows/Highlights" => pg.add(&shadhi_module_row(ctx)),
+                "Local contrast" => pg.add(&localcontrast_module_row(ctx)),
                 "Lowpass" => pg.add(&lowpass_module_row(ctx)),
                 "White balance" => pg.add(&whitebalance_module_row(ctx)),
                 "Invert" => pg.add(&invert_module_row(ctx)),
@@ -2263,7 +2264,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2703,6 +2704,33 @@ fn shadhi_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.shadhi_shadows_ccorrect = v);
             add_param_slider(e, ctx, "Highlights color adj.", 0.0, 100.0, 1.0, p0.shadhi_highlights_ccorrect as f64,
                 |p, v| p.shadhi_highlights_ccorrect = v);
+        })
+}
+
+/// Local contrast (bilat.c, local-laplacian mode): a laplacian-pyramid tone
+/// remap of Lab L — darktable's "local contrast" module, alias "clarity".
+/// Only the LL engine is exposed: it is the C `$DEFAULT:1` mode and both
+/// shipped presets use it; the bilateral-grid mode is future work.
+///
+/// Ranges mirror `dt_iop_bilat_params_t` (bilat.c lines 49-55) intersected
+/// with the LL-mode GUI overrides in `gui_init` (lines 455-489):
+/// midtone 0.001..1.0, shadows/highlights hard-max 2.0 (the introspection
+/// range is 0..100 but the LL widgets cap it and format as %), detail
+/// -1..4. The mode combobox is not surfaced — we ship only the default
+/// local-laplacian engine.
+fn localcontrast_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Local contrast", "clarity / local contrast", p0.lc_on,
+        |p, on| p.lc_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Detail", -1.0, 4.0, 0.01, p0.lc_detail as f64,
+                |p, v| p.lc_detail = v);
+            add_param_slider(e, ctx, "Highlights", 0.0, 2.0, 0.01, p0.lc_highlights as f64,
+                |p, v| p.lc_highlights = v);
+            add_param_slider(e, ctx, "Shadows", 0.0, 2.0, 0.01, p0.lc_shadows as f64,
+                |p, v| p.lc_shadows = v);
+            add_param_slider(e, ctx, "Midtone range", 0.001, 1.0, 0.001, p0.lc_midtone as f64,
+                |p, v| p.lc_midtone = v);
         })
 }
 
