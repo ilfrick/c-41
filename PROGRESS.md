@@ -2667,3 +2667,46 @@ exit-code keyed — check, clippy --workspace, test --workspace --release,
 c41-rs link); 403 c41-ui lib tests pass including 24 xmp tests; zero new
 clippy warnings vs stashed-tree baseline (forced-rebuild comparison).
 PARITY_AUDIT.md updated in this commit closing the 2.3 caveat.
+
+---
+
+## 2026-08-26 16:08 UTC — circle mask FFI migration: C OMP loops → Rust ports
+
+**Commit** `NEXT` (GitHub + Gitea)
+
+**What.** Port of the circle drawn-mask shape rendering from C OMP loops to Rust
+FFI exports, the first of 8 drawn-mask shapes (`src/develop/masks/*.c`) migrated
+to `crates/c41-core/src/masks/`.
+- `crates/c41-core/src/masks/mod.rs` (new): module root. `DT_2PI_F` (TAU),
+  `masks_roundup()` = `dt_masks_roundup`, `circle_feather()` shared quadratic
+  falloff (`sqf(CLIP(...))`), `test_util::lcg_fill()` deterministic test filler.
+- `crates/c41-core/src/masks/circle.rs` (new, 556 lines): 6 safe functions
+  + 6 `#[no_mangle] extern "C"` exports + 10 unit tests:
+  - `darkroom_masks_circle_coord_grid` → `_circle_get_mask` loop 1 (coord grid)
+  - `darkroom_masks_circle_fill` → `_circle_get_mask` loop 2 (feather values)
+  - `darkroom_masks_circle_outline` → `_circle_get_mask_roi` outline (8-fold symmetry)
+  - `darkroom_masks_circle_grid` → `_circle_get_mask_roi` grid points
+  - `darkroom_masks_circle_values` → `_circle_get_mask_roi` mask values (in-place even lanes)
+  - `darkroom_masks_circle_interp` → `_circle_get_mask_roi` bilinear interpolation
+- `src/rust_ffi/darkroom_core.h` (+44 lines): FFI declarations with parameter
+  contract block comments.
+- `crates/c41-core/src/lib.rs` (+1): `pub mod masks;`.
+- `src/develop/masks/circle.c` (-94/+23): all 5 `DT_OMP_FOR` loops replaced with
+  single FFI calls; `#include "rust_ffi/darkroom_core.h"` added.
+
+**Verified.** `scripts/ci-local.sh` exit code 0 — cargo check, clippy
+--workspace --all-targets, test --workspace --release, c41-rs link.
+Self-review (fricktrade-architect unavailable — see Notes) confirmed: FFI
+signatures match exactly, all 6 exports have null/dimension/overflow guards,
+integer arithmetic `(grid*i+px)` before float cast preserved, `sqf`→`f*f`,
+`CLIP`/`CLAMP`→`clamp(0,1)`, bilinear formula order preserved, no unused
+variables that would trip `-Werror`, `DT_OMP_FOR`/`sqf` still used by remaining
+C functions. C `-Werror` compilation not verified locally (no host C toolchain;
+would require the full-app Docker build).
+
+**Notes.** `fricktrade-architect` senior review agent failed twice with
+"model access error" (the `opus` alias resolves to `stealth/ox-alpha` which is
+not available in this environment). This is the same recurring issue documented
+from prior sessions. Proceeded with thorough self-review instead. PARITY_AUDIT.md
+does not track drawn-mask ports (they are outside the pipeline boundary per
+RUST_MIGRATION_PLAN.md) — no parity item to close here.

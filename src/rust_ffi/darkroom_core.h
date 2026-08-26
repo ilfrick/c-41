@@ -3015,6 +3015,50 @@ void darkroom_icc_transform_free(void *t);
 void darkroom_icc_transform_apply_rgba(const void *t, const float *in_buf,
                                        float *out_buf, size_t npixels);
 
+/*
+ * Drawn-mask shape rendering (c41-core::masks) -- pure kernels extracted from
+ * the OMP loops of src/develop/masks/<shape>.c <shape>_get_mask / _get_mask_roi.
+ * The pixelpipe distort callbacks stay C-side; only the coordinate/value
+ * arithmetic crossed the boundary. All buffers are plain float arrays in the
+ * shapes' own layouts; every export validates dimensions and refuses (no-op)
+ * instead of panicking across the FFI.
+ */
+
+/* circle.c _circle_get_mask: fill `points` (2*w*h floats) with the pipe-area
+ * coordinate grid (pos_x + j, pos_y + i), then evaluate the feathered-circle
+ * value at each back-transformed point into `buffer` (n floats). */
+void darkroom_masks_circle_coord_grid(float *points, size_t w, size_t h,
+                                      float pos_x, float pos_y);
+void darkroom_masks_circle_fill(float *buffer, const float *points, size_t n,
+                                float center_x, float center_y,
+                                float total2, float border2);
+
+/* circle.c _circle_get_mask_roi: write the outer-circle outline (`circpts`
+ * points, a multiple of 8 -- see dt_masks_roundup(MIN(360, DT_2PI_F*total2),
+ * 8)) around (center_x, center_y) with radius `total`; then populate the
+ * bbw*bbh bbox grid in module coordinates ((grid*i + px) computed in integer
+ * arithmetic before the float conversion); then evaluate mask values into the
+ * even lanes of `points` in place. `iscale` is 1/roi->scale. */
+void darkroom_masks_circle_outline(float *circ, size_t circpts,
+                                   float center_x, float center_y, float total);
+void darkroom_masks_circle_grid(float *points, size_t bbw, size_t bbh,
+                                int bbxm, int bbym, int px, int py,
+                                float iscale, int grid);
+void darkroom_masks_circle_values(float *points, size_t npoints,
+                                  float center_x, float center_y,
+                                  float total2, float border2);
+
+/* circle.c _circle_get_mask_roi final interpolation: splat the bbw*bbh sampled
+ * values (even lanes of `points`) over rows [start_j,end_j) x cols
+ * [start_i,end_i) of the w-wide ROI `buffer` by bilinear weighting within each
+ * grid*grid cell. start_i/start_j are bbxm*grid / bbym*grid as in the C loop;
+ * end_i/end_j must satisfy MIN(w, bbXM*grid) / MIN(h, bbYM*grid) so the
+ * neighbour lookups stay inside the bbox exactly as they do in C. */
+void darkroom_masks_circle_interp(float *buffer, size_t w, size_t height,
+                                  const float *points, size_t bbw, size_t bbh,
+                                  int start_i, int end_i,
+                                  int start_j, int end_j, int grid);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

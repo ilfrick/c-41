@@ -16,6 +16,7 @@ pub mod icc;
 pub mod interp;
 pub mod iop;
 pub mod locallaplacian;
+pub mod masks;
 pub mod math;
 pub mod params;
 pub mod pipeline;

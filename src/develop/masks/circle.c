@@ -25,6 +25,7 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 
 #define MIN_CIRCLE_RADIUS 0.0005f
 #define MIN_CIRCLE_BORDER 0.0005f
@@ -1097,18 +1098,7 @@ static int _circle_get_mask(const dt_iop_module_t *const restrict module,
 
   const float pos_x = *posx;
   const float pos_y = *posy;
-  DT_OMP_FOR(if(h*w > 50000) num_threads(MIN(dt_get_num_threads(), (h*w)/20000)))
-  for(int i = 0; i < h; i++)
-  {
-    float *const restrict p = points + 2 * i * w;
-    const float y = i + pos_y;
-    DT_OMP_SIMD(aligned(points : 64))
-    for(int j = 0; j < w; j++)
-    {
-      p[2*j] = pos_x + j;
-      p[2*j + 1] = y;
-    }
-  }
+  darkroom_masks_circle_coord_grid(points, (size_t)w, (size_t)h, pos_x, pos_y);
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] circle draw took %0.04f sec", form->name, dt_get_lap_time(&start2));
 
@@ -1143,19 +1133,8 @@ static int _circle_get_mask(const dt_iop_module_t *const restrict module,
   const float total2 = (circle->radius + circle->border) * mindim
     * (circle->radius + circle->border) * mindim;
   const float border2 = total2 - radius2;
-  const float *const points_y = points + 1;
-  DT_OMP_FOR(if(h*w > 50000) num_threads(MIN(dt_get_num_threads(), (h*w)/20000)))
-  for(int i = 0 ; i < h*w; i++)
-  {
-    // find the square of the distance from the center
-    const float l2 = sqf(points[2 * i] - centerx) + sqf(points_y[2 * i] - centery);
-    // quadratic falloff between the circle's radius and the radius of
-    // the outside of the feathering
-    const float ratio = (total2 - l2) / border2;
-    // enforce 1.0 inside the circle and 0.0 outside the feathering
-    const float f = CLIP(ratio);
-    ptbuffer[i] = sqf(f);
-  }
+  darkroom_masks_circle_fill(ptbuffer, points, (size_t)w * h, centerx, centery,
+                             total2, border2);
 
   dt_free_align(points);
 
@@ -1214,34 +1193,7 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
   float *const restrict circ = dt_alloc_align_float(circpts * 2);
   if(circ == NULL) return 0;
 
-  DT_OMP_FOR(if(circpts/8 > 1000))
-  for(int n = 0; n < circpts / 8; n++)
-  {
-    const float phi = (DT_2PI_F * n) / circpts;
-    const float x = total * cosf(phi);
-    const float y = total * sinf(phi);
-    const float cx = centerx;
-    const float cy = centery;
-    const int index_x = 2 * n * 8;
-    const int index_y = 2 * n * 8 + 1;
-    // take advantage of symmetry
-    circ[index_x] = cx + x;
-    circ[index_y] = cy + y;
-    circ[index_x + 2] = cx + x;
-    circ[index_y + 2] = cy - y;
-    circ[index_x + 4] = cx - x;
-    circ[index_y + 4] = cy + y;
-    circ[index_x + 6] = cx - x;
-    circ[index_y + 6] = cy - y;
-    circ[index_x + 8] = cx + y;
-    circ[index_y + 8] = cy + x;
-    circ[index_x + 10] = cx + y;
-    circ[index_y + 10] = cy - x;
-    circ[index_x + 12] = cx - y;
-    circ[index_y + 12] = cy + x;
-    circ[index_x + 14] = cx - y;
-    circ[index_y + 14] = cy - x;
-  }
+  darkroom_masks_circle_outline(circ, circpts, centerx, centery, total);
 
   // we transform the outer circle from input image coordinates to current point in pixelpipe
   if(!dt_dev_distort_transform_plus(module->dev, piece->pipe, module->iop_order,
@@ -1304,14 +1256,7 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
   if(points == NULL) return 0;
 
   // we populate the grid points in module coordinates
-  DT_OMP_FOR(collapse(2) if(bbw*bbh > 50000))
-  for(int j = bbym; j <= bbYM; j++)
-    for(int i = bbxm; i <= bbXM; i++)
-    {
-      const size_t index = (size_t)(j - bbym) * bbw + i - bbxm;
-      points[index * 2] = (grid * i + px) * iscale;
-      points[index * 2 + 1] = (grid * j + py) * iscale;
-    }
+  darkroom_masks_circle_grid(points, (size_t)bbw, (size_t)bbh, bbxm, bbym, px, py, iscale, grid);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] circle grid took %0.04f sec", form->name, dt_get_lap_time(&start2));
@@ -1331,21 +1276,8 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
 
   // we calculate the mask values at the transformed points;
   // for results: re-use the points array
-  DT_OMP_FOR(collapse(2) if(bbh*bbw > 50000) num_threads(MIN(dt_get_num_threads(), (h*w)/20000)))
-  for(int j = 0; j < bbh; j++)
-    for(int i = 0; i < bbw; i++)
-    {
-      const size_t index = (size_t)j * bbw + i;
-      // find the square of the distance from the center
-      const float l2 = sqf(points[2 * index] - centerx)
-        + sqf(points[2 * index + 1] - centery);
-      // quadratic falloff between the circle's radius and the radius
-      // of the outside of the feathering
-      const float ratio = (total2 - l2) / border2;
-      // enforce 1.0 inside the circle and 0.0 outside the feathering
-      const float f = CLAMP(ratio, 0.0f, 1.0f);
-      points[2*index] = f * f;
-    }
+  darkroom_masks_circle_values(points, (size_t)bbw * bbh, centerx, centery,
+                               total2, border2);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] circle draw took %0.04f sec", form->name,
@@ -1355,24 +1287,10 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
   // we only need to take the contents of our bounding box into account
   const int endx = MIN(w, bbXM * grid);
   const int endy = MIN(h, bbYM * grid);
-  DT_OMP_FOR()
-  for(int j = bbym * grid; j < endy; j++)
-  {
-    const int jj = j % grid;
-    const int mj = j / grid - bbym;
-    for(int i = bbxm * grid; i < endx; i++)
-    {
-      const int ii = i % grid;
-      const int mi = i / grid - bbxm;
-      const size_t mindex = (size_t)mj * bbw + mi;
-      buffer[(size_t)j * w + i]
-          = (points[mindex * 2] * (grid - ii) * (grid - jj)
-             + points[(mindex + 1) * 2] * ii * (grid - jj)
-             + points[(mindex + bbw) * 2] * (grid - ii) * jj
-             + points[(mindex + bbw + 1) * 2] * ii * jj)
-            / (grid * grid);
-    }
-  }
+  darkroom_masks_circle_interp(buffer, (size_t)w, (size_t)h, points,
+                               (size_t)bbw, (size_t)bbh,
+                               bbxm * grid, endx,
+                               bbym * grid, endy, grid);
 
   dt_free_align(points);
 
