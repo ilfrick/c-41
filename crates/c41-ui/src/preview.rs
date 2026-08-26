@@ -2988,6 +2988,248 @@ pub fn sample_pixel(
     ))
 }
 
+/// Test fixture: a `PreviewParams` with every field off-default (and mostly
+/// pairwise distinct), shared by sibling modules' tests — encode/decode
+/// roundtrip above and the per-module style coverage guard in `stylemodules`.
+/// Naming every field explicitly is the drift guard: adding a field breaks
+/// compilation here until the fixture is extended.
+#[cfg(test)]
+pub(crate) fn fully_populated_params() -> PreviewParams {
+    PreviewParams {
+        exposure_on: true, black: 0.05, ev: -1.25,
+        velvia_on: true, velvia_strength: 42.0, velvia_bias: 0.75,
+        split_on: true, split_shadow_hue: 0.1, split_shadow_sat: 0.6,
+        split_highlight_hue: 0.9, split_highlight_sat: 0.3,
+        split_balance: 0.4, split_compress: 60.0,
+        mono_on: true, mono_r: -0.2, mono_g: 1.5, mono_b: 0.33,
+        sigmoid_on: true, sigmoid_contrast: 1.8, sigmoid_skew: -0.3,
+        sharpen_on: true, sharpen_radius: 4.0, sharpen_amount: 1.0, sharpen_threshold: 0.05,
+        vibrance_on: true, vibrance_amount: 33.0,
+        color_contrast_on: true, color_contrast_a_steepness: 2.0, color_contrast_b_steepness: 1.5,
+        temperature_on: true, temperature_r: 1.2, temperature_g: 0.9, temperature_b: 0.8,
+        invert_on: true, invert_r: 0.9, invert_g: 0.8, invert_b: 0.7,
+        colorize_on: true, colorize_hue: 0.1, colorize_sat: 0.6, colorize_lightness: 75.0, colorize_lightness_mix: 50.0,
+        color_correction_on: true, color_correction_loa: 5.0, color_correction_hia: 10.0,
+        color_correction_lob: -3.0, color_correction_hib: 7.0, color_correction_saturation: 1.5,
+        colorzones_on: true, colorzones_strength: 25.0, colorzones_channel: 1.0,
+        colorzones_mode: 0.0,
+        colorzones_num_nodes: [2.0, 2.0, 2.0],
+        colorzones_curve_type: [1.0, 1.0, 1.0],
+        colorzones_curve_x: [[0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; 3],
+        colorzones_curve_y: [[0.5; 8]; 3],
+        levels_on: true, levels_black: 5.0, levels_grey: 45.0, levels_white: 95.0,
+        vignette_on: true, vignette_scale: 70.0, vignette_falloff: 40.0,
+        vignette_brightness: -0.6, vignette_saturation: 0.3,
+        vignette_center_x: -0.2, vignette_center_y: 0.15, vignette_shape: 1.4,
+        lowlight_on: true, lowlight_blueness: 30.0,
+        lowlight_transition: [0.1, 0.3, 0.5, 0.6, 0.8, 0.9],
+        gradnd_on: true, gradnd_density: -2.5, gradnd_hardness: 40.0,
+        gradnd_rotation: -75.0, gradnd_offset: 35.0,
+        gradnd_hue: 0.6, gradnd_saturation: 0.4,
+        colisa_on: true, colisa_contrast: 0.3,
+        colisa_brightness: -0.2, colisa_saturation: 0.45,
+        // Every value distinct, so a field packed or unpacked at the wrong
+        // offset shows up as a mismatch rather than coincidentally matching
+        // its neighbour.
+        basicadj_on: true, basicadj_black_point: 0.02,
+        basicadj_exposure: 1.25, basicadj_hlcompr: 70.0,
+        basicadj_hlcomprthresh: 30.0, basicadj_contrast: 0.6,
+        basicadj_preserve_colors: 2.0, basicadj_middle_grey: 22.5,
+        basicadj_brightness: -0.4, basicadj_saturation: 0.15,
+        basicadj_vibrance: -0.35,
+        lowpass_on: true, lowpass_radius: 42.0,
+        lowpass_contrast: 0.6, lowpass_brightness: -0.4,
+        lowpass_saturation: 0.15,
+        shadhi_on: true, shadhi_shadows: 25.0,
+        shadhi_highlights: -30.0, shadhi_whitepoint: 2.0,
+        shadhi_radius: 80.0, shadhi_compress: 60.0,
+        shadhi_shadows_ccorrect: 75.0, shadhi_highlights_ccorrect: 40.0,
+        primaries_on: true,
+        primaries_achromatic_tint_hue: 10.0,
+        primaries_achromatic_tint_purity: 0.3,
+        primaries_red_hue: -15.0,
+        primaries_red_purity: 1.5,
+        primaries_green_hue: 5.0,
+        primaries_green_purity: 0.8,
+        primaries_blue_hue: 20.0,
+        primaries_blue_purity: 1.2,
+        negadoctor_on: true,
+        negadoctor_film_stock: 0.0, // DT_FILMSTOCK_NB
+        negadoctor_dmin_r: 0.2,
+        negadoctor_dmin_g: 0.35,
+        negadoctor_dmin_b: 0.5,
+        negadoctor_wb_high_r: 1.4,
+        negadoctor_wb_high_g: 1.1,
+        negadoctor_wb_high_b: 0.9,
+        negadoctor_wb_low_r: 0.8,
+        negadoctor_wb_low_g: 0.95,
+        negadoctor_wb_low_b: 1.05,
+        negadoctor_d_max: 1.8,
+        negadoctor_offset: 0.1,
+        negadoctor_black: 0.02,
+        negadoctor_gamma: 3.0,
+        negadoctor_soft_clip: 0.4,
+        negadoctor_exposure: 1.5,
+        // Nine distinct gains so any wrong-offset packing shows as a mismatch
+        // (they are adjacent f32s in the blob).
+        toneeq_on: true,
+        toneeq_noise: 0.11,
+        toneeq_ultra_deep_blacks: -0.22,
+        toneeq_deep_blacks: 0.33,
+        toneeq_blacks: -0.44,
+        toneeq_shadows: 0.55,
+        toneeq_midtones: -0.66,
+        toneeq_highlights: 0.77,
+        toneeq_whites: -0.88,
+        toneeq_speculars: 0.99,
+        // Color balance RGB: every field set off-default and pairwise
+        // distinct, so a wrong offset in the 33-float block shows as a
+        // mismatch.
+        cb_on: true,
+        cb_shadows_y: 0.01,
+        cb_shadows_c: -0.02,
+        cb_shadows_h: 3.0,
+        cb_midtones_y: 0.04,
+        cb_midtones_c: -0.05,
+        cb_midtones_h: 6.0,
+        cb_highlights_y: 0.07,
+        cb_highlights_c: -0.08,
+        cb_highlights_h: 9.0,
+        cb_global_y: 0.10,
+        cb_global_c: -0.11,
+        cb_global_h: 12.0,
+        cb_shadows_weight: 1.13,
+        cb_white_fulcrum: -1.14,
+        cb_highlights_weight: 2.15,
+        cb_chroma_shadows: 0.16,
+        cb_chroma_highlights: -0.17,
+        cb_chroma_global: 0.18,
+        cb_chroma_midtones: -0.19,
+        cb_saturation_global: 0.20,
+        cb_saturation_highlights: -0.21,
+        cb_saturation_midtones: 0.22,
+        cb_saturation_shadows: -0.23,
+        cb_hue_angle: 24.0,
+        cb_brilliance_global: 0.25,
+        cb_brilliance_highlights: -0.26,
+        cb_brilliance_midtones: 0.27,
+        cb_brilliance_shadows: -0.28,
+        cb_mask_grey_fulcrum: 0.29,
+        cb_vibrance: -0.30,
+        cb_grey_fulcrum: 0.31,
+        cb_contrast: -0.32,
+        cb_formula: 0.0, // JzAzBz — the non-default formula
+        // Filmic RGB: every value off-default and pairwise distinct so a
+        // wrong offset in the trailing block shows as a mismatch.
+        filmic_on: true,
+        filmic_black_point_source: -6.5,
+        filmic_white_point_source: 5.5,
+        filmic_output_power: 3.5,
+        filmic_latitude: 12.5,
+        filmic_contrast: 1.7,
+        filmic_balance: -25.0,
+        filmic_saturation: 60.0,
+        // Highlight reconstruction: both bools distinct from their defaults
+        // (false/true) plus a non-default threshold, so a wrong offset in
+        // the trailing block shows as a mismatch.
+        hl_on: true,
+        hl_opposed: false,
+        hl_clip: 1.5,
+        // Denoise (profiled): same pattern — bools flipped from their
+        // (false/true) defaults, floats off-default and distinct.
+        dn_on: true,
+        dn_mode_y0u0v0: false,
+        dn_strength: 0.8,
+        dn_shadows: 1.3,
+        dn_bias: -0.25,
+        // Bloom: bool flipped from default, floats off-default and distinct.
+        bl_on: true,
+        bl_size: 33.0,
+        bl_threshold: 72.5,
+        bl_strength: 60.5,
+        // Tone curve: both bools flipped from their (false/true) defaults,
+        // scalars off-default and pairwise distinct, and a third node
+        // moved so a wrong offset inside the 40-float anchor block shows
+        // as a mismatch (slots 0/1 are the C-default identity endpoints —
+        // slot 2 is the first one that differs from the default blob).
+        tc_on: true,
+        tc_unbound: false,
+        tc_type: 1.0,      // Catmull-Rom
+        tc_autoscale: 0.0, // manual
+        tc_preserve: 2.0,  // MAX norm
+        tc_nnodes: 3.0,
+        tc_nodes_l: {
+            let mut n = [(0.0f32, 0.0f32); 20];
+            n[1] = (0.75, 0.75);
+            n[2] = (1.0, 1.0);
+            n
+        },
+        // RGB curve: bool flipped from default; every scalar off-default and
+        // pairwise distinct so a wrong offset inside the appended block shows
+        // as a mismatch; each channel's node array edited differently (R gets
+        // a third node, G keeps 2 but moves its endpoint, B gets two extra)
+        // so per-channel offsets can't silently swap.
+        rc_on: true,
+        rc_type_r: 1.0,
+        rc_type_g: 0.0,
+        rc_type_b: 2.0,
+        rc_autoscale: 1.0, // MANUAL_RGB
+        rc_preserve: 3.0,  // AVERAGE norm
+        rc_nnodes_r: 3.0,
+        rc_nnodes_g: 2.0,
+        rc_nnodes_b: 4.0,
+        rc_nodes_r: {
+            let mut n = [(0.0f32, 0.0f32); 20];
+            n[1] = (0.75, 0.4);
+            n[2] = (1.0, 1.0);
+            n
+        },
+        rc_nodes_g: {
+            let mut n = [(0.0f32, 0.0f32); 20];
+            n[1] = (0.85, 0.6);
+            n
+        },
+        rc_nodes_b: {
+            let mut n = [(0.0f32, 0.0f32); 20];
+            n[1] = (0.25, 0.45);
+            n[2] = (0.6, 0.55);
+            n[3] = (1.0, 1.0);
+            n
+        },
+        // Base curve: bool flipped from default; every scalar off-default
+        // and pairwise distinct so a wrong offset inside the appended block
+        // shows as a mismatch; node array edited at slots 1..4 (slots 0 and
+        // beyond stay identity) so per-slot offsets can't silently swap.
+        bc_on: true,
+        bc_type: 0.0,     // CUBIC_SPLINE — non-default interpolator
+        bc_preserve: 2.0, // DT_RGB_NORM_MAX
+        bc_nnodes: 5.0,
+        bc_exposure_fusion: 1.0, // two exposures
+        bc_exposure_stops: 1.75,
+        bc_exposure_bias: -0.35,
+        bc_nodes: {
+            let mut n = [(0.0f32, 0.0f32); 20];
+            n[1] = (0.2, 0.15);
+            n[2] = (0.45, 0.55);
+            n[3] = (0.7, 0.8);
+            n[4] = (1.0, 1.0);
+            n
+        },
+        // Lens correction: both bools flipped from their defaults, every
+        // float off-default and pairwise distinct so a wrong offset in the
+        // trailing block shows as a mismatch. modify_flags/target_geom are
+        // enum dropdowns — kept at exact small integers.
+        lens_on: true,
+        lens_inverse: true,
+        lens_modify_flags: 5.0, // DIST_TCA
+        lens_scale: 1.15,
+        lens_focal: 85.0,
+        lens_aperture: 5.6,
+        lens_distance: 7.5,
+        lens_target_geom: 3.0, // fisheye
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3805,239 +4047,7 @@ mod tests {
 
     #[test]
     fn params_encode_decode_roundtrips() {
-        let p = PreviewParams {
-            exposure_on: true, black: 0.05, ev: -1.25,
-            velvia_on: true, velvia_strength: 42.0, velvia_bias: 0.75,
-            split_on: true, split_shadow_hue: 0.1, split_shadow_sat: 0.6,
-            split_highlight_hue: 0.9, split_highlight_sat: 0.3,
-            split_balance: 0.4, split_compress: 60.0,
-            mono_on: true, mono_r: -0.2, mono_g: 1.5, mono_b: 0.33,
-            sigmoid_on: true, sigmoid_contrast: 1.8, sigmoid_skew: -0.3,
-            sharpen_on: true, sharpen_radius: 4.0, sharpen_amount: 1.0, sharpen_threshold: 0.05,
-            vibrance_on: true, vibrance_amount: 33.0,
-            color_contrast_on: true, color_contrast_a_steepness: 2.0, color_contrast_b_steepness: 1.5,
-            temperature_on: true, temperature_r: 1.2, temperature_g: 0.9, temperature_b: 0.8,
-            invert_on: true, invert_r: 0.9, invert_g: 0.8, invert_b: 0.7,
-            colorize_on: true, colorize_hue: 0.1, colorize_sat: 0.6, colorize_lightness: 75.0, colorize_lightness_mix: 50.0,
-            color_correction_on: true, color_correction_loa: 5.0, color_correction_hia: 10.0,
-            color_correction_lob: -3.0, color_correction_hib: 7.0, color_correction_saturation: 1.5,
-            colorzones_on: true, colorzones_strength: 25.0, colorzones_channel: 1.0,
-            colorzones_mode: 0.0,
-            colorzones_num_nodes: [2.0, 2.0, 2.0],
-            colorzones_curve_type: [1.0, 1.0, 1.0],
-            colorzones_curve_x: [[0.25, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; 3],
-            colorzones_curve_y: [[0.5; 8]; 3],
-            levels_on: true, levels_black: 5.0, levels_grey: 45.0, levels_white: 95.0,
-            vignette_on: true, vignette_scale: 70.0, vignette_falloff: 40.0,
-            vignette_brightness: -0.6, vignette_saturation: 0.3,
-            vignette_center_x: -0.2, vignette_center_y: 0.15, vignette_shape: 1.4,
-            lowlight_on: true, lowlight_blueness: 30.0,
-            lowlight_transition: [0.1, 0.3, 0.5, 0.6, 0.8, 0.9],
-            gradnd_on: true, gradnd_density: -2.5, gradnd_hardness: 40.0,
-            gradnd_rotation: -75.0, gradnd_offset: 35.0,
-            gradnd_hue: 0.6, gradnd_saturation: 0.4,
-            colisa_on: true, colisa_contrast: 0.3,
-            colisa_brightness: -0.2, colisa_saturation: 0.45,
-            // Every value distinct, so a field packed or unpacked at the wrong
-            // offset shows up as a mismatch rather than coincidentally matching
-            // its neighbour.
-            basicadj_on: true, basicadj_black_point: 0.02,
-            basicadj_exposure: 1.25, basicadj_hlcompr: 70.0,
-            basicadj_hlcomprthresh: 30.0, basicadj_contrast: 0.6,
-            basicadj_preserve_colors: 2.0, basicadj_middle_grey: 22.5,
-            basicadj_brightness: -0.4, basicadj_saturation: 0.15,
-            basicadj_vibrance: -0.35,
-            lowpass_on: true, lowpass_radius: 42.0,
-            lowpass_contrast: 0.6, lowpass_brightness: -0.4,
-            lowpass_saturation: 0.15,
-            shadhi_on: true, shadhi_shadows: 25.0,
-            shadhi_highlights: -30.0, shadhi_whitepoint: 2.0,
-            shadhi_radius: 80.0, shadhi_compress: 60.0,
-            shadhi_shadows_ccorrect: 75.0, shadhi_highlights_ccorrect: 40.0,
-            primaries_on: true,
-            primaries_achromatic_tint_hue: 10.0,
-            primaries_achromatic_tint_purity: 0.3,
-            primaries_red_hue: -15.0,
-            primaries_red_purity: 1.5,
-            primaries_green_hue: 5.0,
-            primaries_green_purity: 0.8,
-            primaries_blue_hue: 20.0,
-            primaries_blue_purity: 1.2,
-            negadoctor_on: true,
-            negadoctor_film_stock: 0.0, // DT_FILMSTOCK_NB
-            negadoctor_dmin_r: 0.2,
-            negadoctor_dmin_g: 0.35,
-            negadoctor_dmin_b: 0.5,
-            negadoctor_wb_high_r: 1.4,
-            negadoctor_wb_high_g: 1.1,
-            negadoctor_wb_high_b: 0.9,
-            negadoctor_wb_low_r: 0.8,
-            negadoctor_wb_low_g: 0.95,
-            negadoctor_wb_low_b: 1.05,
-            negadoctor_d_max: 1.8,
-            negadoctor_offset: 0.1,
-            negadoctor_black: 0.02,
-            negadoctor_gamma: 3.0,
-            negadoctor_soft_clip: 0.4,
-            negadoctor_exposure: 1.5,
-            // Nine distinct gains so any wrong-offset packing shows as a mismatch
-            // (they are adjacent f32s in the blob).
-            toneeq_on: true,
-            toneeq_noise: 0.11,
-            toneeq_ultra_deep_blacks: -0.22,
-            toneeq_deep_blacks: 0.33,
-            toneeq_blacks: -0.44,
-            toneeq_shadows: 0.55,
-            toneeq_midtones: -0.66,
-            toneeq_highlights: 0.77,
-            toneeq_whites: -0.88,
-            toneeq_speculars: 0.99,
-            // Color balance RGB: every field set off-default and pairwise
-            // distinct, so a wrong offset in the 33-float block shows as a
-            // mismatch.
-            cb_on: true,
-            cb_shadows_y: 0.01,
-            cb_shadows_c: -0.02,
-            cb_shadows_h: 3.0,
-            cb_midtones_y: 0.04,
-            cb_midtones_c: -0.05,
-            cb_midtones_h: 6.0,
-            cb_highlights_y: 0.07,
-            cb_highlights_c: -0.08,
-            cb_highlights_h: 9.0,
-            cb_global_y: 0.10,
-            cb_global_c: -0.11,
-            cb_global_h: 12.0,
-            cb_shadows_weight: 1.13,
-            cb_white_fulcrum: -1.14,
-            cb_highlights_weight: 2.15,
-            cb_chroma_shadows: 0.16,
-            cb_chroma_highlights: -0.17,
-            cb_chroma_global: 0.18,
-            cb_chroma_midtones: -0.19,
-            cb_saturation_global: 0.20,
-            cb_saturation_highlights: -0.21,
-            cb_saturation_midtones: 0.22,
-            cb_saturation_shadows: -0.23,
-            cb_hue_angle: 24.0,
-            cb_brilliance_global: 0.25,
-            cb_brilliance_highlights: -0.26,
-            cb_brilliance_midtones: 0.27,
-            cb_brilliance_shadows: -0.28,
-            cb_mask_grey_fulcrum: 0.29,
-            cb_vibrance: -0.30,
-            cb_grey_fulcrum: 0.31,
-            cb_contrast: -0.32,
-            cb_formula: 0.0, // JzAzBz — the non-default formula
-            // Filmic RGB: every value off-default and pairwise distinct so a
-            // wrong offset in the trailing block shows as a mismatch.
-            filmic_on: true,
-            filmic_black_point_source: -6.5,
-            filmic_white_point_source: 5.5,
-            filmic_output_power: 3.5,
-            filmic_latitude: 12.5,
-            filmic_contrast: 1.7,
-            filmic_balance: -25.0,
-            filmic_saturation: 60.0,
-            // Highlight reconstruction: both bools distinct from their defaults
-            // (false/true) plus a non-default threshold, so a wrong offset in
-            // the trailing block shows as a mismatch.
-            hl_on: true,
-            hl_opposed: false,
-            hl_clip: 1.5,
-            // Denoise (profiled): same pattern — bools flipped from their
-            // (false/true) defaults, floats off-default and distinct.
-            dn_on: true,
-            dn_mode_y0u0v0: false,
-            dn_strength: 0.8,
-            dn_shadows: 1.3,
-            dn_bias: -0.25,
-            // Bloom: bool flipped from default, floats off-default and distinct.
-            bl_on: true,
-            bl_size: 33.0,
-            bl_threshold: 72.5,
-            bl_strength: 60.5,
-            // Tone curve: both bools flipped from their (false/true) defaults,
-            // scalars off-default and pairwise distinct, and a third node
-            // moved so a wrong offset inside the 40-float anchor block shows
-            // as a mismatch (slots 0/1 are the C-default identity endpoints —
-            // slot 2 is the first one that differs from the default blob).
-            tc_on: true,
-            tc_unbound: false,
-            tc_type: 1.0,      // Catmull-Rom
-            tc_autoscale: 0.0, // manual
-            tc_preserve: 2.0,  // MAX norm
-            tc_nnodes: 3.0,
-            tc_nodes_l: {
-                let mut n = [(0.0f32, 0.0f32); 20];
-                n[1] = (0.75, 0.75);
-                n[2] = (1.0, 1.0);
-                n
-            },
-            // RGB curve: bool flipped from default; every scalar off-default and
-            // pairwise distinct so a wrong offset inside the appended block shows
-            // as a mismatch; each channel's node array edited differently (R gets
-            // a third node, G keeps 2 but moves its endpoint, B gets two extra)
-            // so per-channel offsets can't silently swap.
-            rc_on: true,
-            rc_type_r: 1.0,
-            rc_type_g: 0.0,
-            rc_type_b: 2.0,
-            rc_autoscale: 1.0, // MANUAL_RGB
-            rc_preserve: 3.0,  // AVERAGE norm
-            rc_nnodes_r: 3.0,
-            rc_nnodes_g: 2.0,
-            rc_nnodes_b: 4.0,
-            rc_nodes_r: {
-                let mut n = [(0.0f32, 0.0f32); 20];
-                n[1] = (0.75, 0.4);
-                n[2] = (1.0, 1.0);
-                n
-            },
-            rc_nodes_g: {
-                let mut n = [(0.0f32, 0.0f32); 20];
-                n[1] = (0.85, 0.6);
-                n
-            },
-            rc_nodes_b: {
-                let mut n = [(0.0f32, 0.0f32); 20];
-                n[1] = (0.25, 0.45);
-                n[2] = (0.6, 0.55);
-                n[3] = (1.0, 1.0);
-                n
-            },
-            // Base curve: bool flipped from default; every scalar off-default
-            // and pairwise distinct so a wrong offset inside the appended block
-            // shows as a mismatch; node array edited at slots 1..4 (slots 0 and
-            // beyond stay identity) so per-slot offsets can't silently swap.
-            bc_on: true,
-            bc_type: 0.0,     // CUBIC_SPLINE — non-default interpolator
-            bc_preserve: 2.0, // DT_RGB_NORM_MAX
-            bc_nnodes: 5.0,
-            bc_exposure_fusion: 1.0, // two exposures
-            bc_exposure_stops: 1.75,
-            bc_exposure_bias: -0.35,
-            bc_nodes: {
-                let mut n = [(0.0f32, 0.0f32); 20];
-                n[1] = (0.2, 0.15);
-                n[2] = (0.45, 0.55);
-                n[3] = (0.7, 0.8);
-                n[4] = (1.0, 1.0);
-                n
-            },
-            // Lens correction: both bools flipped from their defaults, every
-            // float off-default and pairwise distinct so a wrong offset in the
-            // trailing block shows as a mismatch. modify_flags/target_geom are
-            // enum dropdowns — kept at exact small integers.
-            lens_on: true,
-            lens_inverse: true,
-            lens_modify_flags: 5.0, // DIST_TCA
-            lens_scale: 1.15,
-            lens_focal: 85.0,
-            lens_aperture: 5.6,
-            lens_distance: 7.5,
-            lens_target_geom: 3.0, // fisheye
-        };
+        let p = fully_populated_params();
         let blob = p.encode();
         assert_eq!(blob.len(), ENCODED_LEN);
         assert_eq!(PreviewParams::decode(&blob), Some(p));

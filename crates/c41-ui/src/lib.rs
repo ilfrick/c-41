@@ -23,6 +23,7 @@ pub mod persist;
 pub mod preview;
 pub mod raw_preview;
 pub mod snapshots;
+pub mod stylemodules;
 pub mod xmp;
 
 pub const APP_ID:        &str = "org.c41.C41";

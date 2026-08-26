@@ -2349,3 +2349,57 @@ delegate to open_catalog.
 post-fold-ins `gate-m4-148-postreview.log`). m4-147's GitHub CI confirmed fully
 green earlier (check+test+clippy and Build & push Docker image success). No
 PARITY_AUDIT change (robustness hardening).
+
+## 2026-08-26 07:20 UTC — m4-149: per-module styles
+
+**What changed**: closed PARITY_AUDIT 2.4's last limit — a style is no longer
+all-or-nothing. New `c41-ui/src/stylemodules.rs` owns the taxonomy:
+`MODULE_GROUPS` (33 names byte-identical to the `history::describe_change`
+labels) plus `copy_module_group`/`merge_modules`. `Style` gained
+`modules: Option<Vec<String>>` mirroring the previously-reserved column:
+NULL = whole-edit style (applies exactly as before; also every pre-149 row's
+shape), Some = partial, and `apply_style_to` MERGES the listed groups over each
+target's saved edit (`load_saved.unwrap_or_default()` base) instead of
+replacing. The save dialog lists a checkbox per group (all ticked = NULL/
+legacy); partial rows show "N of M modules", counted against groups this build
+knows since apply skips unknown names from newer builds. Basic adjustments
+deliberately copies `basicadj_hlcomprthresh`, which describe_change skips
+(change detection ≠ module ownership) — pinned by its own test.
+
+Drift-guard chain extended: the exhaustive field literal moved out of
+`params_encode_decode_roundtrips` into `#[cfg(test)]
+preview::fully_populated_params()` (verified pure move), shared with
+stylemodules' `merging_every_group_equals_a_wholesale_copy` — adding a
+PreviewParams field now fails compilation until fixture, group arm,
+describe_change AND encode/decode are all extended.
+
+Mechanical verification of the taxonomy (twice): all 231 struct fields map
+into exactly one group — no gaps, no double-assignment, no phantom fields;
+counts match the describe_change transcription everywhere except the one
+documented divergence.
+
+**Senior review: BLOCK → fixed** (fresh general-purpose agent, model "opus",
+read-only mandate — fricktrade-architect API-402s, substitution as documented).
+Findings, all folded in:
+- BLOCKER-1 (comment-truth gate): apply_style_to's OLD doc comment survived
+  above the new one, still asserting unconditional wholesale replacement.
+  Rewritten as one coherent comment, plus an explicit caveat that an open
+  darkroom page's autosave can clobber what Apply wrote (pre-existing hazard,
+  sharpened by merges; no cross-page invalidation yet).
+- MAJOR-2: PARITY_AUDIT row 2.4 not updated → done in this commit.
+- MINOR-3: false borrow-checker justification on save_style_reporting's
+  binding → reworded honestly.
+- MINOR-4: list caption counted unknown group names ("34 of 33" possible from
+  a future build) → counts only MODULE_GROUPS members.
+Reviewer independently verified programmatically: taxonomy bijection vs struct,
+verbatim fixture move, comma-format losslessness, no-migration premise (the
+column shipped in the original DDL before any released table), legacy NULL arm
+byte-equivalence, UI closure soundness.
+
+**Verification**: full local gate exit code **0** (`gate-m4-149.log`): cargo
+check/clippy workspace, test --workspace --release, c41-rs release link.
+c41-ui suite 390 passed (10 new: 6 stylemodules + 4 persist style_tests).
+
+**Follow-ups recorded**: zero-module styles apply as a successful no-op
+(dialog could grey out Save when nothing is ticked); cross-page invalidation
+for Apply vs an open darkroom editor; darkroom-view styles module.

@@ -767,27 +767,43 @@ mod tests {
 /// name, which means saving and applying a style reuse the encode/decode we
 /// already trust rather than a parallel serialisation.
 ///
-/// The cost of that choice, stated plainly: a style is **all-or-nothing**. It
-/// carries every module's settings, so applying one replaces the target's whole
-/// edit rather than merging selected modules, which is what darktable's
-/// per-item styles allow. Partial styles want a module mask alongside the blob;
-/// the schema leaves room for it (`modules` is reserved, NULL today) so adding
-/// them later does not need a migration.
+/// The blob carries EVERY module's settings; `modules` narrows what applying it
+/// touches (m4-149). NULL — the shape every pre-149 row has, and what a
+/// whole-edit save writes — means all-or-nothing: applying replaces the target's
+/// whole edit. A non-NULL value is a comma-separated list of module-group names
+/// (`crate::stylemodules::MODULE_GROUPS`; those names contain no commas), and
+/// applying merges only those groups over the target's saved edit, which is
+/// what darktable's per-item styles do. An empty string is a valid zero-module
+/// style: applying it changes nothing.
 const STYLES_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS main.c41_styles \
      (name TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '', \
       params BLOB NOT NULL, modules TEXT)";
 
 /// One saved style.
+///
+/// `modules` mirrors the column of the same name: `None` = a whole-edit style
+/// (apply replaces everything), `Some(list)` = carry only those module groups.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Style {
     pub name: String,
     pub description: String,
     pub params: PreviewParams,
+    pub modules: Option<Vec<String>>,
 }
 
 /// Save (or overwrite) a style. Returns false if the name is blank or the write
 /// fails — the caller surfaces that rather than silently doing nothing.
-pub fn save_style(db_path: &str, name: &str, description: &str, params: &PreviewParams) -> bool {
+///
+/// `modules`: `None` stores a NULL column (whole-edit style); `Some(groups)`
+/// stores the group names comma-joined. Names are the caller's choice but only
+/// [`crate::stylemodules::MODULE_GROUPS`] entries have meaning at apply time.
+pub fn save_style(
+    db_path: &str,
+    name: &str,
+    description: &str,
+    params: &PreviewParams,
+    modules: Option<&[&str]>,
+) -> bool {
     let name = name.trim();
     if db_path.is_empty() || name.is_empty() {
         return false;
@@ -797,10 +813,16 @@ pub fn save_style(db_path: &str, name: &str, description: &str, params: &Preview
         return false;
     }
     conn.execute(
-        "INSERT INTO main.c41_styles (name, description, params) VALUES (?1, ?2, ?3) \
+        "INSERT INTO main.c41_styles (name, description, params, modules) VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(name) DO UPDATE SET description = excluded.description, \
-                                         params = excluded.params",
-        rusqlite::params![name, description, params.encode()],
+                                         params = excluded.params, \
+                                         modules = excluded.modules",
+        rusqlite::params![
+            name,
+            description,
+            params.encode(),
+            modules.map(|ms| ms.join(",")),
+        ],
     )
     .is_ok()
 }
@@ -813,7 +835,7 @@ pub fn load_styles(db_path: &str) -> Vec<Style> {
     }
     let Ok(conn) = open_catalog(db_path) else { return Vec::new() };
     let Ok(mut stmt) = conn.prepare(
-        "SELECT name, description, params FROM main.c41_styles ORDER BY name COLLATE NOCASE",
+        "SELECT name, description, params, modules FROM main.c41_styles ORDER BY name COLLATE NOCASE",
     ) else {
         return Vec::new();
     };
@@ -822,15 +844,26 @@ pub fn load_styles(db_path: &str) -> Vec<Style> {
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ))
     });
     let Ok(rows) = rows else { return Vec::new() };
     rows.flatten()
-        .filter_map(|(name, description, blob)| {
+        .filter_map(|(name, description, blob, modules)| {
             // A style written by an older ENCODE_VERSION decodes to None. Skip
             // it rather than substituting defaults, which would silently apply
             // a *different* edit than the one the user saved.
-            PreviewParams::decode(&blob).map(|params| Style { name, description, params })
+            PreviewParams::decode(&blob).map(|params| Style {
+                name,
+                description,
+                params,
+                modules: modules.map(|m| {
+                    m.split(',')
+                        .filter(|t| !t.is_empty())
+                        .map(String::from)
+                        .collect()
+                }),
+            })
         })
         .collect()
 }
@@ -925,16 +958,27 @@ pub fn delete_collection_preset(db_path: &str, name: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Apply a style's params to every image in `full_paths`, returning how many
-/// were **actually written**.
+/// Apply a style to every catalogued image in `full_paths`, returning how many
+/// targets were actually written.
 ///
 /// The count is writes, not attempts: params are keyed by `imgid`, so a path
 /// that is not in the catalogue (`images` ⋈ `film_rolls`) has nowhere to store
 /// an edit and is skipped. Reporting attempts would let the UI claim "applied
 /// to 5 images" when none were catalogued.
 ///
-/// Note this **replaces** the target's params wholesale — see the note on
-/// [`STYLES_TABLE_DDL`].
+/// What lands on each target depends on [`Style::modules`]. A whole-edit style
+/// (`None`) replaces the target's saved edit with the style's params, exactly
+/// as styles always did. A partial style (m4-149) instead MERGES: the target's
+/// saved edit is kept and only the listed module groups are copied over from
+/// the style — darktable's per-item style behaviour. A target with no saved
+/// edit yet merges onto defaults; a group name nothing knows about is simply
+/// skipped.
+///
+/// Caveat shared by both arms: an image whose darkroom page is open elsewhere
+/// holds its params in memory and will write them back on autosave, clobbering
+/// what this wrote (pre-existing for whole styles; a partial merge sharpens the
+/// surprise because the user believes their other modules survived). There is
+/// no cross-page invalidation yet.
 pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> usize {
     if db_path.is_empty() {
         return 0;
@@ -946,7 +990,16 @@ pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> us
     let mut written = 0usize;
     for path in full_paths.iter().filter(|p| !p.is_empty()) {
         if let Some(imgid) = imgid_for_path(&conn, path) {
-            if save_params_conn(&conn, imgid, &style.params).is_ok() {
+            let outcome = match &style.modules {
+                None => save_params_conn(&conn, imgid, &style.params),
+                Some(groups) => {
+                    let base = load_saved_conn(&conn, imgid).unwrap_or_default();
+                    let names: Vec<&str> = groups.iter().map(String::as_str).collect();
+                    let merged = crate::stylemodules::merge_modules(&base, &style.params, &names);
+                    save_params_conn(&conn, imgid, &merged)
+                }
+            };
+            if outcome.is_ok() {
                 written += 1;
             }
         }
@@ -1427,7 +1480,7 @@ mod style_tests {
     #[test]
     fn save_load_round_trips_a_style() {
         let (_d, db) = tmp_db("roundtrip");
-        assert!(save_style(&db, "Punchy", "high contrast", &params_with(1.5)));
+        assert!(save_style(&db, "Punchy", "high contrast", &params_with(1.5), None));
         let styles = load_styles(&db);
         assert_eq!(styles.len(), 1);
         assert_eq!(styles[0].name, "Punchy");
@@ -1452,8 +1505,8 @@ mod style_tests {
     #[test]
     fn save_overwrites_by_name_rather_than_duplicating() {
         let (_d, db) = tmp_db("upsert");
-        assert!(save_style(&db, "S", "first", &params_with(1.0)));
-        assert!(save_style(&db, "S", "second", &params_with(2.0)));
+        assert!(save_style(&db, "S", "first", &params_with(1.0), None));
+        assert!(save_style(&db, "S", "second", &params_with(2.0), None));
         let styles = load_styles(&db);
         assert_eq!(styles.len(), 1, "same name must upsert, not duplicate");
         assert_eq!(styles[0].description, "second");
@@ -1463,12 +1516,12 @@ mod style_tests {
     #[test]
     fn blank_names_are_rejected() {
         let (_d, db) = tmp_db("blank");
-        assert!(!save_style(&db, "", "x", &params_with(1.0)));
-        assert!(!save_style(&db, "   ", "x", &params_with(1.0)));
+        assert!(!save_style(&db, "", "x", &params_with(1.0), None));
+        assert!(!save_style(&db, "   ", "x", &params_with(1.0), None));
         assert!(load_styles(&db).is_empty());
         // Names are trimmed, so " S " and "S" are the same style rather than two
         // rows that look identical in the list.
-        assert!(save_style(&db, " S ", "", &params_with(1.0)));
+        assert!(save_style(&db, " S ", "", &params_with(1.0), None));
         assert_eq!(load_styles(&db)[0].name, "S");
     }
 
@@ -1490,8 +1543,8 @@ mod style_tests {
     #[test]
     fn delete_removes_only_the_named_style() {
         let (_d, db) = tmp_db("delete");
-        save_style(&db, "a", "", &params_with(1.0));
-        save_style(&db, "b", "", &params_with(2.0));
+        save_style(&db, "a", "", &params_with(1.0), None);
+        save_style(&db, "b", "", &params_with(2.0), None);
         assert!(delete_style(&db, "a"));
         assert!(!delete_style(&db, "a"), "second delete removes nothing");
         let names: Vec<_> = load_styles(&db).into_iter().map(|s| s.name).collect();
@@ -1502,7 +1555,7 @@ mod style_tests {
     fn styles_list_is_name_ordered_case_insensitively() {
         let (_d, db) = tmp_db("order");
         for n in ["zebra", "Apple", "mango"] {
-            save_style(&db, n, "", &params_with(0.5));
+            save_style(&db, n, "", &params_with(0.5), None);
         }
         let names: Vec<_> = load_styles(&db).into_iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["Apple", "mango", "zebra"]);
@@ -1536,7 +1589,7 @@ mod style_tests {
     fn apply_writes_the_style_to_every_target() {
         let (_d, db) = tmp_db("apply");
         catalogue(&db, "/photos", &["a.dng", "b.dng"]);
-        save_style(&db, "S", "", &params_with(2.5));
+        save_style(&db, "S", "", &params_with(2.5), None);
         let style = load_styles(&db).remove(0);
         let targets = vec!["/photos/a.dng".to_string(), "/photos/b.dng".to_string()];
         assert_eq!(apply_style_to(&db, &targets, &style), 2);
@@ -1552,7 +1605,7 @@ mod style_tests {
         // happened — the UI reports this number back to the user.
         let (_d, db) = tmp_db("applycount");
         catalogue(&db, "/photos", &["a.dng"]);
-        save_style(&db, "S", "", &params_with(1.5));
+        save_style(&db, "S", "", &params_with(1.5), None);
         let style = load_styles(&db).remove(0);
         let targets = vec![
             "/photos/a.dng".to_string(),
@@ -1565,9 +1618,111 @@ mod style_tests {
     #[test]
     fn apply_skips_empty_paths() {
         let (_d, db) = tmp_db("applyempty");
-        save_style(&db, "S", "", &params_with(1.0));
+        save_style(&db, "S", "", &params_with(1.0), None);
         let style = load_styles(&db).remove(0);
         assert_eq!(apply_style_to(&db, &["".to_string()], &style), 0);
+    }
+
+    #[test]
+    fn partial_style_roundtrips_its_module_list() {
+        let (_d, db) = tmp_db("partialroundtrip");
+        assert!(save_style(
+            &db,
+            "Velvia only",
+            "",
+            &params_with(9.0),
+            Some(&["Velvia", "Levels"])
+        ));
+        let style = load_styles(&db).remove(0);
+        assert_eq!(
+            style.modules,
+            Some(vec!["Velvia".to_string(), "Levels".to_string()])
+        );
+
+        // Re-saving the same name with different scope must UPDATE the column
+        // (the upsert's ON CONFLICT arm carries it), not leave the old list.
+        assert!(save_style(&db, "Velvia only", "", &params_with(9.0), None));
+        assert_eq!(load_styles(&db).remove(0).modules, None);
+    }
+
+    #[test]
+    fn whole_style_stores_a_null_modules_column() {
+        // Legacy compatibility is the POINT of None: pre-149 rows have NULL and
+        // must be indistinguishable from a fresh whole-edit save.
+        let (_d, db) = tmp_db("nullcol");
+        assert!(save_style(&db, "Whole", "", &params_with(1.0), None));
+        let conn = open_catalog(&db).unwrap();
+        let n: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM main.c41_styles WHERE modules IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // An empty selection is a valid zero-module style — stored as '' so it
+        // round-trips as Some(vec![]) rather than collapsing into NULL/whole.
+        drop(conn);
+        assert!(save_style(&db, "Nothing", "", &params_with(1.0), Some(&[])));
+        let conn = open_catalog(&db).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT modules FROM main.c41_styles WHERE name = 'Nothing'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, "");
+        assert_eq!(
+            load_styles(&db)
+                .into_iter()
+                .find(|s| s.name == "Nothing")
+                .unwrap()
+                .modules,
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn applying_a_partial_style_merges_over_the_saved_edit() {
+        // The m4-149 behaviour itself: the target keeps its own exposure and
+        // gains only the listed group from the style.
+        let (_d, db) = tmp_db("merge");
+        catalogue(&db, "/photos", &["a.dng"]);
+        let img = "/photos/a.dng";
+        save_params(&db, img, &params_with(1.0));
+
+        let mut overlay = params_with(9.0);
+        overlay.velvia_strength = 42.0;
+        assert!(save_style(&db, "Punch", "", &overlay, Some(&["Velvia"])));
+        let style = load_styles(&db).remove(0);
+
+        assert_eq!(apply_style_to(&db, &[img.to_string()], &style), 1);
+        let merged = load_params(&db, img);
+        assert_eq!(merged.ev, 1.0, "unlisted module must keep the target's value");
+        assert_eq!(merged.velvia_strength, 42.0, "listed module must come from the style");
+    }
+
+    #[test]
+    fn applying_a_partial_style_onto_an_unedited_image_starts_from_defaults() {
+        // No saved edit yet → base is defaults, so unlisted fields land at
+        // default values (NOT at the style's), matching darktable applying a
+        // partial style onto an untouched image.
+        let (_d, db) = tmp_db("mergenew");
+        catalogue(&db, "/photos", &["a.dng"]);
+        let img = "/photos/a.dng";
+        assert!(load_saved(&db, img).is_none());
+
+        let mut overlay = params_with(-2.0);
+        overlay.velvia_strength = 42.0;
+        assert!(save_style(&db, "Punch", "", &overlay, Some(&["Velvia"])));
+        let style = load_styles(&db).remove(0);
+
+        assert_eq!(apply_style_to(&db, &[img.to_string()], &style), 1);
+        let merged = load_params(&db, img);
+        assert_eq!(merged.ev, 0.0, "default, not the style's -2.0");
+        assert_eq!(merged.velvia_strength, 42.0);
     }
 
     #[test]

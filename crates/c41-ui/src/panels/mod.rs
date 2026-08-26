@@ -1933,6 +1933,27 @@ impl MetadataPanel {
                 desc.add_css_class("caption");
                 b.append(&desc);
             }
+            // A partial style says so right on its row — "applies" reading as
+            // replace-all is exactly the surprise m4-149 exists to remove.
+            // Counted against the groups THIS build knows (apply ignores the
+            // rest), so a style from a newer version can't claim "34 of 33".
+            if let Some(groups) = &st.modules {
+                let known = groups
+                    .iter()
+                    .filter(|g| crate::stylemodules::MODULE_GROUPS.contains(&g.as_str()))
+                    .count();
+                let scope = gtk4::Label::builder()
+                    .label(format!(
+                        "{} of {} modules",
+                        known,
+                        crate::stylemodules::MODULE_GROUPS.len()
+                    ))
+                    .halign(gtk4::Align::Start)
+                    .build();
+                scope.add_css_class("dim-label");
+                scope.add_css_class("caption");
+                b.append(&scope);
+            }
             let is_kept = keep.as_deref() == Some(st.name.as_str());
             row.set_child(Some(&b));
             list.append(&row);
@@ -2010,6 +2031,42 @@ impl MetadataPanel {
                 fields.append(&name_entry);
                 fields.append(&desc_entry);
 
+                // Module selection (m4-149): everything ticked saves a
+                // whole-edit style (NULL column, applies as replace); unticking
+                // any makes it partial and applying merges only those groups.
+                // All-ticked is stored as NULL so pre-149 rows stay
+                // indistinguishable from fresh whole-edit saves.
+                let scope_caption = gtk4::Label::builder()
+                    .label("Modules included in the style")
+                    .halign(gtk4::Align::Start)
+                    .build();
+                scope_caption.add_css_class("dim-label");
+                scope_caption.add_css_class("caption");
+                let check_box = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Vertical)
+                    .spacing(2)
+                    .build();
+                for group in crate::stylemodules::MODULE_GROUPS {
+                    let cb = gtk4::CheckButton::with_label(group);
+                    cb.set_active(true);
+                    check_box.append(&cb);
+                }
+                let scope_scroll = gtk4::ScrolledWindow::new();
+                scope_scroll.set_height_request(180);
+                scope_scroll.set_child(Some(&check_box));
+                fields.append(&scope_caption);
+                fields.append(&scope_scroll);
+                // Handles cloned out before the closures capture them: the
+                // buttons live in the dialog either way, these are just refs.
+                let mut checks: Vec<gtk4::CheckButton> = Vec::new();
+                let mut cur = check_box.first_child();
+                while let Some(w) = cur {
+                    if let Some(cb) = w.downcast_ref::<gtk4::CheckButton>() {
+                        checks.push(cb.clone());
+                    }
+                    cur = w.next_sibling();
+                }
+
                 let dialog = adw::AlertDialog::builder()
                     .heading("Save style")
                     .body("Save this image's current edit for reuse.")
@@ -2029,6 +2086,15 @@ impl MetadataPanel {
                 dialog.connect_response(Some("save"), move |_, _| {
                     let name = name_entry.text().to_string();
                     let desc = desc_entry.text().to_string();
+                    // Everything still ticked → whole-edit style (None); any
+                    // unticked group narrows the style to what remains.
+                    let picked: Vec<String> = checks
+                        .iter()
+                        .filter(|c| c.is_active())
+                        .filter_map(|c| c.label().map(|l| l.to_string()))
+                        .collect();
+                    let modules =
+                        if picked.len() == checks.len() { None } else { Some(picked) };
                     // save_style upserts, so a name collision silently replaces
                     // a saved edit with no way back — styles have no history
                     // stack behind them. Confirm first.
@@ -2050,16 +2116,23 @@ impl MetadataPanel {
                             (db_c.clone(), list_c.clone(), notify_c.clone());
                         let (name_x, desc_x, params_x) =
                             (name.clone(), desc.clone(), params.clone());
+                        let modules_x = modules.clone();
                         confirm.connect_response(Some("replace"), move |_, _| {
                             Self::save_style_reporting(
-                                &db_x, &name_x, &desc_x, &params_x, &list_x, &notify_x,
+                                &db_x,
+                                &name_x,
+                                &desc_x,
+                                &params_x,
+                                modules_x.as_deref(),
+                                &list_x,
+                                &notify_x,
                             );
                         });
                         confirm.present(Some(&parent));
                         return;
                     }
                     Self::save_style_reporting(
-                        &db_c, &name, &desc, &params, &list_c, &notify_c,
+                        &db_c, &name, &desc, &params, modules.as_deref(), &list_c, &notify_c,
                     );
                 });
                 dialog.present(Some(btn.upcast_ref::<gtk4::Widget>()));
@@ -2191,10 +2264,16 @@ impl MetadataPanel {
         name: &str,
         desc: &str,
         params: &crate::preview::PreviewParams,
+        modules: Option<&[String]>,
         list: &gtk4::ListBox,
         notify: &std::rc::Rc<dyn Fn(String)>,
     ) {
-        if crate::persist::save_style(db, name, desc, params) {
+        // The Option<&[String]> → Option<&[&str]> conversion is bound first so
+        // the call site reads plainly rather than nesting a map inside the
+        // argument list.
+        let names: Option<Vec<&str>> =
+            modules.map(|ms| ms.iter().map(String::as_str).collect());
+        if crate::persist::save_style(db, name, desc, params, names.as_deref()) {
             Self::refresh_styles_list(list, db);
             notify(format!("Saved style \"{}\"", name.trim()));
         } else if name.trim().is_empty() {
