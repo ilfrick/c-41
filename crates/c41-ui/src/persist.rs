@@ -974,11 +974,16 @@ pub fn delete_collection_preset(db_path: &str, name: &str) -> bool {
 /// edit yet merges onto defaults; a group name nothing knows about is simply
 /// skipped.
 ///
-/// Caveat shared by both arms: an image whose darkroom page is open elsewhere
-/// holds its params in memory and will write them back on autosave, clobbering
-/// what this wrote (pre-existing for whole styles; a partial merge sharpens the
-/// surprise because the user believes their other modules survived). There is
-/// no cross-page invalidation yet.
+/// Why no live-editor invalidation is needed: styles are applied only from
+/// the lighttable's metadata panel, and every darkroom activation builds a
+/// fresh page that seeds itself from this table — lib.rs constructs
+/// `darkroom_page` anew at each entry site and retains nothing after pop,
+/// while the page's AutoSave flushes on hide — so an apply always wins and is
+/// visible on the next visit. This deliberately rests on that page-per-visit
+/// wiring: if darkroom pages were ever cached across visits, a cached page's
+/// autosave would clobber what this wrote, pre-existing for whole styles but
+/// sharper for partial merges because the user believes their other modules
+/// survived. Cross-page invalidation has to come with any such caching.
 pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> usize {
     if db_path.is_empty() {
         return 0;

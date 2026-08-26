@@ -2403,3 +2403,48 @@ c41-ui suite 390 passed (10 new: 6 stylemodules + 4 persist style_tests).
 **Follow-ups recorded**: zero-module styles apply as a successful no-op
 (dialog could grey out Save when nothing is ticked); cross-page invalidation
 for Apply vs an open darkroom editor; darkroom-view styles module.
+
+## 2026-08-26 08:07 UTC — m4-150: styles review follow-ups (caveat truth + zero-module guard)
+
+Two items left by the m4-149 review, plus what the m4-150 review itself found.
+
+**Caveat rewritten (persist.rs `apply_style_to`)**: the shipped caveat claimed an
+image with a darkroom page "open elsewhere" could clobber an applied style via
+autosave. Investigation showed that state is unreachable under current wiring:
+styles Apply lives only in the lighttable metadata panel (sole
+`MetadataPanel::new` at lib.rs:548, wired :701; no darkroom embedding); both
+darkroom entry sites (lib.rs:1466/:1727) construct `darkroom_page` fresh and
+retain nothing after pop; the page seeds params/history from the DB at
+construction (mod.rs:1137/:1140) and AutoSave flushes synchronously on hide
+(mod.rs:1932). The comment now states this invariant positively and warns that
+any future caching of darkroom pages across visits must bring cross-page
+invalidation. Reviewer re-verified every claim against source, including a
+three-layer trace that a disabled AlertDialog response also blocks Enter.
+
+**Zero-module Save guard (panels/mod.rs save-style dialog)**: saving with all
+33 groups unticked would store `Some(vec![])`, and upserting that over an
+existing name silently replaces a real style with a no-op. Save response is now
+disabled while nothing is ticked, a hidden "Tick at least one module" warning
+label explains why, and the save handler itself refuses empty picks
+(defense-in-depth so the invariant lives at the write, not just the widget).
+Initial all-ticked state precedes wiring; whole-style NULL storage untouched.
+
+**Review findings fixed** (senior review substituted again — `fricktrade-architect`
+agent API-402s on spawn, per established workaround a fresh general-purpose
+agent ran with model:"opus" under an explicit read-only mandate):
+MAJOR-1 my first guard version captured `dialog` strongly inside
+`connect_toggled` closures owned by buttons the dialog owns — a GObject
+refcount cycle leaking the subtree per open. Captures now weak
+(`downgrade()`/`upgrade()`), matching repo convention. NIT: handle list moved
+behind one `Rc` instead of cloning a 34-element Vec per closure. NIT: handler
+early-return added.
+
+**What went wrong**: first post-review gate failed GATE_EXIT=1 with E0599 — I
+transcribed the reviewer's suggested `.inspect(..).ok()` verbatim, but `.ok()`
+is a Result method; Option needs `if let`. Fixed and re-gated. One intermediate
+gate run was killed externally before recording an exit code (it had reached the
+final link step) — treated as no-result and re-run to completion.
+
+**Verification**: `scripts/ci-local.sh` GATE_EXIT=0 (fresh log gate-m4-150.log,
+gitignored); style/apply test groups green (39 tests). No PARITY_AUDIT change —
+polish on 2.4's implementation, no parity item resolved.

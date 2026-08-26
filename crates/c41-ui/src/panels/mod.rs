@@ -2054,8 +2054,17 @@ impl MetadataPanel {
                 let scope_scroll = gtk4::ScrolledWindow::new();
                 scope_scroll.set_height_request(180);
                 scope_scroll.set_child(Some(&check_box));
+                // Shown only while zero groups are ticked, to explain why the
+                // Save response below is disabled.
+                let scope_warn = gtk4::Label::builder()
+                    .label("Tick at least one module")
+                    .halign(gtk4::Align::Start)
+                    .visible(false)
+                    .build();
+                scope_warn.add_css_class("warning");
                 fields.append(&scope_caption);
                 fields.append(&scope_scroll);
+                fields.append(&scope_warn);
                 // Handles cloned out before the closures capture them: the
                 // buttons live in the dialog either way, these are just refs.
                 let mut checks: Vec<gtk4::CheckButton> = Vec::new();
@@ -2066,6 +2075,11 @@ impl MetadataPanel {
                     }
                     cur = w.next_sibling();
                 }
+                // Shared behind an Rc from here on: every toggled closure
+                // below reads all buttons' state and the save handler further
+                // down iterates the same list — one refcount per closure beats
+                // cloning the whole handle Vec into each (m4-150 review).
+                let checks = std::rc::Rc::new(checks);
 
                 let dialog = adw::AlertDialog::builder()
                     .heading("Save style")
@@ -2076,6 +2090,28 @@ impl MetadataPanel {
                 dialog.add_response("save", "Save");
                 dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
                 dialog.set_default_response(Some("save"));
+                // A zero-module style would apply as a no-op, and saving one
+                // over an existing name would silently replace a real style
+                // with that no-op. Keep Save unusable while nothing is ticked
+                // (initial state is all-ticked, so this only ever disables).
+                // The dialog and warning label are captured WEAK: the buttons
+                // own these closures and the dialog owns the buttons, so a
+                // strong dialog handle here would be a GObject refcount cycle
+                // leaking the whole subtree per open (m4-150 review MAJOR-1).
+                for cb in checks.iter() {
+                    let dialog_w = dialog.downgrade();
+                    let warn_w = scope_warn.downgrade();
+                    let checks = checks.clone();
+                    cb.connect_toggled(move |_| {
+                        let any = checks.iter().any(|c| c.is_active());
+                        if let Some(d) = dialog_w.upgrade() {
+                            d.set_response_enabled("save", any);
+                            if let Some(w) = warn_w.upgrade() {
+                                w.set_visible(!any);
+                            }
+                        }
+                    });
+                }
 
                 let list_c = list.clone();
                 let db_c = db.clone();
@@ -2093,6 +2129,14 @@ impl MetadataPanel {
                         .filter(|c| c.is_active())
                         .filter_map(|c| c.label().map(|l| l.to_string()))
                         .collect();
+                    // Defense-in-depth behind the checkbox wiring that keeps
+                    // Save insensitive at zero modules: refuse here as well, so
+                    // the invariant lives at the write and not only at the
+                    // widget — a future second path into this handler must not
+                    // upsert an empty partial style over an existing name.
+                    if picked.is_empty() {
+                        return;
+                    }
                     let modules =
                         if picked.len() == checks.len() { None } else { Some(picked) };
                     // save_style upserts, so a name collision silently replaces
