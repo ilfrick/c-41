@@ -30,6 +30,37 @@ pub fn fastlog(x: f32) -> f32 {
     M_LN2 * fastlog2(x)
 }
 
+/// Schraudolph-style exponent bit-hack, matching `dt_fast_expf()` in
+/// src/common/math.h byte-for-byte over its whole domain: an integer add on
+/// the float bits interpolates the exponent, so `e^x` costs one multiply and
+/// one add.
+///
+/// Accuracy (per the C source comment plus measurement): meant for x <= 0;
+/// absolute error stays under ~0.055 on [-2, 0] while *relative* error grows
+/// roughly linearly with |x| (~18% at -2, ~45% at -6) — call sites must only
+/// use it where that envelope is acceptable, exactly as darktable does.
+///
+/// Overflow semantics: C truncates via x86 `cvttss2si`, which yields the
+/// integer-indefinite value INT_MIN for NaN and for anything beyond i32
+/// range; the `k0 > 0` guard folds all of those (and negative overflow) to
+/// zero bits. Rust's saturating cast agrees except for products ≥ 2^31,
+/// which would saturate to i32::MAX (= NaN bits when reinterpreted) instead
+/// of 0 — so that band is mapped to 0 explicitly to stay byte-identical.
+#[inline(always)]
+pub fn fast_expf(x: f32) -> f32 {
+    const I1: i32 = 0x3f80_0000u32 as i32;
+    const I2: i32 = 0x402d_f854u32 as i32;
+    // (I2 - I1) is exact in f32 (< 2^24), same value C's int subtraction yields.
+    let prod = I1 as f32 + x * (I2 - I1) as f32;
+    let k0 = if prod.is_nan() || prod >= 2_147_483_648.0f32 {
+        // what cvttss2si produces for these: INT_MIN, i.e. not > 0
+        0
+    } else {
+        prod as i32
+    };
+    f32::from_bits(if k0 > 0 { k0 as u32 } else { 0 })
+}
+
 // ── PRNG: xoshiro128+ / splitmix32 / noise generators ────────────────────────
 // Mirrors src/develop/noise_generator.h exactly so all three noise types
 // (uniform, Gaussian, Poissonian) produce bit-identical output to the C path.
@@ -281,6 +312,68 @@ mod tests {
     fn fastlog_uses_natural_base() {
         let r = fastlog(std::f32::consts::E);
         assert!((r - 1.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn fast_expf_zero_is_near_one() {
+        // Schraudolph bit-hack: ~3% worst-case relative error by design
+        assert!((fast_expf(0.0) - 1.0).abs() < 0.06, "got {}", fast_expf(0.0));
+    }
+
+    #[test]
+    fn fast_expf_is_positive_and_monotone_decreasing() {
+        let mut prev = f32::MAX;
+        for i in 0..400 {
+            let x = 20.0 - i as f32 * 0.1;
+            let v = fast_expf(x);
+            assert!(v > 0.0, "x={x} gave {v}");
+            assert!(v <= prev, "not monotone at x={x}: {v} > {prev}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn fast_expf_absolute_error_bounded_near_zero() {
+        // measured envelope: max |err| ~0.054 on [-2, 0]; the C source only
+        // promises absolute accuracy here ("largest error ~ -0.06")
+        for &x in &[-2.0f32, -1.5, -1.0, -0.5, -0.25, -0.01] {
+            let err = (fast_expf(x) - x.exp()).abs();
+            assert!(err < 0.06, "x={x}: err={err}");
+        }
+    }
+
+    #[test]
+    fn fast_expf_stays_same_order_of_magnitude_on_the_tail() {
+        // relative error grows with |x| by design; it must at least stay
+        // within a factor of two of exp on the mid tail
+        for &x in &[-3.0f32, -4.0, -5.0, -6.0] {
+            let approx = fast_expf(x);
+            let exact = x.exp();
+            assert!(
+                approx > 0.4 * exact && approx < 2.0 * exact,
+                "x={x}: approx={approx} exact={exact}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_expf_large_negative_collapses_to_zero() {
+        // below the k0 > 0 guard's range the C returns zero bits
+        assert_eq!(fast_expf(-200.0), 0.0);
+    }
+
+    #[test]
+    fn fast_expf_positive_overflow_matches_c_zero_bits() {
+        // x ≳ 94.95 pushes the product past i32 range: cvttss2si gives INT_MIN
+        // so C yields +0.0 — Rust must not saturate to NaN bits here.
+        for &x in &[95.0f32, 100.0, 1e6] {
+            assert_eq!(fast_expf(x), 0.0, "x={x}");
+        }
+        // just below the cutoff the approximation is still finite and positive
+        for &x in &[80.0f32, 94.0] {
+            let v = fast_expf(x);
+            assert!(v > 0.0 && v.is_finite(), "x={x}: {v}");
+        }
     }
 
     // ── PRNG tests ──────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ pub mod geometry;
 pub mod icc;
 pub mod interp;
 pub mod iop;
+pub mod locallaplacian;
 pub mod math;
 pub mod params;
 pub mod pipeline;

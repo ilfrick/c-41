@@ -2492,3 +2492,59 @@ Verification: cargo check clean; style/apply test groups green (29+14);
 scripts/ci-local.sh GATE_EXIT=0 (gate-m4-151.log, gitignored).
 Follow-ups recorded: ActionRow crowding at width_request(320) is cosmetic;
 populate_modules' per-rebuild cost noted by reviewer as do-not-copy pattern.
+
+## 2026-08-26 10:07 UTC — m4-152 slice 1: local-laplacian core port (bilat engine)
+
+What changed: new `c41-core::locallaplacian` — pure-Rust port of darktable's
+`src/common/locallaplacian.c` (mode-0 self-contained buffer path of
+`local_laplacian_internal`, plus `local_laplacian_memory_use` /
+`singlebuffer_size`), and `math::fast_expf` replicating `dt_fast_expf`.
+This is the engine behind bilat.c's "local laplacian filter" mode (darktable's
+Local Contrast module); slice 2 will wire call sites/UI.
+
+Bit-exactness work worth remembering:
+- The C expand stencil mixes precisions: `4.`/`256.`/`24.0`/`4.0` are DOUBLE
+  literals, `6.0f`/`.25f` float — cases 1/2 run f64 outer arithmetic over f32
+  leaf sums; case 0 scales an all-f32 total by the exact dyadic double.
+- `gauss_reduce`'s odd-width scalar tail computes its vertical with a
+  DIFFERENT addition grouping than the SIMD-lane path (`(((g0+4(g1+g3))+6g2)+g4)`
+  vs `(((v0+v4)+v2)+v2)+4((v1+v2)+v3)`) — constants differ by ~1 ulp even on
+  constant fields; replicated faithfully, and the end-to-end constant test is
+  tolerance-based for exactly this reason (documented).
+- `ll_fill_boundary2`'s even-width branch chains assignments right-to-left;
+  statement order matters.
+- `num_levels_for` must cast to u32 before `leading_zeros()` — usize's is a
+  64-bit count and would underflow `31-clz`.
+
+fast_expf overflow semantics: C's cvttss2si yields INT_MIN (→ zero bits via
+the k0>0 guard) for NaN and products ≥ 2^31; Rust saturating casts would give
+i32::MAX → NaN there. Port maps that band to 0 explicitly, byte-identical over
+the whole float domain (test pins x=95/100/1e6 → 0).
+
+Review: fricktrade-architect API-402'd as always → standing workaround: fresh
+general-purpose agent, model opus, explicit READ-ONLY mandate + senior-reviewer
+framing. Verdict SHIP; it additionally built an out-of-band harness comparing
+the port against an independent C transcription: 0 ulp across 30 dim×param
+configurations. Findings fixed (all non-blocking): doc-corrected then
+code-fixed fast_expf positive-overflow divergence; contradictory aliasing
+sentence rewritten; OOM-behaviour note added (Rust aborts where C copies
+through — future pipeline callers should budget via memory_use); added four
+asymmetric hand-computed stencil tests (constant-field tests are
+permutation-invariant and would miss transposed taps).
+
+Failures/corrections along the way (kept): first draft had three real porting
+slips caught by re-reading the C verbatim before compiling — wrong pair-loop
+bound (`col+3<cw-2` instead of `<cw`), reversed fill2 chained-assignment
+order, dead debug code in fill1; plus usize 64-bit clz bug. Three test
+failures were bad expectations, not port bugs: my hand-evaluated dl() series
+was wrong twice (mental ceil vs truncating division), and bitwise
+constant-preservation was idealized (see ulp note above). Borrow checker
+rejected same-buffer row memcpy — added copy_row(split_at_mut) helper.
+Pre-existing (verified on stashed clean master): `stage_pixel_locality…`
+overflows its stack under DEBUG cargo test only; passes release, which is
+what ci-local.sh/CI run.
+
+Verified: scripts/ci-local.sh exit code 0 (check, clippy, test --workspace
+--release, c41-rs link) on a fresh log; 835 c41-core release tests pass.
+PARITY_AUDIT.md untouched — porting alone resolves no listed item there; the
+audit item moves when the module is wired into the live pipeline (slice 2).
