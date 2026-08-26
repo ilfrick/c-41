@@ -1,7 +1,7 @@
 //! XMP sidecar writer (m4-142) — the piece parity item 2.3 deliberately left
 //! open: metadata edits lived only in the catalogue, so they did not travel
 //! with the file. darktable follows every metadata write with
-//! `dt_image_synch_xmps` (`src/libs/metadata.c:383`), maintaining a
+//! `dt_image_synch_xmps` (`src/libs/metadata.c:393`), maintaining a
 //! `<filename>.xmp` beside the image; this module does the same for the five
 //! writable Dublin Core fields.
 //!
@@ -29,17 +29,52 @@
 //! prefix spells; appended properties reuse the document's existing DC prefix,
 //! adding an `xmlns:dc` declaration only when none exists; the document's own
 //! RDF prefix is reused when injecting a new Description.
+//!
+//! **Rating and colour labels** (m4-153) ride the same merge machinery through
+//! [`Payload::RatingLabels`], closing what the metadata-editor sync left open:
+//! star-rating and colour-label writes used to live only in the catalogue.
+//! darktable's sidecar shape (`src/common/exif.cc`): `Xmp.xmp.Rating` is plain
+//! scalar text holding `flags & 7` (0–5; −1 for rejected — unreachable here,
+//! C41 has no reject action, so the API takes `u8`), and
+//! `Xmp.darktable.colorlabels` is an `rdf:Seq` of the colour indices as
+//! decimal strings, written ONLY when at least one label is set — zero labels
+//! means the property is absent, so that is what we write. Unlike the DC
+//! fields there is no read-from-catalogue step here: the caller passes the
+//! values it just committed, which under the per-image write lock are exactly
+//! the catalogue state. A `None` field leaves its property untouched — a
+//! rating-only sync must not delete colour labels, nor vice versa.
+//!
+//! **Locking** is part of the entry-point contract. [`sync_sidecar`] acquires
+//! [`crate::lighttable::path_write_lock`] for the image, serialising the whole
+//! read-modify-write against the lighttable's own sidecar writers; holders of
+//! that lock must call [`sync_sidecar_unlocked`] instead. The rating/label
+//! sync is deliberately exposed ONLY as
+//! [`sync_rating_labels_sidecar_unlocked`]: every current caller writes from
+//! inside a [`crate::lighttable::serialized_write`] closure that already
+//! holds the lock, and `std::sync::Mutex` is not reentrant — a plain-named
+//! twin would sit one careless nesting away from a deadlock. A future caller
+//! off the lock path takes the lock itself (or reintroduces a locking
+//! wrapper) explicitly.
 
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 
 /// The Dublin Core namespace — what makes a property one of "ours".
 const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
+/// The XMP basic namespace, home of `xmp:Rating` (exiv2's built-in binding).
+const XMP_NS: &str = "http://ns.adobe.com/xap/1.0/";
+/// darktable's own namespace, home of `darktable:colorlabels`
+/// (`src/common/exif.cc:6232`).
+const DT_NS: &str = "http://darktable.sf.net/";
 /// The RDF namespace, for recognising `rdf:RDF` / `rdf:Description` however
 /// their prefixes are bound.
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 /// Local names of the five writable properties, canonical order.
 const TARGET_LOCALS: [&str; 5] = ["title", "description", "creator", "publisher", "rights"];
+/// The namespaces this module may write properties into, with the fallback
+/// prefix each gets when the document declares none. Index order is load-bearing
+/// for [`DescBuf::prefixes`] and [`Payload::uses_ns`].
+const NS_TABLE: [(&str, &str); 3] = [(DC_NS, "dc"), (XMP_NS, "xmp"), (DT_NS, "darktable")];
 
 /// The five values to write, in [`TARGET_LOCALS`] order.
 struct XmpValues {
@@ -57,6 +92,112 @@ impl XmpValues {
             && self.creator.is_empty()
             && self.publisher.is_empty()
             && self.rights.is_empty()
+    }
+}
+
+/// The property set one sync owns and rewrites. One enum, two payloads, ONE
+/// streaming merge ([`rewrite_document`]) — a second hand-rolled pass over
+/// scope stacks and balance counting would only drift from this one.
+enum Payload {
+    /// The five Dublin Core fields (`sync_sidecar`, m4-142). Every target is
+    /// owned unconditionally; an empty string deletes its property.
+    Metadata(XmpValues),
+    /// Star rating and/or colour-label mask (m4-153). `None` leaves that
+    /// property exactly as found — these syncs are partial by nature (a star
+    /// click knows nothing about labels). `Some(mask)` replaces the Seq,
+    /// with mask 0 emitting nothing (= deleted, darktable writes the
+    /// property only when at least one label is set).
+    RatingLabels {
+        rating: Option<u8>,
+        colors: Option<u8>,
+    },
+}
+
+impl Payload {
+    /// Does this sync REPLACE the property resolved to `(iri, local)`? Only
+    /// owned properties are dropped from the document; everything else —
+    /// including our own namespaces when the payload's field is `None` —
+    /// streams through verbatim.
+    fn owns(&self, iri: Option<&str>, local: &str) -> bool {
+        match self {
+            Payload::Metadata(_) => iri == Some(DC_NS) && TARGET_LOCALS.contains(&local),
+            Payload::RatingLabels { rating, colors } => {
+                (iri == Some(XMP_NS) && local == "Rating" && rating.is_some())
+                    || (iri == Some(DT_NS) && local == "colorlabels" && colors.is_some())
+            }
+        }
+    }
+
+    /// Does this payload write anything into namespace table row `i`?
+    /// Drives prefix discovery and `xmlns:` declaration on injection. A
+    /// zero colour mask emits nothing, so it must not make us declare the
+    /// darktable namespace on a fresh or injected Description.
+    fn uses_ns(&self, i: usize) -> bool {
+        match self {
+            Payload::Metadata(_) => i == 0,
+            Payload::RatingLabels { rating, colors } => match i {
+                1 => rating.is_some(),
+                2 => colors.is_some_and(|m| m != 0),
+                _ => false,
+            },
+        }
+    }
+
+    /// True when the payload EMITS at least one property. Gates sidecar
+    /// creation and Description injection only — a payload that owns a
+    /// property without emitting (colour mask 0 = delete) still rewrites an
+    /// EXISTING document, it just never conjures new XML for nothing.
+    fn emits_anything(&self) -> bool {
+        match self {
+            Payload::Metadata(v) => !v.all_empty(),
+            Payload::RatingLabels { rating, colors } => {
+                rating.is_some() || colors.is_some_and(|m| m != 0)
+            }
+        }
+    }
+
+    /// Emit the owned properties under per-namespace prefixes (each either
+    /// the document's own binding or [`NS_TABLE`]'s fallback). `rdf_prefix` is
+    /// the RDF binding in scope where the properties land — containers
+    /// (`rdf:Alt/Seq/Bag/li`) are RDF resources and follow it like any other
+    /// prefix spelling. Deletion-shaped values emit nothing, per the module doc.
+    fn emit<W: std::io::Write>(
+        &self,
+        w: &mut Writer<W>,
+        rdf_prefix: &str,
+        prefixes: &[Option<&str>],
+    ) {
+        let pfx = |i: usize| prefixes.get(i).copied().flatten().unwrap_or(NS_TABLE[i].1);
+        match self {
+            Payload::Metadata(v) => push_properties(w, rdf_prefix, pfx(0), v),
+            Payload::RatingLabels { rating, colors } => {
+                if let Some(r) = rating {
+                    let _ = w
+                        .create_element(format!("{}:Rating", pfx(1)))
+                        .write_text_content(BytesText::new(&r.to_string()));
+                }
+                if let Some(m) = colors.filter(|m| *m != 0) {
+                    let _ = w
+                        .create_element(format!("{}:colorlabels", pfx(2)))
+                        .write_inner_content(|prop| {
+                            prop.create_element(format!("{rdf_prefix}:Seq"))
+                                .write_inner_content(|list| {
+                                    for i in 0..c41_db::colorlabels::COLOR_COUNT {
+                                        if m & (1 << i) != 0 {
+                                            let _ = list
+                                                .create_element(format!("{rdf_prefix}:li"))
+                                                .write_text_content(BytesText::new(
+                                                    &i.to_string(),
+                                                ));
+                                        }
+                                    }
+                                    Ok::<(), std::io::Error>(())
+                                })
+                                .map(drop)
+                        });
+                }
+            }
+        }
     }
 }
 
@@ -96,7 +237,22 @@ pub(crate) fn sidecar_path(image_path: &str) -> String {
 /// unplugged medium), or all fields empty with no sidecar to clean up. False
 /// means real trouble worth surfacing — unwritable location, unreadable
 /// sidecar, or an existing sidecar that failed to parse (left untouched).
+///
+/// Locking: acquires [`crate::lighttable::path_write_lock`] for `image_path`
+/// across the whole catalogue-read + rewrite, so a concurrent rating/label
+/// write cannot interleave between this sync's read and its file write. If you
+/// ALREADY hold that lock — inside a [`crate::lighttable::serialized_write`]
+/// closure, as every lighttable writer does — call [`sync_sidecar_unlocked`]
+/// instead; `std::sync::Mutex` is not reentrant and nesting deadlocks.
 pub(crate) fn sync_sidecar(db_path: &str, image_path: &str) -> bool {
+    let lock = crate::lighttable::path_write_lock(image_path);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    sync_sidecar_unlocked(db_path, image_path)
+}
+
+/// Body of [`sync_sidecar`]. Caller MUST already hold
+/// [`crate::lighttable::path_write_lock`] for `image_path`.
+fn sync_sidecar_unlocked(db_path: &str, image_path: &str) -> bool {
     if image_path.is_empty() || db_path.is_empty() {
         return false;
     }
@@ -107,7 +263,8 @@ pub(crate) fn sync_sidecar(db_path: &str, image_path: &str) -> bool {
     // genuinely all-blank catalogue from one we could not read. Treating a
     // failed read as "user blanked everything" would strip the five fields
     // from an existing sidecar — the one direction this module must never go
-    // by accident.
+    // by accident. Runs under the lock, so the read reflects exactly what the
+    // catalogue committed before this sync was requested.
     let fields = crate::persist::try_load_metadata(db_path, image_path);
     let Some(fields) = fields else {
         return false;
@@ -132,8 +289,9 @@ pub(crate) fn sync_sidecar(db_path: &str, image_path: &str) -> bool {
         rights: std::mem::take(&mut v[4]),
     };
     let sp = sidecar_path(image_path);
+    let payload = Payload::Metadata(values);
     match std::fs::read_to_string(&sp) {
-        Ok(existing) => match rewrite_document(&existing, &values) {
+        Ok(existing) => match rewrite_document(&existing, &payload) {
             Some(out) => atomic_write(std::path::Path::new(&sp), &out),
             // Parse failure: overwriting with a fresh packet could destroy
             // history we merely failed to understand. Keep the file.
@@ -141,10 +299,56 @@ pub(crate) fn sync_sidecar(db_path: &str, image_path: &str) -> bool {
         },
         Err(_) if std::path::Path::new(&sp).exists() => false, // unreadable: never clobber
         Err(_) => {
-            if values.all_empty() {
+            if !payload.emits_anything() {
                 return true; // nothing worth creating a sidecar for
             }
-            atomic_write(std::path::Path::new(&sp), &fresh_document(&values))
+            atomic_write(std::path::Path::new(&sp), &fresh_document(&payload))
+        }
+    }
+}
+
+/// Synchronise one image's sidecar with star rating and/or colour labels the
+/// caller just committed to the catalogue (m4-153). Quiet success covers the
+/// nothing-to-do cases (no image on disk, both fields `None`); false means
+/// real trouble — unwritable location, unreadable or unparseable existing
+/// sidecar (left byte-identical). A missing sidecar is created only when
+/// something would be emitted; an existing one is still rewritten when the
+/// payload owns a property without emitting (colour mask 0 deletes).
+///
+/// # Locking
+///
+/// Caller MUST already hold [`crate::lighttable::path_write_lock`] for
+/// `image_path` — i.e. run from inside a
+/// [`crate::lighttable::serialized_write`] closure, like the catalogue write
+/// this sync mirrors. Taking the lock here instead would deadlock every
+/// current caller (`std::sync::Mutex` is not reentrant); see the module doc.
+pub(crate) fn sync_rating_labels_sidecar_unlocked(
+    image_path: &str,
+    rating: Option<u8>,
+    colors: Option<u8>,
+) -> bool {
+    if image_path.is_empty() {
+        return false;
+    }
+    if !std::path::Path::new(image_path).exists() {
+        return true;
+    }
+    let payload = Payload::RatingLabels { rating, colors };
+    if rating.is_none() && colors.is_none() {
+        return true; // owns nothing at all — no document could change under it
+    }
+    let sp = sidecar_path(image_path);
+    match std::fs::read_to_string(&sp) {
+        Ok(existing) => match rewrite_document(&existing, &payload) {
+            Some(out) => atomic_write(std::path::Path::new(&sp), &out),
+            None => false, // parse failure: keep the file, report failure
+        },
+        Err(_) if std::path::Path::new(&sp).exists() => false,
+        Err(_) => {
+            if !payload.emits_anything() {
+                return true; // nothing emitted → never create a packet for it
+            }
+            atomic_write(std::path::Path::new(&sp), &fresh_document(&payload))
         }
     }
 }
@@ -208,20 +412,27 @@ fn sanitize_text(value: &str) -> String {
 /// Append our non-empty properties under `prefix` (canonical shapes, see the
 /// module doc). Blank values emit nothing — blank DELETES the property, the
 /// upstream convention that keeps "no title" one state instead of two.
-fn push_properties<W: std::io::Write>(w: &mut Writer<W>, prefix: &str, v: &XmpValues) {
+fn push_properties<W: std::io::Write>(
+    w: &mut Writer<W>,
+    rdf_prefix: &str,
+    prefix: &str,
+    v: &XmpValues,
+) {
     let prop = |name: &str| format!("{prefix}:{name}");
-    list_property(w, prop("title"), "Alt", &v.title, true);
-    list_property(w, prop("description"), "Alt", &v.description, true);
-    list_property(w, prop("creator"), "Seq", &v.creator, false);
-    list_property(w, prop("publisher"), "Bag", &v.publisher, false);
-    list_property(w, prop("rights"), "Alt", &v.rights, true);
+    list_property(w, prop("title"), rdf_prefix, "Alt", &v.title, true);
+    list_property(w, prop("description"), rdf_prefix, "Alt", &v.description, true);
+    list_property(w, prop("creator"), rdf_prefix, "Seq", &v.creator, false);
+    list_property(w, prop("publisher"), rdf_prefix, "Bag", &v.publisher, false);
+    list_property(w, prop("rights"), rdf_prefix, "Alt", &v.rights, true);
 }
 
 /// One array-shaped property:
-/// `<p:name><rdf:KIND><rdf:li [xml:lang="x-default"]>v</rdf:li></rdf:KIND></p:name>`
+/// `<p:name><r:KIND><r:li [xml:lang="x-default"]>v</r:li></r:KIND></p:name>`
+/// with the container names bound to the document's RDF prefix.
 fn list_property<W: std::io::Write>(
     w: &mut Writer<W>,
     qname: String,
+    rdf_prefix: &str,
     kind: &str,
     value: &str,
     lang_default: bool,
@@ -229,11 +440,12 @@ fn list_property<W: std::io::Write>(
     if value.is_empty() {
         return;
     }
-    let kind_qname = format!("rdf:{kind}");
+    let kind_qname = format!("{rdf_prefix}:{kind}");
+    let li_qname = format!("{rdf_prefix}:li");
     let _ = w.create_element(qname).write_inner_content(|prop| {
         prop.create_element(kind_qname)
             .write_inner_content(|list| {
-                let mut li = list.create_element("rdf:li");
+                let mut li = list.create_element(&li_qname);
                 if lang_default {
                     li = li.with_attribute(("xml:lang", "x-default"));
                 }
@@ -247,8 +459,9 @@ fn list_property<W: std::io::Write>(
 }
 
 /// A brand-new minimal packet in darktable/exiv2 shape (xpacket wrapper,
-/// `x:xmpmeta` / `rdf:RDF` / one Description carrying our properties).
-fn fresh_document(values: &XmpValues) -> Vec<u8> {
+/// `x:xmpmeta` / `rdf:RDF` / one Description carrying the payload's
+/// properties, each written namespace declared).
+fn fresh_document(payload: &Payload) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(1024);
     // The begin="…" delimiter carries a literal U+FEFF per the XMP spec.
     out.extend_from_slice(
@@ -264,14 +477,22 @@ fn fresh_document(values: &XmpValues) -> Vec<u8> {
                 meta.create_element("rdf:RDF")
                     .with_attribute(("xmlns:rdf", RDF_NS))
                     .write_inner_content(|rdf| {
-                        rdf.create_element("rdf:Description")
-                            .with_attribute(("rdf:about", ""))
-                            .with_attribute(("xmlns:dc", DC_NS))
-                            .write_inner_content(|d| {
-                                push_properties(d, "dc", values);
-                                Ok::<(), std::io::Error>(())
-                            })
-                            .map(drop)
+                        let mut el = rdf
+                            .create_element("rdf:Description")
+                            .with_attribute(("rdf:about", ""));
+                        for (i, (uri, dp)) in NS_TABLE.iter().enumerate() {
+                            if payload.uses_ns(i) {
+                                el = el.with_attribute((format!("xmlns:{dp}").as_str(), *uri));
+                            }
+                        }
+                        el.write_inner_content(|d| {
+                            let defaults: Vec<Option<&str>> =
+                                NS_TABLE.iter().map(|(_, dp)| Some(*dp)).collect();
+                            // A fresh packet declares its own rdf binding.
+                            payload.emit(d, "rdf", &defaults);
+                            Ok::<(), std::io::Error>(())
+                        })
+                        .map(drop)
                     })
                     .map(drop)
             });
@@ -293,8 +514,10 @@ struct DescBuf {
     /// Original tag name including its prefix (`rdf:Description`, `r:Description`, …).
     qname: String,
     attrs: Vec<RawAttr>,
-    /// Prefix bound to the DC namespace ON THIS ELEMENT, if declared.
-    dc_prefix: Option<String>,
+    /// Prefix bound to each [`NS_TABLE`] namespace ON THIS ELEMENT, if declared
+    /// (index-aligned with the table; `None` = fall back to the default prefix
+    /// and declare it when we emit into that namespace here).
+    prefixes: [Option<String>; NS_TABLE.len()],
     children: Writer<std::vec::Vec<u8>>,
     has_target: bool,
 }
@@ -355,13 +578,14 @@ fn skip_subtree(
 }
 
 /// Rewrite an existing packet. Everything passes through unchanged except:
-/// target-property subtrees are dropped wherever found; our five properties
-/// are re-emitted ONCE — into the first Description that carried any target
-/// (reusing its DC prefix, declaring one if needed), otherwise into a new
-/// Description injected just before `</rdf:RDF>` (reusing the document's RDF
-/// prefix). `None` = not a well-formed RDF/XMP document; callers must NOT
-/// overwrite the file in that case.
-fn rewrite_document(src: &str, values: &XmpValues) -> Option<Vec<u8>> {
+/// properties the [`Payload`] owns are dropped wherever found and re-emitted
+/// ONCE — into the first Description that carried any owned property (reusing
+/// the document's own prefix for each namespace we write, declaring one if
+/// needed), otherwise into a new Description injected just before
+/// `</rdf:RDF>` (reusing the document's RDF prefix). `None` = not a
+/// well-formed RDF/XMP document; callers must NOT overwrite the file in that
+/// case.
+fn rewrite_document(src: &str, payload: &Payload) -> Option<Vec<u8>> {
     let mut reader = Reader::from_str(src);
     // <dc:title/> arrives as Start+End, so one code path handles empties.
     reader.config_mut().expand_empty_elements = true;
@@ -412,26 +636,61 @@ fn rewrite_document(src: &str, values: &XmpValues) -> Option<Vec<u8>> {
                         let a = a.ok()?;
                         attrs.push(RawAttr(a.key.as_ref().to_vec(), a.value.to_vec()));
                     }
-                    let dc_prefix = attrs.iter().find_map(|RawAttr(k, v)| {
-                        std::str::from_utf8(&k[..])
-                            .ok()
-                            .and_then(|k| k.strip_prefix("xmlns:"))
-                            .filter(|_| std::str::from_utf8(&v[..]).ok() == Some(DC_NS))
-                            .map(String::from)
+                    let mut prefixes: [Option<String>; NS_TABLE.len()] =
+                        std::array::from_fn(|_| None);
+                    for RawAttr(k, v) in &attrs {
+                        let (Ok(k), Ok(v)) =
+                            (std::str::from_utf8(k), std::str::from_utf8(v))
+                        else {
+                            continue;
+                        };
+                        let Some(p) = k.strip_prefix("xmlns:") else {
+                            continue;
+                        };
+                        for (i, (uri, _)) in NS_TABLE.iter().enumerate() {
+                            if v == *uri && prefixes[i].is_none() {
+                                prefixes[i] = Some(p.to_string());
+                            }
+                        }
+                    }
+                    // Owned properties also arrive in ATTRIBUTE form — exiftool
+                    // writes `xmp:Rating="3"` as one, and leaving it beside our
+                    // replacement element would publish two different ratings
+                    // in one Description. Unprefixed attributes have no
+                    // namespace in XML, so they can never be ours. Note the
+                    // scan covers only a TOP-level Description directly under
+                    // rdf:RDF — while one is buffered everything else streams
+                    // verbatim into it (`special_ok`), so a pathological nested
+                    // structure round-trips instead of being rewritten.
+                    let mut owned_attr = false;
+                    attrs.retain(|RawAttr(k, _)| {
+                        let Ok(k) = std::str::from_utf8(k) else {
+                            return true;
+                        };
+                        let Some((p, local)) = k.split_once(':') else {
+                            return true;
+                        };
+                        if p == "xmlns" {
+                            return true; // a declaration, not a property
+                        }
+                        let iri = scope.iter().rev().find_map(|m| m.get(p).cloned());
+                        let owned = payload.owns(iri.as_deref(), local);
+                        owned_attr |= owned;
+                        !owned
                     });
                     desc = Some(DescBuf {
                         qname: name.to_string(),
                         attrs,
-                        dc_prefix,
+                        prefixes,
                         children: Writer::new(Vec::new()),
-                        has_target: false,
+                        has_target: owned_attr,
                     });
                     desc_depth = depth;
                     depth += 1;
                     continue;
                 }
                 if let Some(buf) = desc.as_mut() {
-                    if iri.as_deref() == Some(DC_NS) && TARGET_LOCALS.contains(&local) {
+                    if payload.owns(iri.as_deref(), local) {
                         buf.has_target = true;
                         if !skip_subtree(&mut reader, &mut scope, &mut depth) {
                             return None; // truncated input
@@ -463,7 +722,7 @@ fn rewrite_document(src: &str, values: &XmpValues) -> Option<Vec<u8>> {
                     && local == "RDF"
                     && saw_rdf
                     && !props_emitted
-                    && !values.all_empty();
+                    && payload.emits_anything();
                 if desc.is_some() && my_depth == desc_depth + 1 {
                     // Closes the buffered Description: emit it (rewritten).
                     let buf = desc.take().unwrap();
@@ -476,8 +735,21 @@ fn rewrite_document(src: &str, values: &XmpValues) -> Option<Vec<u8>> {
                     for RawAttr(k, v) in &buf.attrs {
                         rebuilt.push_attribute((k.as_slice(), v.as_slice()));
                     }
-                    if owns_props && buf.dc_prefix.is_none() {
-                        rebuilt.push_attribute(("xmlns:dc", DC_NS));
+                    // Declare every namespace we emit into that the element
+                    // does not already bind. Collected first: `push_attribute`
+                    // borrows its bytes.
+                    let decls: Vec<(String, &str)> = if owns_props {
+                        NS_TABLE
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| payload.uses_ns(*i) && buf.prefixes[*i].is_none())
+                            .map(|(i, (_, dp))| (format!("xmlns:{dp}"), NS_TABLE[i].0))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    for (k, v) in &decls {
+                        rebuilt.push_attribute((k.as_str(), *v));
                     }
                     let _ = w.write_event(Event::Start(rebuilt));
                     w.get_mut().extend_from_slice(&kids);
@@ -485,8 +757,12 @@ fn rewrite_document(src: &str, values: &XmpValues) -> Option<Vec<u8>> {
                         let mut inner = Vec::new();
                         {
                             let mut iw = Writer::new(&mut inner);
-                            let pfx = buf.dc_prefix.as_deref().unwrap_or("dc");
-                            push_properties(&mut iw, pfx, values);
+                            let prefixes: Vec<Option<&str>> =
+                                buf.prefixes.iter().map(|p| p.as_deref()).collect();
+                            // Containers follow the document's own RDF prefix;
+                            // the buffered Description sits inside rdf:RDF,
+                            // whose start tag binds it.
+                            payload.emit(&mut iw, &rdf_prefix, &prefixes);
                         }
                         w.get_mut().extend_from_slice(&inner);
                     }
@@ -496,7 +772,7 @@ fn rewrite_document(src: &str, values: &XmpValues) -> Option<Vec<u8>> {
                 } else {
                     if inject {
                         props_emitted = true;
-                        let bytes = injected_description(&rdf_prefix, values);
+                        let bytes = injected_description(&rdf_prefix, payload);
                         w.get_mut().extend_from_slice(&bytes);
                     }
                     let _ = w.write_event(Event::End(end.to_owned()));
@@ -523,20 +799,29 @@ fn rewrite_document(src: &str, values: &XmpValues) -> Option<Vec<u8>> {
     Some(w.into_inner())
 }
 
-/// A standalone Description with our properties, injected into an existing
-/// document using THAT document's RDF prefix.
-fn injected_description(rdf_prefix: &str, values: &XmpValues) -> Vec<u8> {
+/// A standalone Description with the payload's properties, injected into an
+/// existing document using THAT document's RDF prefix. Every namespace the
+/// payload writes is declared with its default prefix — a fresh Description
+/// cannot rely on bindings declared elsewhere in scope.
+fn injected_description(rdf_prefix: &str, payload: &Payload) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(512);
     let mut w = Writer::new(&mut out);
     let about = format!("{rdf_prefix}:about");
-    let _ = w
+    let mut el = w
         .create_element(format!("{rdf_prefix}:Description"))
-        .with_attribute((about.as_str(), ""))
-        .with_attribute(("xmlns:dc", DC_NS))
-        .write_inner_content(|d| {
-            push_properties(d, "dc", values);
-            Ok::<(), std::io::Error>(())
-        });
+        .with_attribute((about.as_str(), ""));
+    for (i, (uri, dp)) in NS_TABLE.iter().enumerate() {
+        if payload.uses_ns(i) {
+            el = el.with_attribute((format!("xmlns:{dp}").as_str(), *uri));
+        }
+    }
+    let _ = el.write_inner_content(|d| {
+        let defaults: Vec<Option<&str>> = NS_TABLE.iter().map(|(_, dp)| Some(*dp)).collect();
+        // The injection sits inside the document's rdf:RDF, whose start tag
+        // binds `rdf_prefix` — containers may follow it.
+        payload.emit(d, rdf_prefix, &defaults);
+        Ok::<(), std::io::Error>(())
+    });
     out
 }
 
@@ -544,14 +829,19 @@ fn injected_description(rdf_prefix: &str, values: &XmpValues) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn vals(t: &str, d: &str, c: &str, p: &str, r: &str) -> XmpValues {
-        XmpValues {
+    fn vals(t: &str, d: &str, c: &str, p: &str, r: &str) -> Payload {
+        Payload::Metadata(XmpValues {
             title: t.into(),
             description: d.into(),
             creator: c.into(),
             publisher: p.into(),
             rights: r.into(),
-        }
+        })
+    }
+
+    /// Rating/colour-label payload shorthands for the m4-153 tests.
+    fn rl(rating: Option<u8>, colors: Option<u8>) -> Payload {
+        Payload::RatingLabels { rating, colors }
     }
 
     /// Parse output and pull the FULL TEXT of the first element whose LOCAL
@@ -923,6 +1213,275 @@ mod tests {
         assert_eq!(std::fs::read(&sp).unwrap(), before, "malformed sidecar untouched");
 
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── m4-153: rating / colour-label sync ────────────────────────────────
+
+    /// A darktable-shaped Description declaring the canonical xmp/darktable
+    /// prefixes, carrying one rating and one colour label.
+    const RL_DOC: &str = concat!(
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#,
+        r#"<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:darktable="http://darktable.sf.net/">"#,
+        r#"<xmp:Rating>2</xmp:Rating>"#,
+        r#"<darktable:colorlabels><rdf:Seq><rdf:li>0</rdf:li></rdf:Seq></darktable:colorlabels>"#,
+        r#"</rdf:Description></rdf:RDF></x:xmpmeta>"#
+    );
+
+    #[test]
+    fn rating_sync_replaces_element_form_in_place() {
+        let out = rewrite_document(RL_DOC, &rl(Some(4), None)).expect("parses");
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("<xmp:Rating>4</xmp:Rating>"), "{s}");
+        assert!(!s.contains(">2<"), "old rating gone: {s}");
+        assert!(
+            s.contains(r#"<darktable:colorlabels><rdf:Seq><rdf:li>0</rdf:li></rdf:Seq></darktable:colorlabels>"#),
+            "labels untouched by a rating-only sync: {s}"
+        );
+        assert_eq!(s.matches("<xmp:Rating>").count(), 1, "exactly one rating");
+        // Idempotent: the second run must be byte-identical.
+        let again =
+            rewrite_document(std::str::from_utf8(&out).unwrap(), &rl(Some(4), None))
+                .expect("reparse");
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn rating_attribute_form_from_exiftool_is_dropped_not_duplicated() {
+        // Real exiftool shape: Rating arrives as an ATTRIBUTE (`xmp:Rating="3"`)
+        // with the prefix declared on the Description. Dropping it matters —
+        // leaving it beside our replacement element would publish two
+        // different ratings in one Description.
+        let exiftoolish = concat!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Image::ExifTool 12.76">"#,
+            r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#,
+            r#"<rdf:Description rdf:about="" xmlns:exif="http://ns.adobe.com/exif/1.0/" xmlns:xmp="http://ns.adobe.com/xap/1.0/""#,
+            r#" exif:DateTimeOriginal="2024:07:01 10:00:00" xmp:Rating="3">"#,
+            r#"<exif:Flash><exif:Fired>False</exif:Fired></exif:Flash>"#,
+            r#"</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let out = rewrite_document(exiftoolish, &rl(Some(4), None)).expect("parses");
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("xmp:Rating="),
+            "attribute-form rating dropped: {s}"
+        );
+        assert!(s.contains("<xmp:Rating>4</xmp:Rating>"), "{s}");
+        assert!(
+            s.contains("exif:DateTimeOriginal="),
+            "foreign attributes survive"
+        );
+        assert!(s.contains("<exif:Fired>False</exif:Fired>"), "{s}");
+        // The replacement lands INSIDE the Description that carried the
+        // dropped attribute, not in a stray sibling.
+        assert_eq!(s.matches("<xmp:Rating>").count(), 1);
+        assert_eq!(s.matches("<rdf:Description").count(), 1);
+        assert_eq!(text_of(&out, "Rating").as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn undeclared_prefix_is_not_provably_ours_and_is_left_alone() {
+        // Same attribute but with NO xmlns binding anywhere: we cannot resolve
+        // it to a namespace, so owning-by-local-name could delete a foreign
+        // property. The safe direction (module doc) is skip-and-preserve —
+        // our replacement goes into its own Description.
+        let orphaned = concat!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">"#,
+            r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#,
+            r#"<rdf:Description rdf:about="" xmp:Rating="3"></rdf:Description>"#,
+            r#"</rdf:RDF></x:xmpmeta>"#
+        );
+        let out = rewrite_document(orphaned, &rl(Some(4), None)).expect("parses");
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(r#"xmp:Rating="3""#), "{s}");
+        assert!(s.contains("<xmp:Rating>4</xmp:Rating>"), "{s}");
+    }
+
+    #[test]
+    fn colour_sync_replaces_seq_and_zero_mask_deletes() {
+        let out = rewrite_document(RL_DOC, &rl(None, Some(0b0_1010))).expect("parses");
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("<xmp:Rating>2</xmp:Rating>"),
+            "unowned rating untouched: {s}"
+        );
+        assert!(!s.contains("<rdf:li>0<"), "old label list replaced: {s}");
+        assert!(s.contains("<rdf:li>1</rdf:li>") && s.contains("<rdf:li>3</rdf:li>"));
+        assert_eq!(s.matches("<rdf:li>").count(), 2, "mask bits become items");
+        // Idempotent: a second identical sync must be byte-identical.
+        let again =
+            rewrite_document(std::str::from_utf8(&out).unwrap(), &rl(None, Some(0b0_1010)))
+                .expect("reparse");
+        assert_eq!(again, out);
+
+        // Mask 0 = "no labels", and darktable writes the property only when
+        // at least one is set — so zero DELETES rather than emitting an
+        // empty Seq.
+        let out = rewrite_document(RL_DOC, &rl(None, Some(0))).expect("parses");
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("colorlabels"), "zero mask deletes: {s}");
+        assert!(s.contains("<xmp:Rating>2</xmp:Rating>"), "rating kept: {s}");
+    }
+
+    #[test]
+    fn rating_label_prefix_bindings_are_honoured_like_dc_was() {
+        let odd = concat!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#,
+            r#"<rdf:Description rdf:about="" xmlns:ns1="http://ns.adobe.com/xap/1.0/" xmlns:dtx="http://darktable.sf.net/">"#,
+            r#"<ns1:Rating>1</ns1:Rating><dtx:colorlabels><rdf:Seq><rdf:li>2</rdf:li></rdf:Seq></dtx:colorlabels>"#,
+            r#"</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let out = rewrite_document(odd, &rl(Some(5), Some(0b0_0100))).expect("parses");
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("<ns1:Rating>5</ns1:Rating>"), "{s}");
+        assert!(s.contains("<dtx:colorlabels>"), "{s}");
+        assert!(
+            !s.contains("<xmp:Rating") && !s.contains("<darktable:"),
+            "canonical prefixes NOT introduced when bindings exist: {s}"
+        );
+    }
+
+    #[test]
+    fn rating_only_sync_preserves_dc_fields_in_a_combined_description() {
+        // One Description carrying DC fields AND rating AND labels (what a
+        // metadata-editor save followed by star/label clicks converges to):
+        // the RL payload owns neither namespace's DC neighbours, so a
+        // rating-only sync must leave every DC field exactly as found.
+        let combo = concat!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#,
+            r#"<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/""#,
+            r#" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:darktable="http://darktable.sf.net/">"#,
+            r#"<dc:title><rdf:Alt><rdf:li xml:lang="x-default">Kept</rdf:li></rdf:Alt></dc:title>"#,
+            r#"<dc:rights><rdf:Alt><rdf:li xml:lang="x-default">(c) me</rdf:li></rdf:Alt></dc:rights>"#,
+            r#"<xmp:Rating>1</xmp:Rating>"#,
+            r#"<darktable:colorlabels><rdf:Seq><rdf:li>2</rdf:li></rdf:Seq></darktable:colorlabels>"#,
+            r#"</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let out = rewrite_document(combo, &rl(Some(5), None)).expect("parses");
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(text_of(&out, "title").as_deref(), Some("Kept"), "{s}");
+        assert_eq!(text_of(&out, "rights").as_deref(), Some("(c) me"), "{s}");
+        assert_eq!(text_of(&out, "Rating").as_deref(), Some("5"), "{s}");
+        assert!(
+            s.contains(r#"<darktable:colorlabels><rdf:Seq><rdf:li>2</rdf:li></rdf:Seq>"#),
+            "labels untouched: {s}"
+        );
+        assert_eq!(s.matches("<xmp:Rating>").count(), 1);
+    }
+
+    #[test]
+    fn injected_containers_follow_the_documents_rdf_prefix() {
+        // RDF bound to `r`, never spelled `rdf` anywhere: an injection into
+        // this document must emit `<r:Seq>/<r:li>` — a literal `rdf:` would
+        // reference an undeclared prefix and produce ill-formed XML.
+        let odd = concat!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><r:RDF xmlns:r="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#,
+            r#"<r:Description r:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">"#,
+            r#"<xmp:Rating>1</xmp:Rating></r:Description></r:RDF></x:xmpmeta>"#
+        );
+        let out = rewrite_document(odd, &rl(None, Some(0b0_0010))).expect("parses");
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("<darktable:colorlabels><r:Seq><r:li>1</r:li></r:Seq></darktable:colorlabels>"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("rdf:"),
+            "no undeclared rdf: prefix may leak: {s}"
+        );
+        assert!(s.contains("xmlns:darktable="), "injection declares what it writes: {s}");
+        // And it round-trips: the second sync finds the injected block.
+        let again =
+            rewrite_document(std::str::from_utf8(&out).unwrap(), &rl(None, Some(0b0_0010)))
+                .expect("reparse");
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn non_emitting_payloads_leave_foreign_documents_alone() {
+        let bare = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"><photoshop:City>Lyon</photoshop:City></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        // Neither field, or a zero mask that owns the label property but emits
+        // nothing for it: neither may inject an empty Description or declare
+        // namespaces nothing uses (the "phantom inject" of the first draft).
+        for payload in [&rl(None, None), &rl(None, Some(0))] {
+            let out = rewrite_document(bare, payload).expect("parses");
+            let s = String::from_utf8_lossy(&out);
+            assert!(s.contains("<photoshop:City>Lyon</photoshop:City>"), "{s}");
+            assert!(!s.contains("Rating") && !s.contains("colorlabels"), "{s}");
+            assert!(
+                !s.contains("xmlns:darktable") && !s.contains("xmlns:xmp"),
+                "no unused declaration: {s}"
+            );
+            assert_eq!(
+                s.matches("<rdf:Description").count(),
+                1,
+                "nothing injected: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_packet_declares_only_namespaces_it_writes() {
+        let doc = fresh_document(&rl(Some(3), Some(0b0_0010)));
+        let s = String::from_utf8_lossy(&doc);
+        assert!(s.contains("xmlns:xmp="), "{s}");
+        assert!(s.contains("xmlns:darktable="), "{s}");
+        assert!(!s.contains("xmlns:dc="), "unused DC must not be declared: {s}");
+        assert!(s.contains("<xmp:Rating>3</xmp:Rating>"), "{s}");
+        assert!(s.contains(r#"<darktable:colorlabels><rdf:Seq><rdf:li>1</rdf:li></rdf:Seq>"#));
+    }
+
+    #[test]
+    fn rating_label_sidecar_round_trips_through_the_real_fs() {
+        let dir = std::env::temp_dir().join(format!("c41_xmprl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("img.jpg");
+        std::fs::write(&img, b"jpeg-bytes").unwrap();
+        let img_s = img.to_str().unwrap();
+        let sp = dir.join("img.jpg.xmp");
+
+        // Missing image on disk: quiet success, nothing anywhere.
+        assert!(sync_rating_labels_sidecar_unlocked(
+            dir.join("gone.jpg").to_str().unwrap(),
+            Some(3),
+            None
+        ));
+        // Nothing to write: success WITHOUT creating a sidecar.
+        assert!(sync_rating_labels_sidecar_unlocked(img_s, None, None));
+        assert!(!sp.exists());
+        // First rating sync CREATES the packet, declaring exactly what it writes.
+        assert!(sync_rating_labels_sidecar_unlocked(img_s, Some(3), None));
+        let first = std::fs::read_to_string(&sp).unwrap();
+        assert!(first.contains("<xmp:Rating>3</xmp:Rating>"), "{first}");
+        assert!(first.contains("xmlns:xmp="), "{first}");
+        assert!(!first.contains("xmlns:darktable="), "{first}");
+        // Second identical sync is idempotent.
+        assert!(sync_rating_labels_sidecar_unlocked(img_s, Some(3), None));
+        assert_eq!(std::fs::read_to_string(&sp).unwrap(), first);
+        // Labels merge into the same document alongside the rating.
+        assert!(sync_rating_labels_sidecar_unlocked(img_s, Some(4), Some(0b1_0001)));
+        let merged = std::fs::read_to_string(&sp).unwrap();
+        assert!(merged.contains("<xmp:Rating>4</xmp:Rating>"), "{merged}");
+        assert!(merged.contains("<rdf:li>0</rdf:li>"), "{merged}");
+        assert!(merged.contains("<rdf:li>4</rdf:li>"), "{merged}");
+        assert!(merged.contains("xmlns:darktable="), "{merged}");
+        // Clearing every label deletes the property but keeps the rating.
+        assert!(sync_rating_labels_sidecar_unlocked(img_s, Some(4), Some(0)));
+        let cleared = std::fs::read_to_string(&sp).unwrap();
+        assert!(!cleared.contains("colorlabels"), "{cleared}");
+        assert!(cleared.contains("<xmp:Rating>4</xmp:Rating>"), "{cleared}");
+        // Last label off with NO sidecar present at all: quiet success and
+        // never a phantom packet (the missing-file branch gates on emitting).
+        std::fs::remove_file(&sp).unwrap();
+        assert!(sync_rating_labels_sidecar_unlocked(img_s, None, Some(0)));
+        assert!(!sp.exists());
+        // Malformed sidecar: reported false, left byte-identical.
+        std::fs::write(&sp, "<definitely not rdf").unwrap();
+        let before = std::fs::read(&sp).unwrap();
+        assert!(!sync_rating_labels_sidecar_unlocked(img_s, Some(1), None));
+        assert_eq!(std::fs::read(&sp).unwrap(), before);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

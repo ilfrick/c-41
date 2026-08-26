@@ -410,7 +410,22 @@ pub(crate) fn wire_star_clicks(stars_box: &gtk4::Box, full_path: String, db_path
                         if let Err(e) = save_rating(&fp2, &db2, new_rating) {
                             eprintln!("darkroom: save rating failed for {fp2}: {e}");
                         }
-                    }).await;
+                        // Demo/no-catalogue sessions skip the sync exactly like
+                        // the label path does (`toggle_color_label` → None):
+                        // nothing was committed anywhere, so a Rating-only
+                        // sidecar would diverge from a UI showing 0 stars
+                        // (m4-153 review MINOR-1).
+                        else if !db2.is_empty()
+                            && !crate::xmp::sync_rating_labels_sidecar_unlocked(
+                                &fp2,
+                                Some(new_rating),
+                                None,
+                            )
+                        {
+                            eprintln!("darkroom: sidecar rating sync failed for {fp2}");
+                        }
+                    })
+                    .await;
                 });
             });
             lbl.add_controller(gesture);
@@ -516,7 +531,14 @@ fn save_rating(full_path: &str, db_path: &str, rating: u8) -> rusqlite::Result<(
 /// evicting. (A single dedicated DB-writer thread fed by a channel would also
 /// bound blocking-pool use and coalesce writes — deferred, not needed at input
 /// rates.)
-fn path_write_lock(path: &str) -> Arc<Mutex<()>> {
+///
+/// `pub(crate)` because the sidecar writers share it: [`crate::xmp`]'s public
+/// sync entry points acquire it so the metadata-editor commits on the main
+/// thread cannot interleave a whole-file sidecar rewrite with these
+/// worker-thread ones (m4-153 review MAJOR-1). Callers already holding the
+/// lock — every [`serialized_write`] site — MUST call the `_unlocked` xmp
+/// variants instead; `std::sync::Mutex` is not reentrant.
+pub(crate) fn path_write_lock(path: &str) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -740,11 +762,26 @@ pub(crate) fn wire_color_clicks(colors_box: &gtk4::Box, full_path: String, db_pa
                     // On a worker panic the mask is unknown, so skip the repaint
                     // rather than clear labels still in the DB (the next rebind
                     // paints from the DB); likewise skip if the cell was recycled.
-                    if let Some(mask) =
-                        serialized_write(fp2.clone(), move || toggle_color_label(&fp2, &db2, color)).await
+                    if let Some(mask) = serialized_write(fp2.clone(), move || {
+                        let mask = toggle_color_label(&fp2, &db2, color);
+                        // Sidecar only on a known-good catalogue state: a `None`
+                        // here means the DB write never happened. Unlocked
+                        // variant: this closure already holds the per-image lock.
+                        if let Some(m) = mask {
+                            if !crate::xmp::sync_rating_labels_sidecar_unlocked(
+                                &fp2,
+                                None,
+                                Some(m),
+                            ) {
+                                eprintln!("darkroom: sidecar label sync failed for {fp2}");
+                            }
+                        }
+                        mask
+                    })
+                    .await
                     {
                         if cb2.widget_name() == path {
-                            set_color_dots(&cb2, mask);
+                            set_color_dots(&cb2, mask.unwrap_or(0));
                         }
                     }
                 });
@@ -845,15 +882,26 @@ pub fn toggle_selected_color(
             let p   = path.clone();
             let db2 = db.clone();
             let Some(mask) =
-                serialized_write(path.clone(), move || toggle_color_label(&p, &db2, color))
-                    .await
+                serialized_write(path.clone(), move || {
+                    let mask = toggle_color_label(&p, &db2, color);
+                    // Sidecar only on a known-good catalogue state (see the
+                    // click-handler twin of this comment); unlocked variant —
+                    // this closure holds the per-image lock.
+                    if let Some(m) = mask {
+                        if !crate::xmp::sync_rating_labels_sidecar_unlocked(&p, None, Some(m)) {
+                            eprintln!("darkroom: sidecar label sync failed for {p}");
+                        }
+                    }
+                    mask
+                })
+                .await
             else {
                 break; // worker panic: later masks unknown, stop writing AND repainting
             };
             masks.push(mask);
         }
         for (path, mask) in targets.into_iter().zip(masks) {
-            repaint_color_dots_for_path(&grid, &path, mask);
+            repaint_color_dots_for_path(&grid, &path, mask.unwrap_or(0));
         }
     }));
 }
@@ -955,7 +1003,24 @@ pub fn set_selected_rating(
         for path in &targets {
             let p   = path.clone();
             let db2 = db.clone();
-            match serialized_write(path.clone(), move || save_rating(&p, &db2, rating)).await {
+            match serialized_write(path.clone(), move || {
+                let res = save_rating(&p, &db2, rating);
+                // Demo/no-catalogue gate as at the star-click site (MINOR-1);
+                // unlocked variant — this closure holds the per-image lock.
+                if res.is_ok()
+                    && !db2.is_empty()
+                    && !crate::xmp::sync_rating_labels_sidecar_unlocked(
+                        &p,
+                        Some(rating),
+                        None,
+                    )
+                {
+                    eprintln!("darkroom: sidecar rating sync failed for {p}");
+                }
+                res
+            })
+            .await
+            {
                 Some(Ok(())) => written.push(path.clone()),
                 Some(Err(e)) => eprintln!("darkroom: save rating failed for {path}: {e}"),
                 None => break, // worker panic: stop writing and repainting
@@ -1075,20 +1140,22 @@ fn find_stars_box_for_path(root: &gtk4::Widget, path: &str) -> Option<gtk4::Box>
 
 /// Toggle one colour label for an image (by path) and return the resulting mask
 /// so the caller can repaint. A no-op returning 0 if the path can't be resolved.
-fn toggle_color_label(full_path: &str, db_path: &str, color: u8) -> u8 {
-    if db_path.is_empty() { return 0; }
-    let conn = match open_colorlabels_conn(db_path) {
-        Some(c) => c,
-        None => return 0,
-    };
+/// Toggle one colour label and return the image's new label mask, or `None`
+/// when the catalogue could not be read or written (empty/demo db, unopenable
+/// connection, unknown path). Callers that only repaint map `None` to 0 as
+/// before; the sidecar sync (m4-153) MUST NOT fire on `None` — writing mask 0
+/// there would delete the file's labels because of a transient DB lock.
+fn toggle_color_label(full_path: &str, db_path: &str, color: u8) -> Option<u8> {
+    if db_path.is_empty() { return None; }
+    let conn = open_colorlabels_conn(db_path)?;
     let imgid = match c41_db::image::image_get_id_by_path(&conn, full_path) {
         Ok(Some(id)) => id,
-        _ => return 0,
+        _ => return None,
     };
     if let Err(e) = c41_db::colorlabels::color_label_toggle(&conn, imgid, color) {
         eprintln!("darkroom: colour-label toggle failed: {e}");
     }
-    c41_db::colorlabels::color_labels_get(&conn, imgid).unwrap_or(0)
+    c41_db::colorlabels::color_labels_get(&conn, imgid).ok()
 }
 
 // ── DB-backed load functions ──────────────────────────────────────────────

@@ -2602,3 +2602,68 @@ keyed — check, clippy --workspace, test --workspace --release, c41-rs link);
 localcontrast pipeline tests incl. tone+chroma, distinct-controls and hue
 preservation all pass; 393 c41-ui release tests pass. PARITY_AUDIT.md updated in
 this commit with the wiring evidence for the local-contrast item.
+## 2026-08-26 12:56 UTC — m4-153: rating/colour-label sidecar sync (XMP fan-out)
+
+Closes the last open caveat of PARITY_AUDIT 2.3: star-rating and colour-label
+writes used to live only in the catalogue. All four lighttable write paths —
+star click, keyboard rating, colour click, colour key — now mirror into
+`<filename>.xmp` inside the SAME `serialized_write` closure that commits the DB
+write, under the image's per-path lock, so catalogue and sidecar mutate
+together. Implementation: a second payload (`Payload::RatingLabels`) behind the
+ONE m4-142 streaming merge in `c41-ui/src/xmp.rs` — no second hand-rolled pass.
+Shapes verified against vendored darktable before coding: `Xmp.xmp.Rating`
+scalar text = flags & DT_VIEW_RATINGS_MASK (`image.c:600-604`, assigned at
+`exif.cc:5149-5151`; −1/rejected unreachable — no reject UI here);
+`Xmp.darktable.colorlabels` = `rdf:Seq` of decimal indices, written only when
+count > 0 (`exif.cc:5066-5087`) → mask 0 deletes. Partial payloads leave the
+other property untouched; attribute-form owned properties (exiftool's
+`xmp:Rating="3"`) are dropped, not duplicated beside our replacement; container
+names follow the document's RDF prefix binding (`r:Seq`/`r:li`); nothing-
+emitting payloads never create phantom packets or inject empty Descriptions;
+unparseable sidecars stay byte-identical with failure reported (unchanged).
+
+Review: fricktrade-architect API-402'd as always → standing workaround (fresh
+general-purpose agent, model opus, READ-ONLY mandate + senior-reviewer
+framing). Verdict SHIP-WITH-FIXES; 13 items explicitly checked correct
+(merge machinery, rating mapping, consolidate/drop-once semantics, repaint
+equivalence, lighttable lock coverage). Findings + dispositions: MAJOR-1 lock
+nesting — resolved by contract split: `sync_sidecar` is now a locking wrapper
+(acquires `path_write_lock`, safe for the two panels main-thread callers,
+unchanged call sites) while the rating/label sync ships ONLY as
+`sync_rating_labels_sidecar_unlocked` because every caller already holds the
+lock inside its closure; `std::sync::Mutex` is not reentrant so a plain-named
+twin was one careless nesting from deadlock — first draft HAD such a wrapper,
+deleted as dead code with the rationale documented in the module doc.
+MINOR-1 demo gate: all four sites now skip the sidecar when the catalogue db
+is empty (demo mode), matching `save_rating`'s early-Ok. MINOR-2 phantom
+inject/creation: `nothing_to_write()` replaced by `emits_anything()`
+(RL: rating set or nonzero mask) gating BOTH missing-file creation AND
+Description injection, while an existing document is still rewritten for a
+zero mask (delete) — plus `uses_ns(2)` tightened so mask 0 no longer declares
+`xmlns:darktable` on fresh/injected packets. MINOR-3 doc citation: module doc
+said metadata.c:383, reviewer said :391 — grep ground truth is :393 (panels
+already cited it right); fixed, second "measure don't trust supplied numbers"
+case this increment. Also applied: rdf-prefix threading through emit/
+push_properties/list_property (containers were hardcoded `rdf:`), nesting-
+caveat sentence on the attribute-drop comment, six new tests (combined-shape
+DC preservation under rating-only sync; colours idempotency; last-label-off
+with no sidecar → true + no file; phantom-inject guard incl. Some(0) on a
+foreign doc; foreign-RDF-prefix injection round-trip; renamed byte-neutrality
+test).
+
+Failures/corrections along the way (kept): E0614 ×2 — dereferenced u8 in
+`is_some_and(|m| *m != 0)` closures where the binding is already `u8`. First
+clippy baseline comparison was garbage twice over: captures written to /tmp
+inside throwaway containers silently vanished, so the host-side diff compared
+files left over from BEFORE compaction; and cargo freshness skips warning
+emission for cached crates, making single runs non-deterministic. Fixed method:
+redirect outside the container + `touch` every crate root before each capture —
+final diff shows only the four pre-existing `clone!` deprecation warnings at
+shifted line numbers. The reviewer's own metadata.c:391 citation was off by
+grep-truth 393 (see MINOR-3).
+
+Verified: scripts/ci-local.sh exit code 0 AFTER all review fixes (fresh log,
+exit-code keyed — check, clippy --workspace, test --workspace --release,
+c41-rs link); 403 c41-ui lib tests pass including 24 xmp tests; zero new
+clippy warnings vs stashed-tree baseline (forced-rebuild comparison).
+PARITY_AUDIT.md updated in this commit closing the 2.3 caveat.
