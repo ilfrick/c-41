@@ -2990,3 +2990,136 @@ FFI exports in `crates/c41-core/src/masks/object.rs`.
 - `bh` parameter: Added to the zero_peaks FFI (not in the brush/ path pattern
   for this function) to enable `checked_mul(w, bh)` for safe buffer slicing,
   following the brush FFI pattern of passing both dimensions.
+
+---
+
+## 2026-08-27 17:45 UTC — m4-158: group drawn-mask FFI migration
+
+**Commit** bf92632c83 (GitHub + Gitea) — m4-158/159 combined
+
+**What.** Ported the `DT_OMP_FOR_SIMD` combine loops from
+`src/develop/masks/group.c` `_group_get_mask_roi` (and the removed `_combine_masks_*`
+static functions) to a single Rust FFI export.
+
+- `crates/c41-core/src/masks/group.rs` (NEW): 1 kernel + 1 FFI export.
+  - `group_combine(dest, newmask, opacity, inverted, op)` — port of the five
+    `_combine_masks_union/intersect/difference/sum/exclusion` functions and the
+    inline COPY loop. All 11 `DT_OMP_FOR_SIMD` loops replaced with a single
+    match-dispatch on `op` (GROUP_OP_UNION=0 … GROUP_OP_COPY=5). Each operation
+    computes `mask = opacity * (inverted ? 1.0 - newmask[i] : newmask[i])` and
+    applies the blend formula. `both_positive(x,y)` → `if x > 0 && y > 0 { 1.0 }
+    else { 0.0 }` (bit-identical: `mask * 1.0f32 == mask`, `mask * 0.0f32 == 0.0`).
+  - FFI: `darkroom_masks_group_combine(dest: *mut f32, newmask: *const f32,
+    npixels: usize, opacity: f32, inverted: i32, op: i32)` with null/npixels
+    guards.
+  - `ref_group_combine` — reference implementation for bit-exactness tests.
+  - 13 tests: union basic/inverted/with-opacity, intersect basic/negative,
+    difference basic/inverted, sum basic/inverted, exclusion basic/one-zero,
+    copy basic/inverted, reference match over LCG, FFI round-trip (all ops ×
+    inverted), FFI null guard.
+
+- `crates/c41-core/src/masks/mod.rs`: `pub mod group;` added (alphabetically
+  between `gradient` and `object`).
+- `src/rust_ffi/darkroom_core.h`: `darkroom_masks_group_combine` declaration
+  added after object declarations.
+- `src/develop/masks/group.c`: `#include "rust_ffi/darkroom_core.h"` added after
+  `#include "develop/masks.h"`. The 5 static `_combine_masks_*` functions and
+  `both_positive` removed entirely. All 11 `DT_OMP_FOR_SIMD` loops in
+  `_group_get_mask_roi` replaced with 6 `darkroom_masks_group_combine(...)`
+  call sites dispatching on `state & (UNION|INTERSECTION|DIFFERENCE|SUM|EXCLUSION)`.
+  The inline COPY loop replaced with `GROUP_OP_COPY`.
+
+**Key technical decisions.**
+- Single FFI with operation-code dispatch: all 6 combine operations share
+  identical parameter signatures, so one `darkroom_masks_group_combine` with an
+  `op: i32` enum replaces 6 separate FFIs. The C `#define GROUP_OP_*` constants
+  are added at the top of `_group_get_mask_roi`'s file.
+- Float-precision test assertions: `1.0f32 - x` and `x + y` arithmetic is not
+  bit-exact for non-power-of-2 values (e.g. `1.0 - 0.6 = 0.39999998`, `0.3 +
+  0.4 = 0.70000005`). Three tests switched from `assert_eq!` to epsilon comparison
+  (`(val - expected).abs() < 1e-6`). The remaining tests use power-of-2 or
+  exactly-representable values and keep strict `assert_eq!`.
+- The `_group_get_mask` function (non-ROI path) still has inline loops — these
+  are plain C `for` loops (no OMP) and are the old-style mask generation path,
+  not the per-pixel combine loops targeted by this migration. Left unchanged.
+
+**Verified.** All four Docker CI steps passed: `cargo check --workspace`,
+`cargo clippy --workspace --all-targets`, `cargo test --workspace --release`
+(13 new group tests all green), `cargo build --release -p c41 --bin c41-rs`.
+Self-review applied with the same UNDERSTAND→DIAGNOSE→PRIORITISE→PROPOSE→VALIDATE
+framework (fricktrade-architect unavailable: OpenRouter 402).
+(fricktrade-architect) unavailable (OpenRouter 402) — self-review applied with
+the same UNDERSTAND→DIAGNOSE→PRIORITISE→PROPOSE→VALIDATE framework.
+
+---
+
+## 2026-08-27 18:15 UTC — m4-159: detail drawn-mask FFI migration
+
+**Commit** bf92632c83 (combined with m4-158)
+
+**What.** Ported the three OMP loops from `src/develop/masks/detail.c`
+(`dt_masks_calc_scharr_mask` and `dt_masks_calc_detail_blend`) to Rust FFI
+exports in `crates/c41-core/src/masks/detail.rs`.
+
+- `crates/c41-core/src/masks/detail.rs` (NEW): 3 kernel functions + 3 FFI exports.
+  - `scharr_luminance` — port of the `DT_OMP_FOR_SIMD` luminance→`sqrtf` loop
+    (detail.c:129–137). For each pixel: `luminance = fmaxf(0, R*wb[0]) +
+    fmaxf(0, G*wb[1]) + fmaxf(0, B*wb[2])`, `tmp = sqrtf(lum / 3.0)`.
+  - `scharr_gradient_mask` — port of the `DT_OMP_FOR` Scharr-gradient loop
+    (detail.c:139–151). Calls `scharr_gradient_at` which is the Rust port of
+    `scharr_gradient` in `src/common/math.h:405`. With `__FAST_MATH__` (enabled
+    by `-ffast-math` in the Release C build), `dt_fast_hypotf(gx, gy)` =
+    `sqrtf(gx*gx + gy*gy)`, matched by `f32::sqrt`. CLAMP row/col to interior
+    `[1, height-2] × [1, width-2]`; CLIP output to `[0,1]`.
+  - `detail_blend` — port of the `DT_OMP_FOR_SIMD` blend-factor loop
+    (detail.c:173–178), inlining `_calcBlendFactor` (detail.c:156–162).
+    `ithreshold = 16.0 / max(1e-7, threshold)`, `blend = clip(1/(1 +
+    fast_expf(16.0 - ithreshold * val)))`, `out = detail ? blend : 1 - blend`.
+    `fast_expf` reuses `crate::math::fast_expf` (already ported, bit-identical
+    to `dt_fast_expf` in math.h:418).
+  - FFI: `darkroom_masks_detail_scharr_luminance(src, tmp, width, height, wb)`,
+    `darkroom_masks_detail_scharr_gradient(tmp, mask, width, height)`,
+    `darkroom_masks_detail_blend(src, out, msize, threshold, detail)`.
+    All with null/dimension/overflow guards.
+  - `ref_scharr_luminance`, `ref_scharr_gradient_mask`, `ref_detail_blend` —
+    reference implementations.
+  - 17 tests: luminance (uniform black/white, white-balance, reference match
+    over LCG), gradient (uniform=zero, border clamping, reference match over
+    LCG), blend (inflexion point, above-threshold, detail=false, threshold=0
+    epsilon guard, reference match over LCG), FFI round-trips for all three,
+    FFI null/dimension guards for all three.
+
+- `crates/c41-core/src/masks/mod.rs`: `pub mod detail;` added (alphabetically
+  between `circle` and `ellipse`).
+- `src/rust_ffi/darkroom_core.h`: 3 FFI declarations added after
+  `darkroom_masks_group_combine`.
+- `src/develop/masks/detail.c`: `#include "rust_ffi/darkroom_core.h"` added
+  (plus `common/debug.h`, `common/gaussian.h`, `common/imagebuf.h` — the file
+  previously had zero includes since it was never compiled); the 3 OMP loops
+  and `_calcBlendFactor` static inline removed; 3 `darkroom_masks_detail_*`
+  FFI calls now replace the loops; unused `msize` variable removed from
+  `dt_masks_calc_scharr_mask`.
+- `src/CMakeLists.txt`: `"develop/masks/detail.c"` added to `SOURCE_FILES`
+  (it was previously missing — the file existed but was never compiled).
+
+**Key technical decisions.**
+- `fast_expf` reuse: The `_calcBlendFactor` function uses `dt_fast_expf`, which
+  was already ported to `crate::math::fast_expf` in a prior increment. No
+  re-implementation needed.
+- `dt_fast_hypotf` with `__FAST_MATH__`: The Release C build uses `-ffast-math`,
+  which defines `__FAST_MATH__`, making `dt_fast_hypotf(x,y) = sqrtf(x*x + y*y)`.
+  Rust `f32::sqrt(gx * gx + gy * gy)` matches this exactly. The non-fast-math
+  path (`hypotf`) is not used in production builds.
+- `47.0f / 255.0f` constants: Computed as Rust `const` float division, which
+  yields identical f32 bits to the C compile-time division.
+- Single FFI per loop (not combined): The three loops have different buffer
+  signatures (src→tmp, tmp→mask, src→out) and different parameters (wb array,
+  threshold, detail flag), so separate FFIs keep the C call sites simple.
+- `detail.c` was not in CMakeLists.txt before this change — adding it means the
+  C build will now compile it. The includes (`common/debug.h`,
+  `common/gaussian.h`, `common/imagebuf.h`, `develop/masks.h`) are required
+  since the file had none.
+
+**Verified.** All four Docker CI steps passed: `cargo check --workspace`,
+`cargo clippy --workspace --all-targets`, `cargo test --workspace --release`
+(17 new detail tests all green), `cargo build --release -p c41 --bin c41-rs`.

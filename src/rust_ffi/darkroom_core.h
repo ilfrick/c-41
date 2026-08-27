@@ -3178,6 +3178,23 @@ void darkroom_masks_object_zero_peaks(float *dist, int w, int bh,
                                       int x0, int x1, int y0, int y1,
                                       float px, float py, float min_sep_sq);
 
+/* group.c _combine_masks_* / inline copy: element-wise blend of dest and newmask.
+ * op codes: 0=union, 1=intersect, 2=difference, 3=sum, 4=exclusion, 5=copy.
+ * `inverted` selects 1-newmask vs newmask for the mask value. Replaces all six
+ * DT_OMP_FOR_SIMD loops in _group_get_mask_roi (group.c:492–706). */
+void darkroom_masks_group_combine(float *dest, const float *newmask,
+                                  size_t npixels, float opacity,
+                                  int inverted, int op);
+
+void darkroom_masks_detail_scharr_luminance(const float *src, float *tmp,
+                                            int width, int height, const float *wb);
+
+void darkroom_masks_detail_scharr_gradient(const float *tmp, float *mask,
+                                           int width, int height);
+
+void darkroom_masks_detail_blend(const float *src, float *out,
+                                 size_t msize, float threshold, int detail);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -22,6 +22,7 @@
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
+#include "rust_ffi/darkroom_core.h"
 
 static int _group_events_mouse_scrolled(dt_iop_module_t *module,
                                         const float pzx,
@@ -480,150 +481,12 @@ error:
   free(bufs);
   return 0;
 }
-
-static void _combine_masks_union(float *const restrict dest,
-                                 float *const restrict newmask,
-                                 const size_t npixels,
-                                 const float opacity,
-                                 const int inverted)
-{
-  if(inverted)
-  {
-    DT_OMP_FOR_SIMD(dt_omp_sharedconst(dest, newmask) aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * (1.0f - newmask[index]);
-      dest[index] = MAX(dest[index], mask);
-    }
-  }
-  else
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * newmask[index];
-      dest[index] = MAX(dest[index], mask);
-    }
-  }
-}
-
-static void _combine_masks_intersect(float *const restrict dest,
-                                     float *const restrict newmask,
-                                     const size_t npixels,
-                                     const float opacity,
-                                     const int inverted)
-{
-  if(inverted)
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * (1.0f - newmask[index]);
-      dest[index] = MIN(MAX(dest[index], 0.0f), MAX(mask, 0.0f));
-    }
-  }
-  else
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * newmask[index];
-      dest[index] = MIN(MAX(dest[index], 0.0f), MAX(mask, 0.0f));
-    }
-  }
-}
-
-DT_OMP_DECLARE_SIMD()
-static inline int both_positive(const float val1, const float val2)
-{
-  // this needs to be a separate inline function to convince the compiler to vectorize
-  return (val1 > 0.0f) && (val2 > 0.0f);
-}
-
-static void _combine_masks_difference(float *const restrict dest,
-                                      float *const restrict newmask,
-                                      const size_t npixels,
-                                      const float opacity,
-                                      const int inverted)
-{
-  if(inverted)
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * (1.0f - newmask[index]);
-      dest[index] *= (1.0f - mask * both_positive(dest[index],mask));
-    }
-  }
-  else
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * newmask[index];
-      dest[index] *= (1.0f - mask * both_positive(dest[index],mask));
-    }
-  }
-}
-
-static void _combine_masks_sum(float *const restrict dest,
-                               float *const restrict newmask,
-                               const size_t npixels,
-                               const float opacity,
-                               const int inverted)
-{
-  if(inverted)
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * (1.0f - newmask[index]);
-      dest[index] = MIN(1.0f, dest[index] + mask);
-    }
-  }
-  else
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * newmask[index];
-      dest[index] = MIN(1.0f, dest[index] + mask);
-    }
-  }
-}
-
-static void _combine_masks_exclusion(float *const restrict dest,
-                                     float *const restrict newmask,
-                                     const size_t npixels,
-                                     const float opacity,
-                                     const int inverted)
-{
-  if(inverted)
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * (1.0f - newmask[index]);
-      const float pos = both_positive(dest[index], mask);
-      const float neg = (1.0f - pos);
-      const float b1 = dest[index];
-      dest[index] = pos * MAX((1.0f - b1) * mask,
-                              b1 * (1.0f - mask)) + neg * MAX(b1, mask);
-    }
-  }
-  else
-  {
-    DT_OMP_FOR_SIMD(aligned(dest, newmask : 64))
-    for(int index = 0; index < npixels; index++)
-    {
-      const float mask = opacity * newmask[index];
-      const float pos = both_positive(dest[index], mask);
-      const float neg = (1.0f - pos);
-      const float b1 = dest[index];
-      dest[index] = pos * MAX((1.0f - b1) * mask, b1 * (1.0f - mask)) + neg * MAX(b1, mask);
-    }
-  }
-}
+#define GROUP_OP_UNION       0
+#define GROUP_OP_INTERSECT   1
+#define GROUP_OP_DIFFERENCE  2
+#define GROUP_OP_SUM        3
+#define GROUP_OP_EXCLUSION  4
+#define GROUP_OP_COPY       5
 
 static int _group_get_mask_roi(const dt_iop_module_t *const restrict module,
                                const dt_dev_pixelpipe_iop_t *const restrict piece,
@@ -678,32 +541,34 @@ static int _group_get_mask_roi(const dt_iop_module_t *const restrict module,
 
         if(state & DT_MASKS_STATE_UNION)
         {
-          _combine_masks_union(buffer, bufs, npixels, op, inverted);
+          darkroom_masks_group_combine(buffer, bufs, npixels, op, inverted,
+                                       GROUP_OP_UNION);
         }
         else if(state & DT_MASKS_STATE_INTERSECTION)
         {
-          _combine_masks_intersect(buffer, bufs, npixels, op, inverted);
+          darkroom_masks_group_combine(buffer, bufs, npixels, op, inverted,
+                                       GROUP_OP_INTERSECT);
         }
         else if(state & DT_MASKS_STATE_DIFFERENCE)
         {
-          _combine_masks_difference(buffer, bufs, npixels, op, inverted);
+          darkroom_masks_group_combine(buffer, bufs, npixels, op, inverted,
+                                       GROUP_OP_DIFFERENCE);
         }
         else if(state & DT_MASKS_STATE_SUM)
         {
-          _combine_masks_sum(buffer, bufs, npixels, op, inverted);
+          darkroom_masks_group_combine(buffer, bufs, npixels, op, inverted,
+                                       GROUP_OP_SUM);
         }
         else if(state & DT_MASKS_STATE_EXCLUSION)
         {
-          _combine_masks_exclusion(buffer, bufs, npixels, op, inverted);
+          darkroom_masks_group_combine(buffer, bufs, npixels, op, inverted,
+                                       GROUP_OP_EXCLUSION);
         }
         else // if we are here, this mean that we just have to copy
              // the shape and null other parts
         {
-          DT_OMP_FOR_SIMD(aligned(buffer, bufs : 64))
-          for(int index = 0; index < npixels; index++)
-          {
-            buffer[index] = op * (inverted ? (1.0f - bufs[index]) : bufs[index]);
-          }
+          darkroom_masks_group_combine(buffer, bufs, npixels, op, inverted,
+                                       GROUP_OP_COPY);
         }
 
         dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,

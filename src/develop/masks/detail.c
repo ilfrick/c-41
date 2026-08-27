@@ -104,6 +104,12 @@
   hanno@schwalm-bremen.de 21/04/29
 */
 
+#include "common/debug.h"
+#include "common/gaussian.h"
+#include "common/imagebuf.h"
+#include "develop/masks.h"
+#include "rust_ffi/darkroom_core.h"
+
 float *dt_masks_calc_scharr_mask(dt_dev_pixelpipe_t *pipe,
                                  float *const restrict src,
                                  const int width,
@@ -113,7 +119,6 @@ float *dt_masks_calc_scharr_mask(dt_dev_pixelpipe_t *pipe,
   float *mask = dt_iop_image_alloc(width, height, 1);
   float *tmp = dt_iop_image_alloc(width, height, 1);
 
-  const size_t msize = (size_t)width * height;
   if(!tmp || !mask)
   {
     dt_free_align(tmp);
@@ -126,39 +131,11 @@ float *dt_masks_calc_scharr_mask(dt_dev_pixelpipe_t *pipe,
     for(int i=0; i < 3; i++)
       wb[i] /= pipe->dsc.temperature.coeffs[i];
 
-  DT_OMP_FOR_SIMD(aligned(tmp : 64))
-  for(size_t idx =0; idx < msize; idx++)
-  {
-    const float val = fmaxf(0.0f, src[4 * idx] * wb[0])
-                    + fmaxf(0.0f, src[4 * idx + 1] * wb[1])
-                    + fmaxf(0.0f, src[4 * idx + 2] * wb[2]);
-    // add a gamma. sqrtf should make noise variance the same for all image
-    tmp[idx] = sqrtf(val / 3.0f);
-  }
-
-  DT_OMP_FOR()
-  for(size_t row = 0; row < height; row++)
-  {
-    const int irow = CLAMP(row, 1, height -2);
-    for(size_t col = 0; col < width; col++)
-    {
-      const int icol = CLAMP(col, 1, width -2);
-      const size_t idx = (size_t)irow * width + icol;
-
-      const float gradient_magnitude = scharr_gradient(&tmp[idx], width);
-      mask[row * width + col] = CLIP(gradient_magnitude / 16.0f);
-    }
-  }
+  // scharr luminance + gradient (ported to Rust FFI, replaces 2 OMP loops)
+  darkroom_masks_detail_scharr_luminance(src, tmp, width, height, wb);
+  darkroom_masks_detail_scharr_gradient(tmp, mask, width, height);
   dt_free_align(tmp);
   return mask;
-}
-
-static inline float _calcBlendFactor(const float val, const float ithreshold)
-{
-    // sigmoid function
-    // result is in ]0;1] range
-    // inflexion point is at (x, y) (threshold, 0.5)
-    return 1.0f / (1.0f + dt_fast_expf(16.0f - ithreshold * val));
 }
 
 void dt_masks_calc_detail_blend(float *const restrict src,
@@ -169,13 +146,8 @@ void dt_masks_calc_detail_blend(float *const restrict src,
 {
   if(!src || !out) return;
 
-  const float ithreshold = 16.0f / MAX(1e-7, threshold);
-  DT_OMP_FOR_SIMD(aligned(src, out : 64))
-  for(size_t idx = 0; idx < msize; idx++)
-  {
-    const float blend = CLIP(_calcBlendFactor(src[idx], ithreshold));
-    out[idx] = detail ? blend : 1.0f - blend;
-  }
+  // blend factor sigmoid (ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop)
+  darkroom_masks_detail_blend(src, out, msize, threshold, detail);
 }
 
 float *dt_masks_calc_detail_mask(dt_dev_pixelpipe_iop_t *piece,

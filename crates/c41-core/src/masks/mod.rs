@@ -14,8 +14,10 @@
 
 pub mod brush;
 pub mod circle;
+pub mod detail;
 pub mod ellipse;
 pub mod gradient;
+pub mod group;
 pub mod object;
 pub mod path;
 
