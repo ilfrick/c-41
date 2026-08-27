@@ -12,6 +12,7 @@
 //! `CLIP(x)` is clamp-to-[0,1], and `dt_masks_roundup(n, m)` rounds up to a
 //! multiple of `m`.
 
+pub mod brush;
 pub mod circle;
 pub mod ellipse;
 pub mod gradient;

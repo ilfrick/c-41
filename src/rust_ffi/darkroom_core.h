@@ -3114,6 +3114,26 @@ void darkroom_masks_gradient_interp(float *buffer, size_t w, size_t height,
                                     int start_i, int end_i,
                                     int start_j, int end_j, int grid);
 
+/* brush.c _brush_get_mask: per-segment falloff for each brush stroke segment
+ * from points[start_idx..end_idx]. p0/p1 are float→int truncated (truncation
+ * toward zero) from the points/border arrays; payload[i*2]=hardness,
+ * payload[i*2+1]=density. posx/posy offset the buffer origin in image coords;
+ * bw is the buffer stride. Only the falloff fill is ported — _brush_bounding_box
+ * and _brush_get_pts_border stay in C. */
+void darkroom_masks_brush_falloff(float *buffer, int bw, int bh,
+                                  const float *points, const float *border,
+                                  const float *payload,
+                                  int start_idx, int end_idx,
+                                  int posx, int posy);
+
+/* brush.c _brush_get_mask_roi: same per-segment falloff but respecting the
+ * ROI buffer bounds [0,bw) x [0,bh). Segments entirely outside the ROI are
+ * skipped (matching the C skip check on integer-truncated p0/p1). */
+void darkroom_masks_brush_falloff_roi(float *buffer, int bw, int bh,
+                                      const float *points, const float *border,
+                                      const float *payload,
+                                      int start_idx, int end_idx);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

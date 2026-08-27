@@ -26,6 +26,7 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 
 #define HARDNESS_MIN 0.0005f
 #define HARDNESS_MAX 1.0f
@@ -2863,48 +2864,6 @@ static int _brush_get_area(const dt_iop_module_t *const module,
   return _get_area(module, piece, form, width, height, posx, posy, 0);
 }
 
-/** we write a falloff segment */
-static void _brush_falloff(float *const restrict buffer,
-                           int p0[2],
-                           int p1[2],
-                           const int posx,
-                           const int posy,
-                           const int bw,
-                           const float hardness,
-                           const float density)
-{
-  // segment length
-  const int l = sqrt((p1[0] - p0[0])
-                     * (p1[0] - p0[0]) + (p1[1] - p0[1]) * (p1[1] - p0[1])) + 1;
-  const int solid = (int)l * hardness;
-  const int soft = l - solid;
-
-  const float lx = p1[0] - p0[0];
-  const float ly = p1[1] - p0[1];
-
-  for(int i = 0; i < l; i++)
-  {
-    // position
-    const int x = (int)((float)i * lx / (float)l) + p0[0] - posx;
-    const int y = (int)((float)i * ly / (float)l) + p0[1] - posy;
-    const float op = density * ((i <= solid)
-                                ? 1.0f
-                                : 1.0 - (float)(i - solid) / (float)soft);
-
-    buffer[y * bw + x] = MAX(buffer[y * bw + x], op);
-    if(x > 0)
-      buffer[y * bw + x - 1]
-          = MAX(buffer[y * bw + x - 1], op); // this one is to avoid
-                                             // gap due to int
-                                             // rounding
-    if(y > 0)
-      buffer[(y - 1) * bw + x]
-          = MAX(buffer[(y - 1) * bw + x], op); // this one is to avoid
-                                               // gap due to int
-                                               // rounding
-  }
-}
-
 static int _brush_get_mask(const dt_iop_module_t *const module,
                            const dt_dev_pixelpipe_iop_t *const piece,
                            dt_masks_form_t *const form,
@@ -2957,18 +2916,9 @@ static int _brush_get_mask(const dt_iop_module_t *const module,
   }
 
   // now we fill the falloff
-  int p0[2], p1[2];
-
-  for(int i = _nb_ctrl_point(nb_corner); i < border_count; i++)
-  {
-    p0[0] = points[i * 2];
-    p0[1] = points[i * 2 + 1];
-    p1[0] = border[i * 2];
-    p1[1] = border[i * 2 + 1];
-
-    _brush_falloff(*buffer, p0, p1, *posx, *posy, *width,
-                   payload[i * 2], payload[i * 2 + 1]);
-  }
+  darkroom_masks_brush_falloff(*buffer, *width, *height, points, border, payload,
+                               _nb_ctrl_point(nb_corner), border_count,
+                               *posx, *posy);
 
   dt_free_align(points);
   dt_free_align(border);
@@ -2979,56 +2929,6 @@ static int _brush_get_mask(const dt_iop_module_t *const module,
            dt_get_lap_time(&start));
 
   return 1;
-}
-
-/** we write a falloff segment respecting limits of buffer */
-static inline void _brush_falloff_roi(float *buffer,
-                                      const int *p0,
-                                      const int *p1,
-                                      const int bw,
-                                      const int bh,
-                                      const float hardness,
-                                      const float density)
-{
-  // segment length (increase by 1 to avoid division-by-zero special
-  // case handling)
-  const int l = sqrt((p1[0] - p0[0])
-                     * (p1[0] - p0[0]) + (p1[1] - p0[1]) * (p1[1] - p0[1])) + 1;
-  const int solid = hardness * l;
-
-  const float lx = (float)(p1[0] - p0[0]) / (float)l;
-  const float ly = (float)(p1[1] - p0[1]) / (float)l;
-
-  const int dx = lx <= 0 ? -1 : 1;
-  const int dy = ly <= 0 ? -1 : 1;
-  const int dpx = dx;
-  const int dpy = dy * bw;
-
-  float fx = p0[0];
-  float fy = p0[1];
-
-  float op = density;
-  const float dop = density / (float)(l - solid);
-
-  for(int i = 0; i < l; i++)
-  {
-    const int x = fx;
-    const int y = fy;
-
-    fx += lx;
-    fy += ly;
-    if(i > solid) op -= dop;
-
-    if(x < 0 || x >= bw || y < 0 || y >= bh) continue;
-
-    float *buf = buffer + (size_t)y * bw + x;
-
-    *buf = MAX(*buf, op);
-    if(x + dx >= 0 && x + dx < bw)
-      buf[dpx] = MAX(buf[dpx], op); // this one is to avoid gaps due to int rounding
-    if(y + dy >= 0 && y + dy < bh)
-      buf[dpy] = MAX(buf[dpy], op); // this one is to avoid gaps due to int rounding
-  }
 }
 
 // build a stamp which can be combined with other shapes in the same group
@@ -3107,18 +3007,8 @@ static int _brush_get_mask_roi(const dt_iop_module_t *const module,
   }
 
   // now we fill the falloff
-  DT_OMP_FOR()
-  for(int i = _nb_ctrl_point(nb_corner); i < border_count; i++)
-  {
-    const int p0[] = { points[i * 2], points[i * 2 + 1] };
-    const int p1[] = { border[i * 2], border[i * 2 + 1] };
-
-    if(MAX(p0[0], p1[0]) < 0 || MIN(p0[0], p1[0]) >= width || MAX(p0[1], p1[1]) < 0
-       || MIN(p0[1], p1[1]) >= height)
-      continue;
-
-    _brush_falloff_roi(buffer, p0, p1, width, height, payload[i * 2], payload[i * 2 + 1]);
-  }
+  darkroom_masks_brush_falloff_roi(buffer, width, height, points, border,
+                                   payload, _nb_ctrl_point(nb_corner), border_count);
 
   dt_free_align(points);
   dt_free_align(border);

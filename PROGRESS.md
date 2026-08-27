@@ -2829,3 +2829,49 @@ test 865→868 passed, release build).
 `fricktrade-architect` senior review agent unavailable (OpenRouter 402 —
 recurring env issue). Proceeded with self-review per the documented fallback.
 PARITY_AUDIT.md does not track drawn-mask ports — no parity item to close.
+
+---
+
+## 2026-08-27 11:00 UTC — m4-154: Brush drawn-mask FFI migration
+
+**Commit** `pending` (GitHub + Gitea)
+
+**What.** Completed the brush drawn-mask FFI port — the third shape module in the
+mask-shape rendering sweep (after circle, ellipse, gradient).
+- `crates/c41-core/src/masks/brush.rs` (NEW): 2 safe Rust functions
+  (`brush_falloff`, `brush_falloff_roi`) and 2 `#[no_mangle]` FFI exports
+  (`darkroom_masks_brush_falloff`, `darkroom_masks_brush_falloff_roi`). 15 tests
+  covering horizontal/vertical/single-pixel segments, hardness=1.0 edge case,
+  overlapping segments with MAX accumulation, ROI skip-check, all directional
+  segments, LCG fuzz against the C-reference reimplementation, FFI round-trip
+  equivalence, null guards, and out-of-bounds safety.
+- `crates/c41-core/src/masks/mod.rs`: `pub mod brush;` added.
+- `src/rust_ffi/darkroom_core.h`: 2 FFI declarations added.
+- `src/develop/masks/brush.c`: `#include "rust_ffi/darkroom_core.h"` added;
+  `_brush_falloff` and `_brush_falloff_roi` static functions removed; the
+  per-segment loops in `_brush_get_mask` (was lines 2962–2971) and
+  `_brush_get_mask_roi` (was lines 3110–3121) replaced with single FFI calls.
+  `_brush_bounding_box_raw` and `_brush_get_pts_border` OMP loops stay in C
+  (involve pixelpipe callbacks).
+
+**Key technical decisions.**
+- Two falloff kernels ported independently because the opacity formulas differ:
+  `_brush_falloff` computes `density * (1 - k/soft)` as a single expression;
+  `_brush_falloff_roi` accumulates `op -= dop` via repeated subtraction (float
+  accumulation error — must be matched exactly, not unified).
+- `l = sqrt(dx² + dy²) + 1` computed with `i64` intermediate to avoid i32
+  overflow on large images (C has UB here; Rust is well-defined).
+- `solid`/`soft` use different C casts: `_brush_falloff` does
+  `(int)l * hardness` (int→float), `_brush_falloff_roi` does
+  `hardness * l` (float*int→float). Both preserved exactly.
+- Float→int truncation `(int)float` → Rust `as i32` for segment endpoint
+  extraction from `points`/`border` arrays (truncation toward zero, matching C).
+- Adjacent-pixel writes in `_brush_falloff_roi` use direction-based bounds
+  (`x + dx >= 0 && x + dx < bw`) instead of `_brush_falloff`'s `x > 0`; the
+  `dx`/`dy` sign is derived from `lx <= 0 ? -1 : 1` exactly as C.
+- FFI functions take `bh` for buffer-slice length (`bw*bh`), null/dimension
+  guards on all pointers (no panics across FFI).
+
+**CI.** `scripts/ci-local.sh` — all four steps passed (cargo check, clippy
+`--all-targets`, `cargo test --workspace --release`, release build link).
+15 new brush tests + 868 pre-existing tests all green.
