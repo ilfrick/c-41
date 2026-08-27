@@ -3162,6 +3162,22 @@ void darkroom_masks_path_fill_plain_roi(float *buffer, int width,
                                         int xxmin, int xxmax,
                                         int yymin, int yymax);
 
+/* object.c _mask_iou: intersection-over-union reduction of two float masks.
+ * Counts pixels above `threshold` in each mask, returns inter/uni (or 0.0
+ * if union is empty). Replaces the DT_OMP_FOR(reduction(+:inter,uni)) loop
+ * at object.c:528. */
+float darkroom_masks_object_mask_iou(const float *a, const float *b,
+                                     size_t n, float threshold);
+
+/* object.c peak-point exclusion: zero out pixels within a circular region of
+ * radius sqrt(min_sep_sq) around (px,py) in the distance-transform buffer.
+ * The bounding box [x0,x1]×[y0,y1] is pre-clamped to [0,w-1]×[0,h-1] by the
+ * C caller. Replaces the DT_OMP_FOR(collapse(2)) loop at object.c:573 inside
+ * _find_peak_point. Called once per exclude peak. */
+void darkroom_masks_object_zero_peaks(float *dist, int w, int bh,
+                                      int x0, int x1, int y0, int y1,
+                                      float px, float py, float min_sep_sq);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

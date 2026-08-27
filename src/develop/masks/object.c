@@ -30,6 +30,7 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 #include "develop/pixelpipe_hb.h"
 #include "gui/gtk.h"
 #include "imageio/imageio_common.h"
@@ -519,23 +520,6 @@ static void _keep_seed_component(float *mask,
   g_free(labels);
 }
 
-static float _mask_iou(const float *const restrict a,
-                       const float *const restrict b,
-                       const size_t n,
-                       const float threshold)
-{
-  size_t inter = 0, uni = 0;
-  DT_OMP_FOR(reduction(+:inter, uni))
-  for(size_t i = 0; i < n; i++)
-  {
-    const int A = a[i] > threshold;
-    const int B = b[i] > threshold;
-    inter += A & B;
-    uni   += A | B;
-  }
-  return uni > 0 ? (float)inter / (float)uni : 0.0f;
-}
-
 // peak of the (exact-Euclidean) distance transform of mask>threshold,
 // excluding pixels within min_separation of any positive prompt
 static gboolean _find_peak_point(const float *const restrict mask,
@@ -570,14 +554,8 @@ static gboolean _find_peak_point(const float *const restrict mask,
     const int x1 = MIN((int)w - 1, (int)(px + min_separation));
     const int y0 = MAX(0, (int)(py - min_separation));
     const int y1 = MIN((int)h - 1, (int)(py + min_separation));
-    DT_OMP_FOR(collapse(2))
-    for(int y = y0; y <= y1; y++)
-      for(int x = x0; x <= x1; x++)
-      {
-        const float dx = (float)x - px;
-        const float dy = (float)y - py;
-        if(dx * dx + dy * dy < min_sep_sq) dist[(size_t)y * w + x] = 0.0f;
-      }
+    darkroom_masks_object_zero_peaks(dist, (int)w, (int)h,
+                                     x0, x1, y0, y1, px, py, min_sep_sq);
   }
 
   // single-threaded combined max+argmax (exclusion may have lowered
@@ -707,7 +685,7 @@ static void _run_decoder(dt_masks_form_gui_t *gui)
     float *new_mask = dt_seg_compute_mask(d->seg, points, n_points, &mw, &mh);
     if(!new_mask) break;
 
-    if(mask && _mask_iou(mask, new_mask, (size_t)mw * mh, threshold) > 0.99f)
+    if(mask && darkroom_masks_object_mask_iou(mask, new_mask, (size_t)mw * mh, threshold) > 0.99f)
     {
       g_free(mask);
       mask = new_mask;

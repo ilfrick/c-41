@@ -2878,9 +2878,9 @@ mask-shape rendering sweep (after circle, ellipse, gradient).
 
 ---
 
-## 2026-08-27 09:30 UTC — m4-155: path drawn-mask FFI migration
+## 2026-08-27 09:30 UTC — m4-156: path drawn-mask FFI migration
 
-**Commit** `pending` (GitHub + Gitea)
+**Commit** `325e46031b` (GitHub + Gitea)
 
 **What.** Ported the path drawn-mask shape rendering from C OMP loops to
 Rust FFI exports in `crates/c41-core/src/masks/path.rs`.
@@ -2935,3 +2935,58 @@ Rust FFI exports in `crates/c41-core/src/masks/path.rs`.
 **CI.** `scripts/ci-local.sh` — all four steps passed (cargo check, clippy
 `--all-targets`, `cargo test --workspace --release`, release build link).
 19 new path tests + 902 pre-existing tests all green.
+
+---
+
+## 2026-08-27 17:00 UTC — m4-157: object drawn-mask FFI migration
+
+**Commit** `f7608a14f5` (GitHub + Gitea)
+
+**What.** Ported the two OMP loops from `src/develop/masks/object.c` to Rust
+FFI exports in `crates/c41-core/src/masks/object.rs`.
+
+- `crates/c41-core/src/masks/object.rs` (NEW): 2 kernel functions + 2 FFI exports.
+  - `object_mask_iou` (port of `_mask_iou`, object.c:522) — intersection-over-union
+    reduction of two float masks. For each pixel: `A = a[i] > threshold`,
+    `B = b[i] > threshold` (relational → int 0/1 in C). `inter += A & B`,
+    `uni += A | B`. Returns `(float)inter / (float)uni` or `0.0f` if uni is
+    empty. The `size_t`→`float` cast in the division is matched by `usize as
+    f32` in Rust.
+  - `object_zero_peaks` (port of the `DT_OMP_FOR(collapse(2))` loop at
+    object.c:573 inside `_find_peak_point`) — zeroes pixels within a circular
+    exclusion zone of radius `sqrt(min_sep_sq)` around `(px, py)` in the
+    distance-transform buffer. Condition: `dx*dx + dy*dy < min_sep_sq` (strict
+    `<`, f32 arithmetic throughout). The bounding box `[x0,x1]×[y0,y1]` is
+    pre-clamped to `[0,w-1]×[0,h-1]` by the C caller; Rust adds a
+    slice-length guard via `checked_mul(w, bh)`.
+  - FFI: `darkroom_masks_object_mask_iou` (takes `*const f32, *const f32,
+    usize, f32` → returns `f32`) and `darkroom_masks_object_zero_peaks`
+    (takes `*mut f32, i32, i32` for w+bh, plus bbox and params). Both with
+    null/dimension guards.
+  - 13 tests: IoU basic/partial/disjoint/empty/threshold-boundary/NaN/reference
+    match + FFI round-trip + null guards; zero_peaks basic/corner-clamp/empty-
+    range/min-sep-zero/full-circle/reference-match + FFI round-trip + null/dim
+    guards.
+
+- `crates/c41-core/src/masks/mod.rs`: `pub mod object;` added (alphabetically
+  before `path`).
+- `src/rust_ffi/darkroom_core.h`: 2 FFI declarations added after path declarations.
+- `src/develop/masks/object.c`: `#include "rust_ffi/darkroom_core.h"` added;
+  `_mask_iou` static function removed entirely (single call site at line 688
+  now calls `darkroom_masks_object_mask_iou` directly); the `DT_OMP_FOR(collapse(2))`
+  nested loop at line 573 replaced with `darkroom_masks_object_zero_peaks(...)`.
+  The surrounding logic (model loading, distance transform, argmax, IoU
+  convergence check, connected-component filter) all stays in C.
+
+**Key technical decisions.**
+- `object_mask_iou`: The C `int A = a[i] > threshold` produces 0 or 1. In Rust,
+  `a[i] > threshold` is a `bool`. Counting via `if a_above && b_above` and
+  `if a_above || b_above` produces identical `usize` counts, then `inter as f32
+  / uni as f32` matches C's `(float)inter / (float)uni`.
+- `object_zero_peaks`: The C uses `(float)x - px` (int→float cast then subtract).
+  Rust `x as f32 - px` is equivalent. The strict `<` comparison and float
+  arithmetic are matched. The `(int)w` cast in the C call site handles the
+  `size_t → int` conversion; the FFI receives `i32`.
+- `bh` parameter: Added to the zero_peaks FFI (not in the brush/ path pattern
+  for this function) to enable `checked_mul(w, bh)` for safe buffer slicing,
+  following the brush FFI pattern of passing both dimensions.
