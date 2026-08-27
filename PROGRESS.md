@@ -2875,3 +2875,63 @@ mask-shape rendering sweep (after circle, ellipse, gradient).
 **CI.** `scripts/ci-local.sh` — all four steps passed (cargo check, clippy
 `--all-targets`, `cargo test --workspace --release`, release build link).
 15 new brush tests + 868 pre-existing tests all green.
+
+---
+
+## 2026-08-27 09:30 UTC — m4-155: path drawn-mask FFI migration
+
+**Commit** `pending` (GitHub + Gitea)
+
+**What.** Ported the path drawn-mask shape rendering from C OMP loops to
+Rust FFI exports in `crates/c41-core/src/masks/path.rs`.
+
+- `crates/c41-core/src/masks/path.rs` (NEW): 4 kernel functions + 4 FFI exports.
+  - `path_falloff` (port of `_path_falloff`, path.c:3132) — whole-pipe per-segment
+    falloff using `sqrtf(sqf(dx)+sqf(dy))` (float). `op = 1.0 - i/l` (no
+    hardness/density). Adjacent writes with `x > 0` / `y > 0` guards.
+  - `path_falloff_roi` (port of `_path_falloff_roi`, path.c:3558) — ROI-bounded
+    per-segment falloff using `sqrtf(dx*dx + dy*dy)` (int multiply, same value as
+    `sqf`). Direction via `lx < 0 ? -1 : 1` (strict `<`, differs from brush's `<=`).
+    Per-pixel bounds checks on all three writes (main + two adjacent).
+  - `fill_plain` (port of fill loop, path.c:3327) — even-odd fill, `v == 1.0f`
+    trigger, `wb` stride.
+  - `fill_plain_roi` (port of fill ROI loop, path.c:3835) — even-odd fill,
+    `v > 0.5f` trigger (differs from whole-pipe's `== 1.0f`), `width` stride,
+    bounded to `[xxmin..=xxmax] × [yymin..=yymax]`.
+  - FFI: `darkroom_masks_path_falloff` (single-segment, takes int coords + posx/posy),
+    `darkroom_masks_path_falloff_roi` (batch int array of segments), `darkroom_masks_path_fill_plain`,
+    `darkroom_masks_path_fill_plain_roi`. All with null/dimension/overflow guards.
+  - 19 tests including reference bit-exactness, FFI round-trip, null guards, and
+    direction-coverage.
+- `crates/c41-core/src/masks/mod.rs`: `pub mod path;` added.
+- `src/rust_ffi/darkroom_core.h`: 4 FFI declarations added.
+- `src/develop/masks/path.c`: `#include "rust_ffi/darkroom_core.h"` added;
+  `_path_falloff` and `_path_falloff_roi` static functions removed; the fill-plain
+  OMP loop (was 3327–3337), the falloff call inside the complex loop (was 3375),
+  the fill-plain-ROI OMP loop (was 3835–3846), and the falloff-ROI OMP loop
+  (was 3918–3920) all replaced with FFI calls. The point-shifting `DT_OMP_FOR`
+  (line 1510) and the `DT_INVALID_COORDINATE` / deduplication logic stay in C.
+
+**Key technical decisions.**
+- Path uses `sqrtf` (float sqrt) throughout, unlike brush which used `sqrt` (double).
+  Rust: `(dx*dx + dy*dy) as f32).sqrt()` — `f32::sqrt()` is `sqrtf`.
+- Path ROI uses `lx < 0 ? -1 : 1` (strict `<`); brush used `lx <= 0`. Preserved
+  exactly — a segment with `lx == 0.0` gets `dx = +1` in path, `-1` in brush.
+- Path falloff has no hardness/density parameters — opacity is always
+  `1.0 - i/l`. `1.0` (double literal in C `_path_falloff`) vs `1.0f` (float literal
+  in `_path_falloff_roi`): both compile to `1.0f32` in Rust; the double intermediation
+  in C is a no-op (float values are exactly representable as double, and subtraction
+  of exact values then rounds to the same float as pure f32 subtraction).
+- ROI falloff FFI takes the pre-built `dpoints` int array from C (C handles
+  `DT_INVALID_COORDINATE` + dedup; Rust just processes the final segment list).
+
+**Errors fixed during iteration.**
+- Clippy `0 * N + M` "always returns zero" in test assertions — replaced with
+  direct index literals (e.g. `buf[1]` instead of `buf[0 * 5 + 1]`).
+- Test assertion for `fill_plain_roi`: when the even-odd toggle makes `state=false`
+  at the boundary marker, `if(state)` is false so the original value is NOT
+  overwritten — corrected expectation from 1.0 to the original marker value.
+
+**CI.** `scripts/ci-local.sh` — all four steps passed (cargo check, clippy
+`--all-targets`, `cargo test --workspace --release`, release build link).
+19 new path tests + 902 pre-existing tests all green.

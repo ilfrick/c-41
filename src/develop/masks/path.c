@@ -26,6 +26,7 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 #include <assert.h>
 
 static void _path_bounding_box_raw(const float *const points,
@@ -3128,37 +3129,6 @@ static int _path_get_area(const dt_iop_module_t *const module,
   return _get_area(module, piece, form, width, height, posx, posy, FALSE);
 }
 
-/** we write a falloff segment */
-static void _path_falloff(float *const restrict buffer,
-                          int *p0,
-                          int *p1,
-                          const int posx,
-                          const int posy,
-                          const int bw)
-{
-  // segment length
-  int l = sqrtf(sqf(p1[0] - p0[0]) + sqf(p1[1] - p0[1])) + 1;
-
-  const float lx = p1[0] - p0[0];
-  const float ly = p1[1] - p0[1];
-
-  for(int i = 0; i < l; i++)
-  {
-    // position
-    const int x = (int)((float)i * lx / (float)l) + p0[0] - posx;
-    const int y = (int)((float)i * ly / (float)l) + p0[1] - posy;
-    const float op = 1.0 - (float)i / (float)l;
-    size_t idx = y * bw + x;
-    buffer[idx] = fmaxf(buffer[idx], op);
-    // this one is to avoid gap due to int rounding
-    if(x > 0)
-      buffer[idx - 1] = fmaxf(buffer[idx - 1], op);
-    // this one is to avoid gap due to int rounding
-    if(y > 0)
-      buffer[idx - bw] = fmaxf(buffer[idx - bw], op);
-  }
-}
-
 static int _path_get_mask(const dt_iop_module_t *const module,
                           const dt_dev_pixelpipe_iop_t *const piece,
                           dt_masks_form_t *const form,
@@ -3324,17 +3294,7 @@ static int _path_get_mask(const dt_iop_module_t *const module,
            "[masks %s] path_fill draw path took %0.04f sec", form->name,
            dt_get_lap_time(&start2));
 
-  DT_OMP_FOR()
-  for(int yy = 0; yy < hb; yy++)
-  {
-    int state = 0;
-    for(int xx = 0; xx < wb; xx++)
-    {
-      const float v = bufptr[yy * wb + xx];
-      if(v == 1.0f) state = !state;
-      if(state) bufptr[yy * wb + xx] = 1.0f;
-    }
-  }
+  darkroom_masks_path_fill_plain(bufptr, wb, hb);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] path_fill fill plain took %0.04f sec", form->name,
@@ -3372,7 +3332,8 @@ static int _path_get_mask(const dt_iop_module_t *const module,
        || last1[0] != p1[0]
        || last1[1] != p1[1])
     {
-      _path_falloff(bufptr, p0, p1, *posx, *posy, *width);
+      darkroom_masks_path_falloff(bufptr, *width, *height,
+                                  p0[0], p0[1], p1[0], p1[1], *posx, *posy);
       last0[0] = p0[0];
       last0[1] = p0[1];
       last1[0] = p1[0];
@@ -3552,41 +3513,6 @@ static int _path_crop_to_roi(float *path,
     }
   }
   return 1;
-}
-
-/** we write a falloff segment respecting limits of buffer */
-static void _path_falloff_roi(float *buffer,
-                              int *p0,
-                              int *p1,
-                              const int bw,
-                              const int bh)
-{
-  // segment length
-  const int l = sqrtf((p1[0] - p0[0]) * (p1[0] - p0[0])
-                      + (p1[1] - p0[1]) * (p1[1] - p0[1])) + 1;
-
-  const float lx = p1[0] - p0[0];
-  const float ly = p1[1] - p0[1];
-
-  const int dx = lx < 0 ? -1 : 1;
-  const int dy = ly < 0 ? -1 : 1;
-  const int dpy = dy * bw;
-
-  for(int i = 0; i < l; i++)
-  {
-    // position
-    const int x = (int)((float)i * lx / (float)l) + p0[0];
-    const int y = (int)((float)i * ly / (float)l) + p0[1];
-    const float op = 1.0f - (float)i / (float)l;
-    float *buf = buffer + (size_t)y * bw + x;
-
-    if(x >= 0 && x < bw && y >= 0 && y < bh)
-      buf[0] = MAX(buf[0], op);
-    if(x + dx >= 0 && x + dx < bw && y >= 0 && y < bh)
-      buf[dx] = MAX(buf[dx], op); // this one is to avoid gap due to int rounding
-    if(x >= 0 && x < bw && y + dy >= 0 && y + dy < bh)
-      buf[dpy] = MAX(buf[dpy], op); // this one is to avoid gap due to int rounding
-  }
 }
 
 // build a stamp which can be combined with other shapes in the same group
@@ -3832,18 +3758,8 @@ static int _path_get_mask_roi(const dt_iop_module_t *const module,
       const int yymin = MAX(ymin, 0);
       const int yymax = MIN(ymax, height - 1);
 
-      DT_OMP_FOR(num_threads(MIN(8, dt_get_num_threads())))
-      for(int yy = yymin; yy <= yymax; yy++)
-      {
-        int state = 0;
-        for(int xx = xxmin; xx <= xxmax; xx++)
-        {
-          const size_t index = (size_t)yy * width + xx;
-          const float v = buffer[index];
-          if(v > 0.5f) state = !state;
-          if(state) buffer[index] = 1.0f;
-        }
-      }
+      darkroom_masks_path_fill_plain_roi(buffer, width,
+                                         xxmin, xxmax, yymin, yymax);
 
       dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
                "[masks %s] path_fill fill plain took %0.04f sec", form->name,
@@ -3915,9 +3831,7 @@ static int _path_get_mask_roi(const dt_iop_module_t *const module,
       }
     }
 
-    DT_OMP_FOR()
-    for(int n = 0; n < dindex; n += 4)
-      _path_falloff_roi(buffer, dpoints + n, dpoints + n + 2, width, height);
+    darkroom_masks_path_falloff_roi(buffer, width, height, dpoints, dindex / 4);
 
     dt_free_align(dpoints);
 

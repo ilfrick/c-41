@@ -3134,6 +3134,34 @@ void darkroom_masks_brush_falloff_roi(float *buffer, int bw, int bh,
                                       const float *payload,
                                       int start_idx, int end_idx);
 
+/* path.c _path_falloff: whole-pipe per-segment falloff for a path stroke.
+ * p0/p1 are integer segment endpoints (float→int truncated by the C caller).
+ * posx/posy offset the buffer origin in image coordinates; bw is the buffer
+ * stride. No hardness/density — opacity is always 1.0 - i/l. Replaces the
+ * _path_falloff call inside the falloff loop in _path_get_mask (path.c:3375).
+ * The DT_INVALID_COORDINATE skip/dedup logic stays in C. */
+void darkroom_masks_path_falloff(float *buffer, int bw, int bh,
+                                 int p0x, int p0y, int p1x, int p1y,
+                                 int posx, int posy);
+
+/* path.c _path_falloff_roi: ROI-bounded per-segment falloff. segments is an
+ * int array of [p0x, p0y, p1x, p1y] tuples; nsegments = dindex/4.
+ * Replaces the DT_OMP_FOR loop at path.c:3918 that calls _path_falloff_roi
+ * per segment. Coordinates are already int-truncated by the C caller. */
+void darkroom_masks_path_falloff_roi(float *buffer, int bw, int bh,
+                                     const int *segments, int nsegments);
+
+/* path.c whole-pipe even-odd fill (path.c:3327). Toggles state on v == 1.0f,
+ * writes 1.0 inside path. Replaces the DT_OMP_FOR() fill loop. */
+void darkroom_masks_path_fill_plain(float *buffer, int wb, int hb);
+
+/* path.c ROI even-odd fill (path.c:3835). Toggles state on v > 0.5f (not ==1.0f),
+ * writes 1.0 inside path. Bounded to [xxmin..xxmax] x [yymin..yymax], stride
+ * `width`. Replaces the DT_OMP_FOR(num_threads(...)) fill loop. */
+void darkroom_masks_path_fill_plain_roi(float *buffer, int width,
+                                        int xxmin, int xxmax,
+                                        int yymin, int yymax);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

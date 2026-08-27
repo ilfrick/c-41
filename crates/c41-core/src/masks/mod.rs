@@ -16,6 +16,7 @@ pub mod brush;
 pub mod circle;
 pub mod ellipse;
 pub mod gradient;
+pub mod path;
 
 /// `DT_2PI_F` (`src/common/math.h:60`). Written as `TAU`: the C literal's
 /// extra digits vanish in the f32 rounding, so the bits are identical.
