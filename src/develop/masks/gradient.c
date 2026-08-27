@@ -26,6 +26,7 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 
 static inline int _nb_ctrl_point(void)
 {
@@ -1098,15 +1099,6 @@ static int _gradient_get_area(const dt_iop_module_t *const module,
   return 1;
 }
 
-// caller needs to make sure that input remains within bounds
-static inline float dt_gradient_lookup(const float *lut, const float i)
-{
-  const int bin0 = i;
-  const int bin1 = i + 1;
-  const float f = i - bin0;
-  return lut[bin1] * f + lut[bin0] * (1.0f - f);
-}
-
 static int _gradient_get_mask(const dt_iop_module_t *const module,
                               const dt_dev_pixelpipe_iop_t *const piece,
                               dt_masks_form_t *const form,
@@ -1140,13 +1132,7 @@ static int _gradient_get_mask(const dt_iop_module_t *const module,
   float *points = dt_alloc_align_float((size_t)2 * gw * gh);
   if(points == NULL) return 0;
 
-  DT_OMP_FOR(collapse(2))
-  for(int j = 0; j < gh; j++)
-    for(int i = 0; i < gw; i++)
-    {
-      points[(j * gw + i) * 2] = (grid * i + px);
-      points[(j * gw + i) * 2 + 1] = (grid * j + py);
-    }
+  darkroom_masks_gradient_grid(points, (size_t)gw, (size_t)gh, 0, 0, px, py, 1.0f, grid);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] gradient draw took %0.04f sec", form->name,
@@ -1190,40 +1176,11 @@ static int _gradient_get_mask(const dt_iop_module_t *const module,
     return 0;
   }
 
-  DT_OMP_FOR()
-  for(int n = 0; n < lutsize; n++)
-  {
-    const float distance = (n - lutmax) * hwscale;
-    const float value = 0.5f
-      + 0.5f * ((state == DT_MASKS_GRADIENT_STATE_LINEAR)
-                ? normf * distance
-                : erff(distance / compression));
-    lut[n] = (value < 0.0f) ? 0.0f : ((value > 1.0f) ? 1.0f : value);
-  }
+  darkroom_masks_gradient_lut(lut, (size_t)lutsize, lutmax, hwscale, normf, compression, (int)state);
 
-  // center lut around zero
-  const float *clut = lut + lutmax;
-
-
-  DT_OMP_FOR(collapse(2))
-  for(int j = 0; j < gh; j++)
-  {
-    for(int i = 0; i < gw; i++)
-    {
-      const float x = points[(j * gw + i) * 2];
-      const float y = points[(j * gw + i) * 2 + 1];
-
-      const float x0 = (cosv * x + sinv * y - xoffset) * hwscale;
-      const float y0 = (sinv * x - cosv * y - yoffset) * hwscale;
-
-      const float distance = y0 - curvature * x0 * x0;
-
-      points[(j * gw + i) * 2] = (distance <= -4.0f * compression) ? 0.0f :
-                                    ((distance >= 4.0f * compression)
-                                     ? 1.0f
-                                     : dt_gradient_lookup(clut, distance * ihwscale));
-    }
-  }
+  darkroom_masks_gradient_values(points, (size_t)gw * (size_t)gh, lut, lutmax,
+                                 cosv, sinv, xoffset, yoffset, hwscale, ihwscale,
+                                 curvature, compression);
 
   dt_free_align(lut);
 
@@ -1236,24 +1193,8 @@ static int _gradient_get_mask(const dt_iop_module_t *const module,
   }
 
 // we fill the mask buffer by interpolation
-  DT_OMP_FOR()
-  for(int j = 0; j < h; j++)
-  {
-    const int jj = j % grid;
-    const int mj = j / grid;
-    const int grid_jj = grid - jj;
-    for(int i = 0; i < w; i++)
-    {
-      const int ii = i % grid;
-      const int mi = i / grid;
-      const int grid_ii = grid - ii;
-      const size_t pt_index = mj * gw + mi;
-      bufptr[j * w + i] = (points[2 * pt_index] * grid_ii * grid_jj
-                           + points[2 * (pt_index + 1)] * ii * grid_jj
-                           + points[2 * (pt_index + gw)] * grid_ii * jj
-                           + points[2 * (pt_index + gw + 1)] * ii * jj) / (grid * grid);
-    }
-  }
+  darkroom_masks_gradient_interp(bufptr, (size_t)w, (size_t)h, points,
+                                 (size_t)gw, (size_t)gh, 0, w, 0, h, grid);
 
   dt_free_align(points);
 
@@ -1290,15 +1231,7 @@ static int _gradient_get_mask_roi(const dt_iop_module_t *const module,
   float *points = dt_alloc_align_float((size_t)2 * gw * gh);
   if(points == NULL) return 0;
 
-  DT_OMP_FOR(collapse(2))
-  for(int j = 0; j < gh; j++)
-    for(int i = 0; i < gw; i++)
-    {
-
-      const size_t index = (size_t)j * gw + i;
-      points[index * 2] = (grid * i + px) * iscale;
-      points[index * 2 + 1] = (grid * j + py) * iscale;
-    }
+  darkroom_masks_gradient_grid(points, (size_t)gw, (size_t)gh, 0, 0, px, py, iscale, grid);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] gradient draw took %0.04f sec", form->name,
@@ -1342,65 +1275,17 @@ static int _gradient_get_mask_roi(const dt_iop_module_t *const module,
     return 0;
   }
 
-  DT_OMP_FOR()
-  for(int n = 0; n < lutsize; n++)
-  {
-    const float distance = (n - lutmax) * hwscale;
-    const float value = 0.5f
-      + 0.5f * ((state == DT_MASKS_GRADIENT_STATE_LINEAR)
-                ? normf * distance
-                : erff(distance / compression));
-    lut[n] = (value < 0.0f) ? 0.0f : ((value > 1.0f) ? 1.0f : value);
-  }
+  darkroom_masks_gradient_lut(lut, (size_t)lutsize, lutmax, hwscale, normf, compression, (int)state);
 
-  // center lut around zero
-  const float *clut = lut + lutmax;
-
-  DT_OMP_FOR(collapse(2))
-  for(int j = 0; j < gh; j++)
-  {
-    for(int i = 0; i < gw; i++)
-    {
-      const size_t index = (size_t)j * gw + i;
-      const float x = points[index * 2];
-      const float y = points[index * 2 + 1];
-
-      const float x0 = (cosv * x + sinv * y - xoffset) * hwscale;
-      const float y0 = (sinv * x - cosv * y - yoffset) * hwscale;
-
-      const float distance = y0 - curvature * x0 * x0;
-
-      points[index * 2] = (distance <= -4.0f * compression)
-        ? 0.0f
-        : ((distance >= 4.0f * compression)
-           ? 1.0f
-           : dt_gradient_lookup(clut, distance * ihwscale));
-    }
-  }
+  darkroom_masks_gradient_values(points, (size_t)gw * (size_t)gh, lut, lutmax,
+                                 cosv, sinv, xoffset, yoffset, hwscale, ihwscale,
+                                 curvature, compression);
 
   dt_free_align(lut);
 
 // we fill the mask buffer by interpolation
-  DT_OMP_FOR()
-  for(int j = 0; j < h; j++)
-  {
-    const int jj = j % grid;
-    const int mj = j / grid;
-    const int grid_jj = grid - jj;
-    for(int i = 0; i < w; i++)
-    {
-      const int ii = i % grid;
-      const int mi = i / grid;
-      const int grid_ii = grid - ii;
-      const size_t mindex = (size_t)mj * gw + mi;
-      buffer[(size_t)j * w + i]
-          = (points[mindex * 2] * grid_ii * grid_jj
-             + points[(mindex + 1) * 2] * ii * grid_jj
-             + points[(mindex + gw) * 2] * grid_ii * jj
-             + points[(mindex + gw + 1) * 2] * ii * jj)
-            / (grid * grid);
-    }
-  }
+  darkroom_masks_gradient_interp(buffer, (size_t)w, (size_t)h, points,
+                                 (size_t)gw, (size_t)gh, 0, w, 0, h, grid);
 
   dt_free_align(points);
 

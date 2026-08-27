@@ -3091,6 +3091,29 @@ void darkroom_masks_ellipse_interp(float *buffer, size_t w, size_t height,
                                    int start_i, int end_i,
                                    int start_j, int end_j, int grid);
 
+/* gradient.c _gradient_get_mask / _gradient_get_mask_roi:
+ * grid-points fill (same fill_grid_points with bbxm=0,bbym=0; iscale=1.0 for
+ * whole-pipe, roi->scale inverse for ROI); LUT build (sigmoidal via erff or
+ * linear); in-place mask-value evaluation at back-transformed points (rotation
+ * + quadratic distance + LUT lookup with ±4·compression clamping); then
+ * bilinear splat into the output buffer. */
+void darkroom_masks_gradient_grid(float *points, size_t bbw, size_t bbh,
+                                  int bbxm, int bbym, int px, int py,
+                                  float iscale, int grid);
+void darkroom_masks_gradient_lut(float *lut, size_t lutsize, int lutmax,
+                                 float hwscale, float normf, float compression,
+                                 int state);
+void darkroom_masks_gradient_values(float *points, size_t count,
+                                    const float *lut, int lutmax,
+                                    float cosv, float sinv,
+                                    float xoffset, float yoffset,
+                                    float hwscale, float ihwscale,
+                                    float curvature, float compression);
+void darkroom_masks_gradient_interp(float *buffer, size_t w, size_t height,
+                                    const float *points, size_t bbw, size_t bbh,
+                                    int start_i, int end_i,
+                                    int start_j, int end_j, int grid);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

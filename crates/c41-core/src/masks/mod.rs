@@ -14,6 +14,7 @@
 
 pub mod circle;
 pub mod ellipse;
+pub mod gradient;
 
 /// `DT_2PI_F` (`src/common/math.h:60`). Written as `TAU`: the C literal's
 /// extra digits vanish in the f32 rounding, so the bits are identical.
@@ -24,6 +25,9 @@ pub(crate) const DT_2PI_F: f32 = std::f32::consts::TAU;
 /// angle arithmetic (gradient rotation, brush orientation, etc.).
 #[allow(dead_code)]
 pub(crate) const M_PI_F: f32 = std::f32::consts::PI;
+
+/// `DT_MASKS_GRADIENT_STATE_LINEAR` (`src/develop/masks.h:93`).
+pub(crate) const GRADIENT_STATE_LINEAR: i32 = 1;
 
 /// `dt_masks_roundup` (`src/develop/masks.h:1098`): round `num` up to a
 /// multiple of `mult`.

@@ -2789,3 +2789,43 @@ formula order preserved, RustNLL permits `fill_mask_in_place` aliasing (reads Co
 before write), no unused variables that would trip `-Werror`. PARITY_AUDIT.md does
 not track drawn-mask ports (outside the pipeline boundary per RUST_MIGRATION_PLAN.md)
 — no parity item to close.
+
+---
+
+## 2026-08-27 10:30 UTC — m4-153: Gradient drawn-mask FFI migration
+
+**Commit** `658989cc66` (GitHub + Gitea)
+
+**What.** Completed the gradient drawn-mask FFI port — the final missing piece
+of the mask-shape rendering sweep.
+- `crates/c41-core/src/masks/gradient.rs` (NEW): 4 safe Rust functions
+  (`fill_lut`, `gradient_lookup`, `fill_values_in_place`) and 4 `#[no_mangle]`
+  FFI exports (`darkroom_masks_gradient_grid`, `_lut`, `_values`, `_interp`).
+  Uses `extern "C" { fn erff }` for glibc's `erff` (bit-identical to the C code's
+  sigmoidal LUT). 12 tests covering erf values, LUT linear/sigmoidal bit-exactness,
+  clamping, lookup, values-in-place, grid points, and FFI round-trip.
+- `crates/c41-core/src/masks/mod.rs`: `pub mod gradient;` +
+  `GRADIENT_STATE_LINEAR` constant.
+- `src/rust_ffi/darkroom_core.h`: 4 FFI declarations added.
+- `src/develop/masks/gradient.c`: `_gradient_get_mask` and
+  `_gradient_get_mask_roi` — both now call the 4 FFI functions instead of
+  inline OMP loops. `_gradient_get_mouse_guide_points` (UI control points,
+  not mask rendering) left as-is.
+
+**Verified.** `scripts/ci-local.sh` — all four steps green (check, clippy,
+test 865→868 passed, release build).
+
+**Notes.** First CI run after initial creation had 3 test failures:
+1. `state != GRADIENT_STATE_LINEAR` was inverted in the LUT FFI wrapper → state=2
+   (sigmoidal) produced linear LUT values. Fixed to `state == GRADIENT_STATE_LINEAR`.
+2. `fill_values_in_place_matches_reference` used `lutmax=12` with `ihwscale=500,
+   compression=1.5` — correct `lutmax` is `ceil(4*1.5*500)=3000`. Test parameters
+   made self-consistent (shared `hwscale`/`compression`/`lutmax` between LUT build
+   and values evaluation, matching the C code's single-parameter-set invariant).
+3. `fill_values_in_place_clamps_outside` expected value 1.0 for a point whose
+   distance was actually -100 (negative). Fixed `cosv`/`sinv` to 0/1 so `y0=x`
+   gives positive distance → clamped to 1.0 as intended.
+
+`fricktrade-architect` senior review agent unavailable (OpenRouter 402 —
+recurring env issue). Proceeded with self-review per the documented fallback.
+PARITY_AUDIT.md does not track drawn-mask ports — no parity item to close.
