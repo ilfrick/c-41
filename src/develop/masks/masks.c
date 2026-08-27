@@ -2842,8 +2842,6 @@ void dt_masks_line_stroke(cairo_t *cr,
   cairo_stroke(cr);
 }
 
-#include "detail.c"
-
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

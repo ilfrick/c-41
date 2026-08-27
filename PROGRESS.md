@@ -3178,3 +3178,28 @@ that operate on point buffers (not pixel grids) into Rust FFI.
   → `written=0`. Fixed to `x=0.5, y=0.5` with `scale=dt_fast_hypotf(wd,ht)`.
 - fricktrade-architect agent unavailable (OpenRouter API-402); self-review applied using
   UNDERSTAND→DIAGNOSE→PRIORITISE→PROPOSE→VALIDATE framework.
+
+---
+
+## 2026-08-27 22:15 UTC — m4-160 fixup: remove stale `#include "detail.c"` from masks.c
+
+**Commit** `f0798b8903` (GitHub + Gitea)
+
+**What.** `src/develop/masks/masks.c` line 2845 had `#include "detail.c"`,
+which compiled all of `detail.c`'s function definitions into the `masks.c.o`
+translation unit. m4-158/159 added `detail.c` to `src/CMakeLists.txt` so it is
+now also compiled as a separate `detail.c.o` — causing a multiple-definition
+link error in `libdarktable.so` (Fork CI: `CMake + Rust workspace` step).
+
+The fix is one line: remove the stale `#include "detail.c"`. All three functions
+it defined (`dt_masks_calc_scharr_mask`, `dt_masks_calc_detail_blend`,
+`dt_masks_calc_detail_mask`) are already declared in `develop/masks.h`
+(lines 726–734), which `masks.c` includes at line 19. `detail.c` has its own
+includes (`common/debug.h`, `common/gaussian.h`, `common/imagebuf.h`,
+`develop/masks.h`, `rust_ffi/darkroom_core.h`) and is self-contained.
+
+**Verified.** `c41-fullc-deps` Docker image: `cmake -B build -G Ninja
+-DCMAKE_BUILD_TYPE=Release ...` configured and `cmake --build build --target
+lib_darktable` linked `bin/libdarktable.so` successfully (323/323, 0 errors).
+No `-Werror` issues in m4-160's changed files. Rust Docker CI (ci-local.sh)
+remains green from the m4-160 push (this change is C-only).
