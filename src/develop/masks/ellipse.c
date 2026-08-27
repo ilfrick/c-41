@@ -26,6 +26,7 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 
 static inline int _nb_ctrl_point(void)
 {
@@ -1426,72 +1427,6 @@ static void _bounding_box(const float *const points,
   *height = (ymax - ymin);
 }
 
-static void _fill_mask(const size_t numpoints,
-                       float *const bufptr,
-                       const float *const points,
-                       const float *const center,
-                       const float a,
-                       const float b,
-                       const float ta,
-                       const float tb,
-                       const float alpha,
-                       const size_t out_scale)
-{
-  const float a2 = a * a;
-  const float b2 = b * b;
-  const float ta2 = ta * ta;
-  const float tb2 = tb * tb;
-  const float cos_alpha = cosf(alpha);
-  const float sin_alpha = sinf(alpha);
-
-  // Determine the strength of the mask for each of the distorted
-  // points.  If inside the border of the ellipse, the strength is
-  // always 1.0; if outside the falloff region, it is 0.0, and in
-  // between it falls off quadratically.  To compute this, we need to
-  // do the equivalent of projecting the vector from the center of the
-  // ellipse to the given point until it intersect the ellipse and the
-  // outer edge of the falloff, respectively.  The ellipse can be
-  // rotated, but we can compensate for that by applying a rotation
-  // matrix for the same rotation in the opposite direction before
-  // projecting the vector.
-  DT_OMP_FOR()
-  for(size_t i = 0; i < numpoints; i++)
-    {
-      const float x = points[2 * i] - center[0];
-      const float y = points[2 * i + 1] - center[1];
-      // find the square of the distance from the center
-      const float l2 = x * x + y * y;
-      const float l = sqrtf(l2);
-      // normalize the point's coordinate to form a unit vector,
-      // taking care not to divide by zero
-      const float x_norm = l ? x / l : 0.0f;
-      const float y_norm = l ? y / l : 1.0f;  // ensure we don't get 0
-                                              // for both sine and
-                                              // cosine below
-      // apply the rotation matrix
-      const float x_rot = x_norm * cos_alpha + y_norm * sin_alpha;
-      const float y_rot = -x_norm * sin_alpha + y_norm * cos_alpha;
-      // at this point, x_rot = cos(v) and y_rot = sin(v) since they
-      // are on the unit circle; we need the squared values
-      const float cosv2 = x_rot * x_rot;
-      const float sinv2 = y_rot * y_rot;
-
-      // project the rotated unit vector out to the ellipse and the
-      // outer border
-      const float radius2 = a2 * b2 / (a2 * sinv2 + b2 * cosv2);
-      const float total2 = ta2 * tb2 / (ta2 * sinv2 + tb2 * cosv2);
-
-      // quadratic falloff between the ellipses's radius and the
-      // radius of the outside of the feathering ratio = 0.0 at the
-      // outer border, >= 1.0 within the ellipse, negative outside the
-      // falloff
-      const float ratio = (total2 - l2) / (total2 - radius2);
-      // enforce 1.0 inside the ellipse and 0.0 outside the feathering
-      const float f = CLIP(ratio);
-      bufptr[i << out_scale] = f * f;
-    }
-}
-
 static float *const _ellipse_points_to_transform(const float center_x,
                                                  const float center_y,
                                                  const float dim1, const float dim2,
@@ -1667,12 +1602,8 @@ static int _ellipse_get_mask(const dt_iop_module_t *const module,
   if(points == NULL)
     return 0;
 
-  for(int i = 0; i < h; i++)
-    for(int j = 0; j < w; j++)
-    {
-      points[(i * w + j) * 2] = (j + (*posx));
-      points[(i * w + j) * 2 + 1] = (i + (*posy));
-    }
+  darkroom_masks_ellipse_coord_grid(points, (size_t)w, (size_t)h,
+                                    (float)*posx, (float)*posy);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] ellipse draw took %0.04f sec",
@@ -1733,7 +1664,8 @@ static int _ellipse_get_mask(const dt_iop_module_t *const module,
 
   float *const bufptr = *buffer;
 
-  _fill_mask((size_t)(h)*w, bufptr, points, center, a, b, ta, tb, alpha, 0);
+  darkroom_masks_ellipse_fill(bufptr, points, (size_t)h*w,
+                              center[0], center[1], a, b, ta, tb, alpha);
 
   dt_free_align(points);
 
@@ -1802,15 +1734,8 @@ static int _ellipse_get_mask_roi(const dt_iop_module_t *const module,
   float *ell = dt_alloc_align_float(ellpts * 2);
   if(ell == NULL) return 0;
 
-  DT_OMP_FOR()
-  for(int n = 0; n < ellpts; n++)
-  {
-    const float phi = (DT_2PI_F * n) / ellpts;
-    const float cosp = cosf(phi);
-    const float sinp = sinf(phi);
-    ell[2 * n] = center[0] + ta * cosa * cosp - tb * sina * sinp;
-    ell[2 * n + 1] = center[1] + ta * sina * cosp + tb * cosa * sinp;
-  }
+  darkroom_masks_ellipse_outline(ell, ellpts, center[0], center[1],
+                                 ta, tb, cosa, sina);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] ellipse outline took %0.04f sec",
@@ -1877,14 +1802,8 @@ static int _ellipse_get_mask_roi(const dt_iop_module_t *const module,
   if(points == NULL) return 0;
 
   // we populate the grid points in module coordinates
-  DT_OMP_FOR(collapse(2))
-  for(int j = bbym; j <= bbYM; j++)
-    for(int i = bbxm; i <= bbXM; i++)
-    {
-      const size_t index = (size_t)(j - bbym) * bbw + i - bbxm;
-      points[index * 2] = (grid * i + px) * iscale;
-      points[index * 2 + 1] = (grid * j + py) * iscale;
-    }
+  darkroom_masks_ellipse_grid(points, (size_t)bbw, (size_t)bbh,
+                              bbxm, bbym, px, py, iscale, grid);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] ellipse grid took %0.04f sec",
@@ -1906,7 +1825,8 @@ static int _ellipse_get_mask_roi(const dt_iop_module_t *const module,
   // we calculate the mask values at the transformed points; re-use
   // the points array for results; this requires out_scale==1 to
   // double the offsets at which they are stored
-  _fill_mask((size_t)(bbh)*bbw, points, points, center, a, b, ta, tb, alpha, 1);
+  darkroom_masks_ellipse_values(points, (size_t)bbh*bbw,
+                                center[0], center[1], a, b, ta, tb, alpha);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] ellipse draw took %0.04f sec", form->name,
@@ -1916,24 +1836,11 @@ static int _ellipse_get_mask_roi(const dt_iop_module_t *const module,
   // we only need to take the contents of our bounding box into account
   const int endx = MIN(w, bbXM * grid);
   const int endy = MIN(h, bbYM * grid);
-  DT_OMP_FOR()
-  for(int j = bbym * grid; j < endy; j++)
-  {
-    const int jj = j % grid;
-    const int mj = j / grid - bbym;
-    for(int i = bbxm * grid; i < endx; i++)
-    {
-      const int ii = i % grid;
-      const int mi = i / grid - bbxm;
-      const size_t mindex = (size_t)mj * bbw + mi;
-      buffer[(size_t)j * w + i]
-          = (points[mindex * 2] * (grid - ii) * (grid - jj)
-             + points[(mindex + 1) * 2] * ii * (grid - jj)
-             + points[(mindex + bbw) * 2] * (grid - ii) * jj
-             + points[(mindex + bbw + 1) * 2] * ii * jj)
-            / (grid * grid);
-    }
-  }
+  darkroom_masks_ellipse_interp(buffer, (size_t)w, (size_t)h, points,
+                                (size_t)bbw, (size_t)bbh,
+                                bbxm * grid, endx,
+                                bbym * grid, endy,
+                                grid);
 
   dt_free_align(points);
 

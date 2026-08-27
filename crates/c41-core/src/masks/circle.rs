@@ -2,30 +2,16 @@
 //! `src/develop/masks/circle.c` `_circle_get_mask` (whole-pipe form mask) and
 //! `_circle_get_mask_roi` (ROI grid-sampled mask).
 //!
-//! The pixelpipe callbacks between the loops (`dt_dev_distort_backtransform_
-//! plus`, `dt_dev_distort_transform_plus`) stay in C; everything pure moved
-//! here behind `darkroom_masks_circle_*` exports.
+//! The pixelpipe callbacks between the loops (`dt_dev_distort_backtransform_plus`
+//! and friends) stay in C; everything pure moved here behind `darkroom_masks_*`
+//! exports.
 //!
 //! Mask semantics: with `radius2 = (r·mindim)²`, `total2 = ((r+border)·mindim)²`,
 //! the value is 1 inside the hard circle, a quadratic (`f²`) falloff across the
 //! feather band, 0 outside — `sqf(CLIP((total2 - l2) / border2))`.
 
-use super::{circle_feather, masks_roundup, DT_2PI_F};
-
-/// Full-form path, loop 1 of `_circle_get_mask` (circle.c:1100): fill
-/// `points` (2 floats per pixel) with the pipe-area coordinate grid,
-/// `(posx + j, posy + i)`.
-pub fn fill_coord_grid(points: &mut [f32], w: usize, h: usize, pos_x: f32, pos_y: f32) {
-    assert_eq!(points.len(), 2 * w * h, "grid buffer must hold w*h pairs");
-    let slots = points.as_chunks_mut::<2>().0;
-    for i in 0..h {
-        let y = i as f32 + pos_y;
-        for (j, slot) in slots[i * w..(i + 1) * w].iter_mut().enumerate() {
-            slot[0] = pos_x + j as f32;
-            slot[1] = y;
-        }
-    }
-}
+use super::{circle_feather, fill_coord_grid, fill_grid_points, interpolate_into_buffer,
+            masks_roundup, DT_2PI_F};
 
 /// Full-form path, loop 2 of `_circle_get_mask` (circle.c:1147): evaluate the
 /// feathered-circle value at every back-transformed point into `buffer`.
@@ -89,33 +75,6 @@ pub fn outline_point_count(total2: f32) -> usize {
     masks_roundup(raw, 8) as usize
 }
 
-/// ROI path, grid populate loop (circle.c:1307): fill `points` (bbw×bbh
-/// pairs) with the sampled grid coordinates in module coordinates. The C
-/// computes `(grid*i + px)` in INTEGER arithmetic before the float
-/// conversion — replicated here.
-#[allow(clippy::too_many_arguments)] // mirrors the C loop's parameter list
-pub fn fill_grid_points(
-    points: &mut [f32],
-    bbw: usize,
-    bbh: usize,
-    bbxm: i32,
-    bbym: i32,
-    px: i32,
-    py: i32,
-    iscale: f32,
-    grid: i32,
-) {
-    assert_eq!(points.len(), 2 * bbw * bbh);
-    for j in 0..bbh as i32 {
-        let gy = (grid * (bbym + j) + py) as f32 * iscale;
-        for i in 0..bbw as i32 {
-            let index = (j * bbw as i32 + i) as usize;
-            points[2 * index] = (grid * (bbxm + i) + px) as f32 * iscale;
-            points[2 * index + 1] = gy;
-        }
-    }
-}
-
 /// ROI path, mask-value loop (circle.c:1334): evaluate the feathered circle
 /// at the back-transformed grid points, writing results into the even lanes
 /// IN PLACE exactly like the C re-use of the `points` array.
@@ -132,47 +91,6 @@ pub fn values_in_place(
         let dx = points[2 * idx] - center_x;
         let dy = points[2 * idx + 1] - center_y;
         points[2 * idx] = circle_feather(dx * dx + dy * dy, total2, border2);
-    }
-}
-
-/// ROI path, interpolation loop (circle.c:1358): splat the bbw×bbh sampled
-/// values (even lanes of `points`) over the ROI `buffer` (`w` wide) by
-/// bilinear weighting within each `grid × grid` cell. Only the bounding-box
-/// rows/cols are touched, matching the C's `[start_i, end_i) × [start_j,
-/// end_j)` ranges where the caller pre-initialised the rest to zero.
-///
-/// The sequential float multiplications mirror the C expression order
-/// (`v*(g-ii)*(g-jj)` evaluates left-to-right, converting each int operand at
-/// its own multiply), and the denominator is the INT product `grid*grid`
-/// converted once at the division.
-#[allow(clippy::too_many_arguments)]
-pub fn interpolate_into_buffer(
-    buffer: &mut [f32],
-    w: usize,
-    points: &[f32],
-    bbw: usize,
-    start_i: i32,
-    end_i: i32,
-    start_j: i32,
-    end_j: i32,
-    grid: i32,
-) {
-    let g = grid;
-    let denom = (g * g) as f32;
-    for j in start_j..end_j {
-        let jj = j.rem_euclid(g);
-        let mj = j.div_euclid(g) - start_j.div_euclid(g);
-        for i in start_i..end_i {
-            let ii = i.rem_euclid(g);
-            let mi = i.div_euclid(g) - start_i.div_euclid(g);
-            let mindex = (mj * bbw as i32 + mi) as usize;
-            buffer[j as usize * w + i as usize] =
-                (points[mindex * 2] * (g - ii) as f32 * (g - jj) as f32
-                    + points[(mindex + 1) * 2] * ii as f32 * (g - jj) as f32
-                    + points[(mindex + bbw) * 2] * (g - ii) as f32 * jj as f32
-                    + points[(mindex + bbw + 1) * 2] * ii as f32 * jj as f32)
-                    / denom;
-        }
     }
 }
 

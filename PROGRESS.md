@@ -2710,3 +2710,82 @@ not available in this environment). This is the same recurring issue documented
 from prior sessions. Proceeded with thorough self-review instead. PARITY_AUDIT.md
 does not track drawn-mask ports (they are outside the pipeline boundary per
 RUST_MIGRATION_PLAN.md) — no parity item to close here.
+
+---
+
+## 2026-08-27 14:00 UTC — m4-155: Ellipse drawn-mask FFI migration
+
+**Commit** pending (GitHub + Gitea)
+
+**What.** Ported the 6 `DT_OMP_FOR` loops from `_ellipse_get_mask` and
+`_ellipse_get_mask_roi` (`src/develop/masks/ellipse.c`) to Rust FFI exports in
+`crates/c41-core/src/masks/ellipse.rs`. Circle was already complete (m4-154); this
+is the second of 8 drawn-mask shapes.
+
+- `crates/c41-core/src/masks/ellipse.rs` (new): 4 Rust functions + 6
+  `#[no_mangle] extern "C"` exports + 12 unit tests. Key port is `fill_mask`
+  implementing the projected-ellipse distance formula:
+  ```rust
+  let x_rot = x_norm * cos_alpha + y_norm * sin_alpha;
+  let y_rot = -x_norm * sin_alpha + y_norm * cos_alpha;
+  let radius2 = a2 * b2 / (a2 * sinv2 + b2 * cosv2);
+  let total2  = ta2 * tb2 / (ta2 * sinv2 + tb2 * cosv2);
+  let ratio = (total2 - l2) / (total2 - radius2);
+  let f = ratio.clamp(0.0, 1.0);
+  bufptr[i << out_scale] = f * f;
+  ```
+  `fill_mask_in_place` reads both lanes (x,y coords) and writes mask value to the
+  even lane (`i << 1`), matching C's in-place buffer reuse. `outline_point_count`
+  uses the Ramanujan arc-length approximation with `M_PI` (double precision):
+  `let l = (std::f32::consts::PI * (ta + tb) as f64 * scale as f64) as i32;`
+  with `scale = 1.0f32 + inner / denom` in f32.
+- `crates/c41-core/src/masks/mod.rs`: factored shared `pub(crate)` helpers
+  (`fill_coord_grid`, `fill_grid_points`, `interpolate_into_buffer`) that are
+  algorithmically identical between circle and ellipse C loops; both shape modules
+  now import them instead of defining locally. `M_PI_F` constant added (reserved
+  for future shapes needing angle arithmetic). `#[allow(dead_code)]` on `M_PI_F`
+  since ellipse uses `std::f32::consts::PI` directly.
+- `crates/c41-core/src/masks/circle.rs`: updated imports to pull `fill_coord_grid`,
+  `fill_grid_points`, `interpolate_into_buffer` from `super` instead of local
+  definitions.
+- `src/rust_ffi/darkroom_core.h` (+25 lines): 6 ellipse FFI declarations after
+  the circle block: `darkroom_masks_ellipse_coord_grid`,
+  `darkroom_masks_ellipse_fill`, `darkroom_masks_ellipse_values`,
+  `darkroom_masks_ellipse_outline`, `darkroom_masks_ellipse_grid`,
+  `darkroom_masks_ellipse_interp`.
+- `src/develop/masks/ellipse.c` (-97/+26): 6 OMP loops replaced with FFI calls
+  in `_ellipse_get_mask` / `_ellipse_get_mask_roi`; removed unused `_fill_mask`
+  static; added `#include "rust_ffi/darkroom_core.h"`.
+- `crates/c41-core/src/lib.rs`: unchanged (already has `pub mod masks;` from m4-154).
+
+**Verified.** `scripts/ci-local.sh` exit code 0 — all four steps:
+`cargo check --workspace`, `cargo clippy --workspace --all-targets`,
+`cargo test --workspace --release` (403 tests in c41-core including 12 new
+ellipse tests), `cargo build --release -p c41 --bin c41-rs`.
+
+**Fixes during development:**
+1. Invalid hex literal `0xE11ipse` → `0xE13CE1` (i is not a hex digit).
+2. f32/f64 type mismatch in `outline_point_count_matches_c_ramanujan` test:
+   `(ta - tb) / (ta + tb) as f64` parsed as `f32 / f64`; fixed with explicit
+   `let lambda: f32`.
+3. `mod.rs` type mismatch: `(mindex + bbw as i32 + 1) as usize` mixed `usize + i32`;
+   fixed to all-`usize` arithmetic.
+4. Unnecessary `mut` on `pts` in test → removed.
+5. `clippy::approx_constant` (denied): two `0.7071` literals approximating
+  `FRAC_1_SQRT_2` → replaced with `std::f32::consts::FRAC_1_SQRT_2`.
+6. `clippy::approx_constant` (denied): `0.52359877` ≈ `FRAC_PI_6` and
+   `0.78539816` ≈ `FRAC_PI_4` → replaced with `std::f32::consts::FRAC_PI_6` /
+   `std::f32::consts::FRAC_PI_4`.
+7. E0223 ambiguous associated type: `f32::consts::X` needs `std::f32::consts::X`
+   disambiguation.
+
+**Notes.** `fricktrade-architect` senior review agent unavailable (OpenRouter 402 /
+"model access error" — `opus` alias resolves to `stealth/ox-alpha`, not available
+in this environment; same recurring issue documented in prior sessions). Proceeded
+with thorough self-review instead: FFI signatures match C declarations exactly, all
+6 exports have null/dimension/overflow guards, integer arithmetic `(grid*i+px)`
+before float cast preserved, `sqf`→`f*f`, `CLIP`/`CLAMP`→`clamp(0,1)`, bilinear
+formula order preserved, RustNLL permits `fill_mask_in_place` aliasing (reads Copy
+before write), no unused variables that would trip `-Werror`. PARITY_AUDIT.md does
+not track drawn-mask ports (outside the pipeline boundary per RUST_MIGRATION_PLAN.md)
+— no parity item to close.

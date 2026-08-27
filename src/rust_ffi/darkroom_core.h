@@ -3059,6 +3059,38 @@ void darkroom_masks_circle_interp(float *buffer, size_t w, size_t height,
                                   int start_i, int end_i,
                                   int start_j, int end_j, int grid);
 
+/* ellipse.c _ellipse_get_mask: coord-grid fill identical to circle's,
+ * then _fill_mask (with out_scale=0) evaluates the projected-ellipse
+ * feathered value at each back-transformed point into `bufptr` (n floats).
+ * `a,b` are the inner semi-axes, `ta,tb` the outer (with border), `alpha`
+ * the rotation in radians. */
+void darkroom_masks_ellipse_coord_grid(float *points, size_t w, size_t h,
+                                       float pos_x, float pos_y);
+void darkroom_masks_ellipse_fill(float *bufptr, const float *points, size_t n,
+                                 float center_x, float center_y,
+                                 float a, float b, float ta, float tb,
+                                 float alpha);
+
+/* ellipse.c _ellipse_get_mask_roi: parametric outline (no 8-fold symmetry —
+ * the pixelpipe can shear the ellipse) into `ell` (ellpts x,y pairs, using
+ * the pre-computed cosa/sina and outer radii ta,tb); grid-points fill (same
+ * integer-arithmetic indexing as circle); in-place _fill_mask (out_scale=1)
+ * writing mask values to even lanes; then bilinear splat into `buffer`. */
+void darkroom_masks_ellipse_outline(float *ell, size_t ellpts,
+                                    float center_x, float center_y,
+                                    float ta, float tb, float cosa, float sina);
+void darkroom_masks_ellipse_grid(float *points, size_t bbw, size_t bbh,
+                                 int bbxm, int bbym, int px, int py,
+                                 float iscale, int grid);
+void darkroom_masks_ellipse_values(float *points, size_t npoints,
+                                   float center_x, float center_y,
+                                   float a, float b, float ta, float tb,
+                                   float alpha);
+void darkroom_masks_ellipse_interp(float *buffer, size_t w, size_t height,
+                                   const float *points, size_t bbw, size_t bbh,
+                                   int start_i, int end_i,
+                                   int start_j, int end_j, int grid);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
