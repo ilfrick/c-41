@@ -2995,7 +2995,7 @@ FFI exports in `crates/c41-core/src/masks/object.rs`.
 
 ## 2026-08-27 17:45 UTC — m4-158: group drawn-mask FFI migration
 
-**Commit** bf92632c83 (GitHub + Gitea) — m4-158/159 combined
+**Commit** cfd7fa1f96 (GitHub + Gitea) — m4-158/159 combined
 
 **What.** Ported the `DT_OMP_FOR_SIMD` combine loops from
 `src/develop/masks/group.c` `_group_get_mask_roi` (and the removed `_combine_masks_*`
