@@ -3123,3 +3123,58 @@ exports in `crates/c41-core/src/masks/detail.rs`.
 **Verified.** All four Docker CI steps passed: `cargo check --workspace`,
 `cargo clippy --workspace --all-targets`, `cargo test --workspace --release`
 (17 new detail tests all green), `cargo build --release -p c41 --bin c41-rs`.
+
+---
+
+## 2026-08-27 19:42 UTC — m4-160: port remaining mask point-manipulation FFI loops
+
+**What.** Port the last 8 mask OMP loops (across circle, ellipse, brush, path, gradient)
+that operate on point buffers (not pixel grids) into Rust FFI.
+- `crates/c41-core/src/masks/points.rs` (NEW): 5 FFI functions covering all 8 loops:
+  - `darkroom_masks_points_shift` — consolidates 4 identical shift loops
+    (circle.c:744, ellipse.c:333, brush.c:1065, path.c:1511) into one with a
+    `start_index` parameter (0 for circle/brush/path, 5 for ellipse).
+  - `darkroom_masks_circle_circumference` — circle.c:695, center + l circumference points.
+  - `darkroom_masks_ellipse_circumference` — ellipse.c:282, parametric ellipse with rotation.
+  - `darkroom_masks_bbox_reduction` — brush.c:2768, min/max reduction with optional border.
+  - `darkroom_masks_gradient_guide_points` — gradient.c:734, replaces thread-local
+    accumulation + merge with serial deterministic ordering.
+- All 5 C files (circle.c, ellipse.c, brush.c, path.c, gradient.c) updated to call the
+  FFIs; the `DT_OMP_FOR` loops are removed.
+- `src/rust_ffi/darkroom_core.h`: 5 new FFI declarations added.
+- `crates/c41-core/src/masks/mod.rs`: `pub mod points;` added.
+
+**Key technical decisions.**
+- Point-shift consolidation: All 4 shift loops share the same body
+  (`pts[i*2] += dx; pts[i*2+1] += dy`) differing only in start index. One FFI with
+  `start_index` parameter avoids code duplication while matching each shape's semantics.
+- Gradient guide points ordering: The C code uses OMP thread-local accumulation followed
+  by a merge in thread order. The Rust serial version computes points in index order,
+  which is deterministic. Verified this only affects the GUI guide-curve preview drawing
+  — not the mask computation (`_gradient_get_mask` uses grid points and gradient
+  parameters directly, never the guide curve points) — so ordering is irrelevant to
+  correctness.
+- `xstart`/`xdelta` formula equivalence: C uses `xdelta = -2.0f * xstart / (count - 3)`
+  where `count = scale + 3`; Rust uses `n_guides = count - 3` then
+  `xdelta = -2.0 * xstart / (n_guides as f32)` — mathematically identical.
+- Overflow protection: All FFIs use `checked_mul`/`checked_add` for buffer-length
+  calculations, following the m4-154-159 pattern.
+- `bbox_reduction` uses `f32::INFINITY`/`f32::NEG_INFINITY` matching C's `FLT_MAX`/`FLT_MIN`
+  initialization for min/max reduction.
+
+**Verified.** All four Docker CI steps passed:
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets` ✓ (no new warnings from our code)
+- `cargo test --workspace --release` ✓ (979 passed, 0 failed — 22 new tests)
+- `cargo build --release -p c41 --bin c41-rs` ✓
+
+**Notes.** Two test assertions were initially wrong and caught by CI:
+- `bbox_reduction_skips_first_points`: test used `count=5, start_idx=2` (processing 3
+  points including `-3.0`) but asserted `xmin=1.0` — the intent was `count=4` (only
+  points 2,3). Fixed to `count=4`.
+- `gradient_guide_points_count_matches_c_count_minus_3`: test used `x=100, y=200` as
+  pixel coordinates, but per the C code `x`/`y` are normalized (0–1) values multiplied
+  by `wd`/`ht` inside the kernel. With `x*wd=80000` all guide points were out-of-frame
+  → `written=0`. Fixed to `x=0.5, y=0.5` with `scale=dt_fast_hypotf(wd,ht)`.
+- fricktrade-architect agent unavailable (OpenRouter API-402); self-review applied using
+  UNDERSTAND→DIAGNOSE→PRIORITISE→PROPOSE→VALIDATE framework.

@@ -3195,6 +3195,47 @@ void darkroom_masks_detail_scharr_gradient(const float *tmp, float *mask,
 void darkroom_masks_detail_blend(const float *src, float *out,
                                  size_t msize, float threshold, int detail);
 
+/*
+ * Mask point-manipulation kernels — ports of the remaining DT_OMP_FOR loops
+ * in src/develop/masks/{circle,ellipse,brush,path,gradient}.c. Each C loop
+ * is a simple point-arithmetic loop (shift, circumference, bbox-reduction,
+ * guide-curve generation).
+ */
+
+/* Shift all points by (dx,dy) starting at start_index. Replaces the four
+ * identical shift loops in circle.c:744, ellipse.c:333, brush.c:1065, path.c:1511. */
+void darkroom_masks_points_shift(float *points, size_t count,
+                                 float dx, float dy, size_t start_index);
+
+/* Generate circle circumference: center at [0], l points around the arc.
+ * Points buffer must hold 2*(l+1) floats. */
+void darkroom_masks_circle_circumference(float *points,
+                                         float center_x, float center_y,
+                                         float r, int l);
+
+/* Generate ellipse circumference points at indices 5..l+5.
+ * Points buffer must hold 2*(l+5) floats; caller sets indices 0–4. */
+void darkroom_masks_ellipse_circumference(float *points,
+                                          float x, float y,
+                                          float a, float b,
+                                          float cosv, float sinv, int l);
+
+/* Bounding-box reduction over points[start_idx..count), optionally
+ * also checking border at the same indices. */
+void darkroom_masks_bbox_reduction(const float *points, const float *border,
+                                   size_t count, size_t start_idx,
+                                   float *x_min_out, float *x_max_out,
+                                   float *y_min_out, float *y_max_out);
+
+/* Generate gradient guide curve points. Caller sets indices 0..2 (3 control
+ * points). Writes guide points starting at index 3, returns count written. */
+size_t darkroom_masks_gradient_guide_points(float *points, size_t count,
+                                            float x, float y,
+                                            float wd, float ht,
+                                            float scale,
+                                            float cosv, float sinv,
+                                            float curvature);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

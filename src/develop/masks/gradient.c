@@ -722,52 +722,10 @@ static int _gradient_get_points(dt_develop_t *dev,
   (*points)[4] = x2;
   (*points)[5] = y2;
 
-  const int nthreads = dt_get_num_threads();
-  size_t c_padded_size;
-  uint32_t *pts_count = dt_calloc_perthread(1, sizeof(uint32_t), &c_padded_size);
-  float *const restrict pts = dt_alloc_align_float((size_t)2 * count * nthreads);
-
-  // we set the line point
-  const float xstart = fabsf(curvature) > 1.0f ? -sqrtf(1.0f / fabsf(curvature)) : -1.0f;
-  const float xdelta = -2.0f * xstart / (count - 3);
-
-  DT_OMP_FOR(num_threads(nthreads) if(count > 100))
-  for(int i = _nb_ctrl_point(); i < count; i++)
-  {
-    const float xi = xstart + (i - 3) * xdelta;
-    const float yi = curvature * xi * xi;
-    const float xii = (cosv * xi + sinv * yi) * scale;
-    const float yii = (sinv * xi - cosv * yi) * scale;
-    const float xiii = xii + x * wd;
-    const float yiii = yii + y * ht;
-
-    // don't generate guide points if they extend too far beyond the
-    // image frame; this is to avoid that modules like lens correction
-    // fail on out of range coordinates
-    if(!(xiii < -wd || xiii > 2 * wd || yiii < -ht || yiii > 2 * ht))
-    {
-      const int thread = dt_get_thread_num();
-      uint32_t *tcount = dt_get_bythread(pts_count, c_padded_size, thread);
-      pts[(thread * count) + *tcount * 2]     = xiii;
-      pts[(thread * count) + *tcount * 2 + 1] = yiii;
-      (*tcount)++;
-    }
-  }
-
-  *points_count = 3;
-  for(int thread = 0; thread < nthreads; thread++)
-  {
-    const uint32_t tcount = *(uint32_t *)dt_get_bythread(pts_count, c_padded_size, thread);
-    for(int k = 0; k < tcount; k++)
-    {
-      (*points)[(*points_count) * 2]     = pts[(thread * count) + k * 2];
-      (*points)[(*points_count) * 2 + 1] = pts[(thread * count) + k * 2 + 1];
-      (*points_count)++;
-    }
-  }
-
-  dt_free_align(pts_count);
-  dt_free_align(pts);
+  // Generate the guide curve points serially (replaces the OMP thread-local
+  // accumulation + merge — serial iteration is deterministic so no merge needed)
+  *points_count = 3 + darkroom_masks_gradient_guide_points(
+    *points, count, x, y, wd, ht, scale, cosv, sinv, curvature);
 
   // and we transform them with all distorted modules
   if(dt_dev_distort_transform(dev, *points, *points_count)) return 1;

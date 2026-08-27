@@ -278,14 +278,7 @@ static float *_points_to_transform(const float xx,
   points[8] = x - b * cosf(v - M_PI_2f);
   points[9] = y - b * sinf(v - M_PI_2f);
 
-
-  DT_OMP_FOR_SIMD(if(l > 100) aligned(points:64))
-  for(int i = 5; i < l + 5; i++)
-  {
-    const float alpha = (i - 5) * DT_2PI_F / (float)l;
-    points[i * 2] = x + a * cosf(alpha) * cosv - b * sinf(alpha) * sinv;
-    points[i * 2 + 1] = y + a * cosf(alpha) * sinv + b * sinf(alpha) * cosv;
-  }
+  darkroom_masks_ellipse_circumference(points, x, y, a, b, cosv, sinv, (int)l);
 
   return points;
 }
@@ -330,12 +323,7 @@ static int _ellipse_get_points_source(dt_develop_t *dev,
       ptsbuf[0] = pts[0];
       ptsbuf[1] = pts[1];
 
-      DT_OMP_FOR(if(*points_count > 100))
-      for(int i = 5; i < *points_count; i++)
-      {
-        ptsbuf[i * 2] += dx;
-        ptsbuf[i * 2 + 1] += dy;
-      }
+      darkroom_masks_points_shift(ptsbuf, *points_count, dx, dy, 5);
 
       // we apply the rest of the distortions (those after the module)
       // so we have now the SOURCE points in final image reference

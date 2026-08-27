@@ -692,13 +692,7 @@ static float *_points_to_transform(const float x,
   const float center_y = y * ht;
   points[0] = center_x;
   points[1] = center_y;
-  DT_OMP_FOR_SIMD(if(l > 100) aligned(points:64))
-  for(int i = 1; i < l + 1; i++)
-  {
-    const float alpha = (i - 1) * DT_2PI_F / (float)l;
-    points[i * 2] = center_x + r * cosf(alpha);
-    points[i * 2 + 1] = center_y + r * sinf(alpha);
-  }
+  darkroom_masks_circle_circumference(points, center_x, center_y, r, (int)l);
   return points;
 }
 
@@ -741,12 +735,7 @@ static int _circle_get_points_source(dt_develop_t *dev,
       const float dx = pts[0] - (*points)[0];
       const float dy = pts[1] - (*points)[1];
       float *const ptsbuf = DT_IS_ALIGNED(*points);
-      DT_OMP_FOR(if(*points_count > 100))
-      for(int i = 0; i < *points_count; i++)
-      {
-        ptsbuf[i * 2] += dx;
-        ptsbuf[i * 2 + 1] += dy;
-      }
+      darkroom_masks_points_shift(ptsbuf, *points_count, dx, dy, 0);
 
       // we apply the rest of the distortions (those after the module)
       // so we have now the SOURCE points in final image reference

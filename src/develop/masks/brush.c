@@ -1062,12 +1062,7 @@ static int _brush_get_pts_border(dt_develop_t *dev,
       dx = pts[0] - (*points)[2];
       dy = pts[1] - (*points)[3];
       float *const ptsbuf = DT_IS_ALIGNED(*points);
-      DT_OMP_FOR(if(*points_count > 100))
-      for(int i = 0; i < *points_count; i++)
-      {
-        ptsbuf[i * 2] += dx;
-        ptsbuf[i * 2 + 1] += dy;
-      }
+      darkroom_masks_points_shift(ptsbuf, *points_count, dx, dy, 0);
 
       // we apply the rest of the distortions (those after the module)
       // so we have now the SOURCE points in final image reference
@@ -2764,33 +2759,9 @@ static void _brush_bounding_box_raw(const float *const points,
                                     float *y_max)
 {
   // now we want to find the area, so we search min/max points
-  float xmin = FLT_MAX, xmax = FLT_MIN, ymin = FLT_MAX, ymax = FLT_MIN;
-  DT_OMP_FOR(reduction(min : xmin, ymin) reduction(max : xmax, ymax) if(num_points > 1000))
-  for(int i = _nb_ctrl_point(nb_corner); i < num_points; i++)
-  {
-    if(border)
-    {
-      // we look at the borders
-      const float x = border[i * 2];
-      const float y = border[i * 2 + 1];
-      xmin = MIN(x, xmin);
-      xmax = MAX(x, xmax);
-      ymin = MIN(y, ymin);
-      ymax = MAX(y, ymax);
-    }
-
-    // we look at the brush too
-    const float xx = points[i * 2];
-    const float yy = points[i * 2 + 1];
-    xmin = MIN(xx, xmin);
-    xmax = MAX(xx, xmax);
-    ymin = MIN(yy, ymin);
-    ymax = MAX(yy, ymax);
-  }
-  *x_min = xmin;
-  *x_max = xmax;
-  *y_min = ymin;
-  *y_max = ymax;
+  const int start_idx = _nb_ctrl_point(nb_corner);
+  darkroom_masks_bbox_reduction(points, border, num_points, start_idx,
+                                x_min, x_max, y_min, y_max);
 }
 
 static void _brush_bounding_box(const float *const points,

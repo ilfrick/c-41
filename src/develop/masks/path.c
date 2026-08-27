@@ -1508,12 +1508,7 @@ static int _path_get_pts_border(dt_develop_t *dev,
       dy = pts[1] - (*points)[3];
       float *const ptsbuf = DT_IS_ALIGNED(*points);
 
-      DT_OMP_FOR(if(*points_count > 100))
-      for(int i = 0; i < *points_count; i++)
-      {
-        ptsbuf[i * 2]     += dx;
-        ptsbuf[i * 2 + 1] += dy;
-      }
+      darkroom_masks_points_shift(ptsbuf, *points_count, dx, dy, 0);
 
       // we apply the rest of the distortions (those after the module)
       // so we have now the SOURCE points in final image reference
