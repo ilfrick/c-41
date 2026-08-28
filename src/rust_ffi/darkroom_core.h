@@ -3195,6 +3195,27 @@ void darkroom_masks_detail_scharr_gradient(const float *tmp, float *mask,
 void darkroom_masks_detail_blend(const float *src, float *out,
                                  size_t msize, float threshold, int detail);
 
+/* Blend mask post-processing — ports of the DT_OMP_FOR_SIMD loops in
+ * src/develop/blend.c. Each replaces a flat SIMD-friendly element-wise loop
+ * on a single-channel mask buffer.
+ */
+
+/* Replaces the DT_OMP_FOR_SIMD loop at blend.c:291 (CPU path):
+ *   mask[idx] *= CLIP(warp_mask[idx]) for each idx in 0..msize. */
+void darkroom_blend_refine_detail_mask(float *mask, const float *warp_mask,
+                                        size_t msize);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at blend.c:417 (_develop_blend_process_mask_tone_curve):
+ * sigmoid contrast/brightness tone-curve applied in-place over buffsize floats. */
+void darkroom_blend_mask_tone_curve(float *mask, size_t buffsize,
+                                     float contrast, float brightness,
+                                     float opacity);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at blend.c:571 (CPU path):
+ *   mask[i] = (1.0f - raster_mask[i]) * opacity for each i in 0..n. */
+void darkroom_blend_invert_raster_mask(float *mask, const float *raster_mask,
+                                        size_t obuffsize, float opacity);
+
 /*
  * Mask point-manipulation kernels — ports of the remaining DT_OMP_FOR loops
  * in src/develop/masks/{circle,ellipse,brush,path,gradient}.c. Each C loop

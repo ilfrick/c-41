@@ -27,6 +27,7 @@
 #include "develop/masks.h"
 #include "develop/tiling.h"
 #include "develop/imageop_math.h"
+#include "rust_ffi/darkroom_core.h"
 #include <math.h>
 
 typedef enum _develop_mask_post_processing
@@ -288,9 +289,7 @@ static void _refine_with_detail_mask(dt_iop_module_t *self,
        piece->pipe, self, DT_DEVICE_CPU, roi_in, roi_out);
 
   const size_t msize = (size_t)roi_out->width * roi_out->height;
-  DT_OMP_FOR_SIMD(aligned(mask, warp_mask : 64))
-  for(size_t idx =0; idx < msize; idx++)
-    mask[idx] = mask[idx] * CLIP(warp_mask[idx]);
+  darkroom_blend_refine_detail_mask(mask, warp_mask, msize);
   dt_free_align(warp_mask);
 
   return;
@@ -410,35 +409,7 @@ static void _develop_blend_process_mask_tone_curve(float *const restrict mask,
                                                    const float brightness,
                                                    const float opacity)
 {
-  // empirical mask threshold for fully transparent masks
-  const float mask_epsilon = 16.0f * FLT_EPSILON;
-  const float e = expf(3.f * contrast);
-
-  DT_OMP_FOR_SIMD(aligned(mask:64))
-  for(size_t k = 0; k < buffsize; k++)
-  {
-    float x = 2.0f * mask[k] / opacity - 1.0f;
-    if(1.f - brightness <= 0.f)
-      x = mask[k] <= mask_epsilon ? -1.f : 1.f;
-    else if(1.f + brightness <= 0.f)
-      x = mask[k] >= 1.f - mask_epsilon ? 1.f : -1.f;
-    else if(brightness > 0.f)
-    {
-      x = (x + brightness) / (1.f - brightness);
-      x = fminf(x, 1.f);
-    }
-    else
-    {
-      x = (x + brightness) / (1.f + brightness);
-      x = fmaxf(x, -1.f);
-    }
-    const float cval = 0.5f * (x * e / (1.f + (e - 1.f) * fabsf(x))) + 0.5f;
-    /*  we don't want *very* small masking values possibly resulting from above maths
-        so we make sure they above a threshold
-    */
-    const float mval = cval > 1e-6 ? cval : 0.0f;
-    mask[k] = CLIP(mval) * opacity;
-  }
+  darkroom_blend_mask_tone_curve(mask, buffsize, contrast, brightness, opacity);
 }
 
 static const char *_develop_blend_colorspace_to_str(const dt_develop_blend_colorspace_t type)
@@ -568,9 +539,7 @@ void dt_develop_blend_process(dt_iop_module_t *self,
       // invert if required
       if(d->raster_mask_invert)
       {
-        DT_OMP_FOR_SIMD(aligned(mask, raster_mask:64))
-        for(size_t i = 0; i < obuffsize; i++)
-          mask[i] = (1.0f - raster_mask[i]) * opacity;
+        darkroom_blend_invert_raster_mask(mask, raster_mask, obuffsize, opacity);
       }
       else
       {
@@ -838,10 +807,7 @@ static void _refine_with_detail_mask_cl(dt_iop_module_t *self,
        "refine with detail mask", piece->pipe, self, devid, roi_in, roi_out);
 
   const size_t msize = (size_t)roi_out->width * roi_out->height;
-  DT_OMP_FOR_SIMD(aligned(mask, warp_mask : 64))
-  for(size_t idx = 0; idx < msize; idx++)
-    mask[idx] = mask[idx] * CLIP(warp_mask[idx]);
-
+  darkroom_blend_refine_detail_mask(mask, warp_mask, msize);
   dt_free_align(warp_mask);
   return;
 
@@ -1068,9 +1034,7 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
       // invert if required
       if(d->raster_mask_invert)
       {
-        DT_OMP_FOR_SIMD(aligned(mask, raster_mask:64))
-        for(size_t i = 0; i < obuffsize; i++)
-          mask[i] = (1.0f - raster_mask[i]) * opacity;
+        darkroom_blend_invert_raster_mask(mask, raster_mask, obuffsize, opacity);
       }
       else
       {

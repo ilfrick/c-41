@@ -3203,3 +3203,39 @@ includes (`common/debug.h`, `common/gaussian.h`, `common/imagebuf.h`,
 lib_darktable` linked `bin/libdarktable.so` successfully (323/323, 0 errors).
 No `-Werror` issues in m4-160's changed files. Rust Docker CI (ci-local.sh)
 remains green from the m4-160 push (this change is C-only).
+
+---
+
+## 2026-08-28 09:25 UTC — m4-161: Blend mask post-processing FFI ports
+
+**What.** Ported three flat element-wise DT_OMP_FOR_SIMD loops from blend.c to
+`c41-core/src/blend.rs`, the last m4-16x module targeting blend.c.
+- `refine_detail_mask` — `mask[k] *= clamp(warp_mask[k])`, port of
+  blend.c:~291 (CPU) and blend.c:~841 (CL) `_refine_with_detail_mask`.
+- `mask_tone_curve` — sigmoid contrast/brightness tone-curve, port of
+  blend.c:417–441 `_develop_blend_process_mask_tone_curve`.
+- `invert_raster_mask` — `mask[k] = (1.0 - raster_mask[k]) * opacity`, port of
+  blend.c:~571 (CPU) and blend.c:~1071 (CL) raster-mask inversion.
+Each kernel has an FFI wrapper with null/zero/i32::MAX guards, a reference
+implementation for assert_eq! self-consistency tests, and 16 unit+integration
+tests (LCG-fuzz, FFI round-trip, edge cases including brightness=±1.0).
+- `darkroom_core.h`: added three FFI declarations with "Replaces the
+  DT_OMP_FOR_SIMD loop at blend.c:NNN" doc comments.
+- `blend.c`: replaced all four DT_OMP_FOR_SIMD loops (CPU refine, CL refine,
+  CPU invert, CL invert) with FFI calls; added
+  `#include "rust_ffi/darkroom_core.h"`; removed now-unused `mask_epsilon`
+  and `e` locals from `_develop_blend_process_mask_tone_curve`.
+
+**Verified.** `scripts/ci-local.sh` — cargo check ✓, cargo clippy ✓,
+cargo test (999 passed, 0 failed in c41-core) ✓, release build ✓.
+
+**Notes.** Senior review by fricktrade-architect flagged two issues found
+before CI: (1) missing `#include "rust_ffi/darkroom_core.h"` in blend.c —
+hard compilation failure under -Werror; (2) CL path `_refine_with_detail_mask_cl`
+loop at blend.c:809 was missed in the initial port. Both fixed. CI also
+caught a bad test expectation: `mask_tone_curve_clamps_below_threshold` used
+mask=0.5 with contrast=-20 and expected near-zero, but at x=0 the sigmoid
+always evaluates to 0.5 regardless of `e` (only the slope is affected).
+Fixed by using mask=0.0 (x=-1) which does produce near-zero. The `ref_*`
+dead-code warnings are consistent with the existing pattern in detail.rs
+and point.rs — out of scope per CLAUDE.md.
