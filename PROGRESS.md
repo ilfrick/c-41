@@ -3239,3 +3239,57 @@ always evaluates to 0.5 regardless of `e` (only the slope is affected).
 Fixed by using mask=0.0 (x=-1) which does produce near-zero. The `ref_*`
 dead-code warnings are consistent with the existing pattern in detail.rs
 and point.rs — out of scope per CLAUDE.md.
+
+---
+
+## 2026-08-28 11:25 UTC — m4-162: Flat element-wise imagebuf FFI ports
+
+**What.** Ported 7 flat `DT_OMP_FOR_SIMD` element-wise loops from
+`src/common/imagebuf.c` to Rust FFI in `c41-core/src/imagebuf.rs`, extending
+the m4-161 blend.rs pattern to the image buffer utility layer.
+
+- Seven kernel functions: `scaled_copy` (`buf[k] = scale * src[k]`),
+  `add_const` (`buf[k] += value`), `add_image` (`buf[k] += other[k]`),
+  `sub_image` (`buf[k] -= other[k]`), `invert` (`buf[k] = max - buf[k]`),
+  `mul_const` (`buf[k] *= value`), `linear_blend`
+  (`buf[k] = lambda*buf[k] + (1-lambda)*other[k]`).
+- Seven `#[no_mangle] pub unsafe extern "C"` FFI exports with null-pointer
+  guards and `n > i32::MAX` bounds checks.
+- Seven `ref_*` reference implementations (marked `#[allow(dead_code)]`) for
+  assert_eq! self-consistency tests.
+- 22 unit tests: basic correctness (including negative values, zero scale),
+  LCG-random bit-exactness (Rust-vs-Rust), FFI round-trip, null guard, zero-n
+  guard.
+- `darkroom_core.h`: 7 FFI declarations with "Replaces the DT_OMP_FOR_SIMD loop
+  at imagebuf.c:NNN" doc comments.
+- `imagebuf.c`: 7 `DT_OMP_FOR_SIMD` loops replaced with single FFI calls;
+  added `#include "rust_ffi/darkroom_core.h"`.
+- `dt_iop_image_copy` (uses `DT_OMP_FOR` with `copy_pixel_nontemporal`) and
+  `dt_iop_image_fill` (uses `DT_OMP_FOR` + `DT_OMP_SIMD`) were NOT ported —
+  they use thread-managed parallel paths, not the `DT_OMP_FOR_SIMD` pattern.
+
+**Verified.** `scripts/ci-local.sh` — cargo check ✓, cargo clippy ✓,
+cargo test (1034 passed, 0 failed in c41-core) ✓, release build ✓.
+
+**Notes.** Senior review by fricktrade-architect flagged two issues applied
+before commit:
+1. **Doc comment inaccuracy (P0.2)**: Module docs claimed "the Rust kernels
+   handle parallelism internally via the caller's existing threading model" —
+   factually incorrect; the Rust kernels are single-threaded sequential loops
+   (LLVM auto-vectorization at `-O3` only). Corrected the doc to accurately
+   describe the threading model, matching m4-161 blend.rs.
+2. **FMA contraction risk (P0.1)**: `linear_blend` (`lambda*buf[k] +
+   lambda_1*other[k]`) is a multiply-add pattern susceptible to FMA contraction
+   under GCC `-ffast-math`. The Rust kernel uses two separate operations
+   (matching the C sequential fallback), but the C parallel path may contract
+   to `vfmadd132ps` (one rounding). Documented this in the module docs; marked
+   as a known ≤1-ULP difference on some pixels for this one non-bit-exact case.
+3. **Missing `#[allow(dead_code)]` (P1.1)**: `ref_scaled_copy` was the only
+   one of 7 `ref_*` functions missing the attribute. Added for consistency.
+4. **Tautological tests (P1.2)**: The Rust-vs-Rust reference tests are
+   structurally identical (tautological). This is a systemic issue across
+   the project (blend.rs has the same pattern) — tracked as a future
+   cross-language C-vs-Rust test harness improvement.
+5. **Initial test failure**: `add_const_negative` test used `assert_eq!` on
+   floats (`0.5f32 + (-0.3f32)` ≠ `0.2f32` exactly in IEEE 754). Fixed by
+   using approximate comparison (`abs() < 1e-6`).

@@ -3216,6 +3216,35 @@ void darkroom_blend_mask_tone_curve(float *mask, size_t buffsize,
 void darkroom_blend_invert_raster_mask(float *mask, const float *raster_mask,
                                         size_t obuffsize, float opacity);
 
+/* Image buffer element-wise operations — ports of the DT_OMP_FOR_SIMD loops
+ * in src/common/imagebuf.c. Each replaces a flat SIMD-friendly element-wise
+ * loop over a width*height*ch float buffer.
+ */
+
+/* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:257: buf[k] = scale * src[k] */
+void darkroom_imagebuf_scaled_copy(float *buf, const float *src, size_t n,
+                                    float scale);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:327: buf[k] += value */
+void darkroom_imagebuf_add_const(float *buf, size_t n, float value);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:355: buf[k] += other[k] */
+void darkroom_imagebuf_add_image(float *buf, const float *other, size_t n);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:383: buf[k] -= other[k] */
+void darkroom_imagebuf_sub_image(float *buf, const float *other, size_t n);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:411: buf[k] = max - buf[k] */
+void darkroom_imagebuf_invert(float *buf, size_t n, float max_value);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:439: buf[k] *= value */
+void darkroom_imagebuf_mul_const(float *buf, size_t n, float value);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:470:
+ * buf[k] = lambda*buf[k] + (1-lambda)*other[k] */
+void darkroom_imagebuf_linear_blend(float *buf, const float *other, size_t n,
+                                     float lambda);
+
 /*
  * Mask point-manipulation kernels — ports of the remaining DT_OMP_FOR loops
  * in src/develop/masks/{circle,ellipse,brush,path,gradient}.c. Each C loop

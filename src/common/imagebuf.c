@@ -18,6 +18,7 @@
 
 #include <stdarg.h>
 #include "common/imagebuf.h"
+#include "rust_ffi/darkroom_core.h"
 
 static size_t parallel_imgop_minimum = 500000;
 static size_t parallel_imgop_maxthreads = 4;
@@ -245,25 +246,8 @@ void dt_iop_image_scaled_copy(float *const restrict buf,
                               const size_t ch)
 {
   const size_t nfloats = width * height * ch;
-#ifdef _OPENMP
-  if(nfloats > parallel_imgop_minimum)	// is the copy big enough to outweigh threading overhead?
-  {
-    // we can gain a little by using a small number of threads in
-    // parallel, but not much since the memory bus quickly saturates
-    // (basically, each core can saturate a memory channel, so a
-    // system with quad-channel memory won't be able to take advantage
-    // of more than four cores).
-    const int nthreads = MIN(dt_get_num_threads(), parallel_imgop_maxthreads);
-    DT_OMP_FOR_SIMD(num_threads(nthreads) aligned(buf, src : 16))
-    for(size_t k = 0; k < nfloats; k++)
-      buf[k] = scale * src[k];
-    return;
-  }
-#endif // _OPENMP
-  // no OpenMP, or image too small to bother parallelizing
-  DT_OMP_SIMD(aligned(buf, src : 16))
-  for(size_t k = 0; k < nfloats; k++)
-    buf[k] = scale * src[k];
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_imagebuf_scaled_copy(buf, src, nfloats, scale);
 }
 
 void dt_iop_image_fill(float *const buf,
@@ -315,25 +299,8 @@ void dt_iop_image_add_const(float *const buf,
                             const size_t ch)
 {
   const size_t nfloats = width * height * ch;
-#ifdef _OPENMP
-  if(nfloats > parallel_imgop_minimum)	// is the copy big enough to outweigh threading overhead?
-  {
-    // we can gain a little by using a small number of threads in
-    // parallel, but not much since the memory bus quickly saturates
-    // (basically, each core can saturate a memory channel, so a
-    // system with quad-channel memory won't be able to take advantage
-    // of more than four cores).
-    const int nthreads = MIN(dt_get_num_threads(), parallel_imgop_maxthreads);
-    DT_OMP_FOR_SIMD(num_threads(nthreads))
-    for(size_t k = 0; k < nfloats; k++)
-      buf[k] += add_value;
-    return;
-  }
-#endif // _OPENMP
-  // no OpenMP, or image too small to bother parallelizing
-  DT_OMP_SIMD(aligned(buf:16))
-  for(size_t k = 0; k < nfloats; k++)
-    buf[k] += add_value;
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_imagebuf_add_const(buf, nfloats, add_value);
 }
 
 void dt_iop_image_add_image(float *const buf,
@@ -343,25 +310,8 @@ void dt_iop_image_add_image(float *const buf,
                             const size_t ch)
 {
   const size_t nfloats = width * height * ch;
-#ifdef _OPENMP
-  if(nfloats > parallel_imgop_minimum)	// is the copy big enough to outweigh threading overhead?
-  {
-    // we can gain a little by using a small number of threads in
-    // parallel, but not much since the memory bus quickly saturates
-    // (basically, each core can saturate a memory channel, so a
-    // system with quad-channel memory won't be able to take advantage
-    // of more than four cores).
-    const int nthreads = MIN(dt_get_num_threads(), parallel_imgop_maxthreads);
-    DT_OMP_FOR_SIMD(num_threads(nthreads) aligned(buf, other_image : 16))
-    for(size_t k = 0; k < nfloats; k++)
-      buf[k] += other_image[k];
-    return;
-  }
-#endif // _OPENMP
-  // no OpenMP, or image too small to bother parallelizing
-  DT_OMP_SIMD(aligned(buf, other_image : 16))
-  for(size_t k = 0; k < nfloats; k++)
-    buf[k] += other_image[k];
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_imagebuf_add_image(buf, other_image, nfloats);
 }
 
 void dt_iop_image_sub_image(float *const buf,
@@ -371,25 +321,8 @@ void dt_iop_image_sub_image(float *const buf,
                             const size_t ch)
 {
   const size_t nfloats = width * height * ch;
-#ifdef _OPENMP
-  if(nfloats > parallel_imgop_minimum)	// is the copy big enough to outweigh threading overhead?
-  {
-    // we can gain a little by using a small number of threads in
-    // parallel, but not much since the memory bus quickly saturates
-    // (basically, each core can saturate a memory channel, so a
-    // system with quad-channel memory won't be able to take advantage
-    // of more than four cores).
-    const int nthreads = MIN(dt_get_num_threads(), parallel_imgop_maxthreads);
-    DT_OMP_FOR_SIMD(num_threads(nthreads) aligned(buf, other_image : 16))
-    for(size_t k = 0; k < nfloats; k++)
-      buf[k] -= other_image[k];
-    return;
-  }
-#endif // _OPENMP
-  // no OpenMP, or image too small to bother parallelizing
-  DT_OMP_SIMD(aligned(buf, other_image : 16))
-  for(size_t k = 0; k < nfloats; k++)
-    buf[k] -= other_image[k];
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_imagebuf_sub_image(buf, other_image, nfloats);
 }
 
 void dt_iop_image_invert(float *const buf,
@@ -399,25 +332,8 @@ void dt_iop_image_invert(float *const buf,
                          const size_t ch)
 {
   const size_t nfloats = width * height * ch;
-#ifdef _OPENMP
-  if(nfloats > parallel_imgop_minimum)	// is the copy big enough to outweigh threading overhead?
-  {
-    // we can gain a little by using a small number of threads in
-    // parallel, but not much since the memory bus quickly saturates
-    // (basically, each core can saturate a memory channel, so a
-    // system with quad-channel memory won't be able to take advantage
-    // of more than four cores).
-    const int nthreads = MIN(dt_get_num_threads(), parallel_imgop_maxthreads);
-    DT_OMP_FOR_SIMD(num_threads(nthreads) aligned(buf:16))
-    for(size_t k = 0; k < nfloats; k++)
-      buf[k] = max_value - buf[k];
-    return;
-  }
-#endif // _OPENMP
-  // no OpenMP, or image too small to bother parallelizing
-  DT_OMP_SIMD(aligned(buf:16))
-  for(size_t k = 0; k < nfloats; k++)
-    buf[k] = max_value - buf[k];
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_imagebuf_invert(buf, nfloats, max_value);
 }
 
 void dt_iop_image_mul_const(float *const buf,
@@ -427,25 +343,8 @@ void dt_iop_image_mul_const(float *const buf,
                             const size_t ch)
 {
   const size_t nfloats = width * height * ch;
-#ifdef _OPENMP
-  if(nfloats > parallel_imgop_minimum)	// is the copy big enough to outweigh threading overhead?
-  {
-    // we can gain a little by using a small number of threads in
-    // parallel, but not much since the memory bus quickly saturates
-    // (basically, each core can saturate a memory channel, so a
-    // system with quad-channel memory won't be able to take advantage
-    // of more than four cores).
-    const int nthreads = MIN(dt_get_num_threads(), parallel_imgop_maxthreads);
-    DT_OMP_FOR_SIMD(num_threads(nthreads) aligned(buf:16))
-    for(size_t k = 0; k < nfloats; k++)
-      buf[k] *= mul_value;
-    return;
-  }
-#endif // _OPENMP
-  // no OpenMP, or image too small to bother parallelizing
-  DT_OMP_SIMD(aligned(buf:16))
-  for(size_t k = 0; k < nfloats; k++)
-    buf[k] *= mul_value;
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_imagebuf_mul_const(buf, nfloats, mul_value);
 }
 
 // elementwise: buf = lammda*buf + (1-lambda)*other
@@ -457,26 +356,8 @@ void dt_iop_image_linear_blend(float *const restrict buf,
                                const size_t ch)
 {
   const size_t nfloats = width * height * ch;
-  const float lambda_1 = 1.0f - lambda;
-#ifdef _OPENMP
-  if(nfloats > parallel_imgop_minimum/2) // is the task big enough to outweigh threading overhead?
-  {
-    // we can gain a little by using a small number of threads in
-    // parallel, but not much since the memory bus quickly saturates
-    // (basically, each core can saturate a memory channel, so a
-    // system with quad-channel memory won't be able to take advantage
-    // of more than four cores).
-    const int nthreads = MIN(dt_get_num_threads(), parallel_imgop_maxthreads);
-    DT_OMP_FOR_SIMD(num_threads(nthreads) aligned(buf:16))
-    for(size_t k = 0; k < nfloats; k++)
-      buf[k] = lambda*buf[k] + lambda_1*other[k];
-    return;
-  }
-#endif // _OPENMP
-  // no OpenMP, or image too small to bother parallelizing
-  DT_OMP_SIMD(aligned(buf:16))
-  for(size_t k = 0; k < nfloats; k++)
-    buf[k] = lambda*buf[k] + lambda_1*other[k];
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_imagebuf_linear_blend(buf, other, nfloats, lambda);
 }
 
 // perform timings to determine the optimal threshold for switching to

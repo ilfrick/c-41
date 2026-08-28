@@ -14,6 +14,7 @@ pub mod exif;
 pub mod gaussian;
 pub mod geometry;
 pub mod icc;
+pub mod imagebuf;
 pub mod interp;
 pub mod iop;
 pub mod locallaplacian;
