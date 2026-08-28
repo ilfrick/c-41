@@ -1,6 +1,7 @@
-//! Mask post-processing kernels — port of the OMP loops in `src/develop/blend.c`.
+//! Mask post-processing kernels — port of the OMP loops in `src/develop/blend.c`
+//! and `src/develop/blends/blendif_*.c`.
 //!
-//! Three flat element-wise loops are ported, each operating on a single-channel
+//! Four flat element-wise loops are ported, each operating on a single-channel
 //! (1 float per pixel) mask buffer:
 //!
 //! - [`refine_detail_mask`] — `mask[k] *= clip(warp_mask[k])`, the detail-mask
@@ -9,6 +10,10 @@
 //!   `_develop_blend_process_mask_tone_curve` (blend.c:417).
 //! - [`invert_raster_mask`] — `mask[k] = (1.0 - raster_mask[k]) * opacity`, the
 //!   inverted raster-mask fill (blend.c:571 / blend.c:1071 CL path).
+//! - [`invert_and_scale`] — `mask[k] = scale * (1.0 - mask[k])`, the inverted
+//!   mask with global opacity in `dt_develop_blendif_raw_make_mask`
+//!   (blendif_raw.c:61) and `dt_develop_blendif_rgb_jzczhz_make_mask`
+//!   (blendif_rgb_jzczhz.c:293). Both are identical in-place operations.
 //!
 //! Bit-exactness notes.
 //! - `CLIP(x)` (`math.h:73`) → `f32::clamp(0.0, 1.0)`. Mask values are never
@@ -20,6 +25,8 @@
 //! - `fminf`/`fmaxf` → `f32::min`/`f32::max`; `fabsf` → `f32::abs`.
 //! - Expression order is preserved verbatim: `2.0 * mask[k] / opacity - 1.0`
 //!   evaluates left-to-right as `((2.0 * mask[k]) / opacity) - 1.0`.
+//! - No FMA contraction: `scale * (1.0 - mask[k])` has no `a*b + c` pattern,
+//!   so neither GCC (even with `-ffast-math`) nor LLVM can fuse into an FMA.
 
 /// `mask[k] *= clamp(warp_mask[k], 0, 1)` for each `k` in `0..n`.
 ///
@@ -92,6 +99,19 @@ pub fn invert_raster_mask(
     }
 }
 
+/// `mask[k] = scale * (1.0 - mask[k])` in place for each `k` in `0..n`.
+///
+/// Port of the `DT_OMP_FOR_SIMD` loop at blendif_raw.c:61 and
+/// blendif_rgb_jzczhz.c:293. Both are identical in-place operations: when the
+/// blend mask is inverted (`DEVELOP_COMBINE_INV`), the mask buffer is inverted
+/// and scaled by the global opacity in a single pass.
+pub fn invert_and_scale(mask: &mut [f32], n: usize, scale: f32) {
+    let m = n.min(mask.len());
+    for k in 0..m {
+        mask[k] = scale * (1.0f32 - mask[k]);
+    }
+}
+
 // ── FFI exports ─────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -144,9 +164,25 @@ pub unsafe extern "C" fn darkroom_blend_invert_raster_mask(
     invert_raster_mask(mask_slice, raster_slice, n, opacity);
 }
 
+/// # Safety
+/// `mask` must hold at least `n` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blend_invert_and_scale(
+    mask: *mut f32,
+    n: usize,
+    scale: f32,
+) {
+    if mask.is_null() || n == 0 || n > i32::MAX as usize {
+        return;
+    }
+    let mask_slice = std::slice::from_raw_parts_mut(mask, n);
+    invert_and_scale(mask_slice, n, scale);
+}
+
 // ── Reference implementations for bit-exactness tests ────────────────────────
 // These mirror the kernel bodies exactly so we can validate via assert_eq!.
 
+#[allow(dead_code)]
 fn ref_refine_detail_mask(
     mask: &mut [f32],
     warp_mask: &[f32],
@@ -158,6 +194,7 @@ fn ref_refine_detail_mask(
     }
 }
 
+#[allow(dead_code)]
 fn ref_mask_tone_curve(
     mask: &mut [f32],
     n: usize,
@@ -187,6 +224,7 @@ fn ref_mask_tone_curve(
     }
 }
 
+#[allow(dead_code)]
 fn ref_invert_raster_mask(
     mask: &mut [f32],
     raster_mask: &[f32],
@@ -196,6 +234,14 @@ fn ref_invert_raster_mask(
     let m = n.min(mask.len()).min(raster_mask.len());
     for k in 0..m {
         mask[k] = (1.0f32 - raster_mask[k]) * opacity;
+    }
+}
+
+#[allow(dead_code)]
+fn ref_invert_and_scale(mask: &mut [f32], n: usize, scale: f32) {
+    let m = n.min(mask.len());
+    for k in 0..m {
+        mask[k] = scale * (1.0f32 - mask[k]);
     }
 }
 
@@ -434,5 +480,76 @@ mod tests {
         unsafe {
             darkroom_blend_invert_raster_mask(std::ptr::null_mut(), std::ptr::null(), 10, 1.0);
         }
+    }
+
+    // ── invert_and_scale ───────────────────────────────────────────────────────
+
+    #[test]
+    fn invert_and_scale_uniform() {
+        let mut mask = vec![0.0f32; 4];
+        invert_and_scale(&mut mask, 4, 0.5);
+        // 0.5 * (1.0 - 0.0) = 0.5
+        assert_eq!(mask, vec![0.5f32; 4]);
+    }
+
+    #[test]
+    fn invert_and_scale_identity() {
+        let mut mask = vec![0.3f32, 0.7, 0.0, 1.0];
+        invert_and_scale(&mut mask, 4, 1.0);
+        // 1.0 * (1.0 - mask[k])
+        assert_eq!(mask, vec![0.7, 0.3, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn invert_and_scale_partial_opacity() {
+        let mut mask = vec![0.0f32, 1.0, 0.5, 0.25];
+        invert_and_scale(&mut mask, 4, 0.8);
+        // 0.8*(1-0)=0.8, 0.8*(1-1)=0, 0.8*(1-0.5)=0.4, 0.8*(1-0.25)=0.6
+        assert_eq!(mask, vec![0.8, 0.0, 0.4, 0.6]);
+    }
+
+    #[test]
+    fn invert_and_scale_matches_reference_over_lcg() {
+        let mut mask = vec![0.0f32; 256];
+        lcg_fill(&mut mask, 0xB0A7, 1.0);
+
+        let mut direct = mask.clone();
+        let mut reference = mask.clone();
+        invert_and_scale(&mut direct, 256, 0.75);
+        ref_invert_and_scale(&mut reference, 256, 0.75);
+        assert_eq!(direct, reference);
+    }
+
+    // ── FFI invert_and_scale ───────────────────────────────────────────────────
+
+    #[test]
+    fn ffi_invert_and_scale_round_trip() {
+        let mut src = vec![0.0f32; 64];
+        lcg_fill(&mut src, 0xC1D0, 1.0);
+
+        let mut ffi_mask = src.clone();
+        let mut direct_mask = src.clone();
+
+        unsafe {
+            darkroom_blend_invert_and_scale(ffi_mask.as_mut_ptr(), 64, 0.75);
+        }
+        invert_and_scale(&mut direct_mask, 64, 0.75);
+        assert_eq!(ffi_mask, direct_mask, "FFI invert_and_scale mismatch");
+    }
+
+    #[test]
+    fn ffi_invert_and_scale_null_guard() {
+        unsafe {
+            darkroom_blend_invert_and_scale(std::ptr::null_mut(), 10, 0.5);
+        }
+    }
+
+    #[test]
+    fn ffi_invert_and_scale_zero_n() {
+        let mut mask = vec![0.3f32; 4];
+        unsafe {
+            darkroom_blend_invert_and_scale(mask.as_mut_ptr(), 0, 0.5);
+        }
+        assert_eq!(mask, vec![0.3f32; 4]); // untouched
     }
 }

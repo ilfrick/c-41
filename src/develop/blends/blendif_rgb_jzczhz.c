@@ -30,6 +30,7 @@
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 #include <math.h>
 
 #define DT_BLENDIF_RGB_CH 4
@@ -290,9 +291,8 @@ void dt_develop_blendif_rgb_jzczhz_make_mask(dt_dev_pixelpipe_iop_t *piece,
     // mask is not conditional, invert the mask if required
     if(mask_inversed)
     {
-      DT_OMP_FOR_SIMD()
-      for(size_t x = 0; x < buffsize; x++)
-        mask[x] = global_opacity * (1.0f - mask[x]);
+      // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+      darkroom_blend_invert_and_scale(mask, buffsize, global_opacity);
     }
     else
     {

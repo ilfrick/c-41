@@ -3216,6 +3216,12 @@ void darkroom_blend_mask_tone_curve(float *mask, size_t buffsize,
 void darkroom_blend_invert_raster_mask(float *mask, const float *raster_mask,
                                         size_t obuffsize, float opacity);
 
+/* Replaces the DT_OMP_FOR_SIMD loop at blendif_raw.c:61 and
+ * blendif_rgb_jzczhz.c:293 (both identical in-place inversions):
+ *   mask[x] = global_opacity * (1.0f - mask[x]) for each x in 0..buffsize. */
+void darkroom_blend_invert_and_scale(float *mask, size_t buffsize,
+                                      float scale);
+
 /* Image buffer element-wise operations — ports of the DT_OMP_FOR_SIMD loops
  * in src/common/imagebuf.c. Each replaces a flat SIMD-friendly element-wise
  * loop over a width*height*ch float buffer.

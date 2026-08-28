@@ -3293,3 +3293,49 @@ before commit:
 5. **Initial test failure**: `add_const_negative` test used `assert_eq!` on
    floats (`0.5f32 + (-0.3f32)` ≠ `0.2f32` exactly in IEEE 754). Fixed by
    using approximate comparison (`abs() < 1e-6`).
+
+---
+
+## 2026-08-28 11:52 UTC — m4-163: Port invert_and_scale FFI (dual blendif paths)
+
+**What.** Ports two identical `DT_OMP_FOR_SIMD` loops from
+`blendif_raw.c:61` and `blendif_rgb_jzczhz.c:293` into a single
+`invert_and_scale` Rust kernel — `mask[k] = scale * (1.0 - mask[k])` in-place.
+- `crates/c41-core/src/blend.rs`: Added `invert_and_scale` kernel,
+  `darkroom_blend_invert_and_scale` FFI export (null/zero/i32::MAX guards),
+  `ref_invert_and_scale` reference impl, and 6 tests (uniform, identity,
+  partial-opacity, LCG-vs-ref bit-exact, FFI round-trip, null/zero-n guards).
+  Updated module doc to list 4 kernels; added FMA-safety note
+  ("no FMA contraction: `a*(1-x)` has no `a*b+c` pattern").
+  Added `#[allow(dead_code)]` to the 3 pre-existing ref functions in blend.rs
+  for consistency with the new `ref_invert_and_scale` (which already had it).
+- `src/rust_ffi/darkroom_core.h`: Added `darkroom_blend_invert_and_scale`
+  declaration after `darkroom_blend_invert_raster_mask`, with comment
+  referencing both C source line numbers.
+- `src/develop/blends/blendif_raw.c`: Added `#include "rust_ffi/darkroom_core.h"`;
+  replaced `DT_OMP_FOR_SIMD(aligned(mask:64))` loop with FFI call.
+- `src/develop/blends/blendif_rgb_jzczhz.c`: Same changes (uses
+  `DT_OMP_FOR_SIMD()` without alignment hint).
+
+**Verified.** `scripts/ci-local.sh` — cargo check ✓, cargo clippy ✓,
+cargo test (1041 passed, 0 failed in c41-core) ✓, release build ✓.
+EXIT_CODE=0. All 7 invert_and_scale tests pass.
+
+**Notes.** Senior review by fricktrade-architect (opus model) completed with
+one P1 recommendation applied before commit:
+1. **`#[allow(dead_code)]` inconsistency (P1)**: The new `ref_invert_and_scale`
+   already had `#[allow(dead_code)]` at line 235 — contradicting the task
+   description which claimed it "also omits it". The 3 existing ref functions
+   in blend.rs (lines 183, 194, 223) lacked the attribute and produced
+   dead_code warnings. Added `#[allow(dead_code)]` to all three for
+   consistency. The new function's attribute was already correct.
+2. **FMA-safety note (P2, optional)**: Added a bit-exactness note documenting
+   that `scale * (1.0 - mask[k])` has no `a*b + c` pattern, so no FMA
+   contraction is possible even under `-ffast-math`.
+3. **Parallelism trade-off accepted**: `DT_OMP_FOR_SIMD` expands to
+   `parallel for simd` (thread + SIMD). The Rust kernel is sequential, but
+   LLVM auto-vectorization at `opt-level = 3` recovers SIMD. This matches
+   the m4-161/m4-162 precedent.
+4. **No `-ffast-math` in build**: Confirmed no `-ffast-math` or
+   `-ffp-contract` flags in CMakeLists.txt or Docker — bit-exactness is
+   fully safe with no additional risk beyond expression-order preservation.
