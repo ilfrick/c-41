@@ -3391,3 +3391,51 @@ EXIT_CODE=0.
 - Verified C↔Rust constant match by cross-referencing: matrix values,
   D50_INV, LAB_EPSILON, LAB_KAPPA all bit-for-bit identical. `cbrtf(x)` in C
   = `x.cbrt()` in Rust (same libm symbol).
+
+---
+
+## 2026-08-29 12:30 UTC — m4-165: Port eigf variance-analysis correction loops
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Ported the two remaining `DT_OMP_FOR_SIMD` element-wise loops from
+`src/common/eigf.h` to Rust FFI kernels. `eigf.h` is included only by
+`toneequal.c` and `colorequal.c` (both already include `darkroom_core.h`), so
+no other translation units are affected.
+
+- `crates/c41-core/src/eigf.rs` (new): two kernels + FFI exports + reference
+  implementations + tests.
+  - `eigf_variance_correct_4c`: replaces the loop at eigf.h:115 inside
+    `eigf_variance_analysis`. After Gaussian blur, `out` has 4 channels per
+    element (E[guide], E[guide²], E[mask], E[guide·mask]); the kernel computes
+    variance `ch1 -= ch0²` and covariance `ch3 -= ch0*ch2`.
+  - `eigf_variance_correct_2c`: replaces the loop at eigf.h:160 inside
+    `eigf_variance_analysis_no_mask`. 2-channel variant: `ch1 -= ch0²`.
+- `src/common/eigf.h`: added `#include "rust_ffi/darkroom_core.h"`; replaced
+  both `DT_OMP_FOR_SIMD(aligned(out:64))` loops with single FFI call lines.
+- `src/rust_ffi/darkroom_core.h`: added declarations for
+  `darkroom_eigf_variance_correct_4c` and `darkroom_eigf_variance_correct_2c`.
+- `crates/c41-core/src/lib.rs`: registered `pub mod eigf;`.
+
+**Verified.** `scripts/ci-local.sh` — cargo check ✓, cargo clippy ✓,
+cargo test (403 passed, 0 failed) ✓, release build ✓. EXIT_CODE=0.
+
+**Notes.**
+- FMA contraction risk: the expressions `ch -= avg * avg` and `ch -= avg * other`
+  are multiply-subtract patterns. GCC 9's default `-ffp-contract=fast` for C99+
+  at `-O3` may contract these to FMA, while Rust's release profile does not
+  enable contraction. This produces ≤1 ULP difference on some pixels, same
+  trade-off as `linear_blend` in `imagebuf.rs`. `eigf.h` itself has no
+  `#pragma GCC optimize("fast-math")` — only `finite-math-only` (via
+  `extra_optimizations.h`), which does not enable contraction. Documentated
+  in the module-level docs.
+- Senior review by fricktrade-architect (opus): APPROVED with 1 P2 finding —
+  the `ref_eigf_variance_correct_*` functions were byte-for-byte identical
+  copies of the kernels (tautological tests). Fixed by rewriting the reference
+  implementations to use a different FP evaluation order (products computed
+  into temporaries first, then subtracted), creating genuine independent
+  validation. The basic correctness, LCG round-trip, FFI round-trip, and
+  null/zero-guard tests confirmed correct. No other findings.
+- The two `static inline` functions containing the FFI calls are inlined into
+  `fast_eigf_surface_blur` (which has `__DT_CLONE_TARGETS__`). External FFI
+  calls are link-time resolved and unaffected by CPU-target cloning. No issue.

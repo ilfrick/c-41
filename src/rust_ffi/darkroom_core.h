@@ -3298,6 +3298,14 @@ size_t darkroom_masks_gradient_guide_points(float *points, size_t count,
                                             float cosv, float sinv,
                                             float curvature);
 
+/* Replaces the DT_OMP_FOR_SIMD loop at eigf.h:115 (the variance/covariance
+ * correction in eigf_variance_analysis). */
+void darkroom_eigf_variance_correct_4c(float *buf, size_t n_elements);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at eigf.h:160 (the variance correction in
+ * eigf_variance_analysis_no_mask). */
+void darkroom_eigf_variance_correct_2c(float *buf, size_t n_elements);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

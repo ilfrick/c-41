@@ -20,6 +20,7 @@
 
 #include "common/fast_guided_filter.h"
 #include "common/gaussian.h"
+#include "rust_ffi/darkroom_core.h"
 
 /***
  * DOCUMENTATION
@@ -112,12 +113,8 @@ static inline void eigf_variance_analysis(const float *const restrict guide, // 
   dt_gaussian_blur_4c(g, in, out);
   dt_gaussian_free(g);
 
-  DT_OMP_FOR_SIMD(aligned(out:64))
-  for(size_t k = 0; k < Ndim; k++)
-  {
-    out[4 * k + 1] -= out[4 * k] * out[4 * k];
-    out[4 * k + 3] -= out[4 * k] * out[4 * k + 2];
-  }
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_eigf_variance_correct_4c(out, Ndim);
 
   dt_free_align(in);
 }
@@ -157,12 +154,8 @@ static inline void eigf_variance_analysis_no_mask(const float *const restrict gu
   dt_gaussian_blur(g, in, out);
   dt_gaussian_free(g);
 
-  DT_OMP_FOR_SIMD(aligned(out:64))
-  for(size_t k = 0; k < Ndim; k++)
-  {
-    const float avg = out[2 * k];
-    out[2 * k + 1] -= avg * avg;
-  }
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_eigf_variance_correct_2c(out, Ndim);
 
   dt_free_align(in);
 }
