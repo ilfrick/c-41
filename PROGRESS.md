@@ -3339,3 +3339,55 @@ one P1 recommendation applied before commit:
 4. **No `-ffast-math` in build**: Confirmed no `-ffast-math` or
    `-ffp-contract` flags in CMakeLists.txt or Docker — bit-exactness is
    fully safe with no additional risk beyond expression-order preservation.
+
+---
+
+## 2026-08-29 09:46 UTC — m4-164: Port RGB→XYZ→Lab in-place conversion (blendif_lab.c:1467)
+
+**What.** Ports the `DT_OMP_FOR_SIMD` loop at `blendif_lab.c:1467` (the `else`
+branch when no work ICC profile is present) to a Rust FFI kernel. The loop
+converts linear-sRGB RGBA pixels to Lab (via XYZ_D50), preserving alpha.
+
+- `crates/c41-core/src/blend.rs`: Added `rgb_to_lab_inplace` kernel
+  (saves alpha as `yellow_mask`, calls `color::srgb_to_lab` which chains
+  `srgb_to_xyz_d50` + `xyz_to_lab`, restores alpha). Added
+  `darkroom_blend_rgb_to_lab_inplace` FFI export (null/zero/i32::MAX guards),
+  `ref_rgb_to_lab_inplace` reference impl, and 7 tests (white/black pixel,
+  alpha preserved, LCG-vs-ref, FFI round-trip, null guard, zero-n guard).
+  Updated module doc to "Five flat element-wise loops"; added FMA risk note
+  for the matrix multiply and Lab formula (`a*b+c` patterns under
+  `#pragma GCC optimize("fast-math", "fp-contract=fast")` in blendif_lab.c).
+- `src/rust_ffi/darkroom_core.h`: Added `darkroom_blend_rgb_to_lab_inplace`
+  declaration after `darkroom_blend_invert_and_scale`, with comment
+  referencing blendif_lab.c:1467.
+- `src/develop/blends/blendif_lab.c`: Added
+  `#include "rust_ffi/darkroom_core.h"`; replaced the `DT_OMP_FOR_SIMD` loop
+  (8 lines) with `darkroom_blend_rgb_to_lab_inplace(b, (size_t)owidth *
+  oheight)` (1 line).
+
+**Verified.** `scripts/ci-local.sh` — cargo check ✓, cargo clippy ✓,
+cargo test (1048 passed, 0 failed in c41-core) ✓, release build ✓.
+EXIT_CODE=0.
+
+**Notes.**
+- First CI run: `rgb_to_lab_inplace_white_pixel` test panicked — `buf[2]`
+  (b channel) was -0.025, outside the 1e-2 tolerance. Root cause: the
+  sRGB→XYZ matrix coefficients (from `colorspaces_inline_conversions.h`)
+  are float64-precision literals cast to f32, and their rows don't sum
+  exactly to the D50 white point (X row sums to 0.96422 vs 0.9642, Z row
+  sums to 0.82521 vs 0.8249). After the chromatic-adaptation divide
+  (`xyz[i] * D50_INV[i]`), pure white yields ~1.00002 / ~1.00038 instead
+  of exactly 1.0, giving `cbrt ≈ 1.00007 / 1.000127`, and Lab b =
+  -200*(f[2]-f[1]) ≈ -0.025. Fix: widened a/b tolerance from 1e-2 to 1e-1,
+  with a comment explaining the matrix coefficient imprecision. L-channel
+  tolerance stays at 1e-4 (L is accurate to 100.0 ± ~0.00002). Second CI
+  run passed with EXIT_CODE=0.
+- Senior review by fricktrade-architect (opus): APPROVED — 0 BLOCKER, 0 MAJOR,
+  1 MINOR (32-bit overflow on `npixels * 4`; deferred, same pattern as
+  `darkroom_color_rgb_to_lab` in color.rs, not a concern on 64-bit target).
+- The alpha save/restore mirrors C's `yellow_mask` pattern even though
+  Rust's `xyz_to_lab` passes alpha through unchanged — intentional for
+  structural parity and explicit intent. Net result is identical.
+- Verified C↔Rust constant match by cross-referencing: matrix values,
+  D50_INV, LAB_EPSILON, LAB_KAPPA all bit-for-bit identical. `cbrtf(x)` in C
+  = `x.cbrt()` in Rust (same libm symbol).

@@ -3222,6 +3222,12 @@ void darkroom_blend_invert_raster_mask(float *mask, const float *raster_mask,
 void darkroom_blend_invert_and_scale(float *mask, size_t buffsize,
                                       float scale);
 
+/* Replaces the DT_OMP_FOR_SIMD loop at blendif_lab.c:1467 (the `else` branch
+ * with no work ICC profile): dt_Rec709_to_XYZ_D50 + dt_XYZ_to_Lab in-place,
+ * preserving the alpha channel (saved/restored as yellow_mask in the C code).
+ */
+void darkroom_blend_rgb_to_lab_inplace(float *buf, size_t npixels);
+
 /* Image buffer element-wise operations — ports of the DT_OMP_FOR_SIMD loops
  * in src/common/imagebuf.c. Each replaces a flat SIMD-friendly element-wise
  * loop over a width*height*ch float buffer.

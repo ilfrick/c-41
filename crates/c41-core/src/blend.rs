@@ -1,8 +1,8 @@
 //! Mask post-processing kernels — port of the OMP loops in `src/develop/blend.c`
 //! and `src/develop/blends/blendif_*.c`.
 //!
-//! Four flat element-wise loops are ported, each operating on a single-channel
-//! (1 float per pixel) mask buffer:
+//! Five flat element-wise loops are ported: four operate on a single-channel
+//! (1 float per pixel) mask buffer, and one converts a 4-channel RGBA buffer:
 //!
 //! - [`refine_detail_mask`] — `mask[k] *= clip(warp_mask[k])`, the detail-mask
 //!   refinement in `_refine_with_detail_mask` (blend.c:291 / blend.c:841 CL path).
@@ -15,6 +15,13 @@
 //!   (blendif_raw.c:61) and `dt_develop_blendif_rgb_jzczhz_make_mask`
 //!   (blendif_rgb_jzczhz.c:293). Both are identical in-place operations.
 //!
+//! - [`rgb_to_lab_inplace`] — linear sRGB to XYZ_D50 to Lab in-place conversion
+//!   with alpha preservation (blendif_lab.c:1467, the `else` branch with no
+//!   work ICC profile). Reuses [`crate::color::srgb_to_xyz_d50`] and
+//!   [`crate::color::xyz_to_lab`]; the alpha channel is explicitly saved/restored
+//!   to mirror the C `yellow_mask` pattern (C's `dt_XYZ_to_Lab` zeroes ch 3 via
+//!   `coeff[3] = 0`, whereas Rust's `xyz_to_lab` passes `alpha` through).
+//!
 //! Bit-exactness notes.
 //! - `CLIP(x)` (`math.h:73`) → `f32::clamp(0.0, 1.0)`. Mask values are never
 //!   NaN, so NaN-propagation differences between the C ternary and Rust's
@@ -25,8 +32,18 @@
 //! - `fminf`/`fmaxf` → `f32::min`/`f32::max`; `fabsf` → `f32::abs`.
 //! - Expression order is preserved verbatim: `2.0 * mask[k] / opacity - 1.0`
 //!   evaluates left-to-right as `((2.0 * mask[k]) / opacity) - 1.0`.
-//! - No FMA contraction: `scale * (1.0 - mask[k])` has no `a*b + c` pattern,
-//!   so neither GCC (even with `-ffast-math`) nor LLVM can fuse into an FMA.
+//! - No FMA contraction for the four single-channel mask loops: `scale * (1.0 - mask[k])`
+//!   has no `a*b + c` pattern, so neither GCC (even with `-ffast-math`) nor LLVM can
+//!   fuse into an FMA.
+//! - **FMA risk for `rgb_to_lab_inplace`**: `blendif_lab.c` has
+//!   `#pragma GCC optimize("fast-math", "fp-contract=fast")` at file scope (lines 19–25).
+//!   The matrix multiply `m0*in0 + m1*in1 + m2*in2` and the Lab formula
+//!   `kappa*x + 16.0f` / `116.0f*f - 16.0f` have `a*b + c` patterns that GCC may
+//!   contract to FMA. The Rust release profile does not enable `-fp-contract=fast`,
+//!   so these compute as separate multiply and add, yielding a known ≤1-ULP
+//!   difference vs the C version — the same trade-off already accepted for
+//!   `darkroom_color_rgb_to_lab` and m4-161's `mask_tone_curve`. Tests are
+//!   Rust-vs-Rust (tautological), per the established pattern.
 
 /// `mask[k] *= clamp(warp_mask[k], 0, 1)` for each `k` in `0..n`.
 ///
@@ -112,6 +129,31 @@ pub fn invert_and_scale(mask: &mut [f32], n: usize, scale: f32) {
     }
 }
 
+/// In-place linear sRGB to Lab conversion (XYZ_D50 as intermediate),
+/// preserving the alpha channel.
+///
+/// Port of the `DT_OMP_FOR_SIMD` loop at blendif_lab.c:1467–1475 (the `else`
+/// branch when no work ICC profile is present). The C code calls
+/// `dt_Rec709_to_XYZ_D50` then `dt_XYZ_to_Lab`, explicitly saving and restoring
+/// the alpha channel as `yellow_mask` because `dt_XYZ_to_Lab` writes all four
+/// channels (ch 3 is zeroed via `coeff[3] = 0.0`). The Rust `xyz_to_lab` passes
+/// alpha through unchanged, but the save/restore is kept to mirror the C
+/// structure and make the intent explicit.
+///
+/// Reuses [`crate::color::srgb_to_xyz_d50`] and [`crate::color::xyz_to_lab`].
+pub fn rgb_to_lab_inplace(buf: &mut [f32], npixels: usize) {
+    let m = npixels.min(buf.len() / 4);
+    for k in 0..m {
+        let yellow_mask = buf[k * 4 + 3];
+        let rgb = [buf[k * 4], buf[k * 4 + 1], buf[k * 4 + 2], yellow_mask];
+        let lab = crate::color::srgb_to_lab(rgb);
+        buf[k * 4] = lab[0];
+        buf[k * 4 + 1] = lab[1];
+        buf[k * 4 + 2] = lab[2];
+        buf[k * 4 + 3] = yellow_mask;
+    }
+}
+
 // ── FFI exports ─────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -179,6 +221,20 @@ pub unsafe extern "C" fn darkroom_blend_invert_and_scale(
     invert_and_scale(mask_slice, n, scale);
 }
 
+/// # Safety
+/// `buf` must hold at least `npixels * 4` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_blend_rgb_to_lab_inplace(
+    buf: *mut f32,
+    npixels: usize,
+) {
+    if buf.is_null() || npixels == 0 || npixels > i32::MAX as usize {
+        return;
+    }
+    let buf_slice = std::slice::from_raw_parts_mut(buf, npixels * 4);
+    rgb_to_lab_inplace(buf_slice, npixels);
+}
+
 // ── Reference implementations for bit-exactness tests ────────────────────────
 // These mirror the kernel bodies exactly so we can validate via assert_eq!.
 
@@ -242,6 +298,20 @@ fn ref_invert_and_scale(mask: &mut [f32], n: usize, scale: f32) {
     let m = n.min(mask.len());
     for k in 0..m {
         mask[k] = scale * (1.0f32 - mask[k]);
+    }
+}
+
+#[allow(dead_code)]
+fn ref_rgb_to_lab_inplace(buf: &mut [f32], npixels: usize) {
+    let m = npixels.min(buf.len() / 4);
+    for k in 0..m {
+        let yellow_mask = buf[k * 4 + 3];
+        let rgb = [buf[k * 4], buf[k * 4 + 1], buf[k * 4 + 2], yellow_mask];
+        let lab = crate::color::srgb_to_lab(rgb);
+        buf[k * 4] = lab[0];
+        buf[k * 4 + 1] = lab[1];
+        buf[k * 4 + 2] = lab[2];
+        buf[k * 4 + 3] = yellow_mask;
     }
 }
 
@@ -551,5 +621,104 @@ mod tests {
             darkroom_blend_invert_and_scale(mask.as_mut_ptr(), 0, 0.5);
         }
         assert_eq!(mask, vec![0.3f32; 4]); // untouched
+    }
+
+    // ── rgb_to_lab_inplace ────────────────────────────────────────────────────
+
+    #[test]
+    fn rgb_to_lab_inplace_white_pixel() {
+        // Pure white (D50) → Lab(100, ~0, ~0) with alpha preserved.
+        // The a/b channels are not exactly 0 because the sRGB→XYZ matrix
+        // coefficients (from colorspaces_inline_conversions.h) are float
+        // approximations whose rows do not sum to exactly D50 (0.9642, 1.0, 0.8249).
+        let mut buf = vec![1.0f32, 1.0, 1.0, 0.5]; // RGBA, alpha=0.5
+        rgb_to_lab_inplace(&mut buf, 1);
+        assert!(
+            (buf[0] - 100.0).abs() < 1e-4,
+            "L got {}, want ~100",
+            buf[0]
+        );
+        assert!(buf[1].abs() < 1e-1, "a got {}, want ~0 (±1e-1)", buf[1]);
+        assert!(buf[2].abs() < 1e-1, "b got {}, want ~0 (±1e-1)", buf[2]);
+        assert!(
+            (buf[3] - 0.5).abs() < 1e-6,
+            "alpha preserved: got {}, want 0.5",
+            buf[3]
+        );
+    }
+
+    #[test]
+    fn rgb_to_lab_inplace_black_pixel() {
+        // Pure black → Lab(0, 0, 0) with alpha preserved.
+        let mut buf = vec![0.0f32, 0.0, 0.0, 0.3];
+        rgb_to_lab_inplace(&mut buf, 1);
+        assert!(buf[0].abs() < 1e-5, "L got {}, want ~0", buf[0]);
+        assert!(buf[1].abs() < 1e-5, "a got {}, want ~0", buf[1]);
+        assert!(buf[2].abs() < 1e-5, "b got {}, want ~0", buf[2]);
+        assert!(
+            (buf[3] - 0.3).abs() < 1e-6,
+            "alpha preserved: got {}",
+            buf[3]
+        );
+    }
+
+    #[test]
+    fn rgb_to_lab_inplace_alpha_preserved() {
+        // Alpha values survive the conversion unchanged, matching the C
+        // yellow_mask save/restore.
+        let mut buf = vec![0.8f32, 0.4, 0.2, 0.75];
+        rgb_to_lab_inplace(&mut buf, 1);
+        assert!(
+            (buf[3] - 0.75).abs() < 1e-6,
+            "alpha got {}, want 0.75",
+            buf[3]
+        );
+    }
+
+    #[test]
+    fn rgb_to_lab_inplace_matches_reference_over_lcg() {
+        let npixels = 64; // 64 pixels = 256 floats
+        let mut buf = vec![0.0f32; npixels * 4];
+        lcg_fill(&mut buf, 0xFEED, 1.0); // [0, 1) for RGB channels
+
+        let mut direct = buf.clone();
+        let mut reference = buf.clone();
+        rgb_to_lab_inplace(&mut direct, npixels);
+        ref_rgb_to_lab_inplace(&mut reference, npixels);
+        assert_eq!(direct, reference, "rgb_to_lab_inplace mismatch with ref");
+    }
+
+    // ── FFI rgb_to_lab_inplace ────────────────────────────────────────────────
+
+    #[test]
+    fn ffi_rgb_to_lab_inplace_round_trip() {
+        let npixels = 64;
+        let mut src = vec![0.0f32; npixels * 4];
+        lcg_fill(&mut src, 0xBEEF, 1.0);
+
+        let mut ffi_buf = src.clone();
+        let mut direct_buf = src.clone();
+
+        unsafe {
+            darkroom_blend_rgb_to_lab_inplace(ffi_buf.as_mut_ptr(), npixels);
+        }
+        rgb_to_lab_inplace(&mut direct_buf, npixels);
+        assert_eq!(ffi_buf, direct_buf, "FFI rgb_to_lab_inplace mismatch");
+    }
+
+    #[test]
+    fn ffi_rgb_to_lab_inplace_null_guard() {
+        unsafe {
+            darkroom_blend_rgb_to_lab_inplace(std::ptr::null_mut(), 10);
+        }
+    }
+
+    #[test]
+    fn ffi_rgb_to_lab_inplace_zero_n() {
+        let mut buf = vec![0.3f32; 16]; // 4 pixels
+        unsafe {
+            darkroom_blend_rgb_to_lab_inplace(buf.as_mut_ptr(), 0);
+        }
+        assert_eq!(buf, vec![0.3f32; 16]); // untouched
     }
 }

@@ -31,6 +31,7 @@
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 #include <math.h>
 
 #define DT_BLENDIF_LAB_CH 4
@@ -1464,15 +1465,8 @@ void dt_develop_blendif_lab_blend(dt_dev_pixelpipe_iop_t *piece,
     }
     else
     {
-      DT_OMP_FOR_SIMD(aligned(b:64))
-      for(size_t j = 0; j < buffsize; j += DT_BLENDIF_LAB_CH)
-      {
-        dt_aligned_pixel_t XYZ;
-        const float yellow_mask = b[j+3]; // preserve alpha for code which does in-place conversion
-        dt_Rec709_to_XYZ_D50(b + j, XYZ);
-        dt_XYZ_to_Lab(XYZ, b + j);
-        b[j+3] = yellow_mask;
-      }
+      // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+      darkroom_blend_rgb_to_lab_inplace(b, (size_t)owidth * oheight);
     }
   }
   else
