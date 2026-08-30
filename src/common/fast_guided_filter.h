@@ -183,15 +183,8 @@ static inline void variance_analyse(const float *const restrict guide, // I
   dt_box_mean(input, height, width, 4, radius, 1);
 
   // blend the result and store in output buffer
-  DT_OMP_FOR()
-  for(size_t idx = 0; idx < width*height; idx++)
-  {
-    const float d = fmaxf((input[4*idx+2] - input[4*idx+0] * input[4*idx+0]) + feathering, 1e-15f); // avoid division by 0.
-    const float a = (input[4*idx+3] - input[4*idx+0] * input[4*idx+1]) / d;
-    const float b = input[4*idx+1] - a * input[4*idx+0];
-    ab[2*idx] = a;
-    ab[2*idx+1] = b;
-  }
+  // Ported to Rust FFI, replaces the former element-wise solve loop
+  darkroom_fgf_solve_ab(input, ab, width * height, feathering);
 
   if(input != NULL) dt_free_align(input);
 }
@@ -212,12 +205,8 @@ static inline void apply_linear_blending_w_geomean(float *const restrict image,
                                                    const float *const restrict ab,
                                                    const size_t num_elem)
 {
-  DT_OMP_FOR()
-  for(size_t k = 0; k < num_elem; k++)
-  {
-    // Note : image[k] is positive at the outside of the luminance mask
-    image[k] = sqrtf(image[k] * fmaxf(image[k] * ab[k * 2] + ab[k * 2 + 1], MIN_FLOAT));
-  }
+  // Ported to Rust FFI, replaces the former element-wise loop
+  darkroom_fgf_apply_linear_blending_w_geomean(image, ab, num_elem);
 }
 
 
@@ -236,20 +225,11 @@ static inline void quantize(const float *const restrict image,
     // No-op
     dt_iop_image_copy(out, image, num_elem);
   }
-  else if(sampling == 1.0f)
-  {
-    // fast track
-    DT_OMP_FOR()
-    for(size_t k = 0; k < num_elem; k++)
-      out[k] = fast_clamp(exp2f(floorf(log2f(image[k]))), clip_min, clip_max);
-  }
-
   else
   {
-    // slow track
-    DT_OMP_FOR()
-    for(size_t k = 0; k < num_elem; k++)
-      out[k] = fast_clamp(exp2f(floorf(log2f(image[k]) / sampling) * sampling), clip_min, clip_max);
+    // Both the fast track (sampling == 1.0f) and the general track are
+    // ported to Rust FFI, replacing the two former element-wise loops.
+    darkroom_fgf_quantize(image, out, num_elem, sampling, clip_min, clip_max);
   }
 }
 

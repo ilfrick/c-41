@@ -3338,6 +3338,24 @@ float darkroom_focuspeaking_sum_abs_deviation(const float *luma_ds,
  * (the dt_simd_memcpy loop). */
 void darkroom_imagebuf_simd_memcpy(float *buf, const float *src, size_t n);
 
+/* Replaces the former element-wise solve loop at fast_guided_filter.h:186
+ * (the a/b solve at the end of variance_analyse; input is the blurred
+ * 4-channel pack {I, p, I*I, I*p}, ab holds 2 floats per element). */
+void darkroom_fgf_solve_ab(const float *input, float *ab, size_t n_elements,
+                           float feathering);
+
+/* Replaces the former element-wise loop at fast_guided_filter.h:215
+ * (apply_linear_blending_w_geomean). */
+void darkroom_fgf_apply_linear_blending_w_geomean(float *image,
+                                                  const float *ab,
+                                                  size_t n_elements);
+
+/* Replaces the two former element-wise loops at fast_guided_filter.h:242 and
+ * :250 (the quantize fast and general tracks). sampling must not be 0.0 —
+ * the caller keeps that branch (dt_iop_image_copy). */
+void darkroom_fgf_quantize(const float *image, float *out, size_t n_elements,
+                           float sampling, float clip_min, float clip_max);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

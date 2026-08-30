@@ -3589,3 +3589,75 @@ Applied findings:
 - `dt_simd_memcpy` keeps its function shape and
   `__DT_CLONE_TARGETS__` multi-versioning; only the body is now an external
   FFI call (review confirmed clone dispatch is unaffected).
+
+---
+
+## 2026-08-30 10:33 UTC — m4-168: Port fast_guided_filter a/b solve, geomean blend, quantize loops to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Ported the four remaining element-wise loop sites in
+`src/common/fast_guided_filter.h` to Rust FFI kernels in the existing
+`c41-core::fast_guided_filter` module (the gather-based
+`interpolate_bilinear` stays in C for a later increment):
+
+- `solve_ab` + `darkroom_fgf_solve_ab`: the a/b solve at the end of
+  `variance_analyse` (formerly :186) — `d = fmaxf((gg - g²) + feathering,
+  1e-15f)`, `a = (gp - g·p)/d`, `b = p - a·g` over the blurred 4-channel pack.
+- `apply_linear_blending_w_geomean` + `darkroom_fgf_apply_linear_blending_w_geomean`
+  (formerly :215) — `sqrtf(image[k] * fmaxf(image[k]*a + b, MIN_FLOAT))`.
+- `quantize` + `darkroom_fgf_quantize` (formerly :242 fast track and :250
+  general track) — `fast_clamp(exp2f(floorf(log2f(v) / s) * s), min, max)`;
+  the two C tracks collapsed into one kernel branching on `sampling == 1.0f`,
+  and the `sampling == 0.0f` copy branch stays in C (`dt_iop_image_copy`).
+- `src/rust_ffi/darkroom_core.h`: +3 declarations.
+- 26 new tests (known-value incl. hand-computed exact cases, LCG-vs-reference,
+  FFI round-trip, null/zero/i32::MAX guards, NaN→clip_max semantics pin).
+
+**Verified.** `scripts/ci-local.sh` **GATE_EXIT=0** (exit code trusted).
+Incremental full-c Release rebuild: first attempt **REBUILD_EXIT=1** —
+link failure on `darkroom_fgf_solve_ab`/`darkroom_fgf_quantize` — which
+exposed a real harness bug (below); after fixes **REBUILD_EXIT=0** with all
+three new symbols confirmed in `libc41_core.so` via `nm -D`.
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored):
+**APPROVE-WITH-FIXES** with one P0. Applied findings:
+- **P0 (fixed): stray closing brace** in `fast_guided_filter.h` left over
+  from the `apply_linear_blending_w_geomean` edit — broke compilation of
+  every includer. The reviewer compiled the header in the CI deps image to
+  prove it; the cargo-only steps had passed, which is exactly the
+  m4-107 lesson: the C-compile gate must actually run.
+- **P1 (fixed):** module docs still said `apply_linear_blending_w_geomean`
+  was "still-unported" (written in m4-166, false after this change), and the
+  module header described only the m4-166 scope — inventory updated to all
+  five ported loops with "formerly at :N" phrasing so the line refs survive
+  the deletions.
+- **P2 (fixed):** quantize doc now carries the same TU-dependent
+  finite-math-only caveat as its siblings (with the unverified-libmvec part
+  marked speculative); wrong `≥` in the 1e-9 clamp test comment.
+
+**Found by the gate and fixed in the same commit: the full-c CMake build
+never rebuilt c41-core for source edits outside its hand-maintained
+DEPENDS list.** `src/CMakeLists.txt` listed ~75 explicit `.rs` paths captured
+at configure time; `fast_guided_filter.rs` (and `focus_peaking.rs`,
+`imagebuf.rs`, `eigf.rs`, …) were not on it, so editing them left a stale
+`libc41_core.so` and the link failed on the new symbols. (m4-167 only
+worked because it also touched `lib.rs`, which was on the list.) Replaced
+the list with `file(GLOB_RECURSE … CONFIGURE_DEPENDS)` over
+`crates/c41-core/src/*.rs` + `Cargo.toml`, so added/removed/edited files
+regenerate the ninja graph instead of being missed. This also unblocks the
+planned common-helper porting work, which edits exactly these off-list files.
+
+**Development self-catch, kept for the record:** first draft of the quantize
+kernel omitted the trailing `.exp2()` on the general track (returned
+`floor(log2/s)*s` instead of `2^that`) — caught by the hand-computed
+`quantize_slow_track_basic` test before any commit (3.0 @ sampling 0.5
+returned 1.5, expected exp2(1.5) ≈ 2.828).
+
+**Notes.**
+- `fast_clamp` itself stays in C — `toneequal.c` still calls it directly.
+- NaN semantics: `fminf`/`fmaxf`/`f32::min`/`f32::max` are all NaN-ignoring,
+  so a NaN input quantizes to `clip_max` in both languages (pinned by test);
+  the pragma-TU vectorized-max divergence documented in m4-166/167 applies
+  to the removed C paths only.
