@@ -3439,3 +3439,78 @@ cargo test (403 passed, 0 failed) ✓, release build ✓. EXIT_CODE=0.
 - The two `static inline` functions containing the FFI calls are inlined into
   `fast_eigf_surface_blur` (which has `__DT_CLONE_TARGETS__`). External FFI
   calls are link-time resolved and unaffected by CPU-target cloning. No issue.
+
+---
+
+## 2026-08-29 14:45 UTC — m4-166: Port fast_guided_filter variance + blending loops to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Ported the two `DT_OMP_FOR_SIMD` element-wise loops from
+`src/common/fast_guided_filter.h` to Rust FFI kernels in `c41-core`.
+- `variance_analyse` (fast_guided_filter.h:178): `{guide, mask, guide², guide·mask}`
+  packing → `darkroom_fgf_pack_variance_4c`.
+- `apply_linear_blending` (fast_guided_filter.h:211): `max(image*a + b, MIN_FLOAT)`
+  → `darkroom_fgf_apply_linear_blending`.
+
+- `crates/c41-core/src/fast_guided_filter.rs` (new): two safe kernels + two
+  `#[no_mangle] extern "C"` exports + two independent reference implementations
+  (different FP evaluation order) + 16 tests. `MIN_FLOAT = 2^(-16)` exact in f32,
+  matching C's `exp2f(-16.0f)`. Bounds-safe `.min(n_elements).min(guide.len())...`.
+  FFI guards: null pointers, zero n_elements, `n_elements > i32::MAX`.
+- `src/common/fast_guided_filter.h`: added `#include "rust_ffi/darkroom_core.h"`;
+  two `DT_OMP_FOR_SIMD` loops replaced with single FFI calls.
+- `src/rust_ffi/darkroom_core.h`: +2 FFI declarations with contract comments.
+- `crates/c41-core/src/lib.rs`: `pub mod fast_guided_filter;`.
+
+**Verified.** `scripts/ci-local.sh` — cargo check ✓, cargo clippy ✓,
+cargo test (403 passed, 0 failed, incl. 3 new tests) ✓, release build ✓.
+EXIT_CODE=0.
+
+**Senior review** (fricktrade-architect, opus 4.8 — four invocations; the named
+agent was killed repeatedly before producing findings, so reviews were completed
+by extracting JSON from each attempt's transcript):
+
+Three complete reviews were obtained. All agree: **no P0 / blocker findings**.
+
+- **P1 (fixed): Incorrect NaN documentation.** The module doc originally claimed
+  "Rust's `f32::max` returns NaN if either operand is NaN (unlike C's `fmaxf`
+  which picks the non-NaN value)" — factually wrong. `f32::max` is NaN-ignoring
+  (IEEE 754 `maximumNum`), matching C's `fmaxf` exactly. Corrected the doc to
+  state `f32::max` matches `fmaxf`, and clarified that the *reference*
+  implementation's `if blended < MIN_FLOAT` is the NaN-propagating path that
+  diverges — that difference is intentional for independent validation.
+
+- **P2 (fixed): i32::MAX overflow guard untested.** Added
+  `ffi_overflow_guard_pack_variance_4c` and `ffi_overflow_guard_apply_linear_blending`
+  tests verifying `n > i32::MAX` returns early without touching the buffer.
+
+- **P2 (fixed): NaN edge-case unvalidated.** Added
+  `apply_linear_blending_nan_matches_fmaxf` confirming the kernel's `.max(MIN_FLOAT)`
+  returns `MIN_FLOAT` (not NaN) for NaN input — matching C's `fmaxf` — while the
+  reference's `<` comparison propagates NaN.
+
+- **P2 (fixed): Missing test comments on FMA/NaN divergence.** Added explanatory
+  comments on `apply_linear_blending_matches_reference_over_lcg`,
+  `ffi_apply_linear_blending_round_trip`, and `apply_linear_blending_nan_matches_fmaxf`
+  documenting the deliberate structural divergence and the C-vs-Rust FMA trade-off.
+
+- **P2 (accepted, out of scope):** `#[allow(dead_code)]` on reference impls matches
+  the m4-165 precedent (`ref_eigf_variance_correct_*` in eigf.rs uses the same
+  pattern); changing only m4-166 would be inconsistent. The i32::MAX guard is not
+  dead code on the C side (`n_elements` arrives as `size_t` / 64-bit).
+
+**Notes.**
+- FMA contraction risk: `apply_linear_blending` computes `image[k]*a + b` — a
+  multiply-add susceptible to GCC 9's `-ffp-contract=fast` at `-O3`. Rust's
+  release profile does not enable contraction. ≤1 ULP difference possible; same
+  trade-off as `linear_blend` in imagebuf.rs and `mask_tone_curve` in blend.rs.
+  Documented in module-level docs.
+- The pack loop is pure multiplies/assignments — no add-after-multiply — so no
+  FMA risk there.
+- `fast_guided_filter.h` has no `#pragma GCC optimize("fast-math")`;
+  `extra_optimizations.h` applies only `finite-math-only` (does not enable
+  contraction).
+- LCG test data (`lcg_fill`) sourced from `c41-core/src/masks/mod.rs::test_util`.
+- Followed the m4-165 eigf.rs precedent exactly (same FFI guard pattern, same
+  reference implementation approach, same test structure).

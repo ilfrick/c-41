@@ -28,6 +28,7 @@
 #include "common/box_filters.h"
 #include "common/darktable.h"
 #include "common/imagebuf.h"
+#include "rust_ffi/darkroom_core.h"
 
 
 /* NOTE: this code complies with the optimizations in "common/extra_optimizations.h".
@@ -175,15 +176,8 @@ static inline void variance_analyse(const float *const restrict guide, // I
   float *const restrict input = dt_alloc_align_float(Ndimch);
 
   // Pre-multiply guide and mask and pack all inputs into an array of 4×1 SIMD struct
-  DT_OMP_FOR_SIMD()
-  for(size_t k = 0; k < Ndim; k++)
-  {
-    const size_t index = k * 4;
-    input[index] = guide[k];
-    input[index + 1] = mask[k];
-    input[index + 2] = guide[k] * guide[k];
-    input[index + 3] = guide[k] * mask[k];
-  }
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_fgf_pack_variance_4c(input, guide, mask, Ndim);
 
   // blur the guide and mask as a four-channel image to exploit data locality and SIMD
   dt_box_mean(input, height, width, 4, radius, 1);
@@ -208,12 +202,8 @@ static inline void apply_linear_blending(float *const restrict image,
                                          const float *const restrict ab,
                                          const size_t num_elem)
 {
-  DT_OMP_FOR_SIMD(aligned(image, ab:64))
-  for(size_t k = 0; k < num_elem; k++)
-  {
-    // Note : image[k] is positive at the outside of the luminance mask
-    image[k] = fmaxf(image[k] * ab[k * 2] + ab[k * 2 + 1], MIN_FLOAT);
-  }
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_fgf_apply_linear_blending(image, ab, num_elem);
 }
 
 

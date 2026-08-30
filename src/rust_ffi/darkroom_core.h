@@ -3306,6 +3306,16 @@ void darkroom_eigf_variance_correct_4c(float *buf, size_t n_elements);
  * eigf_variance_analysis_no_mask). */
 void darkroom_eigf_variance_correct_2c(float *buf, size_t n_elements);
 
+/* Replaces the DT_OMP_FOR_SIMD loop at fast_guided_filter.h:178 (the
+ * variance-analyse pack loop in variance_analyse). */
+void darkroom_fgf_pack_variance_4c(float *input, const float *guide,
+                                   const float *mask, size_t n_elements);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at fast_guided_filter.h:211
+ * (the linear-blending loop in apply_linear_blending). */
+void darkroom_fgf_apply_linear_blending(float *image, const float *ab,
+                                        size_t n_elements);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
