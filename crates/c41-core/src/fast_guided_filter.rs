@@ -1,6 +1,6 @@
 //! Element-wise loops ported from `src/common/fast_guided_filter.h`.
 //!
-//! Five C loops are ported here (m4-166 and m4-168):
+//! Six C loops are ported here (m4-166 and m4-168/169):
 //! - The variance-analyse pack loop (formerly at fast_guided_filter.h:178,
 //!   `DT_OMP_FOR_SIMD`) that packs `{guide, mask, guide², guide·mask}` into a
 //!   4-channel buffer before the box-mean blur.
@@ -12,6 +12,8 @@
 //!   `DT_OMP_FOR`).
 //! - The `quantize` fast and general tracks (formerly at :242 and :250, plain
 //!   `DT_OMP_FOR`; the `sampling == 0.0f` copy branch stays in C).
+//! - The `interpolate_bilinear` gather loop (formerly at :104, collapse(2)),
+//!   used by `fast_surface_blur` and many IOPs.
 //!
 //! The Rust kernels are single-threaded sequential; LLVM's auto-vectorizer
 //! provides SIMD at `-O3`, but multi-threaded parallelism is no longer used.
@@ -71,6 +73,15 @@
 //!   (whether GCC vectorizes these log2/exp2 chains into diverging libmvec
 //!   variants in pragma TUs is unverified — the old loops were plain
 //!   `DT_OMP_FOR`, so vectorization was opportunistic).
+//! - `interpolate_bilinear` is the first gather-style port: per output pixel
+//!   it reads four corner pixels and blends them with
+//!   `Dy*(Q_SW*Dx_n + Q_SE*Dx_p) + Dy_n*(Q_NW*Dx_n + Q_NE*Dx_p)` — a dense
+//!   multiply-add chain, so the C-vs-Rust difference from GCC's FMA
+//!   contraction (and, more broadly, `-ffast-math` reassociation, which has
+//!   no clean ULP bound) applies here, unlike the single-site cases above. The C quirks preserved: `Dx_next`/`Dy_next` are computed from
+//!   the *clamped* neighbour indices (negative near the right/bottom border,
+//!   weights still summing to 1), and the coordinate chain is
+//!   `(float)j / width_out * width_in` in that order.
 //! - `fast_guided_filter.h` has no `#pragma GCC optimize("fast-math")`.
 //!   The global CMakeLists.txt `-ffast-math` flag is TU-wide and may enable
 //!   FMA contraction (`-ffp-contract=fast`) at `-O3`. The kernel-vs-reference
@@ -183,6 +194,78 @@ pub fn quantize(
     }
 }
 
+/// Fast bilinear interpolation of a `ch`-channel image to a new size.
+///
+/// Port of the `DT_OMP_FOR(collapse(2))` loop in `interpolate_bilinear`
+/// (formerly at fast_guided_filter.h:104). For each output pixel, maps back
+/// to input coordinates, clamps the four neighbours into the input image,
+/// and blends: `out = Dy_prev*(Q_SW*Dx_next + Q_SE*Dx_prev) +
+/// Dy_next*(Q_NW*Dx_next + Q_NE*Dx_prev)` per channel.
+///
+/// Note the C quirks preserved exactly: `Dx_next`/`Dy_next` are computed
+/// from the *clamped* neighbour indices (so both can go slightly negative
+/// near the right/bottom border, with the weights still summing to 1), and
+/// the coordinate chain is `(float)j / width_out * width_in`, in that order.
+pub fn interpolate_bilinear(
+    src: &[f32],
+    width_in: usize,
+    height_in: usize,
+    out: &mut [f32],
+    width_out: usize,
+    height_out: usize,
+    ch: usize,
+) {
+    if width_in == 0 || height_in == 0 || ch == 0 || width_out == 0 || height_out == 0 {
+        return;
+    }
+    if src.len() < width_in * height_in * ch {
+        return;
+    }
+    // Clamp the total pixel count, not the row stride: rows keep the
+    // width_out stride so a defensively short `out` truncates the tail
+    // instead of corrupting the layout (direct Rust callers only — via the
+    // FFI a short buffer is already UB at slice construction).
+    let n_pixels = (width_out * height_out).min(out.len() / ch);
+    for p in 0..n_pixels {
+        let i = p / width_out;
+        let j = p % width_out;
+        // Relative coordinates of the pixel in output space
+        let x_out = j as f32 / width_out as f32;
+        let y_out = i as f32 / height_out as f32;
+
+        // Corresponding absolute coordinates of the pixel in input space
+        let x_in = x_out * width_in as f32;
+        let y_in = y_out * height_in as f32;
+
+        // Nearest neighbours coordinates in input space
+        let x_prev = (x_in.floor() as usize).min(width_in - 1);
+        let x_next = (x_prev + 1).min(width_in - 1);
+        let y_prev = (y_in.floor() as usize).min(height_in - 1);
+        let y_next = (y_prev + 1).min(height_in - 1);
+
+        // Nearest pixels in input array (nodes in grid)
+        let y_prev_row = y_prev * width_in;
+        let y_next_row = y_next * width_in;
+        let q_nw = &src[(y_prev_row + x_prev) * ch..];
+        let q_ne = &src[(y_prev_row + x_next) * ch..];
+        let q_se = &src[(y_next_row + x_next) * ch..];
+        let q_sw = &src[(y_next_row + x_prev) * ch..];
+
+        // Spatial differences between nodes
+        let dy_next = y_next as f32 - y_in;
+        let dy_prev = 1.0f32 - dy_next;
+        let dx_next = x_next as f32 - x_in;
+        let dx_prev = 1.0f32 - dx_next;
+
+        // Interpolate over ch layers
+        let pixel_out = &mut out[p * ch..];
+        for c in 0..ch {
+            pixel_out[c] = dy_prev * (q_sw[c] * dx_next + q_se[c] * dx_prev)
+                + dy_next * (q_nw[c] * dx_next + q_ne[c] * dx_prev);
+        }
+    }
+}
+
 // ── FFI exports ─────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -285,6 +368,44 @@ pub unsafe extern "C" fn darkroom_fgf_quantize(
     );
 }
 
+/// # Safety
+/// `src` must hold at least `width_in * height_in * ch` floats. `out` must
+/// hold at least `width_out * height_out * ch` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_fgf_interpolate_bilinear(
+    src: *const f32,
+    width_in: usize,
+    height_in: usize,
+    out: *mut f32,
+    width_out: usize,
+    height_out: usize,
+    ch: usize,
+) {
+    if src.is_null()
+        || out.is_null()
+        || width_in == 0
+        || height_in == 0
+        || width_out == 0
+        || height_out == 0
+        || ch == 0
+        || width_in.max(height_in).max(width_out).max(height_out) > i32::MAX as usize
+        || ch > i32::MAX as usize
+    {
+        return;
+    }
+    let src_slice = std::slice::from_raw_parts(src, width_in * height_in * ch);
+    let out_slice = std::slice::from_raw_parts_mut(out, width_out * height_out * ch);
+    interpolate_bilinear(
+        src_slice,
+        width_in,
+        height_in,
+        out_slice,
+        width_out,
+        height_out,
+        ch,
+    );
+}
+
 // ── Independent reference implementations ────────────────────────────────────
 //
 // These compute the same results via a different evaluation order:
@@ -370,6 +491,45 @@ fn ref_quantize(
         };
         let top = if v < clip_max { v } else { clip_max };
         out[k] = if top > clip_min { top } else { clip_min };
+    }
+}
+
+#[allow(dead_code)]
+fn ref_interpolate_bilinear(
+    src: &[f32],
+    width_in: usize,
+    height_in: usize,
+    out: &mut [f32],
+    width_out: usize,
+    height_out: usize,
+    ch: usize,
+) {
+    // Same maths and FP evaluation order, different code shape: the four
+    // corner reads go through explicit index temporaries and the two blend
+    // terms are computed as named values.
+    let m = (width_out * height_out).min(out.len() / ch.max(1));
+    for p in 0..m {
+        let i = p / width_out;
+        let j = p % width_out;
+        let x_in = (j as f32 / width_out as f32) * width_in as f32;
+        let y_in = (i as f32 / height_out as f32) * height_in as f32;
+        let xp = (x_in.floor() as usize).min(width_in - 1);
+        let xn = (xp + 1).min(width_in - 1);
+        let yp = (y_in.floor() as usize).min(height_in - 1);
+        let yn = (yp + 1).min(height_in - 1);
+        let dx_n = xn as f32 - x_in;
+        let dx_p = 1.0f32 - dx_n;
+        let dy_n = yn as f32 - y_in;
+        let dy_p = 1.0f32 - dy_n;
+        let i_nw = (yp * width_in + xp) * ch;
+        let i_ne = (yp * width_in + xn) * ch;
+        let i_se = (yn * width_in + xn) * ch;
+        let i_sw = (yn * width_in + xp) * ch;
+        for c in 0..ch {
+            let low = src[i_sw + c] * dx_n + src[i_se + c] * dx_p;
+            let high = src[i_nw + c] * dx_n + src[i_ne + c] * dx_p;
+            out[p * ch + c] = dy_p * low + dy_n * high;
+        }
     }
 }
 
@@ -896,6 +1056,157 @@ mod tests {
                 1.0,
                 0.0,
                 1.0,
+            );
+        }
+        assert_eq!(out, vec![1.0f32; 4]); // untouched
+    }
+
+    // ── interpolate_bilinear ───────────────────────────────────────────────────
+
+    #[test]
+    fn bilinear_identity_single_pixel() {
+        // 1x1 → 1x1: all four corners are the same pixel → out == in exactly
+        let src = vec![7.5f32];
+        let mut out = vec![f32::NAN; 1];
+        interpolate_bilinear(&src, 1, 1, &mut out, 1, 1, 1);
+        assert_eq!(out[0], 7.5);
+    }
+
+    #[test]
+    fn bilinear_upscale_weights() {
+        // 2x1 → 4x1, ch=1: interior samples are exact midpoints at j=1 (0.5, 0.5)
+        let src = vec![1.0f32, 3.0];
+        let mut out = vec![f32::NAN; 4];
+        interpolate_bilinear(&src, 2, 1, &mut out, 4, 1, 1);
+        // j=0: x_in=0 → in[0]; j=2: x_in=1.0 → floor 1, next clamped → in[1]
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[1], 2.0); // (1 + 3)/2
+        assert_eq!(out[2], 3.0);
+        // j=3: x_out=0.75 → x_in=1.5 → prev=1, next clamped to 1 → in[1]
+        assert_eq!(out[3], 3.0);
+    }
+
+    #[test]
+    fn bilinear_border_clamp_weights_sum_to_one() {
+        // 1x1 → 2x2: the clamped-neighbour quirk yields negative Dx_next/Dy_next
+        // with weights still summing to 1, so the constant image reproduces exactly
+        let src = vec![4.0f32];
+        let mut out = vec![f32::NAN; 4];
+        interpolate_bilinear(&src, 1, 1, &mut out, 2, 2, 1);
+        assert_eq!(out, vec![4.0f32; 4]);
+    }
+
+    #[test]
+    fn bilinear_multichannel() {
+        // 1x2 → 1x2 with ch=3: rows interpolate independently per channel
+        let src = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut out = vec![f32::NAN; 6];
+        interpolate_bilinear(&src, 1, 2, &mut out, 1, 2, 3);
+        // i=0: y_in=0 → row 0; i=1: y_in=1.0 → prev=0? floor(1.0)=1 → row 1
+        assert_eq!(out[0..3], src[0..3]);
+        assert_eq!(out[3..6], src[3..6]);
+    }
+
+    #[test]
+    fn bilinear_upscale_samples_and_blends() {
+        // 4x1 → 8x1 (upscale): j=0 lands exactly on node 0; j=3 (x_in=1.5) is
+        // an exact midpoint; j=7 (x_in=3.5) has its right neighbour clamped
+        // to node 3. True downscale coverage lives in the LCG test below.
+        let src = vec![0.0f32, 4.0, 8.0, 12.0];
+        let mut out = vec![f32::NAN; 8];
+        interpolate_bilinear(&src, 4, 1, &mut out, 8, 1, 1);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[3], 6.0); // 0.5*4 + 0.5*8
+        assert_eq!(out[7], 12.0);
+    }
+
+    #[test]
+    fn bilinear_matches_reference_over_lcg() {
+        let mut src = vec![0.0f32; 16 * 8 * 4];
+        lcg_fill(&mut src, 0x1B1B, 10.0);
+        let mut direct = vec![0.0f32; 32 * 16 * 4];
+        let mut reference = vec![0.0f32; 32 * 16 * 4];
+
+        interpolate_bilinear(&src, 16, 8, &mut direct, 32, 16, 4);
+        ref_interpolate_bilinear(&src, 16, 8, &mut reference, 32, 16, 4);
+        assert_eq!(direct, reference);
+
+        // Downscale direction too, and a non-power-of-two pair so the
+        // coordinate-division rounding path is actually compared (the
+        // power-of-two dims divide exactly and skip it)
+        let mut direct_ds = vec![0.0f32; 8 * 4 * 4];
+        let mut reference_ds = vec![0.0f32; 8 * 4 * 4];
+        interpolate_bilinear(&src, 16, 8, &mut direct_ds, 8, 4, 4);
+        ref_interpolate_bilinear(&src, 16, 8, &mut reference_ds, 8, 4, 4);
+        assert_eq!(direct_ds, reference_ds);
+
+        let mut src_npo = vec![0.0f32; 15 * 9 * 4];
+        lcg_fill(&mut src_npo, 0x3D3D, 10.0);
+        let mut direct_npo = vec![0.0f32; 23 * 13 * 4];
+        let mut reference_npo = vec![0.0f32; 23 * 13 * 4];
+        interpolate_bilinear(&src_npo, 15, 9, &mut direct_npo, 23, 13, 4);
+        ref_interpolate_bilinear(&src_npo, 15, 9, &mut reference_npo, 23, 13, 4);
+        assert_eq!(direct_npo, reference_npo);
+    }
+
+    #[test]
+    fn ffi_bilinear_round_trip() {
+        let mut src = vec![0.0f32; 16 * 8 * 2];
+        lcg_fill(&mut src, 0x2C2C, 10.0);
+        let mut ffi_buf = vec![0.0f32; 24 * 12 * 2];
+        let mut direct_buf = vec![0.0f32; 24 * 12 * 2];
+
+        unsafe {
+            darkroom_fgf_interpolate_bilinear(
+                src.as_ptr(),
+                16,
+                8,
+                ffi_buf.as_mut_ptr(),
+                24,
+                12,
+                2,
+            );
+        }
+        interpolate_bilinear(&src, 16, 8, &mut direct_buf, 24, 12, 2);
+        assert_eq!(ffi_buf, direct_buf);
+    }
+
+    #[test]
+    fn ffi_bilinear_guards() {
+        unsafe {
+            darkroom_fgf_interpolate_bilinear(
+                std::ptr::null(),
+                4,
+                4,
+                std::ptr::null_mut(),
+                2,
+                2,
+                1,
+            );
+        }
+        let src = vec![1.0f32; 4];
+        let mut out = vec![1.0f32; 4];
+        // Zero dims, zero ch, oversized dim
+        unsafe {
+            darkroom_fgf_interpolate_bilinear(src.as_ptr(), 0, 4, out.as_mut_ptr(), 2, 2, 1);
+            darkroom_fgf_interpolate_bilinear(src.as_ptr(), 4, 0, out.as_mut_ptr(), 2, 2, 1);
+            darkroom_fgf_interpolate_bilinear(
+                src.as_ptr(),
+                4,
+                4,
+                out.as_mut_ptr(),
+                2,
+                2,
+                0,
+            );
+            darkroom_fgf_interpolate_bilinear(
+                src.as_ptr(),
+                4,
+                4,
+                out.as_mut_ptr(),
+                (i32::MAX as usize) + 1,
+                2,
+                1,
             );
         }
         assert_eq!(out, vec![1.0f32; 4]); // untouched

@@ -3661,3 +3661,69 @@ returned 1.5, expected exp2(1.5) ≈ 2.828).
   so a NaN input quantizes to `clip_max` in both languages (pinned by test);
   the pragma-TU vectorized-max divergence documented in m4-166/167 applies
   to the removed C paths only.
+
+---
+
+## 2026-08-30 11:19 UTC — m4-169: Port interpolate_bilinear gather loop to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Ported the `DT_OMP_FOR(collapse(2))` gather loop in
+`interpolate_bilinear` (src/common/fast_guided_filter.h) — the last
+unported loop in that header — to a new kernel
+`c41-core::fast_guided_filter::interpolate_bilinear` + FFI export
+`darkroom_fgf_interpolate_bilinear`. The function is the shared
+down/up-scaling primitive behind `fast_surface_blur`, `eigf`, `colorequal`,
+`cacorrectrgb`, `hlreconstruct/laplacian` and `rasterfile` (ch ∈ {1,2,4,6}).
+
+- C quirks preserved exactly: `Dx_next`/`Dy_next` derive from the
+  *clamped* neighbour indices (negative near the right/bottom border, weights
+  still sum to 1), coordinate chain `(float)j / width_out * width_in` in that
+  order, per-channel blend expression transcribed op-for-op.
+- Kernel enumerates a flat pixel index (row stride kept at `width_out`) with
+  a defensive `out.len()/ch` clamp for direct Rust callers; FFI guards
+  null/zero-dim/ch and per-dim i32::MAX per repo precedent.
+- 8 new tests (identity, upscale weights incl. the negative-dx quirk,
+  border-clamp constant image, multichannel, upscale-with-clamp, LCG
+  reference match in both directions + a non-power-of-two 15×9→23×13 case
+  that exercises coordinate-division rounding, FFI round-trip, guards).
+
+**Verified.** `scripts/ci-local.sh` **GATE_EXIT=0**. Incremental full-c
+Release rebuild **REBUILD_EXIT=0**, new symbol confirmed in
+`libc41_core.so`. The CMake CONFIGURE_DEPENDS glob fix from m4-168 proved
+itself here: editing only `fast_guided_filter.rs` (off the old hand-made
+DEPENDS list) correctly rebuilt the Rust lib this time.
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored): **APPROVE**,
+0 P0/P1, six P2s. The reviewer proved reachability of the `floor`/cast
+domain (x_out ∈ [0,1) so C's `(size_t)floorf(negative)` UB is unreachable
+and Rust's saturating cast never diverges), enumerated the clamp cases,
+verified all callers' buffer contracts (fast_surface_blur, eigf.h,
+colorequal.c, laplacian.c, cacorrectrgb.c, rasterfile.c), syntax-checked the
+edited header in the CI deps image, and hand-verified the test values.
+Applied P2s:
+- test misnomer fixed (`bilinear_downscale_samples_and_blends` was really an
+  upscale — renamed, comment points at the real downscale coverage);
+- added the non-power-of-two LCG case (power-of-two-only dims never
+  exercise division rounding);
+- `height_out == 0` guard added for symmetry;
+- defensive-clamp comment qualified ("direct Rust callers only — via the
+  FFI a short buffer is already UB at slice construction");
+- the bilinear FMA note rephrased to drop the "≤1 ULP" bound (TU-wide
+  `-ffast-math` reassociation has no clean ULP bound).
+- Accepted, no change: theoretical usize overflow in the FFI slice
+  construction with per-dim i32::MAX dims (unreachable — needs an
+  impossible ~2^93-float allocation; consistent with the file's five
+  existing exports).
+
+**Notes.**
+- `fast_guided_filter.h` now has zero OpenMP loop sites; its remaining
+  `DT_OMP_DECLARE_SIMD`/`__DT_CLONE_TARGETS__` helpers (`fast_clamp`,
+  used by toneequal.c) stay in C.
+- Development self-catch en route: the first draft of the kernel had a
+  leftover closing brace from converting the nested loops to a flat
+  enumeration (compile error caught by the local cargo run, pre-review) and
+  the non-power-of-two test initially reused the 16×8 input buffer (540
+  floats needed vs 512 — index-out-of-bounds panic, fixed by giving the
+  case its own LCG-filled buffer).

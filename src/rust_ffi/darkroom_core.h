@@ -3356,6 +3356,14 @@ void darkroom_fgf_apply_linear_blending_w_geomean(float *image,
 void darkroom_fgf_quantize(const float *image, float *out, size_t n_elements,
                            float sampling, float clip_min, float clip_max);
 
+/* Replaces the former collapse(2) loop in interpolate_bilinear
+ * (fast_guided_filter.h). src holds width_in*height_in*ch floats, out holds
+ * width_out*height_out*ch floats. */
+void darkroom_fgf_interpolate_bilinear(const float *src, size_t width_in,
+                                       size_t height_in, float *out,
+                                       size_t width_out, size_t height_out,
+                                       size_t ch);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

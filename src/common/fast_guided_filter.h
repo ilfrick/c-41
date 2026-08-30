@@ -101,55 +101,9 @@ static inline void interpolate_bilinear(const float *const restrict in,
                                         const size_t ch)
 {
   // Fast vectorized bilinear interpolation on ch channels
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < height_out; i++)
-  {
-    for(size_t j = 0; j < width_out; j++)
-    {
-      // Relative coordinates of the pixel in output space
-      const float x_out = (float)j /(float)width_out;
-      const float y_out = (float)i /(float)height_out;
-
-      // Corresponding absolute coordinates of the pixel in input space
-      const float x_in = x_out * (float)width_in;
-      const float y_in = y_out * (float)height_in;
-
-      // Nearest neighbours coordinates in input space
-      size_t x_prev = (size_t)floorf(x_in);
-      size_t x_next = x_prev + 1;
-      size_t y_prev = (size_t)floorf(y_in);
-      size_t y_next = y_prev + 1;
-
-      x_prev = (x_prev < width_in) ? x_prev : width_in - 1;
-      x_next = (x_next < width_in) ? x_next : width_in - 1;
-      y_prev = (y_prev < height_in) ? y_prev : height_in - 1;
-      y_next = (y_next < height_in) ? y_next : height_in - 1;
-
-      // Nearest pixels in input array (nodes in grid)
-      const size_t Y_prev = y_prev * width_in;
-      const size_t Y_next =  y_next * width_in;
-      const float *const Q_NW = (float *)in + (Y_prev + x_prev) * ch;
-      const float *const Q_NE = (float *)in + (Y_prev + x_next) * ch;
-      const float *const Q_SE = (float *)in + (Y_next + x_next) * ch;
-      const float *const Q_SW = (float *)in + (Y_next + x_prev) * ch;
-
-      // Spatial differences between nodes
-      const float Dy_next = (float)y_next - y_in;
-      const float Dy_prev = 1.f - Dy_next; // because next - prev = 1
-      const float Dx_next = (float)x_next - x_in;
-      const float Dx_prev = 1.f - Dx_next; // because next - prev = 1
-
-      // Interpolate over ch layers
-      float *const pixel_out = (float *)out + (i * width_out + j) * ch;
-
-//#pragma unroll //LLVM warns it can't unroll -- presumably because 'ch' is not a constant
-      for(size_t c = 0; c < ch; c++)
-      {
-        pixel_out[c] = Dy_prev * (Q_SW[c] * Dx_next + Q_SE[c] * Dx_prev) +
-                       Dy_next * (Q_NW[c] * Dx_next + Q_NE[c] * Dx_prev);
-      }
-    }
-  }
+  // Ported to Rust FFI, replaces the former collapse(2) loop
+  darkroom_fgf_interpolate_bilinear(in, width_in, height_in, out, width_out,
+                                    height_out, ch);
 }
 
 
