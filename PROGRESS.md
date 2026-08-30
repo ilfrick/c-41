@@ -3514,3 +3514,78 @@ Three complete reviews were obtained. All agree: **no P0 / blocker findings**.
 - LCG test data (`lcg_fill`) sourced from `c41-core/src/masks/mod.rs::test_util`.
 - Followed the m4-165 eigf.rs precedent exactly (same FFI guard pattern, same
   reference implementation approach, same test structure).
+
+---
+
+## 2026-08-30 09:51 UTC — m4-167: Port focus_peaking luma/reduction loops + dt_simd_memcpy to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Ported three `DT_OMP_FOR_SIMD` element-wise/reduction loops from
+`src/common/focus_peaking.h` and the `dt_simd_memcpy` loop from
+`src/common/imagebuf.h` to Rust FFI kernels in `c41-core`.
+
+- `crates/c41-core/src/focus_peaking.rs` (new): three kernels + FFI exports +
+  reference implementations + 14 tests.
+  - `compute_luma`: replaces the loop at focus_peaking.h:86 —
+    `sqrtf(powf(_uint8_to_float(c), 4.4) + …)` over the 4-channel uint8
+    thumbnail buffer.
+  - `sum_interior`: replaces the TV_sum `collapse(2)` reduction (was :136) —
+    sums luma over the interior `[2, h-2) × [2, w-2)`; the raw sum is
+    returned, the C caller keeps dividing by `(h-4)*(w-4)`.
+  - `sum_abs_deviation`: replaces the sigma reduction (was :147) —
+    `Σ |luma_ds[k] - TV_sum|` over the same region.
+- `crates/c41-core/src/imagebuf.rs`: `simd_memcpy` + FFI export
+  `darkroom_imagebuf_simd_memcpy` (out[k]=in[k]) + 6 tests, following the
+  file's established pattern.
+- `src/common/focus_peaking.h` / `src/common/imagebuf.h`: loops replaced with
+  single FFI call lines; `rust_ffi/darkroom_core.h` include added to both.
+- `src/rust_ffi/darkroom_core.h`: +4 declarations with contract comments.
+- `crates/c41-core/src/lib.rs`: registered `pub mod focus_peaking;`.
+
+**Verified.** `scripts/ci-local.sh` — cargo check ✓, clippy ✓, cargo test
+(--release) ✓, release build ✓. **EXIT_CODE=0** (exit code trusted, not grep).
+Incremental full-c Release `-O3 -ffast-math -Werror` rebuild against this
+exact tree: **REBUILD_EXIT=0** (persistent c41-fullc-deps harness, build dir
+remounted at its configured `/tmp/build` — first attempt mounted the repo at
+`/src` only and ninja reconfigured into a dirty manifest, the same
+mis-mount m4-137 hit).
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored):
+**APPROVE-WITH-FIXES**, 0 P0. Reviewer verified empirically in the CI image
+that GCC 13 does *not* vectorize the old luma loop under the project's
+Release flags (three scalar glibc `powf` calls — identical lowering to
+Rust's `f32::powf`), so `compute_luma` is bit-identical, not just same-class.
+Applied findings:
+- **P1 (fixed): the `fast_guided_filter.rs` NaN doc (written in-session, this
+  commit) misattributed the mechanism.** The scalar `maxss` inlining of
+  `fmaxf(x, MIN_FLOAT)` is NaN-*ignoring* (the constant is the second source
+  operand, and SSE max returns the second operand on NaN); it is the
+  **vectorized** max lowering in `finite-math-only` pragma TUs that
+  propagates NaN (computed value as second operand). Also corrected
+  `CMakeLists.txt:720` → `src/CMakeLists.txt:720` and documented that the
+  global flags are `-ffast-math -fno-finite-math-only` (they *negate*
+  finite-math-only, which is why only pragma TUs diverge).
+- **P2 (fixed):** `sum_interior` now clamps to the slice length like its
+  sibling `sum_abs_deviation` (consistent no-panic degradation for safe-Rust
+  callers with short slices); reduction doc no longer claims a "≤1 ULP"
+  bound (OpenMP reduction reassociation error grows with element count);
+  "non-constant exponent" claim corrected (C folds 2.0f*2.2f to 4.4f at
+  compile time); "at at" typo; the reference-implementation doc softened to
+  admit they are weakly independent (known-value + FFI round-trip tests
+  carry the real weight).
+- **P2 (accepted, no change):** new clippy warnings (`manual_memcpy`,
+  `needless_range_loop`, `useless_vec` ×4) — non-failing at default
+  strictness; the crate carries ~1000 pre-existing warnings and keeping the
+  loop shape mirrors the C loop's shape. CLAUDE.md workflow edits
+  (review-agent independence/model policy, CI steps 9–10) committed
+  deliberately in this commit per the user's request.
+
+**Notes.**
+- The remaining two `DT_OMP_FOR(collapse(2))` loops in focus_peaking.h (the
+  close/far `_laplacian` gradient loop) are NOT part of this increment —
+  they depend on `_get_indices` gather indexing and stay in C.
+- `dt_simd_memcpy` keeps its function shape and
+  `__DT_CLONE_TARGETS__` multi-versioning; only the body is now an external
+  FFI call (review confirmed clone dispatch is unaffected).

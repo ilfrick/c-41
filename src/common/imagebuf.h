@@ -18,6 +18,7 @@
 
 #pragma once
 #include "develop/imageop.h" // for dt_iop_roi_t
+#include "rust_ffi/darkroom_core.h"
 
 G_BEGIN_DECLS
 
@@ -67,9 +68,8 @@ static inline void dt_simd_memcpy(const float *const __restrict__ in,
   // Perform a parallel vectorized memcpy on 64-bits aligned
   // contiguous buffers. This is several times faster than the original memcpy
 
-  DT_OMP_FOR_SIMD(aligned(in, out:64))
-  for(size_t k = 0; k < num_elem; k++)
-    out[k] = in[k];
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_imagebuf_simd_memcpy(out, in, num_elem);
 }
 
 // Copy an image buffer, specifying the number of floats it contains.

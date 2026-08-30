@@ -21,6 +21,7 @@
 #include "common/box_filters.h"
 #include "common/fast_guided_filter.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 
 /* NOTE: this code complies with the optimizations in "common/extra_optimizations.h".
  * Consider including that at the beginning of a *.c file where you use this
@@ -83,18 +84,8 @@ static inline void dt_focuspeaking(cairo_t *cr,
 
   const size_t npixels = (size_t)buf_height * buf_width;
   // Create a luma buffer as the euclidian norm of RGB channels
-  DT_OMP_FOR_SIMD(aligned(image, luma:64))
-  for(size_t index = 0; index < npixels; index++)
-    {
-      const size_t index_RGB = index * 4;
-
-      // remove gamma 2.2 and take the square is equivalent to this:
-      const float exponent = 2.0f * 2.2f;
-
-      luma[index] = sqrtf( powf(_uint8_to_float(image[index_RGB]), exponent) +
-                           powf(_uint8_to_float(image[index_RGB + 1]), exponent) +
-                           powf(_uint8_to_float(image[index_RGB + 2]), exponent) );
-    }
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD loop
+  darkroom_focuspeaking_compute_luma(image, luma, npixels);
 
   // Prefilter noise
   fast_surface_blur(luma, buf_width, buf_height, 12, 0.00001f, 4, DT_GF_BLENDING_LINEAR, 1, 0.0f, exp2f(-8.0f), 1.0f);
@@ -131,24 +122,14 @@ static inline void dt_focuspeaking(cairo_t *cr,
   dt_box_mean(luma_ds, buf_height, buf_width, 1, 2, 1);
 
   // Compute the gradient mean over the picture
-  float TV_sum = 0.0f;
-
-  DT_OMP_FOR_SIMD(collapse(2) aligned(luma_ds:64) reduction(+:TV_sum))
-  for(size_t i = 2; i < buf_height - 2; ++i)
-    for(size_t j = 2; j < buf_width - 2; ++j)
-      TV_sum += luma_ds[i * buf_width + j];
-
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD reduction
+  float TV_sum = darkroom_focuspeaking_sum_interior(luma_ds, buf_width, buf_height);
   TV_sum /= (float)(buf_height - 4) * (float)(buf_width - 4);
 
   // Compute the predicator of the hyper-laplacian distribution
   // (similar to the standard deviation if we had a gaussian distribution)
-  float sigma = 0.0f;
-
-  DT_OMP_FOR_SIMD(collapse(2) aligned(focus_peaking, luma_ds:64) reduction(+:sigma))
-  for(size_t i = 2; i < buf_height - 2; ++i)
-    for(size_t j = 2; j < buf_width - 2; ++j)
-       sigma += fabsf(luma_ds[i * buf_width + j] - TV_sum);
-
+  // Ported to Rust FFI, replaces DT_OMP_FOR_SIMD reduction
+  float sigma = darkroom_focuspeaking_sum_abs_deviation(luma_ds, buf_width, buf_height, TV_sum);
   sigma /= (float)(buf_height - 4) * (float)(buf_width - 4);
 
   // Set the sharpness thresholds

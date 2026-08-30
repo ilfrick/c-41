@@ -3316,6 +3316,28 @@ void darkroom_fgf_pack_variance_4c(float *input, const float *guide,
 void darkroom_fgf_apply_linear_blending(float *image, const float *ab,
                                         size_t n_elements);
 
+/* Replaces the DT_OMP_FOR_SIMD loop at focus_peaking.h:86
+ * (the luma computation in dt_focuspeaking). */
+void darkroom_focuspeaking_compute_luma(const unsigned char *image,
+                                        float *luma, size_t n_pixels);
+
+/* Replaces the DT_OMP_FOR_SIMD reduction loop at focus_peaking.h:136
+ * (the TV_sum accumulation in dt_focuspeaking). Returns the raw sum;
+ * the caller divides by (height-4)*(width-4). */
+float darkroom_focuspeaking_sum_interior(const float *luma_ds,
+                                         size_t width, size_t height);
+
+/* Replaces the DT_OMP_FOR_SIMD reduction loop at focus_peaking.h:147
+ * (the sigma accumulation in dt_focuspeaking). Returns the raw sum;
+ * the caller divides by (height-4)*(width-4). */
+float darkroom_focuspeaking_sum_abs_deviation(const float *luma_ds,
+                                              size_t width, size_t height,
+                                              float tv_sum);
+
+/* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.h:70
+ * (the dt_simd_memcpy loop). */
+void darkroom_imagebuf_simd_memcpy(float *buf, const float *src, size_t n);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

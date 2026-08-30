@@ -11,9 +11,10 @@ Phase 2 db ✅, Phase 3 GTK4 UI in progress). Rust crates are under `crates/`
 For **every** code change, run this full loop in order:
 
 1. **Develop** the change.
-2. **Senior review** — spawn the `fricktrade-architect` agent with `model: "opus"`
-   (Opus 4.8). It is nominally scoped to "Fricktrade" but is intentionally used
-   for darkroom reviews too. Give it the full diff and context.
+2. **Senior review** — spawn an **independent agent** (never review in the same
+   context that wrote the code) with the profile of a **senior software
+   developer with 20+ years of experience**, running the **same model in use
+   for the development steps**. Give it the full diff and context.
 3. **Fix** the review findings.
 4. **Test with Docker** — run **`scripts/ci-local.sh`**. It executes the same
    four steps CI runs, in the CI image, and keys off **exit codes**:
@@ -42,9 +43,16 @@ For **every** code change, run this full loop in order:
    `gh api repos/ilfrick/c-41/commits/<sha>/check-runs` — the
    `check + test + clippy` and `Build & push Docker image` runs. CI logs aren't
    directly readable (403); the local Docker build is the authoritative check.
-
-End commit messages with:
-`Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
+9. **Fix CI failures and repeat until green** — if CI reports a failure, fix
+   the root cause (re-run the loop from step 4, since a fix is a new change)
+   and push again. Do not leave the branch red: a change is only done once CI
+   is green on both the `check + test + clippy` and `Build & push Docker image`
+   runs.
+10. **Commit and push to both repos** (credentials in `~/.netrc`). After CI
+    goes green, make sure the commit is on both `origin` URLs (GitHub
+    `ilfrick/c-41` and Gitea `housefz.com`) — a single
+    `git push origin master` covers both via the dual push URLs; verify both
+    refs actually update.
 
 ## Naming (the C-41 rename, 2026-08-12)
 

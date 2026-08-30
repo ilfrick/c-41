@@ -102,6 +102,17 @@ pub fn linear_blend(buf: &mut [f32], other: &[f32], n: usize, lambda: f32) {
     }
 }
 
+/// `out[k] = in[k]` for each `k` in `0..n`.
+///
+/// Port of the `DT_OMP_FOR_SIMD` loop in `dt_simd_memcpy`
+/// (imagebuf.h:70). Simple element-wise copy.
+pub fn simd_memcpy(buf: &mut [f32], src: &[f32], n: usize) {
+    let m = n.min(buf.len()).min(src.len());
+    for k in 0..m {
+        buf[k] = src[k];
+    }
+}
+
 // ── FFI exports ─────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -215,6 +226,22 @@ pub unsafe extern "C" fn darkroom_imagebuf_linear_blend(
     linear_blend(buf_slice, other_slice, n, lambda);
 }
 
+/// # Safety
+/// `buf` and `src` must each hold at least `n` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imagebuf_simd_memcpy(
+    buf: *mut f32,
+    src: *const f32,
+    n: usize,
+) {
+    if buf.is_null() || src.is_null() || n == 0 || n > i32::MAX as usize {
+        return;
+    }
+    let buf_slice = std::slice::from_raw_parts_mut(buf, n);
+    let src_slice = std::slice::from_raw_parts(src, n);
+    simd_memcpy(buf_slice, src_slice, n);
+}
+
 // ── Reference implementations for bit-exactness tests ────────────────────────
 
 #[allow(dead_code)]
@@ -271,6 +298,18 @@ fn ref_linear_blend(buf: &mut [f32], other: &[f32], n: usize, lambda: f32) {
     let m = n.min(buf.len()).min(other.len());
     for k in 0..m {
         buf[k] = lambda * buf[k] + lambda_1 * other[k];
+    }
+}
+
+#[allow(dead_code)]
+fn ref_simd_memcpy(buf: &mut [f32], src: &[f32], n: usize) {
+    // Deliberately different: iterate using index arithmetic rather than
+    // letting the for-loop iterator handle it. Same result, different shape.
+    let m = n.min(buf.len()).min(src.len());
+    let mut k = 0;
+    while k < m {
+        buf[k] = src[k];
+        k += 1;
     }
 }
 
@@ -489,6 +528,28 @@ mod tests {
         assert_eq!(direct, reference);
     }
 
+    // ── simd_memcpy ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn simd_memcpy_basic() {
+        let src = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut buf = vec![0.0f32; 4];
+        simd_memcpy(&mut buf, &src, 4);
+        assert_eq!(buf, src);
+    }
+
+    #[test]
+    fn simd_memcpy_matches_reference_over_lcg() {
+        let mut src = vec![0.0f32; 256];
+        lcg_fill(&mut src, 0xB0B0, 1.0);
+
+        let mut direct = vec![0.0f32; 256];
+        let mut reference = vec![0.0f32; 256];
+        simd_memcpy(&mut direct, &src, 256);
+        ref_simd_memcpy(&mut reference, &src, 256);
+        assert_eq!(direct, reference);
+    }
+
     // ── FFI round-trip and null-guard tests ────────────────────────────────────
 
     #[test]
@@ -663,6 +724,49 @@ mod tests {
             darkroom_imagebuf_mul_const(buf.as_mut_ptr(), 0, 2.0);
             darkroom_imagebuf_linear_blend(buf.as_mut_ptr(), other.as_ptr(), 0, 0.5);
             darkroom_imagebuf_scaled_copy(buf.as_mut_ptr(), other.as_ptr(), 0, 2.0);
+        }
+        assert_eq!(buf, vec![1.0; 4]); // untouched
+    }
+
+    #[test]
+    fn ffi_simd_memcpy_round_trip() {
+        let mut src = vec![0.0f32; 64];
+        lcg_fill(&mut src, 0xDADA, 1.0);
+
+        let mut ffi_buf = vec![0.0f32; 64];
+        let mut direct_buf = vec![0.0f32; 64];
+
+        unsafe {
+            darkroom_imagebuf_simd_memcpy(ffi_buf.as_mut_ptr(), src.as_ptr(), 64);
+        }
+        simd_memcpy(&mut direct_buf, &src, 64);
+        assert_eq!(ffi_buf, direct_buf);
+    }
+
+    #[test]
+    fn ffi_simd_memcpy_null_guard() {
+        unsafe {
+            darkroom_imagebuf_simd_memcpy(std::ptr::null_mut(), std::ptr::null(), 10);
+        }
+    }
+
+    #[test]
+    fn ffi_simd_memcpy_zero_n_guard() {
+        let mut buf = vec![1.0f32; 4];
+        let src = vec![0.5f32; 4];
+        unsafe {
+            darkroom_imagebuf_simd_memcpy(buf.as_mut_ptr(), src.as_ptr(), 0);
+        }
+        assert_eq!(buf, vec![1.0; 4]); // untouched
+    }
+
+    #[test]
+    fn ffi_simd_memcpy_overflow_guard() {
+        let mut buf = vec![1.0f32; 4];
+        let src = vec![0.5f32; 4];
+        let big_n = (i32::MAX as usize) + 1;
+        unsafe {
+            darkroom_imagebuf_simd_memcpy(buf.as_mut_ptr(), src.as_ptr(), big_n);
         }
         assert_eq!(buf, vec![1.0; 4]); // untouched
     }

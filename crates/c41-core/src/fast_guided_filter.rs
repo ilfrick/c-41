@@ -24,14 +24,33 @@
 //! - `fmaxf(x, MIN_FLOAT)` → `x.max(MIN_FLOAT)`. `MIN_FLOAT` is
 //!   `exp2f(-16.0f)` in C = 2^(-16), which is exactly representable in f32.
 //!   Rust's `f32::max` is the NaN-ignoring maximum (IEEE 754 `maximumNum`),
-//!   matching C's `fmaxf` exactly — both return the non-NaN operand when one
-//!   is NaN. Note: the reference implementation `ref_apply_linear_blending`
+//!   matching standard libm `fmaxf` — both return the non-NaN operand when
+//!   one is NaN. The divergence is TU-dependent on the C side:
+//!   the global Release flags are `-ffast-math -fno-finite-math-only`
+//!   (src/CMakeLists.txt:720), which preserve `fmaxf` NaN semantics, but
+//!   TUs that `#include extra_optimizations.h` re-apply
+//!   `#pragma GCC optimize("finite-math-only")`, and there GCC lowers the
+//!   **vectorized** max to a SIMD max whose source order makes NaN
+//!   propagate (the computed value is the second source operand, and SSE max
+//!   returns the second operand when either input is NaN — verified
+//!   empirically in the CI image; the scalar `maxss` inlining of
+//!   `fmaxf(x, MIN_FLOAT)` happens to be NaN-ignoring because the constant
+//!   ends up as the second operand). The ported loop was `DT_OMP_FOR_SIMD`,
+//!   i.e. vectorized, so in pragma TUs the old C path returned NaN on NaN
+//!   input where the Rust kernel returns `MIN_FLOAT`. NaN reaching
+//!   `image[k]*ab[k*2] + ab[k*2+1]` is rare (requires upstream inf-inf or
+//!   sqrt-of-negative in the luminance-mask pipeline), and the
+//!   still-unported `apply_linear_blending_w_geomean` (still C, still uses
+//!   `fmaxf`) carries this same inconsistency live.
+//! - Note: the reference implementation `ref_apply_linear_blending`
 //!   deliberately diverges using `if blended < MIN_FLOAT { MIN_FLOAT } else { blended }`,
 //!   which is NaN-propagating (NaN < MIN_FLOAT is false, so NaN is returned).
 //!   This structural divergence is intentional for independent validation.
 //! - `fast_guided_filter.h` has no `#pragma GCC optimize("fast-math")`.
-//!   `extra_optimizations.h` (included by some callers) applies only
-//!   `finite-math-only`, which does not enable FMA contraction.
+//!   The global CMakeLists.txt `-ffast-math` flag is TU-wide and may enable
+//!   FMA contraction (`-ffp-contract=fast`) at `-O3`. The kernel-vs-reference
+//!   FMA difference is Rust-internal (both use the same FP evaluation order).
+//!   The C-vs-Rust ≤1 ULP FMA contraction difference is documented above.
 
 /// `MIN_FLOAT` constant from `luminance_mask.h`: `exp2f(-16.0f)` = 2^(-16).
 /// Exactly representable in f32, so no rounding discrepancy vs C.

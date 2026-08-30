@@ -13,6 +13,7 @@ pub mod eigf;
 pub mod error;
 pub mod exif;
 pub mod fast_guided_filter;
+pub mod focus_peaking;
 pub mod gaussian;
 pub mod geometry;
 pub mod icc;
