@@ -3727,3 +3727,71 @@ Applied P2s:
   the non-power-of-two test initially reused the 16×8 input buffer (540
   floats needed vs 512 — index-out-of-bounds panic, fixed by giving the
   case its own LCG-filled buffer).
+
+---
+
+## 2026-08-30 12:11 UTC — m4-170: Port focus_peaking gradient + overlay loops to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Ported the two remaining `DT_OMP_FOR(collapse(2))` loops of
+`dt_focuspeaking` (src/common/focus_peaking.h) to kernels in the existing
+`c41-core::focus_peaking` module — the header now has zero OpenMP sites:
+
+- `gradients` + `darkroom_focuspeaking_gradients`: the close/far laplacian
+  gradient pass (formerly :95), including ports of the `_get_indices` ring
+  helper and `_laplacian` (`dt_fast_hypotf` = `sqrtf(x*x + y*y)` under the
+  project's `-ffast-math` build, src/common/math.h:393). Border condition
+  transcribed as `i+2 >= height || j+2 > width`, behaviorally equivalent to
+  C's `i >= h-2 || j > w-2` for all dimensions (verified by review
+  enumeration incl. the int-wrap cases for dims ≤ 3).
+- `paint_overlay` + `darkroom_focuspeaking_paint_overlay`: the BGRA overlay
+  threshold pass (formerly :144) — yellow/green/blue/transparent with
+  strict `>` comparisons, NaN → transparent exactly like C.
+- `src/rust_ffi/darkroom_core.h`: +2 declarations.
+- 11 new tests (constant-image interior pin, border-band quirks, odd
+  non-square 7×5 case, LCG reference matches, threshold bands incl.
+  boundaries and NaN, FFI round-trips and guards). 25 total in the module.
+
+**Pre-existing upstream quirk handled explicitly (review-scrutinized):** the
+C far-ring read for the single interior corner pixel `(h-3, w-2)` computes
+index `h*w` — one float past the `luma` allocation (indeterminate malloc
+padding). The kernel clamps that one read to the last element
+(`read_clamped`); the review confirmed by exhaustive index enumeration that
+`(h-3, w-2)` is the only pixel affected and that all row-wrap reads stay
+in-bounds and identical. The perturbation is determinate vs C's garbage,
+and spreads only through the subsequent box-mean/blur passes at tiny
+magnitude — documented honestly in the kernel docs.
+
+**Verified.** `scripts/ci-local.sh` **GATE_EXIT=0**; incremental full-c
+Release rebuild **REBUILD_EXIT=0** with both new symbols confirmed in
+`libc41_core.so`.
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored):
+**APPROVE-WITH-FIXES**, 0 P0/P1. The reviewer independently verified the
+corner-index math, the border-condition equivalence by enumeration, the
+`fast_hypotf` branch selection, the FFI buffer contracts against
+`dt_focuspeaking`'s allocations and the view.c/thumbnail.c callers,
+syntax-checked the edited header in the CI deps image, and truth-tabled the
+reference's `!(tv > x)` restructure. Applied P2s:
+- documented the two FMA contraction surfaces of the gradient kernel
+  (`x*x + y*y`, `lap - 0.67f*(far - eps)`) vs the historical C binary, and
+  corrected the math.h line refs (:391 → sqrtf branch at :393);
+- reworded `read_clamped`'s doc: the substitute is one element *before* the
+  C address, and the perturbation is not confined to one overlay pixel
+  (it spreads through the box-mean/blur passes) — determinate and tiny,
+  not single-pixel;
+- border-comment rephrased (behavioral equivalence, not a replication of
+  C's int→size_t wrap);
+- added the odd/non-square 7×5 gradient test pinning the asymmetric bounds
+  and the row-wrap path.
+- Accepted, no action: pre-existing upstream NULL-alloc handling downstream
+  of the (unchanged) C caller — the port turns a hypothetical segfault into
+  defined-but-garbage output, not a regression.
+
+**Notes.**
+- The C helpers `_laplacian`/`_get_indices` remain in the header (static
+  inline, now unused — no other TU references them; harmless).
+- `dt_focuspeaking`'s remaining code (cairo drawing, allocations) stays C;
+  only the OpenMP loops are gone.

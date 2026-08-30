@@ -3321,6 +3321,23 @@ void darkroom_fgf_apply_linear_blending(float *image, const float *ab,
 void darkroom_focuspeaking_compute_luma(const unsigned char *image,
                                         float *luma, size_t n_pixels);
 
+/* Replaces the former collapse(2) gradient loop at focus_peaking.h:95
+ * (luma and luma_ds each hold width*height floats). Border pixels are
+ * zeroed; interior pixels get the close/far laplacian gradient. Note: C's
+ * far-ring read for the (h-3, w-2) corner touches one float past the
+ * allocation; the kernel substitutes the last element (determinate). */
+void darkroom_focuspeaking_gradients(const float *luma, float *luma_ds,
+                                     size_t width, size_t height);
+
+/* Replaces the former collapse(2) overlay loop at focus_peaking.h:144.
+ * luma_ds holds width*height floats; focus_peaking holds width*height*4
+ * bytes of BGRA. */
+void darkroom_focuspeaking_paint_overlay(const float *luma_ds,
+                                         unsigned char *focus_peaking,
+                                         size_t width, size_t height,
+                                         float six_sigma, float four_sigma,
+                                         float two_sigma);
+
 /* Replaces the DT_OMP_FOR_SIMD reduction loop at focus_peaking.h:136
  * (the TV_sum accumulation in dt_focuspeaking). Returns the raw sum;
  * the caller divides by (height-4)*(width-4). */

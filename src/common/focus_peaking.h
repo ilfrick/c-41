@@ -92,31 +92,8 @@ static inline void dt_focuspeaking(cairo_t *cr,
 
   // Compute the gradients magnitudes
   float *const restrict luma_ds =  dt_alloc_align_float((size_t)buf_width * buf_height);
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < buf_height; ++i)
-    for(size_t j = 0; j < buf_width; ++j)
-    {
-      size_t index = i * buf_width + j;
-      if (i < 2 || i >= buf_height - 2 || j < 2 || j > buf_width -2)
-        // ensure defined value for borders
-        luma_ds[index] = 0.0f;
-      else
-      {
-        size_t DT_ALIGNED_ARRAY index_close[8];
-        _get_indices(i, j, buf_width, buf_height, 1, index_close);
-
-        size_t DT_ALIGNED_ARRAY index_far[8];
-        _get_indices(i, j, buf_width, buf_height, 2, index_far);
-
-        // Computing the gradient on the closest neighbours gives us the rate of variation, but doesn't say if we are
-        // looking at local contrast or optical sharpness.
-        // so we compute again the gradient on neighbours a bit further.
-        // if both gradients have the same magnitude, it means we have no sharpness but just a big step in intensity,
-        // aka local contrast. If the closest is higher than the farthest, is means we have indeed a sharp something,
-        // either noise or edge. To mitigate that, we just subtract half the farthest gradient but add a noise threshold
-        luma_ds[index] = _laplacian(luma, index_close) - 0.67f * (_laplacian(luma, index_far) - 0.00390625f);
-      }
-    }
+  // Ported to Rust FFI, replaces the former collapse(2) loop
+  darkroom_focuspeaking_gradients(luma, luma_ds, (size_t)buf_width, (size_t)buf_height);
 
   // Anti-aliasing
   dt_box_mean(luma_ds, buf_height, buf_width, 1, 2, 1);
@@ -141,38 +118,10 @@ static inline void dt_focuspeaking(cairo_t *cr,
   fast_surface_blur(luma_ds, buf_width, buf_height, 12, 0.00001f, 4, DT_GF_BLENDING_LINEAR, 1, 0.0f, exp2f(-8.0f), 1.0f);
 
   // Prepare the focus-peaking image overlay
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < buf_height; ++i)
-    for(size_t j = 0; j < buf_width; ++j)
-    {
-      static const uint8_t yellow[4] = { 0/*B*/, 255/*G*/, 255/*R*/, 255/*alpha*/ };
-      static const uint8_t green[4] = { 0, 255, 0, 255 };
-      static const uint8_t blue[4] = { 255, 0, 0, 255 };
-
-      const size_t index = (i * buf_width + j) * 4;
-      const float TV = luma_ds[index / 4];
-
-      if(TV > six_sigma)
-      {
-        // Very sharp : paint yellow, BGR = (0, 255, 255)
-        for_four_channels(c) focus_peaking[index + c] = yellow[c];
-      }
-      else if(TV > four_sigma)
-      {
-        // Mediun sharp : paint green, BGR = (0, 255, 0)
-        for_four_channels(c) focus_peaking[index + c] = green[c];
-      }
-      else if(TV > two_sigma)
-      {
-        // Little sharp : paint blue, BGR = (255, 0, 0)
-        for_four_channels(c) focus_peaking[index + c] = blue[c];
-      }
-      else
-      {
-        // Not sharp enough : paint 0
-        for_four_channels(c) focus_peaking[index + c] = 0;
-      }
-    }
+  // Ported to Rust FFI, replaces the former collapse(2) loop
+  darkroom_focuspeaking_paint_overlay(luma_ds, focus_peaking, (size_t)buf_width,
+                                       (size_t)buf_height, six_sigma, four_sigma,
+                                       two_sigma);
 
   // draw the focus peaking overlay
   cairo_save(cr);
