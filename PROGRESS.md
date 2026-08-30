@@ -3795,3 +3795,82 @@ reference's `!(tv > x)` restructure. Applied P2s:
   inline, now unused — no other TU references them; harmless).
 - `dt_focuspeaking`'s remaining code (cairo drawing, allocations) stays C;
   only the OpenMP loops are gone.
+
+---
+
+## 2026-08-30 18:55 UTC — m4-171: Port eigf pack/min-max + blending loops to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Ported the four remaining loops of `src/common/eigf.h` (the
+Exposure-Independent Guided Filter, used by toneequal/colorequal) to kernels
+in the existing `c41-core::eigf` module — the header now has zero OpenMP
+sites:
+
+- `pack_variance_minmax_4c` + `darkroom_eigf_pack_variance_minmax_4c`: the
+  pack + min/max reduction loop of `eigf_variance_analysis` (formerly :88) —
+  packs `{g, g², m, m·g}` (a DIFFERENT channel order than fast_guided_filter's
+  `{g, m, g², g·m}`, matched to eigf's own variance-correct kernel) while
+  tracking per-channel ranges (seeds 1e7/0.0) for `dt_gaussian_init`.
+- `pack_variance_minmax_2c` + FFI: the no-mask variant (formerly :137).
+- `eigf_blending` + `darkroom_eigf_blending`: the exposure-independent
+  blending loop (formerly :168) — norm floors `fmaxf(avg·x, 1E-6)`,
+  normalized ratios, a/b solve, linear/geomean output per the filter enum
+  (passed as int; 0 = LINEAR matching `DT_GF_BLENDING_LINEAR`).
+- `eigf_blending_no_mask` + FFI: the 2-channel variant (formerly :201).
+- `src/rust_ffi/darkroom_core.h`: +4 declarations. The C variance-analysis
+  functions keep the old loop's seed values in their `min`/`max` locals so
+  the (unreachable-in-practice) Ndim==0 path behaves identically (the FFI
+  early-return leaves them intact, like the old loop that never ran).
+- 19 new tests (channel-order pin, seed interactions incl. the
+  all-above-seed case, GLib-ternary NaN chain pins for both variants,
+  identity/clamp/NaN blending cases for both filter modes, LCG reference
+  matches, FFI round-trips, guards). 35 total in the module.
+
+**Two semantic subtleties handled explicitly (both review-scrutinized):**
+- **GLib ternaries, not fminf/fmaxf:** the C reductions use gmacros.h
+  MIN/MAX (`a<b?a:b`), whose NaN behaviour differs from both fminf and
+  Rust's `f32::min`: `MIN(acc, NaN)` → NaN, then `MIN(NaN, next)` → next —
+  a mid-stream NaN is absorbed and the accumulator resumes at the next
+  value. The kernels replicate the ternaries exactly (`glib_min`/`glib_max`)
+  and the quirk is pinned by tests for both variants.
+- **Min/max reductions are order-independent** (unlike the sum reductions
+  of m4-167), so the sequential port is bit-identical to the C loop at any
+  OpenMP thread count — for NaN-free data; the docs qualify this since the
+  ternary form is neither commutative nor associative under NaN, and
+  pragma-TU `-ffinite-math-only` may have compiled the historical ternary
+  into a commutative min anyway.
+
+**Verified.** `scripts/ci-local.sh` **GATE_EXIT=0**; incremental full-c
+Release rebuild **REBUILD_EXIT=0** with all six `darkroom_eigf_*` symbols
+confirmed in `libc41_core.so`.
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored):
+**APPROVE-WITH-FIXES**, 0 P0/P1. The reviewer compiled the two real
+consumers (toneequal.c, colorequal.c) against the edited header with the
+project's actual compile_commands flags, verified the channel-order
+distinction vs fast_guided_filter, the blending expression order
+line-for-line, the dt_gaussian_init array-type decay, the n==0 seed
+equivalence, and hand-checked the test arithmetic (including exact
+representability of the seed-case folds). Applied P2s:
+- the order-independence claim qualified to NaN-free data (with the
+  signed-zero and finite-math-only caveats noted);
+- the `pack_minmax_4c_seed_values` comment rewritten to match its data (it
+  described a test that was never written) and the promised all-above-seed
+  case actually added;
+- the reference-section header scoped per family (variance-correct refs
+  change evaluation order; pack refs use f32::min/max folds; blending refs
+  restructure control flow only);
+- 2c test asymmetry closed (seed test + NaN pin + i32::MAX guard case);
+- one doc line for the OOM path's behaviour shift (old C crashed in the
+  pack loop; new C crashes later in the blur — both UB, upstream posture).
+- Accepted, no change: `excessive_precision`/`useless_vec` clippy style
+  warnings (non-failing at default strictness, precedent in color.rs).
+
+**Development self-catch, kept for the record:** the new 2c NaN-pin test
+initially reused a 2-element input buffer for a 3-element case — the
+kernel's defensive length clamp silently truncated the loop to one element
+and the assertion failed (min=1.0 vs expected 3.0). Fixed with a properly
+sized buffer; the failure mode was the clamp doing its job on a test bug,
+not a kernel bug.

@@ -77,37 +77,13 @@ static inline void eigf_variance_analysis(const float *const restrict guide, // 
   const size_t Ndim = width * height;
   float *const restrict in = dt_alloc_align_float(Ndim * 4);
 
-  float ming = 10000000.0f;
-  float maxg = 0.0f;
-  float minm = 10000000.0f;
-  float maxm = 0.0f;
-  float ming2 = 10000000.0f;
-  float maxg2 = 0.0f;
-  float minmg = 10000000.0f;
-  float maxmg = 0.0f;
-  DT_OMP_FOR(reduction(max:maxg, maxm, maxg2, maxmg) reduction(min:ming, minm, ming2, minmg))
-  for(size_t k = 0; k < Ndim; k++)
-  {
-    const float pixelg = guide[k];
-    const float pixelm = mask[k];
-    const float pixelg2 = pixelg * pixelg;
-    const float pixelmg = pixelm * pixelg;
-    in[k * 4] = pixelg;
-    in[k * 4 + 1] = pixelg2;
-    in[k * 4 + 2] = pixelm;
-    in[k * 4 + 3] = pixelmg;
-    ming = MIN(ming,pixelg);
-    maxg = MAX(maxg,pixelg);
-    minm = MIN(minm,pixelm);
-    maxm = MAX(maxm,pixelm);
-    ming2 = MIN(ming2,pixelg2);
-    maxg2 = MAX(maxg2,pixelg2);
-    minmg = MIN(minmg,pixelmg);
-    maxmg = MAX(maxmg,pixelmg);
-  }
+  // Seeds preserved from the former loop's initial reduction values, so the
+  // (unreachable-in-practice) Ndim == 0 path behaves like the old C.
+  dt_aligned_pixel_t min = { 10000000.0f, 10000000.0f, 10000000.0f, 10000000.0f };
+  dt_aligned_pixel_t max = { 0.0f, 0.0f, 0.0f, 0.0f };
+  // Ported to Rust FFI, replaces the former pack + min/max reduction loop
+  darkroom_eigf_pack_variance_minmax_4c(in, guide, mask, Ndim, min, max);
 
-  dt_aligned_pixel_t max = {maxg, maxg2, maxm, maxmg};
-  dt_aligned_pixel_t min = {ming, ming2, minm, minmg};
   dt_gaussian_t *g = dt_gaussian_init(width, height, 4, max, min, sigma, 0);
   if(!g) return;
   dt_gaussian_blur_4c(g, in, out);
@@ -130,25 +106,12 @@ static inline void eigf_variance_analysis_no_mask(const float *const restrict gu
   const size_t Ndim = width * height;
   float *const restrict in = dt_alloc_align_float(Ndim * 2);
 
-  float ming = 10000000.0f;
-  float maxg = 0.0f;
-  float ming2 = 10000000.0f;
-  float maxg2 = 0.0f;
-  DT_OMP_FOR(reduction(max:maxg, maxg2) reduction(min:ming, ming2))
-  for(size_t k = 0; k < Ndim; k++)
-  {
-    const float pixelg = guide[k];
-    const float pixelg2 = pixelg * pixelg;
-    in[2 * k] = pixelg;
-    in[2 * k + 1] = pixelg2;
-    ming = MIN(ming,pixelg);
-    maxg = MAX(maxg,pixelg);
-    ming2 = MIN(ming2,pixelg2);
-    maxg2 = MAX(maxg2,pixelg2);
-  }
+  // Seeds preserved from the former loop's initial reduction values
+  float min[2] = { 10000000.0f, 10000000.0f };
+  float max[2] = { 0.0f, 0.0f };
+  // Ported to Rust FFI, replaces the former pack + min/max reduction loop
+  darkroom_eigf_pack_variance_minmax_2c(in, guide, Ndim, min, max);
 
-  float max[2] = {maxg, maxg2};
-  float min[2] = {ming, ming2};
   dt_gaussian_t *g = dt_gaussian_init(width, height, 2, max, min, sigma, 0);
   if(!g) return;
   dt_gaussian_blur(g, in, out);
@@ -165,30 +128,8 @@ void eigf_blending(float *const restrict image, const float *const restrict mask
                   const dt_iop_guided_filter_blending_t filter,
                   const float feathering)
 {
-  DT_OMP_FOR()
-  for(size_t k = 0; k < Ndim; k++)
-  {
-    const float avg_g = av[k * 4];
-    const float avg_m = av[k * 4 + 2];
-    const float var_g = av[k * 4 + 1];
-    const float covar_mg = av[k * 4 + 3];
-    const float norm_g = fmaxf(avg_g * image[k], 1E-6);
-    const float norm_m = fmaxf(avg_m * mask[k], 1E-6);
-    const float normalized_var_guide = var_g / norm_g;
-    const float normalized_covar = covar_mg / sqrtf(norm_g * norm_m);
-    const float a = normalized_covar / (normalized_var_guide + feathering);
-    const float b = avg_m - a * avg_g;
-    if(filter == DT_GF_BLENDING_LINEAR)
-    {
-      image[k] = fmaxf(image[k] * a + b, MIN_FLOAT);
-    }
-    else
-    {
-      // filter == DT_GF_BLENDING_GEOMEAN
-      image[k] *= fmaxf(image[k] * a + b, MIN_FLOAT);
-      image[k] = sqrtf(image[k]);
-    }
-  }
+  // Ported to Rust FFI, replaces the former element-wise loop
+  darkroom_eigf_blending(image, mask, av, Ndim, (int)filter, feathering);
 }
 
 // same function as above, but specialized for the case where guide == mask
@@ -198,26 +139,8 @@ void eigf_blending_no_mask(float *const restrict image,
                   const dt_iop_guided_filter_blending_t filter,
                   const float feathering)
 {
-  DT_OMP_FOR()
-  for(size_t k = 0; k < Ndim; k++)
-  {
-    const float avg_g = av[k * 2];
-    const float var_g = av[k * 2 + 1];
-    const float norm_g = fmaxf(avg_g * image[k], 1E-6);
-    const float normalized_var_guide = var_g / norm_g;
-    const float a = normalized_var_guide / (normalized_var_guide + feathering);
-    const float b = avg_g - a * avg_g;
-    if(filter == DT_GF_BLENDING_LINEAR)
-    {
-      image[k] = fmaxf(image[k] * a + b, MIN_FLOAT);
-    }
-    else
-    {
-      // filter == DT_GF_BLENDING_GEOMEAN
-      image[k] *= fmaxf(image[k] * a + b, MIN_FLOAT);
-      image[k] = sqrtf(image[k]);
-    }
-  }
+  // Ported to Rust FFI, replaces the former element-wise loop
+  darkroom_eigf_blending_no_mask(image, av, Ndim, (int)filter, feathering);
 }
 
 __DT_CLONE_TARGETS__

@@ -3306,6 +3306,33 @@ void darkroom_eigf_variance_correct_4c(float *buf, size_t n_elements);
  * eigf_variance_analysis_no_mask). */
 void darkroom_eigf_variance_correct_2c(float *buf, size_t n_elements);
 
+/* Replaces the former pack + min/max reduction loop at eigf.h:88 (in
+ * eigf_variance_analysis). input receives the {g, g2, m, m*g} pack
+ * (n_elements*4 floats); min/max receive the per-channel ranges
+ * {g, g2, m, m*g} (4 floats each, seeded 1e7 / 0.0 as in the old loop). */
+void darkroom_eigf_pack_variance_minmax_4c(float *input, const float *guide,
+                                           const float *mask, size_t n_elements,
+                                           float *min, float *max);
+
+/* Replaces the former pack + min/max reduction loop at eigf.h:137 (in
+ * eigf_variance_analysis_no_mask). input receives the {g, g2} pack
+ * (n_elements*2 floats); min/max receive 2 floats each. */
+void darkroom_eigf_pack_variance_minmax_2c(float *input, const float *guide,
+                                           size_t n_elements, float *min,
+                                           float *max);
+
+/* Replaces the former element-wise loop at eigf.h:168 (eigf_blending).
+ * av holds {avg_g, var_g, avg_m, covar_mg} per element (4 floats).
+ * filter is the dt_iop_guided_filter_blending_t enum (0 = linear). */
+void darkroom_eigf_blending(float *image, const float *mask, const float *av,
+                            size_t n_elements, int filter, float feathering);
+
+/* Replaces the former element-wise loop at eigf.h:201
+ * (eigf_blending_no_mask). av holds {avg_g, var_g} per element. */
+void darkroom_eigf_blending_no_mask(float *image, const float *av,
+                                    size_t n_elements, int filter,
+                                    float feathering);
+
 /* Replaces the DT_OMP_FOR_SIMD loop at fast_guided_filter.h:178 (the
  * variance-analyse pack loop in variance_analyse). */
 void darkroom_fgf_pack_variance_4c(float *input, const float *guide,
