@@ -3408,6 +3408,17 @@ void darkroom_fgf_interpolate_bilinear(const float *src, size_t width_in,
                                        size_t width_out, size_t height_out,
                                        size_t ch);
 
+/* Replaces the former element-wise threshold loop at distance_transform.c:105
+ * (the DT_DISTANCE_TRANSFORM_MASK branch of dt_image_distance_transform):
+ * out[k] = (src[k] < clip) ? 0.0f : DT_DISTANCE_TRANSFORM_MAX. */
+void darkroom_distance_transform_mask(const float *src, float *out,
+                                       size_t n_elements, float clip);
+
+/* Replaces the former brute-force reverse-lookup loop at illuminants.h:554
+ * (CCT_reverse_lookup). Returns the temperature of the planckian-locus LUT
+ * point closest to (x, y). */
+float darkroom_illuminants_cct_reverse_lookup(float x, float y);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

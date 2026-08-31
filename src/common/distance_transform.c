@@ -55,6 +55,7 @@
 #include "common/math.h"
 #include "common/distance_transform.h"
 #include "common/imagebuf.h"
+#include "rust_ffi/darkroom_core.h"
 
 static void _image_distance_transform(const float *f,
                                       float *z,
@@ -102,9 +103,8 @@ float dt_image_distance_transform(const float *const src,
     case DT_DISTANCE_TRANSFORM_NONE:
       break;
     case DT_DISTANCE_TRANSFORM_MASK:
-      DT_OMP_FOR()
-      for(size_t i = 0; i < width * height; i++)
-        out[i] = (src[i] < clip) ? 0.0f : DT_DISTANCE_TRANSFORM_MAX;
+      // Ported to Rust FFI, replaces the former element-wise threshold loop
+      darkroom_distance_transform_mask(src, out, width * height, clip);
       break;
     default:
       dt_iop_image_fill(out, 0.0f, width, height, 1);

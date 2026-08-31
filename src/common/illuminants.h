@@ -21,6 +21,7 @@
 #include "common/chromatic_adaptation.h"
 #include "common/image.h"
 #include "common/dttypes.h"
+#include "rust_ffi/darkroom_core.h"
 
 /* Standard CIE illuminants */
 typedef enum dt_illuminant_t
@@ -543,40 +544,10 @@ static inline float CCT_reverse_lookup(const float x, const float y)
   // for any arbitrary x, y chromaticity, by brute-force reverse-lookup.
   // Note that the LUT computation could be defered somewhere else, and computed once
 
-  static const float T_min = 1667.f;
-  static const float T_max = 25000.f;
-  static const float T_range = T_max - T_min;
-  static const size_t LUT_samples = 1<<16;
-
-  struct pair min_radius = { FLT_MAX, 0.0f };
-
-#if !(defined(__apple_build_version__) && __apple_build_version__ < 11030000) //makes Xcode 11.3.1 compiler crash
-  DT_OMP_FOR(reduction(pairmin:min_radius))
-#endif
-  for(size_t i = 0; i < LUT_samples; i++)
-  {
-    // we need more values for the low temperatures, so we scale the step with a power
-    const float step = powf((float)i / (float)(LUT_samples - 1), 4.0f);
-
-    // Current temperature in the lookup range
-    const float T = T_min +  step * T_range;
-
-    // Current x, y chromaticity
-    float x_bb, y_bb;
-
-    if(T >= 4000.f)
-      CCT_to_xy_daylight(T, &x_bb, &y_bb);
-    else
-      CCT_to_xy_blackbody(T, &x_bb, &y_bb);
-
-    // Compute distance between current planckian chromaticity and input
-    const pair radius_tmp = { dt_fast_hypotf((x_bb - x), (y_bb - y)), T };
-
-    // If we found a smaller radius, save it
-    min_radius = pair_min(min_radius, radius_tmp);
-  }
-
-  return min_radius.temperature;
+  // Ported to Rust FFI, replaces the former brute-force reverse-lookup loop
+  // (incl. its CCT_to_xy_* calls and the pairmin reduction; the Rust kernel
+  // keeps the first-wins tie semantics of pair_min)
+  return darkroom_illuminants_cct_reverse_lookup(x, y);
 }
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

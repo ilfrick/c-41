@@ -3874,3 +3874,80 @@ kernel's defensive length clamp silently truncated the loop to one element
 and the assertion failed (min=1.0 vs expected 3.0). Fixed with a properly
 sized buffer; the failure mode was the clamp doing its job on a test bug,
 not a kernel bug.
+
+---
+
+## 2026-08-31 04:58 UTC — m4-172: Port distance_transform mask loop + illuminants CCT_reverse_lookup to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Two more `src/common` loop sites ported to new `c41-core` modules:
+
+- `crates/c41-core/src/distance_transform.rs` (new): the
+  `DT_DISTANCE_TRANSFORM_MASK` threshold loop of
+  `dt_image_distance_transform` (formerly distance_transform.c:105) →
+  `mask_threshold` + `darkroom_distance_transform_mask(src, out, n, clip)`.
+  Strict `<` boundary pinned by test (a pixel exactly at `clip` seeds MAX).
+  The Felzenszwalb–Huttenlocher two-pass transform stays in C (a parallel
+  region with per-thread work arrays, not a flat loop). 5 tests.
+- `crates/c41-core/src/illuminants.rs` (new): the `CCT_reverse_lookup`
+  brute-force planckian-locus scan (formerly illuminants.h:554, a
+  `DT_OMP_FOR` with a custom `pairmin` reduction over a 65536-point LUT) →
+  `cct_reverse_lookup` + `darkroom_illuminants_cct_reverse_lookup(x, y)`,
+  with private ports of the `CCT_to_xy_daylight`/`CCT_to_xy_blackbody`
+  polynomial helpers (the C originals stay — other callers in the header).
+  The C function body is now a single FFI call. Callers:
+  `channelmixerrgb.c` (both call sites verified live, outside the dead
+  `#ifdef AI_ACTIVATED` blocks). 7 tests.
+
+**Reference pins generated from the real C:** the polynomial helpers and
+the reverse-lookup loop were extracted from HEAD, compiled with the
+project's Release flags (`-O3 -ffast-math -fno-finite-math-only`) in the CI
+image, and their %.9g outputs hardcoded as test expectations (11 xy pins +
+6 reverse-lookup pins, with 1e-6 / 1–2 K tolerances absorbing the
+FMA-contraction order-ULP class). The reviewer independently regenerated
+every pin from `git show HEAD` — all 17 reproduce, and a full-precision
+Rust-vs-C diff showed only ≤1 ULP xy differences plus one near-tie LUT-step
+flip (8534.88 vs 8534.31 K, one ~0.57 K LUT step at that temperature),
+empirically validating the tolerance design.
+
+**Verified.** `scripts/ci-local.sh` **GATE_EXIT=0**; incremental full-c
+Release rebuild **REBUILD_EXIT=0** with both new symbols confirmed in
+`libc41_core.so` (the reviewer additionally compiled the two changed C TUs
+under Release `-Werror` — clean).
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored): **APPROVE**,
+0 P0/P1. Verified line-by-line polynomial transcription (coefficients,
+inclusive/exclusive range boundaries incl. the 2222 K blackbody-y switch
+and daylight's unconditional y), the first-wins strict-`<` tie semantics
+(vs the OpenMP combine's implementation-defined tie order — measure-zero,
+documented), the segbased.c NULL-src call path (MASK branch not taken),
+guard-pattern parity, and that `lib.rs` carries exactly two added module
+lines (a sed mishap during development had briefly duplicated them —
+caught and cleaned before commit). Applied P2s:
+- the "independent of OpenMP partitioning" doc claim qualified (exact-tie
+  combine order is implementation-defined; sequential always returns the
+  lowest tied temperature);
+- the weak "monotonicity" test replaced with honest measured assertions
+  (`reverse_lookup_at_locus_point`: Δx=0.002 moves ~61 K — the locus is
+  steep at 6500 K — and Δx=0.05 moves ~1349 K; bounds probed empirically
+  after my first guess at the geometry failed the test).
+- Accepted, no action: the now-unused `struct pair`/`pair_min` reduction
+  machinery stays (pre-existing, single includer, follow-up candidate);
+  9 `excessive_precision` clippy style warnings on C-verbatim coefficients
+  (byte-identical to source is the reviewable choice, 201 pre-existing).
+
+**Notes.**
+- The remaining unported structure in distance_transform.c is the
+  DT_OMP_PRAGMA parallel region (per-thread f/z/d/v work arrays + a
+  barrier between the column and row passes) — not counted by the
+  `DT_OMP_FOR(` metric and not a flat-loop port candidate.
+- `illuminants.h`'s `pair_min` is a non-static function definition in a
+  header — safe only because exactly one TU includes it; unchanged by this
+  diff, flagged for a future cleanup.
+- Development self-catches, kept for the record: (1) a first draft test
+  asserted daylight out-of-range returns (0, 0) — wrong, its y-polynomial
+  is unconditional, giving (0, -0.275); (2) my first "near displacement"
+  bound (25 K) was a geometry guess that the actual 61 K movement
+  falsified — replaced with measured bounds.
