@@ -28,6 +28,7 @@ pub mod locallaplacian;
 pub mod masks;
 pub mod math;
 pub mod params;
+pub mod pfm;
 pub mod pipeline;
 pub mod raw;
 pub mod rawimage;

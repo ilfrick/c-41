@@ -3499,6 +3499,36 @@ void darkroom_colorspaces_cygm_apply_coeffs(float *out, const float *in,
                                              size_t num,
                                              const double *matrix);
 
+/*
+ * PFM unpack (pfm.c, dt_read_pfm, m4-175).
+ *
+ * darkroom_pfm_unpack replaces the former element-wise unpack loops (both
+ * the channels == 3 and the channels == 1 branch, collapsed into one call
+ * with `channels` selecting the path internally). readbuf holds
+ * width*height*channels floats as read from the file; image receives
+ * width*height*planes floats at stride planes per pixel.
+ *
+ * Row flip: the source row of output row `row` is
+ * `made_by_photoshop ? row : height - 1 - row` — the de facto standard PFM
+ * scanline order is bottom-to-top; Photoshop (detected by the caller)
+ * writes top-to-bottom.
+ *
+ * Byte swap: when swap_byte_order is nonzero every source f32 is
+ * byte-swapped as a raw 32-bit pattern (the C union/GUINT32_SWAP_LE_BE
+ * type-pun). Pure bit move — exactly bit-preserving, NaN payloads
+ * included; there is no floating-point arithmetic in the kernel at all.
+ *
+ * Contracts: channels is 1 (mono, the single value is broadcast to every
+ * output plane) or 3 (RGB); planes <= 4 (the C pix array was a 4-float
+ * dt_aligned_pixel_t — the former RGB loop would read out of bounds for
+ * planes > 4; all real callers pass 3 or 4). With planes == 4 in the RGB
+ * branch the fourth output channel is 0.0, the zero-initialised pix slot.
+ * Any other channels value or a zero/degenerate dimension is a no-op.
+ */
+void darkroom_pfm_unpack(const float *readbuf, float *image, size_t width,
+                          size_t height, size_t planes, size_t channels,
+                          int swap_byte_order, int made_by_photoshop);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -25,6 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "rust_ffi/darkroom_core.h"
+
 float *dt_read_pfm(const char *filename,
                    int *err,
                    int *wd,
@@ -165,47 +167,13 @@ float *dt_read_pfm(const char *filename,
     goto error;
   }
 
-  // We use this union to swap the byte order in the float value if needed
-  union { float as_float; guint32 as_int; } value;
-
   // The de facto standard (set by the first implementation) scanline order
-  // of PFM is bottom-to-top, so in the loops below we change the order of
+  // of PFM is bottom-to-top, so in the unpack below we change the order of
   // the rows in the process of filling the output buffer with data
-  if(channels == 3)
-  {
-    DT_OMP_FOR()
-    for(size_t row = 0; row < height; row++)
-    {
-      const size_t target_row = made_by_photoshop ? row : height - 1 - row;
-      for(size_t column = 0; column < width; column++)
-      {
-        dt_aligned_pixel_t pix = { 0.0f, 0.0f, 0.0f, 0.0f};
-        for_three_channels(c)
-        {
-          value.as_float = readbuf[3 * (target_row * width + column) + c];
-          if(swap_byte_order) value.as_int = GUINT32_SWAP_LE_BE(value.as_int);
-          pix[c] = value.as_float;
-        }
-        for(size_t c = 0; c < planes; c++)
-          image[planes*(row*width + column) + c] = pix[c];
-      }
-    }
-  }
-  else
-  {
-    DT_OMP_FOR()
-    for(size_t row = 0; row < height; row++)
-    {
-      const size_t target_row = made_by_photoshop ? row : height - 1 - row;
-      for(size_t column = 0; column < width; column++)
-      {
-        value.as_float = readbuf[target_row * width + column];
-        if(swap_byte_order) value.as_int = GUINT32_SWAP_LE_BE(value.as_int);
-        for(size_t c = 0; c < planes; c++)
-          image[planes*(row*width + column) + c] = value.as_float;
-      }
-    }
-  }
+  // (Photoshop, detected above, writes top-to-bottom instead). Ported to
+  // Rust FFI, replaces the former element-wise unpack loops.
+  darkroom_pfm_unpack(readbuf, image, width, height, planes, channels,
+                      swap_byte_order, made_by_photoshop);
   dt_free_align(readbuf);
   fclose(f);
 

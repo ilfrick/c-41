@@ -4150,3 +4150,75 @@ point that spec+dev+review separation is working.
 - `rgb_to_cygm`'s C FIXME ("is this correct or should it be i*4?") is
   preserved in the Rust docs — the stride-3/write-4 behaviour is
   upstream's intent-as-shipped and matches the only live call pattern.
+
+---
+
+## 2026-08-31 13:14 UTC — m4-175: Port pfm read unpack loops to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Both `DT_OMP_FOR` unpack loops of `dt_read_pfm`
+(src/common/pfm.c, formerly :176/:196 — the channels==3 RGB branch and the
+mono branch) ported to ONE kernel `pfm_unpack` +
+`darkroom_pfm_unpack(readbuf, image, width, height, planes, channels,
+swap_byte_order, made_by_photoshop)` in a new `c41-core::pfm` module
+(mirrors the m4-168 quantize precedent: two C track loops → one kernel
+branching internally). pfm.c now has zero OMP loop sites.
+
+- Row flip (`made_by_photoshop ? row : height-1-row`), RGB read with the
+  zero-initialised 4th pix slot (written when planes=4), mono broadcast to
+  all planes, output indexing `planes*(row*width+column)+c` — all op-for-op.
+- Byte swap: the C union type-pun + `GUINT32_SWAP_LE_BE` maps to
+  `f32::from_bits(v.to_bits().swap_bytes())` — pure bit move, so the port
+  is bit-preserving including NaN payloads. The dev agent surfaced (and
+  the review confirmed) a subtlety worth knowing: byte-swapping a NaN
+  pattern generally yields a NON-NaN float (the exponent byte moves) —
+  bit-faithful to C, not NaN-faithful; both directions pinned via exact
+  `to_bits()` tests.
+- Kernel is stricter than C where C was silently wrong: channels ∉ {1,3}
+  rejected (C's else treated any non-3 as mono; only 1/3 are reachable
+  from the header parse) and planes > 4 rejected (the C RGB loop would
+  read `pix[c]` OOB of its 4-float aligned pixel; all three real callers
+  pass 3 or 4 — verified).
+- The loop-local `union { float as_float; guint32 as_int; }` removed with
+  the loops. `dt_write_pfm` untouched. 15 new tests.
+
+**Build-system fix found by the gate (same class as m4-168's):**
+`darktable-chart` compiles `../common/pfm.c` directly and links only
+`lib_darktable` — with the pfm.c.o now referencing a Rust symbol, ld's
+default no-transitive-DSO-symbols behaviour failed the chart link
+("DSO missing from command line"). Fixed by adding the `c41_core` imported
+target to `darktable-chart`'s `target_link_libraries`
+(src/chart/CMakeLists.txt). First full-c build attempt: REBUILD_EXIT=1 on
+exactly this; post-fix REBUILD_EXIT=0.
+
+**Verified.** `scripts/ci-local.sh` **GATE_EXIT=0**; full-c Release
+rebuild **REBUILD_EXIT=0** with `darkroom_pfm_unpack` confirmed in
+`libc41_core.so`.
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored):
+**APPROVE-WITH-FIXES**, 0 P0/P1. Verified the transcription op-for-op
+(row flip, read indexing, pix zero slot, mono broadcast, output indexing),
+the swap equivalence (GUINT32_SWAP_LE_BE ≡ u32::swap_bytes, host-order
+independent), the union-pun → to_bits/from_bits equivalence (no NaN
+quieting), that channels ∈ {1,3} is the only reachable state at the call
+site, the planes>4 guard justification, and the clamp-arithmetic
+underflow-freedom; compiled pfm.c.o under Release flags. Applied P2s:
+- the FFI now validates `channels ∈ {1,3}` and `planes ∈ 1..=4` BEFORE
+  multiplying them into the from_raw_parts slice lengths (a misuse caller
+  could otherwise overflow the product — repo precedent validates before
+  slice construction);
+- `#[allow(clippy::too_many_arguments)]` on the 8-arg fns (house pattern)
+  plus two doc-indentation warnings fixed.
+- Accepted, no action: P3 notes on the single-threaded-vs-OMP trade-off
+  (documented, accepted pattern), a float-vs-bits Vec comparison in a test
+  (LCG data can't produce ±0-only differences), and the C union pun being
+  UB-adjacent in C11 (GCC defines it; the Rust port is if anything more
+  defined).
+
+**Notes.**
+- The unpack is pure bit movement — no FP arithmetic — so this port is
+  exactly bit-preserving (stronger than the usual order-ULP class).
+- Parallelism loss vs the OMP row loop is the accepted pattern; PFM loads
+  are file-I/O-bound in practice.

@@ -22,6 +22,7 @@ target_link_libraries(darktable-chart
                         ${LCMS2_LIBRARIES}
                         ${GTK3_LIBRARIES}
                         lib_darktable
+                        c41_core
                         m)
 if (WIN32)
   set_target_properties(darktable-chart PROPERTIES LINK_FLAGS "-mwindows -Wl,-subsystem,windows")
