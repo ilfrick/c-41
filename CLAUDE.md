@@ -107,6 +107,11 @@ session that hand-writes each increment exhausts itself after ~1–2. So:
 
 ## Notes
 
+- **Never commit, or otherwise share, API keys or other secrets** — no keys,
+  tokens, passwords or credentials in commits, diffs, `PROGRESS.md` entries,
+  logs, task specs or subagent prompts. Stage files deliberately (never a
+  blind `git add -A` over unknown state) and treat anything secret-shaped in
+  a diff as a stop-before-commit.
 - No local C build deps — build via Docker, never assume a host toolchain.
 - `clippy` runs at default strictness in CI; the pre-existing `clone!`
   deprecation warnings in `c41-ui` are a known style item, out of scope.

@@ -3971,3 +3971,17 @@ prefer re-delegating with a corrected spec over long in-session hand-fixes.
 
 **Verified.** No code change — `scripts/ci-local.sh` still run by the
 pre-push hook on this push (exit code trusted).
+
+---
+
+## 2026-08-31 05:35 UTC — process: CLAUDE.md gains a secrets policy
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Docs-only: first bullet in `CLAUDE.md` Notes — never commit or
+otherwise share API keys or other secrets (commits, diffs, PROGRESS.md,
+logs, task specs, subagent prompts); stage deliberately, treat
+secret-shaped diff content as stop-before-commit.
+
+**Verified.** No code change; pre-push hook gate ran on push (exit code
+trusted).
