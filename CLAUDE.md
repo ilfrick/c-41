@@ -79,6 +79,32 @@ input/decision, or (c) you run out of context/tokens. Chain Phase increments
 back-to-back, each through the full workflow above. After finishing one
 increment, pick the next step from `RUST_MIGRATION_PLAN.md` and continue.
 
+## Context efficiency (delegated development)
+
+Main-session context is the binding constraint on chaining increments — a
+session that hand-writes each increment exhausts itself after ~1–2. So:
+
+- **Delegate the heavy development of each increment** — reading the C
+  source, writing the Rust kernels/tests/references, FFI exports, and
+  C call-site edits — to a **fresh general-purpose subagent** with a precise
+  task spec: target loops, the established module conventions (guard
+  pattern, reference-implementation style, test style), the files to
+  create/edit, and a read-only-everything-else mandate. Give it the relevant
+  repo paths and let it read the code itself.
+- The main session keeps, itself: increment scoping, the task spec,
+  verifying the delegated work (tests/gates), the **independent senior
+  review** (step 2 — that agent is separate by design and must never be the
+  one that wrote the code), applying review fixes (a small fix may be done
+  in-session; a large one re-delegated), the PROGRESS.md entry,
+  commit/push, and CI confirmation.
+- If delegated development comes back broken, prefer **re-delegating with a
+  corrected spec** over hand-fixing at length — the fix usually costs less
+  context than the diagnosis.
+- State lives in the repo, not the session: `PROGRESS.md` (newest last),
+  `RUST_MIGRATION_PLAN.md`, `PARITY_AUDIT.md`. Any fresh session must be
+  able to resume from those alone; keep them current for exactly that
+  reason.
+
 ## Notes
 
 - No local C build deps — build via Docker, never assume a host toolchain.

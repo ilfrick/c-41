@@ -3951,3 +3951,23 @@ caught and cleaned before commit). Applied P2s:
   is unconditional, giving (0, -0.275); (2) my first "near displacement"
   bound (25 K) was a geometry guess that the actual 61 K movement
   falsified — replaced with measured bounds.
+
+---
+
+## 2026-08-31 05:20 UTC — process: CLAUDE.md gains a delegated-development policy
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** Docs-only change to `CLAUDE.md` (new section "Context efficiency
+(delegated development)"): each increment's heavy development (reading C,
+writing kernels/tests, FFI wiring, C call-site edits) is now delegated to a
+fresh general-purpose subagent under a precise task spec, with the main
+session retaining scoping, verification, the independent senior review,
+findings fixes, PROGRESS.md, and commit/push/CI. Rationale: a session that
+hand-writes each increment exhausts its context after ~1–2; delegation is
+the structural fix, and repo state (PROGRESS.md / RUST_MIGRATION_PLAN.md /
+PARITY_AUDIT.md) must stay resumable by any fresh session. Also codifies:
+prefer re-delegating with a corrected spec over long in-session hand-fixes.
+
+**Verified.** No code change — `scripts/ci-local.sh` still run by the
+pre-push hook on this push (exit code trusted).
