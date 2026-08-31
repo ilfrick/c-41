@@ -3454,6 +3454,51 @@ void darkroom_guided_filter_apply(const float *guide, size_t guide_stride,
                                    size_t tile_width,
                                    float guide_weight, float min, float max);
 
+/*
+ * Colorspaces flat matrix kernels (colorspaces.c, m4-174).
+ *
+ * All matrices are flat row-major doubles, passed exactly as the C 2-D
+ * parameters decay: CAM_to_RGB is 12 doubles ([3][4], [c][k] at c*4+k),
+ * RGB_to_CAM is 12 doubles ([4][3], [c][k] at c*3+k), RGB_to_RGB_WB is
+ * 9 doubles ([3][3], [a][b] at a*3+b).
+ *
+ * Numeric contract (all three): every accumulation step is
+ *   o = (float)((double)o + (double)m * (double)v)
+ * — the matrix*value product is computed in f64, added to the promoted
+ * f32 accumulator in f64, and rounded back to f32 at EVERY step (the C
+ * accumulators are float, the matrices double). Pixels are packed
+ * 4-float slots.
+ */
+
+/* In-place CYGM -> RGB over num pixels (colorspaces.c:2462, the former
+ * element-wise loop). Reads all four floats per pixel (the 4th channel
+ * is an input), writes floats 0..2, leaves float 3 untouched on write.
+ * buf holds num*4 floats. */
+void darkroom_colorspaces_cygm_to_rgb(float *buf, size_t num,
+                                       const double *matrix);
+
+/* In-place RGB -> CYGM over num pixels (colorspaces.c:2479, the former
+ * element-wise loop with the C "//FIXME: is this correct or should it
+ * be i*4 ?"). Pixels are READ at stride 3 but FOUR floats are written,
+ * so pixel i's 4th write lands at buf[i*3+3] — pixel i+1's first read
+ * slot: the loop is a sequential cross-pixel chain. The port is
+ * sequential (well-defined for any num, matching C's serial fallback);
+ * the only real callers pass num = 1, where the 4th write simply
+ * overwrites the alpha of the single dt_aligned_pixel_t. buf must hold
+ * at least 3*num + 1 floats. */
+void darkroom_colorspaces_rgb_to_cygm(float *buf, size_t num,
+                                       const double *matrix);
+
+/* RGB -> white-balanced-RGB over num pixels: out[a] =
+ * sum_{b=0..2} matrix[a*3+b] * in[b], out alpha untouched (input alpha
+ * is not read). DEAD exported code — declared in colorspaces.h but
+ * currently with zero callers in src/; the scalar CAM_to_RGB_WB /
+ * RGB_to_RGB_WB setup stays in C and only the precomputed 3x3 matrix
+ * is passed here. out and in are separate buffers and must not alias. */
+void darkroom_colorspaces_cygm_apply_coeffs(float *out, const float *in,
+                                             size_t num,
+                                             const double *matrix);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

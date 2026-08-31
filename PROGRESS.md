@@ -4069,3 +4069,84 @@ claims to verify, not verdicts.
   box-mean calls; the file drops from 3 sites to 1.
 - The `A_RED`/`A_GREEN`/`A_BLUE`/`B` `#define`s stay in C (kernel-only now,
   kept as documentation of the channel layout, per the m4-170 precedent).
+
+---
+
+## 2026-08-31 11:48 UTC — m4-174: Port colorspaces cygm matrix loops to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** All three flat matrix loops of `src/common/colorspaces.c` ported
+to a new `c41-core::colorspaces` module (second delegated-development
+increment):
+
+- `cygm_to_rgb` + `darkroom_colorspaces_cygm_to_rgb(buf, num, matrix)`:
+  in-place 4-float-pixel conversion (formerly :2462) — reads channels
+  0..4, writes 0..3, 4th float untouched on write. LIVE bulk caller:
+  `demosaic.c:865` (num = width·t_rows).
+- `rgb_to_cygm` + `darkroom_colorspaces_rgb_to_cygm(buf, num, matrix)`:
+  the stride-3 quirk loop with the in-C FIXME (formerly :2479) — reads 3
+  floats, writes FOUR, so pixel i's 4th write is pixel i+1's first read: a
+  sequential cross-pixel chain and an OpenMP data race for num > 1.
+  Fact-checked before porting: the only live callers (invert.c:106/:218)
+  pass **num=1**, so the chain never executes in practice; the sequential
+  port matches C's serial fallback deterministically and replicates the
+  chain exactly for any num. FFI slice contract is 3·num+1 floats
+  (faithful to C's real footprint).
+- `cygm_apply_coeffs` + `darkroom_colorspaces_cygm_apply_coeffs(out, in,
+  num, matrix)`: the loop of `dt_colorspaces_cygm_apply_coeffs_to_rgb`
+  (formerly :2446) — verified DEAD exported code (definition + header
+  decl, zero callers anywhere); ported anyway for metric honesty, with its
+  dead status documented and the no-alias contract set by us (C would
+  diverge under aliasing too: it zeroes outpos before reading).
+  The scalar CAM_to_RGB_WB/RGB_to_RGB_WB double matrix setup stays in C;
+  kernels receive precomputed row-major f64 matrices.
+- Load-bearing FP contract on all three: `o[c] += double_expr` with float
+  o rounds to f32 after EVERY accumulation step
+  (`(float)((double)o + (double)m·(double)v)`) — replicated exactly and
+  now pinned by a genuinely discriminating test (see review fixes).
+- `src/rust_ffi/darkroom_core.h`: +3 declarations. 15 new tests.
+
+**Verified.** `scripts/ci-local.sh` **GATE_EXIT=0**; incremental full-c
+Release rebuild **REBUILD_EXIT=0** with all three
+`darkroom_colorspaces_*` symbols in `libc41_core.so` (the reviewer also
+compiled colorspaces.c standalone under the exact Release `-Werror`
+command line from compile_commands.json — clean).
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored):
+**APPROVE**, 0 P0/P1/P2. Verified: the per-step f32-rounding claim against
+C11 compound-assignment semantics; all three transcriptions op-for-op
+including the channel bounds (apply_coeffs reads b in 0..3, NOT 0..4 —
+the dev agent had corrected my spec's wavering on this and the reviewer
+confirmed); the matrix layouts (`double[3][4]` decays to a contiguous
+row-major flat pointer; the flat casts are sound); the num=3 chain by
+hand-simulation from the C ([1,1,1,3,2,2,7,3,3,13] — matches kernel and
+test); the dead-code claim by independent grep; the FFI slice contracts
+(rgb_to_cygm's 3·num+1 is C's real footprint, not stricter-than-C); and
+the FMA doc claim (contraction applies to the f64 site before the per-step
+f32 rounding, so it is NOT mooted — doc accurate). Applied P3s:
+- the dedicated per-step-rounding test was non-discriminating (per-step
+  and one-shot f64 rounding agree for m=1/3 ×4) — strengthened with a
+  genuinely divergent case: accumulator parked at 2^24 then three +1.0
+  products → per-step ties-to-even keeps 16777216.0 while one-shot f64
+  rounding gives 16777220.0; the test now asserts both the kernel result
+  AND that the two strategies differ.
+- comment typo fixed (pixel 2's *first* input, not *second*).
+- Accepted, no action: throughput note on the bulk demosaic path
+  (sequential vs OMP-parallel — consistent with the established porting
+  pattern; ~12 FLOPs/pixel vs VNG's cost; revisit if VNG4 benchmarks are
+  run).
+
+**Delegation process notes.** Second delegated increment; the dev agent
+again self-corrected its own first-draft test pins (three wrong
+expectations, kernels right on first run) and caught my spec's wavering
+on the apply_coeffs channel bounds. Deviations from spec were documented
+rather than silently absorbed. The review found no P2+ — second data
+point that spec+dev+review separation is working.
+
+**Notes.**
+- `colorspaces.c` now has zero `DT_OMP_FOR` sites.
+- `rgb_to_cygm`'s C FIXME ("is this correct or should it be i*4?") is
+  preserved in the Rust docs — the stride-3/write-4 behaviour is
+  upstream's intent-as-shipped and matches the only live call pattern.

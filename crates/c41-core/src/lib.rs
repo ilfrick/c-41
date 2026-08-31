@@ -8,6 +8,7 @@ pub mod blend;
 pub mod color;
 pub mod curve_tools;
 pub mod colorreconstruct;
+pub mod colorspaces;
 pub mod dwt;
 pub mod distance_transform;
 pub mod eigf;
