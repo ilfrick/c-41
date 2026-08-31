@@ -3419,6 +3419,41 @@ void darkroom_distance_transform_mask(const float *src, float *out,
  * point closest to (x, y). */
 float darkroom_illuminants_cct_reverse_lookup(float x, float y);
 
+/*
+ * Guided filter (guided_filter.c, _guided_filter_tiling) -- solve + apply
+ * tile passes (m4-173).
+ *
+ * darkroom_guided_filter_solve replaces the former element-wise Cramer-rule
+ * solve loop. mean_ab holds size*4 packed floats {inp_mean, guide_r,
+ * guide_g, guide_b} on entry and receives {a_r, a_g, a_b, b} in place (the
+ * buffers alias, exactly like the C `a_b = mean` recycling); variance holds
+ * size*9 packed floats {cov_r, cov_g, cov_b, var_rr, var_rg, var_rb,
+ * var_gg, var_gb, var_bb}. eps is the regulariser added to the variance
+ * diagonal; the singular branch (|det0| <= 4*FLT_EPSILON) yields a = 0 and
+ * b = inp_mean.
+ *
+ * darkroom_guided_filter_apply replaces the former per-row apply loop over
+ * the target rectangle [target_left,target_right) x [target_lower,
+ * target_upper) in guide coordinates. guide is the colour guide image
+ * (guide_stride = ch >= 3; only channels 0..3 are read); ab holds the
+ * blurred {a_r, a_g, a_b, b} coefficients, 4 floats per tile pixel, with
+ * the tile-pixel run of row j starting at (target_left - source_left) +
+ * (j - source_lower)*tile_width; out receives one float per pixel. Output
+ * is GLib-CLAMPed (double ternary, NaN passes through) to [min, max].
+ * guide_weight scales the a·guide sum before b is added, matching C.
+ */
+void darkroom_guided_filter_solve(float *mean_ab, const float *variance,
+                                   size_t size, float eps);
+
+void darkroom_guided_filter_apply(const float *guide, size_t guide_stride,
+                                   const float *ab, float *out,
+                                   size_t guide_width,
+                                   size_t target_left, size_t target_right,
+                                   size_t target_lower, size_t target_upper,
+                                   size_t source_left, size_t source_lower,
+                                   size_t tile_width,
+                                   float guide_weight, float min, float max);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

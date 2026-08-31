@@ -32,6 +32,7 @@
 #include "common/guided_filter.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "rust_ffi/darkroom_core.h"
 #include <assert.h>
 #include <float.h>
 #include <stdlib.h>
@@ -156,86 +157,25 @@ static void _guided_filter_tiling(color_image imgg,
   dt_box_mean_vertical(variance.data, variance.height, variance.width, 9|BOXFILTER_KAHAN_SUM, w);
   // we will recycle memory of 'mean' for the new coefficient arrays a_? and b to reduce memory foot print
   color_image a_b = mean;
+  // the A_RED/A_GREEN/A_BLUE/B slot numbering below is kept as documentation
+  // of the {a_r, a_g, a_b, b} layout now produced by the Rust kernel
   #define A_RED 0
   #define A_GREEN 1
   #define A_BLUE 2
   #define B 3
-  DT_OMP_FOR(shared(mean, variance, a_b))
-  for(size_t i = 0; i < size; i++)
-  {
-    const float *meanpx = _get_color_pixel(mean, i);
-    const float inp_mean = meanpx[INP_MEAN];
-    const float guide_r = meanpx[GUIDE_MEAN_R];
-    const float guide_g = meanpx[GUIDE_MEAN_G];
-    const float guide_b = meanpx[GUIDE_MEAN_B];
-    float *const varpx = _get_color_pixel(variance, i);
-    // solve linear system of equations of size 3x3 via Cramer's rule
-    // symmetric coefficient matrix
-    const float Sigma_0_0 = varpx[VAR_RR] - (guide_r * guide_r) + eps;
-    const float Sigma_0_1 = varpx[VAR_RG] - (guide_r * guide_g);
-    const float Sigma_0_2 = varpx[VAR_RB] - (guide_r * guide_b);
-    const float Sigma_1_1 = varpx[VAR_GG] - (guide_g * guide_g) + eps;;
-    const float Sigma_1_2 = varpx[VAR_GB] - (guide_g * guide_b);
-    const float Sigma_2_2 = varpx[VAR_BB] - (guide_b * guide_b) + eps;
-    const float det0 = Sigma_0_0 * (Sigma_1_1 * Sigma_2_2 - Sigma_1_2 * Sigma_1_2)
-      - Sigma_0_1 * (Sigma_0_1 * Sigma_2_2 - Sigma_0_2 * Sigma_1_2)
-      + Sigma_0_2 * (Sigma_0_1 * Sigma_1_2 - Sigma_0_2 * Sigma_1_1);
-    float a_r_, a_g_, a_b_, b_;
-    if(fabsf(det0) > 4.f * FLT_EPSILON)
-    {
-      const float cov_r = varpx[COV_R] - guide_r * inp_mean;
-      const float cov_g = varpx[COV_G] - guide_g * inp_mean;
-      const float cov_b = varpx[COV_B] - guide_b * inp_mean;
-      const float det1 = cov_r * (Sigma_1_1 * Sigma_2_2 - Sigma_1_2 * Sigma_1_2)
-        - Sigma_0_1 * (cov_g * Sigma_2_2 - cov_b * Sigma_1_2)
-        + Sigma_0_2 * (cov_g * Sigma_1_2 - cov_b * Sigma_1_1);
-      const float det2 = Sigma_0_0 * (cov_g * Sigma_2_2 - cov_b * Sigma_1_2)
-        - cov_r * (Sigma_0_1 * Sigma_2_2 - Sigma_0_2 * Sigma_1_2)
-        + Sigma_0_2 * (Sigma_0_1 * cov_b - Sigma_0_2 * cov_g);
-      const float det3 = Sigma_0_0 * (Sigma_1_1 * cov_b - Sigma_1_2 * cov_g)
-        - Sigma_0_1 * (Sigma_0_1 * cov_b - Sigma_0_2 * cov_g)
-        + cov_r * (Sigma_0_1 * Sigma_1_2 - Sigma_0_2 * Sigma_1_1);
-      a_r_ = det1 / det0;
-      a_g_ = det2 / det0;
-      a_b_ = det3 / det0;
-      b_ = inp_mean - a_r_ * guide_r - a_g_ * guide_g - a_b_ * guide_b;
-    }
-    else
-    {
-      // linear system is singular
-      a_r_ = 0.f;
-      a_g_ = 0.f;
-      a_b_ = 0.f;
-      b_ = _get_color_pixel(mean, i)[INP_MEAN];
-    }
-    // now data of imgg_mean_? is no longer needed, we can safely overwrite aliasing arrays
-    a_b.data[4*i+A_RED] = a_r_;
-    a_b.data[4*i+A_GREEN] = a_g_;
-    a_b.data[4*i+A_BLUE] = a_b_;
-    a_b.data[4*i+B] = b_;
-  }
+  // Ported to Rust FFI, replaces the former element-wise solve loop
+  // (mean.data doubles as the a_b output buffer, exactly as the recycled
+  // `a_b = mean` aliasing did before)
+  darkroom_guided_filter_solve(mean.data, variance.data, size, eps);
   _free_color_image(&variance);
 
   dt_box_mean(a_b.data, a_b.height, a_b.width, a_b.stride|BOXFILTER_KAHAN_SUM, w, 1);
 
-  DT_OMP_FOR(shared(target, imgg, a_b, img_out) dt_omp_sharedconst(source))
-  for(int j_imgg = target.lower; j_imgg < target.upper; j_imgg++)
-  {
-    // index of the left most target pixel in the current row
-    size_t l = target.left + (size_t)j_imgg * imgg.width;
-    // index of the left most source pixel in the current row of the
-    // smaller auxiliary gray-scale images a_r, a_g, a_b, and b
-    // excluding boundary data from neighboring tiles
-    size_t k = (target.left - source.left) + (size_t)(j_imgg - source.lower) * width;
-    for(int i_imgg = target.left; i_imgg < target.right; i_imgg++, k++, l++)
-    {
-      const float *pixel = _get_color_pixel(imgg, l);
-      const float *px_ab = _get_color_pixel(a_b, k);
-      float res = guide_weight * (px_ab[A_RED] * pixel[0] + px_ab[A_GREEN] * pixel[1] + px_ab[A_BLUE] * pixel[2]);
-      res += px_ab[B];
-      img_out.data[i_imgg + (size_t)j_imgg * imgg.width] = CLAMP(res, min, max);
-    }
-  }
+  // Ported to Rust FFI, replaces the former per-row tile apply loop
+  darkroom_guided_filter_apply(imgg.data, (size_t)imgg.stride, a_b.data, img_out.data,
+                               (size_t)imgg.width, (size_t)target.left, (size_t)target.right,
+                               (size_t)target.lower, (size_t)target.upper, (size_t)source.left,
+                               (size_t)source.lower, (size_t)width, guide_weight, min, max);
   _free_color_image(&mean);
 }
 

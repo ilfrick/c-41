@@ -3985,3 +3985,87 @@ secret-shaped diff content as stop-before-commit.
 
 **Verified.** No code change; pre-push hook gate ran on push (exit code
 trusted).
+
+---
+
+## 2026-08-31 10:50 UTC — m4-173: Port guided_filter Cramer solve + apply loops to Rust FFI
+
+**Commit** `<pending>` (GitHub + Gitea)
+
+**What.** First increment under the new delegated-development policy: the
+heavy development (reading the C, writing kernels/tests/refs/FFI/C edits)
+was delegated to a fresh general-purpose subagent under a precise task
+spec; the main session scoped, verified, reviewed, fixed, gated, logged,
+and shipped.
+
+Two of the three loops in `src/common/guided_filter.c` (`_guided_filter_tiling`,
+the CPU tile pipeline of the colour-guided guided filter) ported to a new
+`c41-core::guided_filter` module:
+
+- `guided_filter_solve` + `darkroom_guided_filter_solve(mean_ab, variance,
+  size, eps)`: the flat element-wise 3×3 Cramer-rule solve (formerly :163)
+  — Sigma built from the 9-channel variance pixel with +eps on the
+  diagonal, det0..det3 expanded op-for-op, singular threshold
+  `fabsf(det0) > 4·FLT_EPSILON`, singular branch → a's 0 / b = inp_mean.
+  The output aliases the input means (C recycles `mean` as `a_b`); the
+  kernel takes a single `&mut` buffer with read-before-write per element
+  (each iteration touches only its own 4-float slot, so in-place is
+  race-free).
+- `guided_filter_apply` + `darkroom_guided_filter_apply(...)`: the 2D apply
+  pass over the target rectangle (formerly :221) with the l/k cursor
+  arithmetic and GLib's ternary `CLAMP` (gmacros.h:942 — NaN passes
+  through; NOT fminf/fmaxf/f32::clamp; pinned by test).
+- The third loop (pack + per-row `dt_box_mean_horizontal` interleave, :122)
+  is NOT a flat-loop candidate — it interleaves C box-filter calls per row
+  and stays in C.
+- `src/rust_ffi/darkroom_core.h`: +2 declarations. 18 new tests. 59 total
+  matching the module filter.
+
+**Verified.** `scripts/ci-local.sh` **GATE_EXIT=0**; incremental full-c
+Release rebuild **REBUILD_EXIT=0** with both `darkroom_guided_filter_*`
+symbols confirmed in `libc41_core.so`.
+
+**Review.** Independent senior-reviewer agent (fresh general-purpose
+subagent, senior-dev-20+yrs profile, read-only mandate honored):
+**APPROVE-WITH-FIXES**, 0 P0/P1. The reviewer verified the solve
+transcription op-for-op (determinant operand order and signs, the exact
+4ε threshold, the singular re-read equivalence under the aliasing), the
+apply cursors and out-indexing (out shares the guide_width stride, as in
+C), the CLAMP macro against gmacros.h:942 in the dev image, the tile
+geometry invariants (source ⊇ target always holds from the real caller),
+compiled the modified TU under Release `-Werror`, and hand-verified the
+test pins. Applied findings:
+- **P2 (fixed):** FFI apply now rejects `guide_stride < 3` (the docs
+  promise ch >= 3; with stride 1–2 the pixel[1]/[2] reads would panic out
+  of an `extern "C"` fn — worse than C's silent OOB read). Guard test leg
+  added.
+- **P2 (fixed):** documented that `guide_weight` appears twice by upstream
+  design — folded into the packed guide means at pack time, applied again
+  against the raw guide at reconstruction; the two are complementary halves
+  of one model (`w·(a·g) + b = a·(w·g) + b ≈ inp`), NOT a double-application
+  a future maintainer should "fix".
+- **P3 (verified false):** the claim that the safe `guided_filter_apply`
+  lacks the source-origin guards was incorrect — the guard block already
+  covers `source_left/target_left` and `source_lower/target_lower` before
+  the cursor subtractions. No change.
+- Accepted, no action: theoretical 32-bit usize overflow in FFI slice
+  arithmetic (repo is 64-bit-only; same assumption as precedent modules);
+  17 clippy style warnings in the new file (tolerated repo-wide class).
+
+**Delegation process notes (first run of the new policy).** The dev
+subagent delivered working code, ran its own tests/clippy, and caught a
+real error in my task spec: my hand-computed solve pin assumed
+Sigma00 = 5, but with VAR_RR = 0 the diagonal is exactly eps — the agent
+compiled the C loop standalone, corrected the pin (a_r = COV_R/eps), and
+pinned C-verified values. The spec also under-specified: the agent
+self-added the source-origin underflow guards and the aliasing contract
+details. What the orchestrator retains: scoping, verification, review,
+fixes, gates, logging, shipping — worked as designed. Review false-finding
+rate: 1 of 4 findings (P3-1) — worth remembering that review findings are
+claims to verify, not verdicts.
+
+**Notes.**
+- `guided_filter.c` retains one `DT_OMP_FOR` site (the pack loop) plus the
+  box-mean calls; the file drops from 3 sites to 1.
+- The `A_RED`/`A_GREEN`/`A_BLUE`/`B` `#define`s stay in C (kernel-only now,
+  kept as documentation of the channel layout, per the m4-170 precedent).
