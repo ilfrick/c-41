@@ -19,6 +19,7 @@ pub mod focus_peaking;
 pub mod gaussian;
 pub mod geometry;
 pub mod guided_filter;
+pub mod heal;
 pub mod icc;
 pub mod illuminants;
 pub mod imagebuf;

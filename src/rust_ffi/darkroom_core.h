@@ -3538,6 +3538,25 @@ void darkroom_pfm_unpack(const float *readbuf, float *image, size_t width,
                           size_t height, size_t planes, size_t channels,
                           int swap_byte_order, int made_by_photoshop);
 
+/*
+ * Heal split-subtract (heal.c, _heal_sub, m4-177).
+ *
+ * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
+ * padding-row clears. top/bottom hold 4*width*height floats (RGBA);
+ * red/black each hold 4*((width+1)/2)*(height+2) floats: image row r lives
+ * at buf[(r+1)*res_stride] with res_stride = 4*((width+1)/2), rows 0 and
+ * height+1 cleared to zero as solver padding. Pixel (r,c) goes to slot c/2
+ * of the buffer matching the (r+c) checker parity (odd = red); on odd
+ * widths the left-over pixel joins the left-most pixel's buffer and the
+ * opposite-colour tail slot is zeroed. All four channels are subtracted,
+ * matching the default (vectorised, DT_PIXEL_SIMD_CHANNELS == 4) build. Under
+ * a non-default DT_NO_VECTORIZATION build, C would leave alpha untouched while
+ * this kernel still writes channel 3.
+ */
+void darkroom_heal_sub(const float *top_buffer, const float *bottom_buffer,
+                       float *red_buffer, float *black_buffer,
+                       size_t width, size_t height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
