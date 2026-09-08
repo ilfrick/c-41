@@ -4325,3 +4325,32 @@ change.
 - The Laplace SOR/run-list update remains deferred as ordering-sensitive, not a pure
   data-parallel kernel.
 
+---
+
+## 2026-09-08 23:11 UTC — m4-179: port DWT denoise passes to Rust FFI
+
+**Commit** `84edef304c` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `dwt_denoise_vert_1ch` and `dwt_denoise_horiz_1ch`
+(`src/common/dwt.c`), replacing their data-parallel loops with
+`darkroom_dwt_denoise_vert_1ch` and `darkroom_dwt_denoise_horiz_1ch`. Extended
+`c41-core::dwt` with safe kernels, divergent references, validated FFI, and focused
+tests; declared both exports in `src/rust_ffi/darkroom_core.h`. Left `dwt_denoise`
+orchestration/allocation and all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no production-code
+blocker. Applied the requested test-only additions: an absolute overlap double-filter
+case, NaN/negative-threshold/signed-zero assertions, expanded degenerate/FFI guard
+coverage, distinct fold-test seeds, and the non-overlapping-buffers header wording.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
+**Notes.**
+- Correction trail: the first post-fix gate failed on an ambiguous float type in a new
+  threshold table (`E0689`); fixed with explicit `f32` annotations and the gate was
+  rerun green.
+- The Rust passes are serial where the old row loops were OpenMP-parallel; row writes
+  are disjoint, so the port is semantically equivalent.
+
