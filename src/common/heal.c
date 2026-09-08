@@ -56,41 +56,14 @@ static void _heal_sub(const float *const top_buffer, const float *const bottom_b
   darkroom_heal_sub(top_buffer, bottom_buffer, red_buffer, black_buffer, width, height);
 }
 
-// Add first to second and store in result, re-interleaving the 'red' and 'black' pixels
+// Add first to second and store in result, re-interleaving the 'red' and 'black' pixels.
+// Ported to Rust FFI (m4-178); keep in sync with heal_add in
+// crates/c41-core/src/heal.rs.
 static void _heal_add(const float *const restrict red_buffer, const float *const black_buffer,
                       const float *const restrict second_buffer, float *const restrict result_buffer,
                       const size_t width, const size_t height)
 {
-  // how many red or black pixels per line?  For consistency, we need the larger of the two, so round up, then
-  // add one to ensure a padding pixel on the right
-  const size_t res_stride = 4 * ((width + 1) / 2);
-
-  DT_OMP_FOR()
-  for(size_t row = 0; row < height; row++)
-  {
-    const int parity = row & 1;
-    const size_t row_start = (row+1) * res_stride;
-    const float *const restrict buf1 = parity ? red_buffer + row_start : black_buffer + row_start;
-    const float *const restrict buf2 = parity ? black_buffer + row_start : red_buffer + row_start;
-    // handle the pixels of the row pairwise, one red and one black at a time
-    for(size_t col = 0; col < width/2; col++)
-    {
-      const size_t idx = 4 * (row * width + 2*col);
-      for_each_channel(c)
-      {
-        result_buffer[idx + c] = buf1[4*col + c] + second_buffer[idx + c];
-        result_buffer[idx + 4 + c] = buf2[4*col + c] + second_buffer[idx + 4 + c];
-      }
-    }
-    if(width & 1)
-    {
-      // handle the left-over pixel when the total width is odd
-      const size_t res_idx = (width-1)/2;
-      const size_t idx = 4 * (row * width + (width-1));
-      for_each_channel(c)
-        result_buffer[idx + c] = buf1[4*res_idx + c] + second_buffer[idx + c];
-    }
-  }
+  darkroom_heal_add(red_buffer, black_buffer, second_buffer, result_buffer, width, height);
 }
 
 // Perform one iteration of Gauss-Seidel, and return the sum squared residual.

@@ -3557,6 +3557,24 @@ void darkroom_heal_sub(const float *top_buffer, const float *bottom_buffer,
                        float *red_buffer, float *black_buffer,
                        size_t width, size_t height);
 
+/*
+ * Heal re-interleaving add (heal.c, _heal_add, m4-178).
+ *
+ * darkroom_heal_add replaces the former DT_OMP_FOR row loop. red/black each
+ * hold 4*((width+1)/2)*(height+2) floats with image row r at
+ * buf[(r+1)*res_stride] (res_stride = 4*((width+1)/2); padding rows are never
+ * read); second/result each hold 4*width*height floats (RGBA). Each row is
+ * walked pairwise with buf1 holding the left-most pixel's colour (black on
+ * even rows, red on odd rows); the left-over pixel on odd widths comes from
+ * buf1 and the opposite-colour tail slot is never read. All four channels
+ * are added, matching the default (vectorised, DT_PIXEL_SIMD_CHANNELS == 4)
+ * build. Under a non-default DT_NO_VECTORIZATION build, C would leave alpha
+ * untouched while this kernel still writes channel 3.
+ */
+void darkroom_heal_add(const float *red_buffer, const float *black_buffer,
+                       const float *second_buffer, float *result_buffer,
+                       size_t width, size_t height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
