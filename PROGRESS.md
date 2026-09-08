@@ -4298,3 +4298,30 @@ are pre-existing and outside this change.
   deferred because its SOR/run-list update is ordering-sensitive rather than a
   pure data-parallel kernel.
 
+---
+
+## 2026-09-08 22:14 UTC — m4-178: port heal_add reinterleave loop to Rust FFI
+
+**Commit** `992ea71a0e` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `_heal_add` (`src/common/heal.c:59-94`), replacing its row-pair
+reinterleave loop with `darkroom_heal_add`. Extended `c41-core::heal` with a safe
+kernel, divergent reference, validated FFI, and focused tests; declared the export in
+`src/rust_ffi/darkroom_core.h`. Left `_heal_laplace_iteration` and all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0/P1. Applied
+the two requested documentation-only corrections: scoped the shared-buffer layout and
+exactness notes to `heal_sub`/`heal_add`, and kept the non-default
+`DT_NO_VECTORIZATION` alpha divergence explicit.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
+**Notes.**
+- Delegated development noted that host `cargo test` could not link because the host
+  lacks `-llensfun`; the Docker gate is authoritative and passed.
+- The Laplace SOR/run-list update remains deferred as ordering-sensitive, not a pure
+  data-parallel kernel.
+
