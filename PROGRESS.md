@@ -4222,3 +4222,46 @@ underflow-freedom; compiled pfm.c.o under Release flags. Applied P2s:
   exactly bit-preserving (stronger than the usual order-ULP class).
 - Parallelism loss vs the OMP row loop is the accepted pattern; PFM loads
   are file-I/O-bound in practice.
+
+---
+
+## 2026-09-08 16:46 UTC — m4-176: port dt_UCS_22 gamut LUT sampler to Rust FFI
+
+**Commit** `5daa7d3c83` (GitHub + Gitea via `git push origin master`)
+
+**What.** The single `DT_OMP_FOR(reduction(+))` loop in `dt_UCS_22_build_gamut_LUT()`
+(`src/common/darktable_ucs_22_helpers.h`) — the angular gamut-boundary sampler over
+`50*LUT_ELEM` steps (gamut_LUT + sampler accumulators) — is replaced by a one-line
+delegate from the kept `static inline` wrapper to a new `darkroom_ucs_build_gamut_lut`
+FFI export (`crates/c41-core/src/iop/colorbalancerrb.rs`), which wraps the existing,
+already-tested `build_gamut_lut_ucs` kernel (m4-83). All 4 C call-sites
+(`colorbalancerrb.c:919`, `colorequal.c:1607/2582/2729`) are unchanged — repointed
+atomically by editing the header inline.
+
+ABI bridge: C passes the **untransposed** RGB→XYZ D65 matrix (`dot_product(v,M)` =
+`M·v`, on `dt_colormatrix_t`); `build_gamut_lut_ucs` expects **transposed** storage
+(`apply_transposed_color_matrix` ≡ `Mᵀ·v`). The wrapper transposes the incoming 4×4
+(`trans[r][c] = m[4c+r]`) before delegating — matching the Rust `colorbalancerrb` IOP,
+which passes its pre-transposed `rgb_to_xyz_d65_t` directly. `LUT_ELEM=512` matches on
+both sides (math.h:26 == color.rs:1069).
+
+**Verified.** `scripts/ci-local.sh` exit 0 — `cargo check/clippy/test --workspace`
+(default + release) and `cargo build --release -p c41 --bin c41-rs` (the real C+Rust
+link across colorbalancerrb.c/colorequal.c). Independent senior review (fresh-context
+subagent): **APPROVE**, 0 P0/P1. New test
+`ucs_build_gamut_lut_transposes_like_direct_rust` (bitwise equality vs the direct
+kernel on `SRGB_TO_XYZ_D65_T4`) is green in the release test run.
+
+**Notes.**
+- P2 nits from review, deferred (non-blocking; CI green with them present):
+  (1) `Delta_H()` in the helpers header is now dead code (its only caller was the
+  removed sampler loop) — left to avoid churning an already-green change;
+  (2) `darkroom_ucs_build_gamut_lut` is declared in both `darkroom_core.h` and the
+  helpers header (harmless duplicate, both C linkage). Candidate for a future cleanup.
+- This "port" reuses an already-existent Rust kernel (m4-83) rather than writing a new
+  one: its value is removing the last shared-infra `DT_OMP_FOR` in
+  `dt_UCS_22_build_gamut_LUT` and unifying the C helper with the Rust IOP path —
+  the m4-175/m4-137 "FFI kernel reuse" precedent and the plan's A-goal. (The
+  independent-review subagent was rate-limited mid-cycle and only cleared on the third
+  retry; flags the pool fragility for any multi-hour review queue.)
+
