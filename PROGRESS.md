@@ -4263,5 +4263,38 @@ kernel on `SRGB_TO_XYZ_D65_T4`) is green in the release test run.
   `dt_UCS_22_build_gamut_LUT` and unifying the C helper with the Rust IOP path —
   the m4-175/m4-137 "FFI kernel reuse" precedent and the plan's A-goal. (The
   independent-review subagent was rate-limited mid-cycle and only cleared on the third
-  retry; flags the pool fragility for any multi-hour review queue.)
+   retry; flags the pool fragility for any multi-hour review queue.)
+
+---
+
+## 2026-09-08 21:24 UTC — m4-177: port heal split-subtract loop to Rust FFI
+
+**Commit** `83b978f81d` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `_heal_sub` (`src/common/heal.c:50-92`), removing its active
+`DT_OMP_FOR` row loop and padding clears. C now calls the new
+`darkroom_heal_sub` export from `c41-core::heal`; the header gains the FFI
+declaration. Left `_heal_add`, `_heal_laplace_iteration`, and all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0.
+Applied the P1 fix: `width.checked_add(1)` in both `heal_sub` and `ref_heal_sub`
+so `usize::MAX` is a no-op in debug as well as release. Also applied P2 fixes:
+symmetric null-`bottom` and short-`bottom`/`black` coverage, parenthesised
+`& 1 == 1` tests of parity, reverted unrelated `darkroom_pfm_unpack` whitespace,
+and qualified the bit-exact/non-default-`DT_NO_VECTORIZATION` documentation.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Also ran a debug-targeted Docker gate,
+`cargo test -p c41-core --lib heal::`: 10 passed, 0 failed. Remaining warnings
+are pre-existing and outside this change.
+
+**Notes.**
+- Correction trail: delegated code initially used `assert_eq!` on intentionally
+  NaN-containing buffers; fixed to `to_bits()` before the gate. I also caught
+  and fixed an invalid `?` inside an `Option` construction in the reference
+  implementation before running the gate.
+- `_heal_add` is the natural narrow follow-up; `_heal_laplace_iteration` stays
+  deferred because its SOR/run-list update is ordering-sensitive rather than a
+  pure data-parallel kernel.
 
