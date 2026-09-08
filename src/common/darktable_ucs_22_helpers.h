@@ -15,6 +15,9 @@ static inline float Delta_H(const float h_1, const float h_2)
   return diff;
 }
 
+/* m4-176: gamut LUT sampler now lives in Rust (c41-core, colorbalancerrb.rs). */
+extern void darkroom_ucs_build_gamut_lut(const float *matrix, float *gamut_lut);
+
 static inline void dt_UCS_22_build_gamut_LUT(dt_colormatrix_t input_matrix, float gamut_LUT[LUT_ELEM])
 {
   /**
@@ -25,87 +28,12 @@ static inline void dt_UCS_22_build_gamut_LUT(dt_colormatrix_t input_matrix, floa
    *
    * See https://eng.aurelienpierre.com/2022/02/color-saturation-control-for-the-21th-century/#Gamut-mapping
    * for the details of the computations.
+   *
+   * @note (m4-176) the angular sampler was a single `DT_OMP_FOR` reduction over
+   * `50*LUT_ELEM` samples (gamut_LUT + sampler accumulators); it now runs in
+   * darkroom_ucs_build_gamut_lut() (Rust build_gamut_lut_ucs).
    */
-
-  // init the LUT between -180° and 180°
-  for(size_t k = 0; k < LUT_ELEM; k++) gamut_LUT[k] = 0.f;
-  float *const restrict sampler = dt_calloc_align_float(LUT_ELEM);
-
-  dt_aligned_pixel_t D65_xyY = { D65xyY.x,  D65xyY.y,  1.f, 0.f };
-
-  // Compute the RGB space primaries in xyY
-  dt_aligned_pixel_t RGB_red   = { 1.f, 0.f, 0.f, 0.f };
-  dt_aligned_pixel_t RGB_green = { 0.f, 1.f, 0.f, 0.f };
-  dt_aligned_pixel_t RGB_blue =  { 0.f, 0.f, 1.f, 0.f };
-
-  dt_aligned_pixel_t XYZ_red, XYZ_green, XYZ_blue;
-  dot_product(RGB_red, input_matrix, XYZ_red);
-  dot_product(RGB_green, input_matrix, XYZ_green);
-  dot_product(RGB_blue, input_matrix, XYZ_blue);
-
-  dt_aligned_pixel_t xyY_red, xyY_green, xyY_blue;
-  dt_D65_XYZ_to_xyY(XYZ_red, xyY_red);
-  dt_D65_XYZ_to_xyY(XYZ_green, xyY_green);
-  dt_D65_XYZ_to_xyY(XYZ_blue, xyY_blue);
-
-  // Get the "hue" angles of the primaries in xy compared to D65
-  const float h_red   = atan2f(xyY_red[1] - D65_xyY[1], xyY_red[0] - D65_xyY[0]);
-  const float h_green = atan2f(xyY_green[1] - D65_xyY[1], xyY_green[0] - D65_xyY[0]);
-  const float h_blue  = atan2f(xyY_blue[1] - D65_xyY[1], xyY_blue[0] - D65_xyY[0]);
-
-  // March the gamut boundary in CIE xyY 1931 by angular steps of 0.02°
-  DT_OMP_FOR(reduction(+: gamut_LUT[:LUT_ELEM], sampler[:LUT_ELEM]))
-  for(int i = 0; i < 50 * LUT_ELEM; i++)
-  {
-    const float angle = -M_PI_F + ((float)i) / (float)(50 * LUT_ELEM) * DT_2PI_F;
-    const float tan_angle = tanf(angle);
-
-    const float t_1 = Delta_H(angle, h_blue)  / Delta_H(h_red, h_blue);
-    const float t_2 = Delta_H(angle, h_red)   / Delta_H(h_green, h_red);
-    const float t_3 = Delta_H(angle, h_green) / Delta_H(h_blue, h_green);
-
-    float x_t = 0;
-    float y_t = 0;
-
-    if(t_1 == CLAMP(t_1, 0, 1))
-    {
-      const float t = (D65_xyY[1] - xyY_blue[1] + tan_angle * (xyY_blue[0] - D65_xyY[0]))
-                / (xyY_red[1] - xyY_blue[1] + tan_angle * (xyY_blue[0] - xyY_red[0]));
-      x_t = xyY_blue[0] + t * (xyY_red[0] - xyY_blue[0]);
-      y_t = xyY_blue[1] + t * (xyY_red[1] - xyY_blue[1]);
-    }
-    else if(t_2 == CLAMP(t_2, 0, 1))
-    {
-      const float t = (D65_xyY[1] - xyY_red[1] + tan_angle * (xyY_red[0] - D65_xyY[0]))
-                / (xyY_green[1] - xyY_red[1] + tan_angle * (xyY_red[0] - xyY_green[0]));
-      x_t = xyY_red[0] + t * (xyY_green[0] - xyY_red[0]);
-      y_t = xyY_red[1] + t * (xyY_green[1] - xyY_red[1]);
-    }
-    else if(t_3 == CLAMP(t_3, 0, 1))
-    {
-      const float t = (D65_xyY[1] - xyY_green[1] + tan_angle * (xyY_green[0] - D65_xyY[0]))
-                    / (xyY_blue[1] - xyY_green[1] + tan_angle * (xyY_green[0] - xyY_blue[0]));
-      x_t = xyY_green[0] + t * (xyY_blue[0] - xyY_green[0]);
-      y_t = xyY_green[1] + t * (xyY_blue[1] - xyY_green[1]);
-    }
-
-    // Convert to darktable UCS
-    dt_aligned_pixel_t xyY = { x_t, y_t, 1.f, 0.f };
-    float UV_star_prime[2];
-    xyY_to_dt_UCS_UV(xyY, UV_star_prime);
-
-    // Get the hue angle in darktable UCS
-    const float hue = atan2f(UV_star_prime[1], UV_star_prime[0]);
-    int index = roundf((float)(LUT_ELEM - 1) * (hue + M_PI_F) / DT_2PI_F);
-    index += (index < 0) ? LUT_ELEM : 0;
-    index -= (index >= LUT_ELEM) ? LUT_ELEM : 0;
-    // Warning: we store M², the square of the colorfulness
-    gamut_LUT[index] += UV_star_prime[0] * UV_star_prime[0] + UV_star_prime[1] * UV_star_prime[1];
-    sampler[index] += 1.0f;
-  }
-  for(size_t k = 0; k < LUT_ELEM; k++)
-    gamut_LUT[k] = gamut_LUT[k] / fmaxf(1.0f, sampler[k]);
-  dt_free_align(sampler);
+  darkroom_ucs_build_gamut_lut((const float *)input_matrix, gamut_LUT);
 }
 
 

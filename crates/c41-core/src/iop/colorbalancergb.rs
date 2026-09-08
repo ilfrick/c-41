@@ -983,10 +983,72 @@ pub unsafe extern "C" fn darkroom_colorbalancergb_opacity_luts(
     }
 }
 
+/// C-callable wrapper around [`build_gamut_lut_ucs`].
+///
+/// m4-176 ports the single `DT_OMP_FOR` reduction in `dt_UCS_22_build_gamut_LUT()`
+/// (`src/common/darktable_ucs_22_helpers.h`) by delegating to the existing Rust
+/// sampler. `matrix` points to 16 row-major floats = the **untransposed** RGB→XYZ
+/// D65 matrix that the C callers pass (`dot_product(v, M)` computes `M·v`);
+/// [`build_gamut_lut_ucs`] instead expects the **transposed** storage used by
+/// `apply_transposed_color_matrix` (≡ `Mᵀ·v`), so this wrapper transposes the
+/// incoming 4×4 before delegating — matching the Rust `colorbalancerrb` IOP,
+/// which feeds its pre-transposed `rgb_to_xyz_d65_t` to `build_gamut_lut_ucs` directly.
+///
+/// `gamut_lut` receives `LUT_ELEM` (512) floats = colourfulness² (M²) per hue bin,
+/// bit-identical to the C output (same reduction order, single-threaded).
+///
+/// # Safety
+/// `matrix` must point to ≥16 readable `f32`s; `gamut_lut` to ≥`LUT_ELEM`
+/// writable `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_ucs_build_gamut_lut(
+    matrix: *const f32,
+    gamut_lut: *mut f32,
+) {
+    if matrix.is_null() || gamut_lut.is_null() {
+        return;
+    }
+    let m = std::slice::from_raw_parts(matrix, 16);
+    // C passes untransposed row-major M[r][c] = m[r*4+c]; build_gamut_lut_ucs wants Mᵀ storage.
+    let trans = [
+        [m[0], m[4], m[8], m[12]],
+        [m[1], m[5], m[9], m[13]],
+        [m[2], m[6], m[10], m[14]],
+        [m[3], m[7], m[11], m[15]],
+    ];
+    let lut = build_gamut_lut_ucs(&trans);
+    let out = std::slice::from_raw_parts_mut(gamut_lut, LUT_ELEM);
+    out.copy_from_slice(&lut);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::color::SRGB_TO_XYZ_D65_T4;
+
+    #[test]
+    fn ucs_build_gamut_lut_transposes_like_direct_rust() {
+        // build_gamut_lut_ucs takes the *transposed* RGB→XYZ D65 storage.
+        let t = SRGB_TO_XYZ_D65_T4;
+        // A C caller passes the untransposed matrix (tᵀ); the wrapper must re-transpose
+        // it so its output matches calling build_gamut_lut_ucs directly on the transposed matrix.
+        let u: Vec<f32> = (0..16)
+            .map(|i| {
+                let (r, c) = (i / 4, i % 4);
+                t[c][r]
+            })
+            .collect();
+        let direct = build_gamut_lut_ucs(&t);
+        let mut lut = vec![0.0f32; LUT_ELEM];
+        unsafe {
+            darkroom_ucs_build_gamut_lut(u.as_ptr(), lut.as_mut_ptr());
+        }
+        // identical reduction order => bitwise identical output
+        assert!(direct
+            .iter()
+            .zip(lut.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
 
     // (the sRGB → XYZ D65 test matrix moved to `color::SRGB_TO_XYZ_D65_T4` —
     // one source of truth now that the pipeline grades in both spaces)

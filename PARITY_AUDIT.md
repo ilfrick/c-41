@@ -20,6 +20,13 @@ Everything not reached by then stays here, written down, rather than being quiet
 dropped. Full darktable parity is **not** reachable by that date and is not the
 target — see the note at the bottom.
 
+> **2026-08-31 scope decision:** severity-1.9 (geotagging/neural-restore
+> panel) and severity-3.4 (map/print/tethering views) are **deferred for
+> later evaluation**, not dropped — see the matching entry in
+> `RUST_MIGRATION_PLAN.md`. Migration is prioritizing the A→B FFI port chain
+> (src/common shared infra → unblock dependent src/iop + develop/masks loops);
+> C is written down, pending an explicit post-infra decision.
+
 > **2026-08-21 update:** shadows/highlights (shadhi) wired as the 21st live module,
 > joining basicadj (item 2.1) as a parity-2.1 increment — full pipeline Stage +
 > Gaussian blur pre-pass + FFI kernel reuse + 7-slider UI + history label.

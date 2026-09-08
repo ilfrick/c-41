@@ -16,6 +16,15 @@ extern "C" {
 #endif
 
 /*
+ * dt-UCS gamut LUT builder (m4-176). Replaces the loop body of
+ * dt_UCS_22_build_gamut_LUT() in src/common/darktable_ucs_22_helpers.h.
+ * `matrix`: 16 row-major floats = the untransposed RGB->XYZ D65
+ * CAT-premultiplied matrix (C callers build XYZ_D50_to_D65_CAT16 *
+ * work_profile->matrix_in). `gamut_lut`: LUT_ELEM (512) floats, M² per hue bin.
+ */
+void darkroom_ucs_build_gamut_lut(const float *matrix, float *gamut_lut);
+
+/*
  * Color-contrast IOP -- affine transform on Lab a/b channels.
  *
  * Replaces the two OMP loops in src/iop/colorcontrast.c::process().

@@ -7,6 +7,29 @@ application runnable throughout.
 
 ---
 
+## Scope decision — 2026-08-31 (user-approved)
+
+Work front splits into four tiers:
+- **A. Remaining `src/common` / `src/include` / `src/imageio` shared-infra
+  `DT_OMP_FOR` loop ports** into an existing or new `c41-core` FFI kernel, following
+  the m4-175 precedent. After m4-175, ~37 files / ~90–130 loop sites remain.
+  Hard, non-flat targets — locallaplacian (multi-stage + callbacks), `box_filters.cc`
+  (Kahan-compensated cores), `densecrf.cc` (C++), `gaussian.c` (recursive IIR which
+  is sequential), `nlmeans_core.c`, `histogram.c` (worker fn-ptr), the
+  `distance_transform.c` parallel region with per-thread stats, and the C++ only
+  imageio formats — are **classified out** with a documented reason rather than
+  force-ported; they stay in C behind the existing FFI where a port buys nothing.
+- **B. Dependent `src/iop` loop ports** (13 stubbed IOP modules) — unblocked once
+  their blocking shared-infra kernels from (A) exist; ported thereafter.
+- **C. UI parity** (`PARITY_AUDIT.md`: severity 1.9 geotagging/neural-restore
+  panel, 3.4 map/print/tethering views) — **deferred for later evaluation**.
+- **D. `ROADMAP.md` Lightroom-gap features** (face recognition, cloud sync,
+  mobile companion, AI tagging) — unchanged, future work.
+
+**Decision: execute A → B to completion; defer C; leave D untouched.**
+
+---
+
 ## Current status -- 2026-06-04
 
 ### Phase 0 -- Infrastructure complete
