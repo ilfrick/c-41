@@ -20,6 +20,7 @@
 #include "common/imagebuf.h"
 #include "control/control.h"
 #include "develop/imageop.h"
+#include "rust_ffi/darkroom_core.h"
 #include "dwt.h"
 
 /* Based on the original source code of GIMP's Wavelet Decompose plugin, by Marco Rossini
@@ -375,6 +376,8 @@ void dwt_decompose(dwt_params_t *p, _dwt_layer_func layer_func)
 }
 
 // first, "vertical" pass of wavelet decomposition
+// Ported to Rust FFI (m4-179); keep in sync with denoise_vert_1ch in
+// crates/c41-core/src/dwt.rs.
 static void dwt_denoise_vert_1ch(
     float *const restrict out,
     const float *const restrict in,
@@ -382,32 +385,13 @@ static void dwt_denoise_vert_1ch(
     const size_t width,
     const size_t lev)
 {
-  const int vscale = MIN(1 << lev, height);
-  DT_OMP_FOR()
-  for(int rowid = 0; rowid < height ; rowid++)
-  {
-    const int row = dwt_interleave_rows(rowid,height,vscale);
-    // perform a weighted sum of the current pixel row with the rows 'scale' pixels above and below
-    // if either of those is beyond the edge of the image, we use reflection to get a value for averaging,
-    // i.e. we move as many rows in from the edge as we would have been beyond the edge
-    // for the top edge, this means we can simply use the absolute value of row-vscale; for the bottom edge,
-    //   we need to reflect around height
-    const size_t rowstart = (size_t)row * width;
-    const size_t below_row = (row + vscale < height) ? (row + vscale) : 2*(height-1) - (row + vscale);
-    const float *const restrict center = in + rowstart;
-    const float *const restrict above =  in + abs(row - vscale) * width;
-    const float *const restrict below = in + below_row * width;
-    float* const restrict outrow = out + rowstart;
-    DT_OMP_SIMD()
-    for(int col= 0; col < width; col++)
-    {
-      outrow[col] = 2.f * center[col] + above[col] + below[col];
-    }
-  }
+  darkroom_dwt_denoise_vert_1ch(out, in, height, width, lev);
 }
 
 // second, horizontal pass of wavelet decomposition; generates 'coarse' into the output buffer and overwrites
 //   the input buffer with 'details'
+// Ported to Rust FFI (m4-179); keep in sync with denoise_horiz_1ch in
+// crates/c41-core/src/dwt.rs.
 static void dwt_denoise_horiz_1ch(
     float *const restrict out,
     float *const restrict in,
@@ -418,70 +402,7 @@ static void dwt_denoise_horiz_1ch(
     const float thold,
     const int last)
 {
-  const int hscale = MIN(1 << lev, width);
-  DT_OMP_FOR()
-  for(int row = 0; row < height ; row++)
-  {
-    // perform a weighted sum of the current pixel with the ones 'scale' pixels to the left and right, using
-    // reflection to get a value if either of those positions is out of bounds, i.e. we move as many columns
-    // in from the edge as we would have been beyond the edge to avoid an additional pass, we also rescale the
-    // final sum and split the original input into 'coarse' and 'details' by subtracting the scaled sum from
-    // the original input.
-    const size_t rowindex = (size_t)row * width;
-    float *const restrict details = in + rowindex;
-    float *const restrict coarse = out + rowindex;
-    float *const restrict accum_row = accum + rowindex;
-    // handle reflection at left edge
-    DT_OMP_SIMD()
-    for(int col = 0; col < hscale; col++)
-    {
-      // add up left/center/right, and renormalize by dividing by the total weight of all numbers added together
-      const float hat = (2.f * coarse[col] + coarse[hscale-col] + coarse[col+hscale]) / 16.f;
-      // the normalized value is our 'coarse' result; 'diff' is the difference between original input and 'coarse'
-      // (which would ordinarily be stored as the details scale, but we don't need it any further)
-      const float diff = details[col] - hat;
-      details[col] = hat;		// done with original input, so we can overwrite it with 'coarse'
-      // GCC8 won't vectorize if we use the following line, but it turns out that just adding the two conditional
-      // alternatives produces exactly the same result, and *that* does get vectorized
-      //const float excess = diff < 0.0 ? MIN(diff + thold, 0.0f) : MAX(diff - thold, 0.0f);
-      accum_row[col] += MAX(diff - thold,0.0f) + MIN(diff + thold, 0.0f);
-    }
-    DT_OMP_SIMD()
-    for(int col = hscale; col < width - hscale; col++)
-    {
-      // add up left/center/right, and renormalize by dividing by the total weight of all numbers added together
-      const float hat = (2.f * coarse[col] + coarse[col-hscale] + coarse[col+hscale]) / 16.f;
-      // the normalized value is our 'coarse' result; 'diff' is the difference between original input and 'coarse'
-      // (which would ordinarily be stored as the details scale, but we don't need it any further)
-      const float diff = details[col] - hat;
-      details[col] = hat;		// done with original input, so we can overwrite it with 'coarse'
-      // GCC8 won't vectorize if we use the following line, but it turns out that just adding the two conditional
-      // alternatives produces exactly the same result, and *that* does get vectorized
-      //const float excess = diff < 0.0 ? MIN(diff + thold, 0.0f) : MAX(diff - thold, 0.0f);
-      accum_row[col] += MAX(diff - thold,0.0f) + MIN(diff + thold, 0.0f);
-    }
-    // handle reflection at right edge
-    DT_OMP_SIMD()
-    for(int col = width - hscale; col < width; col++)
-    {
-      const float right = coarse[2*width - 2 - (col+hscale)];
-      // add up left/center/right, and renormalize by dividing by the total weight of all numbers added together
-      const float hat = (2.f * coarse[col] + coarse[col-hscale] + right) / 16.f;
-      // the normalized value is our 'coarse' result; 'diff' is the difference between original input and 'coarse'
-      // (which would ordinarily be stored as the details scale, but we don't need it any further)
-      const float diff = details[col] - hat;
-      details[col] = hat;		// done with original input, so we can overwrite it with 'coarse'
-      accum_row[col] += MAX(diff - thold,0.0f) + MIN(diff + thold, 0.0f);
-    }
-    if(last)
-    {
-      // add the details to the residue to create the final denoised result
-      for(int col = 0; col < width; col++)
-      {
-        details[col] += accum_row[col];
-      }
-    }
-  }
+  darkroom_dwt_denoise_horiz_1ch(out, in, accum, height, width, lev, thold, last);
 }
 
 /* this function denoises an image by decomposing it into the specified number of wavelet scales and

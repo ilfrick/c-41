@@ -18,6 +18,10 @@
 //! scale-count helpers, and the 1-channel `dwt_denoise`. Not ported: all OpenCL
 //! (`dwt_*_cl`).
 //!
+//! The 1-channel denoise passes are additionally exported over FFI
+//! ([`darkroom_dwt_denoise_vert_1ch`] / [`darkroom_dwt_denoise_horiz_1ch`],
+//! m4-179) and drive `src/common/dwt.c`'s denoise loops.
+//!
 //! **Rust-vs-C hardening.** The C code reflects out-of-bounds edge taps with
 //! unsigned/`int` index arithmetic that reads slightly out of bounds (benign UB)
 //! on degenerate inputs where a wavelet scale is comparable to the image
@@ -332,7 +336,19 @@ where
 // Vertical pass, single channel: out = 2·center + above + below with edge
 // reflection. Port of `dwt_denoise_vert_1ch` (note vscale caps at `height`, not
 // `height-1`, so reflected rows are clamped to stay in bounds — see module docs).
-fn denoise_vert_1ch(out: &mut [f32], inp: &[f32], height: usize, width: usize, lev: usize) {
+//
+// Rows are visited in natural order: the C visits them via `dwt_interleave_rows`
+// purely for cache friendliness (see `dwt.h`), and each output row depends only
+// on *input* rows that are never mutated during the pass, so the visiting order
+// has no effect on the result.
+//
+// `out` and `inp` must each hold `width * height` floats and must not overlap.
+pub fn denoise_vert_1ch(out: &mut [f32], inp: &[f32], height: usize, width: usize, lev: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    debug_assert_eq!(out.len(), width * height);
+    debug_assert_eq!(inp.len(), width * height);
     let vscale = pow2(lev).min(height);
     let last = height - 1;
     for row in 0..height {
@@ -356,8 +372,13 @@ fn denoise_vert_1ch(out: &mut [f32], inp: &[f32], height: usize, width: usize, l
 // accumulates the soft-thresholded detail into `accum`. On the last band the
 // accumulated detail is added back into `details`. Port of
 // `dwt_denoise_horiz_1ch`.
+//
+// The soft threshold is `MAX(diff − thold, 0) + MIN(diff + thold, 0)` exactly as
+// in C (a single expression, so NaN / negative-threshold / signed-zero inputs
+// behave identically). `coarse` must not overlap `details` or `accum`; all
+// three slices must hold `width * height` floats.
 #[allow(clippy::too_many_arguments)]
-fn denoise_horiz_1ch(
+pub fn denoise_horiz_1ch(
     coarse: &[f32],
     details: &mut [f32],
     accum: &mut [f32],
@@ -367,6 +388,12 @@ fn denoise_horiz_1ch(
     thold: f32,
     last: bool,
 ) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    debug_assert_eq!(coarse.len(), width * height);
+    debug_assert_eq!(details.len(), width * height);
+    debug_assert_eq!(accum.len(), width * height);
     let hscale = pow2(lev).min(width);
     let wlast = width - 1;
     for row in 0..height {
@@ -425,6 +452,182 @@ pub fn denoise(img: &mut [f32], width: usize, height: usize, bands: usize, noise
         denoise_vert_1ch(&mut interm, img, height, width, lev);
         denoise_horiz_1ch(&interm, img, &mut accum, height, width, lev, nz, last);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structurally divergent reference implementations (m4-179)
+// ---------------------------------------------------------------------------
+//
+// These compute the same clamped semantics as the public kernels above but with
+// deliberately different loop structure, so the differential tests below catch
+// transcription slips rather than re-running the same code. The scalar value
+// expressions keep the C association order (`(2·c + a) + b`, `/ 16`, the
+// single-expression soft threshold) — that order is load-bearing for bit-exact
+// agreement, so it is shared on purpose; everything around it differs.
+
+// Reference for [`denoise_vert_1ch`]: a single flat pixel loop with the row/column
+// recovered by division/remainder, and the reflected tap rows resolved by small
+// helpers over `i64` (instead of the kernel's nested row-major loops with inline
+// `usize`/`i32` index math).
+fn denoise_vert_1ch_reference(
+    out: &mut [f32],
+    inp: &[f32],
+    height: usize,
+    width: usize,
+    lev: usize,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    debug_assert_eq!(out.len(), width * height);
+    debug_assert_eq!(inp.len(), width * height);
+    let vscale = pow2(lev).min(height) as i64;
+    let h = height as i64;
+    let w = width as i64;
+    let reflect_top = |row: i64| (row - vscale).abs().min(h - 1);
+    let reflect_bottom = |row: i64| {
+        if row + vscale < h {
+            row + vscale
+        } else {
+            (2 * (h - 1) - (row + vscale)).clamp(0, h - 1)
+        }
+    };
+    for idx in 0..width * height {
+        let idx64 = idx as i64;
+        let row = idx64 / w;
+        let col = idx64 % w;
+        let a = reflect_top(row) * w + col;
+        let b = reflect_bottom(row) * w + col;
+        out[idx] = 2.0 * inp[idx] + inp[a as usize] + inp[b as usize];
+    }
+}
+
+// Reference for [`denoise_horiz_1ch`]: the same three positional tap ranges driven
+// through per-column helper closures, with the `last` fold as a whole-buffer
+// pass afterwards (instead of the kernel's inline tap math and per-row fold).
+//
+// The three ranges are kept (not unified): when `hscale > width/2` the left and
+// right ranges overlap, and the C filters those shared columns twice — the
+// second time from the already-overwritten `details`. That double filtering is
+// C behaviour, so the reference reproduces it.
+#[allow(clippy::too_many_arguments)]
+fn denoise_horiz_1ch_reference(
+    coarse: &[f32],
+    details: &mut [f32],
+    accum: &mut [f32],
+    height: usize,
+    width: usize,
+    lev: usize,
+    thold: f32,
+    last: bool,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    debug_assert_eq!(coarse.len(), width * height);
+    debug_assert_eq!(details.len(), width * height);
+    debug_assert_eq!(accum.len(), width * height);
+    let hscale = pow2(lev).min(width);
+    let wlast = (width - 1) as i64;
+    let clamp_col = |c: i64| c.clamp(0, wlast) as usize;
+    for row in 0..height {
+        let ri = row * width;
+        let mut step = |col: usize, lcol: usize, rcol: usize| {
+            let hat = (2.0 * coarse[ri + col] + coarse[ri + lcol] + coarse[ri + rcol]) / 16.0;
+            let diff = details[ri + col] - hat;
+            details[ri + col] = hat;
+            accum[ri + col] += (diff - thold).max(0.0) + (diff + thold).min(0.0);
+        };
+        // left edge: left tap reflected as hscale − col
+        for col in 0..hscale.min(width) {
+            step(col, (hscale - col).min(width - 1), (col + hscale).min(width - 1));
+        }
+        // interior: direct taps
+        for col in hscale..width.saturating_sub(hscale) {
+            step(col, col - hscale, col + hscale);
+        }
+        // right edge: right tap reflected around the boundary
+        for col in width.saturating_sub(hscale)..width {
+            step(
+                col,
+                clamp_col(col as i64 - hscale as i64),
+                clamp_col(2 * width as i64 - 2 - (col as i64 + hscale as i64)),
+            );
+        }
+    }
+    if last {
+        for (d, a) in details.iter_mut().zip(accum.iter()) {
+            *d += *a;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FFI exports (m4-179) — drive `dwt_denoise_vert_1ch` / `dwt_denoise_horiz_1ch`
+// in `src/common/dwt.c`.
+// ---------------------------------------------------------------------------
+
+/// Vertical denoise pass over FFI — port of the `dwt_denoise_vert_1ch` loop body.
+///
+/// `vscale = min(1<<lev, height)`; `out[row] = 2·in[row] + in[|row−vscale|] +
+/// in[reflect(row+vscale)]`, reflected taps clamped into range.
+///
+/// # Safety
+/// `out` and `inp` must be non-null, non-overlapping, and each hold at least
+/// `width * height` floats (the `dwt_denoise` caller allocates exactly that).
+/// Zero `width`/`height` is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_dwt_denoise_vert_1ch(
+    out: *mut f32,
+    inp: *const f32,
+    height: usize,
+    width: usize,
+    lev: usize,
+) {
+    if out.is_null() || inp.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    let Some(npix) = width.checked_mul(height) else {
+        return;
+    };
+    let out = std::slice::from_raw_parts_mut(out, npix);
+    let inp = std::slice::from_raw_parts(inp, npix);
+    denoise_vert_1ch(out, inp, height, width, lev);
+}
+
+/// Horizontal denoise pass over FFI — port of the `dwt_denoise_horiz_1ch` loop body.
+///
+/// `coarse` is the vertical-pass result (read-only); `details` (the running
+/// image) is overwritten with the coarse layer while the soft-thresholded detail
+/// `MAX(diff−thold,0)+MIN(diff+thold,0)` accumulates into `accum`. Non-zero
+/// `last` folds the accumulation back into `details`.
+///
+/// # Safety
+/// All three pointers must be non-null; `coarse` must not overlap `details` or
+/// `accum`; each buffer must hold at least `width * height` floats. Zero
+/// `width`/`height` is a no-op.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_dwt_denoise_horiz_1ch(
+    coarse: *const f32,
+    details: *mut f32,
+    accum: *mut f32,
+    height: usize,
+    width: usize,
+    lev: usize,
+    thold: f32,
+    last: i32,
+) {
+    if coarse.is_null() || details.is_null() || accum.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    let Some(npix) = width.checked_mul(height) else {
+        return;
+    };
+    let coarse = std::slice::from_raw_parts(coarse, npix);
+    let details = std::slice::from_raw_parts_mut(details, npix);
+    let accum = std::slice::from_raw_parts_mut(accum, npix);
+    denoise_horiz_1ch(coarse, details, accum, height, width, lev, thold, last != 0);
 }
 
 #[cfg(test)]
@@ -659,5 +862,439 @@ mod tests {
         let mut p = params(64, 64, 8, 0);
         p.preview_scale = 0.1;
         assert_eq!(p.first_scale_visible(), 5);
+    }
+
+    // ── m4-179: 1-channel denoise passes ─────────────────────────────────────
+
+    /// Deterministic 1-channel fill in [0, 1).
+    fn fill1(n: usize) -> Vec<f32> {
+        let mut v = Vec::with_capacity(n);
+        let mut s: u32 = 0x9e37_79b9;
+        for _ in 0..n {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            v.push((s >> 8) as f32 / 16_777_216.0);
+        }
+        v
+    }
+
+    /// Row-constant image: pixel (r, c) == r as f32.
+    fn row_ramp(width: usize, height: usize) -> Vec<f32> {
+        (0..height)
+            .flat_map(|r| std::iter::repeat_n(r as f32, width))
+            .collect()
+    }
+
+    /// Elementwise closeness assertion with per-index diagnostics.
+    fn assert_close(got: &[f32], expected: &[f32], tol: f32, what: &str) {
+        assert_eq!(got.len(), expected.len(), "{what}: length mismatch");
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!((g - e).abs() <= tol, "{what}[{i}]: {g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn denoise_vert_top_and_bottom_reflection() {
+        // lev 0 → vscale 1 on a 4×5 row ramp. Top row reflects around row 0
+        // (|0−1| = 1), bottom row around height−1 (2·4−(4+1) = 3).
+        let (w, h) = (4, 5);
+        let inp = row_ramp(w, h);
+        let mut out = vec![0.0f32; w * h];
+        denoise_vert_1ch(&mut out, &inp, h, w, 0);
+        // row 0: 2·0 + 1 + 1 = 2; row 2 (interior): 2·2 + 1 + 3 = 8;
+        // row 4: 2·4 + 3 + 3 = 14.
+        assert!(out[0..w].iter().all(|&v| v == 2.0), "top reflection: {out:?}");
+        assert!(
+            out[2 * w..3 * w].iter().all(|&v| v == 8.0),
+            "interior: {out:?}"
+        );
+        assert!(
+            out[4 * w..5 * w].iter().all(|&v| v == 14.0),
+            "bottom reflection: {out:?}"
+        );
+    }
+
+    #[test]
+    fn denoise_vert_wider_scale_reflection() {
+        // lev 1 → vscale 2 on a 3×6 row ramp: row 0 reads |0−2| = 2,
+        // row 5 reads 2·5−(5+2) = 3.
+        let (w, h) = (3, 6);
+        let inp = row_ramp(w, h);
+        let mut out = vec![0.0f32; w * h];
+        denoise_vert_1ch(&mut out, &inp, h, w, 1);
+        assert!(out[0..w].iter().all(|&v| v == 4.0), "top: {out:?}");
+        assert!(out[5 * w..6 * w].iter().all(|&v| v == 16.0), "bottom: {out:?}");
+    }
+
+    #[test]
+    fn denoise_vert_overscale_clamps_instead_of_oob() {
+        // height 3, lev 5 → vscale capped to 3; the top tap |0−3| = 3 is out of
+        // range (C would read past the buffer) and clamps to row 2, while the
+        // bottom tap 2·2−(0+3) = 1 stays in range.
+        let (w, h) = (2, 3);
+        let inp = row_ramp(w, h);
+        let mut out = vec![0.0f32; w * h];
+        denoise_vert_1ch(&mut out, &inp, h, w, 5);
+        assert!(out[0..w].iter().all(|&v| v == 3.0), "clamped top: {out:?}");
+    }
+
+    #[test]
+    fn denoise_horiz_edges_hat_and_zero_threshold() {
+        // width 5, lev 0 → hscale 1. Coarse and details start identical, so with
+        // thold 0 the accumulator receives the full detail (diff) at every
+        // column, exercising the left-reflection, interior, and
+        // right-reflection tap selections against hand-computed hats.
+        let (w, h) = (5, 1);
+        let coarse = vec![10.0f32, 20.0, 30.0, 40.0, 50.0];
+        let mut details = coarse.clone();
+        let mut accum = vec![0.0f32; w * h];
+        denoise_horiz_1ch(&coarse, &mut details, &mut accum, h, w, 0, 0.0, false);
+        let hats = [3.75f32, 5.0, 7.5, 10.0, 11.25];
+        assert_close(&details, &hats, 1e-6, "hat");
+        let expected_accum: Vec<f32> =
+            coarse.iter().zip(hats.iter()).map(|(&c, &e)| c - e).collect();
+        assert_close(&accum, &expected_accum, 1e-6, "accum");
+    }
+
+    #[test]
+    fn denoise_horiz_overlap_filters_shared_column_twice() {
+        // width 3, lev 1 → hscale 2 overlaps the left/right ranges. The shared
+        // column must be filtered first from the input detail, then again from
+        // the already-overwritten detail value.
+        let (w, h) = (3, 1);
+        let coarse = vec![0.0f32, 16.0, 32.0];
+        let expected_details = vec![4.0f32, 3.0, 4.0];
+        let expected_accum = vec![-3.0f32, -1.0, -1.0];
+        for use_reference in [false, true] {
+            let mut details = vec![1.0f32, 2.0, 3.0];
+            let mut accum = vec![0.0f32; w * h];
+            if use_reference {
+                denoise_horiz_1ch_reference(&coarse, &mut details, &mut accum, h, w, 1, 0.0, false);
+            } else {
+                denoise_horiz_1ch(&coarse, &mut details, &mut accum, h, w, 1, 0.0, false);
+            }
+            assert_eq!(details, expected_details, "use_reference={use_reference}");
+            assert_eq!(accum, expected_accum, "use_reference={use_reference}");
+        }
+    }
+
+    #[test]
+    fn denoise_horiz_threshold_gates_accum_not_coarse() {
+        // A threshold larger than any detail zeroes the accumulation, but the
+        // coarse layer is still written into `details`.
+        let (w, h) = (5, 1);
+        let coarse = vec![10.0f32, 20.0, 30.0, 40.0, 50.0];
+        let mut details = coarse.clone();
+        let mut accum = vec![0.0f32; w * h];
+        denoise_horiz_1ch(&coarse, &mut details, &mut accum, h, w, 0, 1.0e9, false);
+        assert!(accum.iter().all(|&v| v == 0.0));
+        let hats = [3.75f32, 5.0, 7.5, 10.0, 11.25];
+        assert_close(&details, &hats, 1e-6, "coarse");
+    }
+
+    #[test]
+    fn denoise_horiz_soft_threshold_branches_and_deadzone() {
+        // Flat-zero coarse → hat 0 everywhere, so diff == details. With
+        // thold 1 the dead zone (|diff| ≤ 1) contributes nothing, positive
+        // excess keeps diff−thold, negative excess keeps diff+thold — the C
+        // MAX(diff−thold,0)+MIN(diff+thold,0) behaviour on both sides.
+        let (w, h) = (5, 1);
+        let coarse = vec![0.0f32; w];
+        let mut details = vec![-50.0f32, -0.25, 0.0, 0.25, 50.0];
+        let mut accum = vec![0.0f32; w];
+        denoise_horiz_1ch(&coarse, &mut details, &mut accum, h, w, 0, 1.0, false);
+        assert!(details.iter().all(|&v| v == 0.0), "hats must be zero");
+        let expected = [-49.0f32, 0.0, 0.0, 0.0, 49.0];
+        assert_close(&accum, &expected, 1e-6, "soft threshold");
+    }
+
+    #[test]
+    fn denoise_horiz_threshold_edge_values_are_exact() {
+        // Single-pixel input makes the horizontal hat exactly zero, isolating
+        // the soft-threshold expression on the supplied detail value.
+        let (w, h) = (1, 1);
+        let coarse = vec![0.0f32];
+        for (input, thold, expected) in [
+            (f32::NAN, 0.25f32, 0.0f32),
+            (2.0f32, -1.0f32, 3.0f32),
+            (-2.0f32, -1.0f32, -3.0f32),
+            (0.0f32, 1.0f32, 0.0f32),
+            (-0.0f32, 1.0f32, 0.0f32),
+        ] {
+            let mut details = vec![input];
+            let mut accum = vec![0.0f32];
+            denoise_horiz_1ch(&coarse, &mut details, &mut accum, h, w, 0, thold, false);
+            assert_eq!(details[0].to_bits(), 0.0f32.to_bits(), "input={input}");
+            assert_eq!(
+                accum[0].to_bits(),
+                expected.to_bits(),
+                "input={input} thold={thold}"
+            );
+        }
+    }
+
+    #[test]
+    fn denoise_horiz_last_fold_restores_input_at_zero_threshold() {
+        // last=true with thold 0: details = hat + (orig − hat) == orig.
+        let (w, h) = (9, 3);
+        let coarse = fill1(w * h);
+        let orig = row_ramp(w, h);
+        let mut details = orig.clone();
+        let mut accum = vec![0.0f32; w * h];
+        denoise_horiz_1ch(&coarse, &mut details, &mut accum, h, w, 1, 0.0, true);
+        for (d, o) in details.iter().zip(orig.iter()) {
+            assert!((d - o).abs() < 1e-5, "last fold did not restore input");
+        }
+    }
+
+    #[test]
+    fn denoise_horiz_last_false_leaves_fold_out() {
+        // last=false must not add the accumulation back into details.
+        let (w, h) = (9, 3);
+        let coarse = fill1(w * h);
+        let orig = row_ramp(w, h);
+        let mut details = orig.clone();
+        let mut accum = vec![0.0f32; w * h];
+        denoise_horiz_1ch(&coarse, &mut details, &mut accum, h, w, 1, 0.0, false);
+        let changed = details.iter().zip(orig.iter()).any(|(d, o)| (d - o).abs() > 1e-6);
+        assert!(changed, "details unexpectedly unchanged without fold");
+        // The accumulation is non-trivial, so the test above is not vacuous:
+        // skipping the fold must leave details different from a folded run.
+        assert!(accum.iter().any(|a| *a != 0.0), "accum unexpectedly all zero");
+        let mut folded = details.clone();
+        for (d, a) in folded.iter_mut().zip(accum.iter()) {
+            *d += *a;
+        }
+        assert!(
+            folded.iter().zip(orig.iter()).all(|(d, o)| (d - o).abs() < 1e-5),
+            "folded details should restore the input at zero threshold"
+        );
+    }
+
+    #[test]
+    fn denoise_kernels_agree_with_references_bit_exact() {
+        // Differential agreement over sizes (including short/degenerate ones
+        // where edge regions overlap), scales, thresholds, and last flags.
+        let dims = [(1, 1), (1, 7), (7, 1), (2, 3), (3, 2), (5, 5), (9, 3), (16, 12)];
+        let tholds = [0.0f32, 0.25, 1.0e9];
+        for &(w, h) in &dims {
+            for lev in 0..4 {
+                // vertical pass
+                let inp = fill1(w * h);
+                let mut a = vec![0.0f32; w * h];
+                let mut b = vec![0.0f32; w * h];
+                denoise_vert_1ch(&mut a, &inp, h, w, lev);
+                denoise_vert_1ch_reference(&mut b, &inp, h, w, lev);
+                assert!(
+                    a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "vert mismatch {w}x{h} lev {lev}"
+                );
+                assert!(a.iter().all(|v| v.is_finite()));
+                // horizontal pass
+                for &th in &tholds {
+                    for &last in &[false, true] {
+                        let coarse = fill1(w * h);
+                        let orig = fill1(w * h);
+                        let mut d1 = orig.clone();
+                        let mut d2 = orig.clone();
+                        let mut a1 = vec![0.0f32; w * h];
+                        let mut a2 = vec![0.0f32; w * h];
+                        denoise_horiz_1ch(&coarse, &mut d1, &mut a1, h, w, lev, th, last);
+                        denoise_horiz_1ch_reference(&coarse, &mut d2, &mut a2, h, w, lev, th, last);
+                        assert!(
+                            d1.iter().zip(d2.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
+                            "horiz details mismatch {w}x{h} lev {lev} th {th} last {last}"
+                        );
+                        assert!(
+                            a1.iter().zip(a2.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
+                            "horiz accum mismatch {w}x{h} lev {lev} th {th} last {last}"
+                        );
+                        assert!(d1.iter().all(|v| v.is_finite()));
+                        assert!(a1.iter().all(|v| v.is_finite()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn denoise_ffi_matches_safe_kernels() {
+        // The FFI exports must pass lev/thold/last/width/height through
+        // unchanged, including non-zero `last` values other than 1.
+        let (w, h) = (11, 7);
+        let inp = fill1(w * h);
+        let mut via_safe = vec![0.0f32; w * h];
+        let mut via_ffi = vec![0.0f32; w * h];
+        denoise_vert_1ch(&mut via_safe, &inp, h, w, 2);
+        unsafe {
+            darkroom_dwt_denoise_vert_1ch(via_ffi.as_mut_ptr(), inp.as_ptr(), h, w, 2);
+        }
+        assert!(via_safe.iter().zip(via_ffi.iter()).all(|(x, y)| x.to_bits() == y.to_bits()));
+
+        for &last in &[0, 1, 2] {
+            let coarse = fill1(w * h);
+            let orig = fill1(w * h);
+            let mut d1 = orig.clone();
+            let mut d2 = orig.clone();
+            let mut a1 = vec![0.0f32; w * h];
+            let mut a2 = vec![0.0f32; w * h];
+            denoise_horiz_1ch(&coarse, &mut d1, &mut a1, h, w, 2, 0.125, last != 0);
+            unsafe {
+                darkroom_dwt_denoise_horiz_1ch(
+                    coarse.as_ptr(),
+                    d2.as_mut_ptr(),
+                    a2.as_mut_ptr(),
+                    h,
+                    w,
+                    2,
+                    0.125,
+                    last,
+                );
+            }
+            assert!(
+                d1.iter().zip(d2.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "ffi details mismatch last={last}"
+            );
+            assert!(
+                a1.iter().zip(a2.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "ffi accum mismatch last={last}"
+            );
+        }
+    }
+
+    #[test]
+    fn denoise_ffi_guards_do_not_crash() {
+        // Null pointers and degenerate dimensions are no-ops, never UB.
+        unsafe {
+            darkroom_dwt_denoise_vert_1ch(std::ptr::null_mut(), std::ptr::null(), 4, 4, 0);
+            darkroom_dwt_denoise_vert_1ch(std::ptr::null_mut(), std::ptr::null(), 0, 0, 0);
+            darkroom_dwt_denoise_horiz_1ch(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                4,
+                4,
+                0,
+                0.0,
+                0,
+            );
+            darkroom_dwt_denoise_horiz_1ch(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0.0,
+                1,
+            );
+
+            // Every null-pointer permutation is rejected before any slice exists.
+            let valid_in = vec![1.0f32; 16];
+            let mut valid_out = vec![2.0f32; 16];
+            darkroom_dwt_denoise_vert_1ch(
+                std::ptr::null_mut(),
+                valid_in.as_ptr(),
+                4,
+                4,
+                0,
+            );
+            darkroom_dwt_denoise_vert_1ch(
+                valid_out.as_mut_ptr(),
+                std::ptr::null(),
+                4,
+                4,
+                0,
+            );
+            let valid_coarse = vec![3.0f32; 16];
+            let mut valid_details = vec![4.0f32; 16];
+            let mut valid_accum = vec![5.0f32; 16];
+            darkroom_dwt_denoise_horiz_1ch(
+                std::ptr::null(),
+                valid_details.as_mut_ptr(),
+                valid_accum.as_mut_ptr(),
+                4,
+                4,
+                0,
+                0.0,
+                0,
+            );
+            darkroom_dwt_denoise_horiz_1ch(
+                valid_coarse.as_ptr(),
+                std::ptr::null_mut(),
+                valid_accum.as_mut_ptr(),
+                4,
+                4,
+                0,
+                0.0,
+                0,
+            );
+            darkroom_dwt_denoise_horiz_1ch(
+                valid_coarse.as_ptr(),
+                valid_details.as_mut_ptr(),
+                std::ptr::null_mut(),
+                4,
+                4,
+                0,
+                0.0,
+                0,
+            );
+
+            // Partial-zero dimensions are also no-ops when the other pointers
+            // are valid, and must leave those buffers untouched.
+            darkroom_dwt_denoise_vert_1ch(valid_out.as_mut_ptr(), valid_in.as_ptr(), 0, 4, 0);
+            darkroom_dwt_denoise_vert_1ch(valid_out.as_mut_ptr(), valid_in.as_ptr(), 4, 0, 0);
+            darkroom_dwt_denoise_horiz_1ch(
+                valid_coarse.as_ptr(),
+                valid_details.as_mut_ptr(),
+                valid_accum.as_mut_ptr(),
+                0,
+                4,
+                0,
+                0.0,
+                0,
+            );
+            darkroom_dwt_denoise_horiz_1ch(
+                valid_coarse.as_ptr(),
+                valid_details.as_mut_ptr(),
+                valid_accum.as_mut_ptr(),
+                4,
+                0,
+                0,
+                0.0,
+                0,
+            );
+            assert!(valid_out.iter().all(|&v| v == 2.0));
+            assert!(valid_details.iter().all(|&v| v == 4.0));
+            assert!(valid_accum.iter().all(|&v| v == 5.0));
+
+            // Overflowing dimension products are rejected before slices exist;
+            // these pointers are never dereferenced.
+            let dangling = std::ptr::NonNull::<f32>::dangling().as_ptr();
+            darkroom_dwt_denoise_vert_1ch(
+                dangling as *mut f32,
+                dangling,
+                usize::MAX,
+                2,
+                0,
+            );
+            darkroom_dwt_denoise_horiz_1ch(
+                dangling,
+                dangling as *mut f32,
+                dangling as *mut f32,
+                2,
+                usize::MAX,
+                0,
+                0.0,
+                0,
+            );
+        }
+        // Degenerate dimensions on the safe kernels are no-ops too.
+        let mut empty: Vec<f32> = Vec::new();
+        denoise_vert_1ch(&mut empty, &[], 0, 0, 0);
+        denoise_vert_1ch(&mut empty, &[], 0, 4, 0);
+        denoise_vert_1ch(&mut empty, &[], 4, 0, 0);
+        denoise_horiz_1ch(&[], &mut [], &mut [], 0, 0, 0, 0.0, true);
+        denoise_horiz_1ch(&[], &mut [], &mut [], 0, 4, 0, 0.0, true);
+        denoise_horiz_1ch(&[], &mut [], &mut [], 4, 0, 0, 0.0, true);
     }
 }

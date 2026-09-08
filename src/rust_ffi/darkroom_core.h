@@ -3575,6 +3575,32 @@ void darkroom_heal_add(const float *red_buffer, const float *black_buffer,
                        const float *second_buffer, float *result_buffer,
                        size_t width, size_t height);
 
+/*
+ * À-trous wavelet denoise passes (src/common/dwt.c, m4-179).
+ *
+ * darkroom_dwt_denoise_vert_1ch replaces the loop body of dwt_denoise_vert_1ch():
+ *   out[row] = 2*in[row] + in[|row-vscale|] + in[reflect(row+vscale)]
+ * with vscale = min(1<<lev, height). Rows run in natural order (the C row
+ * interleave is a pure cache optimisation over a read-only input). Reflected
+ * taps outside [0, height-1] are clamped into range; for in-range inputs the
+ * clamp is a no-op. `out` and `in` must be non-overlapping width*height buffers.
+ *
+ * darkroom_dwt_denoise_horiz_1ch replaces the loop body of
+ * dwt_denoise_horiz_1ch(): `coarse` is the vertical-pass result (read-only),
+ * `details` is the running image (overwritten with the coarse layer),
+ * `accum` gathers the soft-thresholded detail
+ * MAX(diff-thold,0)+MIN(diff+thold,0); when `last` != 0 the accumulation is
+ * folded back into `details`. Left/right edge taps reflect around the image
+ * boundary (clamped into range); when hscale > width/2 the edge ranges overlap
+ * and shared columns are filtered twice, exactly like the C. All three buffers
+ * hold width*height floats; `coarse` must not alias `details`/`accum`.
+ */
+void darkroom_dwt_denoise_vert_1ch(float *out, const float *in,
+                                    size_t height, size_t width, size_t lev);
+void darkroom_dwt_denoise_horiz_1ch(const float *coarse, float *details, float *accum,
+                                     size_t height, size_t width, size_t lev,
+                                     float thold, int last);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
