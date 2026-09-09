@@ -866,43 +866,14 @@ static inline void _cmatrix_fastpath_clipping(float *const restrict out,
                                               const dt_colormatrix_t lmatrix,
                                               const dt_aligned_pixel_t corr)
 {
-  const dt_aligned_pixel_t nmatrix_row0 = { nmatrix[0][0],
-                                            nmatrix[1][0],
-                                            nmatrix[2][0],
-                                            0.0f };
-  const dt_aligned_pixel_t nmatrix_row1 = { nmatrix[0][1],
-                                            nmatrix[1][1],
-                                            nmatrix[2][1],
-                                            0.0f };
-  const dt_aligned_pixel_t nmatrix_row2 = { nmatrix[0][2],
-                                            nmatrix[1][2],
-                                            nmatrix[2][2],
-                                            0.0f };
-  const dt_aligned_pixel_t lmatrix_row0 = { lmatrix[0][0],
-                                            lmatrix[1][0],
-                                            lmatrix[2][0],
-                                            0.0f };
-  const dt_aligned_pixel_t lmatrix_row1 = { lmatrix[0][1],
-                                            lmatrix[1][1],
-                                            lmatrix[2][1],
-                                            0.0f };
-  const dt_aligned_pixel_t lmatrix_row2 = { lmatrix[0][2],
-                                            lmatrix[1][2],
-                                            lmatrix[2][2],
-                                            0.0f };
-
-  // this function is called from inside a parallel for loop, so no
-  // need for further parallelization
-  for(size_t k = 0; k < npixels; k++)
-  {
-    dt_aligned_pixel_t cam = {in[4*k] * corr[0], in[4*k+1] * corr[1], in[4*k+2] * corr[2],  1.0f};
-    dt_aligned_pixel_t nRGB;
-    dt_apply_color_matrix_by_row(cam, nmatrix_row0, nmatrix_row1, nmatrix_row2, nRGB);
-    dt_vector_clip(nRGB);
-    dt_aligned_pixel_t res;
-    dt_RGB_to_Lab(nRGB, lmatrix_row0, lmatrix_row1, lmatrix_row2, res);
-    copy_pixel_nontemporal(out + 4*k, res);
-  }
+  // Rust port (m4-181): per-pixel cam→nmatrix→clip→lmatrix→Lab loop lives in
+  // crates/c41-core/src/iop/colorin.rs. Matrices are passed untransposed as
+  // stored; the Rust side applies them row-major, matching the old
+  // column-vectors + dt_apply_color_matrix_by_row behavior.
+  darkroom_colorin_cmatrix_fastpath_clipping(in, out, npixels,
+                                             (const float *)nmatrix,
+                                             (const float *)lmatrix,
+                                             corr);
 }
 
 static void process_cmatrix_fastpath(dt_iop_module_t *self,
@@ -937,29 +908,14 @@ static void _cmatrix_proper_simple(float *const restrict out,
                                    const dt_colormatrix_t cmatrix,
                                    const dt_aligned_pixel_t corr)
 {
-  const dt_aligned_pixel_t cmatrix_row0 = { cmatrix[0][0],
-                                            cmatrix[1][0],
-                                            cmatrix[2][0],
-                                            0.0f };
-  const dt_aligned_pixel_t cmatrix_row1 = { cmatrix[0][1],
-                                            cmatrix[1][1],
-                                            cmatrix[2][1],
-                                            0.0f };
-  const dt_aligned_pixel_t cmatrix_row2 = { cmatrix[0][2],
-                                            cmatrix[1][2],
-                                            cmatrix[2][2],
-                                            0.0f };
-
-  // this function is called from inside a parallel for loop, so no
-  // need for further parallelization
-  for(size_t k = 0; k < npixels; k++)
-  {
-    dt_aligned_pixel_t cam = {in[4*k] * corr[0], in[4*k+1] * corr[1], in[4*k+2] * corr[2],  1.0f};
-    _apply_tone_curves(cam, d);
-    dt_aligned_pixel_t res;
-    dt_RGB_to_Lab(cam, cmatrix_row0, cmatrix_row1, cmatrix_row2, res);
-    copy_pixel_nontemporal(out + 4*k, res);
-  }
+  // Rust port (m4-181): per-pixel corr→tone-curves→cmatrix→Lab loop lives in
+  // crates/c41-core/src/iop/colorin.rs (`d` flattened to lut/unbounded_coeffs
+  // where it sat in the parameter order).
+  darkroom_colorin_cmatrix_proper_simple(in, out, npixels,
+                                         (const float *)d->lut,
+                                         (const float *)d->unbounded_coeffs,
+                                         (const float *)cmatrix,
+                                         corr);
 }
 
 static inline void _cmatrix_proper_clipping(float *const restrict out,
@@ -970,47 +926,14 @@ static inline void _cmatrix_proper_clipping(float *const restrict out,
                                             const dt_colormatrix_t lmatrix,
                                             const dt_aligned_pixel_t corr)
 {
-  const dt_aligned_pixel_t nmatrix_row0 = { nmatrix[0][0],
-                                            nmatrix[1][0],
-                                            nmatrix[2][0],
-                                            0.0f };
-  const dt_aligned_pixel_t nmatrix_row1 = { nmatrix[0][1],
-                                            nmatrix[1][1],
-                                            nmatrix[2][1],
-                                            0.0f };
-  const dt_aligned_pixel_t nmatrix_row2 = { nmatrix[0][2],
-                                            nmatrix[1][2],
-                                            nmatrix[2][2],
-                                            0.0f };
-  const dt_aligned_pixel_t lmatrix_row0 = { lmatrix[0][0],
-                                            lmatrix[1][0],
-                                            lmatrix[2][0],
-                                            0.0f };
-  const dt_aligned_pixel_t lmatrix_row1 = { lmatrix[0][1],
-                                            lmatrix[1][1],
-                                            lmatrix[2][1],
-                                            0.0f };
-  const dt_aligned_pixel_t lmatrix_row2 = { lmatrix[0][2],
-                                            lmatrix[1][2],
-                                            lmatrix[2][2],
-                                            0.0f };
-
-  // this function is called from inside a parallel for loop, so no need for further parallelization
-  for(size_t k = 0; k < npixels; k++)
-  {
-    dt_aligned_pixel_t cam = {in[4*k] * corr[0], in[4*k+1] * corr[1], in[4*k+2] * corr[2],  1.0f};
-    _apply_tone_curves(cam, d);
-
-    // convert to the gamut-clipping colorspace
-    dt_aligned_pixel_t nRGB;
-    dt_apply_color_matrix_by_row(cam, nmatrix_row0, nmatrix_row1, nmatrix_row2, nRGB);
-    // clip to the gamut colorspace
-    dt_vector_clip(nRGB);
-    // convert from gamut colorspace to destination colorspace
-    dt_aligned_pixel_t res;
-    dt_RGB_to_Lab(nRGB, lmatrix_row0, lmatrix_row1, lmatrix_row2, res);
-    copy_pixel_nontemporal(out + 4*k, res);
-  }
+  // Rust port (m4-181): per-pixel corr→tone-curves→nmatrix→clip→lmatrix→Lab
+  // loop lives in crates/c41-core/src/iop/colorin.rs.
+  darkroom_colorin_cmatrix_proper_clipping(in, out, npixels,
+                                           (const float *)d->lut,
+                                           (const float *)d->unbounded_coeffs,
+                                           (const float *)nmatrix,
+                                           (const float *)lmatrix,
+                                           corr);
 }
 
 static void process_cmatrix_proper(dt_iop_module_t *self,

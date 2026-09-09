@@ -861,6 +861,56 @@ void darkroom_colorin_cmatrix_bm(const float *in_buf,
                                  int clipping);
 
 /*
+ * colorin IOP -- linear fastpath with gamut clipping (m4-181).
+ *
+ * Replaces the per-pixel loop in _cmatrix_fastpath_clipping() in colorin.c:
+ * cam = in*corr, nRGB = nmatrix*cam, clamp to [0,1], lmatrix*nRGB -> XYZ -> Lab.
+ * nmatrix/lmatrix: 16 floats each (dt_colormatrix_t, untransposed as stored).
+ * corr: 4 white-balance coefficients. Output alpha is 0.
+ */
+void darkroom_colorin_cmatrix_fastpath_clipping(const float *in_buf,
+                                                float *out_buf,
+                                                size_t npixels,
+                                                const float *nmatrix,
+                                                const float *lmatrix,
+                                                const float *corr);
+
+/*
+ * colorin IOP -- tone-curve ("proper") path without gamut clipping (m4-181).
+ *
+ * Replaces the per-pixel loop in _cmatrix_proper_simple() in colorin.c:
+ * cam = in*corr, tone curves (lut/unbounded_coeffs, skipped per channel when
+ * lut[c][0] < 0), then cmatrix*cam -> XYZ -> Lab.
+ * lut: 3 x 0x10000 floats; unbounded_coeffs: 3 x 3 floats.
+ * cmatrix: 16 floats (dt_colormatrix_t, untransposed). corr: 4 floats.
+ * Output alpha is 0.
+ */
+void darkroom_colorin_cmatrix_proper_simple(const float *in_buf,
+                                            float *out_buf,
+                                            size_t npixels,
+                                            const float *lut,
+                                            const float *unbounded_coeffs,
+                                            const float *cmatrix,
+                                            const float *corr);
+
+/*
+ * colorin IOP -- tone-curve ("proper") path with gamut clipping (m4-181).
+ *
+ * Replaces the per-pixel loop in _cmatrix_proper_clipping() in colorin.c:
+ * cam = in*corr, tone curves, nRGB = nmatrix*cam, clamp to [0,1],
+ * then lmatrix*nRGB -> XYZ -> Lab. Same pointer layout as _proper_simple
+ * with nmatrix/lmatrix in place of cmatrix. Output alpha is 0.
+ */
+void darkroom_colorin_cmatrix_proper_clipping(const float *in_buf,
+                                              float *out_buf,
+                                              size_t npixels,
+                                              const float *lut,
+                                              const float *unbounded_coeffs,
+                                              const float *nmatrix,
+                                              const float *lmatrix,
+                                              const float *corr);
+
+/*
  * ColorBalanceRGB IOP -- the four OMP loops of colorbalancergb.c (m4-137).
  *
  * darkroom_colorbalancergb_process replaces the DT_OMP_FOR pixel loop in
