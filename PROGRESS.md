@@ -4419,3 +4419,23 @@ documentation before gating.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-09 12:34 UTC — m4-183: port image fill helper to Rust FFI
+
+**Commit** `4d5b6ae37a` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `dt_iop_image_fill` (`src/common/imagebuf.c`), replacing its
+data-parallel fill loop with `darkroom_imagebuf_fill`. Extended `c41-core::imagebuf`
+with a safe kernel, divergent reference, validated FFI, and focused tests; declared the
+export in `src/rust_ffi/darkroom_core.h`. Left copy/ROI helpers and all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0. Added the
+requested zero-path reference and FFI coverage; left file ordering and the inherited
+huge-image guard limitation unchanged as documented.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
