@@ -4461,3 +4461,26 @@ across kernel, reference, FFI, header, and test documentation.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-09 19:15 UTC — m4-185: port EAW denoise-decompose loop to Rust FFI
+
+**Commit** `af61138ba8` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `eaw_dn_decompose` (`src/common/eaw.c`), replacing its
+edge-avoiding stencil/reduction loop with `darkroom_eaw_dn_decompose`, a thin export
+reusing the existing `c41-core::eaw::dn_decompose` kernel. Declared the export in
+`src/rust_ffi/darkroom_core.h`. Preserved the C signature/function-pointer compatibility
+and left decompose-and-synthesize helpers, OpenCL, and all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **HOLD** on one live P0 plus one likely
+red-build P1. Fixed the center-pixel edge-weight reference, guarded the now-unused C
+helper against `-Wunused-function`, corrected stencil-math documentation, and added a
+center-pixel regression oracle. A later Docker gate also exposed an unsound dangling-
+pointer overflow test; fixed it with an `isize::MAX` slice-length guard and reran the
+gate green.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
