@@ -20,6 +20,7 @@
 #include "common/math.h"
 #include "control/control.h"     // needed by dwt.h
 #include "common/dwt.h"          // for dwt_interleave_rows
+#include "rust_ffi/darkroom_core.h" // for darkroom_eaw_synthesize
 
 static inline void weight(const dt_aligned_pixel_t c1,
                               const dt_aligned_pixel_t c2,
@@ -207,15 +208,12 @@ void eaw_synthesize(float *const out, const float *const in, const float *const 
                     const float *const restrict threshold, const float *const restrict boost,
                     const int32_t width, const int32_t height)
 {
-  const dt_aligned_pixel_t thresh = { threshold[0], threshold[1], threshold[2], threshold[3] };
-  const dt_aligned_pixel_t boostval = { boost[0], boost[1], boost[2], boost[3] };
-  const size_t npixels = (size_t)width * height;
-
-  DT_OMP_FOR()
-  for(size_t k = 0; k < npixels; k++)
-  {
-    accumulate(out + 4*k, detail + 4*k, thresh, boostval);
-  }
+  // Live data-parallel loop ported to Rust (m4-182): the soft-threshold
+  // accumulate (MAX(detail-thresh,0)+MIN(detail+thresh,0), scaled by boost)
+  // now runs in darkroom_eaw_synthesize. `in` stays in the signature for
+  // eaw_synthesize_t compatibility (the body never read it). Decompose
+  // helpers, OpenCL code, and everything else above/below are untouched.
+  darkroom_eaw_synthesize(out, in, detail, threshold, boost, width, height);
   dt_omploop_sfence();
 }
 

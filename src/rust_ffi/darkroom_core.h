@@ -3671,6 +3671,25 @@ void darkroom_bilateral_slice_to_output(const float *grid_buf,
                                         const float *in_buf, float *out_buf,
                                         float detail);
 
+/*
+ * Edge-avoiding wavelets soft-threshold synthesize (src/common/eaw.c, m4-182).
+ *
+ * darkroom_eaw_synthesize replaces the loop body of eaw_synthesize():
+ *   out[k] += boost[c] * (max(detail[k]-thresh[c],0) + min(detail[k]+thresh[c],0))
+ * over width*height packed-RGBA pixels. `in_buf` is unused (the C body never
+ * reads it either) and kept solely for eaw_synthesize_t compatibility; it may
+ * alias `out_buf` (denoiseprofile passes out, out, ...) or be NULL.
+ * threshold/boost each point to 4 floats. Null pointers, non-positive dims,
+ * and overflowing dim products are guarded no-ops.
+ */
+void darkroom_eaw_synthesize(float *out_buf,
+                             const float *in_buf,
+                             const float *detail,
+                             const float *threshold,
+                             const float *boost,
+                             int width,
+                             int height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

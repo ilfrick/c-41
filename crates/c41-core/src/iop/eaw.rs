@@ -147,6 +147,57 @@ pub fn synthesize(
     }
 }
 
+/// FFI wrapper for C `eaw_synthesize` (eaw.c:207).
+///
+/// Replaces only the `DT_OMP_FOR` loop body: reads `threshold`/`boost` as
+/// 4-float vectors and accumulates `boost · soft(detail, thresh)` into `out`
+/// via [`synthesize`] — identical soft-threshold semantics, no duplicated math.
+///
+/// `in_buf` is unused (the C body never reads it either) and kept solely for
+/// `eaw_synthesize_t` function-pointer compatibility; it may even alias `out`
+/// (the denoiseprofile caller passes `out, out, ...`) or be NULL. The stated
+/// buffer lengths (`width·height·4` floats for `out`/`detail`, 4 floats for
+/// `threshold`/`boost`) remain a caller contract; null pointers, non-positive
+/// dims, and overflowing dim products are guarded no-ops.
+///
+/// # Safety
+/// `out`/`detail` must each point to `width·height·4` valid floats (they must
+/// not overlap each other; either may alias `in_buf`), `threshold`/`boost` to
+/// 4 valid floats each, with `width > 0` and `height > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_eaw_synthesize(
+    out: *mut f32,
+    _in_buf: *const f32,
+    detail: *const f32,
+    threshold: *const f32,
+    boost: *const f32,
+    width: i32,
+    height: i32,
+) {
+    if out.is_null() || detail.is_null() || threshold.is_null() || boost.is_null() {
+        return;
+    }
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let (w, h) = (width as usize, height as usize);
+    let npixels = match w.checked_mul(h) {
+        Some(n) => n,
+        None => return,
+    };
+    let len = match npixels.checked_mul(4) {
+        Some(n) => n,
+        None => return,
+    };
+    let accum = std::slice::from_raw_parts_mut(out, len);
+    let det = std::slice::from_raw_parts(detail, len);
+    let thresh = std::slice::from_raw_parts(threshold, 4);
+    let boostv = std::slice::from_raw_parts(boost, 4);
+    let t = [thresh[0], thresh[1], thresh[2], thresh[3]];
+    let b = [boostv[0], boostv[1], boostv[2], boostv[3]];
+    synthesize(accum, det, &t, &b, npixels);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +337,165 @@ mod tests {
         let mut accum = vec![0.0f32; npixels * 4];
         synthesize(&mut accum, &detail, &[0.5; 4], &[2.0; 4], npixels);
         assert!((accum[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ffi_synthesize_agrees_with_safe_kernel() {
+        // Round-trip: the FFI export must produce bit-identical output to a
+        // direct `synthesize` call on non-trivial threshold/boost/detail.
+        let (w, h) = (7i32, 5i32);
+        let npixels = (w as usize) * (h as usize);
+        let mut detail = vec![0.0f32; npixels * 4];
+        for (k, d) in detail.iter_mut().enumerate() {
+            // Deterministic pseudo-signal spanning both sides of the threshold.
+            *d = (((k as u32).wrapping_mul(2654435761u32) >> 8) % 2000) as f32 / 1000.0 - 1.0;
+        }
+        let threshold = [0.15f32, 0.3, 0.05, 0.5];
+        let boost = [1.0f32, 2.0, 0.5, 1.5];
+        let mut want = vec![0.25f32; npixels * 4];
+        synthesize(&mut want, &detail, &threshold, &boost, npixels);
+        let mut got = vec![0.25f32; npixels * 4];
+        unsafe {
+            darkroom_eaw_synthesize(
+                got.as_mut_ptr(),
+                got.as_ptr(), // in_buf aliases out: ignored, must be harmless
+                detail.as_ptr(),
+                threshold.as_ptr(),
+                boost.as_ptr(),
+                w,
+                h,
+            );
+        }
+        assert_eq!(got, want, "FFI must agree with synthesize bit-for-bit");
+    }
+
+    #[test]
+    fn ffi_synthesize_threshold_and_boost_semantics() {
+        // Zero threshold passes detail through scaled by boost; huge threshold
+        // annihilates; per-channel boost scales survivors independently.
+        let (w, h) = (2i32, 1i32);
+        let detail = [1.0f32, -1.0, 0.25, -0.25, 0.6, -0.6, 2.0, -2.0];
+        let zero = [0.0f32; 4];
+        let one = [1.0f32; 4];
+
+        let mut out = vec![0.0f32; 8];
+        unsafe {
+            darkroom_eaw_synthesize(
+                out.as_mut_ptr(),
+                std::ptr::null(),
+                detail.as_ptr(),
+                zero.as_ptr(),
+                one.as_ptr(),
+                w,
+                h,
+            );
+        }
+        for k in 0..8 {
+            assert!((out[k] - detail[k]).abs() < 1e-6, "passthrough at {k}");
+        }
+
+        let huge = [10.0f32; 4];
+        let mut out = vec![0.5f32; 8];
+        unsafe {
+            darkroom_eaw_synthesize(
+                out.as_mut_ptr(),
+                std::ptr::null(),
+                detail.as_ptr(),
+                huge.as_ptr(),
+                one.as_ptr(),
+                w,
+                h,
+            );
+        }
+        assert!(out.iter().all(|&a| a == 0.5), "huge threshold kills all detail");
+
+        // Per-channel: thresh 0.5, boost [2,1,0,3].
+        let thresh = [0.5f32; 4];
+        let boost = [2.0f32, 1.0, 0.0, 3.0];
+        let mut out = vec![0.0f32; 8];
+        unsafe {
+            darkroom_eaw_synthesize(
+                out.as_mut_ptr(),
+                std::ptr::null(),
+                detail.as_ptr(),
+                thresh.as_ptr(),
+                boost.as_ptr(),
+                w,
+                h,
+            );
+        }
+        // px0: d=1 -> 0.5*boost; -1 -> -0.5*boost; 0.25 -> 0; -0.25 -> 0.
+        assert!((out[0] - 1.0).abs() < 1e-6);
+        assert!((out[1] - -0.5).abs() < 1e-6);
+        assert_eq!(out[2], 0.0);
+        assert_eq!(out[3], 0.0);
+        // px1: 0.6 -> 0.1*2 = 0.2; -0.6 -> -0.1; 2.0 -> 1.5*0 = 0; -2.0 -> -1.5*3.
+        assert!((out[4] - 0.2).abs() < 1e-6);
+        assert!((out[5] - -0.1).abs() < 1e-6);
+        assert_eq!(out[6], 0.0);
+        assert!((out[7] - -4.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ffi_synthesize_guards_are_noops() {
+        // Null pointers, degenerate dims, and in==NULL must not crash and must
+        // leave the output untouched. (Short-buffer overruns remain a caller
+        // contract — the guards only cover null/dim/overflow.)
+        let detail = [1.0f32; 16];
+        let t = [0.0f32; 4];
+        let b = [1.0f32; 4];
+
+        // Null out.
+        unsafe {
+            darkroom_eaw_synthesize(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                detail.as_ptr(),
+                t.as_ptr(),
+                b.as_ptr(),
+                2,
+                1,
+            );
+        }
+        // Null detail / threshold / boost with a live out: untouched.
+        let mut out = vec![0.5f32; 8];
+        let before = out.clone();
+        unsafe {
+            darkroom_eaw_synthesize(out.as_mut_ptr(), std::ptr::null(), std::ptr::null(), t.as_ptr(), b.as_ptr(), 2, 1);
+            darkroom_eaw_synthesize(out.as_mut_ptr(), std::ptr::null(), detail.as_ptr(), std::ptr::null(), b.as_ptr(), 2, 1);
+            darkroom_eaw_synthesize(out.as_mut_ptr(), std::ptr::null(), detail.as_ptr(), t.as_ptr(), std::ptr::null(), 2, 1);
+        }
+        assert_eq!(out, before);
+
+        // Degenerate dims: zero / negative width or height.
+        for (w, h) in [(0, 1), (1, 0), (-3, 4), (4, -2)] {
+            unsafe {
+                darkroom_eaw_synthesize(
+                    out.as_mut_ptr(),
+                    std::ptr::null(),
+                    detail.as_ptr(),
+                    t.as_ptr(),
+                    b.as_ptr(),
+                    w,
+                    h,
+                );
+            }
+        }
+        assert_eq!(out, before, "degenerate dims must be no-ops");
+
+        // NULL in_buf is explicitly allowed (parameter is unused).
+        let mut out = vec![0.0f32; 8];
+        unsafe {
+            darkroom_eaw_synthesize(
+                out.as_mut_ptr(),
+                std::ptr::null(),
+                detail.as_ptr(),
+                t.as_ptr(),
+                b.as_ptr(),
+                2,
+                1,
+            );
+        }
+        assert_eq!(out, vec![1.0f32; 8], "NULL in_buf must not affect the result");
     }
 }
