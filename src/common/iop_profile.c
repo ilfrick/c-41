@@ -27,6 +27,7 @@
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 #include "develop/pixelpipe.h"
+#include "rust_ffi/darkroom_core.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -373,49 +374,28 @@ static inline void _apply_tonecurves(const float *const image_in,
                                      const float *const restrict unbounded_coeffsb,
                                      const int lutsize)
 {
-  const int ch = 4;
   const float *const lut[3] = { lutr, lutg, lutb };
-  const float *const unbounded_coeffs[3] =
-    { unbounded_coeffsr, unbounded_coeffsg, unbounded_coeffsb };
-  const size_t stride = (size_t)ch * width * height;
 
   // do we have any lut to apply, or is this a linear profile?
   if((lut[0][0] >= 0.0f)
      && (lut[1][0] >= 0.0f)
      && (lut[2][0] >= 0.0f))
   {
-    DT_OMP_FOR(collapse(2))
-    for(size_t k = 0; k < stride; k += ch)
-    {
-      for(int c = 0; c < 3; c++) // for_each_channel doesn't
-                                 // vectorize, and some code needs
-                                 // image_out[3] preserved
-      {
-        image_out[k + c] = (image_in[k + c] < 1.0f)
-          ? extrapolate_lut(lut[c], image_in[k + c], lutsize)
-          : eval_exp(unbounded_coeffs[c], image_in[k + c]);
-      }
-    }
+    darkroom_apply_tonecurves(image_in, image_out,
+                              (size_t)width, (size_t)height,
+                              lutr, lutg, lutb,
+                              unbounded_coeffsr, unbounded_coeffsg, unbounded_coeffsb,
+                              (size_t)lutsize);
   }
   else if((lut[0][0] >= 0.0f)
           || (lut[1][0] >= 0.0f)
           || (lut[2][0] >= 0.0f))
   {
-    DT_OMP_FOR(collapse(2))
-    for(size_t k = 0; k < stride; k += ch)
-    {
-      for(int c = 0; c < 3; c++) // for_each_channel doesn't
-                                 // vectorize, and some code needs
-                                 // image_out[3] preserved
-      {
-        if(lut[c][0] >= 0.0f)
-        {
-          image_out[k + c] = (image_in[k + c] < 1.0f)
-            ? extrapolate_lut(lut[c], image_in[k + c], lutsize)
-            : eval_exp(unbounded_coeffs[c], image_in[k + c]);
-        }
-      }
-    }
+    darkroom_apply_tonecurves(image_in, image_out,
+                              (size_t)width, (size_t)height,
+                              lutr, lutg, lutb,
+                              unbounded_coeffsr, unbounded_coeffsg, unbounded_coeffsb,
+                              (size_t)lutsize);
   }
 }
 

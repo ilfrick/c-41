@@ -3780,6 +3780,37 @@ void darkroom_eaw_decompose_and_synthesize(float *out_buf,
                                            long width,
                                            long height);
 
+/*
+ * Input-profile tone curves (src/common/iop_profile.c, _apply_tonecurves, m4-187).
+ *
+ * darkroom_apply_tonecurves replaces the two DT_OMP_FOR(collapse(2)) loop
+ * bodies (the all-channels fast path and the per-channel-sentinel path);
+ * the C wrapper keeps its sentinel branching and calls this from each live
+ * branch. image_in/image_out each hold 4*width*height floats (RGBA); only
+ * channels 0..2 are written, alpha (image_out[k+3]) is preserved. lutr/lutg/
+ * lutb each hold lutsize floats (the profile's own LUTs, default 0x10000);
+ * each unbounded_coeffs* holds 3 floats for the v >= 1.0 eval_exp tail
+ * (v < 1.0 takes the LUT, negatives clamp to lut[0]). A LUT whose first
+ * entry is negative marks a linear channel and is left untouched in
+ * image_out (not copied from image_in); all three linear is a full no-op.
+ * May be called in place (image_in == image_out, as
+ * _transform_lab_to_rgb_matrix does); otherwise the buffers must not
+ * overlap — partial overlap is unsupported (stricter than C, whose image
+ * pointers here carry no `restrict`). Null pointers, zero dims,
+ * lutsize < 2 and overflowing dim products are guarded no-ops.
+ */
+void darkroom_apply_tonecurves(const float *image_in,
+                               float *image_out,
+                               size_t width,
+                               size_t height,
+                               const float *lutr,
+                               const float *lutg,
+                               const float *lutb,
+                               const float *unbounded_coeffsr,
+                               const float *unbounded_coeffsg,
+                               const float *unbounded_coeffsb,
+                               size_t lutsize);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

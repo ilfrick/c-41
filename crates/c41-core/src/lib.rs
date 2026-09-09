@@ -25,6 +25,7 @@ pub mod illuminants;
 pub mod imagebuf;
 pub mod interp;
 pub mod iop;
+pub mod iop_profile;
 pub mod locallaplacian;
 pub mod masks;
 pub mod math;
