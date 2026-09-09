@@ -4484,3 +4484,26 @@ gate green.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-09 19:57 UTC — m4-186: port EAW decompose-and-synthesize loop to Rust FFI
+
+**Commit** `dc9539abaa` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `eaw_decompose_and_synthesize` (`src/common/eaw.c`), the last
+`DT_OMP_FOR` loop in that file, replacing it with `darkroom_eaw_decompose_and_synthesize`,
+a new kernel in `c41-core::eaw` (expf/`dt_vector_exp`-based vector weights, sharpen
+vector, per-channel threshold/boost combine). Declared the export in
+`src/rust_ffi/darkroom_core.h`. Preserved the C signature used by the atrous caller;
+annotated the now-unused `weight`/`accumulate` helpers against `-Wunused-function` and
+left OpenCL code and all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0. Corrected
+misleading overlap/double-filter wording (shared taps, single column visits), restored
+deleted doc fragments, tightened no-op-guarantee and scale-bound wording, reverted
+whitespace churn, and added an independent `vector_exp_lane` bit-oracle test.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
