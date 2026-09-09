@@ -102,6 +102,27 @@ pub fn linear_blend(buf: &mut [f32], other: &[f32], n: usize, lambda: f32) {
     }
 }
 
+/// `buf[k] = value` for each `k` in `0..n`.
+///
+/// Port of `dt_iop_image_fill` (imagebuf.c:253). The C has two paths: a
+/// data-parallel chunked fill for large buffers and a sequential fallback
+/// (`memset` when `value == 0.0f`, plain loop otherwise). All paths write
+/// the same value to every element, so the sequential loop matches both.
+/// The `value == 0.0` branch writes canonical `+0.0`, matching the C
+/// `memset(0)` (which also normalizes `-0.0` to `+0.0`).
+pub fn fill(buf: &mut [f32], n: usize, value: f32) {
+    let m = n.min(buf.len());
+    if value == 0.0 {
+        for k in 0..m {
+            buf[k] = 0.0;
+        }
+    } else {
+        for k in 0..m {
+            buf[k] = value;
+        }
+    }
+}
+
 /// `out[k] = in[k]` for each `k` in `0..n`.
 ///
 /// Port of the `DT_OMP_FOR_SIMD` loop in `dt_simd_memcpy`
@@ -210,6 +231,21 @@ pub unsafe extern "C" fn darkroom_imagebuf_mul_const(
 }
 
 /// # Safety
+/// `buf` must hold at least `n` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imagebuf_fill(
+    buf: *mut f32,
+    n: usize,
+    value: f32,
+) {
+    if buf.is_null() || n == 0 || n > i32::MAX as usize {
+        return;
+    }
+    let buf_slice = std::slice::from_raw_parts_mut(buf, n);
+    fill(buf_slice, n, value);
+}
+
+/// # Safety
 /// `buf` and `other` must each hold at least `n` floats.
 #[no_mangle]
 pub unsafe extern "C" fn darkroom_imagebuf_linear_blend(
@@ -298,6 +334,19 @@ fn ref_linear_blend(buf: &mut [f32], other: &[f32], n: usize, lambda: f32) {
     let m = n.min(buf.len()).min(other.len());
     for k in 0..m {
         buf[k] = lambda * buf[k] + lambda_1 * other[k];
+    }
+}
+
+#[allow(dead_code)]
+fn ref_fill(buf: &mut [f32], n: usize, value: f32) {
+    // Deliberately different: while-loop with canonical +0.0 on the zero
+    // path (mirrors memset), versus the for-loop kernel. Same result.
+    let m = n.min(buf.len());
+    let v = if value == 0.0 { 0.0 } else { value };
+    let mut k = 0;
+    while k < m {
+        buf[k] = v;
+        k += 1;
     }
 }
 
@@ -482,6 +531,108 @@ mod tests {
         mul_const(&mut direct, 256, 0.75);
         ref_mul_const(&mut reference, 256, 0.75);
         assert_eq!(direct, reference);
+    }
+
+    // ── fill ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fill_zero() {
+        let mut buf = vec![1.0f32, 2.0, 3.0, 4.0];
+        fill(&mut buf, 4, 0.0);
+        assert_eq!(buf, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn fill_negative_zero_normalizes_to_positive_zero() {
+        // Matches the C `memset(buf, 0, ...)` taken when `fill_value == 0.0f`.
+        let mut buf = vec![1.0f32; 4];
+        fill(&mut buf, 4, -0.0);
+        assert!(buf.iter().all(|&v| v.to_bits() == 0u32));
+    }
+
+    #[test]
+    fn fill_reference_zero_path_matches_bit_exact() {
+        // Exercise ref_fill's zero branch too: both implementations must take
+        // the canonical +0.0 path for either float zero.
+        for value in [0.0f32, -0.0] {
+            let mut direct = vec![1.0f32; 16];
+            let mut reference = vec![1.0f32; 16];
+            fill(&mut direct, 16, value);
+            ref_fill(&mut reference, 16, value);
+            assert_eq!(direct, reference, "value bits: {:x}", value.to_bits());
+            assert!(direct.iter().all(|&v| v.to_bits() == 0u32));
+        }
+    }
+
+    #[test]
+    fn fill_nonzero() {
+        let mut buf = vec![0.0f32; 4];
+        fill(&mut buf, 4, 0.5);
+        assert_eq!(buf, vec![0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn fill_non_multiple_of_4_tails() {
+        for n in [1usize, 2, 3, 5, 6, 7, 9, 13, 1001] {
+            let mut direct = vec![0.0f32; n];
+            let mut reference = vec![0.0f32; n];
+            fill(&mut direct, n, 1.25);
+            ref_fill(&mut reference, n, 1.25);
+            assert_eq!(direct, reference, "n={n}");
+            assert!(direct.iter().all(|&v| v == 1.25));
+        }
+    }
+
+    #[test]
+    fn fill_nan_inf_bit_exact() {
+        let nan_bits = 0x7FC0_1234u32;
+        let nan = f32::from_bits(nan_bits);
+        let mut buf = vec![0.0f32; 8];
+        fill(&mut buf, 8, nan);
+        assert!(buf.iter().all(|&v| v.to_bits() == nan_bits));
+
+        let mut buf = vec![0.0f32; 8];
+        fill(&mut buf, 8, f32::INFINITY);
+        assert!(buf.iter().all(|&v| v == f32::INFINITY));
+        let mut buf = vec![0.0f32; 8];
+        fill(&mut buf, 8, f32::NEG_INFINITY);
+        assert!(buf.iter().all(|&v| v == f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn fill_matches_reference_over_lcg() {
+        let mut buf = vec![0.0f32; 256];
+        lcg_fill(&mut buf, 0xF111, 1.0);
+
+        let mut direct = buf.clone();
+        let mut reference = buf.clone();
+        fill(&mut direct, 256, -2.5);
+        ref_fill(&mut reference, 256, -2.5);
+        assert_eq!(direct, reference);
+    }
+
+    #[test]
+    fn fill_short_inputs_clamp() {
+        // n larger than the buffer: kernel clamps to buf.len().
+        let mut buf = vec![0.0f32; 3];
+        fill(&mut buf, 100, 7.0);
+        assert_eq!(buf, vec![7.0, 7.0, 7.0]);
+
+        // n smaller than the buffer: tail untouched.
+        let mut buf = vec![0.0f32; 8];
+        fill(&mut buf, 3, 7.0);
+        assert_eq!(&buf[..3], &[7.0, 7.0, 7.0]);
+        assert_eq!(&buf[3..], &[0.0; 5]);
+    }
+
+    #[test]
+    fn fill_degenerate_empty() {
+        let mut buf: Vec<f32> = vec![];
+        fill(&mut buf, 0, 1.0); // no-op, no panic
+        assert!(buf.is_empty());
+        let mut buf = vec![1.0f32; 4];
+        fill(&mut buf, 0, 2.0); // n == 0: untouched
+        assert_eq!(buf, vec![1.0; 4]);
     }
 
     // ── linear_blend ───────────────────────────────────────────────────────────
@@ -686,6 +837,58 @@ mod tests {
         unsafe {
             darkroom_imagebuf_mul_const(std::ptr::null_mut(), 10, 2.0);
         }
+    }
+
+    #[test]
+    fn ffi_fill_round_trip() {
+        let mut src = vec![0.0f32; 64];
+        lcg_fill(&mut src, 0xF00D, 1.0);
+
+        let mut ffi_buf = src.clone();
+        let mut direct_buf = src.clone();
+
+        unsafe {
+            darkroom_imagebuf_fill(ffi_buf.as_mut_ptr(), 64, 0.5);
+        }
+        fill(&mut direct_buf, 64, 0.5);
+        assert_eq!(ffi_buf, direct_buf);
+        // Pin the memset-equivalent zero path through FFI as well.
+        for value in [0.0f32, -0.0] {
+            let mut ffi_zero = vec![1.0f32; 64];
+            let mut direct_zero = vec![1.0f32; 64];
+            unsafe {
+                darkroom_imagebuf_fill(ffi_zero.as_mut_ptr(), 64, value);
+            }
+            fill(&mut direct_zero, 64, value);
+            assert_eq!(ffi_zero, direct_zero, "value bits: {:x}", value.to_bits());
+            assert!(ffi_zero.iter().all(|&v| v.to_bits() == 0u32));
+        }
+    }
+
+    #[test]
+    fn ffi_fill_null_guard() {
+        unsafe {
+            darkroom_imagebuf_fill(std::ptr::null_mut(), 10, 1.0);
+        }
+    }
+
+    #[test]
+    fn ffi_fill_zero_n_guard() {
+        let mut buf = vec![1.0f32; 4];
+        unsafe {
+            darkroom_imagebuf_fill(buf.as_mut_ptr(), 0, 2.0);
+        }
+        assert_eq!(buf, vec![1.0; 4]); // untouched
+    }
+
+    #[test]
+    fn ffi_fill_overflow_guard() {
+        let mut buf = vec![1.0f32; 4];
+        let big_n = (i32::MAX as usize) + 1;
+        unsafe {
+            darkroom_imagebuf_fill(buf.as_mut_ptr(), big_n, 2.0);
+        }
+        assert_eq!(buf, vec![1.0; 4]); // untouched
     }
 
     #[test]

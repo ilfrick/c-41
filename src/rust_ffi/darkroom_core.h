@@ -3299,6 +3299,11 @@ void darkroom_imagebuf_scaled_copy(float *buf, const float *src, size_t n,
 /* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:327: buf[k] += value */
 void darkroom_imagebuf_add_const(float *buf, size_t n, float value);
 
+/* Replaces dt_iop_image_fill at imagebuf.c:253: buf[k] = fill_value.
+ * Covers both the data-parallel chunked path (large buffers) and the
+ * sequential memset/plain-loop fallback; all write the same value. */
+void darkroom_imagebuf_fill(float *buf, size_t n, float value);
+
 /* Replaces the DT_OMP_FOR_SIMD loop at imagebuf.c:355: buf[k] += other[k] */
 void darkroom_imagebuf_add_image(float *buf, const float *other, size_t n);
 

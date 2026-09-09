@@ -257,39 +257,8 @@ void dt_iop_image_fill(float *const buf,
                        const size_t ch)
 {
   const size_t nfloats = width * height * ch;
-#ifdef _OPENMP
-  if(nfloats > parallel_imgop_minimum)	// is the copy big enough to outweigh threading overhead?
-  {
-    const size_t nthreads = MIN(16, dt_get_num_threads());
-    // determine the number of 4-float vectors to be processed by each thread
-    const size_t chunksize = (((nfloats + nthreads - 1) / nthreads) + 3) / 4;
-    DT_OMP_FOR(num_threads(nthreads))
-    for(size_t chunk = 0; chunk < nthreads; chunk++)
-    {
-      size_t limit = MIN(4*(chunk+1)*chunksize, nfloats);
-      size_t limit4 = limit & ~3;
-      dt_aligned_pixel_t pix = { fill_value, fill_value,fill_value, fill_value };
-      for(size_t k = 4 * chunk * chunksize; k < limit4; k += 4)
-        copy_pixel_nontemporal(buf + k, pix);
-      // handle any leftover pixels in the final slice
-      for(size_t k  = 0; k < (limit & 3); k++)
-        buf[k + limit4] = fill_value;
-    }
-    return;
-  }
-#endif // _OPENMP
-  // no OpenMP, or image too small to bother parallelizing
-  if(fill_value == 0.0f)
-  {
-    // take advantage of compiler intrinsic which is hopefully highly optimized
-    memset(buf, 0, sizeof(float) * nfloats);
-  }
-  else
-  {
-    DT_OMP_SIMD(aligned(buf:16))
-    for(size_t k = 0; k < nfloats; k++)
-      buf[k] = fill_value;
-  }
+  // Ported to Rust FFI, replaces parallel chunked + sequential memset/loop paths
+  darkroom_imagebuf_fill(buf, nfloats, fill_value);
 }
 
 void dt_iop_image_add_const(float *const buf,
