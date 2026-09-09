@@ -3601,6 +3601,26 @@ void darkroom_dwt_denoise_horiz_1ch(const float *coarse, float *details, float *
                                      size_t height, size_t width, size_t lev,
                                      float thold, int last);
 
+/*
+ * Bilateral-grid slice-to-output (src/common/bilateral.c, m4-180).
+ *
+ * darkroom_bilateral_slice_to_output replaces the loop body of
+ * dt_bilateral_slice_to_output(): out[L] = max(0, out[L] + norm*interp) with
+ * norm = -detail*sigma_r*0.04 and interp the 8-tap trilinear read of the
+ * blurred grid (z fastest, then x, then y). Only the L channel is touched.
+ * `input` and `output` may be the same buffer (each pixel is fully read
+ * before its own L is written); otherwise they must not overlap. Null
+ * pointers, degenerate dims (a grid axis < 2, non-positive image dims), and
+ * overflowing dim products are guarded no-ops; the stated buffer lengths
+ * remain a caller contract.
+ */
+void darkroom_bilateral_slice_to_output(const float *grid_buf,
+                                        size_t size_x, size_t size_y, size_t size_z,
+                                        float sigma_s_inv, float sigma_r_inv, float sigma_r,
+                                        int width, int height,
+                                        const float *in_buf, float *out_buf,
+                                        float detail);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

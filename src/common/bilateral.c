@@ -27,6 +27,7 @@
 #include "common/bilateral.h"
 #include "common/darktable.h" // for CLAMPS, dt_alloc_align, dt_free_align
 #include "develop/imageop.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_bilateral_slice_to_output
 #include <glib.h>             // for MIN, MAX
 #include <math.h>             // for roundf
 #include <stdlib.h>           // for size_t, free, malloc, NULL
@@ -443,36 +444,14 @@ void dt_bilateral_slice_to_output(const dt_bilateral_t *const b,
                                   const float detail)
 {
   // detail: 0 is leave as is, -1 is bilateral filtered, +1 is contrast boost
-  const float norm = -detail * b->sigma_r * 0.04f;
-  const int ox = b->size_z;
-  const int oy = b->size_x * b->size_z;
-  const int oz = 1;
-  float *const buf = b->buf;
-  const int width = b->width;
-  const int height = b->height;
-
-  if(!buf) return;
-  DT_OMP_FOR(collapse(2))
-  for(int j = 0; j < height; j++)
-  {
-    for(int i = 0; i < width; i++)
-    {
-      size_t index = 4 * (j * width + i);
-      float xf, yf, zf;
-      const float L = in[index];
-      // trilinear lookup:
-      const size_t gi = image_to_grid(b, i, j, L, &xf, &yf, &zf);
-      const float Lout = norm * (buf[gi] * (1.0f - xf) * (1.0f - yf) * (1.0f - zf)
-                                 + buf[gi + ox] * (xf) * (1.0f - yf) * (1.0f - zf)
-                                 + buf[gi + oy] * (1.0f - xf) * (yf) * (1.0f - zf)
-                                 + buf[gi + ox + oy] * (xf) * (yf) * (1.0f - zf)
-                                 + buf[gi + oz] * (1.0f - xf) * (1.0f - yf) * (zf)
-                                 + buf[gi + ox + oz] * (xf) * (1.0f - yf) * (zf)
-                                 + buf[gi + oy + oz] * (1.0f - xf) * (yf) * (zf)
-                                 + buf[gi + ox + oy + oz] * (xf) * (yf) * (zf));
-      out[index] = MAX(0.0f, out[index] + Lout);
-    }
-  }
+  // Live data-parallel loop ported to Rust (m4-180): the trilinear
+  // read-back + norm scaling + MAX(0, ...) accumulation now runs in
+  // darkroom_bilateral_slice_to_output. Splat/merge reductions and the
+  // recursive blur-line passes above are untouched.
+  if(!b || !b->buf) return;
+  darkroom_bilateral_slice_to_output(b->buf, b->size_x, b->size_y, b->size_z,
+                                     b->sigma_s_inv, b->sigma_r_inv, b->sigma_r,
+                                     b->width, b->height, in, out, detail);
 }
 
 void dt_bilateral_free(dt_bilateral_t *b)
