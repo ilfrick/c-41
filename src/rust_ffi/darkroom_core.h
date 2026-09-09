@@ -3657,6 +3657,35 @@ void darkroom_dwt_denoise_horiz_1ch(const float *coarse, float *details, float *
                                      float thold, int last);
 
 /*
+ * À-trous wavelet RGBA decompose passes (src/common/dwt.c, m4-184).
+ *
+ * darkroom_dwt_decompose_vert replaces the loop body of dwt_decompose_vert():
+ *   out[row] = 2*in[row] + in[|row-vscale|] + in[reflect(row+vscale)]
+ * with vscale = min(1<<lev, height-1). Rows run in natural order (the C row
+ * interleave is a pure cache optimisation over a read-only input; the Rust
+ * reference visits rows interleaved, locking the equivalence). With the
+ * vscale cap both reflected rows stay in [0, height-1] for height >= 1, so no
+ * further clamping is needed; `lev` needs no clamp beyond the saturating
+ * shift. `out` and `in` must be non-overlapping 4*width*height buffers.
+ *
+ * darkroom_dwt_decompose_horiz replaces the loop body of
+ * dwt_decompose_horiz(): `out` holds the vertical-pass coarse (read-only
+ * during the row) and receives the normalised (2*center+left+right)/16 layer,
+ * while `details` (the running image) is left holding input − coarse. Left
+ * taps reflect via |col-hscale|, right-edge taps around the boundary (clamped
+ * into range); when hscale = min(1<<lev, width) exceeds width/2 the edge
+ * ranges share taps (each column is still visited once), exactly like the C.
+ * Carries its own row scratch; the C temp/padded_size per-thread buffer is
+ * retained for signature stability but no longer consumed. Both buffers hold
+ * 4*width*height floats and must not overlap. Null pointers, zero dims, and
+ * overflowing dim products are guarded no-ops.
+ */
+void darkroom_dwt_decompose_vert(float *out, const float *in,
+                                 size_t height, size_t width, size_t lev);
+void darkroom_dwt_decompose_horiz(float *out, float *details,
+                                  size_t height, size_t width, size_t lev);
+
+/*
  * Bilateral-grid slice-to-output (src/common/bilateral.c, m4-180).
  *
  * darkroom_bilateral_slice_to_output replaces the loop body of

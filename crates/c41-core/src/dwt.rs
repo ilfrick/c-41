@@ -16,11 +16,15 @@
 //!
 //! Ported: the CPU `dwt_decompose` (RGBA, `ch == 4`) with its layer callback, the
 //! scale-count helpers, and the 1-channel `dwt_denoise`. Not ported: all OpenCL
-//! (`dwt_*_cl`).
+//! (`dwt_*_cl`), and the `dwt_wavelet_decompose` callback orchestration /
+//! allocation strategy (still C).
 //!
 //! The 1-channel denoise passes are additionally exported over FFI
 //! ([`darkroom_dwt_denoise_vert_1ch`] / [`darkroom_dwt_denoise_horiz_1ch`],
-//! m4-179) and drive `src/common/dwt.c`'s denoise loops.
+//! m4-179) and drive `src/common/dwt.c`'s denoise loops. The RGBA decompose
+//! passes are likewise exported ([`darkroom_dwt_decompose_vert`] /
+//! [`darkroom_dwt_decompose_horiz`], m4-184) and drive `dwt_decompose_vert` /
+//! `dwt_decompose_horiz` in `src/common/dwt.c`.
 //!
 //! **Rust-vs-C hardening.** The C code reflects out-of-bounds edge taps with
 //! unsigned/`int` index arithmetic that reads slightly out of bounds (benign UB)
@@ -38,7 +42,9 @@
 //! via `dwt_interleave_rows` purely for cache friendliness (its own comment says
 //! so). Each output row depends only on *input* rows that are never mutated during
 //! the pass, so the visiting order has no effect on the result; this port iterates
-//! rows in natural order.
+//! rows in natural order. The [`decompose_vert_reference`] used by the m4-184
+//! tests visits rows in the C's interleave order, so kernel/reference agreement
+//! locks that equivalence bit-exactly.
 
 /// Parameters for [`decompose`], mirroring C's `dwt_params_t`. The image buffer is
 /// passed separately (as a `&mut [f32]`) rather than stored as a raw pointer.
@@ -141,8 +147,21 @@ fn two_mut(buf: &mut [Vec<f32>; 2], i: usize, j: usize) -> (&mut Vec<f32>, &mut 
 }
 
 // "Vertical" pass of one decomposition scale (RGBA): out = 2·center + above +
-// below, reflecting at the top/bottom edges. Port of `dwt_decompose_vert`.
-fn decompose_vert(out: &mut [f32], inp: &[f32], height: usize, width: usize, lev: usize) {
+// below, reflecting at the top/bottom edges. Port of `dwt_decompose_vert`
+// (m4-184 safe kernel; the FFI export [`darkroom_dwt_decompose_vert`] forwards
+// here).
+//
+// Rows run in natural order (see the module-level interleave note).
+// `vscale` caps at `height - 1`, so for `height >= 1` both reflected rows stay
+// in `[0, height-1]` with no further clamping; `lev` needs no clamp beyond the
+// saturating `1 << lev` in [`pow2`]. `out` and `inp` must each hold
+// `4 * width * height` floats and must not overlap.
+pub fn decompose_vert(out: &mut [f32], inp: &[f32], height: usize, width: usize, lev: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    debug_assert_eq!(out.len(), 4 * width * height);
+    debug_assert_eq!(inp.len(), 4 * width * height);
     // vscale capped at height-1, so both reflected rows stay in [0, height-1].
     let vscale = pow2(lev).min(height.saturating_sub(1));
     for row in 0..height {
@@ -165,8 +184,22 @@ fn decompose_vert(out: &mut [f32], inp: &[f32], height: usize, width: usize, lev
 }
 
 // Horizontal pass (RGBA): writes the normalised 'coarse' back into `out` and the
-// 'details' (input − coarse) into `inp`. Port of `dwt_decompose_horiz`.
-fn decompose_horiz(out: &mut [f32], inp: &mut [f32], height: usize, width: usize, lev: usize) {
+// 'details' (input − coarse) into `inp`. Port of `dwt_decompose_horiz` (m4-184
+// safe kernel; the FFI export [`darkroom_dwt_decompose_horiz`] forwards here).
+//
+// `hscale` caps at `width`. Taps read from `out` (the vertical-pass result,
+// never mutated during the row — only the scratch row is written, then copied
+// back), so overlapping tap reads reuse identical values when
+// `hscale > width/2` makes the edge ranges share taps (matching the C).
+// Reflected taps outside `[0, width-1]` are clamped into range; for in-range
+// inputs the clamp is a no-op. `out`/`inp` must each hold `4 * width * height`
+// floats and must not overlap.
+pub fn decompose_horiz(out: &mut [f32], inp: &mut [f32], height: usize, width: usize, lev: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    debug_assert_eq!(out.len(), 4 * width * height);
+    debug_assert_eq!(inp.len(), 4 * width * height);
     let hscale = pow2(lev).min(width);
     let last = width.saturating_sub(1);
     let mut temprow = vec![0.0f32; 4 * width];
@@ -628,6 +661,197 @@ pub unsafe extern "C" fn darkroom_dwt_denoise_horiz_1ch(
     let details = std::slice::from_raw_parts_mut(details, npix);
     let accum = std::slice::from_raw_parts_mut(accum, npix);
     denoise_horiz_1ch(coarse, details, accum, height, width, lev, thold, last != 0);
+}
+
+// ---------------------------------------------------------------------------
+// Structurally divergent reference implementations for the RGBA decompose
+// passes (m4-184)
+// ---------------------------------------------------------------------------
+//
+// These compute the same clamped semantics as [`decompose_vert`] /
+// [`decompose_horiz`] but with deliberately different loop structure, so the
+// differential tests below catch transcription slips rather than re-running the
+// same code. The scalar value expressions keep the C association order
+// (`2·center + above + below`, `(2·c + l + r) / 16` — that order is
+// load-bearing for bit-exact agreement, so it is shared on purpose);
+// everything around it differs.
+
+// Reference for [`decompose_vert`]: rows visited in the C's
+// `dwt_interleave_rows` order (via [`crate::math::dwt_interleave_rows`]) with
+// the taps resolved through `i64` helpers and a single flat per-float loop per
+// row (instead of the kernel's natural-order row-major loops with inline
+// `usize` index math and a channel sub-loop — all four channels share the same
+// row mapping, so the flat loop is equivalent).
+//
+// `vscale == 0` (1-px-tall images, or any height with `lev` saturating to a
+// zero cap) bypasses the interleave helper: the stride-0 call would divide by
+// zero (in the C too), while semantically every row maps to itself.
+fn decompose_vert_reference(
+    out: &mut [f32],
+    inp: &[f32],
+    height: usize,
+    width: usize,
+    lev: usize,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    debug_assert_eq!(out.len(), 4 * width * height);
+    debug_assert_eq!(inp.len(), 4 * width * height);
+    let vscale = pow2(lev).min(height.saturating_sub(1));
+    let h = height as i64;
+    let stride = 4 * width;
+    for rowid in 0..height {
+        let row = if vscale == 0 {
+            rowid
+        } else {
+            crate::math::dwt_interleave_rows(rowid, height, vscale)
+        } as i64;
+        let above = (row - (vscale as i64)).abs().min(h - 1) as usize * stride;
+        let centre = row as usize * stride;
+        let below = if row + (vscale as i64) < h {
+            (row + (vscale as i64)) as usize * stride
+        } else {
+            (2 * (h - 1) - (row + (vscale as i64))).clamp(0, h - 1) as usize * stride
+        };
+        let dst = row as usize * stride;
+        for k in 0..stride {
+            out[dst + k] = 2.0 * inp[centre + k] + inp[above + k] + inp[below + k];
+        }
+    }
+}
+
+// Reference for [`decompose_horiz`]: the same two positional tap ranges driven
+// through a per-column `step` closure with flat offset math, and the final
+// coarse write-back as an element loop (instead of the kernel's inline tap
+// math, channel sub-loops, and `copy_from_slice`).
+//
+// The two ranges are kept (not unified): when `hscale > width/2` their tap
+// reads overlap, but each column is still visited once (the taps are re-read
+// from the unmutated `out`, so any shared tap value is identical). The
+// reference reproduces that shared-tap behavior.
+#[allow(clippy::manual_memcpy)] // the element loop is intentional divergence
+// from the kernel's copy_from_slice.
+fn decompose_horiz_reference(
+    out: &mut [f32],
+    inp: &mut [f32],
+    height: usize,
+    width: usize,
+    lev: usize,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    debug_assert_eq!(out.len(), 4 * width * height);
+    debug_assert_eq!(inp.len(), 4 * width * height);
+    let hscale = pow2(lev).min(width);
+    let hscale_i = hscale as i64;
+    let wlast = width.saturating_sub(1) as i64;
+    let clamp_col = |c: i64| c.clamp(0, wlast) as usize;
+    let mut temprow = vec![0.0f32; 4 * width];
+    for row in 0..height {
+        let ri = 4 * row * width;
+        let mut step = |col: usize, lcol: usize, rcol: usize| {
+            for c in 0..4 {
+                let hat =
+                    (2.0 * out[ri + 4 * col + c] + out[ri + 4 * lcol + c] + out[ri + 4 * rcol + c])
+                        / 16.0;
+                temprow[4 * col + c] = hat;
+                inp[ri + 4 * col + c] -= hat;
+            }
+        };
+        // interior columns: reflected left, direct right
+        for col in 0..width.saturating_sub(hscale) {
+            step(
+                col,
+                ((col as i64 - hscale_i).unsigned_abs() as usize).min(width - 1),
+                col + hscale,
+            );
+        }
+        // right edge: reflect the right tap around the image boundary. Note the
+        // left tap keeps the C's abs() (unlike the 1-ch denoise port, whose C
+        // clamps with max(0)): |col−hscale| then clamped into range.
+        for col in width.saturating_sub(hscale)..width {
+            step(
+                col,
+                ((col as i64 - hscale_i).abs() as usize).min(width - 1),
+                clamp_col(2 * width as i64 - 2 - (col as i64 + hscale_i)),
+            );
+        }
+        for k in 0..4 * width {
+            out[ri + k] = temprow[k];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FFI exports (m4-184) — drive `dwt_decompose_vert` / `dwt_decompose_horiz`
+// in `src/common/dwt.c`.
+// ---------------------------------------------------------------------------
+
+/// Vertical decompose pass over FFI — port of the `dwt_decompose_vert` loop body.
+///
+/// `vscale = min(1<<lev, height-1)` (saturating shift); each output row is
+/// `2·center + above + below` with top/bottom reflection. Rows run in natural
+/// order (the C row interleave is a pure cache optimisation over a read-only
+/// input — see the module docs). `out` and `inp` must be non-null,
+/// non-overlapping, and each hold at least `4 * width * height` floats. Zero
+/// `width`/`height` is a no-op.
+///
+/// # Safety
+/// See the buffer contract above; overflowing dimension products are also
+/// guarded no-ops.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_dwt_decompose_vert(
+    out: *mut f32,
+    inp: *const f32,
+    height: usize,
+    width: usize,
+    lev: usize,
+) {
+    if out.is_null() || inp.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    let Some(npix) = width.checked_mul(height).and_then(|n| n.checked_mul(4)) else {
+        return;
+    };
+    let out = std::slice::from_raw_parts_mut(out, npix);
+    let inp = std::slice::from_raw_parts(inp, npix);
+    decompose_vert(out, inp, height, width, lev);
+}
+
+/// Horizontal decompose pass over FFI — port of the `dwt_decompose_horiz` loop body.
+///
+/// Reads the vertical-pass 'coarse' from `out`, writes the normalised
+/// `(2·center + left + right) / 16` back into `out`, and subtracts it from
+/// `details` (`inp`, the running image) to leave the detail layer. Edge taps
+/// reflect around the image boundary (clamped into range); when
+/// `hscale = min(1<<lev, width)` exceeds `width/2` the edge ranges share taps
+/// (each column is still visited once), exactly like the C. Carries its own
+/// scratch — the C `temp`/`padded_size` per-thread buffer is retained (but no
+/// longer consumed) for signature stability.
+///
+/// # Safety
+/// `out` and `details` must be non-null, non-overlapping, and each hold at
+/// least `4 * width * height` floats. Zero `width`/`height` is a no-op;
+/// overflowing dimension products are guarded no-ops.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_dwt_decompose_horiz(
+    out: *mut f32,
+    details: *mut f32,
+    height: usize,
+    width: usize,
+    lev: usize,
+) {
+    if out.is_null() || details.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    let Some(npix) = width.checked_mul(height).and_then(|n| n.checked_mul(4)) else {
+        return;
+    };
+    let out = std::slice::from_raw_parts_mut(out, npix);
+    let details = std::slice::from_raw_parts_mut(details, npix);
+    decompose_horiz(out, details, height, width, lev);
 }
 
 #[cfg(test)]
@@ -1296,5 +1520,339 @@ mod tests {
         denoise_horiz_1ch(&[], &mut [], &mut [], 0, 0, 0, 0.0, true);
         denoise_horiz_1ch(&[], &mut [], &mut [], 0, 4, 0, 0.0, true);
         denoise_horiz_1ch(&[], &mut [], &mut [], 4, 0, 0, 0.0, true);
+    }
+
+    // ── m4-184: RGBA decompose passes ───────────────────────────────────────
+
+    /// Deterministic RGBA fill in [0, 1).
+    fn fill4(width: usize, height: usize) -> Vec<f32> {
+        let mut v = Vec::with_capacity(4 * width * height);
+        let mut s: u32 = 0x51ab_3f29;
+        for _ in 0..4 * width * height {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            v.push((s >> 8) as f32 / 16_777_216.0);
+        }
+        v
+    }
+
+    /// RGBA row ramp: pixel (r, c) holds r as f32 in all four channels.
+    fn row_ramp4(width: usize, height: usize) -> Vec<f32> {
+        (0..height)
+            .flat_map(|r| std::iter::repeat_n([r as f32; 4], width).flatten())
+            .collect()
+    }
+
+    /// Elementwise `to_bits` equality with per-index diagnostics.
+    fn assert_bits_eq(got: &[f32], expected: &[f32], what: &str) {
+        assert_eq!(got.len(), expected.len(), "{what}: length mismatch");
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(g.to_bits() == e.to_bits(), "{what}[{i}]: {g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn decompose_vert_top_and_bottom_reflection() {
+        // lev 0 → vscale 1 on a 4×5 row ramp (all channels equal). Top row
+        // reflects around row 0 (|0−1| = 1), bottom row around height−1
+        // (2·4−(4+1) = 3).
+        let (w, h) = (4, 5);
+        let inp = row_ramp4(w, h);
+        let mut out = vec![0.0f32; 4 * w * h];
+        decompose_vert(&mut out, &inp, h, w, 0);
+        // row 0: 2·0 + 1 + 1 = 2; row 2 (interior): 2·2 + 1 + 3 = 8;
+        // row 4: 2·4 + 3 + 3 = 14 — in every channel.
+        for (r, expected) in [(0usize, 2.0f32), (2, 8.0), (4, 14.0)] {
+            assert!(
+                out[4 * r * w..4 * (r + 1) * w].iter().all(|&v| v == expected),
+                "row {r}: {:?}",
+                &out[4 * r * w..4 * (r + 1) * w]
+            );
+        }
+    }
+
+    #[test]
+    fn decompose_vert_wider_scale_reflection() {
+        // lev 1 → vscale 2 on a 3×6 row ramp: row 0 reads |0−2| = 2
+        // (2·0 + 2 + 2 = 4), row 5 reads 2·5−(5+2) = 3 (2·5 + 3 + 3 = 16).
+        let (w, h) = (3, 6);
+        let inp = row_ramp4(w, h);
+        let mut out = vec![0.0f32; 4 * w * h];
+        decompose_vert(&mut out, &inp, h, w, 1);
+        assert!(out[0..4 * w].iter().all(|&v| v == 4.0), "top: {out:?}");
+        assert!(
+            out[4 * 5 * w..].iter().all(|&v| v == 16.0),
+            "bottom: {out:?}"
+        );
+    }
+
+    #[test]
+    fn decompose_vert_lev_clamping() {
+        // Absurd `lev` must saturate (never panic/shift-overflow) and behave
+        // exactly like the capped scale: height 5 caps vscale at 4, i.e. lev 2.
+        let (w, h) = (4, 5);
+        let inp = fill4(w, h);
+        let mut a = vec![0.0f32; 4 * w * h];
+        let mut b = vec![0.0f32; 4 * w * h];
+        let mut c = vec![0.0f32; 4 * w * h];
+        decompose_vert(&mut a, &inp, h, w, 2);
+        decompose_vert(&mut b, &inp, h, w, 100);
+        decompose_vert(&mut c, &inp, h, w, usize::MAX);
+        assert_bits_eq(&b, &a, "lev 100 vs capped lev 2");
+        assert_bits_eq(&c, &a, "lev MAX vs capped lev 2");
+    }
+
+    #[test]
+    fn decompose_vert_height_one_is_scaled_copy() {
+        // height 1 → vscale 0, so every tap is the row itself: out = 4·in.
+        // (The C would divide by zero in `dwt_interleave_rows(rowid, 1, 0)`;
+        // the kernel's natural order has no such edge.)
+        let (w, h) = (3, 1);
+        let inp = fill4(w, h);
+        let mut out = vec![0.0f32; 4 * w * h];
+        decompose_vert(&mut out, &inp, h, w, 0);
+        for (o, i) in out.iter().zip(inp.iter()) {
+            assert!((o - 4.0 * i).abs() <= 1e-6, "{o} vs 4·{i}");
+        }
+        // …and the reference agrees bit-exactly (it bypasses the interleave
+        // helper for vscale 0 for the same reason).
+        let mut refr = vec![0.0f32; 4 * w * h];
+        decompose_vert_reference(&mut refr, &inp, h, w, 0);
+        assert_bits_eq(&refr, &out, "height-1 reference");
+    }
+
+    #[test]
+    fn decompose_horiz_edges_hat_and_details() {
+        // width 5, lev 0 → hscale 1. Coarse and details start identical; with
+        // hand-computed hats [3.75, 5, 7.5, 10, 11.25] the coarse row must
+        // equal the hats and details must equal input − hat, in all channels.
+        let (w, h) = (5, 1);
+        let pix = [10.0f32, 20.0, 30.0, 40.0, 50.0];
+        let coarse: Vec<f32> = pix.iter().flat_map(|&v| [v; 4]).collect();
+        let mut out = coarse.clone();
+        let mut details = coarse.clone();
+        decompose_horiz(&mut out, &mut details, h, w, 0);
+        let hats = [3.75f32, 5.0, 7.5, 10.0, 11.25];
+        let expected_coarse: Vec<f32> = hats.iter().flat_map(|&v| [v; 4]).collect();
+        let expected_details: Vec<f32> = pix
+            .iter()
+            .zip(hats.iter())
+            .flat_map(|(&c, &e)| [c - e; 4])
+            .collect();
+        assert_close(&out, &expected_coarse, 1e-6, "coarse");
+        assert_close(&details, &expected_details, 1e-6, "details");
+    }
+
+    #[test]
+    fn decompose_horiz_overlap_shares_taps() {
+        // width 3, lev 1 → hscale 2 exceeds width/2, so the edge ranges share
+        // taps. Each column is still visited once (taps re-read from the
+        // unmutated `out`): details = orig − hat there.
+        // coarse [0,16,32], details start [1,2,3]:
+        //   col 0: hat (0+32+32)/16 = 4 → temp 4, details 1−4 = −3
+        //   col 1: hat (32+16+16)/16 = 4 → temp 4, details 2−4 = −2
+        //   col 2: hat (64+0+0)/16 = 4 → temp 4, details 3−4 = −1
+        let (w, h) = (3, 1);
+        let coarse: Vec<f32> = [0.0f32, 16.0, 32.0].iter().flat_map(|&v| [v; 4]).collect();
+        let expected_coarse = vec![4.0f32; 4 * w * h];
+        let expected_details: Vec<f32> = [-3.0f32, -2.0, -1.0].iter().flat_map(|&v| [v; 4]).collect();
+        for use_reference in [false, true] {
+            let mut out = coarse.clone();
+            let mut details: Vec<f32> =
+                [1.0f32, 2.0, 3.0].iter().flat_map(|&v| [v; 4]).collect();
+            if use_reference {
+                decompose_horiz_reference(&mut out, &mut details, h, w, 1);
+            } else {
+                decompose_horiz(&mut out, &mut details, h, w, 1);
+            }
+            assert_eq!(out, expected_coarse, "use_reference={use_reference}");
+            assert_eq!(details, expected_details, "use_reference={use_reference}");
+        }
+    }
+
+    #[test]
+    fn decompose_kernels_agree_with_references_bit_exact() {
+        // Differential agreement over sizes (including short/degenerate ones
+        // where edge regions overlap or scales exceed the dims) and scales.
+        let dims = [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (2, 3),
+            (3, 2),
+            (3, 3),
+            (5, 5),
+            (9, 3),
+            (16, 12),
+        ];
+        for &(w, h) in &dims {
+            for lev in 0..6 {
+                // vertical pass
+                let inp = fill4(w, h);
+                let mut a = vec![0.0f32; 4 * w * h];
+                let mut b = vec![0.0f32; 4 * w * h];
+                decompose_vert(&mut a, &inp, h, w, lev);
+                decompose_vert_reference(&mut b, &inp, h, w, lev);
+                assert_bits_eq(&a, &b, "vert {w}x{h} lev {lev}");
+                assert!(a.iter().all(|v| v.is_finite()));
+                // horizontal pass
+                let coarse = fill4(w, h);
+                let orig = fill4(w, h);
+                let mut o1 = coarse.clone();
+                let mut o2 = coarse.clone();
+                let mut d1 = orig.clone();
+                let mut d2 = orig.clone();
+                decompose_horiz(&mut o1, &mut d1, h, w, lev);
+                decompose_horiz_reference(&mut o2, &mut d2, h, w, lev);
+                assert_bits_eq(&o1, &o2, "horiz coarse {w}x{h} lev {lev}");
+                assert_bits_eq(&d1, &d2, "horiz details {w}x{h} lev {lev}");
+                assert!(o1.iter().all(|v| v.is_finite()));
+                assert!(d1.iter().all(|v| v.is_finite()));
+            }
+        }
+    }
+
+    #[test]
+    fn decompose_vert_interleave_order_equivalent() {
+        // Non-trivial interleave strides (vscale > 1 with height not a multiple
+        // of vscale): the natural-order kernel must equal the
+        // interleave-ordered reference bit-exactly.
+        let (w, h) = (6, 18);
+        let inp = fill4(w, h);
+        for lev in [2, 3] {
+            let vscale = (1usize << lev).min(h - 1);
+            assert!(vscale > 1 && h % vscale != 0, "sanity: stride is non-trivial");
+            let mut a = vec![0.0f32; 4 * w * h];
+            let mut b = vec![0.0f32; 4 * w * h];
+            decompose_vert(&mut a, &inp, h, w, lev);
+            decompose_vert_reference(&mut b, &inp, h, w, lev);
+            assert_bits_eq(&a, &b, "interleave lev {lev}");
+        }
+    }
+
+    #[test]
+    fn decompose_kernels_degenerate_dims_no_panic() {
+        // Zero dims are no-ops; 1-px-wide/tall and over-large scales stay
+        // finite (clamped reflection, never OOB).
+        let mut empty: Vec<f32> = Vec::new();
+        decompose_vert(&mut empty, &[], 0, 0, 0);
+        decompose_vert(&mut empty, &[], 0, 4, 0);
+        decompose_vert(&mut empty, &[], 4, 0, 0);
+        decompose_horiz(&mut [], &mut [], 0, 0, 0);
+        decompose_horiz(&mut [], &mut [], 0, 4, 0);
+        decompose_horiz(&mut [], &mut [], 4, 0, 0);
+        for (w, h) in [(1, 1), (1, 8), (8, 1), (2, 2), (3, 3)] {
+            let inp = fill4(w, h);
+            let mut o = vec![0.0f32; 4 * w * h];
+            decompose_vert(&mut o, &inp, h, w, 7);
+            assert!(o.iter().all(|v| v.is_finite()), "vert {w}x{h}");
+            let mut o2 = inp.clone();
+            let mut d2 = inp.clone();
+            decompose_horiz(&mut o2, &mut d2, h, w, 7);
+            assert!(o2.iter().all(|v| v.is_finite()), "horiz coarse {w}x{h}");
+            assert!(d2.iter().all(|v| v.is_finite()), "horiz details {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn decompose_ffi_matches_safe_kernels() {
+        // The FFI exports must pass height/width/lev through unchanged.
+        let (w, h) = (11, 7);
+        let inp = fill4(w, h);
+        let mut via_safe = vec![0.0f32; 4 * w * h];
+        let mut via_ffi = vec![0.0f32; 4 * w * h];
+        decompose_vert(&mut via_safe, &inp, h, w, 2);
+        unsafe {
+            darkroom_dwt_decompose_vert(via_ffi.as_mut_ptr(), inp.as_ptr(), h, w, 2);
+        }
+        assert_bits_eq(&via_ffi, &via_safe, "vert ffi");
+
+        let coarse = fill4(w, h);
+        let orig = fill4(w, h);
+        let mut o1 = coarse.clone();
+        let mut o2 = coarse.clone();
+        let mut d1 = orig.clone();
+        let mut d2 = orig.clone();
+        decompose_horiz(&mut o1, &mut d1, h, w, 2);
+        unsafe {
+            darkroom_dwt_decompose_horiz(o2.as_mut_ptr(), d2.as_mut_ptr(), h, w, 2);
+        }
+        assert_bits_eq(&o2, &o1, "horiz ffi coarse");
+        assert_bits_eq(&d2, &d1, "horiz ffi details");
+    }
+
+    #[test]
+    fn decompose_ffi_guards_do_not_crash() {
+        // Null pointers and degenerate dimensions are no-ops, never UB.
+        unsafe {
+            darkroom_dwt_decompose_vert(std::ptr::null_mut(), std::ptr::null(), 4, 4, 0);
+            darkroom_dwt_decompose_vert(std::ptr::null_mut(), std::ptr::null(), 0, 0, 0);
+            darkroom_dwt_decompose_horiz(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                4,
+                4,
+                0,
+            );
+            darkroom_dwt_decompose_horiz(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0, 0);
+
+            // Every null-pointer permutation is rejected before any slice exists.
+            let valid_in = vec![1.0f32; 64];
+            let mut valid_out = vec![2.0f32; 64];
+            darkroom_dwt_decompose_vert(std::ptr::null_mut(), valid_in.as_ptr(), 4, 4, 0);
+            darkroom_dwt_decompose_vert(valid_out.as_mut_ptr(), std::ptr::null(), 4, 4, 0);
+            let mut valid_details = vec![4.0f32; 64];
+            darkroom_dwt_decompose_horiz(
+                std::ptr::null_mut(),
+                valid_details.as_mut_ptr(),
+                4,
+                4,
+                0,
+            );
+            darkroom_dwt_decompose_horiz(valid_out.as_mut_ptr(), std::ptr::null_mut(), 4, 4, 0);
+
+            // Partial-zero dimensions are also no-ops when the other pointers
+            // are valid, and must leave those buffers untouched.
+            darkroom_dwt_decompose_vert(valid_out.as_mut_ptr(), valid_in.as_ptr(), 0, 4, 0);
+            darkroom_dwt_decompose_vert(valid_out.as_mut_ptr(), valid_in.as_ptr(), 4, 0, 0);
+            darkroom_dwt_decompose_horiz(
+                valid_out.as_mut_ptr(),
+                valid_details.as_mut_ptr(),
+                0,
+                4,
+                0,
+            );
+            darkroom_dwt_decompose_horiz(
+                valid_out.as_mut_ptr(),
+                valid_details.as_mut_ptr(),
+                4,
+                0,
+                0,
+            );
+            assert!(valid_out.iter().all(|&v| v == 2.0));
+            assert!(valid_details.iter().all(|&v| v == 4.0));
+
+            // Overflowing dimension products are rejected before slices exist;
+            // these pointers are never dereferenced.
+            let dangling = std::ptr::NonNull::<f32>::dangling().as_ptr();
+            darkroom_dwt_decompose_vert(
+                dangling as *mut f32,
+                dangling,
+                usize::MAX,
+                4,
+                0,
+            );
+            darkroom_dwt_decompose_horiz(
+                dangling as *mut f32,
+                dangling as *mut f32,
+                usize::MAX,
+                4,
+                0,
+            );
+        }
+        // Degenerate dimensions on the safe kernels are no-ops too (covered
+        // again here for the FFI-adjacent paths).
+        let mut empty: Vec<f32> = Vec::new();
+        decompose_vert(&mut empty, &[], 0, 0, 0);
+        decompose_horiz(&mut [], &mut [], 0, 0, 0);
     }
 }

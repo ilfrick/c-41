@@ -111,38 +111,21 @@ static void dwt_get_image_layer(float *const layer, dwt_params_t *const p)
 }
 
 // first, "vertical" pass of wavelet decomposition
+// Ported to Rust FFI (m4-184); keep in sync with decompose_vert in
+// crates/c41-core/src/dwt.rs. Rows run in natural order there — the C row
+// interleave was a pure cache optimisation over a read-only input.
 static void dwt_decompose_vert(float *const restrict out, const float *const restrict in,
                                const size_t height, const size_t width, const size_t lev)
 {
-  const size_t vscale = MIN(1 << lev, height-1);
-  DT_OMP_FOR()
-  for(int rowid = 0; rowid < height ; rowid++)
-  {
-    const size_t row = dwt_interleave_rows(rowid,height,vscale);
-    // perform a weighted sum of the current pixel row with the rows 'scale' pixels above and below
-    // if either of those is beyond the edge of the image, we use reflection to get a value for averaging,
-    // i.e. we move as many rows in from the edge as we would have been beyond the edge
-    // for the top edge, this means we can simply use the absolute value of row-vscale; for the bottom edge,
-    //   we need to reflect around height
-    const size_t rowstart = (size_t)4 * row * width;
-    const size_t above_row = (row > vscale) ? row - vscale : vscale - row;
-    const size_t below_row = (row + vscale < height) ? (row + vscale) : 2*(height-1) - (row + vscale);
-    const float* const restrict center = in + rowstart;
-    const float* const restrict above = in + 4 * above_row * width;
-    const float* const restrict below = in + 4 * below_row * width;
-    float* const restrict temprow = out + rowstart;
-    for(size_t col = 0; col < 4*width; col += 4)
-    {
-      for_each_channel(c,aligned(center, above, below, temprow : 16))
-      {
-        temprow[col + c] = 2.f * center[col+c] + above[col+c] + below[col+c];
-      }
-    }
-  }
+  darkroom_dwt_decompose_vert(out, in, height, width, lev);
 }
 
 // second, horizontal pass of wavelet decomposition; generates 'coarse' into the output buffer and overwrites
 //   the input buffer with 'details'
+// Ported to Rust FFI (m4-184); keep in sync with decompose_horiz in
+// crates/c41-core/src/dwt.rs. The Rust kernel carries its own row scratch;
+// `temp`/`padded_size` are retained for signature stability (the allocation in
+// dwt_wavelet_decompose is untouched) but no longer consumed here.
 static void dwt_decompose_horiz(
     float *const restrict out,
     float *const restrict in,
@@ -152,55 +135,9 @@ static void dwt_decompose_horiz(
     const size_t width,
     const size_t lev)
 {
-  const int hscale = MIN(1 << lev, width);  //(int because we need a signed difference below)
-  DT_OMP_FOR()
-  for(int row = 0; row < height ; row++)
-  {
-    // perform a weighted sum of the current pixel with the ones 'scale' pixels to the left and right, using
-    // reflection to get a value if either of those positions is out of bounds, i.e. we move as many columns
-    // in from the edge as we would have been beyond the edge to avoid an additional pass, we also rescale the
-    // final sum and split the original input into 'coarse' and 'details' by subtracting the scaled sum from
-    // the original input.
-    const size_t rowindex = (size_t)4 * (row * width);
-    float* const restrict temprow = dt_get_perthread(temp,padded_size);
-    float* const restrict details = in + rowindex;
-    float* const restrict coarse = out + rowindex;
-
-    for(int col = 0; col < width - hscale; col++)
-    {
-      const size_t leftpos = (size_t)4*abs(col-hscale);	// the abs() handles reflection at the left edge
-      const size_t rightpos = (size_t)4*(col+hscale);
-      for_each_channel(c,aligned(temprow, details, coarse : 16))
-      {
-        const float left = coarse[leftpos+c];
-        const float right = coarse[rightpos+c];
-        // add up left/center/right, and renormalize by dividing by the total weight of all numbers added together
-        const float hat = (2.f * coarse[4*col+c] + left + right) / 16.f;
-        // the normalized value is our 'coarse' result; 'details' is the difference between original input and 'coarse'
-        temprow[4*col+c] = hat;
-        details[4*col+c] -= hat;
-      }
-    }
-    // handle reflection at right edge
-    for(int col = width - hscale; col < width; col++)
-    {
-      const size_t leftpos = (size_t)4 * abs(col-hscale); // still need to handle reflection, if hscale>=width/2
-      const size_t rightpos = (size_t)4 * (2*width - 2 - (col+hscale));
-      for_each_channel(c,aligned(temprow, details, coarse : 16))
-      {
-        const float left = coarse[leftpos+c];
-        const float right = coarse[rightpos+c];
-        // add up left/center/right, and renormalize by dividing by the total weight of all numbers added together
-        const float hat = (2.f * coarse[4*col+c] + left + right) / 16.f;
-        // the normalized value is our 'coarse' result; 'details' is the difference between original input and 'coarse'
-        temprow[4*col+c] = hat;
-        details[4*col+c] -= hat;
-      }
-    }
-    // now that we're done with the row of pixels, we can overwrite the intermediate result from the
-    // first pass with the final decomposition
-    memcpy(coarse, temprow, sizeof(float) * 4 * width);
-  }
+  (void)temp;
+  (void)padded_size;
+  darkroom_dwt_decompose_horiz(out, in, height, width, lev);
 }
 
 // split input into 'coarse' and 'details'; put 'details' back into the input buffer
