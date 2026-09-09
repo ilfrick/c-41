@@ -4439,3 +4439,25 @@ huge-image guard limitation unchanged as documented.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-09 14:59 UTC — m4-184: port DWT decompose passes to Rust FFI
+
+**Commit** `1141d4fac3` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `dwt_decompose_vert` and `dwt_decompose_horiz`
+(`src/common/dwt.c`), replacing their data-parallel loops with
+`darkroom_dwt_decompose_vert` and `darkroom_dwt_decompose_horiz`. Extended
+`c41-core::dwt` with safe kernels, divergent references, validated FFI, and focused
+tests; declared both exports in `src/rust_ffi/darkroom_core.h`. Left
+`dwt_wavelet_decompose` orchestration/allocation, denoise passes, OpenCL, and all
+unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0. Corrected
+the misleading overlap/double-filter wording to shared taps with single column visits
+across kernel, reference, FFI, header, and test documentation.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
