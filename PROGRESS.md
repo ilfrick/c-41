@@ -4354,3 +4354,25 @@ change.
 - The Rust passes are serial where the old row loops were OpenMP-parallel; row writes
   are disjoint, so the port is semantically equivalent.
 
+---
+
+## 2026-09-09 00:16 UTC — m4-180: port bilateral slice-to-output loop to Rust FFI
+
+**Commit** `19703505da` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `dt_bilateral_slice_to_output` (`src/common/bilateral.c`),
+replacing its per-pixel loop with `darkroom_bilateral_slice_to_output`. Extended
+`c41-core::bilateral` with a safe kernel, divergent reference, validated flat-parameter
+FFI, and focused tests; declared the export in `src/rust_ffi/darkroom_core.h`. Left
+bilateral splat/merge reductions, recursive blur-line passes, grid ABI, orchestration,
+and all unrelated files untouched. Added a null-`b` guard on the C wrapper alongside
+the existing null-buffer check.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0/P1. Applied
+the requested documentation-only corrections and expanded guard/alias-channel test
+coverage.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
