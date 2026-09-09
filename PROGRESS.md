@@ -4398,3 +4398,24 @@ overflow-guard tests.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-09 07:52 UTC — m4-182: port EAW synthesize loop to Rust FFI
+
+**Commit** `be16933329` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `eaw_synthesize` (`src/common/eaw.c`), replacing its soft-threshold
+accumulate loop with `darkroom_eaw_synthesize`, a thin export reusing the existing
+`c41-core::eaw::synthesize` kernel. Declared the export in `src/rust_ffi/darkroom_core.h`.
+Preserved the C signature/function-pointer compatibility and left decompose helpers,
+OpenCL, and all unrelated files untouched. The original toneequal m4-182 target was
+verified to be compiled-out dead reference code, so no port was performed there.
+
+**Review.** Independent senior-reviewer agent: **HOLD** on one blocking test assertion,
+otherwise sound. Fixed the length-mismatch assertion and the stale `eaw.c` line-number
+documentation before gating.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
