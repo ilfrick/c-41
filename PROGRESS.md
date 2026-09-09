@@ -4507,3 +4507,23 @@ whitespace churn, and added an independent `vector_exp_lane` bit-oracle test.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-09 21:28 UTC — m4-187: port profile tone-curve loops to Rust FFI
+
+**Commit** `3e7aad67b3` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `_apply_tonecurves` (`src/common/iop_profile.c`), replacing both
+tone-curve loop bodies with `darkroom_apply_tonecurves`. Added top-level
+`c41-core::iop_profile` with a safe kernel, divergent reference, validated FFI, and
+focused tests; declared the export in `src/rust_ffi/darkroom_core.h`. Left LCMS paths,
+matrix transforms, orchestration, and all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0. Fixed the
+header aliasing-contract wording, reverted whitespace churn, and added the requested
+`lutsize` boundary guard cases.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
