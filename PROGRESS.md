@@ -4376,3 +4376,25 @@ coverage.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-09 06:05 UTC — m4-181: port colorin clipping variants to Rust FFI
+
+**Commit** `7b6554e4b8` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `_cmatrix_fastpath_clipping`, `_cmatrix_proper_simple`, and
+`_cmatrix_proper_clipping` (`src/iop/colorin.c`), replacing their tone-LUT/matrix/clip
+loops with validated FFI exports. Extended `c41-core::colorin` with a shared tone-curve
+helper, safe kernels, references, and focused tests; declared the exports in
+`src/rust_ffi/darkroom_core.h`. Left LCMS paths, OpenCL, blue mapping, orchestration,
+and all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0. Fixed the
+NaN-clip divergence with `max`/`min` instead of `clamp`, reverted wrapper-signature
+whitespace, corrected matrix-pair documentation, and added boundary/mixed-sentinel plus
+overflow-guard tests.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
