@@ -20,7 +20,7 @@
 #include "common/math.h"
 #include "control/control.h"     // needed by dwt.h
 #include "common/dwt.h"          // for dwt_interleave_rows
-#include "rust_ffi/darkroom_core.h" // for darkroom_eaw_synthesize
+#include "rust_ffi/darkroom_core.h" // for darkroom_eaw_synthesize/_dn_decompose
 
 static inline void weight(const dt_aligned_pixel_t c1,
                               const dt_aligned_pixel_t c2,
@@ -221,7 +221,7 @@ void eaw_synthesize(float *const out, const float *const in, const float *const 
 // begin wavelet code from denoiseprofile.c
 // =====================================================================================
 
-static inline float dn_weight(const float *c1, const float *c2, const float inv_sigma2)
+static inline float __attribute__((unused)) dn_weight(const float *c1, const float *c2, const float inv_sigma2)
 {
   // 3d distance based on color
   dt_aligned_pixel_t sqr;
@@ -270,94 +270,17 @@ void eaw_dn_decompose(float *const restrict out, const float *const restrict in,
                       dt_aligned_pixel_t sum_squared, const int scale, const float inv_sigma2,
                       const int32_t width, const int32_t height)
 {
-  const int mult = 1u << scale;
-  static const float filter[25] =
-    {
-      1.0f / 256.0f,  4.0f / 256.0f,  6.0f / 256.0f,  4.0f / 256.0f, 1.0f / 256.0f,
-      4.0f / 256.0f, 16.0f / 256.0f, 24.0f / 256.0f, 16.0f / 256.0f, 4.0f / 256.0f,
-      6.0f / 256.0f, 24.0f / 256.0f, 36.0f / 256.0f, 24.0f / 256.0f, 6.0f / 256.0f,
-      4.0f / 256.0f, 16.0f / 256.0f, 24.0f / 256.0f, 16.0f / 256.0f, 4.0f / 256.0f,
-      1.0f / 256.0f,  4.0f / 256.0f,  6.0f / 256.0f,  4.0f / 256.0f, 1.0f / 256.0f
-    };
-  const int boundary = 2 * mult;
-
-  dt_aligned_pixel_t sum_sq = { 0.0f, 0.0f, 0.0f, 0.0f };
-
-#if !(defined(__apple_build_version__) && __apple_build_version__ < 11030000) //makes Xcode 11.3.1 compiler crash
-  DT_OMP_FOR(reduction(+: sum_sq[0:4]))
-#endif
-  for(int rowid = 0; rowid < height; rowid++)
-  {
-    const size_t j = dwt_interleave_rows(rowid, height, mult);
-    const float *px = ((float *)in) + (size_t)4 * j * width;
-    const float *px2;
-    float *pdetail = detail + (size_t)4 * j * width;
-    float *pcoarse = out + (size_t)4 * j * width;
-
-    // for the first and last 'boundary' rows, we have to perform boundary tests for the entire row;
-    //   for the central bulk, we only need to use those slower versions on the leftmost and rightmost pixels
-    const int lbound = (j < boundary || j >= height - boundary) ? width-boundary : boundary;
-
-    /* The first "2*mult" pixels need a boundary check because we might try to access past the left edge,
-     * which requires nearest pixel interpolation */
-    int i;
-    for(i = 0; i < lbound; i++)
-    {
-      SUM_PIXEL_PROLOGUE;
-      for(int jj = 0; jj < 5; jj++)
-      {
-        const int y = j + mult * (jj-2);
-        const int clamp_y = CLAMP(y,0,height-1);
-        for(int ii = 0; ii < 5; ii++)
-        {
-          int x = i + mult * ((ii)-2);
-          if(x < 0) x = 0;			// we might be looking past the left edge
-          px2 = ((float *)in) + 4 * x + (size_t)4 * clamp_y * width;
-          SUM_PIXEL_CONTRIBUTION;
-        }
-      }
-      SUM_PIXEL_EPILOGUE;
-    }
-
-    /* For pixels [2*mult, width-2*mult], we don't need to do any boundary checks */
-    for( ; i < width - boundary; i++)
-    {
-      SUM_PIXEL_PROLOGUE;
-      px2 = ((float *)in) + (size_t)4 * (i - 2 * mult + (size_t)(j - 2 * mult) * width);
-      for(int jj = 0; jj < 5; jj++)
-      {
-        for(int ii = 0; ii < 5; ii++)
-        {
-          SUM_PIXEL_CONTRIBUTION;
-          px2 += (size_t)4 * mult;
-        }
-        px2 += (size_t)4 * (width - 5) * mult;
-      }
-      SUM_PIXEL_EPILOGUE;
-    }
-
-    /* Last 2*mult pixels in the row require the boundary check again */
-    for( ; i < width; i++)
-    {
-      SUM_PIXEL_PROLOGUE;
-      for(int jj = 0; jj < 5; jj++)
-      {
-        const int y = j + mult * (jj-2);
-        const int clamp_y = CLAMP(y,0,height-1);
-        for(int ii = 0; ii < 5; ii++)
-        {
-          const int x = i + mult * ((ii)-2);
-          // ensure that we don't look past either edge (left edge is possible at higher scales on small images)
-          const int clamp_x = CLAMP(x, 0, width-1);
-          px2 = ((float *)in) + 4 * clamp_x + (size_t)4 * clamp_y * width;
-          SUM_PIXEL_CONTRIBUTION;
-        }
-      }
-      SUM_PIXEL_EPILOGUE;
-    }
-  }
-  for_each_channel(c)
-    sum_squared[c] = sum_sq[c];
+  // Live data-parallel loop ported to Rust (m4-185): the à-trous B-spline
+  // smooth with edge-avoiding dn_weight taps plus the sum-of-squared-details
+  // statistic now runs in darkroom_eaw_dn_decompose, which reuses the safe
+  // dn_decompose kernel (no duplication; in-range pixels match, sum_sq order
+  // and degenerate narrow-image clamping follow the kernel's documented
+  // semantics). Signature unchanged for eaw_dn_decompose_t compatibility
+  // (denoiseprofile passes this through process_wavelets). Decompose-and-
+  // synthesize helpers, OpenCL code, and everything else above/below are
+  // untouched.
+  darkroom_eaw_dn_decompose(out, in, detail, sum_squared, scale, inv_sigma2, width, height);
+  dt_omploop_sfence();
 }
 
 #undef SUM_PIXEL_CONTRIBUTION

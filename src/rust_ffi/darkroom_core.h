@@ -3724,6 +3724,31 @@ void darkroom_eaw_synthesize(float *out_buf,
                              int width,
                              int height);
 
+/*
+ * Edge-avoiding wavelets denoise decompose (src/common/eaw.c, m4-185).
+ *
+ * darkroom_eaw_dn_decompose replaces the loop body of eaw_dn_decompose():
+ *   B-spline smooth of `in_buf` at stride 2^scale into `out_buf` (coarse),
+ *   detail = in - coarse into `detail`, plus the per-channel sum of squared
+ *   details written back through `sum_squared` (4 floats, the BayesShrink
+ *   threshold input). Reuses the safe dn_decompose kernel -- no duplication;
+ *   in-range pixels match, while `sum_sq` follows natural row order and
+ *   degenerate narrow images use unified clamping per that kernel's docs.
+ *   Buffers hold width*height packed-RGBA floats each and must
+ *   be distinct (the kernel reads `in_buf` while writing the other two).
+ *   Null pointers, non-positive dims, out-of-range scale (`0 <= scale < 32`,
+ *   the C's `1u << scale` domain), and overflowing dim products are guarded
+ *   no-ops.
+ */
+void darkroom_eaw_dn_decompose(float *out_buf,
+                               const float *in_buf,
+                               float *detail,
+                               float *sum_squared,
+                               int scale,
+                               float inv_sigma2,
+                               int width,
+                               int height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
