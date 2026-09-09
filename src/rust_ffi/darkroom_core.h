@@ -3749,6 +3749,37 @@ void darkroom_eaw_dn_decompose(float *out_buf,
                                int width,
                                int height);
 
+/*
+ * Edge-avoiding wavelets decompose-and-synthesize (src/common/eaw.c, m4-186).
+ *
+ * darkroom_eaw_decompose_and_synthesize replaces the loop body of
+ * eaw_decompose_and_synthesize() (the atrous equalizer path):
+ *   B-spline smooth of `in_buf` at stride 2^scale into `out_buf` (coarse)
+ *   with `dt_vector_exp`-based vector `weight` taps driven by the sharpen vector
+ *   [-0.5*sharpen, -sharpen, -sharpen, 0], then per-channel soft-threshold
+ *   accumulate of the detail (input - coarse) into `accum`:
+ *   accum[k] += boost[c] * (max(detail-thresh[c],0) + min(detail+thresh[c],0)).
+ * `accum` gathers every scale's detail on top of what it holds (the atrous
+ * caller zeroes it once before the scale loop), so it must be distinct from
+ * `out_buf`/`in_buf`. In-range pixels match; per-pixel `accum` is
+ * order-independent (rows are visited naturally) and degenerate narrow images
+ * clamp instead of the C's row-bleeding left-edge phase. Buffers hold width*height packed-RGBA floats
+ * each; threshold/boost each point to 4 floats (dt_aligned_pixel_t-shaped).
+ * `width`/`height` are `long` to mirror the C's `ssize_t` (identical on
+ * LP64). Null pointers, non-positive dims, out-of-range scale
+ * (`0 <= scale < 31`, the C's signed `1 << scale` domain), and overflowing
+ * dim products are guarded no-ops.
+ */
+void darkroom_eaw_decompose_and_synthesize(float *out_buf,
+                                           const float *in_buf,
+                                           float *accum,
+                                           int scale,
+                                           float sharpen,
+                                           const float *threshold,
+                                           const float *boost,
+                                           long width,
+                                           long height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

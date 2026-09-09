@@ -22,7 +22,7 @@
 #include "common/dwt.h"          // for dwt_interleave_rows
 #include "rust_ffi/darkroom_core.h" // for darkroom_eaw_synthesize/_dn_decompose
 
-static inline void weight(const dt_aligned_pixel_t c1,
+static inline void __attribute__((unused)) weight(const dt_aligned_pixel_t c1,
                               const dt_aligned_pixel_t c2,
                               const dt_aligned_pixel_t sharpen,
                               dt_aligned_pixel_t weight)
@@ -47,7 +47,7 @@ static inline void weight(const dt_aligned_pixel_t c1,
   dt_vector_exp(sharpened, weight);				// { wl, wc, wc, 1 }
 }
 
-static inline void accumulate(dt_aligned_pixel_t accum,
+static inline void __attribute__((unused)) accumulate(dt_aligned_pixel_t accum,
                               const dt_aligned_pixel_t detail,
                               const dt_aligned_pixel_t thresh,
                               const dt_aligned_pixel_t boostval)
@@ -119,89 +119,17 @@ void eaw_decompose_and_synthesize(float *const restrict out,
                                   const ssize_t width,
                                   const ssize_t height)
 {
-  const int mult = 1 << scale;
-  static const float filter[25] =
-    {
-      1.0f / 256.0f,  4.0f / 256.0f,  6.0f / 256.0f,  4.0f / 256.0f, 1.0f / 256.0f,
-      4.0f / 256.0f, 16.0f / 256.0f, 24.0f / 256.0f, 16.0f / 256.0f, 4.0f / 256.0f,
-      6.0f / 256.0f, 24.0f / 256.0f, 36.0f / 256.0f, 24.0f / 256.0f, 6.0f / 256.0f,
-      4.0f / 256.0f, 16.0f / 256.0f, 24.0f / 256.0f, 16.0f / 256.0f, 4.0f / 256.0f,
-      1.0f / 256.0f,  4.0f / 256.0f,  6.0f / 256.0f,  4.0f / 256.0f, 1.0f / 256.0f
-    };
-  const int boundary = 2 * mult;
-  const dt_aligned_pixel_t vsharpen = { -0.5f * sharpen, -sharpen, -sharpen, 0.0f };
-
-  DT_OMP_FOR()
-  for(size_t rowid = 0; rowid < height; rowid++)
-  {
-    const size_t j = dwt_interleave_rows(rowid, height, mult);
-    const float *px = ((float *)in) + (size_t)4 * j * width;
-    const float *px2;
-    float *pdetail = accum + (size_t)4 * j * width;
-    float *pcoarse = out + (size_t)4 * j * width;
-
-    // for the first and last 'boundary' rows, we have to perform boundary tests for the entire row;
-    //   for the central bulk, we only need to use those slower versions on the leftmost and rightmost pixels
-    const size_t lbound = (j < boundary || j >= height - boundary) ? width-boundary : boundary;
-
-    /* The first "2*mult" pixels need a boundary check because we might try to access past the left edge,
-     * which requires nearest pixel interpolation */
-    size_t i;
-    for(i = 0; i < lbound; i++)
-    {
-      SUM_PIXEL_PROLOGUE;
-      for(ssize_t jj = 0; jj < 5; jj++)
-      {
-        const ssize_t y = j + mult * (jj-2);
-        const ssize_t clamp_y = CLAMP(y,0,height-1);
-        for(ssize_t ii = 0; ii < 5; ii++)
-        {
-          ssize_t x = i + mult * ((ii)-2);
-          if(x < 0) x = 0;			// we might be looking past the left edge
-          px2 = ((float *)in) + 4 * x + (size_t)4 * clamp_y * width;
-          SUM_PIXEL_CONTRIBUTION;
-        }
-      }
-      SUM_PIXEL_EPILOGUE;
-    }
-
-    /* For pixels [2*mult, width-2*mult], we don't need to do any boundary checks */
-    for( ; i < width - boundary; i++)
-    {
-      SUM_PIXEL_PROLOGUE;
-      px2 = ((float *)in) + (size_t)4 * (i - 2 * mult + (size_t)(j - 2 * mult) * width);
-      for(ssize_t jj = 0; jj < 5; jj++)
-      {
-        for(ssize_t ii = 0; ii < 5; ii++)
-        {
-          SUM_PIXEL_CONTRIBUTION;
-          px2 += (size_t)4 * mult;
-        }
-        px2 += (size_t)4 * (width - 5) * mult;
-      }
-      SUM_PIXEL_EPILOGUE;
-    }
-
-    /* Last 2*mult pixels in the row require the boundary check again */
-    for( ; i < width; i++)
-    {
-      SUM_PIXEL_PROLOGUE;
-      for(ssize_t jj = 0; jj < 5; jj++)
-      {
-        const ssize_t y = j + mult * (jj-2);
-        const ssize_t clamp_y = CLAMP(y,0,height-1);
-        for(ssize_t ii = 0; ii < 5; ii++)
-        {
-          const ssize_t x = i + mult * ((ii)-2);
-          // ensure that we don't look past either edge (left edge is possible at higher scales on small images)
-          const ssize_t clamp_x = CLAMP(x, 0, width - 1);
-          px2 = ((float *)in) + 4 * clamp_x + (size_t)4 * clamp_y * width;
-          SUM_PIXEL_CONTRIBUTION;
-        }
-      }
-      SUM_PIXEL_EPILOGUE;
-    }
-  }
+  // Live data-parallel loop ported to Rust (m4-186): the edge-avoiding 5x5
+  // B-spline smooth (expf-based `weight` vector taps, sharpen vector) plus
+  // the per-channel threshold/boost `accumulate` now runs in
+  // darkroom_eaw_decompose_and_synthesize, which reuses the safe
+  // decompose_and_synthesize kernel (natural row order and unified clamping
+  // instead of the C's dwt_interleave_rows order and 3-phase split; in-range
+  // pixels match, degenerate narrow images clamp instead of the C's
+  // row-bleeding left-edge phase). Signature unchanged for the atrous caller.
+  // OpenCL code and everything else above/below are untouched.
+  darkroom_eaw_decompose_and_synthesize(out, in, accum, scale, sharpen, threshold, boost, width, height);
+  dt_omploop_sfence();
 }
 
 void eaw_synthesize(float *const out, const float *const in, const float *const restrict detail,
