@@ -4527,3 +4527,24 @@ header aliasing-contract wording, reverted whitespace churn, and added the reque
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-10 01:53 UTC — m4-188: port profile RGB-Lab matrix loops to Rust FFI
+
+**Commit** `8fc85e3b65` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `_transform_rgb_to_lab_matrix` and `_transform_lab_to_rgb_matrix`
+(`src/common/iop_profile.c`), replacing their three matrix/XYZ-Lab loops with
+`darkroom_iop_profile_rgb_to_lab_matrix` and `darkroom_iop_profile_lab_to_rgb_matrix`.
+Extended `c41-core::iop_profile` with safe kernels, divergent references, validated FFI,
+and focused tests; declared both exports in `src/rust_ffi/darkroom_core.h`. Left LCMS
+paths, `_transform_matrix_rgb`, orchestration, and all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0/P1. Fixed the
+header aliasing-contract wording, dropped stale C line references, and simplified the
+FFI helper return.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
