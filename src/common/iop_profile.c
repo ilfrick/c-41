@@ -407,8 +407,6 @@ static inline void _transform_rgb_to_lab_matrix
    const int height,
    const dt_iop_order_iccprofile_info_t *const profile_info)
 {
-  const int ch = 4;
-  const size_t stride = (size_t)width * height * ch;
   const dt_colormatrix_t *matrix_ptr = &profile_info->matrix_in_transposed;
 
   if(profile_info->nonlinearlut)
@@ -423,27 +421,18 @@ static inline void _transform_rgb_to_lab_matrix
                       profile_info->unbounded_coeffs_in[2],
                       profile_info->lutsize);
 
-    DT_OMP_FOR()
-    for(size_t y = 0; y < stride; y += ch)
-    {
-      float *const restrict in = DT_IS_ALIGNED_PIXEL(image_out + y);
-      dt_aligned_pixel_t xyz; // inited in _ioppr_linear_rgb_matrix_to_xyz()
-      dt_apply_transposed_color_matrix(in, *matrix_ptr, xyz);
-      dt_XYZ_to_Lab(xyz, in);
-    }
+    // Rust port (m4-188): in-place matrix + XYZ->Lab over image_out.
+    // The FFI export dispatches on pointer equality to its inplace kernel.
+    darkroom_iop_profile_rgb_to_lab_matrix(image_out, image_out,
+                                           (size_t)width, (size_t)height,
+                                           &(*matrix_ptr)[0][0]);
   }
   else
   {
-    DT_OMP_FOR()
-    for(size_t y = 0; y < stride; y += ch)
-    {
-      const float *const restrict in = DT_IS_ALIGNED_PIXEL(image_in + y);
-      float *const restrict out = DT_IS_ALIGNED_PIXEL(image_out + y);
-
-      dt_aligned_pixel_t xyz; // inited in _ioppr_linear_rgb_matrix_to_xyz()
-      dt_apply_transposed_color_matrix(in, *matrix_ptr, xyz);
-      dt_XYZ_to_Lab(xyz, out);
-    }
+    // Rust port (m4-188): split matrix + XYZ->Lab.
+    darkroom_iop_profile_rgb_to_lab_matrix(image_in, image_out,
+                                           (size_t)width, (size_t)height,
+                                           &(*matrix_ptr)[0][0]);
   }
 }
 
@@ -455,23 +444,13 @@ static inline void _transform_lab_to_rgb_matrix
    const int height,
    const dt_iop_order_iccprofile_info_t *const profile_info)
 {
-  const int ch = 4;
-  const size_t stride = (size_t)width * height * ch;
   const dt_colormatrix_t *matrix_ptr = &profile_info->matrix_out_transposed;
 
-  DT_OMP_FOR()
-  for(size_t y = 0; y < stride; y += ch)
-  {
-    const float *const restrict in = DT_IS_ALIGNED_PIXEL(image_in + y);
-    float *const restrict out = DT_IS_ALIGNED_PIXEL(image_out + y);
-
-    dt_aligned_pixel_t xyz;
-    const float alpha = in[3];
-    // some code does in-place conversions and relies on alpha being preserved
-    dt_Lab_to_XYZ(in, xyz);
-    dt_apply_transposed_color_matrix(xyz, *matrix_ptr, out);
-    out[3] = alpha;
-  }
+  // Rust port (m4-188): Lab->XYZ + matrix with alpha preservation.
+  // The FFI export also serves in-place callers (image_in == image_out).
+  darkroom_iop_profile_lab_to_rgb_matrix(image_in, image_out,
+                                         (size_t)width, (size_t)height,
+                                         &(*matrix_ptr)[0][0]);
 
   if(profile_info->nonlinearlut)
   {

@@ -3811,6 +3811,40 @@ void darkroom_apply_tonecurves(const float *image_in,
                                const float *unbounded_coeffsb,
                                size_t lutsize);
 
+/*
+ * Input-profile RGB<->Lab matrix transforms, non-LCMS path
+ * (src/common/iop_profile.c, _transform_rgb_to_lab_matrix /
+ * _transform_lab_to_rgb_matrix, m4-188).
+ *
+ * Each replaces one DT_OMP_FOR loop body; the C wrappers keep their
+ * tone-curve orchestration (_apply_tonecurves before the RGB->Lab loops when
+ * nonlinearlut, after the Lab->RGB loop when nonlinearlut) and profile-matrix
+ * selection, and call these from each live branch.
+ * darkroom_iop_profile_rgb_to_lab_matrix covers both RGB->Lab loops: the
+ * nonlinear branch calls it in place (image_in == image_out, tone curves
+ * already ran into image_out), the linear branch split. Output alpha is
+ * forced to 0.0, matching dt_XYZ_to_Lab (4-channel vector build).
+ * darkroom_iop_profile_lab_to_rgb_matrix covers the Lab->RGB loop (split,
+ * but in-place safe: input alpha is preserved into the output, which some
+ * callers rely on).
+ * matrix: 16 floats, the profile's matrix_in_transposed /
+ * matrix_out_transposed exactly as stored (already transposed; applied
+ * without further transposition: out[r] = m[0][r]*in[0] + ... for r in 0..3).
+ * May be called in place (image_in == image_out); otherwise the buffers must
+ * not overlap. Null pointers, zero dims, dims above INT_MAX and overflowing
+ * dim products are guarded no-ops.
+ */
+void darkroom_iop_profile_rgb_to_lab_matrix(const float *image_in,
+                                            float *image_out,
+                                            size_t width,
+                                            size_t height,
+                                            const float *matrix);
+void darkroom_iop_profile_lab_to_rgb_matrix(const float *image_in,
+                                            float *image_out,
+                                            size_t width,
+                                            size_t height,
+                                            const float *matrix);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

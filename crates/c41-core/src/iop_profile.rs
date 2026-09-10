@@ -47,7 +47,9 @@
 //! `image_out, image_out`) is served by [`apply_tonecurves_inplace`]; the
 //! FFI export dispatches on pointer equality.
 
-use crate::color::{eval_exp, extrapolate_lut};
+use crate::color::{
+    apply_transposed_color_matrix, eval_exp, extrapolate_lut, lab_to_xyz, xyz_to_lab,
+};
 
 /// Map one channel value through its tone curve.
 ///
@@ -274,7 +276,445 @@ fn ref_apply_tonecurves(
     }
 }
 
-// ── FFI export ───────────────────────────────────────────────────────────────
+// ── RGB↔Lab matrix transforms (m4-188) ─────────────────────────────────────────
+//
+// Ports of `_transform_rgb_to_lab_matrix` (iop_profile.c:403-448) and
+// `_transform_lab_to_rgb_matrix` (iop_profile.c:451-488): the non-LCMS
+// matrix paths. Each pixel is mapped RGB→XYZ via the profile's pre-transposed
+// `matrix_in_transposed` (resp. Lab→XYZ then `matrix_out_transposed`→RGB)
+// with the shared D50 [`xyz_to_lab`]/[`lab_to_xyz`] conversions.
+//
+// The C wrappers keep their tone-curve orchestration (`_apply_tonecurves`
+// before the RGB→Lab loops when `nonlinearlut`, after the Lab→RGB loop when
+// `nonlinearlut`); only the three `DT_OMP_FOR` loop bodies move here:
+//   - RGB→Lab nonlinear branch: in-place over `image_out` (tone curves
+//     already ran `image_in`→`image_out`), served by
+//     [`rgb_to_lab_matrix_inplace`];
+//   - RGB→Lab linear branch: split `image_in`→`image_out`, [`rgb_to_lab_matrix`];
+//   - Lab→RGB: split `image_in`→`image_out` with alpha preservation,
+//     [`lab_to_rgb_matrix`] (alias-tolerant via [`lab_to_rgb_matrix_inplace`]
+//     — the C comment notes callers rely on in-place conversion).
+//
+// Semantic edge cases (all pinned by tests):
+// - RGB→Lab output alpha is forced to **0.0**: `dt_XYZ_to_Lab` writes
+//   `Lab[3] = 0*(f[3]-0)-0` under the normal 4-channel vector build (only
+//   under the rare `DT_NO_VECTORIZATION` build would it loop 3 channels and
+//   leave alpha untouched — not a target). The shared [`xyz_to_lab`] instead
+//   preserves `xyz[3]`, so the kernels overwrite lane 3 with 0.0 after the
+//   call. `Lab[0..2]` never depend on `xyz[3]` (only `xyz[0..2]` feed `f`).
+// - Lab→RGB output alpha is the **input** alpha (`in[3]` read before the
+//   write; `dt_Lab_to_XYZ` zeroes `XYZ[3]` and the matrix write to `out[3]`
+//   is then overwritten with the saved alpha). The shared [`lab_to_xyz`]
+//   carries `lab[3]` into `xyz[3]`, but that lane is never read by
+//   [`apply_transposed_color_matrix`] (only `in[0..2]`), so reusing the
+//   helper is bit-exact here.
+// - Matrix order is the transposed convention
+//   (`out[r] = m[0][r]*in[0] + m[1][r]*in[1] + m[2][r]*in[2]`, `r` over all
+//   4 lanes); the profile hands over its already-transposed matrices and the
+//   kernels must NOT transpose again.
+//
+// Degenerate/short buffers: zero `width`/`height`, dimension arithmetic
+// overflow, image buffers shorter than `4*width*height` floats, or a matrix
+// shorter than 16 floats is a no-op — no panic, no out-of-bounds access.
+// Well-formed callers forward the profile's own 16-float matrices over
+// exactly `4*width*height` floats and never hit this path.
+//
+// Aliasing: the split kernels require non-overlapping buffers. In-place
+// traffic is served by [`rgb_to_lab_matrix_inplace`]/
+// [`lab_to_rgb_matrix_inplace`]; the FFI exports dispatch on pointer
+// equality. Partial overlap is unsupported (stricter than C).
+
+/// Validate dimensions and buffer lengths for the matrix kernels.
+///
+/// Returns the pixel count (`width * height`) on success. Fails on zero
+/// dimensions, dimension arithmetic overflow, image buffers shorter than
+/// `4*width*height` floats, or a matrix shorter than 16 floats
+/// (`dt_colormatrix_t`).
+fn checked_matrix_len(
+    image_in_len: usize,
+    image_out_len: usize,
+    matrix_len: usize,
+    width: usize,
+    height: usize,
+) -> Option<usize> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let npixels = width.checked_mul(height)?;
+    let pix_len = npixels.checked_mul(4)?;
+    if image_in_len < pix_len || image_out_len < pix_len {
+        return None;
+    }
+    if matrix_len < 16 {
+        return None;
+    }
+    Some(npixels)
+}
+
+/// Reinterpret a 16-float `dt_colormatrix_t` slice as `[[f32; 4]; 4]`.
+///
+/// The caller guarantees `matrix.len() >= 16` (checked by
+/// [`checked_matrix_len`]); row-major layout matches the C type exactly, and
+/// `[[f32; 4]; 4]` has the same alignment as `f32`, so the cast is sound.
+#[inline(always)]
+fn as_colormatrix(matrix: &[f32]) -> &[[f32; 4]; 4] {
+    // SAFETY: `matrix` holds at least 16 contiguous `f32`s with alignment 4,
+    // which satisfies `[[f32; 4]; 4]` (size 64, alignment 4).
+    unsafe { &*(matrix.as_ptr() as *const [[f32; 4]; 4]) }
+}
+
+/// RGB→Lab via the profile matrix, split buffers.
+///
+/// Port of the linear `DT_OMP_FOR` loop in `_transform_rgb_to_lab_matrix`:
+/// `xyz = matrix_in_transposed * rgb; lab = XYZ_to_Lab(xyz)` with output
+/// alpha forced to 0.0 (see above). `matrix` is the 16-float transposed
+/// profile matrix. Buffers must not overlap; degenerate/short inputs are a
+/// no-op.
+pub fn rgb_to_lab_matrix(
+    image_in: &[f32],
+    image_out: &mut [f32],
+    matrix: &[f32],
+    width: usize,
+    height: usize,
+) {
+    let Some(npixels) =
+        checked_matrix_len(image_in.len(), image_out.len(), matrix.len(), width, height)
+    else {
+        return;
+    };
+    let m = as_colormatrix(matrix);
+    for px in 0..npixels {
+        let b = px * 4;
+        let inp = [
+            image_in[b],
+            image_in[b + 1],
+            image_in[b + 2],
+            image_in[b + 3],
+        ];
+        let xyz = apply_transposed_color_matrix(&inp, m);
+        let lab = xyz_to_lab(xyz);
+        image_out[b] = lab[0];
+        image_out[b + 1] = lab[1];
+        image_out[b + 2] = lab[2];
+        // dt_XYZ_to_Lab zeroes the fourth lane (4-channel vector build);
+        // xyz_to_lab preserves xyz[3] instead, so force it here.
+        image_out[b + 3] = 0.0;
+    }
+}
+
+/// RGB→Lab via the profile matrix, in place.
+///
+/// Same per-pixel semantics as [`rgb_to_lab_matrix`] on a single buffer (each
+/// lane is read into a local before it is written, so in-place mapping is
+/// exact). Serves the nonlinear branch, whose C loop runs over `image_out`
+/// after the tone curves. Degenerate/short inputs are a no-op.
+pub fn rgb_to_lab_matrix_inplace(
+    image: &mut [f32],
+    matrix: &[f32],
+    width: usize,
+    height: usize,
+) {
+    let Some(npixels) = checked_matrix_len(image.len(), image.len(), matrix.len(), width, height)
+    else {
+        return;
+    };
+    let m = as_colormatrix(matrix);
+    for px in 0..npixels {
+        let b = px * 4;
+        let inp = [image[b], image[b + 1], image[b + 2], image[b + 3]];
+        let xyz = apply_transposed_color_matrix(&inp, m);
+        let lab = xyz_to_lab(xyz);
+        image[b] = lab[0];
+        image[b + 1] = lab[1];
+        image[b + 2] = lab[2];
+        image[b + 3] = 0.0;
+    }
+}
+
+/// Lab→RGB via the profile matrix, split buffers.
+///
+/// Port of the `DT_OMP_FOR` loop in `_transform_lab_to_rgb_matrix`:
+/// `xyz = Lab_to_XYZ(lab); rgb = matrix_out_transposed * xyz` with the input
+/// alpha saved and restored afterwards. `matrix` is the 16-float transposed
+/// profile matrix. Buffers must not overlap; degenerate/short inputs are a
+/// no-op.
+pub fn lab_to_rgb_matrix(
+    image_in: &[f32],
+    image_out: &mut [f32],
+    matrix: &[f32],
+    width: usize,
+    height: usize,
+) {
+    let Some(npixels) =
+        checked_matrix_len(image_in.len(), image_out.len(), matrix.len(), width, height)
+    else {
+        return;
+    };
+    let m = as_colormatrix(matrix);
+    for px in 0..npixels {
+        let b = px * 4;
+        let alpha = image_in[b + 3];
+        let lab = [image_in[b], image_in[b + 1], image_in[b + 2], alpha];
+        // lab[3] never affects xyz[0..2] (dt_Lab_to_XYZ zeroes XYZ[3]
+        // regardless) and xyz[3] is never read by the matrix multiply.
+        let xyz = lab_to_xyz(lab);
+        let rgb = apply_transposed_color_matrix(&xyz, m);
+        image_out[b] = rgb[0];
+        image_out[b + 1] = rgb[1];
+        image_out[b + 2] = rgb[2];
+        image_out[b + 3] = alpha;
+    }
+}
+
+/// Lab→RGB via the profile matrix, in place.
+///
+/// Same per-pixel semantics as [`lab_to_rgb_matrix`] on a single buffer.
+/// Serves callers that convert in place (the C comment: "some code does
+/// in-place conversions and relies on alpha being preserved").
+/// Degenerate/short inputs are a no-op.
+pub fn lab_to_rgb_matrix_inplace(
+    image: &mut [f32],
+    matrix: &[f32],
+    width: usize,
+    height: usize,
+) {
+    let Some(npixels) = checked_matrix_len(image.len(), image.len(), matrix.len(), width, height)
+    else {
+        return;
+    };
+    let m = as_colormatrix(matrix);
+    for px in 0..npixels {
+        let b = px * 4;
+        let alpha = image[b + 3];
+        let lab = [image[b], image[b + 1], image[b + 2], alpha];
+        let xyz = lab_to_xyz(lab);
+        let rgb = apply_transposed_color_matrix(&xyz, m);
+        image[b] = rgb[0];
+        image[b + 1] = rgb[1];
+        image[b + 2] = rgb[2];
+        image[b + 3] = alpha;
+    }
+}
+
+// ── Independent reference implementations for bit-exactness tests ─────────────
+
+// Local copies of the D50 Lab constants for the divergent references below,
+// so they do not call into the shared-helper path. Values mirror
+// `crate::color::{D50, D50_INV, LAB_EPSILON, LAB_KAPPA, LAB_CBRT_EPSILON}`
+// (colorspaces_inline_conversions.h:144-145, dt_XYZ_to_Lab/dt_Lab_to_XYZ).
+#[allow(dead_code)]
+const REF_D50: [f32; 3] = [0.9642, 1.0, 0.8249];
+#[allow(dead_code)]
+const REF_D50_INV: [f32; 3] = [1.0 / 0.9642, 1.0, 1.0 / 0.8249];
+#[allow(dead_code)]
+const REF_LAB_EPSILON: f32 = 216.0 / 24389.0;
+#[allow(dead_code)]
+const REF_LAB_KAPPA: f32 = 24389.0 / 27.0;
+#[allow(dead_code)]
+const REF_LAB_CBRT_EPSILON: f32 = 0.20689655172413796;
+
+/// Structurally divergent reference for [`rgb_to_lab_matrix`]: channel-outer
+/// accumulation (for each output lane, dot the matrix column against the
+/// pixel, then run an inlined XYZ→Lab conversion) where the kernel loops
+/// pixel-outer through the shared helpers. Arithmetic association order is
+/// kept identical so the comparison is bit-exact.
+#[allow(dead_code)]
+fn ref_rgb_to_lab_matrix(
+    image_in: &[f32],
+    image_out: &mut [f32],
+    matrix: &[f32],
+    width: usize,
+    height: usize,
+) {
+    let Some(npixels) =
+        checked_matrix_len(image_in.len(), image_out.len(), matrix.len(), width, height)
+    else {
+        return;
+    };
+    for px in 0..npixels {
+        let b = px * 4;
+        // transposed application, lane by lane: out[r] = m[0][r]*in0 + ...
+        // (row-major flat layout: m[c*4+r]).
+        let mut xyz = [0.0f32; 4];
+        for r in 0..4 {
+            xyz[r] = matrix[r] * image_in[b] + matrix[4 + r] * image_in[b + 1]
+                + matrix[8 + r] * image_in[b + 2];
+        }
+        // inlined dt_XYZ_to_Lab (D50): same ops as xyz_to_lab, written out.
+        let mut f = [0.0f32; 3];
+        for i in 0..3 {
+            let x = xyz[i] * REF_D50_INV[i];
+            f[i] = if x > REF_LAB_EPSILON {
+                x.cbrt()
+            } else {
+                (REF_LAB_KAPPA * x + 16.0) / 116.0
+            };
+        }
+        image_out[b] = 116.0 * f[1] - 16.0;
+        image_out[b + 1] = 500.0 * (f[0] - f[1]);
+        image_out[b + 2] = -200.0 * (f[2] - f[1]);
+        image_out[b + 3] = 0.0;
+    }
+}
+
+/// Structurally divergent reference for [`lab_to_rgb_matrix`]: per-pixel
+/// scalar staging through an inlined Lab→XYZ conversion (explicit fy/fx/fz
+/// temporaries and a direct `lab_f_inv` copy) followed by a lane-by-lane
+/// transposed matrix multiply, where the kernel threads whole `[f32; 4]`
+/// arrays through the shared helpers. Arithmetic association order is kept
+/// identical so the comparison is bit-exact.
+#[allow(dead_code)]
+fn ref_lab_to_rgb_matrix(
+    image_in: &[f32],
+    image_out: &mut [f32],
+    matrix: &[f32],
+    width: usize,
+    height: usize,
+) {
+    let Some(npixels) =
+        checked_matrix_len(image_in.len(), image_out.len(), matrix.len(), width, height)
+    else {
+        return;
+    };
+    for px in 0..npixels {
+        let b = px * 4;
+        let (l, a, bb) = (image_in[b], image_in[b + 1], image_in[b + 2]);
+        let alpha = image_in[b + 3];
+        let fy = (l + 16.0) / 116.0;
+        let fx = a / 500.0 + fy;
+        let fz = fy - bb / 200.0;
+        let xyz = [
+            REF_D50[0] * ref_lab_f_inv(fx),
+            REF_D50[1] * ref_lab_f_inv(fy),
+            REF_D50[2] * ref_lab_f_inv(fz),
+        ];
+        for r in 0..3 {
+            image_out[b + r] =
+                matrix[r] * xyz[0] + matrix[4 + r] * xyz[1] + matrix[8 + r] * xyz[2];
+        }
+        image_out[b + 3] = alpha;
+    }
+}
+
+/// Local copy of the `lab_f_inv` step so the Lab→RGB reference does not call
+/// the shared helper path.
+#[allow(dead_code)]
+fn ref_lab_f_inv(x: f32) -> f32 {
+    if x > REF_LAB_CBRT_EPSILON {
+        x * x * x
+    } else {
+        (116.0 * x - 16.0) / REF_LAB_KAPPA
+    }
+}
+
+// ── FFI exports (matrix transforms) ────────────────────────────────────────────
+
+/// Validate the raw FFI arguments shared by both matrix-transform exports.
+///
+/// Returns `(npixels, pix_len)` on success: all pointers non-null, `width`
+/// and `height` nonzero and within the C `int` domain (negative values arrive
+/// as huge `size_t` and must not reach slice construction), and the
+/// `4*width*height` product non-overflowing. (The safe kernels re-check
+/// buffer lengths defensively.)
+fn checked_ffi_matrix_args(
+    image_in: *const f32,
+    image_out: *mut f32,
+    matrix: *const f32,
+    width: usize,
+    height: usize,
+) -> Option<usize> {
+    if image_in.is_null() || image_out.is_null() || matrix.is_null() {
+        return None;
+    }
+    if width == 0
+        || height == 0
+        || width > i32::MAX as usize
+        || height > i32::MAX as usize
+    {
+        return None;
+    }
+    let npixels = width.checked_mul(height)?;
+    let pix_len = npixels.checked_mul(4)?;
+    Some(pix_len)
+}
+
+/// RGB→Lab via the profile matrix (`_transform_rgb_to_lab_matrix` loops).
+///
+/// `image_in`/`image_out` each hold `4*width*height` floats (RGBA); only used
+/// by the linear branch split — the nonlinear branch calls with
+/// `image_in == image_out` (tone curves already ran into `image_out`) and is
+/// dispatched to [`rgb_to_lab_matrix_inplace`]. `matrix` holds 16 floats: the
+/// profile's `matrix_in_transposed` exactly as stored (already transposed;
+/// applied without further transposition). Output alpha is forced to 0.0,
+/// matching `dt_XYZ_to_Lab`. Otherwise the buffers must not overlap (partial
+/// overlap is unsupported, stricter than C).
+///
+/// # Safety
+/// All pointers must be valid for the stated lengths; the C caller forwards
+/// the profile's own 16-float matrix over exactly `4*width*height` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_iop_profile_rgb_to_lab_matrix(
+    image_in: *const f32,
+    image_out: *mut f32,
+    width: usize,
+    height: usize,
+    matrix: *const f32,
+) {
+    let Some(pix_len) =
+        checked_ffi_matrix_args(image_in, image_out, matrix, width, height)
+    else {
+        return;
+    };
+    let matrix = std::slice::from_raw_parts(matrix, 16);
+    if std::ptr::eq(image_in, image_out) {
+        // nonlinear branch (runs over image_out after the tone curves):
+        // a single mutable slice avoids shared+mutable aliasing.
+        let image = std::slice::from_raw_parts_mut(image_out, pix_len);
+        rgb_to_lab_matrix_inplace(image, matrix, width, height);
+    } else {
+        let image_in = std::slice::from_raw_parts(image_in, pix_len);
+        let image_out = std::slice::from_raw_parts_mut(image_out, pix_len);
+        rgb_to_lab_matrix(image_in, image_out, matrix, width, height);
+    }
+}
+
+/// Lab→RGB via the profile matrix (`_transform_lab_to_rgb_matrix` loop).
+///
+/// `image_in`/`image_out` each hold `4*width*height` floats (RGBA); input
+/// alpha is preserved into the output. `matrix` holds 16 floats: the
+/// profile's `matrix_out_transposed` exactly as stored. May be called in
+/// place (`image_in == image_out`, which some callers rely on); otherwise the
+/// buffers must not overlap (partial overlap is unsupported, stricter
+/// than C).
+///
+/// # Safety
+/// All pointers must be valid for the stated lengths; the C caller forwards
+/// the profile's own 16-float matrix over exactly `4*width*height` floats.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_iop_profile_lab_to_rgb_matrix(
+    image_in: *const f32,
+    image_out: *mut f32,
+    width: usize,
+    height: usize,
+    matrix: *const f32,
+) {
+    let Some(pix_len) =
+        checked_ffi_matrix_args(image_in, image_out, matrix, width, height)
+    else {
+        return;
+    };
+    let matrix = std::slice::from_raw_parts(matrix, 16);
+    if std::ptr::eq(image_in, image_out) {
+        let image = std::slice::from_raw_parts_mut(image_out, pix_len);
+        lab_to_rgb_matrix_inplace(image, matrix, width, height);
+    } else {
+        let image_in = std::slice::from_raw_parts(image_in, pix_len);
+        let image_out = std::slice::from_raw_parts_mut(image_out, pix_len);
+        lab_to_rgb_matrix(image_in, image_out, matrix, width, height);
+    }
+}
+
+// ── FFI export (tone curves, m4-187) ───────────────────────────────────────────
 
 /// Apply the input-profile tone curves (`_apply_tonecurves`).
 ///
@@ -805,6 +1245,361 @@ mod tests {
                 inn.as_ptr(), out.as_mut_ptr(), 4, (i32::MAX as usize) + 1, lr.as_ptr(),
                 lr.as_ptr(), lr.as_ptr(), c.as_ptr(), c.as_ptr(), c.as_ptr(), 2,
             );
+        }
+        assert!(out.iter().all(|&v| v == 7.0)); // untouched
+    }
+
+    // ── m4-188 matrix-transform tests ─────────────────────────────────────────
+
+    /// 16-float identity 3x3 embedded in a 4x4 (flat row-major, as stored):
+    /// `out[r] = in[r]` for `r = 0..2` (and `out[3] = 0` from the multiply).
+    fn identity_matrix() -> Vec<f32> {
+        vec![
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ]
+    }
+
+    /// Cyclic lane permute (flat row-major of the *transposed* matrix):
+    /// `out[0] = in[1]`, `out[1] = in[2]`, `out[2] = in[0]`. A naive
+    /// non-transposed application (`out[r] = m[r*4+0]*in0 + ...`) would give
+    /// the inverse rotation instead, so this distinguishes the order.
+    fn permute_matrix() -> Vec<f32> {
+        vec![
+            0.0, 0.0, 1.0, 0.0, //
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ]
+    }
+
+    /// Non-trivial realistic matrix (sRGB→XYZ D50 coefficients, flat
+    /// row-major with padding) for reference-agreement fuzzing.
+    fn srgb_like_matrix() -> Vec<f32> {
+        vec![
+            0.4360747, 0.2225045, 0.0139322, 0.0, //
+            0.3850649, 0.7168786, 0.0971045, 0.0, //
+            0.1430804, 0.0606169, 0.7141733, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ]
+    }
+
+    #[test]
+    fn matrix_order_is_transposed() {
+        use crate::color::{apply_transposed_color_matrix, lab_to_xyz, xyz_to_lab};
+        // RGB→Lab: permute-then-convert must equal hand-staged
+        // permute (flat column-dot) + shared xyz_to_lab with alpha forced 0.
+        let m = permute_matrix();
+        let rgb = [0.1f32, 0.5, 0.9, 0.7];
+        let image_in = rgb.to_vec();
+        let mut out = vec![-1.0f32; 4];
+        rgb_to_lab_matrix(&image_in, &mut out, &m, 1, 1);
+        // hand-staged: xyz = [in1, in2, in0] (column dots of the flat rows).
+        let xyz = [rgb[1], rgb[2], rgb[0], 0.0];
+        let mut expected = xyz_to_lab(xyz);
+        expected[3] = 0.0;
+        assert_eq!(out, expected);
+        // sanity: the wrong (non-transposed) order gives the inverse rotation
+        // [in2, in0, in1] — the test above is not vacuous.
+        let wrong_xyz = [rgb[2], rgb[0], rgb[1], 0.0];
+        assert_ne!(xyz_to_lab(xyz), xyz_to_lab(wrong_xyz));
+        // cross-check against the [[f32;4];4] helper path too.
+        let marr: [[f32; 4]; 4] = [
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let xyz2 = apply_transposed_color_matrix(&rgb, &marr);
+        assert_eq!(xyz2, xyz);
+
+        // Lab→RGB: hand-staged lab_to_xyz + permute, alpha preserved.
+        let lab = [50.0f32, 20.0, -30.0, 0.42];
+        let image_lab = lab.to_vec();
+        let mut rgb_out = vec![-1.0f32; 4];
+        lab_to_rgb_matrix(&image_lab, &mut rgb_out, &m, 1, 1);
+        let xyz = lab_to_xyz(lab);
+        assert_eq!(rgb_out, vec![xyz[1], xyz[2], xyz[0], 0.42]);
+        // wrong order would give [xyz2, xyz0, xyz1] instead.
+        assert_ne!((rgb_out[0], rgb_out[1], rgb_out[2]), (xyz[2], xyz[0], xyz[1]));
+    }
+
+    #[test]
+    fn xyz_lab_round_trip_through_kernels() {
+        // RGB→Lab (diag(2,3,0.5)) then Lab→RGB (inverse diag) recovers the
+        // input up to f32 cbrt/pow round-trip error. Alpha goes in as 0.0
+        // (RGB→Lab forces it) so the return leg restores 0.0 as well.
+        let fwd = vec![
+            2.0, 0.0, 0.0, 0.0, //
+            0.0, 3.0, 0.0, 0.0, //
+            0.0, 0.0, 0.5, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let inv = vec![
+            0.5, 0.0, 0.0, 0.0, //
+            0.0, 1.0 / 3.0, 0.0, 0.0, //
+            0.0, 0.0, 2.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let (w, h) = (3usize, 2usize);
+        let mut rgb = vec![0.0f32; 4 * w * h];
+        lcg_fill(&mut rgb, 0xBE57, 1.5);
+        for v in rgb.iter_mut().skip(3).step_by(4) {
+            *v = 0.0; // input alpha irrelevant: RGB→Lab forces 0.0
+        }
+        // keep XYZ safely positive and away from the epsilon kink
+        for v in rgb.iter_mut().step_by(4) {
+            *v = 0.05 + (*v % 1.0).abs() * 0.5;
+        }
+        let mut lab = vec![0.0f32; 4 * w * h];
+        rgb_to_lab_matrix(&rgb, &mut lab, &fwd, w, h);
+        let mut back = vec![0.0f32; 4 * w * h];
+        lab_to_rgb_matrix(&lab, &mut back, &inv, w, h);
+        for px in 0..w * h {
+            for c in 0..3 {
+                let (a, b) = (rgb[px * 4 + c], back[px * 4 + c]);
+                assert!(
+                    (a - b).abs() <= 1e-4 * a.abs().max(1.0),
+                    "px={px} c={c}: {a} vs {b}"
+                );
+            }
+            assert_eq!(back[px * 4 + 3].to_bits(), 0.0f32.to_bits());
+        }
+    }
+
+    #[test]
+    fn alpha_semantics() {
+        let m = identity_matrix();
+        // RGB→Lab forces alpha to exactly 0.0 whatever the input held.
+        for &alpha in &[0.0f32, 0.7, 1.0, 123.5] {
+            let inn = vec![0.4f32, 0.2, 0.6, alpha];
+            let mut out = vec![-1.0f32; 4];
+            rgb_to_lab_matrix(&inn, &mut out, &m, 1, 1);
+            assert_eq!(out[3].to_bits(), 0.0f32.to_bits(), "alpha={alpha}");
+            let mut io = inn.clone();
+            rgb_to_lab_matrix_inplace(&mut io, &m, 1, 1);
+            assert_eq!(io, out, "alpha={alpha}");
+            assert_eq!(io[3].to_bits(), 0.0f32.to_bits());
+        }
+        // Lab→RGB restores the input alpha bit-exactly.
+        for &alpha in &[0.0f32, 1.0, 0.33, -2.5] {
+            let inn = vec![50.0f32, 10.0, -10.0, alpha];
+            let mut out = vec![-1.0f32; 4];
+            lab_to_rgb_matrix(&inn, &mut out, &m, 1, 1);
+            assert_eq!(out[3].to_bits(), alpha.to_bits(), "alpha={alpha}");
+            let mut io = inn.clone();
+            lab_to_rgb_matrix_inplace(&mut io, &m, 1, 1);
+            assert_eq!(io, out, "alpha={alpha}");
+        }
+    }
+
+    #[test]
+    fn matrix_matches_reference_over_lcg() {
+        // kernel vs structurally divergent reference: bit-exact (to_bits)
+        // over pseudo-random RGB and Lab inputs, several image shapes.
+        let matrices = [identity_matrix(), permute_matrix(), srgb_like_matrix()];
+        for m in &matrices {
+            for &(w, h) in &[(1usize, 1usize), (2, 1), (3, 2), (5, 4), (8, 7)] {
+                // RGB inputs in [0, 1.5): covers the Lab epsilon kink region
+                // after the sRGB-like matrix as well as plain positives.
+                let mut rgb = vec![0.0f32; 4 * w * h];
+                lcg_fill(&mut rgb, 0x1880 + w as u32 * 17 + h as u32, 1.5);
+                let mut direct = vec![-33.0f32; 4 * w * h];
+                let mut refr = vec![-33.0f32; 4 * w * h];
+                rgb_to_lab_matrix(&rgb, &mut direct, m, w, h);
+                ref_rgb_to_lab_matrix(&rgb, &mut refr, m, w, h);
+                assert_eq!(direct, refr, "rgb2lab w={w} h={h}");
+                for (d, r) in direct.iter().zip(refr.iter()) {
+                    assert_eq!(d.to_bits(), r.to_bits(), "rgb2lab w={w} h={h}");
+                }
+                // Lab inputs: L in [0,100), a/b shifted to [-50,50).
+                let mut lab = vec![0.0f32; 4 * w * h];
+                lcg_fill(&mut lab, 0x1881 + w as u32 * 31 + h as u32, 100.0);
+                for px in 0..w * h {
+                    lab[px * 4 + 1] -= 50.0;
+                    lab[px * 4 + 2] -= 50.0;
+                }
+                let mut direct = vec![-33.0f32; 4 * w * h];
+                let mut refr = vec![-33.0f32; 4 * w * h];
+                lab_to_rgb_matrix(&lab, &mut direct, m, w, h);
+                ref_lab_to_rgb_matrix(&lab, &mut refr, m, w, h);
+                assert_eq!(direct, refr, "lab2rgb w={w} h={h}");
+                for (d, r) in direct.iter().zip(refr.iter()) {
+                    assert_eq!(d.to_bits(), r.to_bits(), "lab2rgb w={w} h={h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_inplace_matches_split() {
+        // in-place kernels equal the split kernels with a copied input, for
+        // identity, permute and realistic matrices.
+        let matrices = [identity_matrix(), permute_matrix(), srgb_like_matrix()];
+        for m in &matrices {
+            for &(w, h) in &[(1usize, 1usize), (4, 3), (7, 5)] {
+                let mut rgb = vec![0.0f32; 4 * w * h];
+                lcg_fill(&mut rgb, 0x1882, 1.5);
+                let mut split = vec![0.0f32; 4 * w * h];
+                rgb_to_lab_matrix(&rgb, &mut split, m, w, h);
+                let mut io = rgb.clone();
+                rgb_to_lab_matrix_inplace(&mut io, m, w, h);
+                assert_eq!(io, split, "rgb2lab w={w} h={h}");
+
+                let mut lab = vec![0.0f32; 4 * w * h];
+                lcg_fill(&mut lab, 0x1883, 100.0);
+                for px in 0..w * h {
+                    lab[px * 4 + 1] -= 50.0;
+                    lab[px * 4 + 2] -= 50.0;
+                }
+                let mut split = vec![0.0f32; 4 * w * h];
+                lab_to_rgb_matrix(&lab, &mut split, m, w, h);
+                let mut io = lab.clone();
+                lab_to_rgb_matrix_inplace(&mut io, m, w, h);
+                assert_eq!(io, split, "lab2rgb w={w} h={h}");
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_degenerate_guards_no_op() {
+        let m = identity_matrix();
+        let short_m = vec![1.0f32; 15];
+        // zero dims leave buffers untouched (all four kernels + references)
+        for &(w, h) in &[(0usize, 4usize), (4usize, 0usize), (0usize, 0usize)] {
+            let inn: Vec<f32> = vec![0.5; 64];
+            let mut out = vec![9.0f32; 64];
+            rgb_to_lab_matrix(&inn, &mut out, &m, w, h);
+            lab_to_rgb_matrix(&inn, &mut out, &m, w, h);
+            assert!(out.iter().all(|&v| v == 9.0), "w={w} h={h}");
+            let mut io = vec![9.0f32; 64];
+            rgb_to_lab_matrix_inplace(&mut io, &m, w, h);
+            lab_to_rgb_matrix_inplace(&mut io, &m, w, h);
+            assert!(io.iter().all(|&v| v == 9.0), "inplace w={w} h={h}");
+            let mut ref_out = vec![9.0f32; 64];
+            ref_rgb_to_lab_matrix(&inn, &mut ref_out, &m, w, h);
+            ref_lab_to_rgb_matrix(&inn, &mut ref_out, &m, w, h);
+            assert!(ref_out.iter().all(|&v| v == 9.0), "ref w={w} h={h}");
+        }
+        // short buffers / short matrix: no-op, no panic
+        let (w, h) = (4usize, 4usize);
+        let mut inn = vec![0.0f32; 4 * w * h];
+        lcg_fill(&mut inn, 0x5E88, 1.5);
+        let mut out = vec![9.0f32; 4 * w * h];
+        rgb_to_lab_matrix(&inn[..10], &mut out, &m, w, h);
+        rgb_to_lab_matrix(&inn, &mut out[..10], &m, w, h);
+        lab_to_rgb_matrix(&inn[..10], &mut out, &m, w, h);
+        lab_to_rgb_matrix(&inn, &mut out[..10], &m, w, h);
+        rgb_to_lab_matrix(&inn, &mut out, &short_m, w, h);
+        lab_to_rgb_matrix(&inn, &mut out, &short_m, w, h);
+        rgb_to_lab_matrix(&inn, &mut out, &[], w, h);
+        assert!(out.iter().all(|&v| v == 9.0));
+        let mut io = vec![9.0f32; 10];
+        rgb_to_lab_matrix_inplace(&mut io, &m, w, h);
+        lab_to_rgb_matrix_inplace(&mut io, &m, w, h);
+        assert!(io.iter().all(|&v| v == 9.0));
+        // boundary dimension arithmetic must no-op without panicking
+        rgb_to_lab_matrix(&[], &mut [], &m, usize::MAX, 1);
+        lab_to_rgb_matrix(&[], &mut [], &m, usize::MAX, 1);
+        ref_rgb_to_lab_matrix(&[], &mut [], &m, usize::MAX, 1);
+        ref_lab_to_rgb_matrix(&[], &mut [], &m, usize::MAX, 1);
+        rgb_to_lab_matrix_inplace(&mut [], &m, usize::MAX, 1);
+        lab_to_rgb_matrix_inplace(&mut [], &m, usize::MAX, 1);
+    }
+
+    #[test]
+    fn matrix_ffi_round_trip() {
+        // split and in-place FFI calls agree with the safe kernels, both ways.
+        let matrices = [identity_matrix(), permute_matrix(), srgb_like_matrix()];
+        for m in &matrices {
+            for &(w, h) in &[(4usize, 2usize), (5usize, 3usize)] {
+                let mut rgb = vec![0.0f32; 4 * w * h];
+                lcg_fill(&mut rgb, 0xFF88 + w as u32, 1.5);
+                let mut ffi_out = vec![-3.0f32; 4 * w * h];
+                let mut direct = vec![-3.0f32; 4 * w * h];
+                unsafe {
+                    darkroom_iop_profile_rgb_to_lab_matrix(
+                        rgb.as_ptr(), ffi_out.as_mut_ptr(), w, h, m.as_ptr(),
+                    );
+                }
+                rgb_to_lab_matrix(&rgb, &mut direct, m, w, h);
+                assert_eq!(ffi_out, direct, "rgb2lab w={w} h={h}");
+                // in-place FFI (same pointer twice, like the nonlinear
+                // RGB→Lab branch) matches the inplace kernel.
+                let mut ffi_io = rgb.clone();
+                let mut direct_io = rgb.clone();
+                unsafe {
+                    darkroom_iop_profile_rgb_to_lab_matrix(
+                        ffi_io.as_ptr(), ffi_io.as_mut_ptr(), w, h, m.as_ptr(),
+                    );
+                }
+                rgb_to_lab_matrix_inplace(&mut direct_io, m, w, h);
+                assert_eq!(ffi_io, direct_io, "rgb2lab inplace w={w} h={h}");
+
+                let mut lab = vec![0.0f32; 4 * w * h];
+                lcg_fill(&mut lab, 0xFF89 + w as u32, 100.0);
+                for px in 0..w * h {
+                    lab[px * 4 + 1] -= 50.0;
+                    lab[px * 4 + 2] -= 50.0;
+                }
+                let mut ffi_out = vec![-3.0f32; 4 * w * h];
+                let mut direct = vec![-3.0f32; 4 * w * h];
+                unsafe {
+                    darkroom_iop_profile_lab_to_rgb_matrix(
+                        lab.as_ptr(), ffi_out.as_mut_ptr(), w, h, m.as_ptr(),
+                    );
+                }
+                lab_to_rgb_matrix(&lab, &mut direct, m, w, h);
+                assert_eq!(ffi_out, direct, "lab2rgb w={w} h={h}");
+                let mut ffi_io = lab.clone();
+                let mut direct_io = lab.clone();
+                unsafe {
+                    darkroom_iop_profile_lab_to_rgb_matrix(
+                        ffi_io.as_ptr(), ffi_io.as_mut_ptr(), w, h, m.as_ptr(),
+                    );
+                }
+                lab_to_rgb_matrix_inplace(&mut direct_io, m, w, h);
+                assert_eq!(ffi_io, direct_io, "lab2rgb inplace w={w} h={h}");
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_ffi_guards() {
+        let m = identity_matrix();
+        let inn: Vec<f32> = vec![0.5; 64];
+        let mut out = vec![7.0f32; 64];
+        unsafe {
+            for export in [
+                darkroom_iop_profile_rgb_to_lab_matrix,
+                darkroom_iop_profile_lab_to_rgb_matrix,
+            ] {
+                // null pointers (each of the three, one at a time)
+                export(std::ptr::null(), out.as_mut_ptr(), 4, 4, m.as_ptr());
+                export(inn.as_ptr(), std::ptr::null_mut(), 4, 4, m.as_ptr());
+                export(inn.as_ptr(), out.as_mut_ptr(), 4, 4, std::ptr::null());
+                // zero dims
+                export(inn.as_ptr(), out.as_mut_ptr(), 0, 4, m.as_ptr());
+                export(inn.as_ptr(), out.as_mut_ptr(), 4, 0, m.as_ptr());
+                // i32::MAX caps (C ints arrive non-negative; negatives would
+                // wrap to huge size_t and must not reach slice construction)
+                export(
+                    inn.as_ptr(),
+                    out.as_mut_ptr(),
+                    (i32::MAX as usize) + 1,
+                    4,
+                    m.as_ptr(),
+                );
+                export(
+                    inn.as_ptr(),
+                    out.as_mut_ptr(),
+                    4,
+                    (i32::MAX as usize) + 1,
+                    m.as_ptr(),
+                );
+            }
         }
         assert!(out.iter().all(|&v| v == 7.0)); // untouched
     }
