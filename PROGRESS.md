@@ -4548,3 +4548,23 @@ FFI helper return.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-11 07:43 UTC — m4-189: port profile matrix-rgb loops to Rust FFI
+
+**Commit** `26b65b7edc` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `_transform_matrix_rgb` (`src/common/iop_profile.c`), replacing both
+matrix loops with `darkroom_iop_profile_matrix_rgb`. Extended `c41-core::iop_profile`
+with a safe kernel, divergent reference, validated FFI, and focused tests; declared the
+export in `src/rust_ffi/darkroom_core.h`. Left LCMS paths, tone-curve/matrix helpers,
+orchestration, and all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0. Reverted
+unrelated header whitespace, fixed the TRC documentation referent and lane-3 build
+note, added the exact-alias guard, and added NaN plus output-side-null assertions.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
