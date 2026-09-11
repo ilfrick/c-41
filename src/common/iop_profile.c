@@ -475,8 +475,6 @@ static inline void _transform_matrix_rgb
    const dt_iop_order_iccprofile_info_t *const profile_info_from,
    const dt_iop_order_iccprofile_info_t *const profile_info_to)
 {
-  const size_t stride = (size_t)width * height * 4;
-
   // RGB -> XYZ -> RGB are 2 matrices products, they can be premultiplied globally ahead
   // and put in a new matrix. then we spare one matrix product per pixel.
   dt_colormatrix_t _matrix;
@@ -486,74 +484,53 @@ static inline void _transform_matrix_rgb
 
   if(profile_info_from->nonlinearlut || profile_info_to->nonlinearlut)
   {
-    const int run_lut_in[3] DT_ALIGNED_PIXEL= { (profile_info_from->lut_in[0][0] >= 0.0f),
-                                                (profile_info_from->lut_in[1][0] >= 0.0f),
-                                                (profile_info_from->lut_in[2][0] >= 0.0f) };
-
-    const int run_lut_out[3] DT_ALIGNED_PIXEL = { (profile_info_to->lut_out[0][0] >= 0.0f),
-                                                  (profile_info_to->lut_out[1][0] >= 0.0f),
-                                                  (profile_info_to->lut_out[2][0] >= 0.0f) };
-
-    DT_OMP_FOR(shared(matrix))
-    for(size_t y = 0; y < stride; y += 4)
-    {
-      const float *const restrict in = DT_IS_ALIGNED_PIXEL(image_in + y);
-      float *const restrict out = DT_IS_ALIGNED_PIXEL(image_out + y);
-      dt_aligned_pixel_t rgb;
-
-      // linearize if non-linear input
-      if(profile_info_from->nonlinearlut)
-      {
-        for(size_t c = 0; c < 3; c++)
-        {
-          rgb[c] = (run_lut_in[c]
-                    ? ((in[c] < 1.0f)
-                       ? extrapolate_lut(profile_info_from->lut_in[c], in[c],
-                                         profile_info_from->lutsize)
-                       : eval_exp(profile_info_from->unbounded_coeffs_in[c], in[c]))
-                    : in[c]);
-        }
-      }
-      else
-      {
-        for_each_channel(c)
-          rgb[c] = in[c];
-      }
-
-      if(profile_info_to->nonlinearlut)
-      {
-        // convert color space
-        dt_aligned_pixel_t temp;
-        dt_apply_transposed_color_matrix(rgb, matrix, temp);
-
-        // de-linearize non-linear output
-        for(size_t c = 0; c < 3; c++)
-        {
-          out[c] = (run_lut_out[c]
-                    ? ((temp[c] < 1.0f)
-                       ? extrapolate_lut(profile_info_to->lut_out[c],
-                                         temp[c], profile_info_to->lutsize)
-                       : eval_exp(profile_info_to->unbounded_coeffs_out[c], temp[c]))
-                    : temp[c]);
-        }
-      }
-      else
-      {
-        // convert color space
-        dt_apply_transposed_color_matrix(rgb, matrix, out);
-      }
-    }
+    // Rust port (m4-189): linearize -> premultiplied matrix -> delinearize.
+    // The export re-derives the per-channel run_lut sentinels from the LUTs
+    // (lut[c][0] < 0 marks a linear channel) gated on the nonlinear flags.
+    darkroom_iop_profile_matrix_rgb(image_in, image_out,
+                                    (size_t)width, (size_t)height,
+                                    &matrix[0][0],
+                                    profile_info_from->lut_in[0],
+                                    profile_info_from->lut_in[1],
+                                    profile_info_from->lut_in[2],
+                                    profile_info_from->unbounded_coeffs_in[0],
+                                    profile_info_from->unbounded_coeffs_in[1],
+                                    profile_info_from->unbounded_coeffs_in[2],
+                                    profile_info_to->lut_out[0],
+                                    profile_info_to->lut_out[1],
+                                    profile_info_to->lut_out[2],
+                                    profile_info_to->unbounded_coeffs_out[0],
+                                    profile_info_to->unbounded_coeffs_out[1],
+                                    profile_info_to->unbounded_coeffs_out[2],
+                                    (size_t)profile_info_from->lutsize,
+                                    (size_t)profile_info_to->lutsize,
+                                    profile_info_from->nonlinearlut,
+                                    profile_info_to->nonlinearlut);
   }
   else
   {
-    DT_OMP_FOR(shared(matrix))
-    for(size_t y = 0; y < stride; y += 4)
-    {
-      const float *const restrict in = DT_IS_ALIGNED_PIXEL(image_in + y);
-      float *const restrict out = DT_IS_ALIGNED_PIXEL(image_out + y);
-
-      dt_apply_transposed_color_matrix(in, matrix, out);
-    }
+    // Rust port (m4-189): premultiplied matrix only. LUT pointers and
+    // lutsizes are forwarded but unused (both nonlinear flags are 0, and the
+    // export only materializes TRC tables for nonlinear sides).
+    darkroom_iop_profile_matrix_rgb(image_in, image_out,
+                                    (size_t)width, (size_t)height,
+                                    &matrix[0][0],
+                                    profile_info_from->lut_in[0],
+                                    profile_info_from->lut_in[1],
+                                    profile_info_from->lut_in[2],
+                                    profile_info_from->unbounded_coeffs_in[0],
+                                    profile_info_from->unbounded_coeffs_in[1],
+                                    profile_info_from->unbounded_coeffs_in[2],
+                                    profile_info_to->lut_out[0],
+                                    profile_info_to->lut_out[1],
+                                    profile_info_to->lut_out[2],
+                                    profile_info_to->unbounded_coeffs_out[0],
+                                    profile_info_to->unbounded_coeffs_out[1],
+                                    profile_info_to->unbounded_coeffs_out[2],
+                                    (size_t)profile_info_from->lutsize,
+                                    (size_t)profile_info_to->lutsize,
+                                    0,
+                                    0);
   }
 }
 

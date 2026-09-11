@@ -3845,6 +3845,57 @@ void darkroom_iop_profile_lab_to_rgb_matrix(const float *image_in,
                                             size_t height,
                                             const float *matrix);
 
+/*
+ * Input-profile RGB->RGB matrix transform, non-LCMS path
+ * (src/common/iop_profile.c, _transform_matrix_rgb, m4-189).
+ *
+ * Replaces both DT_OMP_FOR loop bodies (the nonlinear linearize->matrix->
+ * delinearize loop and the linear matrix-only loop); the C wrapper keeps the
+ * profile-matrix premultiplication (to->matrix_out * from->matrix_in, then
+ * transpose_3xSSE), the outer nonlinearlut branch, and all orchestration, and
+ * calls this from each branch (linear branch with nonlinear_from/to == 0).
+ * matrix: 16 floats, the premultiplied TRANSPOSED product exactly as stored
+ * (already transposed; applied without further transposition:
+ * out[r] = m[0][r]*in[0] + ... for r in 0..3).
+ * lut_in_r/g/b + unbounded_coeffs_in_r/g/b: the source profile's lut_in /
+ * unbounded_coeffs_in (lutsize_in floats per LUT -- the source profile's own
+ * lutsize -- 3 floats per coefficient slice), used only when nonlinear_from
+ * != 0. lut_out_r/g/b + unbounded_coeffs_out_r/g/b + lutsize_out: the same
+ * for the destination profile's lut_out / unbounded_coeffs_out, used only
+ * when nonlinear_to != 0. A LUT whose first entry is negative marks a linear
+ * channel (passed through, matching the run_lut sentinels). Unused sides
+ * tolerate null pointers and any lutsize; used sides reject nulls,
+ * lutsize < 2 and overflowing dim products as guarded no-ops.
+ * v < 1.0 takes the LUT (negatives clamp to lut[0]), v >= 1.0 takes eval_exp.
+ * Output alpha (lane 3) follows the C loops exactly: preserved (never
+ * written) when nonlinear_to != 0, otherwise the matrix zero-padding product
+ * (0.0 for finite inputs, NaN for infinite ones -- computed, not forced).
+ * Buffers must not overlap (matching the C `restrict` qualifiers); no
+ * in-place support. Null image/matrix pointers, zero dims, dims above
+ * INT_MAX and overflowing dim products are guarded no-ops.
+ */
+void darkroom_iop_profile_matrix_rgb(const float *image_in,
+                                     float *image_out,
+                                     size_t width,
+                                     size_t height,
+                                     const float *matrix,
+                                     const float *lut_in_r,
+                                     const float *lut_in_g,
+                                     const float *lut_in_b,
+                                     const float *unbounded_coeffs_in_r,
+                                     const float *unbounded_coeffs_in_g,
+                                     const float *unbounded_coeffs_in_b,
+                                     const float *lut_out_r,
+                                     const float *lut_out_g,
+                                     const float *lut_out_b,
+                                     const float *unbounded_coeffs_out_r,
+                                     const float *unbounded_coeffs_out_g,
+                                     const float *unbounded_coeffs_out_b,
+                                     size_t lutsize_in,
+                                     size_t lutsize_out,
+                                     int nonlinear_from,
+                                     int nonlinear_to);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

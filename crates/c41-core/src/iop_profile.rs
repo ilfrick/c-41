@@ -48,7 +48,7 @@
 //! FFI export dispatches on pointer equality.
 
 use crate::color::{
-    apply_transposed_color_matrix, eval_exp, extrapolate_lut, lab_to_xyz, xyz_to_lab,
+    apply_transposed_color_matrix, apply_trc, eval_exp, extrapolate_lut, lab_to_xyz, xyz_to_lab,
 };
 
 /// Map one channel value through its tone curve.
@@ -712,6 +712,496 @@ pub unsafe extern "C" fn darkroom_iop_profile_lab_to_rgb_matrix(
         let image_out = std::slice::from_raw_parts_mut(image_out, pix_len);
         lab_to_rgb_matrix(image_in, image_out, matrix, width, height);
     }
+}
+
+// ── RGB→RGB matrix transform (m4-189) ──────────────────────────────────────────
+//
+// Port of `_transform_matrix_rgb` (iop_profile.c:470-558): the non-LCMS
+// RGB→RGB path between two matrix profiles. The C wrapper premultiplies the
+// two 3x3 profile matrices once per image
+// (`_matrix = to->matrix_out * from->matrix_in`, then `transpose_3xSSE`) and
+// hands the kernel the already-transposed 16-float product; the kernel never
+// sees the two factors and must NOT transpose again. Two `DT_OMP_FOR` loops
+// move here:
+//   - nonlinear branch (either profile `nonlinearlut`): per-pixel
+//     linearize (input TRC) → premultiplied matrix → delinearize (output
+//     TRC), [`matrix_rgb`] with either flag set;
+//   - linear branch (both linear): premultiplied matrix only.
+// The C wrapper keeps the premultiplication, the transpose, and the outer
+// `nonlinearlut` branch; both branches call the single FFI export (the linear
+// branch with both flags 0).
+//
+// Per-pixel semantics, mirroring the C loop bodies exactly:
+// - Linearize (only when `nonlinear_from`): each channel through the shared
+//   [`apply_trc`] (LUT below 1.0, `eval_exp` at and above, passthrough for
+//   channels whose LUT is marked linear via `lut[0] < 0.0`). Otherwise the
+//   pixel is copied unchanged (the C `for_each_channel` copy, all 4 lanes).
+// - Matrix: shared [`apply_transposed_color_matrix`] over lanes 0..2 (lane 3
+//   of the input is never read, matching C).
+// - Delinearize (only when `nonlinear_to`): same TRC shape over the matrix
+//   result; otherwise the matrix result is stored directly.
+//
+// Semantic edge cases (all pinned by tests):
+// - Each side carries its OWN `lutsize` (`from->lutsize` for the input TRCs,
+//   `to->lutsize` for the output TRCs, as in C — the two profiles may differ).
+// - Alpha (lane 3) is written only on matrix-direct-to-output paths, i.e.
+//   when `nonlinear_to` is false (the linear branch, and the
+//   from-nonlinear/to-linear sub-case): `out[3] = m[0][3]*in0 + m[1][3]*in1 +
+//   m[2][3]*in2` through the shared helper. The transposed product carries
+//   zero padding there (`transpose_3xSSE` writes 0.0), so finite inputs yield
+//   exactly 0.0 — but an infinite input yields NaN (`0.0 * inf`), and the
+//   helper reproduces that bit-exactly, which is why lane 3 is computed
+//   rather than forced to 0.0. When `nonlinear_to` is true, lane 3 is NEVER
+//   written (preserved as-is in `image_out`), as in C.
+// - `v < 1.0` selects the LUT path (negatives clamp to `lut[0]` inside
+//   `extrapolate_lut`); `v >= 1.0` — including exactly 1.0 — selects
+//   `eval_exp`. Inactive (linear-marked) channels pass the value through on
+//   BOTH sides (unlike [`apply_tonecurves`'s leave-untouched rule — here the
+//   C loop assigns `rgb[c] = in[c]` / `out[c] = temp[c]`).
+//
+// Degenerate/short buffers: zero `width`/`height`, dimension arithmetic
+// overflow, image buffers shorter than `4*width*height` floats, or a matrix
+// shorter than 16 floats is a no-op — no panic, no out-of-bounds access.
+// TRC tables are validated PER SIDE and only when that side is nonlinear: a
+// linear side accepts empty LUT/coefficient slices (never touched); a
+// nonlinear side requires `lutsize >= 2`, LUTs of at least `lutsize` floats
+// and coefficient slices of at least 3 floats. Well-formed callers forward
+// the profiles' own `lutsize`-long LUTs and never hit these paths.
+//
+// Aliasing: split buffers must not overlap (matching the C `restrict`
+// qualifiers); no in-place kernel is provided (unlike the m4-188 pair —
+// `_transform_matrix_rgb` is `restrict`-qualified and has no in-place
+// callers, so the FFI export offers no pointer-equality dispatch).
+
+/// Validate one side's TRC tables: `lutsize >= 2` (below which both the C
+/// loop and `extrapolate_lut` index out of bounds), every LUT at least
+/// `lutsize` floats, every coefficient slice at least 3 floats.
+fn check_trc_side(luts: [&[f32]; 3], coeffs: [&[f32]; 3], lutsize: usize) -> bool {
+    if lutsize < 2 {
+        return false;
+    }
+    for lut in luts {
+        if lut.len() < lutsize {
+            return false;
+        }
+    }
+    for coeff in coeffs {
+        if coeff.len() < 3 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate dimensions and buffer lengths for the RGB→RGB matrix kernel.
+///
+/// Returns the pixel count (`width * height`) on success. Always fails on
+/// zero dimensions, dimension arithmetic overflow, image buffers shorter
+/// than `4*width*height` floats, or a matrix shorter than 16 floats
+/// (`dt_colormatrix_t`). TRC tables are checked per side, only for nonlinear
+/// sides (see [`check_trc_side`]).
+#[allow(clippy::too_many_arguments)]
+fn checked_matrix_rgb_len(
+    image_in_len: usize,
+    image_out_len: usize,
+    matrix_len: usize,
+    luts_in: [&[f32]; 3],
+    coeffs_in: [&[f32]; 3],
+    lutsize_in: usize,
+    nonlinear_from: bool,
+    luts_out: [&[f32]; 3],
+    coeffs_out: [&[f32]; 3],
+    lutsize_out: usize,
+    nonlinear_to: bool,
+    width: usize,
+    height: usize,
+) -> Option<usize> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let npixels = width.checked_mul(height)?;
+    let pix_len = npixels.checked_mul(4)?;
+    if image_in_len < pix_len || image_out_len < pix_len {
+        return None;
+    }
+    if matrix_len < 16 {
+        return None;
+    }
+    if nonlinear_from && !check_trc_side(luts_in, coeffs_in, lutsize_in) {
+        return None;
+    }
+    if nonlinear_to && !check_trc_side(luts_out, coeffs_out, lutsize_out) {
+        return None;
+    }
+    Some(npixels)
+}
+
+/// RGB→RGB via the premultiplied profile matrix, with optional TRCs.
+///
+/// Port of the two `DT_OMP_FOR` loops in `_transform_matrix_rgb`: the
+/// nonlinear loop (iop_profile.c:497-545) when either flag is set, the linear
+/// loop (iop_profile.c:549-556) otherwise. `matrix` is the 16-float
+/// premultiplied TRANSPOSED product exactly as the C wrapper builds it
+/// (already transposed; applied without further transposition). `luts_in` /
+/// `coeffs_in` are the source profile's `lut_in` / `unbounded_coeffs_in`
+/// (`lutsize_in` floats per LUT, 3 floats per coefficient slice, gated on
+/// `nonlinear_from`); `luts_out` / `coeffs_out` / `lutsize_out` are the
+/// destination profile's `lut_out` / `unbounded_coeffs_out` (gated on
+/// `nonlinear_to`). Linear sides may pass empty slices. Buffers must not
+/// overlap; degenerate/short inputs are a no-op as documented above.
+#[allow(clippy::too_many_arguments)]
+pub fn matrix_rgb(
+    image_in: &[f32],
+    image_out: &mut [f32],
+    matrix: &[f32],
+    luts_in: [&[f32]; 3],
+    coeffs_in: [&[f32]; 3],
+    lutsize_in: usize,
+    nonlinear_from: bool,
+    luts_out: [&[f32]; 3],
+    coeffs_out: [&[f32]; 3],
+    lutsize_out: usize,
+    nonlinear_to: bool,
+    width: usize,
+    height: usize,
+) {
+    let Some(npixels) = checked_matrix_rgb_len(
+        image_in.len(),
+        image_out.len(),
+        matrix.len(),
+        luts_in,
+        coeffs_in,
+        lutsize_in,
+        nonlinear_from,
+        luts_out,
+        coeffs_out,
+        lutsize_out,
+        nonlinear_to,
+        width,
+        height,
+    ) else {
+        return;
+    };
+    let m = as_colormatrix(matrix);
+    if nonlinear_from || nonlinear_to {
+        for px in 0..npixels {
+            let b = px * 4;
+            let inp = [
+                image_in[b],
+                image_in[b + 1],
+                image_in[b + 2],
+                image_in[b + 3],
+            ];
+            // linearize (apply_trc passes linear-marked channels through and
+            // carries lane 3; the matrix multiply below never reads lane 3,
+            // so the C garbage-`rgb[3]` versus our `in[3]` is unobservable).
+            let lin = if nonlinear_from {
+                apply_trc(inp, luts_in, coeffs_in, lutsize_in)
+            } else {
+                inp
+            };
+            let temp = apply_transposed_color_matrix(&lin, m);
+            if nonlinear_to {
+                let dl = apply_trc(temp, luts_out, coeffs_out, lutsize_out);
+                image_out[b] = dl[0];
+                image_out[b + 1] = dl[1];
+                image_out[b + 2] = dl[2];
+                // lane 3 untouched (preserved), as in C.
+            } else {
+                image_out[b] = temp[0];
+                image_out[b + 1] = temp[1];
+                image_out[b + 2] = temp[2];
+                image_out[b + 3] = temp[3];
+            }
+        }
+    } else {
+        for px in 0..npixels {
+            let b = px * 4;
+            let inp = [
+                image_in[b],
+                image_in[b + 1],
+                image_in[b + 2],
+                image_in[b + 3],
+            ];
+            let out4 = apply_transposed_color_matrix(&inp, m);
+            image_out[b] = out4[0];
+            image_out[b + 1] = out4[1];
+            image_out[b + 2] = out4[2];
+            image_out[b + 3] = out4[3];
+        }
+    }
+}
+
+// ── Independent reference implementation for bit-exactness tests ─────────────
+
+/// Inlined LUT sample so the RGB→RGB reference does not call the shared
+/// helper path. Same ops as [`extrapolate_lut`], written out.
+#[allow(dead_code)]
+fn ref_lut_sample(lut: &[f32], v: f32, lutsize: usize) -> f32 {
+    let ft = (v * (lutsize - 1) as f32).clamp(0.0, (lutsize - 1) as f32);
+    let t = if (ft as usize) < lutsize - 2 {
+        ft as usize
+    } else {
+        lutsize - 2
+    };
+    let f = ft - t as f32;
+    lut[t] * (1.0 - f) + lut[t + 1] * f
+}
+
+/// Inlined exponential tail so the reference does not call [`eval_exp`].
+/// Same ops: `coeff[1] * (x * coeff[0])^coeff[2]`.
+#[allow(dead_code)]
+fn ref_exp_sample(coeff: &[f32], x: f32) -> f32 {
+    coeff[1] * (x * coeff[0]).powf(coeff[2])
+}
+
+/// Structurally divergent reference for [`matrix_rgb`]: a single unified
+/// pixel loop (where the kernel mirrors C's two loop nests), per-pixel
+/// scalar TRC staging through the inlined [`ref_lut_sample`] /
+/// [`ref_exp_sample`] (where the kernel threads whole `[f32; 4]` arrays
+/// through the shared [`apply_trc`]), and a lane-by-lane flat-index matrix
+/// dot (`matrix[r]*v0 + matrix[4+r]*v1 + matrix[8+r]*v2`, i.e. `m[c][r]` at
+/// flat `c*4+r`) where the kernel uses [`apply_transposed_color_matrix`].
+/// Arithmetic association order is kept identical so the comparison is
+/// bit-exact. Same no-op preconditions: well-formed buffers only.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn ref_matrix_rgb(
+    image_in: &[f32],
+    image_out: &mut [f32],
+    matrix: &[f32],
+    luts_in: [&[f32]; 3],
+    coeffs_in: [&[f32]; 3],
+    lutsize_in: usize,
+    nonlinear_from: bool,
+    luts_out: [&[f32]; 3],
+    coeffs_out: [&[f32]; 3],
+    lutsize_out: usize,
+    nonlinear_to: bool,
+    width: usize,
+    height: usize,
+) {
+    let Some(npixels) = checked_matrix_rgb_len(
+        image_in.len(),
+        image_out.len(),
+        matrix.len(),
+        luts_in,
+        coeffs_in,
+        lutsize_in,
+        nonlinear_from,
+        luts_out,
+        coeffs_out,
+        lutsize_out,
+        nonlinear_to,
+        width,
+        height,
+    ) else {
+        return;
+    };
+    for px in 0..npixels {
+        let b = px * 4;
+        let mut rgb = [image_in[b], image_in[b + 1], image_in[b + 2]];
+        if nonlinear_from {
+            for c in 0..3 {
+                if luts_in[c][0] >= 0.0 {
+                    let v = rgb[c];
+                    rgb[c] = if v < 1.0 {
+                        ref_lut_sample(luts_in[c], v, lutsize_in)
+                    } else {
+                        ref_exp_sample(coeffs_in[c], v)
+                    };
+                }
+            }
+        }
+        let mut tmp = [0.0f32; 4];
+        for r in 0..4 {
+            tmp[r] = matrix[r] * rgb[0] + matrix[4 + r] * rgb[1] + matrix[8 + r] * rgb[2];
+        }
+        if nonlinear_to {
+            for c in 0..3 {
+                image_out[b + c] = if luts_out[c][0] >= 0.0 {
+                    if tmp[c] < 1.0 {
+                        ref_lut_sample(luts_out[c], tmp[c], lutsize_out)
+                    } else {
+                        ref_exp_sample(coeffs_out[c], tmp[c])
+                    }
+                } else {
+                    tmp[c]
+                };
+            }
+        } else {
+            image_out[b] = tmp[0];
+            image_out[b + 1] = tmp[1];
+            image_out[b + 2] = tmp[2];
+            image_out[b + 3] = tmp[3];
+        }
+    }
+}
+
+// ── FFI export (RGB→RGB matrix transform, m4-189) ────────────────────────────
+
+/// Materialize one side's TRC tables from raw pointers.
+///
+/// Returns `None` on any null pointer, `lutsize < 2`, `lutsize` above the C
+/// `int` domain (negative values arrive as huge `size_t` and must not reach
+/// slice construction), or the LUT/coefficient slices below. The caller only
+/// invokes this for nonlinear sides (mirroring this wrapper's `nonlinearlut`
+/// flags); linear sides bind empty tables and additionally tolerate null
+/// pointers and any `lutsize`.
+#[allow(clippy::type_complexity)]
+unsafe fn trc_side<'a>(
+    lut0: *const f32,
+    lut1: *const f32,
+    lut2: *const f32,
+    coeff0: *const f32,
+    coeff1: *const f32,
+    coeff2: *const f32,
+    lutsize: usize,
+) -> Option<([&'a [f32]; 3], [&'a [f32]; 3])> {
+    if lut0.is_null()
+        || lut1.is_null()
+        || lut2.is_null()
+        || coeff0.is_null()
+        || coeff1.is_null()
+        || coeff2.is_null()
+        || lutsize < 2
+        || lutsize > i32::MAX as usize
+    {
+        return None;
+    }
+    Some((
+        [
+            std::slice::from_raw_parts(lut0, lutsize),
+            std::slice::from_raw_parts(lut1, lutsize),
+            std::slice::from_raw_parts(lut2, lutsize),
+        ],
+        [
+            std::slice::from_raw_parts(coeff0, 3),
+            std::slice::from_raw_parts(coeff1, 3),
+            std::slice::from_raw_parts(coeff2, 3),
+        ],
+    ))
+}
+
+/// RGB→RGB via the premultiplied profile matrix (`_transform_matrix_rgb`
+/// loops).
+///
+/// `image_in`/`image_out` each hold `4*width*height` floats (RGBA) and must
+/// not overlap (matching the C `restrict` qualifiers; no in-place support).
+/// `matrix` holds 16 floats: the C wrapper's premultiplied TRANSPOSED product
+/// (`transpose_3xSSE(to->matrix_out * from->matrix_in)`) exactly as stored.
+/// The `lut_in_*` / `coeff_in_*` triple is the source profile's `lut_in` /
+/// `unbounded_coeffs_in` (`lutsize_in` floats per LUT — the source profile's
+/// own `lutsize` — 3 floats per coefficient slice), used only when
+/// `nonlinear_from != 0`; the `lut_out_*` / `coeff_out_*` triple is the
+/// destination profile's `lut_out` / `unbounded_coeffs_out` (`lutsize_out`
+/// floats per LUT), used only when `nonlinear_to != 0`. A LUT whose first
+/// entry is negative marks a linear channel (passed through). Unused sides
+/// tolerate null pointers and any `lutsize`. Output lane 3 follows the C
+/// loops exactly: preserved when `nonlinear_to != 0`, otherwise the matrix
+/// zero-padding product (0.0 for finite inputs, NaN for infinite ones).
+/// Lane-3 behavior assumes the normal 4-channel vector build
+/// (`DT_NO_VECTORIZATION` is commented out in `src/common/darktable.h`);
+/// not a target otherwise.
+///
+/// # Safety
+/// All pointers dereferenced on the taken paths must be valid for the stated
+/// lengths; the C caller forwards the profiles' own tables over exactly
+/// `4*width*height` floats.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_iop_profile_matrix_rgb(
+    image_in: *const f32,
+    image_out: *mut f32,
+    width: usize,
+    height: usize,
+    matrix: *const f32,
+    lut_in_r: *const f32,
+    lut_in_g: *const f32,
+    lut_in_b: *const f32,
+    coeff_in_r: *const f32,
+    coeff_in_g: *const f32,
+    coeff_in_b: *const f32,
+    lut_out_r: *const f32,
+    lut_out_g: *const f32,
+    lut_out_b: *const f32,
+    coeff_out_r: *const f32,
+    coeff_out_g: *const f32,
+    coeff_out_b: *const f32,
+    lutsize_in: usize,
+    lutsize_out: usize,
+    nonlinear_from: i32,
+    nonlinear_to: i32,
+) {
+    if image_in.is_null() || image_out.is_null() || matrix.is_null() {
+        return;
+    }
+    // No in-place callers exist and the C marks these pointers `restrict`:
+    // reject exact aliasing up front rather than building overlapping slices.
+    if std::ptr::eq(image_in, image_out) {
+        return;
+    }
+    if width == 0
+        || height == 0
+        || width > i32::MAX as usize
+        || height > i32::MAX as usize
+    {
+        return;
+    }
+    // with width, height <= i32::MAX the pixel product still needs checking
+    // (4*width*height can overflow usize in theory); validate BEFORE
+    // constructing the slices (the safe kernel re-checks defensively)
+    let Some(npixels) = width.checked_mul(height) else {
+        return;
+    };
+    let Some(pix_len) = npixels.checked_mul(4) else {
+        return;
+    };
+    let nonlinear_from = nonlinear_from != 0;
+    let nonlinear_to = nonlinear_to != 0;
+    // TRC tables materialize only for nonlinear sides; linear sides bind
+    // empty tables (never touched by the kernel) and skip pointer/lutsize
+    // validation entirely.
+    let empty: &[f32] = &[];
+    let (luts_in, coeffs_in) = if nonlinear_from {
+        let Some(t) = trc_side(
+            lut_in_r, lut_in_g, lut_in_b, coeff_in_r, coeff_in_g, coeff_in_b, lutsize_in,
+        ) else {
+            return;
+        };
+        t
+    } else {
+        ([empty, empty, empty], [empty, empty, empty])
+    };
+    let (luts_out, coeffs_out) = if nonlinear_to {
+        let Some(t) = trc_side(
+            lut_out_r, lut_out_g, lut_out_b, coeff_out_r, coeff_out_g, coeff_out_b,
+            lutsize_out,
+        ) else {
+            return;
+        };
+        t
+    } else {
+        ([empty, empty, empty], [empty, empty, empty])
+    };
+    let image_in = std::slice::from_raw_parts(image_in, pix_len);
+    let image_out = std::slice::from_raw_parts_mut(image_out, pix_len);
+    let matrix = std::slice::from_raw_parts(matrix, 16);
+    matrix_rgb(
+        image_in,
+        image_out,
+        matrix,
+        luts_in,
+        coeffs_in,
+        lutsize_in,
+        nonlinear_from,
+        luts_out,
+        coeffs_out,
+        lutsize_out,
+        nonlinear_to,
+        width,
+        height,
+    )
 }
 
 // ── FFI export (tone curves, m4-187) ───────────────────────────────────────────
@@ -1602,5 +2092,583 @@ mod tests {
             }
         }
         assert!(out.iter().all(|&v| v == 7.0)); // untouched
+    }
+
+    // ── m4-189 RGB→RGB matrix-transform tests ────────────────────────────────
+
+    /// 2-entry LUT mapping `v` in `[0,1)` to `0.5 + 0.5*v` (lerp between the
+    /// entries): `0.5 -> 0.75`, `0.25 -> 0.625`, `0.75 -> 0.875` — all dyadic
+    /// and hence bit-exact — distinguishing mapped channels from passthrough
+    /// ones. `lut[0]` is non-negative, so the channel is active.
+    fn scale_lut() -> Vec<f32> {
+        vec![0.5, 1.0]
+    }
+
+    /// Constant-2 exponential fit: `eval_exp([1,2,0], v) == 2.0` for every
+    /// `v` (`powf(_, 0.0) == 1.0` is C99-mandated), pinning the `v >= 1.0`
+    /// tail including exactly 1.0.
+    fn const2_coeff() -> [f32; 3] {
+        [1.0, 2.0, 0.0]
+    }
+
+    #[test]
+    fn matrix_rgb_flag_paths_and_alpha() {
+        // identity matrix + scale LUTs + const-2 tails: every (nf, nt) combo
+        // is bit-exact by hand computation, pinning which lanes the C loops
+        // write. Input lanes: 0.5 (LUT region), 1.5 (exp region -> 2.0),
+        // 0.25 (LUT region); output prefilled with -7.0 to detect untouched
+        // lanes (preserved alpha shows the PREFILL, not the input alpha).
+        let m = identity_matrix();
+        let sc = scale_lut();
+        let c2 = const2_coeff();
+        let image_in = vec![0.5f32, 1.5, 0.25, 0.9];
+        // linearize(0.5)=0.75, linearize(1.5)=2.0, linearize(0.25)=0.625;
+        // delinearize(0.75)=0.875, delinearize(2.0)=2.0, delinearize(0.625)=0.8125.
+        let cases: [((bool, bool), [f32; 4]); 4] = [
+            ((false, false), [0.5, 1.5, 0.25, 0.0]),
+            ((true, false), [0.75, 2.0, 0.625, 0.0]),
+            ((false, true), [0.75, 2.0, 0.625, -7.0]),
+            ((true, true), [0.875, 2.0, 0.8125, -7.0]),
+        ];
+        for ((nf, nt), expected) in cases {
+            let mut out = vec![-7.0f32; 4];
+            matrix_rgb(
+                &image_in, &mut out, &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, nf,
+                [&sc, &sc, &sc], [&c2, &c2, &c2], 2, nt, 1, 1,
+            );
+            assert_eq!(out, expected.to_vec(), "nf={nf} nt={nt}");
+            for (o, e) in out.iter().zip(expected.iter()) {
+                assert_eq!(o.to_bits(), e.to_bits(), "nf={nf} nt={nt}");
+            }
+            // the divergent reference agrees bit-exactly on every path
+            let mut refr = vec![-7.0f32; 4];
+            ref_matrix_rgb(
+                &image_in, &mut refr, &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, nf,
+                [&sc, &sc, &sc], [&c2, &c2, &c2], 2, nt, 1, 1,
+            );
+            assert_eq!(refr, expected.to_vec(), "ref nf={nf} nt={nt}");
+        }
+    }
+
+    #[test]
+    fn matrix_rgb_linear_alpha_zero_product() {
+        // linear path writes lane 3 through the matrix (zero padding), not by
+        // preserving the input alpha: permute matrix moves lanes 0..2 and
+        // zeroes lane 3 whatever it held.
+        let m = permute_matrix();
+        let empty: Vec<f32> = vec![];
+        let e = empty.as_slice();
+        for &alpha in &[0.0f32, 0.7, 1.0, -3.25] {
+            let image_in = vec![0.1f32, 0.5, 0.9, alpha];
+            let mut out = vec![-1.0f32; 4];
+            matrix_rgb(
+                &image_in, &mut out, &m, [e, e, e], [e, e, e], 0, false,
+                [e, e, e], [e, e, e], 0, false, 1, 1,
+            );
+            assert_eq!(out, vec![0.5, 0.9, 0.1, 0.0], "alpha={alpha}");
+            assert_eq!(out[3].to_bits(), 0.0f32.to_bits());
+        }
+        // infinite RGB input: 0.0 * inf is NaN, and the C loop (like the
+        // shared helper) computes lane 3 rather than forcing 0.0.
+        let image_in = vec![f32::INFINITY, 0.5, 0.25, 1.0];
+        let mut out = vec![-1.0f32; 4];
+        matrix_rgb(
+            &image_in, &mut out, &m, [e, e, e], [e, e, e], 0, false,
+            [e, e, e], [e, e, e], 0, false, 1, 1,
+        );
+        assert!(out[3].is_nan(), "out={out:?}");
+    }
+
+    #[test]
+    fn matrix_rgb_linear_nan_input_propagates() {
+        // Linear path, identity matrix: NaN in lane 0 contaminates every lane
+        // through the multiply (0.0 * NaN is NaN); nothing on this path forces
+        // lanes, unlike the nonlinear alpha-preserve path.
+        let m = identity_matrix();
+        let empty: Vec<f32> = vec![];
+        let e = empty.as_slice();
+        let image_in = vec![f32::NAN, 0.5, 0.25, 1.0];
+        let mut out = vec![-1.0f32; 4];
+        matrix_rgb(
+            &image_in, &mut out, &m, [e, e, e], [e, e, e], 0, false,
+            [e, e, e], [e, e, e], 0, false, 1, 1,
+        );
+        for c in 0..4 {
+            assert!(out[c].is_nan(), "lane {c} must propagate NaN: {out:?}");
+        }
+    }
+
+    #[test]
+    fn matrix_rgb_sentinel_passthrough() {
+        // green TRCs marked linear on both sides: R/B map through the scale
+        // LUT on the way in and out, G passes the value through untouched —
+        // on the way in (`rgb[c] = in[c]`) AND on the way out
+        // (`out[c] = temp[c]`).
+        let m = identity_matrix();
+        let sc = scale_lut();
+        let lin = linear_lut();
+        let c = identity_coeff();
+        let image_in = vec![0.5f32, 0.5, 0.5, 0.9];
+        let mut out = vec![-7.0f32; 4];
+        matrix_rgb(
+            &image_in, &mut out, &m, [&sc, &lin, &sc], [&c, &c, &c], 2, true,
+            [&sc, &lin, &sc], [&c, &c, &c], 2, true, 1, 1,
+        );
+        // lin: [0.75, 0.5, 0.75]; dl: [0.875, 0.5, 0.875]; alpha prefill kept.
+        assert_eq!(out, vec![0.875, 0.5, 0.875, -7.0]);
+        let mut refr = vec![-7.0f32; 4];
+        ref_matrix_rgb(
+            &image_in, &mut refr, &m, [&sc, &lin, &sc], [&c, &c, &c], 2, true,
+            [&sc, &lin, &sc], [&c, &c, &c], 2, true, 1, 1,
+        );
+        assert_eq!(refr, out);
+    }
+
+    #[test]
+    fn matrix_rgb_premultiplied_equivalence() {
+        // the C wrapper premultiplies once per image; one kernel call with
+        // the standard 4x4 product C = A*B must equal the chained A-then-B
+        // application up to f32 rounding (different association order), while
+        // the kernel-vs-reference comparison on C itself is bit-exact.
+        let a = vec![
+            0.9, 0.1, 0.05, 0.0, //
+            0.2, 0.8, 0.1, 0.0, //
+            0.05, 0.15, 0.7, 0.0, //
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        let b = vec![
+            1.1, 0.0, 0.1, 0.0, //
+            0.05, 0.9, 0.0, 0.0, //
+            0.1, 0.05, 1.2, 0.0, //
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        let mut c = vec![0.0f32; 16];
+        for row in 0..4 {
+            for col in 0..4 {
+                let mut s = 0.0f32;
+                for k in 0..4 {
+                    s += a[row * 4 + k] * b[k * 4 + col];
+                }
+                c[row * 4 + col] = s;
+            }
+        }
+        let empty: Vec<f32> = vec![];
+        let e = empty.as_slice();
+        for &(w, h) in &[(1usize, 1usize), (3, 2), (5, 4)] {
+            let mut image_in = vec![0.0f32; 4 * w * h];
+            lcg_fill(&mut image_in, 0x1890 + w as u32 * 17 + h as u32, 1.5);
+            let mut chained = vec![0.0f32; 4 * w * h];
+            let mut step = vec![0.0f32; 4 * w * h];
+            matrix_rgb(
+                &image_in, &mut step, &a, [e, e, e], [e, e, e], 0, false,
+                [e, e, e], [e, e, e], 0, false, w, h,
+            );
+            matrix_rgb(
+                &step, &mut chained, &b, [e, e, e], [e, e, e], 0, false,
+                [e, e, e], [e, e, e], 0, false, w, h,
+            );
+            let mut combined = vec![0.0f32; 4 * w * h];
+            matrix_rgb(
+                &image_in, &mut combined, &c, [e, e, e], [e, e, e], 0, false,
+                [e, e, e], [e, e, e], 0, false, w, h,
+            );
+            // non-vacuous: the product is not the identity
+            assert!(
+                combined
+                    .iter()
+                    .zip(image_in.iter())
+                    .any(|(o, i)| (o - i).abs() > 1e-3),
+                "w={w} h={h}"
+            );
+            for (o, r) in combined.iter().zip(chained.iter()) {
+                // NaN never appears for these finite inputs; compare relative
+                assert!(
+                    (o - r).abs() <= 1e-5 * r.abs().max(1.0),
+                    "w={w} h={h}: {o} vs {r}"
+                );
+            }
+            // ... while the reference on the product itself is bit-exact
+            let mut refr = vec![0.0f32; 4 * w * h];
+            ref_matrix_rgb(
+                &image_in, &mut refr, &c, [e, e, e], [e, e, e], 0, false,
+                [e, e, e], [e, e, e], 0, false, w, h,
+            );
+            assert_eq!(combined, refr, "w={w} h={h}");
+            for (o, r) in combined.iter().zip(refr.iter()) {
+                assert_eq!(o.to_bits(), r.to_bits(), "w={w} h={h}");
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_rgb_matches_reference_over_lcg() {
+        // kernel vs structurally divergent reference: bit-exact (to_bits)
+        // over all four (nonlinear_from, nonlinear_to) combos, mixed
+        // per-side sentinel LUT sets, and — unlike m4-187/188 — DIFFERENT
+        // input/output lutsizes (the two profiles carry their own).
+        let luts5: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.2, 0.5, 0.9, 1.0],
+            vec![0.1, 0.3, 0.4, 0.8, 1.0],
+            vec![0.0, 0.0, 0.6, 0.7, 1.0],
+        ];
+        let lin5 = vec![-1.0f32, 0.2, 0.5, 0.9, 1.0];
+        let coeff_sets: Vec<[f32; 3]> = vec![[1.0, 1.2, 0.9], [0.8, 1.0, 1.1], [1.1, 0.9, 1.0]];
+        let out_lut = scale_lut();
+        let out_lin = linear_lut();
+        let c2 = const2_coeff();
+        let matrices = [identity_matrix(), permute_matrix(), srgb_like_matrix()];
+        // (in-mask, out-mask): which channels carry active TRCs per side
+        let masks: Vec<([bool; 3], [bool; 3])> = vec![
+            ([true, true, true], [true, true, true]),
+            ([true, false, true], [false, true, false]),
+            ([false, false, false], [true, true, true]),
+            ([true, true, true], [false, false, false]),
+        ];
+        for m in &matrices {
+            for (in_mask, out_mask) in &masks {
+                let li: [&[f32]; 3] = [
+                    if in_mask[0] { &luts5[0] } else { &lin5 },
+                    if in_mask[1] { &luts5[1] } else { &lin5 },
+                    if in_mask[2] { &luts5[2] } else { &lin5 },
+                ];
+                let lo: [&[f32]; 3] = [
+                    if out_mask[0] { &out_lut } else { &out_lin },
+                    if out_mask[1] { &out_lut } else { &out_lin },
+                    if out_mask[2] { &out_lut } else { &out_lin },
+                ];
+                for &(nf, nt) in &[(false, false), (true, false), (false, true), (true, true)]
+                {
+                    for &(w, h) in &[(1usize, 1usize), (2, 1), (3, 2), (5, 4)] {
+                        let mut image_in = vec![0.0f32; 4 * w * h];
+                        // [-0.5, 1.5): clamp, LUT and exp regions, near 1.0
+                        lcg_fill(&mut image_in, 0x1891 + w as u32 * 17 + h as u32, 2.0);
+                        for v in image_in.iter_mut().step_by(4) {
+                            *v -= 0.5;
+                        }
+                        if !image_in.is_empty() {
+                            image_in[0] = 1.0;
+                            if image_in.len() > 4 {
+                                image_in[4] = -0.0;
+                            }
+                            if image_in.len() > 8 {
+                                image_in[8] = 0.999_999_9;
+                            }
+                        }
+                        let mut direct = vec![-33.0f32; 4 * w * h];
+                        let mut refr = vec![-33.0f32; 4 * w * h];
+                        matrix_rgb(
+                            &image_in, &mut direct, m, li,
+                            [&coeff_sets[0], &coeff_sets[1], &coeff_sets[2]], 5, nf, lo,
+                            [&c2, &c2, &c2], 2, nt, w, h,
+                        );
+                        ref_matrix_rgb(
+                            &image_in, &mut refr, m, li,
+                            [&coeff_sets[0], &coeff_sets[1], &coeff_sets[2]], 5, nf, lo,
+                            [&c2, &c2, &c2], 2, nt, w, h,
+                        );
+                        assert_eq!(direct, refr, "masks={in_mask:?}/{out_mask:?} nf={nf} nt={nt} w={w} h={h}");
+                        for (d, r) in direct.iter().zip(refr.iter()) {
+                            assert_eq!(
+                                d.to_bits(),
+                                r.to_bits(),
+                                "masks={in_mask:?}/{out_mask:?} nf={nf} nt={nt} w={w} h={h}"
+                            );
+                        }
+                        // alpha lanes: written on matrix-direct paths only
+                        for px in 0..w * h {
+                            if nt {
+                                assert_eq!(
+                                    direct[px * 4 + 3].to_bits(),
+                                    (-33.0f32).to_bits(),
+                                    "alpha preserved nf={nf} nt={nt}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_rgb_degenerate_guards_no_op() {
+        let m = identity_matrix();
+        let short_m = vec![1.0f32; 15];
+        let sc = scale_lut();
+        let c2 = const2_coeff();
+        let empty: Vec<f32> = vec![];
+        let e = empty.as_slice();
+        // zero dims leave buffers untouched (kernel + reference, all paths)
+        for &(w, h) in &[(0usize, 4usize), (4usize, 0usize), (0usize, 0usize)] {
+            for &(nf, nt) in &[(false, false), (true, true)] {
+                let inn: Vec<f32> = vec![0.5; 64];
+                let mut out = vec![9.0f32; 64];
+                matrix_rgb(
+                    &inn, &mut out, &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, nf,
+                    [&sc, &sc, &sc], [&c2, &c2, &c2], 2, nt, w, h,
+                );
+                assert!(out.iter().all(|&v| v == 9.0), "w={w} h={h}");
+                let mut ref_out = vec![9.0f32; 64];
+                ref_matrix_rgb(
+                    &inn, &mut ref_out, &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, nf,
+                    [&sc, &sc, &sc], [&c2, &c2, &c2], 2, nt, w, h,
+                );
+                assert!(ref_out.iter().all(|&v| v == 9.0), "ref w={w} h={h}");
+            }
+        }
+        // short images / short matrix: no-op, no panic
+        let (w, h) = (4usize, 4usize);
+        let mut inn = vec![0.0f32; 4 * w * h];
+        lcg_fill(&mut inn, 0x5E90, 2.0);
+        let mut out = vec![9.0f32; 4 * w * h];
+        matrix_rgb(
+            &inn[..10], &mut out, &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        matrix_rgb(
+            &inn, &mut out[..10], &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        matrix_rgb(
+            &inn, &mut out, &short_m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        matrix_rgb(
+            &inn, &mut out, &[], [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        assert!(out.iter().all(|&v| v == 9.0));
+        // nonlinear side with short tables / degenerate lutsize: no-op
+        let short_lut = vec![0.5f32; 1];
+        let short_c = vec![1.0f32; 2];
+        let mut o = vec![9.0f32; 4 * w * h];
+        // short input LUT (len 1 < lutsize 2)
+        matrix_rgb(
+            &inn, &mut o, &m, [&short_lut, &sc, &sc], [&c2, &c2, &c2], 2, true,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        // short input coeffs (len 2 < 3)
+        matrix_rgb(
+            &inn, &mut o, &m, [&sc, &sc, &sc], [&short_c, &c2, &c2], 2, true,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        // degenerate input lutsize
+        matrix_rgb(
+            &inn, &mut o, &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 1, true,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        // short output LUT / degenerate output lutsize
+        matrix_rgb(
+            &inn, &mut o, &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true,
+            [&short_lut, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        matrix_rgb(
+            &inn, &mut o, &m, [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 0, true, w, h,
+        );
+        assert!(o.iter().all(|&v| v == 9.0));
+        // linear sides skip table validation entirely: EMPTY tables still run
+        let mut o = vec![9.0f32; 4 * w * h];
+        matrix_rgb(
+            &inn, &mut o, &m, [e, e, e], [e, e, e], 0, false, [e, e, e], [e, e, e],
+            0, false, w, h,
+        );
+        assert!(!o.iter().all(|&v| v == 9.0)); // ran: identity matrix copied RGB
+        // one side linear + other nonlinear: only the nonlinear side is gated
+        let mut o = vec![9.0f32; 4 * w * h];
+        matrix_rgb(
+            &inn, &mut o, &m, [e, e, e], [e, e, e], 0, false,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        assert!(!o.iter().all(|&v| v == 9.0));
+        let mut o = vec![9.0f32; 4 * w * h];
+        ref_matrix_rgb(
+            &inn, &mut o, &m, [e, e, e], [e, e, e], 0, false,
+            [&sc, &sc, &sc], [&c2, &c2, &c2], 2, true, w, h,
+        );
+        assert!(!o.iter().all(|&v| v == 9.0));
+        // boundary dimension arithmetic must no-op without panicking
+        matrix_rgb(
+            &[], &mut [], &m, [e, e, e], [e, e, e], 0, false, [e, e, e], [e, e, e],
+            0, false, usize::MAX, 1,
+        );
+        ref_matrix_rgb(
+            &[], &mut [], &m, [e, e, e], [e, e, e], 0, false, [e, e, e], [e, e, e],
+            0, false, usize::MAX, 1,
+        );
+    }
+
+    #[test]
+    fn matrix_rgb_ffi_round_trip() {
+        // FFI calls agree with the safe kernel on every flag combo, with
+        // distinct per-side lutsizes.
+        let luts5: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.2, 0.5, 0.9, 1.0],
+            vec![0.1, 0.3, 0.4, 0.8, 1.0],
+            vec![0.0, 0.0, 0.6, 0.7, 1.0],
+        ];
+        let coeff_sets: Vec<[f32; 3]> = vec![[1.0, 1.2, 0.9], [0.8, 1.0, 1.1], [1.1, 0.9, 1.0]];
+        let out_lut = scale_lut();
+        let c2 = const2_coeff();
+        let matrices = [identity_matrix(), permute_matrix(), srgb_like_matrix()];
+        for m in &matrices {
+            for &(nf, nt) in &[(false, false), (true, false), (false, true), (true, true)] {
+                for &(w, h) in &[(4usize, 2usize), (5usize, 3usize)] {
+                    let mut image_in = vec![0.0f32; 4 * w * h];
+                    lcg_fill(&mut image_in, 0xFF90 + w as u32, 2.0);
+                    let mut ffi_out = vec![-3.0f32; 4 * w * h];
+                    let mut direct = vec![-3.0f32; 4 * w * h];
+                    unsafe {
+                        darkroom_iop_profile_matrix_rgb(
+                            image_in.as_ptr(),
+                            ffi_out.as_mut_ptr(),
+                            w,
+                            h,
+                            m.as_ptr(),
+                            luts5[0].as_ptr(),
+                            luts5[1].as_ptr(),
+                            luts5[2].as_ptr(),
+                            coeff_sets[0].as_ptr(),
+                            coeff_sets[1].as_ptr(),
+                            coeff_sets[2].as_ptr(),
+                            out_lut.as_ptr(),
+                            out_lut.as_ptr(),
+                            out_lut.as_ptr(),
+                            c2.as_ptr(),
+                            c2.as_ptr(),
+                            c2.as_ptr(),
+                            5,
+                            2,
+                            nf as i32,
+                            nt as i32,
+                        );
+                    }
+                    matrix_rgb(
+                        &image_in, &mut direct, m,
+                        [&luts5[0], &luts5[1], &luts5[2]],
+                        [&coeff_sets[0], &coeff_sets[1], &coeff_sets[2]],
+                        5, nf,
+                        [&out_lut, &out_lut, &out_lut],
+                        [&c2, &c2, &c2],
+                        2, nt, w, h,
+                    );
+                    assert_eq!(ffi_out, direct, "nf={nf} nt={nt} w={w} h={h}");
+                    for (f, d) in ffi_out.iter().zip(direct.iter()) {
+                        assert_eq!(f.to_bits(), d.to_bits(), "nf={nf} nt={nt}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_rgb_ffi_guards() {
+        let m = identity_matrix();
+        let sc = scale_lut();
+        let c2 = const2_coeff();
+        let inn: Vec<f32> = vec![0.5; 64];
+        let mut out = vec![7.0f32; 64];
+        unsafe {
+            // null image/matrix pointers (each, one at a time)
+            darkroom_iop_profile_matrix_rgb(
+                std::ptr::null(), out.as_mut_ptr(), 4, 4, m.as_ptr(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), 2, 2, 1, 1,
+            );
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), std::ptr::null_mut(), 4, 4, m.as_ptr(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), 2, 2, 1, 1,
+            );
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, 4, std::ptr::null(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), 2, 2, 1, 1,
+            );
+            // null input LUT with nonlinear_from: guarded no-op ...
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, 4, m.as_ptr(), std::ptr::null(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), 2, 2, 1, 1,
+            );
+            // null output LUT / coeff with nonlinear_to: guarded no-op ...
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, 4, m.as_ptr(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                std::ptr::null(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), 2, 2, 1, 1,
+            );
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, 4, m.as_ptr(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                std::ptr::null(), 2, 2, 1, 1,
+            );
+            // ... but degenerate input lutsize with linear_from: tables
+            // untouched, so the call below (flags 0,0 with nulls) must RUN.
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, 4, m.as_ptr(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), 1, 0, 1, 1,
+            );
+            // zero dims
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 0, 4, m.as_ptr(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), 2, 2, 1, 1,
+            );
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, 0, m.as_ptr(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), 2, 2, 1, 1,
+            );
+            // huge lutsize on a nonlinear side: no-op, no slice-construction UB
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, 4, m.as_ptr(), sc.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), usize::MAX, 2, 1, 1,
+            );
+            // i32::MAX caps (C ints arrive non-negative; negatives would wrap
+            // to huge size_t and must not reach slice construction)
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), (i32::MAX as usize) + 1, 4, m.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), c2.as_ptr(), 2, 2, 1, 1,
+            );
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, (i32::MAX as usize) + 1, m.as_ptr(),
+                sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), sc.as_ptr(), sc.as_ptr(), sc.as_ptr(), c2.as_ptr(),
+                c2.as_ptr(), c2.as_ptr(), 2, 2, 1, 1,
+            );
+        }
+        assert!(out.iter().all(|&v| v == 7.0)); // untouched
+        // linear sides tolerate null LUTs and any lutsize: runs (identity
+        // matrix copies RGB, zeroes alpha).
+        let mut out = vec![7.0f32; 64];
+        unsafe {
+            darkroom_iop_profile_matrix_rgb(
+                inn.as_ptr(), out.as_mut_ptr(), 4, 4, m.as_ptr(), std::ptr::null(),
+                std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(), std::ptr::null(), std::ptr::null(), usize::MAX,
+                usize::MAX, 0, 0,
+            );
+        }
+        for px in 0..16 {
+            assert_eq!(out[px * 4], 0.5);
+            assert_eq!(out[px * 4 + 1], 0.5);
+            assert_eq!(out[px * 4 + 2], 0.5);
+            assert_eq!(out[px * 4 + 3].to_bits(), 0.0f32.to_bits());
+        }
     }
 }
