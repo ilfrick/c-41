@@ -4593,3 +4593,23 @@ duplication; `powf` bit-parity scope clarified as preview-path only.
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-12 16:05 UTC — m4-190 fixup: header comment terminated the C comment
+
+**Commit** `ffdb1cfe65` (GitHub + Gitea) — **CI had failed on `02be58279b`**
+
+**What.** The m4-190 `darkroom_core.h` doc wrote `lut_in_*/coeff_in_*`, whose `*/`
+closed the `/* ... */` comment early; every TU including the header then failed
+under Release `-Werror` with `unknown type name 'coeff_in_'` (`bauhaus.c`,
+`act_on.c`, `bilateral.c`, ...). Reworded to name the four tables without an
+embedded `*/` sequence. No code change.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 again. CI green on the fixup
+(to be confirmed via check-runs).
+
+**Notes — why it escaped.** `scripts/ci-local.sh` covers the Rust workspace and
+the `c41-rs` link, not the full C CMake build; the breaking shape (comment text
+only) is invisible to all four local steps. The `CMake + Rust workspace` CI job
+is the authoritative check for header edits — that is exactly what caught it.
+
