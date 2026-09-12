@@ -4568,3 +4568,28 @@ note, added the exact-alias guard, and added NaN plus output-side-null assertion
 and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-12 15:36 UTC — m4-190: port retouch preview auto-levels loops to Rust FFI
+
+**Commit** `c10cd5e1c2` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `rt_process_stats` and `rt_adjust_levels`
+(`src/iop/retouch.c:3066-3160`), replacing both `DT_OMP_FOR` loops with
+`darkroom_retouch_process_stats` and `darkroom_retouch_adjust_levels`. Extended
+`c41-core::iop::retouch` with safe kernels, divergent references, validated FFI,
+and focused tests; declared both exports in `src/rust_ffi/darkroom_core.h`. C keeps
+the work-profile gating, default-triple early return, and `left`/`right`/
+`in_inv_gamma` derivation; left wavelet/mask/copy helpers and all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **HOLD**, one P0. Fixed the `ch == 3`
+OOB-read/panic in stats (and its reference) by requiring `min_ch = 4` for both
+kernels — well-formed callers always forward `ch == 4` — plus a one-line NOTE for
+the empty-input `levels` divergence. P1 profile-view dedup deferred as acceptable
+duplication; `powf` bit-parity scope clarified as preview-path only.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release tests,
+and the `c41-rs` release link. Remaining warnings are pre-existing and outside this
+change.
+
