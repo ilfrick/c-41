@@ -3757,6 +3757,28 @@ void darkroom_bilateral_slice_to_output(const float *grid_buf,
                                         float detail);
 
 /*
+ * Bilateral-grid slice (src/common/bilateral.c, m4-191).
+ *
+ * darkroom_bilateral_slice replaces the loop body of dt_bilateral_slice():
+ * each output pixel is first copied from the input pixel, then out[L] is set
+ * to max(0, L + norm*interp) with norm = -detail*sigma_r*0.04 and interp the
+ * 8-tap trilinear read of the blurred grid (z fastest, then x, then y). Only
+ * the L channel is recomputed; colour and alpha are copied through.
+ * `in_buf` and `out_buf` may be the same buffer (each pixel L is read before
+ * its own write, and no pixel reads another pixel data, as in the in-place
+ * retouch, monochrome and colormapping callers); otherwise they must not
+ * overlap. Null pointers, degenerate dims (a grid axis < 2, non-positive
+ * image dims), and overflowing dim products are guarded no-ops; the stated
+ * buffer lengths remain a caller contract.
+ */
+void darkroom_bilateral_slice(const float *grid_buf,
+                              size_t size_x, size_t size_y, size_t size_z,
+                              float sigma_s_inv, float sigma_r_inv, float sigma_r,
+                              int width, int height,
+                              const float *in_buf, float *out_buf,
+                              float detail);
+
+/*
  * Edge-avoiding wavelets soft-threshold synthesize (src/common/eaw.c, m4-182).
  *
  * darkroom_eaw_synthesize replaces the loop body of eaw_synthesize():

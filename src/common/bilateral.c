@@ -136,7 +136,7 @@ size_t dt_bilateral_singlebuffer_size2(const int width,
 }
 #endif /* !HAVE_OPENCL */
 
-static size_t image_to_grid(const dt_bilateral_t *const b,
+static size_t __attribute__((unused)) image_to_grid(const dt_bilateral_t *const b,
                             const int i,
                             const int j,
                             const float L,
@@ -402,39 +402,14 @@ void dt_bilateral_slice(const dt_bilateral_t *const b,
                         const float detail)
 {
   // detail: 0 is leave as is, -1 is bilateral filtered, +1 is contrast boost
-  const float norm = -detail * b->sigma_r * 0.04f;
-  const int ox = b->size_z;
-  const int oy = b->size_x * b->size_z;
-  const int oz = 1;
-  float *const buf = b->buf;
-  const int width = b->width;
-  const int height = b->height;
-
-  if(!buf) return;
-  DT_OMP_FOR(collapse(2))
-  for(int j = 0; j < height; j++)
-  {
-    for(int i = 0; i < width; i++)
-    {
-      size_t index = 4 * (j * width + i);
-      float xf, yf, zf;
-      const float L = in[index];
-      // trilinear lookup:
-      const size_t gi = image_to_grid(b, i, j, L, &xf, &yf, &zf);
-      const float Lout = fmaxf( 0.0f, L
-                         + norm * (buf[gi] * (1.0f - xf) * (1.0f - yf) * (1.0f - zf)
-                                   + buf[gi + ox] * (xf) * (1.0f - yf) * (1.0f - zf)
-                                   + buf[gi + oy] * (1.0f - xf) * (yf) * (1.0f - zf)
-                                   + buf[gi + ox + oy] * (xf) * (yf) * (1.0f - zf)
-                                   + buf[gi + oz] * (1.0f - xf) * (1.0f - yf) * (zf)
-                                   + buf[gi + ox + oz] * (xf) * (1.0f - yf) * (zf)
-                                   + buf[gi + oy + oz] * (1.0f - xf) * (yf) * (zf)
-                                   + buf[gi + ox + oy + oz] * (xf) * (yf) * (zf)));
-      // copy color and mask, then update L
-      copy_pixel(out + index, in + index);
-      out[index] = Lout;
-    }
-  }
+  // Live data-parallel loop ported to Rust (m4-191): the trilinear
+  // read-back + norm scaling + MAX(0, ...) copy now runs in
+  // darkroom_bilateral_slice. Splat/merge reductions and the
+  // recursive blur-line passes above are untouched.
+  if(!b || !b->buf) return;
+  darkroom_bilateral_slice(b->buf, b->size_x, b->size_y, b->size_z,
+                           b->sigma_s_inv, b->sigma_r_inv, b->sigma_r,
+                           b->width, b->height, in, out, detail);
 }
 
 DT_OMP_DECLARE_SIMD(aligned(out, in :64))

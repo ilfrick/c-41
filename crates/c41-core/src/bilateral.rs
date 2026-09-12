@@ -81,13 +81,6 @@ impl Bilateral {
         }
     }
 
-    /// Grid → 8-neighbour trilinear index + fractions (matches `image_to_grid`).
-    #[inline]
-    fn image_to_grid(&self, i: usize, j: usize, l: f32) -> (usize, f32, f32, f32) {
-        grid_lookup(self.size_x, self.size_y, self.size_z,
-                    self.sigma_s_inv, self.sigma_r_inv, i, j, l)
-    }
-
     /// Scatter each pixel's L into the grid (matches `dt_bilateral_splat`, serial).
     /// `input` is packed RGBA `f32` (`width*height*4`); L is channel 0.
     pub fn splat(&mut self, input: &[f32]) {
@@ -143,17 +136,12 @@ impl Bilateral {
     /// `dt_bilateral_slice`). `detail`: 0 = unchanged, −1 = bilateral smooth,
     /// +1 = contrast boost. `output` is packed RGBA (colour/alpha copied from
     /// `input`, only L updated); `input`/`output` are `width*height*4`.
+    /// Delegates to [`slice_kernel`] so the method and the FFI export below run
+    /// one implementation.
     pub fn slice(&self, input: &[f32], output: &mut [f32], detail: f32) {
-        let norm = -detail * self.sigma_r * 0.04;
-        for j in 0..self.height {
-            for i in 0..self.width {
-                let index = 4 * (j * self.width + i);
-                let l = input[index];
-                let (gi, xf, yf, zf) = self.image_to_grid(i, j, l);
-                output[index..index + 4].copy_from_slice(&input[index..index + 4]);
-                output[index] = (l + norm * self.interp(gi, xf, yf, zf)).max(0.0);
-            }
-        }
+        slice_kernel(&self.buf, self.size_x, self.size_y, self.size_z,
+                     self.sigma_s_inv, self.sigma_r_inv, self.sigma_r,
+                     self.width, self.height, input, output, detail);
     }
 
     /// Like [`Bilateral::slice`] but **accumulates** into L and does NOT copy the
@@ -165,19 +153,11 @@ impl Bilateral {
                                self.sigma_s_inv, self.sigma_r_inv, self.sigma_r,
                                self.width, self.height, input, output, detail);
     }
-
-    /// 8-tap trilinear read of the blurred grid at cell `gi` with fractions
-    /// `(xf,yf,zf)`. Shared by [`Bilateral::slice`] and
-    /// [`Bilateral::slice_to_output`] so they can't drift.
-    #[inline]
-    fn interp(&self, gi: usize, xf: f32, yf: f32, zf: f32) -> f32 {
-        interp_grid(&self.buf, self.size_x, self.size_z, gi, xf, yf, zf)
-    }
 }
 
 /// Grid → 8-neighbour trilinear index + fractions (matches C `image_to_grid`).
-/// Free-function core of [`Bilateral::image_to_grid`] so the method and the
-/// [`slice_to_output_kernel`] below run one implementation. Stride convention
+/// Shared by the [`slice_kernel`] / [`slice_to_output_kernel`] slice kernels
+/// below so they run one implementation. Stride convention
 /// matches the C: `ox = size_z`, `oy = size_x*size_z`, `oz = 1`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -198,7 +178,8 @@ fn grid_lookup(size_x: usize, size_y: usize, size_z: usize,
 /// `(xf,yf,zf)`, in the **exact C tap order**
 /// (`gi, +ox, +oy, +ox+oy, +oz, +ox+oz, +oy+oz, +ox+oy+oz`) with the C's
 /// left-associative per-tap factor chains (`buf * (1-xf) * (1-yf) * (1-zf)`).
-/// Free-function core of [`Bilateral::interp`].
+/// Shared by the [`slice_kernel`] / [`slice_to_output_kernel`] slice kernels
+/// so they can't drift.
 #[inline]
 fn interp_grid(grid: &[f32], size_x: usize, size_z: usize,
                gi: usize, xf: f32, yf: f32, zf: f32) -> f32 {
@@ -341,6 +322,144 @@ fn slice_to_output_reference(grid: &[f32],
     }
 }
 
+/// Safe `dt_bilateral_slice` kernel (m4-191): copies each packed-RGBA pixel
+/// from `input` to `output`, then recomputes L as
+/// `out[L] = max(0, L + norm·interp)` with `norm = −detail·sigma_r·0.04` and
+/// `interp` the 8-tap trilinear read of the blurred grid.
+///
+/// `grid` holds `size_x·size_y·size_z` floats (z fastest, then x, then y);
+/// `input`/`output` each hold `width·height·4` packed-RGBA floats (L is channel
+/// 0). `input` and `output` may be the same buffer — each pixel's L is read
+/// before its own write and no pixel reads another pixel's data, as in the
+/// in-place `retouch` / `monochrome` / `colormapping` callers — but must not
+/// partially overlap.
+///
+/// Invalid inputs (a grid axis < 2 — trilinear taps need ≥ 2 cells —, zero
+/// image dims, or slice lengths disagreeing with the dims) are a silent no-op
+/// rather than a panic, so the FFI export below can share this body.
+#[allow(clippy::too_many_arguments)]
+pub fn slice_kernel(grid: &[f32],
+                    size_x: usize, size_y: usize, size_z: usize,
+                    sigma_s_inv: f32, sigma_r_inv: f32, sigma_r: f32,
+                    width: usize, height: usize,
+                    input: &[f32], output: &mut [f32], detail: f32) {
+    let cells = match size_x.checked_mul(size_y).and_then(|v| v.checked_mul(size_z)) {
+        Some(n) if n != 0 => n,
+        _ => return,
+    };
+    if size_x < 2 || size_y < 2 || size_z < 2 || width == 0 || height == 0 {
+        return;
+    }
+    let npix = match width.checked_mul(height).and_then(|v| v.checked_mul(4)) {
+        Some(n) => n,
+        None => return,
+    };
+    if grid.len() != cells || input.len() < npix || output.len() < npix {
+        return;
+    }
+    // detail: 0 is leave as is, −1 is bilateral filtered, +1 is contrast boost
+    let norm = -detail * sigma_r * 0.04;
+    for j in 0..height {
+        for i in 0..width {
+            let index = 4 * (j * width + i);
+            let l = input[index];
+            // trilinear lookup:
+            let (gi, xf, yf, zf) =
+                grid_lookup(size_x, size_y, size_z, sigma_s_inv, sigma_r_inv, i, j, l);
+            let interp = interp_grid(grid, size_x, size_z, gi, xf, yf, zf);
+            // copy colour and alpha, then update L (matches C `copy_pixel` + write)
+            output[index..index + 4].copy_from_slice(&input[index..index + 4]);
+            output[index] = (l + norm * interp).max(0.0);
+        }
+    }
+}
+
+/// Structurally divergent reference for [`slice_kernel`]: flat pixel loop,
+/// hand-rolled clamp/index math, an offsets-table + weight-array accumulation
+/// instead of nested loops and one long tap expression, and a per-channel copy
+/// staged through a temporary pixel instead of `copy_from_slice`. Each tap
+/// keeps the kernel's exact left-associative factor chain and taps accumulate
+/// in the same order, so agreement checks spelling-level equivalence; the
+/// hand-computed tap tests remain the backstop against identical drift.
+#[allow(clippy::too_many_arguments)]
+fn slice_reference(grid: &[f32],
+                   size_x: usize, size_y: usize, size_z: usize,
+                   sigma_s_inv: f32, sigma_r_inv: f32, sigma_r: f32,
+                   width: usize, height: usize,
+                   input: &[f32], output: &mut [f32], detail: f32) {
+    let cells = match size_x.checked_mul(size_y).and_then(|v| v.checked_mul(size_z)) {
+        Some(n) if n != 0 => n,
+        _ => return,
+    };
+    if size_x < 2 || size_y < 2 || size_z < 2 || width == 0 || height == 0 {
+        return;
+    }
+    let npix = match width.checked_mul(height).and_then(|v| v.checked_mul(4)) {
+        Some(n) => n,
+        None => return,
+    };
+    if grid.len() != cells || input.len() < npix || output.len() < npix {
+        return;
+    }
+    let norm = -detail * sigma_r * 0.04;
+    let ox = size_z;
+    let oy = size_x * size_z;
+    let oz = 1usize;
+    let npixels = width * height;
+    for p in 0..npixels {
+        let i = p % width;
+        let j = p / width;
+        let index = 4 * p;
+        let l = input[index];
+        // grid cell + fractions, spelled out without the shared helpers:
+        let mut x = i as f32 * sigma_s_inv;
+        if x < 0.0 { x = 0.0; } else if x > (size_x - 1) as f32 { x = (size_x - 1) as f32; }
+        let mut y = j as f32 * sigma_s_inv;
+        if y < 0.0 { y = 0.0; } else if y > (size_y - 1) as f32 { y = (size_y - 1) as f32; }
+        let mut z = l * sigma_r_inv;
+        if z < 0.0 { z = 0.0; } else if z > (size_z - 1) as f32 { z = (size_z - 1) as f32; }
+        let mut xi = x as usize;
+        if xi > size_x - 2 { xi = size_x - 2; }
+        let mut yi = y as usize;
+        if yi > size_y - 2 { yi = size_y - 2; }
+        let mut zi = z as usize;
+        if zi > size_z - 2 { zi = size_z - 2; }
+        let gi = ((xi + yi * size_x) * size_z) + zi;
+        let xf = x - xi as f32;
+        let yf = y - yi as f32;
+        let zf = z - zi as f32;
+        // same 8 taps in the same order, via an offset table + weight array:
+        let taps = [gi, gi + ox, gi + oy, gi + ox + oy,
+                    gi + oz, gi + ox + oz, gi + oy + oz, gi + ox + oy + oz];
+        let ax = 1.0 - xf;
+        let ay = 1.0 - yf;
+        let az = 1.0 - zf;
+        let weights = [
+            grid[taps[0]] * ax * ay * az,
+            grid[taps[1]] * xf * ay * az,
+            grid[taps[2]] * ax * yf * az,
+            grid[taps[3]] * xf * yf * az,
+            grid[taps[4]] * ax * ay * zf,
+            grid[taps[5]] * xf * ay * zf,
+            grid[taps[6]] * ax * yf * zf,
+            grid[taps[7]] * xf * yf * zf,
+        ];
+        let mut interp = weights[0];
+        for w in weights.iter().skip(1) {
+            interp += *w;
+        }
+        // copy colour and alpha channel by channel, then update L:
+        let mut px = [0.0f32; 4];
+        for c in 0..4 {
+            px[c] = input[index + c];
+        }
+        px[0] = (l + norm * interp).max(0.0);
+        for c in 0..4 {
+            output[index + c] = px[c];
+        }
+    }
+}
+
 // ── FFI boundary (m4-180): `dt_bilateral_slice_to_output` in
 // `src/common/bilateral.c` forwards its grid fields + pixel buffers here
 // instead of running the OpenMP loop in C. Runs the SAME serial scalar code
@@ -405,6 +524,73 @@ pub unsafe extern "C" fn darkroom_bilateral_slice_to_output(
     slice_to_output_kernel(grid, size_x, size_y, size_z,
                            sigma_s_inv, sigma_r_inv, sigma_r,
                            w, h, input, output, detail);
+}
+
+// ── FFI boundary (m4-191): `dt_bilateral_slice` in
+// `src/common/bilateral.c` forwards its grid fields + pixel buffers here
+// instead of running the OpenMP loop in C. Runs the SAME serial scalar code
+// as [`slice_kernel`] (which [`Bilateral::slice`] delegates to), so
+// method-level tests pin both callers at once; dedicated FFI parity tests
+// re-drive this export against the kernel and the reference.
+
+/// # Safety
+/// `grid` must hold `size_x·size_y·size_z` floats (z fastest, then x, then y —
+/// `dt_bilateral_t.buf`); `input`/`output` each hold `width·height·4`
+/// packed-RGBA floats. `input` and `output` may be the same buffer (the
+/// `retouch`, `monochrome` and `colormapping` callers pass `in` as `out`:
+/// each pixel's L is read before its own write, and no pixel reads another
+/// pixel's data) but must not partially overlap. Null pointers, degenerate
+/// dims (a grid axis < 2, non-positive image dims), and overflowing dim
+/// products are guarded no-ops; the stated buffer lengths remain a caller
+/// contract.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn darkroom_bilateral_slice(
+    grid: *const f32,
+    size_x: usize,
+    size_y: usize,
+    size_z: usize,
+    sigma_s_inv: f32,
+    sigma_r_inv: f32,
+    sigma_r: f32,
+    width: i32,
+    height: i32,
+    input: *const f32,
+    output: *mut f32,
+    detail: f32,
+) {
+    if grid.is_null() || input.is_null() || output.is_null() {
+        return;
+    }
+    // Trilinear taps need ≥ 2 cells per axis; real grids are always ≥ 5 per
+    // axis (`dt_bilateral_init` sizes are ceil()+1 over dims clamped to ≥ 4) —
+    // this only guards corrupt callers instead of indexing out of bounds.
+    if size_x < 2 || size_y < 2 || size_z < 2 {
+        return;
+    }
+    // Same i32-cast wrap guard as the other grid exports: the lookup casts
+    // pixel coords with `as usize`, and real grids are ≤ 3001 cells per axis.
+    if size_x > i32::MAX as usize || size_y > i32::MAX as usize || size_z > i32::MAX as usize {
+        return;
+    }
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let (w, h) = (width as usize, height as usize);
+    let cells = match size_x.checked_mul(size_y).and_then(|v| v.checked_mul(size_z)) {
+        Some(n) => n,
+        None => return,
+    };
+    let npix = match w.checked_mul(h).and_then(|v| v.checked_mul(4)) {
+        Some(n) => n,
+        None => return,
+    };
+    let grid = std::slice::from_raw_parts(grid, cells);
+    let input = std::slice::from_raw_parts(input, npix);
+    let output = std::slice::from_raw_parts_mut(output, npix);
+    slice_kernel(grid, size_x, size_y, size_z,
+                 sigma_s_inv, sigma_r_inv, sigma_r,
+                 w, h, input, output, detail);
 }
 
 /// Separable `[1 4 6 4 1]/16` Gaussian along the `offset3` axis (`size3` elements),
@@ -869,6 +1055,283 @@ mod tests {
                                        w, h, &input, &mut a, detail);
                 slice_to_output_reference(&grid, sx, sy, sz, ss_inv, sr_inv, sr,
                                           w, h, &input, &mut r, detail);
+                for p in 0..w * h * 4 {
+                    assert_eq!(a[p].to_bits(), r[p].to_bits(),
+                               "kernel vs reference differ at {p} case {k} detail {detail}");
+                }
+            }
+        }
+    }
+
+    // ── m4-191: `dt_bilateral_slice` kernel tests ──
+
+    /// Drive the safe slice kernel directly on a hand-built grid (bypasses
+    /// `Bilateral::new` so a tiny synthetic grid is possible).
+    fn run_slice(grid: &[f32], sx: usize, sy: usize, sz: usize,
+                 ss_inv: f32, sr_inv: f32, sr: f32,
+                 w: usize, h: usize, input: &[f32],
+                 detail: f32) -> Vec<f32> {
+        let mut out = vec![f32::NAN; w * h * 4];
+        slice_kernel(grid, sx, sy, sz, ss_inv, sr_inv, sr,
+                     w, h, input, &mut out, detail);
+        out
+    }
+
+    #[test]
+    fn slice_trilinear_weights_match_hand_computed_taps() {
+        // 2×2×2 grid, unit inverse sigmas, one pixel at L=0.5 with distinct
+        // colour channels: x=0,y=0,z=0.5 → base cell 0, xf=yf=0, zf=0.5, so
+        // only the two z taps contribute: interp = buf[0]*0.5 + buf[1]*0.5
+        // = 10*0.5+20*0.5 = 15.
+        let grid = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let input = [0.5f32, 7.0, 8.0, 9.0];
+        // detail −1, sigma_r 25 → norm = 1*25*0.04 = 1:
+        // out[L] = max(0, 0.5+15) = 15.5; colour/alpha copied through.
+        let out = run_slice(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, -1.0);
+        assert_eq!(out[0].to_bits(), 15.5f32.to_bits(), "z taps wrong: {}", out[0]);
+        assert_eq!(out[1].to_bits(), 7.0f32.to_bits());
+        assert_eq!(out[2].to_bits(), 8.0f32.to_bits());
+        assert_eq!(out[3].to_bits(), 9.0f32.to_bits());
+
+        // Two-pixel-wide image: pixel (1,0) has x=1 → xi clamps to 0 with
+        // xf=1, so the +ox taps take over:
+        // interp = buf[2]*0.5 + buf[3]*0.5 = 30*0.5+40*0.5 = 35.
+        let input2 = [0.5f32, 7.0, 8.0, 9.0, 0.5, 1.0, 2.0, 3.0];
+        let out2 = run_slice(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 2, 1, &input2, -1.0);
+        assert_eq!(out2[0].to_bits(), 15.5f32.to_bits(), "pixel 0 moved: {}", out2[0]);
+        assert_eq!(out2[4].to_bits(), 35.5f32.to_bits(), "x taps wrong: {}", out2[4]);
+        assert_eq!(out2[5].to_bits(), 1.0f32.to_bits());
+        assert_eq!(out2[7].to_bits(), 3.0f32.to_bits());
+    }
+
+    #[test]
+    fn slice_detail_zero_copies_input_bit_exact() {
+        // detail 0 ⇒ norm 0 ⇒ L unchanged AND colour copied: the whole pixel
+        // is bit-identical to the input.
+        let grid = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let input = [0.5f32, 7.25, -3.0, 9.5, 99.0, 1.0, 2.0, 0.0];
+        let out = run_slice(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 2, 1, &input, 0.0);
+        for p in 0..8 {
+            assert_eq!(out[p].to_bits(), input[p].to_bits(),
+                       "detail 0 changed lane {p}: {} vs {}", out[p], input[p]);
+        }
+    }
+
+    #[test]
+    fn slice_detail_sign_and_scale_behave() {
+        // Same synthetic setup as above: interp = 15 at the single pixel.
+        let grid = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let input = [50.0f32, 7.0, 8.0, 9.0];
+        // detail −1 adds, detail +1 subtracts: with L=50 both stay clear of
+        // the clamp, so the deltas are exact opposites in sign.
+        let neg = run_slice(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, -1.0);
+        let pos = run_slice(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, 1.0);
+        assert!(neg[0] > 50.0, "detail −1 should brighten: {}", neg[0]);
+        assert!(pos[0] < 50.0, "detail +1 should darken: {}", pos[0]);
+        assert!((neg[0] - 50.0 + (pos[0] - 50.0)).abs() < 1e-4,
+                "sign not symmetric: {neg:?} vs {pos:?}");
+        // Doubling the magnitude doubles the delta bit-exactly
+        // (out − L = norm·interp; scaling by 2 is exact in binary FP).
+        let one = run_slice(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, -1.0);
+        let two = run_slice(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, -2.0);
+        assert_eq!((two[0] - 50.0).to_bits(), (2.0 * (one[0] - 50.0)).to_bits(),
+                   "detail scale not exact: {} vs {}", two[0], one[0]);
+    }
+
+    #[test]
+    fn slice_negative_result_clamps_to_zero() {
+        // detail +1 with L=0.5 drives L negative → MAX(0, …) clamps.
+        let grid = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let input = [0.5f32, 7.0, 8.0, 9.0];
+        let out = run_slice(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, 1.0);
+        assert_eq!(out[0].to_bits(), 0.0f32.to_bits(), "expected hard clamp, got {}", out[0]);
+        // Colour/alpha still copy through under the clamp.
+        assert_eq!(out[1].to_bits(), 7.0f32.to_bits());
+        assert_eq!(out[3].to_bits(), 9.0f32.to_bits());
+    }
+
+    #[test]
+    fn slice_nan_poison_is_deterministic() {
+        // A NaN L poisons the trilinear weights to NaN, so L + norm·interp is
+        // NaN and f32::max (like C fmaxf) returns the other argument: 0.0.
+        // Kernel and reference must agree to the bit, and colour must still
+        // copy through untouched.
+        let grid = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let input = [f32::NAN, 7.0, 8.0, 9.0];
+        let mut a = vec![0.0f32; 4];
+        let mut r = vec![0.0f32; 4];
+        slice_kernel(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, &mut a, -1.0);
+        slice_reference(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, &mut r, -1.0);
+        for p in 0..4 {
+            assert_eq!(a[p].to_bits(), r[p].to_bits(),
+                       "kernel vs reference differ at {p} under NaN L");
+        }
+        assert_eq!(a[0].to_bits(), 0.0f32.to_bits(), "NaN L must clamp to 0, got {}", a[0]);
+        assert_eq!(a[1].to_bits(), 7.0f32.to_bits());
+        // A NaN grid cell poisons the same way (finite L, NaN tap).
+        let mut nan_grid = grid;
+        nan_grid[1] = f32::NAN;
+        let finite = [0.5f32, 7.0, 8.0, 9.0];
+        let mut a2 = vec![0.0f32; 4];
+        let mut r2 = vec![0.0f32; 4];
+        slice_kernel(&nan_grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &finite, &mut a2, -1.0);
+        slice_reference(&nan_grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &finite, &mut r2, -1.0);
+        for p in 0..4 {
+            assert_eq!(a2[p].to_bits(), r2[p].to_bits(),
+                       "kernel vs reference differ at {p} under NaN grid");
+        }
+        assert_eq!(a2[0].to_bits(), 0.0f32.to_bits(), "NaN grid must clamp to 0, got {}", a2[0]);
+    }
+
+    #[test]
+    fn slice_degenerate_and_short_inputs_are_noops() {
+        let grid = [1.0f32; 8];
+        let input = [10.0f32, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0,
+                     18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0];
+        // grid axis < 2 (trilinear needs a neighbour cell):
+        let mut out = vec![3.0f32; 16];
+        slice_kernel(&grid[..4], 1, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, &mut out, -1.0);
+        assert!(out.iter().all(|&v| v == 3.0), "size_x<2 must no-op");
+        // zero image dims:
+        let mut out = vec![3.0f32; 4];
+        slice_kernel(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 0, 1, &[], &mut out, -1.0);
+        assert!(out.iter().all(|&v| v == 3.0), "width 0 must no-op");
+        // short grid / input / output slices:
+        let mut out = vec![3.0f32; 16];
+        slice_kernel(&grid[..7], 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, &mut out, -1.0);
+        assert!(out.iter().all(|&v| v == 3.0), "short grid must no-op");
+        slice_kernel(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input[..3], &mut out, -1.0);
+        assert!(out.iter().all(|&v| v == 3.0), "short input must no-op");
+        let mut short_out = vec![3.0f32; 3];
+        slice_kernel(&grid, 2, 2, 2, 1.0, 1.0, 25.0, 1, 1, &input, &mut short_out, -1.0);
+        assert!(short_out.iter().all(|&v| v == 3.0), "short output must no-op");
+    }
+
+    #[test]
+    fn slice_ffi_guards_leave_output_untouched() {
+        // Null pointers and degenerate dims must no-op, never crash.
+        let grid = [1.0f32; 8];
+        let input = [10.0f32; 16];
+        let mut out = [3.0f32; 16];
+        unsafe {
+            darkroom_bilateral_slice(
+                std::ptr::null(), 2, 2, 2, 1.0, 1.0, 25.0, 1, 1,
+                input.as_ptr(), out.as_mut_ptr(), -1.0);
+            darkroom_bilateral_slice(
+                grid.as_ptr(), 2, 2, 2, 1.0, 1.0, 25.0, 1, 1,
+                std::ptr::null(), out.as_mut_ptr(), -1.0);
+            darkroom_bilateral_slice(
+                grid.as_ptr(), 2, 2, 2, 1.0, 1.0, 25.0, 1, 1,
+                input.as_ptr(), std::ptr::null_mut(), -1.0);
+            // degenerate grid axis / image dims:
+            darkroom_bilateral_slice(
+                grid.as_ptr(), 1, 2, 2, 1.0, 1.0, 25.0, 1, 1,
+                input.as_ptr(), out.as_mut_ptr(), -1.0);
+            darkroom_bilateral_slice(
+                grid.as_ptr(), 2, 1, 2, 1.0, 1.0, 25.0, 1, 1,
+                input.as_ptr(), out.as_mut_ptr(), -1.0);
+            darkroom_bilateral_slice(
+                grid.as_ptr(), 2, 2, 1, 1.0, 1.0, 25.0, 1, 1,
+                input.as_ptr(), out.as_mut_ptr(), -1.0);
+            darkroom_bilateral_slice(
+                grid.as_ptr(), 2, 2, 2, 1.0, 1.0, 25.0, 0, 1,
+                input.as_ptr(), out.as_mut_ptr(), -1.0);
+            darkroom_bilateral_slice(
+                grid.as_ptr(), 2, 2, 2, 1.0, 1.0, 25.0, 1, 0,
+                input.as_ptr(), out.as_mut_ptr(), -1.0);
+            darkroom_bilateral_slice(
+                grid.as_ptr(), 2, 2, 2, 1.0, 1.0, 25.0, 1, -2,
+                input.as_ptr(), out.as_mut_ptr(), -1.0);
+        }
+        assert!(out.iter().all(|&v| v == 3.0), "guarded FFI calls must no-op: {out:?}");
+    }
+
+    #[test]
+    fn slice_ffi_matches_kernel_and_method_bit_exact() {
+        // A realistic blurred grid through all three entry points must agree
+        // to the bit — including the in-place (input == output) aliasing the
+        // `retouch` / `monochrome` / `colormapping` callers rely on.
+        let (w, h) = (24usize, 18usize);
+        let inp = img(w, h, |i, j| ((i * 7 + j * 13) % 100) as f32);
+        let mut b = Bilateral::new(w, h, 6.0, 10.0);
+        b.splat(&inp);
+        b.blur();
+        for detail in [-1.0f32, -0.25, 0.0, 0.5, 2.0] {
+            let mut via_method = vec![f32::NAN; w * h * 4];
+            b.slice(&inp, &mut via_method, detail);
+            let mut via_kernel = vec![f32::NAN; w * h * 4];
+            slice_kernel(&b.buf, b.size_x, b.size_y, b.size_z,
+                         b.sigma_s_inv, b.sigma_r_inv, b.sigma_r,
+                         w, h, &inp, &mut via_kernel, detail);
+            let mut via_ffi = vec![f32::NAN; w * h * 4];
+            unsafe {
+                darkroom_bilateral_slice(
+                    b.buf.as_ptr(), b.size_x, b.size_y, b.size_z,
+                    b.sigma_s_inv, b.sigma_r_inv, b.sigma_r,
+                    w as i32, h as i32,
+                    inp.as_ptr(), via_ffi.as_mut_ptr(), detail);
+            }
+            for p in 0..w * h * 4 {
+                assert_eq!(via_kernel[p].to_bits(), via_method[p].to_bits(),
+                           "kernel vs method differ at {p} (detail {detail})");
+                assert_eq!(via_ffi[p].to_bits(), via_method[p].to_bits(),
+                           "FFI vs method differ at {p} (detail {detail})");
+            }
+            // in-place aliasing: out starts as a copy of in, FFI reads L from
+            // the same buffer it writes back into.
+            let mut aliased = inp.clone();
+            unsafe {
+                darkroom_bilateral_slice(
+                    b.buf.as_ptr(), b.size_x, b.size_y, b.size_z,
+                    b.sigma_s_inv, b.sigma_r_inv, b.sigma_r,
+                    w as i32, h as i32,
+                    aliased.as_ptr(), aliased.as_mut_ptr(), detail);
+            }
+            let mut separate = vec![f32::NAN; w * h * 4];
+            unsafe {
+                darkroom_bilateral_slice(
+                    b.buf.as_ptr(), b.size_x, b.size_y, b.size_z,
+                    b.sigma_s_inv, b.sigma_r_inv, b.sigma_r,
+                    w as i32, h as i32,
+                    inp.as_ptr(), separate.as_mut_ptr(), detail);
+            }
+            for p in 0..w * h {
+                assert_eq!(aliased[4 * p].to_bits(), separate[4 * p].to_bits(),
+                           "aliasing changed L at pixel {p} (detail {detail})");
+                for c in 1..4 {
+                    assert_eq!(aliased[4 * p + c].to_bits(), inp[4 * p + c].to_bits(),
+                               "aliasing touched channel {c} at pixel {p}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slice_matches_reference_bit_exact() {
+        // Kernel vs the structurally divergent reference over varied grid
+        // shapes, sigma scales, L ranges (incl. negative and > 100, which hit
+        // the clamp rails), and detail signs.
+        let cases = [
+            (2usize, 2usize, 2usize, 1.0f32, 1.0f32, 25.0f32),
+            (3, 4, 5, 0.5, 0.2, 8.0),
+            (5, 3, 6, 2.0, 0.05, 40.0),
+        ];
+        for (k, &(sx, sy, sz, ss_inv, sr_inv, sr)) in cases.iter().enumerate() {
+            let (w, h) = (8usize, 6usize);
+            let grid: Vec<f32> = (0..sx * sy * sz)
+                .map(|n| ((n * 37 + k * 11) % 97) as f32 * 0.7 - 5.0)
+                .collect();
+            let input = img(w, h, |i, j| {
+                // span the clamp rails: negative, in-range, and over-100 L
+                [-12.0, 0.0, 37.5, 100.0, 140.0][(i + 3 * j + k) % 5]
+            });
+            for detail in [-2.0f32, -1.0, 0.0, 0.75, 10.0] {
+                let mut a = vec![1.5f32; w * h * 4];
+                let mut r = vec![1.5f32; w * h * 4];
+                slice_kernel(&grid, sx, sy, sz, ss_inv, sr_inv, sr,
+                             w, h, &input, &mut a, detail);
+                slice_reference(&grid, sx, sy, sz, ss_inv, sr_inv, sr,
+                                w, h, &input, &mut r, detail);
                 for p in 0..w * h * 4 {
                     assert_eq!(a[p].to_bits(), r[p].to_bits(),
                                "kernel vs reference differ at {p} case {k} detail {detail}");
