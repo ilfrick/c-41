@@ -3071,41 +3071,29 @@ static void rt_process_stats(dt_iop_module_t *self,
                              const int ch,
                              float levels[3])
 {
-  const size_t size = (size_t)width * height * ch;
-  float l_max = -FLT_MAX;
-  float l_min = FLT_MAX;
-  float l_sum = 0.f;
-  int count = 0;
   const dt_iop_order_iccprofile_info_t *const work_profile =
     dt_ioppr_get_pipe_work_profile_info(piece->pipe);
 
-  DT_OMP_FOR(reduction(+ : count, l_sum) reduction(max : l_max) reduction(min : l_min))
-  for(int i = 0; i < size; i += ch)
+  if(work_profile)
   {
-    dt_aligned_pixel_t Lab = { 0 };
-
-    if(work_profile)
-    {
-      dt_ioppr_rgb_matrix_to_lab(img_src + i, Lab, work_profile->matrix_in_transposed,
-                                  work_profile->lut_in, work_profile->unbounded_coeffs_in,
-                                  work_profile->lutsize, work_profile->nonlinearlut);
-    }
-    else
-    {
-      dt_aligned_pixel_t XYZ;
-      dt_linearRGB_to_XYZ(img_src + i, XYZ);
-      dt_XYZ_to_Lab(XYZ, Lab);
-    }
-
-    l_max = MAX(l_max, Lab[0]);
-    l_min = MIN(l_min, Lab[0]);
-    l_sum += Lab[0];
-    count++;
+    darkroom_retouch_process_stats(img_src, width, height, ch, levels,
+                                   &work_profile->matrix_in_transposed[0][0],
+                                   work_profile->lut_in[0],
+                                   work_profile->lut_in[1],
+                                   work_profile->lut_in[2],
+                                   &work_profile->unbounded_coeffs_in[0][0],
+                                   &work_profile->unbounded_coeffs_in[1][0],
+                                   &work_profile->unbounded_coeffs_in[2][0],
+                                   work_profile->lutsize,
+                                   work_profile->nonlinearlut,
+                                   1);
   }
-
-  levels[0] = l_min / 100.f;
-  levels[2] = l_max / 100.f;
-  levels[1] = (l_sum / (float)count) / 100.f;
+  else
+  {
+    darkroom_retouch_process_stats(img_src, width, height, ch, levels,
+                                   NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                   0, 0, 0);
+  }
 }
 
 static void rt_adjust_levels(dt_iop_module_t *self,
@@ -3116,7 +3104,6 @@ static void rt_adjust_levels(dt_iop_module_t *self,
                              const int ch,
                              const float levels[3])
 {
-  const int size = width * height * ch;
   const dt_iop_order_iccprofile_info_t *const work_profile =
     dt_ioppr_get_pipe_work_profile_info(piece->pipe);
 
@@ -3132,57 +3119,36 @@ static void rt_adjust_levels(dt_iop_module_t *self,
   const float tmp = (middle - mid) / delta;
   const float in_inv_gamma = powf(10, tmp);
 
-  DT_OMP_FOR()
-  for(int i = 0; i < size; i += ch)
+  if(work_profile)
   {
-    if(work_profile)
-    {
-      dt_ioppr_rgb_matrix_to_lab(img_src + i, img_src + i,
-                                 work_profile->matrix_in_transposed,
-                                 work_profile->lut_in,
-                                 work_profile->unbounded_coeffs_in,
-                                 work_profile->lutsize,
-                                 work_profile->nonlinearlut);
-    }
-    else
-    {
-      dt_aligned_pixel_t XYZ;
-
-      dt_linearRGB_to_XYZ(img_src + i, XYZ);
-      dt_XYZ_to_Lab(XYZ, img_src + i);
-    }
-
-    for(int c = 0; c < 1; c++)
-    {
-      const float L_in = img_src[i + c] / 100.0f;
-
-      if(L_in <= left)
-      {
-        img_src[i + c] = 0.f;
-      }
-      else
-      {
-        const float percentage = (L_in - left) / (right - left);
-        img_src[i + c] = 100.0f * powf(percentage, in_inv_gamma);
-      }
-    }
-
-    if(work_profile)
-    {
-      dt_ioppr_lab_to_rgb_matrix(img_src + i, img_src + i,
-                                 work_profile->matrix_out_transposed,
-                                 work_profile->lut_out,
-                                 work_profile->unbounded_coeffs_out,
-                                 work_profile->lutsize,
-                                 work_profile->nonlinearlut);;
-    }
-    else
-    {
-      dt_aligned_pixel_t XYZ;
-
-      dt_Lab_to_XYZ(img_src + i, XYZ);
-      dt_XYZ_to_linearRGB(XYZ, img_src + i);
-    }
+    darkroom_retouch_adjust_levels(img_src, width, height, ch,
+                                   left, right, in_inv_gamma,
+                                   &work_profile->matrix_in_transposed[0][0],
+                                   &work_profile->matrix_out_transposed[0][0],
+                                   work_profile->lut_in[0],
+                                   work_profile->lut_in[1],
+                                   work_profile->lut_in[2],
+                                   &work_profile->unbounded_coeffs_in[0][0],
+                                   &work_profile->unbounded_coeffs_in[1][0],
+                                   &work_profile->unbounded_coeffs_in[2][0],
+                                   work_profile->lut_out[0],
+                                   work_profile->lut_out[1],
+                                   work_profile->lut_out[2],
+                                   &work_profile->unbounded_coeffs_out[0][0],
+                                   &work_profile->unbounded_coeffs_out[1][0],
+                                   &work_profile->unbounded_coeffs_out[2][0],
+                                   work_profile->lutsize,
+                                   work_profile->nonlinearlut,
+                                   1);
+  }
+  else
+  {
+    darkroom_retouch_adjust_levels(img_src, width, height, ch,
+                                   left, right, in_inv_gamma,
+                                   NULL, NULL,
+                                   NULL, NULL, NULL, NULL, NULL, NULL,
+                                   NULL, NULL, NULL, NULL, NULL, NULL,
+                                   0, 0, 0);
   }
 }
 

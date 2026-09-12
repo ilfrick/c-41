@@ -1217,7 +1217,7 @@ void darkroom_basecurve_copy_output(const float *comb0, const float *in_buf,
 void darkroom_color_rgb_to_lab(const float *in_buf, float *out_buf, size_t npixels);
 void darkroom_color_lab_to_rgb(float *buf, size_t npixels);
 
-/* Retouch IOP helpers -- 5 portable DT_OMP_FOR loops. */
+/* Retouch IOP helpers -- 7 portable DT_OMP_FOR loops. */
 void darkroom_retouch_copy_rows(const float *in_buf, float *out_buf,
                                  int y_to, int xoffs, int yoffs,
                                  int in_width, int out_width, int ch,
@@ -1247,6 +1247,57 @@ void darkroom_retouch_fill(float *dest,
                             int mask_roi_x, int mask_roi_y,
                             int mask_w, int mask_h, float opacity,
                             const float *fill_color);
+
+/*
+ * Retouch preview auto-levels (m4-190).
+ *
+ * darkroom_retouch_process_stats replaces the DT_OMP_FOR reduction loop in
+ * rt_process_stats() in src/iop/retouch.c: levels receives
+ * [min/100, mean/100, max/100] of the L channel after working-RGB->Lab.
+ * darkroom_retouch_adjust_levels replaces the DT_OMP_FOR loop in
+ * rt_adjust_levels(): in-place working-RGB->Lab, L scaling
+ * (L_in <= left -> 0, else 100*((L_in-left)/(right-left))^in_inv_gamma),
+ * Lab->working-RGB. left/right/in_inv_gamma are pre-computed by the C
+ * caller, which also keeps the default-triple early return.
+ * matrix_in/matrix_out: 16 floats each (the profile's matrix_in/out_transposed
+ * exactly as stored); lut_in_*/coeff_in_* and lut_out_*/coeff_out_* are the
+ * profile's lut/coeff tables (lutsize floats per LUT, 3 per coeff slice),
+ * used only when nonlinear != 0. With have_profile == 0 the sRGB fallback
+ * runs and all table pointers are ignored (may be NULL).
+ */
+void darkroom_retouch_process_stats(const float *img,
+                                    int width, int height, int ch,
+                                    float *levels,
+                                    const float *matrix_in,
+                                    const float *lut_in_r,
+                                    const float *lut_in_g,
+                                    const float *lut_in_b,
+                                    const float *coeff_in_r,
+                                    const float *coeff_in_g,
+                                    const float *coeff_in_b,
+                                    int lutsize,
+                                    int nonlinear,
+                                    int have_profile);
+void darkroom_retouch_adjust_levels(float *img,
+                                    int width, int height, int ch,
+                                    float left, float right, float in_inv_gamma,
+                                    const float *matrix_in,
+                                    const float *matrix_out,
+                                    const float *lut_in_r,
+                                    const float *lut_in_g,
+                                    const float *lut_in_b,
+                                    const float *coeff_in_r,
+                                    const float *coeff_in_g,
+                                    const float *coeff_in_b,
+                                    const float *lut_out_r,
+                                    const float *lut_out_g,
+                                    const float *lut_out_b,
+                                    const float *coeff_out_r,
+                                    const float *coeff_out_g,
+                                    const float *coeff_out_b,
+                                    int lutsize,
+                                    int nonlinear,
+                                    int have_profile);
 
 /*
  * Hazeremoval IOP -- per-pixel dark channel.
