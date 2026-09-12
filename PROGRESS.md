@@ -4613,3 +4613,29 @@ the `c41-rs` link, not the full C CMake build; the breaking shape (comment text
 only) is invisible to all four local steps. The `CMake + Rust workspace` CI job
 is the authoritative check for header edits — that is exactly what caught it.
 
+---
+
+## 2026-09-12 16:35 UTC — m4-191: port bilateral slice loop to Rust FFI
+
+**Commit** `7f891c0401` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `dt_bilateral_slice` (`src/common/bilateral.c:399`,
+loop `~414-437`), replacing the body with `darkroom_bilateral_slice`. Added a
+`slice_kernel` plus divergent `slice_reference` in `c41-core::bilateral`
+(`Bilateral::slice` now delegates to the kernel); declared the export in
+`src/rust_ffi/darkroom_core.h` next to the m4-180 export. Single shared-body
+replacement covers all 6 downstream callers (`lowpass`, `retouch`, `monochrome`,
+`shadhi`, `colormapping`, `bilat`) with no per-site edits; `in == out` permitted
+(per-pixel read-before-write). Left `splat`/`blur_line` recurrences and all
+unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (four P2
+notes only: formal aliasing-UB caveat shared with m4-180, OpenMP-to-serial
+throughput flag, minor test gaps for follow-up, safe-API guard tightening noted
+as intended).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
