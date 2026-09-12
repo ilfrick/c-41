@@ -1260,8 +1260,8 @@ void darkroom_retouch_fill(float *dest,
  * Lab->working-RGB. left/right/in_inv_gamma are pre-computed by the C
  * caller, which also keeps the default-triple early return.
  * matrix_in/matrix_out: 16 floats each (the profile's matrix_in/out_transposed
- * exactly as stored); lut_in_*/coeff_in_* and lut_out_*/coeff_out_* are the
- * profile's lut/coeff tables (lutsize floats per LUT, 3 per coeff slice),
+ * exactly as stored); the lut_in, coeff_in, lut_out and coeff_out tables are
+ * the profile's lut/coeff tables (lutsize floats per LUT, 3 per coeff slice),
  * used only when nonlinear != 0. With have_profile == 0 the sRGB fallback
  * runs and all table pointers are ignored (may be NULL).
  */
