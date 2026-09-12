@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/dwt.h"
 #include "develop/openmp_maths.h"
+#include "rust_ffi/darkroom_core.h"
 
 // Define the following as TRUE to use nontemporal writes in the decomposition
 // on a 32-core Threadripper, nt writes are 8% slower wiith one thread,
@@ -148,31 +149,15 @@ static inline void blur_2D_Bspline(const float *const restrict in,
                                    const int mult,
                                    const gboolean clip_negatives)
 {
-  // À-trous B-spline interpolation/blur shifted by mult
-  DT_OMP_FOR()
-  for(size_t row = 0; row < height; row++)
-  {
-    // get a thread-private one-row temporary buffer
-    float *restrict const temp = dt_get_perthread(tempbuf, padded_size);
-    // interleave the order in which we process the rows so that we minimize cache misses
-    const size_t i = dwt_interleave_rows(row, height, mult);
-    // Convolve B-spline filter over columns: for each pixel in the current row, compute vertical blur
-    _bspline_vertical_pass(in, temp, i, width, height, mult, clip_negatives);
-    // Convolve B-spline filter horizontally over current row
-    for(size_t j = 0; j < width; j++)
-    {
-#if USE_NONTEMPORAL
-      dt_aligned_pixel_t blur;
-      _bspline_horizontal(temp, blur, j, width, mult, clip_negatives);
-      copy_pixel_nontemporal(out + (i * width + j) * 4, blur);
-#else
-      _bspline_horizontal(temp, out + (i * width + j) * 4, j, width, mult, clip_negatives);
-#endif
-    }
-  }
-#if USE_NONTEMPORAL
-  dt_omploop_sfence();  // ensure that nontemporal writes complete before we attempt to read the output
-#endif
+  // A-trous B-spline blur ported to Rust (m4-192): the separable 5-tap
+  // [1 4 6 4 1] / 16 vertical-then-horizontal pass now runs in
+  // darkroom_blur_2d_bspline (non-nontemporal path only; USE_NONTEMPORAL
+  // is FALSE). tempbuf and padded_size stay in the signature so the
+  // filmicrgb and color-picker callers are unchanged; the Rust side owns
+  // a private row scratch buffer instead.
+  (void)tempbuf;
+  (void)padded_size;
+  darkroom_blur_2d_bspline(in, out, width, height, mult, clip_negatives);
 }
 
 DT_OMP_DECLARE_SIMD(aligned(in, HF, LF:64) aligned(tempbuf:16))

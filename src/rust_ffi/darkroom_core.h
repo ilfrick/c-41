@@ -3969,6 +3969,30 @@ void darkroom_iop_profile_matrix_rgb(const float *image_in,
                                      int nonlinear_from,
                                      int nonlinear_to);
 
+/*
+ * Separable 5-tap B-spline a-trous blur (src/common/bspline.h, m4-192).
+ *
+ * darkroom_blur_2d_bspline replaces the loop body of blur_2D_Bspline():
+ * vertical [1 4 6 4 1] / 16 pass at stride mult into a row scratch buffer,
+ * then the horizontal pass into the output row, with edge-index clamping
+ * and optional MAX(0, ...) clipping when clip_negatives is non-zero. Only
+ * the non-nontemporal path is ported (USE_NONTEMPORAL is FALSE, so that
+ * branch is dead). Rows run serially in the C dwt_interleave_rows order (a
+ * pure cache optimisation over independent rows). Carries its own row
+ * scratch; the C tempbuf and padded_size per-thread plumbing stays in the
+ * C signature so the filmicrgb and color-picker callers are unchanged.
+ * Buffers hold 4*width*height floats each and must not overlap. Null
+ * pointers, zero dims, mult <= 0 and overflowing dim products are guarded
+ * no-ops. Named blur_2d_bspline to stay clear of darkroom_blurs_bspline_2d,
+ * the unrelated single-channel copy in src/iop/blurs.c.
+ */
+void darkroom_blur_2d_bspline(const float *in_buf,
+                              float *out_buf,
+                              size_t width,
+                              size_t height,
+                              int mult,
+                              int clip_negatives);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
