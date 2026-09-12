@@ -4639,3 +4639,28 @@ tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
 
+---
+
+## 2026-09-12 17:05 UTC — m4-192: port bspline blur loop to Rust FFI
+
+**Commit** `c68b41d838` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `blur_2D_Bspline` (`src/common/bspline.h:142`), replacing
+the body with `darkroom_blur_2d_bspline`. Added new `c41-core::bspline` (safe
+kernel, divergent reference, validated FFI, 10 tests; reuses
+`c41-core::math::dwt_interleave_rows`); registered `pub mod bspline` in lib.rs;
+declared the export in `src/rust_ffi/darkroom_core.h` (name checked against the
+unrelated `darkroom_blurs_bspline_2d`). Callers (`filmicrgb.c:1231,:1239`,
+`color_picker.c:494`) untouched via shared-body replacement; `USE_NONTEMPORAL`
+dead branch not ported. Left `decompose_2D_Bspline` and all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (three P2
+notes only: serial-vs-OpenMP throughput tradeoff, unchecked row-alloc multiply
+defense-in-depth, silent `USE_NONTEMPORAL`-flip coupling).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header additions scanned for embedded `*/`
+(only block terminators). Remaining warnings are pre-existing and outside this
+change.
+
