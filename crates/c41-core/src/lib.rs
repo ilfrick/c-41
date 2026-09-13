@@ -38,6 +38,7 @@ pub mod raw;
 pub mod rawimage;
 pub mod roi;
 pub mod splines;
+pub mod thumbnail;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;

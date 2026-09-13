@@ -37,62 +37,15 @@ void dt_iop_flip_and_zoom_8(const uint8_t *in,
                             uint32_t *width,
                             uint32_t *height)
 {
-  // init strides:
-  const uint32_t iwd = (orientation & ORIENTATION_SWAP_XY) ? ih : iw;
-  const uint32_t iht = (orientation & ORIENTATION_SWAP_XY) ? iw : ih;
-  // DO NOT UPSCALE !!!
-  const float scale = fmaxf(1.0, fmaxf(iwd / (float)ow, iht / (float)oh));
-  const uint32_t wd = *width = MIN(ow, iwd / scale);
-  const uint32_t ht = *height = MIN(oh, iht / scale);
-  const int bpp = 4; // bytes per pixel
-  int32_t ii = 0, jj = 0;
-  int32_t si = 1, sj = iw;
-  if(orientation & ORIENTATION_FLIP_Y)
-  {
-    jj = ih - jj - 1;
-    sj = -sj;
-  }
-  if(orientation & ORIENTATION_FLIP_X)
-  {
-    ii = iw - ii - 1;
-    si = -si;
-  }
-  if(orientation & ORIENTATION_SWAP_XY)
-  {
-    int t = sj;
-    sj = si;
-    si = t;
-  }
-  const int32_t half_pixel = .5f * scale;
-  const int32_t offm = half_pixel * bpp * MIN(MIN(0, si), MIN(sj, si + sj));
-  const int32_t offM = half_pixel * bpp * MAX(MAX(0, si), MAX(sj, si + sj));
-  DT_OMP_FOR()
-  for(uint32_t j = 0; j < ht; j++)
-  {
-    uint8_t *out2 = out + bpp * wd * j;
-    const uint8_t *in2 = in + bpp * (iw * jj + ii + sj * (int32_t)(scale * j));
-    float stepi = 0.0f;
-    for(uint32_t i = 0; i < wd; i++)
-    {
-      const uint8_t *in3 = in2 + ((int32_t)stepi) * si * bpp;
-      // this should always be within the bounds of in[], due to the way
-      // wd/ht are constructed by always just rounding down. half_pixel should never
-      // add up to one pixel difference.
-      // we have this check with the hope the branch predictor will get rid of it:
-      if(in3 + offm >= in && in3 + offM < in + bpp * iw * ih)
-      {
-        for(int k = 0; k < 3; k++)
-          out2[k] = // in3[k];
-              CLAMP(((int32_t)in3[bpp * half_pixel * sj + k]
-                     + (int32_t)in3[bpp * half_pixel * (si + sj) + k]
-                     + (int32_t)in3[bpp * half_pixel * si + k] + (int32_t)in3[k])
-                        / 4,
-                    0, 255);
-      }
-      out2 += bpp;
-      stepi += scale;
-    }
-  }
+  // Pixel loop ported to Rust FFI (darkroom_flip_and_zoom_8 in
+  // crates/c41-core/src/thumbnail.rs): per-output-row walk of the input with
+  // float stepi += scale, 4-tap box average, flip-X/flip-Y/swap-XY orientation
+  // via si/sj strides. Signature and orchestration unchanged, so the 3
+  // mipmap_cache.c callers need no edits.
+  const size_t in_len = (iw > 0 && ih > 0) ? (size_t)4 * (size_t)iw * (size_t)ih : 0;
+  const size_t out_len = (ow > 0 && oh > 0) ? (size_t)4 * (size_t)ow * (size_t)oh : 0;
+  darkroom_flip_and_zoom_8(in, iw, ih, out, ow, oh, (uint32_t)orientation, in_len, out_len, width,
+                           height);
 }
 
 void dt_iop_clip_and_zoom_8(const uint8_t *i,

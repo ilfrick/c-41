@@ -4044,6 +4044,34 @@ void darkroom_borders_copy_with_border(float *out,
                                        const float *in,
                                        const struct dt_iop_border_positions_t *binfo);
 
+/*
+ * 8-bit RGBA thumbnail downscale with orientation (src/develop/imageop_math.c,
+ * m4-196).
+ *
+ * darkroom_flip_and_zoom_8 replaces the loop body of dt_iop_flip_and_zoom_8():
+ * per-output-row walk of the input with float stepi += scale, 4-tap box
+ * average over 4 bytes per pixel clamped to 0..255, flip-X / flip-Y / swap-XY
+ * orientation via si/sj strides. Never upscales (scale pinned at >= 1.0);
+ * the in-bounds guard branch and half_pixel tap offsets hold under all 8
+ * orientations. Only RGB lanes are written, alpha is preserved.
+ * orientation carries the ORIENTATION_FLIP_X / ORIENTATION_FLIP_Y /
+ * ORIENTATION_SWAP_XY bits; width and height receive the actual thumbnail
+ * dims. in_len and out_len are the caller buffer sizes in bytes
+ * (4 * iw * ih and 4 * ow * oh); null pointers, degenerate dims, overflowing
+ * dim products and short buffers are guarded no-ops.
+ */
+void darkroom_flip_and_zoom_8(const unsigned char *in_buf,
+                              int iw,
+                              int ih,
+                              unsigned char *out_buf,
+                              int ow,
+                              int oh,
+                              unsigned int orientation,
+                              size_t in_len,
+                              size_t out_len,
+                              unsigned int *width,
+                              unsigned int *height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
