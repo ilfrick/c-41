@@ -27,7 +27,7 @@
 #include "common/bilateral.h"
 #include "common/darktable.h" // for CLAMPS, dt_alloc_align, dt_free_align
 #include "develop/imageop.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_bilateral_slice_to_output
+#include "rust_ffi/darkroom_core.h" // for darkroom_bilateral_{slice_to_output, slice, blur_line}
 #include <glib.h>             // for MIN, MAX
 #include <math.h>             // for roundf
 #include <stdlib.h>           // for size_t, free, malloc, NULL
@@ -331,53 +331,6 @@ static void blur_line_z(float *buf,
   }
 }
 
-DT_OMP_DECLARE_SIMD(aligned(buf:64))
-static void blur_line(float *buf,
-                      const int offset1,
-                      const int offset2,
-                      const int offset3,
-                      const int size1,
-                      const int size2,
-                      const int size3)
-{
-  const float w0 = 6.f / 16.f;
-  const float w1 = 4.f / 16.f;
-  const float w2 = 1.f / 16.f;
-  DT_OMP_FOR()
-  for(int k = 0; k < size1; k++)
-  {
-    size_t index = (size_t)k * offset1;
-    for(int j = 0; j < size2; j++)
-    {
-      float tmp1 = buf[index];
-      buf[index] = buf[index] * w0 + w1 * buf[index + offset3]
-        + w2 * buf[index + 2 * offset3];
-      index += offset3;
-      float tmp2 = buf[index];
-      buf[index] = buf[index] * w0 + w1 * (buf[index + offset3] + tmp1)
-        + w2 * buf[index + 2 * offset3];
-      index += offset3;
-      for(int i = 2; i < size3 - 2; i++)
-      {
-        const float tmp3 = buf[index];
-        buf[index]
-            = buf[index] * w0 + w1 * (buf[index + offset3] + tmp2)
-          + w2 * (buf[index + 2 * offset3] + tmp1);
-        index += offset3;
-        tmp1 = tmp2;
-        tmp2 = tmp3;
-      }
-      const float tmp3 = buf[index];
-      buf[index] = buf[index] * w0 + w1 * (buf[index + offset3] + tmp2) + w2 * tmp1;
-      index += offset3;
-      buf[index] = buf[index] * w0 + w1 * tmp3 + w2 * tmp2;
-      index += offset3;
-      index += offset2 - offset3 * size3;
-    }
-  }
-}
-
-
 void dt_bilateral_blur(const dt_bilateral_t *b)
 {
   if(!b || !b->buf)
@@ -386,10 +339,11 @@ void dt_bilateral_blur(const dt_bilateral_t *b)
   const int ox = b->size_z;
   const int oy = b->size_x * b->size_z;
   const int oz = 1;
+  // gaussian up to 3 sigma (m4-198: serial Rust kernel; lines are
+  // independent so the former OMP split over k was bit-exact)
+  darkroom_bilateral_blur_line(b->buf, oz, oy, ox, b->size_z, b->size_y, b->size_x);
   // gaussian up to 3 sigma
-  blur_line(b->buf, oz, oy, ox, b->size_z, b->size_y, b->size_x);
-  // gaussian up to 3 sigma
-  blur_line(b->buf, oz, ox, oy, b->size_z, b->size_x, b->size_y);
+  darkroom_bilateral_blur_line(b->buf, oz, ox, oy, b->size_z, b->size_x, b->size_y);
   // -2 derivative of the gaussian up to 3 sigma: x*exp(-x*x)
   blur_line_z(b->buf, ox, oy, oz, b->size_x, b->size_y, b->size_z);
 }
@@ -405,7 +359,7 @@ void dt_bilateral_slice(const dt_bilateral_t *const b,
   // Live data-parallel loop ported to Rust (m4-191): the trilinear
   // read-back + norm scaling + MAX(0, ...) copy now runs in
   // darkroom_bilateral_slice. Splat/merge reductions and the
-  // recursive blur-line passes above are untouched.
+  // blur_line_z pass above remain in C.
   if(!b || !b->buf) return;
   darkroom_bilateral_slice(b->buf, b->size_x, b->size_y, b->size_z,
                            b->sigma_s_inv, b->sigma_r_inv, b->sigma_r,
@@ -422,7 +376,7 @@ void dt_bilateral_slice_to_output(const dt_bilateral_t *const b,
   // Live data-parallel loop ported to Rust (m4-180): the trilinear
   // read-back + norm scaling + MAX(0, ...) accumulation now runs in
   // darkroom_bilateral_slice_to_output. Splat/merge reductions and the
-  // recursive blur-line passes above are untouched.
+  // blur_line_z pass above remain in C.
   if(!b || !b->buf) return;
   darkroom_bilateral_slice_to_output(b->buf, b->size_x, b->size_y, b->size_z,
                                      b->sigma_s_inv, b->sigma_r_inv, b->sigma_r,

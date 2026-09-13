@@ -593,6 +593,56 @@ pub unsafe extern "C" fn darkroom_bilateral_slice(
                  w, h, input, output, detail);
 }
 
+// ── FFI boundary (m4-198): `dt_bilateral_blur` in
+// `src/common/bilateral.c` forwards its two Gaussian passes here instead of
+// running the OpenMP `blur_line` in C. Runs the SAME serial scalar code as
+// [`blur_line`] (which [`Bilateral::blur`] delegates to), so method-level
+// tests pin both callers at once; dedicated FFI parity tests re-drive this
+// export against the method. The `blur_line_z` derivative pass stays in C
+// (backup m4-199). Lines are independent — each (k, j) line touches disjoint
+// cells — so the serial loop is bit-exact with the C's `DT_OMP_FOR` split
+// over k: no reduction or cross-line read whose order serial could change.
+
+/// # Safety
+/// `buf` must hold at least
+/// `offset1·(size1−1) + offset2·(size2−1) + offset3·(size3−1) + 1` floats —
+/// the highest index the line loop touches. Cells are mutated strictly in
+/// place, one independent line at a time.
+///
+/// The bound is sound for every input *because* [`blur_line`] early-returns
+/// when `size3 < 4`: with fewer than four cells on the innermost axis the
+/// [1 4 6 4 1] stencil has no valid centre, so no wider indexing occurs.
+/// Null pointers, zero sizes, and overflowing offset bounds are guarded
+/// no-ops; the stated buffer length remains a caller contract.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_bilateral_blur_line(
+    buf: *mut f32,
+    offset1: usize,
+    offset2: usize,
+    offset3: usize,
+    size1: usize,
+    size2: usize,
+    size3: usize,
+) {
+    if buf.is_null() || size1 == 0 || size2 == 0 || size3 == 0 {
+        return;
+    }
+    let max_index = match offset1
+        .checked_mul(size1 - 1)
+        .and_then(|a| a.checked_add(offset2.checked_mul(size2 - 1)?))
+        .and_then(|b| b.checked_add(offset3.checked_mul(size3 - 1)?))
+    {
+        Some(m) => m,
+        None => return,
+    };
+    let len = match max_index.checked_add(1) {
+        Some(n) => n,
+        None => return,
+    };
+    let buf = std::slice::from_raw_parts_mut(buf, len);
+    blur_line(buf, offset1, offset2, offset3, size1, size2, size3);
+}
+
 /// Separable `[1 4 6 4 1]/16` Gaussian along the `offset3` axis (`size3` elements),
 /// for each of size1×size2 lines. In-place, running-buffer boundary handling —
 /// a faithful port of the C `blur_line`.
@@ -1337,6 +1387,57 @@ mod tests {
                                "kernel vs reference differ at {p} case {k} detail {detail}");
                 }
             }
+        }
+    }
+
+    // ── m4-198: `dt_bilateral_blur` Gaussian-pass FFI parity ──
+
+    #[test]
+    fn blur_line_ffi_guards_leave_buffer_untouched() {
+        // Null pointers, zero sizes, and overflowing offset bounds must
+        // no-op, never crash or touch the buffer.
+        let mut buf = [3.0f32; 64];
+        unsafe {
+            darkroom_bilateral_blur_line(std::ptr::null_mut(), 1, 1, 1, 2, 2, 4);
+            darkroom_bilateral_blur_line(buf.as_mut_ptr(), 1, 1, 1, 0, 2, 4);
+            darkroom_bilateral_blur_line(buf.as_mut_ptr(), 1, 1, 1, 2, 0, 4);
+            darkroom_bilateral_blur_line(buf.as_mut_ptr(), 1, 1, 1, 2, 2, 0);
+            // overflowing highest-touched-index bound:
+            darkroom_bilateral_blur_line(buf.as_mut_ptr(), usize::MAX, 1, 1, 2, 2, 4);
+            // degenerate line (size3 < 4): the kernel early-returns, so the
+            // buffer is unchanged (the C reads OOB heap here and survives;
+            // Rust makes it a defined no-op instead).
+            darkroom_bilateral_blur_line(buf.as_mut_ptr(), 1, 8, 2, 2, 2, 2);
+        }
+        assert!(buf.iter().all(|&v| v == 3.0), "guarded FFI calls must no-op: {buf:?}");
+    }
+
+    #[test]
+    fn blur_line_serial_ffi_matches_method_blur_bit_exact() {
+        // The two serial FFI Gaussian passes plus the shared blur_line_z
+        // kernel must reproduce Bilateral::blur to the bit: the method and
+        // the FFI run one implementation, and lines are independent so the
+        // serial loop is bit-exact with the C's former OMP split over k.
+        let (w, h) = (24usize, 18usize);
+        let input = img(w, h, |i, j| ((i * 7 + j * 13) % 100) as f32);
+        let mut m = Bilateral::new(w, h, 6.0, 10.0);
+        m.splat(&input);
+        let mut raw = m.buf.clone();
+        m.blur();
+        let want = m.buf.clone();
+
+        let (sx, sy, sz) = (m.size_x, m.size_y, m.size_z);
+        let ox = sz;
+        let oy = sx * sz;
+        let oz = 1usize;
+        unsafe {
+            darkroom_bilateral_blur_line(raw.as_mut_ptr(), oz, oy, ox, sz, sy, sx);
+            darkroom_bilateral_blur_line(raw.as_mut_ptr(), oz, ox, oy, sz, sx, sy);
+        }
+        blur_line_z(&mut raw, ox, oy, oz, sx, sy, sz);
+        assert_eq!(raw.len(), want.len());
+        for (k, (a, b)) in raw.iter().zip(&want).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "cell {k} diverged after blur");
         }
     }
 }
