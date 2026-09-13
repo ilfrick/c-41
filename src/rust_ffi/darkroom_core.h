@@ -3326,8 +3326,9 @@ void darkroom_blend_mask_tone_curve(float *mask, size_t buffsize,
 void darkroom_blend_invert_raster_mask(float *mask, const float *raster_mask,
                                         size_t obuffsize, float opacity);
 
-/* Replaces the DT_OMP_FOR_SIMD loop at blendif_raw.c:61 and
- * blendif_rgb_jzczhz.c:293 (both identical in-place inversions):
+/* Replaces the identical DT_OMP_FOR in-place inversion loops at
+ * blendif_raw.c:61, blendif_rgb_jzczhz.c:293, blendif_lab.c:229 and
+ * blendif_rgb_hsl.c:269:
  *   mask[x] = global_opacity * (1.0f - mask[x]) for each x in 0..buffsize. */
 void darkroom_blend_invert_and_scale(float *mask, size_t buffsize,
                                       float scale);
