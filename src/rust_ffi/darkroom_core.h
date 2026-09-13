@@ -4024,6 +4024,26 @@ void darkroom_decompose_2d_bspline(const float *in_buf,
                                    size_t height,
                                    int mult);
 
+/*
+ * Border compose helper (src/develop/borders_helper.c, m4-195).
+ *
+ * darkroom_borders_copy_with_border replaces the flat row loop of
+ * dt_iop_copy_image_with_border(): outer-border fill, frameline-band
+ * border/frame/border spans, inner five-span band, and the image band
+ * (left border plus optional inner frame, copied image row sourced at
+ * (row - image_top) * stride, right border plus optional outer frame).
+ * All spans are 4-float RGBA pixels. The old SSE streaming stores become
+ * plain stores, so the trailing sfence is dropped. The struct is declared
+ * here by tag only; the full layout lives in develop/borders_helper.h and
+ * is mirrored by BorderPositions in crates/c41-core/src/borders.rs.
+ * Both callers (borders.c, enlargecanvas.c) keep the same C signature.
+ * Null pointers and degenerate dims are guarded no-ops.
+ */
+struct dt_iop_border_positions_t;
+void darkroom_borders_copy_with_border(float *out,
+                                       const float *in,
+                                       const struct dt_iop_border_positions_t *binfo);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -18,101 +18,19 @@
 
 #include "common/darktable.h"
 #include "develop/borders_helper.h"
+#include "rust_ffi/darkroom_core.h"
 
-// this will be called from inside an OpenMP parallel section, so no
-// need to parallelize further
-static inline void set_pixels(float *buf,
-                              const dt_aligned_pixel_t color,
-                              const int npixels)
-{
-  for(int i = 0; i < npixels; i++)
-  {
-    copy_pixel_nontemporal(buf + 4*i,  color);
-  }
-}
-
-// this will be called from inside an OpenMP parallel section, so no
-// need to parallelize further
-static inline void copy_pixels(float *out,
-                               const float *const in,
-                               const int npixels)
-{
-  for(int i = 0; i < npixels; i++)
-  {
-    copy_pixel_nontemporal(out + 4*i, in + 4*i);
-  }
-}
+// m4-195: the row loop (set_pixels/copy_pixels over the border, frameline
+// and image bands) now lives in crates/c41-core/src/borders.rs as
+// darkroom_borders_copy_with_border. Plain 4-float stores replace the SSE
+// streaming stores, so the trailing sfence is dropped (normal stores need
+// no fence). Signature and orchestration are unchanged.
 
 void dt_iop_copy_image_with_border(float *out,
                                    const float *const in,
                                    const dt_iop_border_positions_t *binfo)
 {
-  const int image_width = binfo->image_right - binfo->image_left;
-  DT_OMP_FOR()
-  for(size_t row = 0; row < binfo->height; row++)
-  {
-    float *outrow = out + 4 * row * binfo->width;
-    if(row < binfo->border_top || row >= binfo->border_bot)
-    {
-      // top/bottom border outside the frameline: entirely the border color
-      set_pixels(outrow, binfo->bcolor, binfo->width);
-    }
-    else if(row < binfo->fl_top || row >= binfo->fl_bot)
-    {
-      // top/bottom frameline
-      set_pixels(outrow, binfo->bcolor, binfo->border_left);
-      set_pixels(outrow + 4*binfo->border_left, binfo->flcolor,
-                 binfo->border_right - binfo->border_left);
-      set_pixels(outrow + 4*binfo->border_right, binfo->bcolor,
-                 binfo->width - binfo->border_right);
-    }
-    else if(row < binfo->image_top || row >= binfo->image_bot)
-    {
-      // top/bottom border inside the frameline
-      set_pixels(outrow, binfo->bcolor, binfo->border_left);
-      set_pixels(outrow + 4*binfo->border_left, binfo->flcolor,
-                 binfo->fl_left - binfo->border_left);
-      set_pixels(outrow + 4*binfo->fl_left, binfo->bcolor,
-                 binfo->fl_right - binfo->fl_left);
-      set_pixels(outrow + 4*binfo->fl_right, binfo->flcolor,
-                 binfo->border_right - binfo->fl_right);
-      set_pixels(outrow + 4*binfo->border_right, binfo->bcolor,
-                 binfo->width - binfo->border_right);
-    }
-    else
-    {
-      // image area: set left border (w/optional frame line), copy
-      // image row, set right border (w/optional frame line) set outer
-      // border
-      set_pixels(outrow, binfo->bcolor, binfo->border_left);
-      if(binfo->image_left > binfo->border_left)
-      {
-        // we have a frameline, so set it and the inner border
-        set_pixels(outrow + 4*binfo->border_left, binfo->flcolor,
-                   binfo->fl_left - binfo->border_left);
-        set_pixels(outrow + 4*binfo->fl_left, binfo->bcolor,
-                   binfo->image_left - binfo->fl_left);
-      }
-      // copy image row
-      copy_pixels(outrow + 4*binfo->image_left,
-                  in + 4 * (row - binfo->image_top) * binfo->stride,
-                  image_width);
-      // set right border
-      set_pixels(outrow + 4*binfo->image_right, binfo->bcolor,
-                 binfo->fl_right - binfo->image_right);
-      if(binfo->width > binfo->fl_right)
-      {
-        // we have a frameline, so set it and the outer border
-        set_pixels(outrow + 4*binfo->fl_right, binfo->flcolor,
-                   binfo->border_right - binfo->fl_right);
-        set_pixels(outrow + 4*binfo->border_right, binfo->bcolor,
-                   binfo->width - binfo->border_right);
-      }
-    }
-  }
-  // ensure that all streaming writes complete before we attempt to
-  // read from the output buffer
-  dt_omploop_sfence();
+  darkroom_borders_copy_with_border(out, in, binfo);
 }
 
 void dt_iop_setup_binfo(const dt_dev_pixelpipe_iop_t *piece,

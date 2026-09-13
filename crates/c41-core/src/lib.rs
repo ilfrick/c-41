@@ -5,6 +5,7 @@
 
 pub mod bilateral;
 pub mod blend;
+pub mod borders;
 pub mod bspline;
 pub mod color;
 pub mod curve_tools;
