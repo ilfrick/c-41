@@ -4692,3 +4692,27 @@ k=54 by exactly 1 ulp). The kernel was correct (HF `==` in - LF held); the
 reconstruction assertion was dropped and the comment corrected. Gate green on
 re-run.
 
+---
+
+## 2026-09-13 08:40 UTC — m4-194: port alpha-copy loop to Rust FFI
+
+**Commit** `95b51fce8c` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `dt_iop_alpha_copy` (`src/develop/imageop_math.h:141`),
+replacing the strided alpha-channel loop with `darkroom_imagebuf_copy_alpha`.
+Extended `c41-core::imagebuf` (safe kernel, divergent reference, validated FFI,
+12 tests); declared the export in `src/rust_ffi/darkroom_core.h`. All 6 callers
+(`overexposed`, `rawoverexposed`, `zonesystem`, `graduatednd`, `profile_gamma`,
+`retouch`) untouched via shared-header replacement; `in == out` safe. Left all
+unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0/P1.
+Fixed the two actionable P2 nits in-session (Safety-doc overflow wording,
+include placement with the other quoted includes); left the test-idiom and
+formal-aliasing notes as consistent with file convention.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
