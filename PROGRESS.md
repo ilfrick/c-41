@@ -4716,3 +4716,32 @@ tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
 
+---
+
+## 2026-09-13 09:20 UTC — m4-195: port borders compose loop to Rust FFI
+
+**Commit** `208ad154b1` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `dt_iop_copy_image_with_border`
+(`src/develop/borders_helper.c:51`), replacing the row loop with
+`darkroom_borders_copy_with_border`. Added new `c41-core::borders` (safe
+kernel, divergent reference, validated FFI, 12 tests; `BorderPositions`
+mirrors `dt_iop_border_positions_t` at `repr(C, align(16))`, 160 bytes);
+registered `pub mod borders`; declared the export in
+`src/rust_ffi/darkroom_core.h`. Both callers (`borders.c:572`,
+`enlargecanvas.c:383`) untouched via shared-body replacement; nontemporal
+stores become plain stores with the trailing fence dropped (documented).
+Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0.
+Fixed the P1 doc overclaim in-session (short-buffer clamping scoped to the
+safe kernel; FFI caller guarantee unconditional). P2 notes recorded: serial
+vs OpenMP throughput tradeoff, size_t-vs-i64 negative-bound divergence
+(unreachable — setup emits non-negative geometry), two dead-code/confusing-
+comment nits left as-is.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
