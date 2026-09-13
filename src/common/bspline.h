@@ -170,38 +170,15 @@ inline static void decompose_2D_Bspline(const float *const in,
                                         float *const tempbuf,
                                         const size_t padded_size)
 {
-  // Blur and compute the decimated wavelet at once
-  DT_OMP_FOR()
-  for(size_t row = 0; row < height; row++)
-  {
-    // get a thread-private one-row temporary buffer
-    float *restrict const temp = dt_get_perthread(tempbuf, padded_size);
-    // interleave the order in which we process the rows so that we minimize cache misses
-    const size_t i = dwt_interleave_rows(row, height, mult);
-    // Convolve B-spline filter over columns: for each pixel in the current row, compute vertical blur
-    _bspline_vertical_pass(in, temp, i, width, height, mult, TRUE); // always clip negatives
-    // Convolve B-spline filter horizontally over current row
-    for(size_t j = 0; j < width; j++)
-    {
-      const size_t index = 4U * (i * width + j);
-#if USE_NONTEMPORAL
-      dt_aligned_pixel_t blur;
-      _bspline_horizontal(temp, blur, j, width, mult, TRUE); // always clip negatives
-      copy_pixel_nontemporal(LF + index, blur);
-      // compute the HF component by subtracting the LF from the original input
-      for_four_channels(c)
-        HF[index + c] = in[index + c] - blur[c];
-#else
-      _bspline_horizontal(temp, LF + index, j, width, mult, TRUE); // always clip negatives
-      // compute the HF component by subtracting the LF from the original input
-      for_four_channels(c)
-        HF[index + c] = in[index + c] - LF[index + c];
-#endif
-    }
-  }
-#if USE_NONTEMPORAL
-  dt_omploop_sfence();  // ensure that nontemporal writes complete before we attempt to read the output
-#endif
+  // Blur and decimated-wavelet split in one pass, ported to Rust (m4-193):
+  // the double-clipped separable 5-tap blur into LF plus the unclipped
+  // HF = in - LF residue now runs in darkroom_decompose_2d_bspline
+  // (non-nontemporal path only; USE_NONTEMPORAL is FALSE). tempbuf and
+  // padded_size stay in the signature so the diffuse and laplacian callers
+  // are unchanged; the Rust side owns a private row scratch buffer instead.
+  (void)tempbuf;
+  (void)padded_size;
+  darkroom_decompose_2d_bspline(in, HF, LF, width, height, mult);
 }
 
 // clang-format off

@@ -3993,6 +3993,30 @@ void darkroom_blur_2d_bspline(const float *in_buf,
                               int mult,
                               int clip_negatives);
 
+/*
+ * B-spline blur + decimated-wavelet split (src/common/bspline.h, m4-193).
+ *
+ * darkroom_decompose_2d_bspline replaces the loop body of
+ * decompose_2D_Bspline(): the double-clipped separable [1 4 6 4 1] / 16
+ * blur at stride mult into lf_buf plus the unclipped in - LF residue into
+ * hf_buf, computed in one row pass with edge-index clamping. Both blur
+ * passes always clip (the C literals are TRUE); only the residue may hold
+ * negatives. Only the non-nontemporal path is ported (USE_NONTEMPORAL is
+ * FALSE, so that branch is dead). Rows run serially in the C
+ * dwt_interleave_rows order (a pure cache optimisation over independent
+ * rows). Carries its own row scratch; the C tempbuf and padded_size
+ * per-thread plumbing stays in the C signature so the diffuse and
+ * laplacian callers are unchanged. All three buffers hold
+ * 4*width*height floats each and must not overlap. Null pointers, zero
+ * dims, mult <= 0 and overflowing dim products are guarded no-ops.
+ */
+void darkroom_decompose_2d_bspline(const float *in_buf,
+                                   float *hf_buf,
+                                   float *lf_buf,
+                                   size_t width,
+                                   size_t height,
+                                   int mult);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
