@@ -8,6 +8,10 @@
 //! loops; LLVM's auto-vectorizer provides SIMD at `-O3`, but multi-threaded
 //! parallelism is no longer used. This matches the m4-161 `blend.rs` pattern.
 //!
+//! `copy_alpha` is the one exception to the imagebuf.c source: it ports the
+//! strided alpha-lane loop of `dt_iop_alpha_copy` in
+//! `src/develop/imageop_math.h`, not a flat element-wise loop.
+//!
 //! Bit-exactness notes:
 //! - The six arithmetic-only kernels (`scaled_copy`, `add_const`, `add_image`,
 //!   `sub_image`, `invert`, `mul_const`) are single FP operations with no
@@ -131,6 +135,24 @@ pub fn simd_memcpy(buf: &mut [f32], src: &[f32], n: usize) {
     let m = n.min(buf.len()).min(src.len());
     for k in 0..m {
         buf[k] = src[k];
+    }
+}
+
+/// `out[k] = src[k]` for each alpha lane `k` in `3, 7, 11, ... < width*height*4`.
+///
+/// Port of the strided loop in `dt_iop_alpha_copy` (imageop_math.h:141).
+/// Unlike `simd_memcpy` this is NOT a bulk copy: only channel 3 (alpha) of
+/// each RGBA pixel is copied and the RGB lanes of `out` are left untouched.
+/// Each lane is read before its own write, so aliasing (`out` is `src`)
+/// is benign. The element count is checked (`width*height*4` overflow or
+/// empty dims are a no-op) and clamped to the shorter slice.
+pub fn copy_alpha(out: &mut [f32], src: &[f32], width: usize, height: usize) {
+    let Some(n) = width.checked_mul(height).and_then(|p| p.checked_mul(4)) else {
+        return;
+    };
+    let m = n.min(out.len()).min(src.len());
+    for k in (3..m).step_by(4) {
+        out[k] = src[k];
     }
 }
 
@@ -278,6 +300,40 @@ pub unsafe extern "C" fn darkroom_imagebuf_simd_memcpy(
     simd_memcpy(buf_slice, src_slice, n);
 }
 
+/// Copy the alpha channel 1:1 from `src` to `out`.
+///
+/// Port of `dt_iop_alpha_copy` (imageop_math.h:141): for each RGBA pixel
+/// `p` in `0..width*height`, `out[p*4+3] = src[p*4+3]`; RGB lanes are
+/// untouched. This is a strided channel copy, not a bulk memcpy.
+/// Aliasing (`src == out`) is safe: every lane is read before its own
+/// write. NULL pointers, empty dims, or a `width*height*4` overflow are a
+/// no-op; short buffers clamp instead of panicking.
+///
+/// # Safety
+/// `src` and `out` must each hold at least `width*height*4` floats (or be
+/// NULL, in which case this is a no-op). A `width*height*4` overflow is also
+/// a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imagebuf_copy_alpha(
+    src: *const f32,
+    out: *mut f32,
+    width: usize,
+    height: usize,
+) {
+    if src.is_null() || out.is_null() {
+        return;
+    }
+    let Some(n) = width.checked_mul(height).and_then(|v| v.checked_mul(4)) else {
+        return;
+    };
+    if n == 0 {
+        return;
+    }
+    let src_slice = std::slice::from_raw_parts(src, n);
+    let out_slice = std::slice::from_raw_parts_mut(out, n);
+    copy_alpha(out_slice, src_slice, width, height);
+}
+
 // ── Reference implementations for bit-exactness tests ────────────────────────
 
 #[allow(dead_code)]
@@ -359,6 +415,22 @@ fn ref_simd_memcpy(buf: &mut [f32], src: &[f32], n: usize) {
     while k < m {
         buf[k] = src[k];
         k += 1;
+    }
+}
+
+#[allow(dead_code)]
+fn ref_copy_alpha(out: &mut [f32], src: &[f32], width: usize, height: usize) {
+    // Deliberately different: per-pixel base indexing (pixel p lives at
+    // p*4..p*4+4) instead of the flat strided lane loop of the kernel.
+    // Same result, different shape.
+    let Some(npix) = width.checked_mul(height) else {
+        return;
+    };
+    let m = npix.min(out.len() / 4).min(src.len() / 4);
+    let mut p = 0;
+    while p < m {
+        out[p * 4 + 3] = src[p * 4 + 3];
+        p += 1;
     }
 }
 
@@ -972,5 +1044,162 @@ mod tests {
             darkroom_imagebuf_simd_memcpy(buf.as_mut_ptr(), src.as_ptr(), big_n);
         }
         assert_eq!(buf, vec![1.0; 4]); // untouched
+    }
+
+    // ── copy_alpha ────────────────────────────────────────────────────────────
+
+    fn to_bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    #[test]
+    fn copy_alpha_basic() {
+        // 2x1 RGBA: alphas copied, RGB lanes untouched.
+        let src = vec![1.0f32, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 20.0];
+        let mut out = vec![-1.0f32, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0];
+        copy_alpha(&mut out, &src, 2, 1);
+        assert_eq!(
+            to_bits(&out),
+            to_bits(&[-1.0, -2.0, -3.0, 10.0, -5.0, -6.0, -7.0, 20.0])
+        );
+    }
+
+    #[test]
+    fn copy_alpha_golden_vector() {
+        // Fixed 1x3 golden vector, compared bit-exact.
+        let src = vec![
+            0.0f32, 0.0, 0.0, 0.25, //
+            1.0, 0.5, 0.125, 0.5, //
+            0.3, 0.6, 0.9, 1.0,
+        ];
+        let mut out = vec![9.0f32; 12];
+        copy_alpha(&mut out, &src, 3, 1);
+        let expected = vec![
+            9.0f32, 9.0, 9.0, 0.25, //
+            9.0, 9.0, 9.0, 0.5, //
+            9.0, 9.0, 9.0, 1.0,
+        ];
+        assert_eq!(to_bits(&out), to_bits(&expected));
+    }
+
+    #[test]
+    fn copy_alpha_matches_reference_over_lcg() {
+        let mut src = vec![0.0f32; 4 * 64];
+        let mut dst = vec![0.0f32; 4 * 64];
+        lcg_fill(&mut src, 0xA1FA, 1.0);
+        lcg_fill(&mut dst, 0xC0FF, 1.0);
+
+        let mut direct = dst.clone();
+        let mut reference = dst.clone();
+        copy_alpha(&mut direct, &src, 8, 8);
+        ref_copy_alpha(&mut reference, &src, 8, 8);
+        assert_eq!(to_bits(&direct), to_bits(&reference));
+
+        // RGB lanes preserved from dst, alpha lanes taken from src.
+        for p in 0..64 {
+            assert_eq!(direct[p * 4 + 3].to_bits(), src[p * 4 + 3].to_bits());
+            assert_eq!(
+                to_bits(&direct[p * 4..p * 4 + 3]),
+                to_bits(&dst[p * 4..p * 4 + 3])
+            );
+        }
+    }
+
+    #[test]
+    fn copy_alpha_degenerate_empty() {
+        let src = vec![1.0f32; 8];
+        let mut out = vec![2.0f32; 8];
+        copy_alpha(&mut out, &src, 0, 4); // width == 0: untouched
+        copy_alpha(&mut out, &src, 2, 0); // height == 0: untouched
+        copy_alpha(&mut out, &src, 0, 0);
+        assert_eq!(out, vec![2.0; 8]);
+        let mut empty: Vec<f32> = vec![];
+        copy_alpha(&mut empty, &[], 0, 0); // no-op, no panic
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn copy_alpha_short_inputs_clamp() {
+        // Buffers shorter than width*height*4: copy what fits, no panic.
+        let src = vec![1.0f32, 2.0, 3.0, 10.0, 5.0];
+        let mut direct = vec![0.0f32; 5];
+        let mut reference = vec![0.0f32; 5];
+        copy_alpha(&mut direct, &src, 2, 1);
+        ref_copy_alpha(&mut reference, &src, 2, 1);
+        assert_eq!(to_bits(&direct), to_bits(&reference));
+        assert_eq!(direct[3].to_bits(), 10.0f32.to_bits());
+        assert_eq!(&direct[..3], &[0.0, 0.0, 0.0][..]); // RGB untouched
+        assert_eq!(direct[4].to_bits(), 0.0f32.to_bits()); // tail untouched
+    }
+
+    #[test]
+    fn copy_alpha_overflow_noop() {
+        // Overflowing width*height*4: no-op, no panic.
+        let src = vec![1.0f32; 8];
+        let mut out = vec![2.0f32; 8];
+        copy_alpha(&mut out, &src, usize::MAX, 2);
+        copy_alpha(&mut out, &src, usize::MAX, usize::MAX);
+        assert_eq!(out, vec![2.0; 8]);
+    }
+
+    #[test]
+    fn ffi_copy_alpha_round_trip() {
+        let mut src = vec![0.0f32; 4 * 64];
+        let mut dst = vec![0.0f32; 4 * 64];
+        lcg_fill(&mut src, 0x5EED, 1.0);
+        lcg_fill(&mut dst, 0xCAFE, 1.0);
+
+        let mut ffi_out = dst.clone();
+        let mut direct_out = dst.clone();
+        unsafe {
+            darkroom_imagebuf_copy_alpha(src.as_ptr(), ffi_out.as_mut_ptr(), 8, 8);
+        }
+        copy_alpha(&mut direct_out, &src, 8, 8);
+        assert_eq!(to_bits(&ffi_out), to_bits(&direct_out));
+    }
+
+    #[test]
+    fn ffi_copy_alpha_null_guard() {
+        let mut buf = vec![1.0f32; 8];
+        unsafe {
+            darkroom_imagebuf_copy_alpha(std::ptr::null(), buf.as_mut_ptr(), 2, 1);
+            darkroom_imagebuf_copy_alpha(buf.as_ptr(), std::ptr::null_mut(), 2, 1);
+            darkroom_imagebuf_copy_alpha(std::ptr::null(), std::ptr::null_mut(), 2, 1);
+        }
+        assert_eq!(buf, vec![1.0; 8]); // untouched
+    }
+
+    #[test]
+    fn ffi_copy_alpha_zero_dims_guard() {
+        let src = vec![3.0f32; 8];
+        let mut out = vec![1.0f32; 8];
+        unsafe {
+            darkroom_imagebuf_copy_alpha(src.as_ptr(), out.as_mut_ptr(), 0, 2);
+            darkroom_imagebuf_copy_alpha(src.as_ptr(), out.as_mut_ptr(), 2, 0);
+        }
+        assert_eq!(out, vec![1.0; 8]); // untouched
+    }
+
+    #[test]
+    fn ffi_copy_alpha_overflow_guard() {
+        // Overflow must return before any slice is built: no panic, untouched.
+        let src = vec![3.0f32; 8];
+        let mut out = vec![1.0f32; 8];
+        unsafe {
+            darkroom_imagebuf_copy_alpha(src.as_ptr(), out.as_mut_ptr(), usize::MAX, 2);
+        }
+        assert_eq!(out, vec![1.0; 8]); // untouched
+    }
+
+    #[test]
+    fn ffi_copy_alpha_alias_in_place() {
+        // in == out: each alpha lane reads itself; buffer bit-identical.
+        let mut buf = vec![0.0f32; 4 * 16];
+        lcg_fill(&mut buf, 0xA11A5, 1.0);
+        let before = to_bits(&buf);
+        unsafe {
+            darkroom_imagebuf_copy_alpha(buf.as_ptr(), buf.as_mut_ptr(), 4, 4);
+        }
+        assert_eq!(to_bits(&buf), before);
     }
 }

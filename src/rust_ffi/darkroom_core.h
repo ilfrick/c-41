@@ -3497,6 +3497,13 @@ float darkroom_focuspeaking_sum_abs_deviation(const float *luma_ds,
  * (the dt_simd_memcpy loop). */
 void darkroom_imagebuf_simd_memcpy(float *buf, const float *src, size_t n);
 
+/* Replaces the strided alpha-lane loop at imageop_math.h:141
+ * (dt_iop_alpha_copy): out[k] = in[k] for k = 3, 7, ... < width*height*4.
+ * Only channel 3 of each RGBA pixel is copied; RGB lanes are untouched.
+ * May alias (src == out); NULL or degenerate/overflowing dims are a no-op. */
+void darkroom_imagebuf_copy_alpha(const float *src, float *out,
+                                  size_t width, size_t height);
+
 /* Replaces the former element-wise solve loop at fast_guided_filter.h:186
  * (the a/b solve at the end of variance_analyse; input is the blurred
  * 4-channel pack {I, p, I*I, I*p}, ab holds 2 floats per element). */

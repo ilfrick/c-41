@@ -23,6 +23,7 @@
 
 #include "common/image.h"    // for dt_image_t, dt_image_orientation_t
 #include "develop/imageop.h" // for dt_iop_roi_t
+#include "rust_ffi/darkroom_core.h" // for darkroom_imagebuf_copy_alpha
 #include <glib.h>            // for inline
 #include <math.h>            // for log, logf, powf
 #include <stddef.h>          // for size_t, NULL
@@ -136,18 +137,15 @@ static inline float dt_iop_eval_exp(const float *const coeff, const float x)
 }
 
 
-/** Copy alpha channel 1:1 from input to output */
-DT_OMP_DECLARE_SIMD(uniform(width, height) aligned(ivoid, ovoid:64))
+/** Copy alpha channel 1:1 from input to output.
+ * Ported to Rust FFI (darkroom_imagebuf_copy_alpha): the strided alpha-lane
+ * loop now lives in crates/c41-core/src/imagebuf.rs. Signature and static
+ * inline orchestration unchanged, so the 6 callers need no edits. */
 static inline void dt_iop_alpha_copy(const void *const ivoid,
                                      void *const ovoid,
                                      const size_t width, const size_t height)
 {
-  const float *const __restrict__ in = (const float *const)ivoid;
-  float *const __restrict__ out = (float *const)ovoid;
-
-  DT_OMP_FOR()
-  for(size_t k = 3; k < width * height * 4; k += 4)
-    out[k] = in[k];
+  darkroom_imagebuf_copy_alpha((const float *)ivoid, (float *)ovoid, width, height);
 }
 
 /** Calculate the bayer pattern color from the row and column **/
