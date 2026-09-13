@@ -4664,3 +4664,31 @@ tests, and the `c41-rs` release link. Header additions scanned for embedded `*/`
 (only block terminators). Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-13 07:55 UTC — m4-193: port bspline decompose loop to Rust FFI
+
+**Commit** `4c703ccd38` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `decompose_2D_Bspline` (`src/common/bspline.h:179`),
+replacing the body with `darkroom_decompose_2d_bspline`. Extended
+`c41-core::bspline` (safe kernel, divergent reference, validated FFI, tests —
+blur plus unclipped `HF = in - LF` residue in one pass, always-clip on both
+passes); declared the export in `src/rust_ffi/darkroom_core.h`. Callers
+(`diffuse.c:1058`, `laplacian.c:170`) untouched via shared-body replacement.
+Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header additions scanned for embedded `*/`
+(only block terminators). Remaining warnings are pre-existing and outside this
+change.
+
+**Notes — test fix before commit.** The first gate run failed one new test:
+`decompose_hf_is_unclipped_residue` asserted `LF + HF == in` bit-exactly, which
+is not a valid f32 identity (`(in - LF) + LF` can differ by 1 ulp — failed at
+k=54 by exactly 1 ulp). The kernel was correct (HF `==` in - LF held); the
+reconstruction assertion was dropped and the comment corrected. Gate green on
+re-run.
+
