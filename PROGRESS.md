@@ -4745,3 +4745,31 @@ tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
 
+---
+
+## 2026-09-13 10:00 UTC — m4-196: port thumbnail flip-zoom loop to Rust FFI
+
+**Commit** `bdc51d40ef` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `dt_iop_flip_and_zoom_8` (`src/develop/imageop_math.c:30`),
+replacing the loop with `darkroom_flip_and_zoom_8`. Added new
+`c41-core::thumbnail` (safe kernel, divergent reference, validated FFI with
+explicit byte lengths + `isize::MAX` cap, 9 tests covering all 8 orientations,
+never-upscale pinning, alpha preservation); registered `pub mod thumbnail`;
+declared the export in `src/rust_ffi/darkroom_core.h`. All 3 callers
+(`mipmap_cache.c:1566,:1600,:1622`) untouched via shared-body replacement.
+Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0. Fixed one P2
+nit in-session (`#[allow(dead_code)]` → `#[cfg(test)]` on the test-only
+reference). Recorded: guarded FFI no-ops leave `*width/*height` untouched
+where C always wrote them (strictly safer on degenerate input — C divided by
+zero on 0-dims); serial vs OpenMP row parallelism now serial
+(output-identical, thumbnail-scale); golden covers orientation 0 with 1–7 via
+kernel-vs-ref consistency.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
