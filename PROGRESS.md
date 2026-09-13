@@ -4796,3 +4796,29 @@ tests, and the `c41-rs` release link. Diff scanned for embedded `*/` (none —
 `//`-style comments). Remaining warnings are pre-existing and outside this
 change.
 
+---
+
+## 2026-09-13 11:20 UTC — m4-198: port bilateral blur-line passes to Rust FFI
+
+**Commit** `508ca22f5e` (GitHub + Gitea via `git push origin master`)
+
+**What.** Exposed the existing private Rust `blur_line` kernel as
+`darkroom_bilateral_blur_line` and wired it into both `blur_line` sites in
+`dt_bilateral_blur` (`bilateral.c:390/:392`); deleted the now-unused static C
+`blur_line` (would trip `-Wunused-function` under `-Werror`). No transcription
+— FFI calls the same kernel `Bilateral::blur()` uses, so method and FFI can't
+drift. `blur_line_z`, the OpenCL path, and all 8 downstream IOPs untouched.
+Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (three P2
+nits only, left as-is: one-space re-indent churn in the header hunk,
+"lines are independent" doc scoped to grid strides in the strict sense,
+minimal C comment touch-ups accurate).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link — this also settles the dev-session
+question about a host-debug abort in a slice test (pre-existing toolchain
+artifact, release gate authoritative and green). Header addition scanned for
+embedded `*/` (only the block terminator). Remaining warnings are pre-existing
+and outside this change.
+
