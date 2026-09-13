@@ -4773,3 +4773,26 @@ tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
 
+---
+
+## 2026-09-13 10:40 UTC — m4-197: wire blend invert-scale into lab/hsl blendif
+
+**Commit** `f191834941` (GitHub + Gitea via `git push origin master`)
+
+**What.** Wired the existing `darkroom_blend_invert_and_scale` export into the
+two missed loops (`blendif_lab.c:229`, `blendif_rgb_hsl.c:269`), replacing each
+3-line `DT_OMP_FOR` invert-and-scale body with the FFI call (mirrors the
+`blendif_raw.c:63` / `blendif_rgb_jzczhz.c:295` precedent). Zero new Rust —
+kernel, decl, and tests pre-exist. Added the one-line header include to the hsl
+file (lab pre-existed); refreshed the export doc to cite all four call sites.
+Closes the portable invert-and-scale class (remaining blendif work is
+three-operand merges or fn-ptr-dispatched row kernels).
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0 (one doc nit
+applied in-session: export comment now cites all four replaced loops).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Diff scanned for embedded `*/` (none —
+`//`-style comments). Remaining warnings are pre-existing and outside this
+change.
+
