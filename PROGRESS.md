@@ -4843,6 +4843,29 @@ tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
 
+---
+
+## 2026-09-13 13:10 UTC — m4-200: port imagebuf copy-ROI fallback to Rust FFI
+
+**Commit** `ca6ffa6300` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `dt_iop_copy_image_roi` inconsistent-ROI fallback
+(`src/common/imagebuf.c:223`), replacing it with `darkroom_imagebuf_copy_roi`.
+Extended `c41-core::imagebuf` (safe kernel, divergent reference, validated FFI,
+10 tests — bounds-conditional copy-or-zero, signed offsets in i64, `+0.0`
+zero branch); declared the export in `src/rust_ffi/darkroom_core.h`. Fast
+whole-buffer and per-row `memcpy` paths stay in C under identical selection;
+~25 call sites untouched via shared-body replacement. Not the excluded bulk-
+memcpy class. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
+notes only: serial-vs-OpenMP perf-only, one comment wording nit).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
 **Notes — resumed after rate limit.** The delegated m4-199 dev subagent hit a
 provider rate limit after writing the Rust side (`blur_line_z` FFI +
 reference + tests) but before the C/header wiring; the main session verified
