@@ -25,6 +25,11 @@
 //! The Rust kernel is single-threaded sequential; the C loop was
 //! `DT_OMP_FOR` over pixels, but each output quad reads only its own
 //! input quad, so thread scheduling cannot change the result.
+//!
+//! m4-206 adds a second kernel in this module: `u8_to_float`, port of the
+//! `!orientation` fast path of `dt_imageio_flip_buffers_ui8_to_float`
+//! (same C file). The oriented stride path stays in C; see that kernel's
+//! docs for the split.
 
 /// Swap the R and B lanes of an 8-bit RGBA buffer in place.
 ///
@@ -88,6 +93,151 @@ pub unsafe extern "C" fn darkroom_imageio_swap_rb(buf: *mut u8, npixels: usize) 
     };
     let buf = std::slice::from_raw_parts_mut(buf, len);
     swap_rb_inplace(buf, npixels);
+}
+
+// ── 8-bit to float normalise (m4-206) ────────────────────────────────────────
+
+/// Safe 8-bit to float normalisation kernel.
+///
+/// Port of the `!orientation` fast-path `DT_OMP_FOR` row loop of
+/// `dt_imageio_flip_buffers_ui8_to_float` (src/imageio/imageio.c): per
+/// pixel `(row, col)` and lane `k < ch`,
+/// `out[4*(row*wd+col)+k] = (inp[row*stride+ch*col+k] as f32 - black) * scale`
+/// with `scale = 1/(white-black)` computed once up front, exactly as the C
+/// does (`const float scale = 1.0f / (white - black)` outside the loop, so
+/// the single division cannot drift per element).
+///
+/// Fidelity notes:
+/// - `u8 as f32` is exact, so the subtraction and multiply replay the C's
+///   usual-arithmetic-conversion promotion bit for bit.
+/// - Output lanes `ch..4` of each quad are never written, matching the C
+///   loop (which only stores lanes below `ch`); callers must not expect
+///   them zeroed. Input row padding (`stride > ch*wd`) is skipped.
+/// - `ch` is 1..=4 by contract: the C loop would scribble past the RGBA
+///   quad for larger values, so the FFI wrapper refuses those instead of
+///   reproducing the overflow. Dims are non-zero (validated by the FFI
+///   wrapper; `debug_assert`ed here).
+/// - The C loop is `DT_OMP_FOR` over rows, but each output float reads
+///   only its own input byte, so sequential iteration is identical.
+pub fn u8_to_float(
+    out: &mut [f32],
+    inp: &[u8],
+    black: f32,
+    white: f32,
+    ch: usize,
+    wd: usize,
+    ht: usize,
+    stride: usize,
+) {
+    debug_assert!(wd > 0 && ht > 0 && stride > 0);
+    debug_assert!((1..=4).contains(&ch));
+    debug_assert!(out.len() >= 4 * wd * ht);
+    debug_assert!(inp.len() >= (ht - 1) * stride + ch * wd);
+
+    let scale = 1.0f32 / (white - black);
+    for j in 0..ht {
+        for i in 0..wd {
+            for k in 0..ch {
+                out[4 * (j * wd + i) + k] = (inp[j * stride + ch * i + k] as f32 - black) * scale;
+            }
+        }
+    }
+}
+
+/// Structurally divergent reference for `u8_to_float`: same single-scale
+/// setup, but a flat `while` pixel walk (`row = n / wd`, `col = n % wd`)
+/// instead of the kernel's nested row/col/lane `for` loops, so the sweep
+/// test cross-checks traversal as well as values. Must return
+/// bit-identical output to [`u8_to_float`] (compared with `to_bits`, so
+/// even NaN payloads from a `white == black` caller must agree).
+#[cfg(test)]
+fn ref_u8_to_float(
+    out: &mut [f32],
+    inp: &[u8],
+    black: f32,
+    white: f32,
+    ch: usize,
+    wd: usize,
+    ht: usize,
+    stride: usize,
+) {
+    let scale = 1.0f32 / (white - black);
+    let mut n = 0usize;
+    while n < wd * ht {
+        let j = n / wd;
+        let i = n % wd;
+        let mut k = 0usize;
+        while k < ch {
+            out[4 * n + k] = (inp[j * stride + ch * i + k] as f32 - black) * scale;
+            k += 1;
+        }
+        n += 1;
+    }
+}
+
+/// 8-bit to float normalisation for the no-orientation import path.
+///
+/// Replaces the `!orientation` fast-path loop of
+/// `dt_imageio_flip_buffers_ui8_to_float` (src/imageio/imageio.c); the C
+/// wrapper keeps its signature and the oriented stride path, so the single
+/// `imageio_jpeg.c` caller is unchanged. `black`/`white` are the C
+/// parameters (the scale is derived inside, one IEEE division, exactly as
+/// the C's hoisted `const float scale`).
+///
+/// `out` must hold at least `4*wd*ht` floats, `inp` at least
+/// `(ht-1)*stride + ch*wd` bytes. Null pointers, non-positive dims, `ch`
+/// outside 1..=4, and overflowing dim products are guarded no-ops that
+/// never touch memory.
+///
+/// # Safety
+/// The buffers must hold the documented lengths; the wrapper validates
+/// the products with checked arithmetic (plus an `isize::MAX` cap before
+/// building the slices) but takes the lengths themselves on trust, matching
+/// the module's `darkroom_imageio_swap_rb` contract.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imageio_u8_to_float(
+    out: *mut f32,
+    inp: *const u8,
+    black: f32,
+    white: f32,
+    ch: i32,
+    wd: i32,
+    ht: i32,
+    stride: i32,
+) {
+    if out.is_null() || inp.is_null() {
+        return;
+    }
+    if wd <= 0 || ht <= 0 || stride <= 0 || !(1..=4).contains(&ch) {
+        return;
+    }
+    let (wdu, htu, chu, strideu) = (wd as usize, ht as usize, ch as usize, stride as usize);
+    let need_out = match wdu.checked_mul(htu).and_then(|p| p.checked_mul(4)) {
+        Some(n) => n,
+        None => return,
+    };
+    // Last input byte read is (ht-1)*stride + ch*wd - 1, hence +1 for the
+    // length; ht >= 1 here so ht - 1 cannot underflow.
+    let need_in = match (htu - 1)
+        .checked_mul(strideu)
+        .and_then(|b| chu.checked_mul(wdu).and_then(|r| b.checked_add(r)))
+    {
+        Some(n) => n,
+        None => return,
+    };
+    // Slices can never span more than isize::MAX bytes; bail before
+    // building one (debug builds abort on the from_raw_parts precondition
+    // otherwise). need_out counts f32 lanes, so its byte span is 4x.
+    let out_bytes = match need_out.checked_mul(4) {
+        Some(n) => n,
+        None => return,
+    };
+    if out_bytes > isize::MAX as usize || need_in > isize::MAX as usize {
+        return;
+    }
+    let out_slice = std::slice::from_raw_parts_mut(out, need_out);
+    let inp_slice = std::slice::from_raw_parts(inp, need_in);
+    u8_to_float(out_slice, inp_slice, black, white, chu, wdu, htu, strideu);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -208,5 +358,162 @@ mod tests {
             darkroom_imageio_swap_rb(buf.as_mut_ptr(), usize::MAX / 4 + 1);
         }
         assert_eq!(buf, vec![7u8; 16]); // untouched
+    }
+
+    // helper: bit-exact float comparison (NaN payloads must agree too,
+    // for the white == black degenerate sweep below).
+    fn assert_bits_eq(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "float {i}");
+        }
+    }
+
+    // known-answer pin: black level maps exactly to +0.0, and a mid value
+    // lands where the single hoisted scale puts it (checked against the
+    // reference, plus the exact-zero property the C shares).
+    #[test]
+    fn u8_to_float_known_answer() {
+        // 2x1 RGBA, tight stride
+        let inp = vec![0u8, 128, 255, 64, 16, 32, 48, 200];
+        let mut out = vec![-1.0f32; 8];
+        let mut reference = vec![-1.0f32; 8];
+        u8_to_float(&mut out, &inp, 0.0, 255.0, 4, 2, 1, 8);
+        ref_u8_to_float(&mut reference, &inp, 0.0, 255.0, 4, 2, 1, 8);
+        assert_bits_eq(&out, &reference);
+        assert_eq!(out[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(out[4].to_bits(), (16.0f32 * (1.0f32 / 255.0)).to_bits());
+    }
+
+    // kernel and reference agree bit-exactly over sweeps of dims, channel
+    // counts, strides, and black/white points (including degenerate
+    // white == black and an inverted range).
+    #[test]
+    fn u8_to_float_matches_reference_over_sweep() {
+        for (wd, ht) in [(1usize, 1), (3, 1), (1, 4), (5, 3), (17, 9)] {
+            for ch in [1usize, 2, 3, 4] {
+                for pad in [0usize, 1, 3] {
+                    let stride = ch * wd + pad;
+                    for (black, white) in [
+                        (0.0f32, 255.0f32),
+                        (16.0, 235.0),
+                        (0.0, 1.0),
+                        (255.0, 0.0),
+                        (5.0, 5.0),
+                    ] {
+                        let mut inp = vec![0u8; ht * stride];
+                        for (i, v) in inp.iter_mut().enumerate() {
+                            // LCG over the full byte range; stride padding
+                            // lands in the stream too, like real rows.
+                            *v = ((i as u64).wrapping_mul(2_654_435_761).wrapping_add(0x9E37)
+                                % 256) as u8;
+                        }
+                        let mut direct = vec![0.0f32; 4 * wd * ht];
+                        let mut reference = vec![0.0f32; 4 * wd * ht];
+                        u8_to_float(&mut direct, &inp, black, white, ch, wd, ht, stride);
+                        ref_u8_to_float(&mut reference, &inp, black, white, ch, wd, ht, stride);
+                        assert_bits_eq(&direct, &reference);
+                    }
+                }
+            }
+        }
+    }
+
+    // the C loop only stores lanes below ch: with ch == 3 the alpha lane
+    // keeps whatever the output buffer held (here a sentinel).
+    #[test]
+    fn u8_to_float_leaves_unwritten_lanes() {
+        let inp = vec![10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let mut out = vec![-7.0f32; 16];
+        u8_to_float(&mut out, &inp, 0.0, 255.0, 3, 1, 3, 4);
+        for row in 0..3 {
+            assert_eq!(out[4 * row + 3].to_bits(), (-7.0f32).to_bits(), "row {row}");
+            // written lanes still match the reference
+            let mut one = vec![-7.0f32; 4];
+            let row_in = &inp[4 * row..4 * row + 4];
+            ref_u8_to_float(&mut one, row_in, 0.0, 255.0, 3, 1, 1, 4);
+            assert_bits_eq(&out[4 * row..4 * row + 3], &one[0..3]);
+        }
+    }
+
+    // stride padding bytes are never read: a padded input converts
+    // identically to the tight packing of the same pixels.
+    #[test]
+    fn u8_to_float_skips_stride_padding() {
+        let wd = 3usize;
+        let ht = 2usize;
+        let ch = 4usize;
+        let tight: Vec<u8> = (0..(ch * wd * ht) as u8).collect();
+        let stride = ch * wd + 2;
+        let mut padded = vec![0xABu8; ht * stride];
+        for j in 0..ht {
+            padded[j * stride..j * stride + ch * wd]
+                .copy_from_slice(&tight[j * ch * wd..(j + 1) * ch * wd]);
+        }
+        let mut from_tight = vec![0.0f32; 4 * wd * ht];
+        let mut from_padded = vec![0.0f32; 4 * wd * ht];
+        u8_to_float(&mut from_tight, &tight, 16.0, 235.0, ch, wd, ht, ch * wd);
+        u8_to_float(&mut from_padded, &padded, 16.0, 235.0, ch, wd, ht, stride);
+        assert_bits_eq(&from_tight, &from_padded);
+    }
+
+    #[test]
+    fn u8_to_float_ffi_round_trip() {
+        let (wd, ht, ch) = (7usize, 5usize, 4usize);
+        let stride = ch * wd + 1;
+        let mut inp = vec![0u8; ht * stride];
+        for (i, v) in inp.iter_mut().enumerate() {
+            *v = ((i as u64).wrapping_mul(2_654_435_761) % 256) as u8;
+        }
+        let mut ffi_out = vec![0.0f32; 4 * wd * ht];
+        let mut direct_out = vec![0.0f32; 4 * wd * ht];
+        unsafe {
+            darkroom_imageio_u8_to_float(
+                ffi_out.as_mut_ptr(),
+                inp.as_ptr(),
+                16.0,
+                235.0,
+                ch as i32,
+                wd as i32,
+                ht as i32,
+                stride as i32,
+            );
+        }
+        u8_to_float(&mut direct_out, &inp, 16.0, 235.0, ch, wd, ht, stride);
+        assert_bits_eq(&ffi_out, &direct_out);
+    }
+
+    #[test]
+    fn u8_to_float_ffi_guards() {
+        let inp = vec![9u8; 64];
+        let mut out = vec![3.0f32; 64];
+        unsafe {
+            // null pointers
+            darkroom_imageio_u8_to_float(std::ptr::null_mut(), inp.as_ptr(), 0.0, 255.0, 4, 2, 2, 8);
+            darkroom_imageio_u8_to_float(out.as_mut_ptr(), std::ptr::null(), 0.0, 255.0, 4, 2, 2, 8);
+            // degenerate dims
+            darkroom_imageio_u8_to_float(out.as_mut_ptr(), inp.as_ptr(), 0.0, 255.0, 4, 0, 2, 8);
+            darkroom_imageio_u8_to_float(out.as_mut_ptr(), inp.as_ptr(), 0.0, 255.0, 4, 2, 0, 8);
+            darkroom_imageio_u8_to_float(out.as_mut_ptr(), inp.as_ptr(), 0.0, 255.0, 4, 2, 2, 0);
+            darkroom_imageio_u8_to_float(out.as_mut_ptr(), inp.as_ptr(), 0.0, 255.0, 4, -2, 2, 8);
+            // ch outside 1..=4 (0, and 5 which would scribble past the
+            // RGBA quad in C)
+            darkroom_imageio_u8_to_float(out.as_mut_ptr(), inp.as_ptr(), 0.0, 255.0, 0, 2, 2, 8);
+            darkroom_imageio_u8_to_float(out.as_mut_ptr(), inp.as_ptr(), 0.0, 255.0, 5, 2, 2, 8);
+            // overflowing dim products (4*wd*ht wraps — must reject
+            // before building any slice, so the small buffers stay valid)
+            darkroom_imageio_u8_to_float(
+                out.as_mut_ptr(),
+                inp.as_ptr(),
+                0.0,
+                255.0,
+                4,
+                i32::MAX,
+                i32::MAX,
+                i32::MAX,
+            );
+        }
+        assert_eq!(out, vec![3.0f32; 64]); // untouched
+        assert_eq!(inp, vec![9u8; 64]); // untouched
     }
 }

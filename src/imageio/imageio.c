@@ -31,7 +31,7 @@
 #include "develop/imageop.h"
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb
+#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb, darkroom_imageio_u8_to_float
 
 #ifdef HAVE_OPENEXR
 #include "imageio/imageio_exr.h"
@@ -924,12 +924,11 @@ void dt_imageio_flip_buffers_ui8_to_float(float *out,
   const float scale = 1.0f / (white - black);
   if(!orientation)
   {
-    DT_OMP_FOR()
-    for(int j = 0; j < ht; j++)
-      for(int i = 0; i < wd; i++)
-        for(int k = 0; k < ch; k++)
-          out[4 * ((size_t)j * wd + i) + k] =
-            (in[(size_t)j * stride + (size_t)ch * i + k] - black) * scale;
+    // Pixel loop ported to Rust FFI (darkroom_imageio_u8_to_float in
+    // crates/c41-core/src/imageio.rs), which recomputes scale once exactly
+    // as the hoisting above did; the oriented stride path below stays in C,
+    // as does the orientation bookkeeping.
+    darkroom_imageio_u8_to_float(out, in, black, white, ch, wd, ht, stride);
     return;
   }
   int ii = 0;

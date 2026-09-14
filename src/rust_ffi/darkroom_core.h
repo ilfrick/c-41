@@ -3750,6 +3750,24 @@ void darkroom_png_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
 void darkroom_imageio_swap_rb(unsigned char *buf, size_t npixels);
 
 /*
+ * 8-bit to float normalise (imageio.c, dt_imageio_flip_buffers_ui8_to_float,
+ * m4-206).
+ *
+ * darkroom_imageio_u8_to_float replaces the former DT_OMP_FOR pixel loop of
+ * the !orientation fast path: per pixel (row, col) and lane k < ch,
+ * out[4*(row*wd+col)+k] = (in[row*stride+ch*col+k] - black)/(white-black).
+ * Lanes ch..4 of each output quad are never written and input row padding
+ * (stride >= ch*wd) is skipped. The oriented stride path and the single
+ * imageio_jpeg.c caller stay in C. out holds 4*wd*ht floats, in holds
+ * (ht-1)*stride+ch*wd bytes, ch is 1..4 by contract. Null pointers,
+ * non-positive dims, ch outside 1..4, and overflowing dim products are
+ * guarded no-ops.
+ */
+void darkroom_imageio_u8_to_float(float *out, const unsigned char *in,
+                                  float black, float white,
+                                  int ch, int wd, int ht, int stride);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
