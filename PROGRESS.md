@@ -4918,6 +4918,30 @@ this change.
 
 ---
 
+## 2026-09-13 15:20 UTC — m4-204: port PNG 16-bit normalize loop to Rust FFI
+
+**Commit** `39bc5572cd` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `bpp >= 16` else-branch of `dt_imageio_open_png`
+(`src/imageio/imageio_png.c:241`), replacing it with `darkroom_png_u16_to_float`.
+Extended `c41-core::png` (safe kernel, divergent reference, validated FFI,
+6 new tests — big-endian pairs times identical `1.0f32/65535.0f32` normalizer,
+blue-lane LSB quirk replicated bit-exactly and pinned against accidental
+"fix", alpha never written, dead `normalizer` removed); declared the export in
+`src/rust_ffi/darkroom_core.h` after the u8 block. Decode/alloc/flags and the
+u8 branch untouched; single call site. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (four P2
+nits; applied the actionable one in-session: blue-interior assertion added to
+the rails test).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 13:10 UTC — m4-200: port imagebuf copy-ROI fallback to Rust FFI
 
 **Commit** `ca6ffa6300` (GitHub + Gitea via `git push origin master`)
