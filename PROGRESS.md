@@ -4918,6 +4918,30 @@ this change.
 
 ---
 
+## 2026-09-13 16:20 UTC — m4-206: port imageio u8 fast path to Rust FFI
+
+**Commit** `cbe83c159b` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `!orientation` fast path of
+`dt_imageio_flip_buffers_ui8_to_float` (`src/imageio/imageio.c:924`),
+replacing it with `darkroom_imageio_u8_to_float`. Extended `c41-core::imageio`
+(safe kernel, divergent reference, validated FFI, 6 tests — hoisted
+`1/(white-black)` scale, lanes `ch..4` never written, stride padding skipped,
+`ch > 4` refused); declared the export in `src/rust_ffi/darkroom_core.h` after
+the swap block. Oriented stride path, signature, and the jpeg caller untouched.
+Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, one P1.
+Fixed in-session (byte-span `isize::MAX` cap on the `out` side, which counts
+f32 lanes not bytes; plus the C comment wording on scale hoisting).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 15:20 UTC — m4-204: port PNG 16-bit normalize loop to Rust FFI
 
 **Commit** `39bc5572cd` (GitHub + Gitea via `git push origin master`)
