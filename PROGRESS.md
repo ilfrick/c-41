@@ -4871,6 +4871,29 @@ this change.
 
 ---
 
+## 2026-09-13 14:20 UTC — m4-202: port QOI u8 normalize loop to Rust FFI
+
+**Commit** `2611140420` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `dt_imageio_open_qoi` u8→float normalize loop
+(`src/imageio/imageio_qoi.c:102`), replacing it with `darkroom_qoi_u8_to_float`.
+Added new `c41-core::qoi` (safe kernel, divergent reference, validated FFI,
+5 tests — true division `/ 255.0f32`, never reciprocal-multiply; all 4 lanes
+incl. alpha scaled); registered `pub mod qoi`; declared the export in
+`src/rust_ffi/darkroom_core.h` after the RGBE block. Decode orchestration
+untouched; single call site. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
+nits: `255.0` type-inference pinning — fixed in-session to `255.0f32` in both
+kernel and reference; sequential-vs-OMP note).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 13:10 UTC — m4-200: port imagebuf copy-ROI fallback to Rust FFI
 
 **Commit** `ca6ffa6300` (GitHub + Gitea via `git push origin master`)
