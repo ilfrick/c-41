@@ -4894,6 +4894,30 @@ this change.
 
 ---
 
+## 2026-09-13 14:50 UTC — m4-203: port PNG 8-bit normalize loop to Rust FFI
+
+**Commit** `303f94bef5` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `bpp < 16` branch of `dt_imageio_open_png`
+(`src/imageio/imageio_png.c:230`), replacing it with `darkroom_png_u8_to_float`.
+Added new `c41-core::png` (safe kernel, divergent reference, validated FFI,
+5 tests — identical `1.0f32/255.0f32` normalizer multiplied per lane, alpha
+never written, 16-bit branch deliberately left in C with its blue-lane
+asymmetry documented neutrally); registered `pub mod png`; declared the export
+in `src/rust_ffi/darkroom_core.h` after the QOI block. Decode/alloc/flags
+orchestration untouched; single call site. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (three P2
+notes: OMP→serial perf-only, one partial-write test pinning suggestion,
+double blank line after include — fixed in-session).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 13:10 UTC — m4-200: port imagebuf copy-ROI fallback to Rust FFI
 
 **Commit** `ca6ffa6300` (GitHub + Gitea via `git push origin master`)
