@@ -4822,3 +4822,31 @@ artifact, release gate authoritative and green). Header addition scanned for
 embedded `*/` (only the block terminator). Remaining warnings are pre-existing
 and outside this change.
 
+---
+
+## 2026-09-13 12:30 UTC — m4-199: port bilateral blur-line-z pass to Rust FFI
+
+**Commit** `c39b6dd1de` (GitHub + Gitea via `git push origin master`)
+
+**What.** Exposed the existing private Rust `blur_line_z` kernel as
+`darkroom_bilateral_blur_line_z` and wired it into the remaining pass of
+`dt_bilateral_blur`; deleted the now-unused static C `blur_line_z`. FFI calls
+the same kernel `Bilateral::blur()` uses. Completes the Rust port of the
+bilateral blur (both Gaussian passes from m4-198 plus the z derivative);
+splat/merge reductions, the OpenCL path, and all downstream IOPs untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (one
+cosmetic P2 only: continuation indent one space deeper than the sibling decl).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+**Notes — resumed after rate limit.** The delegated m4-199 dev subagent hit a
+provider rate limit after writing the Rust side (`blur_line_z` FFI +
+reference + tests) but before the C/header wiring; the main session verified
+the kernel op-by-op against the C original, applied the small C + header edits
+itself (call-site swap, static deletion, decl, stale-comment touch-ups), and
+ran the normal independent review + gate from there.
+
