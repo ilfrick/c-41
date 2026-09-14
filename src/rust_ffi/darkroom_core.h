@@ -3697,6 +3697,23 @@ void darkroom_qoi_u8_to_float(const unsigned char *rgba_buf, float *mipbuf,
                               size_t npixels);
 
 /*
+ * PNG 8-bit RGB normalize (imageio_png.c, dt_imageio_open_png, m4-203).
+ *
+ * darkroom_png_u8_to_float replaces the former DT_OMP_FOR pixel loop of
+ * the bpp < 16 branch: per pixel i, out[4*i + c] = src[3*i + c] *
+ * normalizer for c in 0..2 with normalizer = 1.0f / 255.0f (the C
+ * precomputed reciprocal, multiplied, not divided per lane). The alpha
+ * lane out[4*i + 3] is left as allocated, exactly as before. The 16-bit
+ * big-endian pair branch stays in C, as do the libpng decode, the
+ * mipmap-cache allocation, and the colorspace and flag setup. rgb_buf
+ * holds 3*npixels bytes, mipbuf 4*npixels floats; null pointers, a zero
+ * npixels, and overflowing 3/4*npixels products are guarded no-ops; the
+ * buffers must not overlap.
+ */
+void darkroom_png_u8_to_float(const unsigned char *rgb_buf, float *mipbuf,
+                              size_t npixels);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
