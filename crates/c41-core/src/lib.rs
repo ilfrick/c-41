@@ -25,6 +25,7 @@ pub mod heal;
 pub mod icc;
 pub mod illuminants;
 pub mod imagebuf;
+pub mod imageio;
 pub mod interp;
 pub mod iop;
 pub mod iop_profile;

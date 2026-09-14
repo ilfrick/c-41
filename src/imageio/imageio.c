@@ -31,6 +31,7 @@
 #include "develop/imageop.h"
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb
 
 #ifdef HAVE_OPENEXR
 #include "imageio/imageio_exr.h"
@@ -1435,14 +1436,10 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
       else
       { // !display_byteorder, need to swap:
         uint8_t *const buf8 = pipe.backbuf;
-        DT_OMP_FOR()
         // just flip byte order
-        for(size_t k = 0; k < (size_t)processed_width * processed_height; k++)
-        {
-          uint8_t tmp = buf8[4 * k + 0];
-          buf8[4 * k + 0] = buf8[4 * k + 2];
-          buf8[4 * k + 2] = tmp;
-        }
+        // Ported to Rust FFI, replaces DT_OMP_FOR loop
+        // (darkroom_imageio_swap_rb in crates/c41-core/src/imageio.rs)
+        darkroom_imageio_swap_rb(buf8, (size_t)processed_width * processed_height);
       }
     }
   }

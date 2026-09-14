@@ -3735,6 +3735,21 @@ void darkroom_png_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
                                size_t npixels);
 
 /*
+ * 8-bit export R/B lane swap (imageio.c, dt_imageio_export_with_flags,
+ * m4-205).
+ *
+ * darkroom_imageio_swap_rb replaces the former DT_OMP_FOR pixel loop of
+ * the bpp == 8 !display_byteorder branch: per pixel k, buf[4*k] and
+ * buf[4*k+2] exchange values (lanes 1 and 3 untouched), in place over
+ * npixels = processed_width * processed_height quads of pipe.backbuf.
+ * The pipeline processing, the float-to-byte downconversion, and the
+ * format-writer handoff stay in C. buf holds 4*npixels bytes; a null
+ * pointer, a zero npixels, and an overflowing 4*npixels product are
+ * guarded no-ops.
+ */
+void darkroom_imageio_swap_rb(unsigned char *buf, size_t npixels);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
