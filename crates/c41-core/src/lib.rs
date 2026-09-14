@@ -36,6 +36,7 @@ pub mod pfm;
 pub mod pipeline;
 pub mod raw;
 pub mod rawimage;
+pub mod rgbe;
 pub mod roi;
 pub mod splines;
 pub mod thumbnail;

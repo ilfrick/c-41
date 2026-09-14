@@ -19,6 +19,7 @@
 #include "common/matrices.h"
 #include "develop/imageop.h"         // for IOP_CS_RGB
 #include "imageio/imageio_rgbe.h"
+#include "rust_ffi/darkroom_core.h"  // for darkroom_rgbe_clamp_pack
 
 #include <ctype.h>
 #include <math.h>
@@ -475,15 +476,10 @@ dt_imageio_retval_t dt_imageio_open_rgbe(dt_image_t *img,
     return DT_IMAGEIO_CACHE_FULL;
   }
 
-  // repair nan/inf etc
-  DT_OMP_FOR()
-  for(size_t i = 0; i < npixels; i++)
-  {
-    dt_aligned_pixel_t pix = {0.0f, 0.0f, 0.0f, 0.0f};
-    for_three_channels(c)
-      pix[c] = fmaxf(0.0f, fminf(10000.0f, rgbe_buf[3 * i + c]));
-    copy_pixel_nontemporal(&mipbuf[4*i], pix);
-  }
+  // repair nan/inf etc — clamp-and-pack loop ported to Rust FFI (m4-201):
+  // each decoded channel is clamped to [0, 10000] and packed into the
+  // 4-channel float mipmap buffer (alpha stays 0.0, as before).
+  darkroom_rgbe_clamp_pack(rgbe_buf, mipbuf, npixels);
 
   dt_free_align(rgbe_buf);
 

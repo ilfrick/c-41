@@ -3665,6 +3665,24 @@ void darkroom_pfm_unpack(const float *readbuf, float *image, size_t width,
                           int swap_byte_order, int made_by_photoshop);
 
 /*
+ * RGBE clamp-and-pack (imageio_rgbe.c, dt_imageio_open_rgbe, m4-201).
+ *
+ * darkroom_rgbe_clamp_pack replaces the former DT_OMP_FOR pixel loop that
+ * repairs the decoded floats and packs them into the mipmap buffer: per
+ * pixel i, out[4*i + c] = fmaxf(0.0f, fminf(10000.0f, in[3*i + c])) for
+ * c in 0..2, and out[4*i + 3] = 0.0 (the C zero-initialised pix slot
+ * carried through the 4-wide nontemporal store). NaN maps to 10000.0
+ * (fminf/fmaxf minNum/maxNum semantics under the repo-wide
+ * -fno-finite-math-only), -0.0 normalises to +0.0, +inf saturates to
+ * 10000.0 and -inf to 0.0; finite values inside the rails pass through
+ * untouched. rgbe_buf holds 3*npixels floats, mipbuf 4*npixels; the two
+ * buffers must not overlap. Null pointers, a zero npixels, and overflowing
+ * 3/4*npixels products are guarded no-ops.
+ */
+void darkroom_rgbe_clamp_pack(const float *rgbe_buf, float *mipbuf,
+                               size_t npixels);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
