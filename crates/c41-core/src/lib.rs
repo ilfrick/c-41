@@ -34,6 +34,7 @@ pub mod math;
 pub mod params;
 pub mod pfm;
 pub mod pipeline;
+pub mod qoi;
 pub mod raw;
 pub mod rawimage;
 pub mod rgbe;

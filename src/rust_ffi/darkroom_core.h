@@ -3683,6 +3683,20 @@ void darkroom_rgbe_clamp_pack(const float *rgbe_buf, float *mipbuf,
                                size_t npixels);
 
 /*
+ * QOI u8-to-float normalize (imageio_qoi.c, dt_imageio_open_qoi, m4-202).
+ *
+ * darkroom_qoi_u8_to_float replaces the former DT_OMP_FOR pixel loop that
+ * scales the decoded bytes into the mipmap buffer: per flat index i,
+ * out[i] = (float)src[i] / 255.0f over all 4*npixels bytes, alpha lane
+ * included (an opaque 255 alpha becomes exactly 1.0). The decode, the
+ * mipmap-cache allocation, and the colorspace/flag setup stay in C.
+ * Null pointers, a zero npixels, and an overflowing 4*npixels product
+ * are guarded no-ops; the buffers must not overlap.
+ */
+void darkroom_qoi_u8_to_float(const unsigned char *rgba_buf, float *mipbuf,
+                              size_t npixels);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the

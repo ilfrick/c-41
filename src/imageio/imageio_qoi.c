@@ -30,6 +30,7 @@
 #include "common/image.h"
 #include "develop/imageop.h"         // for IOP_CS_RGB
 #include "imageio/imageio_common.h"
+#include "rust_ffi/darkroom_core.h"  // for darkroom_qoi_u8_to_float
 
 dt_imageio_retval_t dt_imageio_open_qoi(dt_image_t *img,
                                         const char *filename,
@@ -99,11 +100,10 @@ dt_imageio_retval_t dt_imageio_open_qoi(dt_image_t *img,
 
   const size_t npixels = (size_t)desc.width * desc.height;
 
-  DT_OMP_FOR()
-  for(size_t index = 0; index < npixels * 4; index++)
-  {
-    mipbuf[index] = int_RGBA_buf[index] / 255.f;
-  }
+  // u8-to-float normalize loop ported to Rust FFI (m4-202): each decoded
+  // byte is scaled by 1/255 into the 4-channel float mipmap buffer, alpha
+  // lane included (opaque 255 becomes exactly 1.0, as before).
+  darkroom_qoi_u8_to_float(int_RGBA_buf, mipbuf, npixels);
 
   img->buf_dsc.cst = IOP_CS_RGB;
   img->buf_dsc.filters = 0u;
