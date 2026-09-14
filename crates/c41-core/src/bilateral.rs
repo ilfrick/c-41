@@ -593,14 +593,14 @@ pub unsafe extern "C" fn darkroom_bilateral_slice(
                  w, h, input, output, detail);
 }
 
-// ── FFI boundary (m4-198): `dt_bilateral_blur` in
-// `src/common/bilateral.c` forwards its two Gaussian passes here instead of
-// running the OpenMP `blur_line` in C. Runs the SAME serial scalar code as
-// [`blur_line`] (which [`Bilateral::blur`] delegates to), so method-level
-// tests pin both callers at once; dedicated FFI parity tests re-drive this
-// export against the method. The `blur_line_z` derivative pass stays in C
-// (backup m4-199). Lines are independent — each (k, j) line touches disjoint
-// cells — so the serial loop is bit-exact with the C's `DT_OMP_FOR` split
+// ── FFI boundary (m4-198/m4-199): `dt_bilateral_blur` in
+// `src/common/bilateral.c` forwards all three passes here instead of
+// running the OpenMP `blur_line` / `blur_line_z` in C. Each runs the SAME
+// serial scalar code as [`blur_line`] / [`blur_line_z`] (which
+// [`Bilateral::blur`] delegates to), so method-level tests pin every caller
+// at once; dedicated FFI parity tests re-drive these exports against the
+// method. Lines are independent — each (k, j) line touches disjoint
+// cells — so the serial loops are bit-exact with the C's `DT_OMP_FOR` split
 // over k: no reduction or cross-line read whose order serial could change.
 
 /// # Safety
@@ -641,6 +641,46 @@ pub unsafe extern "C" fn darkroom_bilateral_blur_line(
     };
     let buf = std::slice::from_raw_parts_mut(buf, len);
     blur_line(buf, offset1, offset2, offset3, size1, size2, size3);
+}
+
+/// # Safety
+/// `buf` must hold at least
+/// `offset1·(size1−1) + offset2·(size2−1) + offset3·(size3−1) + 1` floats —
+/// the highest index the line loop touches. Cells are mutated strictly in
+/// place, one independent line at a time.
+///
+/// The bound is sound for every input *because* [`blur_line_z`] early-returns
+/// when `size3 < 4`: with fewer than four cells on the innermost axis the
+/// derivative stencil has no valid centre, so no wider indexing occurs.
+/// Null pointers, zero sizes, and overflowing offset bounds are guarded
+/// no-ops; the stated buffer length remains a caller contract.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_bilateral_blur_line_z(
+    buf: *mut f32,
+    offset1: usize,
+    offset2: usize,
+    offset3: usize,
+    size1: usize,
+    size2: usize,
+    size3: usize,
+) {
+    if buf.is_null() || size1 == 0 || size2 == 0 || size3 == 0 {
+        return;
+    }
+    let max_index = match offset1
+        .checked_mul(size1 - 1)
+        .and_then(|a| a.checked_add(offset2.checked_mul(size2 - 1)?))
+        .and_then(|b| b.checked_add(offset3.checked_mul(size3 - 1)?))
+    {
+        Some(m) => m,
+        None => return,
+    };
+    let len = match max_index.checked_add(1) {
+        Some(n) => n,
+        None => return,
+    };
+    let buf = std::slice::from_raw_parts_mut(buf, len);
+    blur_line_z(buf, offset1, offset2, offset3, size1, size2, size3);
 }
 
 /// Separable `[1 4 6 4 1]/16` Gaussian along the `offset3` axis (`size3` elements),
@@ -730,6 +770,48 @@ fn blur_line_z(
             buf[index] = w1 * (buf[index + offset3] - tmp2) - w2 * tmp1;
             index += offset3;
             buf[index] = -w1 * tmp3 - w2 * tmp2;
+        }
+    }
+}
+
+/// Structurally divergent reference for [`blur_line_z`]: two-phase instead of
+/// running-buffer — each line is snapshotted into scratch, then every output
+/// is recomputed from pristine snapshot cells with direct index arithmetic
+/// (no tmp chain, no in-place forward reads). Equivalent because the kernel's
+/// forward reads (`buf[index + offset3]`, `buf[index + 2*offset3]`) always hit
+/// cells ahead of the write frontier, and the tmp chain replays pristine
+/// predecessors (`tmp1` = snap[i-2], `tmp2` = snap[i-1]); each expression
+/// below keeps the kernel's exact left-associative spelling so agreement
+/// checks formula-level equivalence to the bit.
+fn blur_line_z_reference(
+    buf: &mut [f32],
+    offset1: usize,
+    offset2: usize,
+    offset3: usize,
+    size1: usize,
+    size2: usize,
+    size3: usize,
+) {
+    if size3 < 4 {
+        return;
+    }
+    let (w1, w2) = (4.0 / 16.0, 2.0 / 16.0);
+    let mut line = vec![0.0f32; size3];
+    for k in 0..size1 {
+        for j in 0..size2 {
+            let start = k * offset1 + j * offset2;
+            for i in 0..size3 {
+                line[i] = buf[start + i * offset3];
+            }
+            buf[start] = w1 * line[1] + w2 * line[2];
+            buf[start + offset3] = w1 * (line[2] - line[0]) + w2 * line[3];
+            for i in 2..size3 - 2 {
+                buf[start + i * offset3] =
+                    w1 * (line[i + 1] - line[i - 1]) + w2 * (line[i + 2] - line[i - 2]);
+            }
+            let n = size3;
+            buf[start + (n - 2) * offset3] = w1 * (line[n - 1] - line[n - 3]) - w2 * line[n - 4];
+            buf[start + (n - 1) * offset3] = -w1 * line[n - 2] - w2 * line[n - 3];
         }
     }
 }
@@ -1414,10 +1496,10 @@ mod tests {
 
     #[test]
     fn blur_line_serial_ffi_matches_method_blur_bit_exact() {
-        // The two serial FFI Gaussian passes plus the shared blur_line_z
-        // kernel must reproduce Bilateral::blur to the bit: the method and
-        // the FFI run one implementation, and lines are independent so the
-        // serial loop is bit-exact with the C's former OMP split over k.
+        // All three serial FFI passes must reproduce Bilateral::blur to the
+        // bit: the method and the FFI exports run one implementation, and
+        // lines are independent so the serial loops are bit-exact with the
+        // C's former OMP splits over k.
         let (w, h) = (24usize, 18usize);
         let input = img(w, h, |i, j| ((i * 7 + j * 13) % 100) as f32);
         let mut m = Bilateral::new(w, h, 6.0, 10.0);
@@ -1433,11 +1515,84 @@ mod tests {
         unsafe {
             darkroom_bilateral_blur_line(raw.as_mut_ptr(), oz, oy, ox, sz, sy, sx);
             darkroom_bilateral_blur_line(raw.as_mut_ptr(), oz, ox, oy, sz, sx, sy);
+            darkroom_bilateral_blur_line_z(raw.as_mut_ptr(), ox, oy, oz, sx, sy, sz);
         }
-        blur_line_z(&mut raw, ox, oy, oz, sx, sy, sz);
         assert_eq!(raw.len(), want.len());
         for (k, (a, b)) in raw.iter().zip(&want).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "cell {k} diverged after blur");
+        }
+    }
+
+    // ── m4-199: `dt_bilateral_blur` derivative-pass FFI parity ──
+
+    #[test]
+    fn blur_line_z_ffi_guards_leave_buffer_untouched() {
+        // Null pointers, zero sizes, and overflowing offset bounds must
+        // no-op, never crash or touch the buffer.
+        let mut buf = [3.0f32; 64];
+        unsafe {
+            darkroom_bilateral_blur_line_z(std::ptr::null_mut(), 1, 1, 1, 2, 2, 4);
+            darkroom_bilateral_blur_line_z(buf.as_mut_ptr(), 1, 1, 1, 0, 2, 4);
+            darkroom_bilateral_blur_line_z(buf.as_mut_ptr(), 1, 1, 1, 2, 0, 4);
+            darkroom_bilateral_blur_line_z(buf.as_mut_ptr(), 1, 1, 1, 2, 2, 0);
+            // overflowing highest-touched-index bound:
+            darkroom_bilateral_blur_line_z(buf.as_mut_ptr(), usize::MAX, 1, 1, 2, 2, 4);
+            // degenerate line (size3 < 4): the kernel early-returns, so the
+            // buffer is unchanged (the C reads OOB heap here and survives;
+            // Rust makes it a defined no-op instead).
+            darkroom_bilateral_blur_line_z(buf.as_mut_ptr(), 1, 8, 2, 2, 2, 2);
+        }
+        assert!(buf.iter().all(|&v| v == 3.0), "guarded FFI calls must no-op: {buf:?}");
+    }
+
+    #[test]
+    fn blur_line_z_matches_reference_bit_exact() {
+        // Kernel vs the two-phase snapshot reference over varied line counts,
+        // lengths (head-only size3 == 4 through headed/bodied/tailed), and
+        // strides (unit, gapped, and grid-like ox/oy/oz layouts).
+        let layouts = [
+            (1usize, 1usize, 1usize),
+            (1, 2, 3),
+            (4, 3, 2),
+        ];
+        for (case, &(o1, o2, o3)) in layouts.iter().enumerate() {
+            for size3 in [4usize, 5, 6, 9, 16] {
+                let (size1, size2) = (3usize, 2usize);
+                let len = o1 * (size1 - 1) + o2 * (size2 - 1) + o3 * (size3 - 1) + 1;
+                let seed = |n: usize| ((n * 37 + case * 11 + size3 * 5) % 97) as f32 * 0.7 - 5.0;
+                let base: Vec<f32> = (0..len).map(seed).collect();
+                let mut a = base.clone();
+                let mut r = base.clone();
+                blur_line_z(&mut a, o1, o2, o3, size1, size2, size3);
+                blur_line_z_reference(&mut r, o1, o2, o3, size1, size2, size3);
+                for (k, (x, y)) in a.iter().zip(&r).enumerate() {
+                    assert_eq!(x.to_bits(), y.to_bits(),
+                               "kernel vs reference differ at {k} case {case} size3 {size3}");
+                }
+                // the pass must actually change something (guards the test
+                // against a vacuous both-no-op agreement):
+                assert!(a.iter().zip(&base).any(|(x, y)| x.to_bits() != y.to_bits()),
+                        "pass was a no-op in case {case} size3 {size3}");
+            }
+        }
+    }
+
+    #[test]
+    fn blur_line_z_ffi_matches_kernel_bit_exact() {
+        // Re-driving the export over a grid-like layout must reproduce the
+        // kernel to the bit (they share the body; this pins the FFI plumbing).
+        let (sx, sy, sz) = (5usize, 4usize, 7usize);
+        let (ox, oy, oz) = (sz, sx * sz, 1usize);
+        let len = ox * (sx - 1) + oy * (sy - 1) + oz * (sz - 1) + 1;
+        let base: Vec<f32> = (0..len).map(|n| ((n * 13) % 53) as f32 * 0.5 - 3.0).collect();
+        let mut via_kernel = base.clone();
+        let mut via_ffi = base.clone();
+        blur_line_z(&mut via_kernel, ox, oy, oz, sx, sy, sz);
+        unsafe {
+            darkroom_bilateral_blur_line_z(via_ffi.as_mut_ptr(), ox, oy, oz, sx, sy, sz);
+        }
+        for (k, (x, y)) in via_kernel.iter().zip(&via_ffi).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "FFI vs kernel differ at cell {k}");
         }
     }
 }

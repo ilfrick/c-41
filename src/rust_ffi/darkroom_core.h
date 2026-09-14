@@ -3795,13 +3795,25 @@ void darkroom_bilateral_slice(const float *grid_buf,
  * boundary handling. buf must hold at least the highest touched cell --
  * index offset1*(size1-1) + offset2*(size2-1) + offset3*(size3-1) -- plus
  * one. Call it twice to reproduce the Gaussian half of dt_bilateral_blur
- * (x, then y axes); the blur_line_z derivative pass stays in C. Null
- * pointers, zero sizes, and overflowing offset bounds are guarded no-ops;
- * the stated buffer length remains a caller contract.
+ * (x, then y axes). Null pointers, zero sizes, and overflowing offset
+ * bounds are guarded no-ops; the stated buffer length remains a caller
+ * contract.
  */
 void darkroom_bilateral_blur_line(float *buf,
                                   size_t offset1, size_t offset2, size_t offset3,
                                   size_t size1, size_t size2, size_t size3);
+
+/*
+ * Bilateral-grid blur-line z derivative (src/common/bilateral.c, m4-199).
+ *
+ * darkroom_bilateral_blur_line_z replaces the blur_line_z pass of
+ * dt_bilateral_blur(): the -2-derivative-of-gaussian pass along offset3
+ * (asymmetric forward/backward edge handling), completing the Rust port of
+ * the blur. Same guard contract as darkroom_bilateral_blur_line.
+ */
+void darkroom_bilateral_blur_line_z(float *buf,
+                                     size_t offset1, size_t offset2, size_t offset3,
+                                     size_t size1, size_t size2, size_t size3);
 
 /*
  * Edge-avoiding wavelets soft-threshold synthesize (src/common/eaw.c, m4-182).
