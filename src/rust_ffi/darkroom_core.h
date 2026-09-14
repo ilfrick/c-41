@@ -3704,14 +3704,35 @@ void darkroom_qoi_u8_to_float(const unsigned char *rgba_buf, float *mipbuf,
  * normalizer for c in 0..2 with normalizer = 1.0f / 255.0f (the C
  * precomputed reciprocal, multiplied, not divided per lane). The alpha
  * lane out[4*i + 3] is left as allocated, exactly as before. The 16-bit
- * big-endian pair branch stays in C, as do the libpng decode, the
- * mipmap-cache allocation, and the colorspace and flag setup. rgb_buf
+ * big-endian pair branch is ported separately (darkroom_png_u16_to_float,
+ * m4-204); the libpng decode, the
+ * mipmap-cache allocation, and the colorspace and flag setup stay in C.
+ * rgb_buf
  * holds 3*npixels bytes, mipbuf 4*npixels floats; null pointers, a zero
  * npixels, and overflowing 3/4*npixels products are guarded no-ops; the
  * buffers must not overlap.
  */
 void darkroom_png_u8_to_float(const unsigned char *rgb_buf, float *mipbuf,
                               size_t npixels);
+
+/*
+ * PNG 16-bit RGB normalize (imageio_png.c, dt_imageio_open_png, m4-204).
+ *
+ * darkroom_png_u16_to_float replaces the former DT_OMP_FOR pixel loop of
+ * the bpp >= 16 branch: per pixel i, out[4*i] is (src[6*i] * 256.0f +
+ * src[6*i+1]) * normalizer (red) and out[4*i+1] is (src[6*i+2] * 256.0f
+ * + src[6*i+3]) * normalizer (green), with normalizer = 1.0f / 65535.0f;
+ * the blue lane out[4*i+2] combines its own MSB with the GREEN lane's
+ * LSB ((src[6*i+4] * 256.0f + src[6*i+3]) * normalizer), exactly as the C
+ * loop did — preserved, not adjudicated. The alpha lane out[4*i+3] is
+ * left as allocated, exactly as before. The libpng decode, the
+ * mipmap-cache allocation, and the colorspace and flag setup stay in C.
+ * rgb_buf holds 6*npixels bytes, mipbuf 4*npixels floats; null pointers,
+ * a zero npixels, and overflowing 6/4*npixels products are guarded
+ * no-ops; the buffers must not overlap.
+ */
+void darkroom_png_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
+                               size_t npixels);
 
 /*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).

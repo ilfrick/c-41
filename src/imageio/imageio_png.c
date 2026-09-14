@@ -30,7 +30,7 @@
 #include "develop/develop.h"
 #include "imageio_common.h"
 #include "imageio_png.h"
-#include "rust_ffi/darkroom_core.h"  // for darkroom_png_u8_to_float
+#include "rust_ffi/darkroom_core.h"  // for darkroom_png_u8_to_float/u16_to_float
 
 // Reading of PNG files also takes place in the LUT 3D module in order to obtain
 // LUTs encoded in this format. To minimize code duplication, we put the code
@@ -228,7 +228,7 @@ dt_imageio_retval_t dt_imageio_open_png(dt_image_t *img,
     // u8-to-float normalize loop ported to Rust FFI (m4-203): each RGB
     // byte is scaled by 1/255 into the 4-channel float mipmap buffer; the
     // alpha lane is left as allocated, as before. The 16-bit pair branch
-    // below stays in C.
+    // below is ported separately (m4-204).
     darkroom_png_u8_to_float(buf, mipbuf, npixels);
   }
   else
@@ -236,15 +236,12 @@ dt_imageio_retval_t dt_imageio_open_png(dt_image_t *img,
     img->flags &= ~DT_IMAGE_LDR;
     img->flags |= DT_IMAGE_HDR;
 
-    const float normalizer = 1.0f / 65535.0f;
-
-    DT_OMP_FOR()
-    for(size_t index = 0; index < npixels; index++)
-    {
-      mipbuf[4 * index]     = (buf[2 * (3 * index)]     * 256.0f + buf[2 * (3 * index)     + 1]) * normalizer;
-      mipbuf[4 * index + 1] = (buf[2 * (3 * index + 1)] * 256.0f + buf[2 * (3 * index + 1) + 1]) * normalizer;
-      mipbuf[4 * index + 2] = (buf[2 * (3 * index + 2)] * 256.0f + buf[2 * (3 * index + 1) + 1]) * normalizer;
-    }
+    // 16-bit big-endian pair normalize loop ported to Rust FFI (m4-204):
+    // each channel's two bytes combine MSB-first and scale by 1/65535
+    // into the 4-channel float mipmap buffer; the alpha lane is left as
+    // allocated, as before. The blue lane keeps the C loop's low-byte
+    // source (the green lane's offset); see crates/c41-core/src/png.rs.
+    darkroom_png_u16_to_float(buf, mipbuf, npixels);
   }
 
   dt_free_align(buf);
