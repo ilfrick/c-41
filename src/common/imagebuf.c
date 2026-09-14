@@ -219,23 +219,17 @@ void dt_iop_copy_image_roi(float *const __restrict__ out,
   }
 
   // the RoI are inconsistant so we do a copy per location and fill by zero if
-  // not available in RoI-in
-  DT_OMP_FOR(collapse(2))
-  for(int row = 0; row < roi_out->height; row++)
-  {
-    for(int col = 0; col < roi_out->width; col++)
-    {
-      const int irow = row + dy;
-      const int icol = col + dx;
-      const size_t ox = (size_t)ch * (row * roi_out->width + col);
-      const size_t ix = (size_t)ch * (irow * roi_in->width + icol);
-      const gboolean avail = irow >= 0 && irow < roi_in->height
-                          && icol >= 0 && icol < roi_in->width;
-
-      for(int c = 0; c < ch; c++)
-        out[ox+c] = avail ? in[ix+c] : 0.0f;
-    }
-  }
+  // not available in RoI-in. Pixel loop ported to Rust FFI
+  // (darkroom_imagebuf_copy_roi in crates/c41-core/src/imagebuf.rs); the
+  // whole-buffer and per-row memcpy fast paths above stay in C. Negative ROI
+  // dims wrap to huge size_t values, which the FFI rejects via its checked
+  // length validation, matching the C loop's empty-range no-op.
+  darkroom_imagebuf_copy_roi(out, in, ch,
+                             (size_t)roi_in->width, (size_t)roi_in->height,
+                             (size_t)roi_out->width, (size_t)roi_out->height,
+                             dx, dy,
+                             ch * (size_t)roi_out->width * (size_t)roi_out->height,
+                             ch * (size_t)roi_in->width * (size_t)roi_in->height);
 }
 
 void dt_iop_image_scaled_copy(float *const restrict buf,

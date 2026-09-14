@@ -156,6 +156,62 @@ pub fn copy_alpha(out: &mut [f32], src: &[f32], width: usize, height: usize) {
     }
 }
 
+/// ROI copy with zero-fill for out-of-range pixels.
+///
+/// Port of the `DT_OMP_FOR(collapse(2))` fallback loop in
+/// `dt_iop_copy_image_roi` (imagebuf.c:223). The C fast paths — whole-buffer
+/// copy and per-row `memcpy` — stay in C; only this branch, taken when the
+/// ROIs are inconsistent, is ported. For each output pixel `(row, col)`,
+/// `(irow, icol) = (row + dy, col + dx)`; when inside the input ROI the `ch`
+/// channels are copied, otherwise the pixel is zeroed. This is a
+/// bounds-conditional kernel, not a bulk memcpy.
+///
+/// `dx`/`dy` are signed (`roi_out - roi_in` offsets can be negative), so the
+/// index math runs in `i64` and an out-of-range source coordinate takes the
+/// zero branch without ever forming an out-of-bounds index. Undersized
+/// buffers or a `ch*w*h` overflow are a no-op (the FFI caller guarantees
+/// exact lengths, so production always runs full). Like the C `restrict`
+/// contract, `out` and `src` must not overlap.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_roi(
+    out: &mut [f32],
+    src: &[f32],
+    ch: usize,
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    dx: i64,
+    dy: i64,
+) {
+    let Some(need_out) = ch.checked_mul(out_w).and_then(|v| v.checked_mul(out_h)) else {
+        return;
+    };
+    let Some(need_in) = ch.checked_mul(in_w).and_then(|v| v.checked_mul(in_h)) else {
+        return;
+    };
+    if need_out == 0 || need_in == 0 || out.len() < need_out || src.len() < need_in {
+        return;
+    }
+    let in_w_i = in_w as i64;
+    let in_h_i = in_h as i64;
+    for row in 0..out_h {
+        for col in 0..out_w {
+            let irow = row as i64 + dy;
+            let icol = col as i64 + dx;
+            let ox = ch * (row * out_w + col);
+            if irow >= 0 && irow < in_h_i && icol >= 0 && icol < in_w_i {
+                let ix = ch * ((irow as usize) * in_w + (icol as usize));
+                out[ox..ox + ch].copy_from_slice(&src[ix..ix + ch]);
+            } else {
+                for c in 0..ch {
+                    out[ox + c] = 0.0;
+                }
+            }
+        }
+    }
+}
+
 // ── FFI exports ─────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -334,6 +390,63 @@ pub unsafe extern "C" fn darkroom_imagebuf_copy_alpha(
     copy_alpha(out_slice, src_slice, width, height);
 }
 
+/// Copy the inconsistent-ROI fallback of `dt_iop_copy_image_roi`.
+///
+/// `dx`/`dy` are the C `int` ROI offsets (`roi_out - roi_in`, may be
+/// negative); the remaining sizes are element counts. `out_len`/`in_len`
+/// are validated against the checked `ch*w*h` products — the slices are
+/// built from the recomputed products, never from the caller lengths, so a
+/// wrapped C-side product cannot size a slice. NULL pointers, empty dims,
+/// arithmetic overflow, oversized (`> i32::MAX`) products, or short buffers
+/// are a no-op. `out` and `src` must not overlap (C `restrict` contract).
+///
+/// # Safety
+/// `out` must hold at least `out_len` floats and `src` at least `in_len`
+/// floats (or be NULL, in which case this is a no-op).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imagebuf_copy_roi(
+    out: *mut f32,
+    src: *const f32,
+    ch: usize,
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    dx: i32,
+    dy: i32,
+    out_len: usize,
+    in_len: usize,
+) {
+    if out.is_null() || src.is_null() {
+        return;
+    }
+    let Some(need_out) = ch.checked_mul(out_w).and_then(|v| v.checked_mul(out_h)) else {
+        return;
+    };
+    let Some(need_in) = ch.checked_mul(in_w).and_then(|v| v.checked_mul(in_h)) else {
+        return;
+    };
+    if need_out == 0 || need_in == 0 || out_len < need_out || in_len < need_in {
+        return;
+    }
+    if need_out > i32::MAX as usize || need_in > i32::MAX as usize {
+        return;
+    }
+    let out_slice = std::slice::from_raw_parts_mut(out, need_out);
+    let src_slice = std::slice::from_raw_parts(src, need_in);
+    copy_roi(
+        out_slice,
+        src_slice,
+        ch,
+        in_w,
+        in_h,
+        out_w,
+        out_h,
+        dx as i64,
+        dy as i64,
+    );
+}
+
 // ── Reference implementations for bit-exactness tests ────────────────────────
 
 #[allow(dead_code)]
@@ -430,6 +543,53 @@ fn ref_copy_alpha(out: &mut [f32], src: &[f32], width: usize, height: usize) {
     let mut p = 0;
     while p < m {
         out[p * 4 + 3] = src[p * 4 + 3];
+        p += 1;
+    }
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn ref_copy_roi(
+    out: &mut [f32],
+    src: &[f32],
+    ch: usize,
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    dx: i64,
+    dy: i64,
+) {
+    // Deliberately different: single flat pass over the output pixels with
+    // div/mod coordinate recovery and a while-loop channel copy, versus the
+    // kernel's nested row/col/for-channel loops. Same result.
+    let Some(need_out) = ch.checked_mul(out_w).and_then(|v| v.checked_mul(out_h)) else {
+        return;
+    };
+    let Some(need_in) = ch.checked_mul(in_w).and_then(|v| v.checked_mul(in_h)) else {
+        return;
+    };
+    if need_out == 0 || need_in == 0 || out.len() < need_out || src.len() < need_in {
+        return;
+    }
+    let npix = out_w * out_h;
+    let mut p = 0;
+    while p < npix {
+        let row = p / out_w;
+        let col = p % out_w;
+        let irow = row as i64 + dy;
+        let icol = col as i64 + dx;
+        let ox = p * ch;
+        let inside = irow >= 0 && irow < in_h as i64 && icol >= 0 && icol < in_w as i64;
+        let mut c = 0;
+        while c < ch {
+            out[ox + c] = if inside {
+                src[ch * ((irow as usize) * in_w + (icol as usize)) + c]
+            } else {
+                0.0
+            };
+            c += 1;
+        }
         p += 1;
     }
 }
@@ -1201,5 +1361,222 @@ mod tests {
             darkroom_imagebuf_copy_alpha(buf.as_ptr(), buf.as_mut_ptr(), 4, 4);
         }
         assert_eq!(to_bits(&buf), before);
+    }
+
+    // ── copy_roi ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn copy_roi_full_overlap_is_identity() {
+        // Same dims, zero offset: out == in, bit-exact.
+        let mut src = vec![0.0f32; 4 * 6];
+        lcg_fill(&mut src, 0xC01, 1.0);
+        let mut out = vec![-7.0f32; 4 * 6];
+        copy_roi(&mut out, &src, 4, 3, 2, 3, 2, 0, 0);
+        assert_eq!(to_bits(&out), to_bits(&src));
+    }
+
+    #[test]
+    fn copy_roi_shifted_window() {
+        // 4x4 single-channel input 0..16; 2x2 output at dx=1, dy=1.
+        let src: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let mut out = vec![-1.0f32; 4];
+        copy_roi(&mut out, &src, 1, 4, 4, 2, 2, 1, 1);
+        assert_eq!(to_bits(&out), to_bits(&[5.0, 6.0, 9.0, 10.0]));
+    }
+
+    #[test]
+    fn copy_roi_zero_pad() {
+        // 2x2 input, 3x3 output at dx=-1, dy=-1: the input lands in the
+        // bottom-right corner, everything else is +0.0.
+        let src = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut out = vec![-1.0f32; 9];
+        copy_roi(&mut out, &src, 1, 2, 2, 3, 3, -1, -1);
+        assert_eq!(
+            to_bits(&out),
+            to_bits(&[0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 3.0, 4.0])
+        );
+    }
+
+    #[test]
+    fn copy_roi_multichannel_shift_and_pad() {
+        // 2x1 RGBA input; 2x2 RGBA output at dx=0, dy=-1: first row zeros,
+        // second row carries the input row.
+        let src = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut out = vec![-1.0f32; 16];
+        copy_roi(&mut out, &src, 4, 2, 1, 2, 2, 0, -1);
+        assert_eq!(
+            to_bits(&out),
+            to_bits(&[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+            ])
+        );
+    }
+
+    #[test]
+    fn copy_roi_matches_reference_over_lcg() {
+        // Aligned overlap plus a shifted window with zero padding, incl. ch=1.
+        for (ch, in_w, in_h, out_w, out_h, dx, dy) in [
+            (4usize, 8, 6, 8, 6, 0i64, 0i64),
+            (4, 8, 6, 5, 4, 2, 1),
+            (4, 5, 4, 8, 6, -2, -1),
+            (1, 7, 5, 4, 9, 3, -2),
+        ] {
+            let mut src = vec![0.0f32; ch * in_w * in_h];
+            lcg_fill(&mut src, 0xC0E1, 1.0);
+            let mut direct = vec![-3.0f32; ch * out_w * out_h];
+            let mut reference = vec![-3.0f32; ch * out_w * out_h];
+            copy_roi(&mut direct, &src, ch, in_w, in_h, out_w, out_h, dx, dy);
+            ref_copy_roi(&mut reference, &src, ch, in_w, in_h, out_w, out_h, dx, dy);
+            assert_eq!(to_bits(&direct), to_bits(&reference), "dx={dx} dy={dy}");
+        }
+    }
+
+    #[test]
+    fn copy_roi_nan_payload_bit_exact() {
+        // NaN payloads and infinities survive the copy bit-identical.
+        let nan = f32::from_bits(0x7FC0_1234);
+        let src = vec![nan, f32::INFINITY, f32::NEG_INFINITY, 1.5];
+        let mut out = vec![0.0f32; 4];
+        copy_roi(&mut out, &src, 1, 2, 2, 2, 2, 0, 0);
+        assert_eq!(to_bits(&out), to_bits(&src));
+    }
+
+    #[test]
+    fn copy_roi_degenerate_noop() {
+        let src = vec![1.0f32; 16];
+        let mut out = vec![2.0f32; 16];
+        copy_roi(&mut out, &src, 4, 2, 2, 2, 2, 0, 0); // sanity: runs
+        copy_roi(&mut out, &src, 0, 2, 2, 2, 2, 0, 0); // ch == 0
+        copy_roi(&mut out, &src, 4, 0, 2, 2, 2, 0, 0); // in_w == 0
+        copy_roi(&mut out, &src, 4, 2, 2, 0, 2, 0, 0); // out_w == 0
+        copy_roi(&mut out, &src, usize::MAX, 2, 2, 2, 0, 0, 0); // overflow
+        let mut empty: Vec<f32> = vec![];
+        copy_roi(&mut empty, &[], 4, 0, 0, 0, 0, 0, 0); // no panic
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn copy_roi_short_buffers_noop() {
+        // Buffers shorter than ch*w*h: untouched, no panic.
+        let src = vec![1.0f32; 8];
+        let mut out = vec![2.0f32; 8];
+        copy_roi(&mut out, &src, 4, 2, 2, 2, 2, 0, 0); // needs 16 each
+        assert_eq!(out, vec![2.0; 8]);
+    }
+
+    #[test]
+    fn ffi_copy_roi_round_trip() {
+        let mut src = vec![0.0f32; 4 * 8 * 6];
+        lcg_fill(&mut src, 0xBEEF, 1.0);
+        let (in_w, in_h) = (8usize, 6usize);
+        let (out_w, out_h) = (5usize, 4usize);
+        let (dx, dy) = (2i32, 1i32);
+        let mut ffi_out = vec![-3.0f32; 4 * out_w * out_h];
+        let mut direct_out = vec![-3.0f32; 4 * out_w * out_h];
+        unsafe {
+            darkroom_imagebuf_copy_roi(
+                ffi_out.as_mut_ptr(),
+                src.as_ptr(),
+                4,
+                in_w,
+                in_h,
+                out_w,
+                out_h,
+                dx,
+                dy,
+                ffi_out.len(),
+                src.len(),
+            );
+        }
+        copy_roi(
+            &mut direct_out,
+            &src,
+            4,
+            in_w,
+            in_h,
+            out_w,
+            out_h,
+            dx as i64,
+            dy as i64,
+        );
+        assert_eq!(to_bits(&ffi_out), to_bits(&direct_out));
+    }
+
+    #[test]
+    fn ffi_copy_roi_guards() {
+        let src = vec![1.0f32; 16];
+        let mut out = vec![2.0f32; 16];
+        unsafe {
+            // NULL pointers.
+            darkroom_imagebuf_copy_roi(
+                std::ptr::null_mut(),
+                src.as_ptr(),
+                4,
+                2,
+                2,
+                2,
+                2,
+                0,
+                0,
+                16,
+                16,
+            );
+            darkroom_imagebuf_copy_roi(
+                out.as_mut_ptr(),
+                std::ptr::null(),
+                4,
+                2,
+                2,
+                2,
+                2,
+                0,
+                0,
+                16,
+                16,
+            );
+            // Empty dims.
+            darkroom_imagebuf_copy_roi(
+                out.as_mut_ptr(),
+                src.as_ptr(),
+                4,
+                2,
+                2,
+                0,
+                2,
+                0,
+                0,
+                16,
+                16,
+            );
+            // Short caller lengths.
+            darkroom_imagebuf_copy_roi(
+                out.as_mut_ptr(),
+                src.as_ptr(),
+                4,
+                2,
+                2,
+                2,
+                2,
+                0,
+                0,
+                15,
+                16,
+            );
+            darkroom_imagebuf_copy_roi(
+                out.as_mut_ptr(),
+                src.as_ptr(),
+                4,
+                2,
+                2,
+                2,
+                2,
+                0,
+                0,
+                16,
+                15,
+            );
+        }
+        assert_eq!(out, vec![2.0; 16]); // untouched
     }
 }

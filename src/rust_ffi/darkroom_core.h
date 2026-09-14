@@ -3373,6 +3373,18 @@ void darkroom_imagebuf_mul_const(float *buf, size_t n, float value);
 void darkroom_imagebuf_linear_blend(float *buf, const float *other, size_t n,
                                      float lambda);
 
+/* Replaces the DT_OMP_FOR(collapse(2)) inconsistent-ROI fallback at
+ * imagebuf.c:223 in dt_iop_copy_image_roi: per-pixel copy-or-zero with
+ * (dx, dy) = roi_out - roi_in offsets (may be negative). The whole-buffer
+ * and per-row memcpy fast paths stay in C. `out_len`/`in_len` are explicit
+ * buffer lengths; NULL, empty dims, arithmetic overflow, oversized products
+ * or short buffers are a no-op. `out` and `src` must not overlap. */
+void darkroom_imagebuf_copy_roi(float *out, const float *src, size_t ch,
+                                size_t in_w, size_t in_h,
+                                size_t out_w, size_t out_h,
+                                int dx, int dy,
+                                size_t out_len, size_t in_len);
+
 /*
  * Mask point-manipulation kernels — ports of the remaining DT_OMP_FOR loops
  * in src/develop/masks/{circle,ellipse,brush,path,gradient}.c. Each C loop
