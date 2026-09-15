@@ -4966,6 +4966,32 @@ this change.
 
 ---
 
+## 2026-09-13 17:30 UTC — m4-208: port HEIF u16 normalize loop to Rust FFI
+
+**Commit** `5862fcc5ea` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `dt_imageio_open_heif` normalize loop
+(`src/imageio/imageio_heif.c:245`, the file's only `DT_OMP_FOR` site),
+replacing it with `darkroom_heif_u16_to_float`. Added new `c41-core::heif`
+(safe kernel, divergent reference, validated FFI, 5 tests — hoisted
+`1/max_channel` reciprocal-multiply, explicit LE decode, alpha zeroed,
+rowbytes padding skipped); registered `pub mod heif`; declared the export in
+`src/rust_ffi/darkroom_core.h` after the WebP block. Decode/alloc/flags/ICC
+orchestration untouched; single call site. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES** (code
+correct; gates unexecuted at review time). Fixed in-session: NaN/Inf
+`max_channel` FFI guard lines added. The negative-rowbytes doc note was
+evaluated and needed no code change (the claim lived in the dev report, not
+the code; the guard behavior for real callers is a correct no-op).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 16:50 UTC — m4-207: port WebP u8 normalize loop to Rust FFI
 
 **Commit** `b6aa9a0e8c` (GitHub + Gitea via `git push origin master`)
