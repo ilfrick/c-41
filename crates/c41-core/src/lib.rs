@@ -3,6 +3,7 @@
 //! Defines `IopProcess`, the trait every IOP module must implement.
 //! Phase 0: trait + types defined. Phase 1: one module per src/iop/*.c file.
 
+pub mod avif;
 pub mod bilateral;
 pub mod blend;
 pub mod borders;
