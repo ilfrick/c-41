@@ -4966,6 +4966,30 @@ this change.
 
 ---
 
+## 2026-09-13 16:50 UTC — m4-207: port WebP u8 normalize loop to Rust FFI
+
+**Commit** `b6aa9a0e8c` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `dt_imageio_open_webp` normalize loop
+(`src/imageio/imageio_webp.c:148`), replacing it with `darkroom_webp_u8_to_float`.
+Added new `c41-core::webp` (safe kernel, divergent reference, validated FFI,
+5 tests — true division `/ 255.0f32`, alpha zeroed even for opaque input,
+unlike QOI/PNG neighbours); registered `pub mod webp`; declared the export in
+`src/rust_ffi/darkroom_core.h` after the m4-206 block. Decode/alloc/flags
+orchestration untouched; single call site. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, P2-only.
+Fixed all three in-session (reverted unrelated one-space reindent in the m4-206
+decl; lane-range notation unified to house `0..2`; short-buffer clamp semantics
+pinned with first-quad/tail assertions).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 15:50 UTC — m4-205: port imageio RB swap tail to Rust FFI
 
 **Commit** `b4683555f2` (GitHub + Gitea via `git push origin master`)
