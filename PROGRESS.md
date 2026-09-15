@@ -5005,9 +5005,35 @@ declared the export in `src/rust_ffi/darkroom_core.h` after the u16 block and
 repointed its stale "case 8 stays in C" line. `imageio_avif.c` now has zero
 `DT_OMP_FOR` sites. Left all unrelated files untouched.
 
-**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2 doc
-nits, both fixed in-session: include comment covers both exports, top module
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
+doc nits, both fixed in-session: include comment covers both exports, top module
 paragraph scoped to the u16 branch).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
+## 2026-09-13 19:00 UTC — m4-211: port J2K int normalize loops to Rust FFI
+
+**Commit** `0129d8e378` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported both `dt_imageio_open_j2k` normalize loops (grey `:303` +
+RGB `:310`), replacing them with `darkroom_j2k_grey_to_float` /
+`darkroom_j2k_rgb_to_float`. Added new `c41-core::j2k` (safe kernels,
+divergent references, validated FFI, 8 tests — per-lane DIVIDE spelling,
+signed offsets, alpha preserved, zero divisor follows IEEE); registered
+`pub mod j2k`; declared both exports in `src/rust_ffi/darkroom_core.h`. The 3
+sycc helper loops stay in C. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0/P1
+(two P2 nits). Fixed in-session: `wrapping_add` on all four lane+offset sites
+(kernel + refs) so adversarial offsets no-op instead of debug-panicking across
+FFI; new `division_spelling_differs_from_reciprocal_multiply` test that
+constructively finds a lane/divisor where `/` and `*recip` observably differ
+and pins the kernel to the division side (gate-green, so the probe hit).
 
 **Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
