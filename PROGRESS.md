@@ -4966,6 +4966,33 @@ this change.
 
 ---
 
+## 2026-09-13 18:00 UTC — m4-209: port AVIF u16 normalize loop to Rust FFI
+
+**Commit** `b489b198c3` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `case 12 / case 10` branch of `dt_imageio_open_avif`
+(`src/imageio/imageio_avif.c:175`), replacing it with `darkroom_avif_u16_to_float`.
+Added new `c41-core::avif` (safe kernel, divergent reference, validated FFI,
+5 tests — hoisted `1/max_channel` reciprocal-multiply, explicit LE decode,
+alpha zeroed, rowbytes padding skipped); registered `pub mod avif`; declared
+the export in `src/rust_ffi/darkroom_core.h` after the HEIF block. The `case 8`
+byte-lane sibling stays in C as the natural m4-210. Left all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES** (code
+correct; gates unexecuted at review time). Fixed in-session: guard docs now say
+non-positive-or-non-finite `max_channel` in both module and header docs. The LE
+citation P2 was verified against `imageio_heif.c:167` ("Darktable only supports
+LITTLE_ENDIAN systems...") and needed no change — the reviewer grep had missed
+it.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 17:30 UTC — m4-208: port HEIF u16 normalize loop to Rust FFI
 
 **Commit** `5862fcc5ea` (GitHub + Gitea via `git push origin master`)
