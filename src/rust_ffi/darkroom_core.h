@@ -3768,6 +3768,21 @@ void darkroom_imageio_u8_to_float(float *out, const unsigned char *in,
                                   int ch, int wd, int ht, int stride);
 
 /*
+ * WebP 8-bit RGBA normalize (imageio_webp.c, dt_imageio_open_webp, m4-207).
+ *
+ * darkroom_webp_u8_to_float replaces the former DT_OMP_FOR pixel loop:
+ * per pixel i, out[4*i + c] = src[4*i + c] / 255.0f for c in 0..2
+ * (the C division spelling, not a reciprocal multiply) and out[4*i + 3]
+ * is zeroed, exactly as the C loop copying a zero-initialised pixel did.
+ * The libwebp decode, the mipmap-cache allocation, and the colorspace
+ * and flag setup stay in C. src holds 4*npixels bytes, mipbuf
+ * 4*npixels floats; null pointers, a zero npixels, and an overflowing
+ * 4*npixels product are guarded no-ops; the buffers must not overlap.
+ */
+void darkroom_webp_u8_to_float(const unsigned char *rgba_buf, float *mipbuf,
+                               size_t npixels);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the

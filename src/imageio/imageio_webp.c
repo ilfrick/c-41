@@ -22,6 +22,7 @@
 #include "common/image.h"
 #include "develop/imageop.h"         // for IOP_CS_RGB
 #include "imageio/imageio_common.h"
+#include "rust_ffi/darkroom_core.h"  // for darkroom_webp_u8_to_float
 
 dt_imageio_retval_t dt_imageio_open_webp(dt_image_t *img,
                                          const char *filename,
@@ -145,14 +146,11 @@ dt_imageio_retval_t dt_imageio_open_webp(dt_image_t *img,
     return DT_IMAGEIO_CACHE_FULL;
   }
 
-  DT_OMP_FOR()
-  for(int i = 0; i < npixels; i++)
-  {
-    dt_aligned_pixel_t pix = {0.0f, 0.0f, 0.0f, 0.0f};
-    for_three_channels(c)
-      pix[c] = *(int_RGBA_buffer + i * 4 + c) / 255.f;
-    copy_pixel_nontemporal(&mipbuf[i * 4], pix);
-  }
+  // u8-to-float normalize loop ported to Rust FFI (m4-207): each RGB
+  // byte is scaled by 1/255 division into the 4-channel float mipmap
+  // buffer; the alpha lane is zeroed, as before (the C loop copied a
+  // zero-initialised pixel, so opaque 255 alpha became 0.0).
+  darkroom_webp_u8_to_float(int_RGBA_buffer, mipbuf, (size_t)npixels);
 
   dt_free_align(int_RGBA_buffer);
 
