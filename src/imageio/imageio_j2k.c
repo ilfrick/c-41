@@ -19,6 +19,7 @@
 #include "common/darktable.h"
 #include "common/exif.h"
 #include "imageio/imageio_j2k.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_j2k_{grey,rgb}_to_float
 
 #include <assert.h>
 #include <math.h>
@@ -300,20 +301,16 @@ dt_imageio_retval_t dt_imageio_open_j2k(dt_image_t *img,
 
   if(image->numcomps < 3) // 1, 2 => grayscale
   {
-    DT_OMP_FOR()
-    for(size_t index = 0; index < npixels; index++)
-      buf[index * 4] = buf[index * 4 + 1] = buf[index * 4 + 2] =
-      (float)(image->comps[0].data[index] + signed_offsets[0]) / float_divs[0];
+    // Grayscale normalize loop ported to Rust FFI (m4-211): the comp-0 int
+    // lane is offset and scaled into the R/G/B lanes; alpha is untouched.
+    darkroom_j2k_grey_to_float(buf, image->comps[0].data, npixels, signed_offsets[0], float_divs[0]);
   }
   else // 3, 4 => rgb
   {
-    DT_OMP_FOR()
-    for(size_t index = 0; index < npixels; index++)
-    {
-      buf[index * 4]     = (float)(image->comps[0].data[index] + signed_offsets[0]) / float_divs[0];
-      buf[index * 4 + 1] = (float)(image->comps[1].data[index] + signed_offsets[1]) / float_divs[1];
-      buf[index * 4 + 2] = (float)(image->comps[2].data[index] + signed_offsets[2]) / float_divs[2];
-    }
+    // RGB normalize loop ported to Rust FFI (m4-211): each comp lane is
+    // offset and scaled into its own channel; alpha is untouched.
+    darkroom_j2k_rgb_to_float(buf, image->comps[0].data, image->comps[1].data,
+                              image->comps[2].data, npixels, signed_offsets, float_divs);
   }
 
   img->buf_dsc.cst = IOP_CS_RGB; // j2k is always RGB

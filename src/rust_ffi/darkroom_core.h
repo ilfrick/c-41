@@ -3852,6 +3852,36 @@ void darkroom_avif_u8_to_float(const unsigned char *rgb_buf, float *mipbuf,
                                float max_channel);
 
 /*
+ * JPEG2000 int-to-float normalize (imageio_j2k.c, dt_imageio_open_j2k,
+ * m4-211).
+ *
+ * darkroom_j2k_grey_to_float replaces the former DT_OMP_FOR pixel loop of
+ * the numcomps < 3 branch: per pixel index,
+ * buf[4*index + c] = (float)(comps[0].data[index] + signed_offsets[0]) /
+ * float_divs[0] for c in 0..2 (chained assignment, so one value lands in
+ * all three lanes).
+ * darkroom_j2k_rgb_to_float replaces the former DT_OMP_FOR pixel loop of
+ * the numcomps >= 3 branch: per pixel index,
+ * buf[4*index + c] = (float)(comps[c].data[index] + signed_offsets[c]) /
+ * float_divs[c] for c in 0..2.
+ * In both, the alpha lane (buf[4*index + 3]) is never written and keeps
+ * whatever the mipmap-cache allocation left there. The OpenJPEG decode,
+ * the component-size/precision sanity checks, and the colorspace and flag
+ * setup stay in C. buf holds 4*npixels floats; each comp plane holds
+ * npixels int lanes; offsets/divs each point to 3 entries (entries 0..2
+ * of the C signed_offsets/float_divs arrays: 1 << (prec - 1) for signed
+ * components else 0, and (1 << prec) - 1). The i64/i32 mirror the C long
+ * and int exactly on LP64. Null pointers, a zero npixels, and
+ * overflowing dim products are guarded no-ops; the buffers must not
+ * overlap.
+ */
+void darkroom_j2k_grey_to_float(float *buf, const int *comp0, size_t npixels,
+                                long offset0, int div0);
+void darkroom_j2k_rgb_to_float(float *buf, const int *comp0, const int *comp1,
+                               const int *comp2, size_t npixels,
+                               const long *offsets, const int *divs);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
