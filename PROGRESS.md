@@ -4993,6 +4993,29 @@ this change.
 
 ---
 
+## 2026-09-13 18:30 UTC — m4-210: port AVIF u8 normalize loop to Rust FFI
+
+**Commit** `f8467d3678` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `case 8` byte-lane branch of `dt_imageio_open_avif`
+(`src/imageio/imageio_avif.c:182`), replacing it with `darkroom_avif_u8_to_float`.
+Extended `c41-core::avif` (safe kernel, divergent reference, validated FFI,
+5 new tests — reciprocal-multiply spelling, alpha zeroed, 3-byte rows);
+declared the export in `src/rust_ffi/darkroom_core.h` after the u16 block and
+repointed its stale "case 8 stays in C" line. `imageio_avif.c` now has zero
+`DT_OMP_FOR` sites. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2 doc
+nits, both fixed in-session: include comment covers both exports, top module
+paragraph scoped to the u16 branch).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 17:30 UTC — m4-208: port HEIF u16 normalize loop to Rust FFI
 
 **Commit** `5862fcc5ea` (GitHub + Gitea via `git push origin master`)
