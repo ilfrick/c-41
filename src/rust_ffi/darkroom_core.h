@@ -3816,7 +3816,8 @@ void darkroom_heif_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
  * out[4*(y*width+x) + 3] is zeroed. Input rows may carry padding
  * (rowbytes >= 6*width); output rows are tightly packed. The libavif
  * decode, the mipmap-cache allocation, and the colorspace and flag setup
- * stay in C, as does the case 8 byte-lane branch. rgb_buf holds
+ * stay in C. The case 8 byte-lane branch is ported separately
+ * (darkroom_avif_u8_to_float, m4-210). rgb_buf holds
  * (height-1)*rowbytes + 6*width bytes, mipbuf 4*width*height floats;
  * max_channel is the C max_channel_f ((float)((1 << bit_depth) - 1),
  * 1023.0 or 4095.0 here). Null pointers, zero dims, a non-positive or
@@ -3827,6 +3828,28 @@ void darkroom_heif_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
 void darkroom_avif_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
                                 size_t width, size_t height, size_t rowbytes,
                                 float max_channel);
+
+/*
+ * AVIF 8-bit RGB normalize (imageio_avif.c, dt_imageio_open_avif, m4-210).
+ *
+ * darkroom_avif_u8_to_float replaces the former DT_OMP_FOR_SIMD pixel
+ * loop of the case 8 branch: per pixel (y, x),
+ * out[4*(y*width+x) + c] = (float)in_pixel[c] * (1.0f / max_channel) for
+ * c in 0..2, where in_pixel is the byte triple at offset y*rowbytes +
+ * 3*x of the libavif RGB plane (AVIF_RGB_FORMAT_RGB at 8-bit depth),
+ * and out[4*(y*width+x) + 3] is zeroed. Input rows may carry padding
+ * (rowbytes >= 3*width); output rows are tightly packed. The libavif
+ * decode, the mipmap-cache allocation, and the colorspace and flag setup
+ * stay in C. rgb_buf holds (height-1)*rowbytes + 3*width bytes, mipbuf
+ * 4*width*height floats; max_channel is the C max_channel_f
+ * ((float)((1 << bit_depth) - 1), 255.0 here). Null pointers, zero
+ * dims, a non-positive or non-finite max_channel, a rowbytes narrower
+ * than one pixel row, and overflowing dim products are guarded no-ops;
+ * the buffers must not overlap.
+ */
+void darkroom_avif_u8_to_float(const unsigned char *rgb_buf, float *mipbuf,
+                               size_t width, size_t height, size_t rowbytes,
+                               float max_channel);
 
 /*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).

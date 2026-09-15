@@ -29,7 +29,7 @@
 #include "develop/imageop.h"  // for IOP_CS_RGB
 #include "imageio_common.h"
 #include "imageio_avif.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_avif_u16_to_float
+#include "rust_ffi/darkroom_core.h" // for darkroom_avif_{u16,u8}_to_float
 
 dt_imageio_retval_t dt_imageio_open_avif(dt_image_t *img,
                                          const char *filename,
@@ -182,22 +182,10 @@ dt_imageio_retval_t dt_imageio_open_avif(dt_image_t *img,
   case 8: {
     img->flags |= DT_IMAGE_LDR;
     img->flags &= ~DT_IMAGE_HDR;
-    DT_OMP_FOR_SIMD(collapse(2))
-    for(size_t y = 0; y < height; y++)
-    {
-      for(size_t x = 0; x < width; x++)
-      {
-          uint8_t *in_pixel = (uint8_t *)&in[(y * rowbytes)
-                                             + (3 * sizeof(uint8_t) * x)];
-          float *out_pixel = &mipbuf[(size_t)4 * ((y * width) + x)];
-
-          // max_channel_f is 255.0f for 8bit
-          out_pixel[0] = (float)(in_pixel[0]) * (1.0f / max_channel_f);
-          out_pixel[1] = (float)(in_pixel[1]) * (1.0f / max_channel_f);
-          out_pixel[2] = (float)(in_pixel[2]) * (1.0f / max_channel_f);
-          out_pixel[3] = 0.0f; // alpha
-      }
-    }
+    // u8-to-float normalize loop ported to Rust FFI (m4-210): each decoded
+    // byte lane is scaled by 1/max_channel_f into the 4-channel float
+    // mipmap buffer; the alpha lane is zeroed, as before.
+    darkroom_avif_u8_to_float(in, mipbuf, width, height, rowbytes, max_channel_f);
     break;
   }
   default:

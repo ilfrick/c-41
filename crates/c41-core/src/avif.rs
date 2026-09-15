@@ -1,10 +1,11 @@
-//! Kernel ported from `src/imageio/imageio_avif.c` (`dt_imageio_open_avif`,
-//! the 10/12-bit u16-to-float normalize loop, m4-209). The kernel replaces
-//! the whole loop body: each decoded 16-bit AVIF lane is scaled by
-//! `1/max_channel_f` into the 4-channel float mipmap buffer, with the
-//! alpha lane zeroed.
+//! Kernels ported from `src/imageio/imageio_avif.c` (`dt_imageio_open_avif`,
+//! the 10/12-bit u16-to-float normalize loop, m4-209, and the 8-bit
+//! u8-to-float normalize loop, m4-210). Each kernel replaces its whole loop
+//! body: every decoded AVIF lane is scaled by `1/max_channel_f` into the
+//! 4-channel float mipmap buffer, with the alpha lane zeroed.
 //!
-//! What the C loop does, per pixel `(y, x)`:
+//! What the C loops do, per pixel `(y, x)` (`case 12 / case 10` branch,
+//! m4-209; the `case 8` branch is the same with single bytes at `3*x`):
 //! - `mipbuf[4*(y*width+x) + c] = (float)in_pixel[c] * (1.0f / max_channel_f)`
 //!   for `c` in `0..2`, where `in_pixel` is the `uint16_t` triple at byte
 //!   offset `y*rowbytes + 6*x` of the libavif RGB plane (`rgb.pixels` at
@@ -31,8 +32,12 @@
 //! - Buffers: the C caller passes the libavif RGB plane (`rgb.pixels`) and
 //!   the mipmap-cache allocation. The kernel must not be called with
 //!   overlapping buffers.
-//! - Only the `case 12 / case 10` branch is ported here; the `case 8`
-//!   byte-lane branch stays in C.
+//! - Both the `case 12 / case 10` branch (`avif_u16_to_float`, m4-209)
+//!   and the `case 8` byte-lane branch (`avif_u8_to_float`, m4-210) are
+//!   ported here. The two kernels differ only in lane width (16-bit
+//!   little-endian pairs vs single bytes) and row stride (6 vs 3 bytes
+//!   per pixel); the reciprocal-multiply spelling, the zeroed alpha lane,
+//!   and the padding/clamping contracts are identical.
 //!
 //! The Rust kernel is single-threaded sequential; the C loop was
 //! `DT_OMP_FOR_SIMD(collapse(2))` over rows and columns, but each output
@@ -167,6 +172,138 @@ fn ref_avif_u16_to_float(
     }
 }
 
+/// Scale decoded AVIF 8-bit lanes into the float mipmap buffer.
+///
+/// Port of the former element-wise loop in `dt_imageio_open_avif`
+/// (src/imageio/imageio_avif.c, the `case 8` branch): `src` holds the
+/// interleaved RGB plane (`height` rows, `rowbytes` bytes each, 3 bytes
+/// per pixel), `out` receives `4*width*height` floats (RGB lanes times
+/// the `1/max_channel` reciprocal, alpha lane zeroed). Same
+/// reciprocal-multiply spelling as the u16 sibling: the C loop writes
+/// `(float)in_pixel[c] * (1.0f / max_channel_f)` with `max_channel_f` at
+/// 255.0 for 8-bit input, so the kernel hoists `inv` once and multiplies.
+/// A per-lane division is NOT bit-identical and must not be used (this is
+/// what distinguishes this kernel from the WebP one, whose C loop divides).
+///
+/// Degenerate dims (`width == 0` or `height == 0`) or a non-positive or
+/// non-finite `max_channel` are no-ops; short buffers and a `rowbytes`
+/// narrower than one pixel row are handled by clamped iteration (no panic,
+/// no out-of-bounds access). For the well-formed buffers the C caller
+/// passes the clamps never engage and the behaviour is exactly the C
+/// loop's.
+pub fn avif_u8_to_float(
+    src: &[u8],
+    out: &mut [f32],
+    width: usize,
+    height: usize,
+    rowbytes: usize,
+    max_channel: f32,
+) {
+    if width == 0 || height == 0 || !max_channel.is_finite() || max_channel <= 0.0 {
+        return;
+    }
+    let inv = 1.0f32 / max_channel;
+    let Some(row_need) = width.checked_mul(3) else {
+        return;
+    };
+    let Some(out_row) = width.checked_mul(4) else {
+        return;
+    };
+    if rowbytes < row_need {
+        return;
+    }
+    for y in 0..height {
+        let Some(base) = y.checked_mul(rowbytes) else {
+            break;
+        };
+        let Some(src_end) = base.checked_add(row_need) else {
+            break;
+        };
+        if src.len() < src_end {
+            break;
+        }
+        let Some(d) = y.checked_mul(out_row) else {
+            break;
+        };
+        let Some(out_end) = d.checked_add(out_row) else {
+            break;
+        };
+        if out.len() < out_end {
+            break;
+        }
+        for x in 0..width {
+            let s = base + 3 * x;
+            let lane0 = src[s] as f32;
+            let lane1 = src[s + 1] as f32;
+            let lane2 = src[s + 2] as f32;
+            let o = d + 4 * x;
+            out[o] = lane0 * inv;
+            out[o + 1] = lane1 * inv;
+            out[o + 2] = lane2 * inv;
+            out[o + 3] = 0.0f32;
+        }
+    }
+}
+
+// ── Independent reference implementation for bit-exactness tests ─────────────
+
+/// Structurally divergent reference for `avif_u8_to_float`: walks pixels
+/// by flat index with `div`/`mod` (the kernel uses nested row/column loops
+/// with explicit stride arithmetic) and accumulates each lane through a
+/// single-byte slice (the kernel indexes source bytes directly), so the
+/// sweep test cross-checks indexing as well as values. The arithmetic is
+/// the same `byte as f32 * (1.0 / max_channel)` reciprocal multiply by
+/// construction (see the kernel docs: per-lane division is not
+/// bit-identical and must not be used), and lane 3 is assigned the
+/// literal `0.0`. Same well-formed-buffers precondition, enforced here by
+/// early return rather than clamping.
+#[cfg(test)]
+fn ref_avif_u8_to_float(
+    src: &[u8],
+    out: &mut [f32],
+    width: usize,
+    height: usize,
+    rowbytes: usize,
+    max_channel: f32,
+) {
+    if width == 0 || height == 0 || !max_channel.is_finite() || max_channel <= 0.0 {
+        return;
+    }
+    let Some(row_need) = width.checked_mul(3) else {
+        return;
+    };
+    if rowbytes < row_need {
+        return;
+    }
+    let Some(npixels) = width.checked_mul(height) else {
+        return;
+    };
+    let Some(out_need) = npixels.checked_mul(4) else {
+        return;
+    };
+    let Some(src_need) = rowbytes.checked_mul(height) else {
+        return;
+    };
+    if src.len() < src_need || out.len() < out_need {
+        return;
+    }
+    let inv = 1.0f32 / max_channel;
+    for p in 0..npixels {
+        let y = p / width;
+        let x = p % width;
+        let s = y * rowbytes + 3 * x;
+        let mut lanes = [0.0f32; 3];
+        for (lane, byte) in lanes.iter_mut().zip(src[s..s + 3].iter()) {
+            *lane = *byte as f32 * inv;
+        }
+        let o = 4 * p;
+        out[o] = lanes[0];
+        out[o + 1] = lanes[1];
+        out[o + 2] = lanes[2];
+        out[o + 3] = 0.0f32;
+    }
+}
+
 // ── FFI export ───────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -217,6 +354,55 @@ pub unsafe extern "C" fn darkroom_avif_u16_to_float(
     let src = std::slice::from_raw_parts(rgb_buf, src_len);
     let out = std::slice::from_raw_parts_mut(mipbuf, out_len);
     avif_u16_to_float(src, out, width, height, rowbytes, max_channel);
+}
+
+/// # Safety
+/// `rgb_buf` must hold at least `(height - 1) * rowbytes + 3 * width`
+/// bytes (the C caller passes the libavif RGB plane at
+/// `AVIF_RGB_FORMAT_RGB` with 8-bit depth, `rowbytes` its per-row byte
+/// stride) and `mipbuf` at least `4 * width * height` floats (the
+/// mipmap-cache allocation for the 4-channel float image). The two buffers
+/// must not overlap. `max_channel` is the C `max_channel_f`, i.e.
+/// `(float)((1 << bit_depth) - 1)` — 255.0 for 8-bit — strictly positive.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_avif_u8_to_float(
+    rgb_buf: *const u8,
+    mipbuf: *mut f32,
+    width: usize,
+    height: usize,
+    rowbytes: usize,
+    max_channel: f32,
+) {
+    if rgb_buf.is_null() || mipbuf.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    if !max_channel.is_finite() || max_channel <= 0.0 {
+        return;
+    }
+    // validate the products BEFORE building the slices below (a misuse
+    // caller could otherwise wrap a length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let Some(row_need) = width.checked_mul(3) else {
+        return;
+    };
+    if rowbytes < row_need {
+        return;
+    }
+    let src_len = match height
+        .checked_sub(1)
+        .and_then(|h| h.checked_mul(rowbytes))
+        .and_then(|base| base.checked_add(row_need))
+    {
+        Some(n) => n,
+        None => return,
+    };
+    let out_len = match width.checked_mul(height).and_then(|n| n.checked_mul(4)) {
+        Some(n) => n,
+        None => return,
+    };
+    let src = std::slice::from_raw_parts(rgb_buf, src_len);
+    let out = std::slice::from_raw_parts_mut(mipbuf, out_len);
+    avif_u8_to_float(src, out, width, height, rowbytes, max_channel);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -358,6 +544,142 @@ mod tests {
             // overflowing dims
             darkroom_avif_u16_to_float(src.as_ptr(), out.as_mut_ptr(), usize::MAX, 2, 12, 1023.0);
             darkroom_avif_u16_to_float(src.as_ptr(), out.as_mut_ptr(), 2, usize::MAX, 12, 1023.0);
+        }
+        assert_eq!(out, vec![7.0f32; 16]); // untouched
+    }
+
+    // Rails for the 8-bit branch: 0 scales to +0.0 exactly; the alpha
+    // lane is pinned to +0.0; the full-scale lane pins the
+    // reciprocal-multiply spelling the C loop uses (255 * (1/255), not
+    // 255/255).
+    #[test]
+    fn u8_rails_pin() {
+        let max = 255.0f32;
+        // one pixel: lanes (0, 1, 255)
+        let src = [0u8, 1, 255];
+        let mut out = vec![7.0f32; 4];
+        avif_u8_to_float(&src, &mut out, 1, 1, 3, max);
+        assert_eq!(out[0].to_bits(), 0x0000_0000); // 0 -> +0.0
+        assert_eq!(out[1].to_bits(), (1.0f32 * (1.0f32 / max)).to_bits());
+        assert_eq!(out[2].to_bits(), (255.0f32 * (1.0f32 / max)).to_bits());
+        assert_eq!(out[3].to_bits(), 0x0000_0000); // alpha zeroed
+    }
+
+    // kernel and reference must agree bit-exactly on every lane over
+    // several shapes (including a padded stride), and lane 3 must read
+    // +0.0 everywhere.
+    #[test]
+    fn u8_matches_reference_over_sweep() {
+        // (width, height, rowbytes)
+        let shapes = [
+            (1usize, 1usize, 3usize),
+            (3, 2, 9),
+            (5, 4, 20), // 5 bytes of padding per row
+            (7, 5, 21), // tight
+            (16, 9, 50),
+        ];
+        for (w, h, rb) in shapes {
+            let max = 255.0f32;
+            let mut src = vec![0u8; rb * h];
+            for (i, v) in src.iter_mut().enumerate() {
+                // LCG over the full byte range
+                *v = ((i as u64).wrapping_mul(2_654_435_761).wrapping_add(0x9E37) % 256) as u8;
+            }
+            // force padding bytes to 0xFF: they must never leak into output
+            if rb > 3 * w {
+                for y in 0..h {
+                    for b in (y * rb + 3 * w)..((y + 1) * rb) {
+                        src[b] = 0xFF;
+                    }
+                }
+            }
+            let mut direct = vec![-1.0f32; 4 * w * h];
+            let mut reference = vec![-1.0f32; 4 * w * h];
+            avif_u8_to_float(&src, &mut direct, w, h, rb, max);
+            ref_avif_u8_to_float(&src, &mut reference, w, h, rb, max);
+            assert_eq!(direct.len(), reference.len());
+            for (k, (d, r)) in direct.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(d.to_bits(), r.to_bits(), "shape ({w},{h},{rb}) lane {k}");
+                if k % 4 == 3 {
+                    assert_eq!(*d, 0.0f32, "alpha lane {k} zeroed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn u8_degenerate_guards_no_op() {
+        let src = vec![0xCDu8; 6];
+        // zero dims: output untouched
+        let mut out = vec![9.0f32; 8];
+        avif_u8_to_float(&src, &mut out, 0, 2, 3, 255.0);
+        avif_u8_to_float(&src, &mut out, 2, 0, 6, 255.0);
+        assert_eq!(out, vec![9.0f32; 8]);
+        // non-positive max: output untouched
+        avif_u8_to_float(&src, &mut out, 1, 2, 3, 0.0);
+        avif_u8_to_float(&src, &mut out, 1, 2, 3, -3.0);
+        avif_u8_to_float(&src, &mut out, 1, 2, 3, f32::NAN);
+        assert_eq!(out, vec![9.0f32; 8]);
+        // rowbytes narrower than one row: no-op
+        avif_u8_to_float(&src, &mut out, 2, 1, 3, 255.0);
+        assert_eq!(out, vec![9.0f32; 8]);
+        // truncated source: no panic, row 0 converts fully, unwritten rows
+        // stay untouched. 2x2 tight needs 12 bytes; 7 bytes hold row 0
+        // (6) plus one byte.
+        let short_src = vec![0x02u8; 7];
+        let mut short_out = vec![0.0f32; 16];
+        avif_u8_to_float(&short_src, &mut short_out, 2, 2, 6, 255.0);
+        let lane = 2.0f32 * (1.0f32 / 255.0f32);
+        for q in 0..2 {
+            for c in 0..3 {
+                assert_eq!(short_out[4 * q + c].to_bits(), lane.to_bits());
+            }
+            assert_eq!(short_out[4 * q + 3].to_bits(), 0.0f32.to_bits());
+        }
+        assert_eq!(&short_out[8..16], &[0.0f32; 8]);
+        // empty buffers with live dims: no panic, no writes possible
+        let empty: Vec<u8> = vec![];
+        let mut out2 = vec![0.0f32; 4];
+        avif_u8_to_float(&empty, &mut out2, 1, 1, 3, 255.0);
+        assert_eq!(out2, vec![0.0f32; 4]);
+    }
+
+    #[test]
+    fn u8_ffi_round_trip() {
+        let (w, h, rb, max) = (9usize, 5usize, 30usize, 255.0f32);
+        let mut src = vec![0u8; rb * h];
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = ((i as u64).wrapping_mul(2_654_435_761) % 256) as u8;
+        }
+        let mut ffi_out = vec![-2.0f32; 4 * w * h];
+        let mut direct_out = vec![-2.0f32; 4 * w * h];
+        unsafe {
+            darkroom_avif_u8_to_float(src.as_ptr(), ffi_out.as_mut_ptr(), w, h, rb, max);
+        }
+        avif_u8_to_float(&src, &mut direct_out, w, h, rb, max);
+        assert_eq!(ffi_out, direct_out);
+    }
+
+    #[test]
+    fn u8_ffi_guards() {
+        let src = vec![0xCDu8; 12];
+        let mut out = vec![7.0f32; 16];
+        unsafe {
+            // null pointers
+            darkroom_avif_u8_to_float(std::ptr::null(), out.as_mut_ptr(), 2, 2, 6, 255.0);
+            darkroom_avif_u8_to_float(src.as_ptr(), std::ptr::null_mut(), 2, 2, 6, 255.0);
+            // zero dims
+            darkroom_avif_u8_to_float(src.as_ptr(), out.as_mut_ptr(), 0, 2, 6, 255.0);
+            darkroom_avif_u8_to_float(src.as_ptr(), out.as_mut_ptr(), 2, 0, 6, 255.0);
+            // non-positive / non-finite max
+            darkroom_avif_u8_to_float(src.as_ptr(), out.as_mut_ptr(), 2, 2, 6, 0.0);
+            darkroom_avif_u8_to_float(src.as_ptr(), out.as_mut_ptr(), 2, 2, 6, f32::NAN);
+            darkroom_avif_u8_to_float(src.as_ptr(), out.as_mut_ptr(), 2, 2, 6, f32::INFINITY);
+            // rowbytes narrower than one row
+            darkroom_avif_u8_to_float(src.as_ptr(), out.as_mut_ptr(), 2, 2, 3, 255.0);
+            // overflowing dims
+            darkroom_avif_u8_to_float(src.as_ptr(), out.as_mut_ptr(), usize::MAX, 2, 6, 255.0);
+            darkroom_avif_u8_to_float(src.as_ptr(), out.as_mut_ptr(), 2, usize::MAX, 6, 255.0);
         }
         assert_eq!(out, vec![7.0f32; 16]); // untouched
     }
