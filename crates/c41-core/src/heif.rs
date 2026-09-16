@@ -213,6 +213,208 @@ pub unsafe extern "C" fn darkroom_heif_u16_to_float(
     heif_u16_to_float(src, out, width, height, rowbytes, max_channel);
 }
 
+/// Quantize float RGB lanes into the 8-bit HEIF export plane.
+///
+/// Port of the `case 8` branch of `write_image`
+/// (`src/imageio/format/heif.c`, m4-213): `src` holds `4*width*height`
+/// tightly packed floats (RGBA; the alpha lane is never read), `out`
+/// receives the interleaved `RGB` plane (`height` rows, `rowbytes` bytes
+/// each, 3 u8 lanes per pixel). Per lane,
+/// `out = (u8)roundf(CLAMP(src[c] * max_channel, 0, max_channel))` with
+/// `max_channel = 255.0` at 8-bit depth.
+///
+/// Fidelity notes (each pinned by a test below):
+/// - The multiply runs before the clamp, in f32, exactly as parenthesised
+///   in C. Clamping first would differ for out-of-range inputs (e.g. a
+///   `-0.1` lane clamps to 0 rather than rounding to -0).
+/// - The clamp is spelled branch-by-branch, high bound first exactly like
+///   glib's `CLAMP`, instead of `f32::clamp`, which panics on NaN. A NaN
+///   lane falls through to `round` just as in C, where `roundf(NaN)` stays
+///   NaN; the final `as u8` saturates NaN to 0 in Rust (defined), matching
+///   the x86 convert result the C cast produces in practice.
+/// - `f32::round` is round-half-away-from-zero, matching `roundf`, so a
+///   `127.5` product lands on 128.
+/// - Degenerate dims (`width == 0` or `height == 0`), a non-finite or
+///   non-positive `max_channel`, a `rowbytes` narrower than one pixel row,
+///   and short buffers are guarded no-ops / clamped iteration (no panic,
+///   no out-of-bounds access). For the well-formed buffers the C caller
+///   passes the clamps never engage and the behaviour is exactly the C
+///   loop's.
+///
+/// The Rust kernel is single-threaded sequential; the C loop was
+/// `DT_OMP_FOR(collapse(2))` over rows and columns, but each output triple
+/// reads only its own source quad, so thread scheduling cannot change the
+/// result.
+pub fn heif_float_to_u8(
+    src: &[f32],
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    rowbytes: usize,
+    max_channel: f32,
+) {
+    if width == 0 || height == 0 || !max_channel.is_finite() || max_channel <= 0.0 {
+        return;
+    }
+    let Some(src_row) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(dst_row) = width.checked_mul(3) else {
+        return;
+    };
+    if rowbytes < dst_row {
+        return;
+    }
+    for y in 0..height {
+        let Some(s) = y.checked_mul(src_row) else {
+            break;
+        };
+        let Some(s_end) = s.checked_add(src_row) else {
+            break;
+        };
+        if src.len() < s_end {
+            break;
+        }
+        let Some(d) = y.checked_mul(rowbytes) else {
+            break;
+        };
+        let Some(d_end) = d.checked_add(dst_row) else {
+            break;
+        };
+        if out.len() < d_end {
+            break;
+        }
+        for x in 0..width {
+            let si = s + 4 * x;
+            let di = d + 3 * x;
+            for c in 0..3 {
+                let v = src[si + c] * max_channel;
+                // glib CLAMP order (high bound first); NaN falls through.
+                let cl = if v > max_channel {
+                    max_channel
+                } else if v < 0.0 {
+                    0.0
+                } else {
+                    v
+                };
+                out[di + c] = cl.round() as u8;
+            }
+        }
+    }
+}
+
+// ── Independent reference for the export kernel (bit-exactness tests) ────────
+
+/// Structurally divergent reference for `heif_float_to_u8`: walks pixels
+/// by flat index with `div`/`mod` (the kernel uses nested row/column loops
+/// with explicit stride arithmetic) and converts each lane through a
+/// scalar helper over zipped slice iterators (the kernel indexes both
+/// sides directly), so the sweep test cross-checks indexing as well as
+/// values. The arithmetic is the same multiply-then-branch-clamp-then-round
+/// spelling by construction (see the kernel docs: clamp-first and
+/// `f32::clamp` must not be used). Same well-formed-buffers
+/// precondition, enforced here by early return rather than clamping.
+#[cfg(test)]
+fn ref_lane(v: f32, max_channel: f32) -> u8 {
+    let scaled = v * max_channel;
+    let cl = if scaled > max_channel {
+        max_channel
+    } else if scaled < 0.0 {
+        0.0
+    } else {
+        scaled
+    };
+    cl.round() as u8
+}
+
+#[cfg(test)]
+fn ref_heif_float_to_u8(
+    src: &[f32],
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    rowbytes: usize,
+    max_channel: f32,
+) {
+    if width == 0 || height == 0 || !max_channel.is_finite() || max_channel <= 0.0 {
+        return;
+    }
+    let (Some(src_row), Some(dst_row)) = (width.checked_mul(4), width.checked_mul(3)) else {
+        return;
+    };
+    if rowbytes < dst_row {
+        return;
+    }
+    let Some(npixels) = width.checked_mul(height) else {
+        return;
+    };
+    if src.len() < npixels.saturating_mul(4) || out.len() < height.saturating_mul(rowbytes) {
+        return;
+    }
+    for p in 0..npixels {
+        let y = p / width;
+        let x = p % width;
+        let lanes: Vec<u8> = src[y * src_row + 4 * x..y * src_row + 4 * x + 3]
+            .iter()
+            .map(|&v| ref_lane(v, max_channel))
+            .collect();
+        for (slot, lane) in out[y * rowbytes + 3 * x..y * rowbytes + 3 * x + 3]
+            .iter_mut()
+            .zip(lanes.iter())
+        {
+            *slot = *lane;
+        }
+    }
+}
+
+/// # Safety
+/// `in_data` must hold at least `4 * width * height` floats (the C caller
+/// passes the export pipeline buffer, tightly packed RGBA) and `out` at
+/// least `(height - 1) * rowbytes + 3 * width` bytes (the libheif
+/// interleaved `RGB` plane, `rowbytes` its per-row byte stride). The two
+/// buffers must not overlap. `max_channel` is the C `max_channel_f`, i.e.
+/// `(float)((1 << bit_depth) - 1)`, strictly positive (255.0 at 8-bit).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_heif_float_to_u8(
+    in_data: *const f32,
+    out: *mut u8,
+    width: usize,
+    height: usize,
+    rowbytes: usize,
+    max_channel: f32,
+) {
+    if in_data.is_null() || out.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    if !max_channel.is_finite() || max_channel <= 0.0 {
+        return;
+    }
+    // validate the products BEFORE building the slices below (a misuse
+    // caller could otherwise wrap a length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let Some(dst_row) = width.checked_mul(3) else {
+        return;
+    };
+    if rowbytes < dst_row {
+        return;
+    }
+    let src_len = match width.checked_mul(height).and_then(|n| n.checked_mul(4)) {
+        Some(n) => n,
+        None => return,
+    };
+    let dst_len = match height
+        .checked_sub(1)
+        .and_then(|h| h.checked_mul(rowbytes))
+        .and_then(|base| base.checked_add(dst_row))
+    {
+        Some(n) => n,
+        None => return,
+    };
+    let src = std::slice::from_raw_parts(in_data, src_len);
+    let out = std::slice::from_raw_parts_mut(out, dst_len);
+    heif_float_to_u8(src, out, width, height, rowbytes, max_channel);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -351,5 +553,144 @@ mod tests {
             darkroom_heif_u16_to_float(src.as_ptr(), out.as_mut_ptr(), 2, usize::MAX, 12, 1023.0);
         }
         assert_eq!(out, vec![7.0f32; 16]); // untouched
+    }
+
+    // Export rails at 8-bit depth (max 255): 0.0 -> 0, 1.0 -> 255, the
+    // 0.5 lane pins the reciprocal-free multiply-then-round spelling
+    // (0.5 * 255 = 127.5 -> 128), and out-of-range lanes clamp on both
+    // sides. The alpha lane is never read: out holds 3 lanes per pixel.
+    #[test]
+    fn float_to_u8_rails_pin() {
+        let max = 255.0f32;
+        let src = [0.0f32, 0.5, 1.0, 0.9, 2.0, -0.1, 0.25, 0.0];
+        let mut out = vec![0xCDu8; 6];
+        heif_float_to_u8(&src, &mut out, 2, 1, 6, max);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], ((0.5f32 * max).round() as u8)); // 127.5 -> 128
+        assert_eq!(out[1], 128);
+        assert_eq!(out[2], 255);
+        assert_eq!(out[3], 255); // 2.0 * 255 clamps to 255
+        assert_eq!(out[4], 0); // negative clamps to 0
+        assert_eq!(out[5], ((0.25f32 * max).round() as u8));
+    }
+
+    // Multiply-then-clamp order matters: a -0.1 lane scales to -25.5 and
+    // clamps to 0 (clamp-first would round -25.5 to -26 and then clamp,
+    // same result here, but a lane of exactly -0.5/255 would round to -1
+    // under round-first and must read 0). NaN falls through the
+    // branch-clamp like glib's CLAMP and saturates to 0 via `as u8`.
+    #[test]
+    fn float_to_u8_clamp_order_and_nan() {
+        let max = 255.0f32;
+        // one pixel: tiny-negative, NaN, and -1.0 lanes all read 0 (the
+        // alpha slot is never read)
+        let src = [-0.5f32 / 255.0, f32::NAN, -1.0, 9.9];
+        let mut out = vec![0xCDu8; 3];
+        heif_float_to_u8(&src, &mut out, 1, 1, 3, max);
+        assert_eq!(out, vec![0, 0, 0]);
+        // just-past-full-scale and far-past lanes clamp to 255
+        let src2 = [1.0f32 + 0.5 / 255.0, 7.0, 1.0, 0.0];
+        let mut out2 = vec![0xCDu8; 3];
+        heif_float_to_u8(&src2, &mut out2, 1, 1, 3, max);
+        assert_eq!(out2, vec![255, 255, 255]);
+    }
+
+    // Kernel and reference agree bit-exactly over several shapes
+    // (including a padded stride), with inputs spanning below 0 and above
+    // 1 so both clamp sides and the rounding are exercised. Padding bytes
+    // are forced to 0xCD and must never leak into output.
+    #[test]
+    fn float_to_u8_matches_reference_over_sweep() {
+        // (width, height, rowbytes)
+        let shapes = [
+            (1usize, 1usize, 3usize),
+            (3, 2, 9),
+            (5, 4, 20), // 5 bytes of padding per row
+            (7, 5, 21),
+            (16, 9, 55),
+        ];
+        for (w, h, rb) in shapes {
+            let mut src = vec![0.0f32; 4 * w * h];
+            for (i, v) in src.iter_mut().enumerate() {
+                // deterministic sweep across [-0.5, 1.5]
+                let k = ((i as u64).wrapping_mul(2_654_435_761).wrapping_add(0x9E37) % 2001) as f32;
+                *v = k / 1000.0 - 0.5;
+            }
+            let mut direct = vec![0xCDu8; rb * h];
+            let mut reference = vec![0xCDu8; rb * h];
+            heif_float_to_u8(&src, &mut direct, w, h, rb, 255.0);
+            ref_heif_float_to_u8(&src, &mut reference, w, h, rb, 255.0);
+            assert_eq!(direct, reference, "shape ({w},{h},{rb})");
+            // padding bytes never written
+            if rb > 3 * w {
+                for y in 0..h {
+                    assert_eq!(&direct[y * rb + 3 * w..(y + 1) * rb], &vec![0xCDu8; rb - 3 * w][..]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn float_to_u8_degenerate_guards_no_op() {
+        let src = vec![1.0f32; 8];
+        let mut out = vec![0xCDu8; 6];
+        // zero dims: output untouched
+        heif_float_to_u8(&src, &mut out, 0, 2, 6, 255.0);
+        heif_float_to_u8(&src, &mut out, 2, 0, 6, 255.0);
+        assert_eq!(out, vec![0xCDu8; 6]);
+        // non-positive / non-finite max: output untouched
+        heif_float_to_u8(&src, &mut out, 2, 1, 6, 0.0);
+        heif_float_to_u8(&src, &mut out, 2, 1, 6, -3.0);
+        heif_float_to_u8(&src, &mut out, 2, 1, 6, f32::NAN);
+        heif_float_to_u8(&src, &mut out, 2, 1, 6, f32::INFINITY);
+        assert_eq!(out, vec![0xCDu8; 6]);
+        // rowbytes narrower than one row: no-op
+        heif_float_to_u8(&src, &mut out, 2, 1, 5, 255.0);
+        assert_eq!(out, vec![0xCDu8; 6]);
+        // truncated source: no panic, nothing written
+        let short = vec![1.0f32; 3];
+        heif_float_to_u8(&short, &mut out, 2, 1, 6, 255.0);
+        assert_eq!(out, vec![0xCDu8; 6]);
+    }
+
+    #[test]
+    fn float_to_u8_ffi_round_trip() {
+        let (w, h, rb) = (9usize, 5usize, 30usize);
+        let mut src = vec![0.0f32; 4 * w * h];
+        for (i, v) in src.iter_mut().enumerate() {
+            let k = ((i as u64).wrapping_mul(2_654_435_761) % 2001) as f32;
+            *v = k / 1000.0 - 0.5;
+        }
+        let mut ffi_out = vec![0xCDu8; rb * h];
+        let mut direct_out = vec![0xCDu8; rb * h];
+        unsafe {
+            darkroom_heif_float_to_u8(src.as_ptr(), ffi_out.as_mut_ptr(), w, h, rb, 255.0);
+        }
+        heif_float_to_u8(&src, &mut direct_out, w, h, rb, 255.0);
+        assert_eq!(ffi_out, direct_out);
+    }
+
+    #[test]
+    fn float_to_u8_ffi_guards() {
+        let src = vec![1.0f32; 16];
+        let mut out = vec![0xCDu8; 12];
+        unsafe {
+            // null pointers
+            darkroom_heif_float_to_u8(std::ptr::null(), out.as_mut_ptr(), 2, 2, 6, 255.0);
+            darkroom_heif_float_to_u8(src.as_ptr(), std::ptr::null_mut(), 2, 2, 6, 255.0);
+            // zero dims
+            darkroom_heif_float_to_u8(src.as_ptr(), out.as_mut_ptr(), 0, 2, 6, 255.0);
+            darkroom_heif_float_to_u8(src.as_ptr(), out.as_mut_ptr(), 2, 0, 6, 255.0);
+            // non-positive / non-finite max
+            darkroom_heif_float_to_u8(src.as_ptr(), out.as_mut_ptr(), 2, 2, 6, 0.0);
+            darkroom_heif_float_to_u8(src.as_ptr(), out.as_mut_ptr(), 2, 2, 6, f32::NAN);
+            darkroom_heif_float_to_u8(src.as_ptr(), out.as_mut_ptr(), 2, 2, 6, f32::INFINITY);
+            // rowbytes narrower than one row
+            darkroom_heif_float_to_u8(src.as_ptr(), out.as_mut_ptr(), 2, 2, 5, 255.0);
+            // overflowing dims
+            darkroom_heif_float_to_u8(src.as_ptr(), out.as_mut_ptr(), usize::MAX, 2, 6, 255.0);
+            darkroom_heif_float_to_u8(src.as_ptr(), out.as_mut_ptr(), 2, usize::MAX, 6, 255.0);
+        }
+        assert_eq!(out, vec![0xCDu8; 12]); // untouched
     }
 }

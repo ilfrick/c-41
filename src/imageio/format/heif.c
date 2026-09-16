@@ -23,6 +23,7 @@
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_heif_float_to_u8
 
 #include <glib/gstdio.h>
 #include <inttypes.h>
@@ -193,19 +194,12 @@ int write_image(dt_imageio_module_data_t *data,
   switch(bit_depth)
   {
     case 8:
-    DT_OMP_FOR(collapse(2))
-      for(size_t row = 0; row < height; row++)
-      {
-        for(size_t x = 0; x < width; x++)
-        {
-            const float *in_pixel = &in_data[(size_t)4 * ((row * width) + x)];
-            uint8_t *out_pixel = (uint8_t *)&out[(row * rowbytes) + (3 * sizeof(uint8_t) * x)];
-
-            out_pixel[0] = (uint8_t)roundf(CLAMP(in_pixel[0] * max_channel_f, 0, max_channel_f));
-            out_pixel[1] = (uint8_t)roundf(CLAMP(in_pixel[1] * max_channel_f, 0, max_channel_f));
-            out_pixel[2] = (uint8_t)roundf(CLAMP(in_pixel[2] * max_channel_f, 0, max_channel_f));
-        }
-      }
+      // Pixel loop ported to Rust FFI (darkroom_heif_float_to_u8 in
+      // crates/c41-core/src/heif.rs): the same per-lane
+      // roundf(CLAMP(v * max, 0, max)) over the tightly packed RGBA input
+      // into the rowbytes-strided RGB plane, now serial instead of OpenMP
+      // (pixels are independent). The 10/12-bit branch below stays in C.
+      darkroom_heif_float_to_u8(in_data, out, width, height, (size_t)rowbytes, max_channel_f);
       break;
     case 10:
     case 12:
