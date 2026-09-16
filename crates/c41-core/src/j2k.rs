@@ -40,6 +40,19 @@
 //! The Rust kernels are single-threaded sequential; the C loops were
 //! `DT_OMP_FOR` over the pixel index, but each output triple reads only
 //! its own source lanes, so thread scheduling cannot change the result.
+//!
+//! sYCC 4:4:4 conversion (m4-212): `j2k_sycc444_to_rgb` replaces the loop
+//! body of `sycc444_to_rgb()` in the same C file. Per pixel it runs the
+//! scalar `sycc_to_rgb` arithmetic: subtract `offset` from the Cb/Cr
+//! lanes, add the truncated products `1.402*cr`, `-(0.344*cb + 0.714*cr)`
+//! and `1.772*cb` to Y, and clamp each lane to `[0, upb]` (glib `CLAMP`
+//! order). The C constants are unsuffixed doubles, so each product runs
+//! in f64 over the exact `(float)lane` promotion — the kernel spells the
+//! same `as f32 as f64` chain rather than computing in f32. The 4:2:2 and
+//! 4:2:0 subsampled variants stay in C (shared-subsample indexing, and
+//! the 4:2:0 tail passes the base `*cr` where the pattern calls for the
+//! local `curr_cr`); the calloc allocation, the NULL-alloc early return,
+//! and the plane hand-off stay in C with the converted call.
 
 /// Scale one signed OpenJPEG component lane into the R/G/B lanes.
 ///
@@ -259,6 +272,166 @@ pub unsafe extern "C" fn darkroom_j2k_rgb_to_float(
     let offs = std::slice::from_raw_parts(offsets, 3);
     let divs = std::slice::from_raw_parts(divs, 3);
     j2k_rgb_to_float(out, src0, src1, src2, npixels, offs, divs);
+}
+
+// ── sYCC 4:4:4 conversion (m4-212) ───────────────────────────────────────────
+
+/// Convert sYCC 4:4:4 planes to RGB planes, one `int` lane per pixel.
+///
+/// Port of the former element-wise loop in `sycc444_to_rgb()`
+/// (`src/imageio/imageio_j2k.c`): per index `k`, with `cbs = cb[k] -
+/// offset` and `crs = cr[k] - offset`,
+/// `r[k] = CLAMP(y[k] + (int)(1.402 * (float)crs), 0, upb)` and likewise
+/// `g[k] = CLAMP(y[k] - (int)(0.344 * (float)cbs + 0.714 * (float)crs),
+/// 0, upb)`, `b[k] = CLAMP(y[k] + (int)(1.772 * (float)cbs), 0, upb)`.
+/// `npixels` is the C loop bound (`maxw * maxh`); short buffers iterate
+/// clamped (no panic, no out-of-bounds access). A zero `npixels` is a
+/// no-op.
+#[allow(clippy::too_many_arguments)]
+pub fn j2k_sycc444_to_rgb(
+    y: &[i32],
+    cb: &[i32],
+    cr: &[i32],
+    r: &mut [i32],
+    g: &mut [i32],
+    b: &mut [i32],
+    npixels: usize,
+    offset: i32,
+    upb: i32,
+) {
+    let n = npixels
+        .min(y.len())
+        .min(cb.len())
+        .min(cr.len())
+        .min(r.len())
+        .min(g.len())
+        .min(b.len());
+    for k in 0..n {
+        // wrapping_sub: real lanes/offsets are small (prec <= 16 bits),
+        // but a debug panic across FFI would be UB — wrap instead of
+        // trapping on adversarial inputs, as the grey/RGB kernels do.
+        let cbs = cb[k].wrapping_sub(offset);
+        let crs = cr[k].wrapping_sub(offset);
+        let yv = y[k];
+        // C product order, in f64 over the exact (float)lane promotion:
+        // the constants are unsuffixed doubles, so `(float)cr` promotes
+        // and the multiply runs in f64. `as i32` truncates toward zero
+        // exactly like the C cast for these in-range values.
+        let rv = yv.wrapping_add((1.402f64 * (crs as f32 as f64)) as i32);
+        let gv = yv.wrapping_sub(
+            (0.344f64 * (cbs as f32 as f64) + 0.714f64 * (crs as f32 as f64)) as i32,
+        );
+        let bv = yv.wrapping_add((1.772f64 * (cbs as f32 as f64)) as i32);
+        // glib CLAMP(v, 0, upb) order, spelled branch-by-branch so an
+        // adversarial negative upb (unreachable from the C caller, whose
+        // upb is (1 << prec) - 1 >= 1) degrades instead of panicking the
+        // way `i32::clamp` would on a reversed range.
+        r[k] = if rv > upb { upb } else if rv < 0 { 0 } else { rv };
+        g[k] = if gv > upb { upb } else if gv < 0 { 0 } else { gv };
+        b[k] = if bv > upb { upb } else if bv < 0 { 0 } else { bv };
+    }
+}
+
+/// Structurally divergent reference for `j2k_sycc444_to_rgb`: folds the
+/// six planes through zipped iterators into a per-pixel scalar helper
+/// (the kernel indexes all six sides with `k`), so the sweep test
+/// cross-checks indexing as well as values. The arithmetic is the same
+/// f64-product-then-truncate-then-clamp spelling by construction (see
+/// the module docs: computing the products in f32 must not be used).
+/// Same well-formed-buffers precondition, enforced here by the same
+/// clamping.
+#[cfg(test)]
+fn sycc_pixel(yv: i32, cbv: i32, crv: i32, offset: i32, upb: i32) -> (i32, i32, i32) {
+    let cbs = cbv.wrapping_sub(offset);
+    let crs = crv.wrapping_sub(offset);
+    let rv = yv.wrapping_add((1.402f64 * f64::from(crs as f32)) as i32);
+    let gv = yv.wrapping_sub(
+        (0.344f64 * f64::from(cbs as f32) + 0.714f64 * f64::from(crs as f32)) as i32,
+    );
+    let bv = yv.wrapping_add((1.772f64 * f64::from(cbs as f32)) as i32);
+    let clamp = |v: i32| {
+        if v > upb {
+            upb
+        } else if v < 0 {
+            0
+        } else {
+            v
+        }
+    };
+    (clamp(rv), clamp(gv), clamp(bv))
+}
+
+#[cfg(test)]
+fn ref_j2k_sycc444_to_rgb(
+    y: &[i32],
+    cb: &[i32],
+    cr: &[i32],
+    r: &mut [i32],
+    g: &mut [i32],
+    b: &mut [i32],
+    npixels: usize,
+    offset: i32,
+    upb: i32,
+) {
+    let n = npixels
+        .min(y.len())
+        .min(cb.len())
+        .min(cr.len())
+        .min(r.len())
+        .min(g.len())
+        .min(b.len());
+    let ins = y.iter().zip(cb.iter()).zip(cr.iter());
+    let outs = r.iter_mut().zip(g.iter_mut()).zip(b.iter_mut());
+    for (((&yv, &cbv), &crv), ((rv, gv), bv)) in ins.zip(outs).take(n) {
+        let (rr, gg, bb) = sycc_pixel(yv, cbv, crv, offset, upb);
+        *rv = rr;
+        *gv = gg;
+        *bv = bb;
+    }
+}
+
+/// # Safety
+/// `y`/`cb`/`cr` must each hold at least `npixels` `int` lanes (the C
+/// caller passes the OpenJPEG component planes) and `r`/`g`/`b` at
+/// least `npixels` `int` lanes each (the C caller passes the calloc
+/// allocations that replace the planes). No buffer may overlap another.
+/// `offset`/`upb` are the C `1 << (prec - 1)` / `(1 << prec) - 1`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_j2k_sycc444_to_rgb(
+    y: *const i32,
+    cb: *const i32,
+    cr: *const i32,
+    r: *mut i32,
+    g: *mut i32,
+    b: *mut i32,
+    npixels: usize,
+    offset: i32,
+    upb: i32,
+) {
+    if y.is_null()
+        || cb.is_null()
+        || cr.is_null()
+        || r.is_null()
+        || g.is_null()
+        || b.is_null()
+        || npixels == 0
+    {
+        return;
+    }
+    // No length product to validate here (one lane per pixel per plane),
+    // but refuse lengths that cannot back a slice so the constructions
+    // below stay inside the language model; the safe kernel re-checks
+    // defensively via clamped iteration.
+    if npixels > isize::MAX as usize {
+        return;
+    }
+    let y = std::slice::from_raw_parts(y, npixels);
+    let cb = std::slice::from_raw_parts(cb, npixels);
+    let cr = std::slice::from_raw_parts(cr, npixels);
+    let r = std::slice::from_raw_parts_mut(r, npixels);
+    let g = std::slice::from_raw_parts_mut(g, npixels);
+    let b = std::slice::from_raw_parts_mut(b, npixels);
+    j2k_sycc444_to_rgb(y, cb, cr, r, g, b, npixels, offset, upb);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -560,5 +733,204 @@ mod tests {
             );
         }
         assert_eq!(out, vec![SENTINEL; 16]); // untouched
+    }
+
+    // ── sYCC 4:4:4 (m4-212) ──────────────────────────────────────────────
+
+    // Achromatic pixels pass through, rails clamp: 8-bit (offset 128,
+    // upb 255) with Cb == Cr == 128 reproduces Y on all three lanes;
+    // a hot chroma lane drives its channel into the rail.
+    #[test]
+    fn sycc444_neutral_and_rails_pin() {
+        let (offset, upb) = (128, 255);
+        let run = |y: &[i32], cb: &[i32], cr: &[i32]| {
+            let n = y.len();
+            let (mut r, mut g, mut b) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+            j2k_sycc444_to_rgb(y, cb, cr, &mut r, &mut g, &mut b, n, offset, upb);
+            (r, g, b)
+        };
+        // neutral grey ramps straight through
+        let (r, g, b) = run(&[0, 100, 255], &[128, 128, 128], &[128, 128, 128]);
+        assert_eq!((r, g, b), (vec![0, 100, 255], vec![0, 100, 255], vec![0, 100, 255]));
+        // hot blue-yellow lane: b rails at 255, g takes the partial hit
+        // b = 200 + (int)(1.772 * 127) = 200 + 225; g = 200 - (int)(0.344 * 127)
+        let (r, g, b) = run(&[200], &[255], &[128]);
+        assert_eq!((r, g, b), (vec![200], vec![157], vec![255]));
+        // cold red lane on dark Y: r rails at 0
+        // r = 10 + (int)(1.402 * -128) = 10 - 179
+        let (r, g, b) = run(&[10], &[0], &[0]);
+        assert_eq!((r, g, b), (vec![0], vec![145], vec![0]));
+    }
+
+    // Pin the f64-product spelling against an f32-product variant: the
+    // C constants are unsuffixed doubles, so a kernel that multiplied
+    // in f32 would observably differ on large-magnitude lanes. The pin
+    // below sits strictly inside the rails, so the asserted value is the
+    // raw truncated product, not a clamp. (An earlier revision pinned
+    // r=4435/b=3296, but both spellings truncate identically there, so
+    // those pins passed under the wrong spelling too and were vacuous.)
+    #[test]
+    fn sycc444_precision_spelling_is_f64() {
+        let (offset, upb) = (0, 65535);
+        // r = 60000 + (int)(1.402 * -41500): the f64 product is exactly
+        // -58183.0, truncating to -58183 (r = 1817), while an f32 product
+        // rounds to -58182.99609375, truncating to -58182 (r = 1818).
+        let (mut r, mut g, mut b) = (vec![0i32; 1], vec![0i32; 1], vec![0i32; 1]);
+        j2k_sycc444_to_rgb(&[60000], &[0], &[-41500], &mut r, &mut g, &mut b, 1, offset, upb);
+        assert_eq!(r[0], 1817);
+        // The 1.772 term shows no f32/f64 truncation divergence anywhere in
+        // the realistic lane range, so the r-pin above plus inspection is
+        // the practical coverage for the spelling requirement.
+    }
+
+    // Kernel and reference must agree exactly over several shapes,
+    // precisions (8/12/16-bit offsets and rails), and full-span lanes
+    // including out-of-range values that must clamp rather than wrap.
+    #[test]
+    fn sycc444_matches_reference_over_sweep() {
+        let shapes = [1usize, 2, 7, 20, 64];
+        let params = [(128i32, 255i32), (2048, 4095), (32768, 65535)];
+        for (s, n) in shapes.iter().enumerate() {
+            let n = *n;
+            let mut planes = [vec![0i32; n], vec![0i32; n], vec![0i32; n]];
+            for (c, plane) in planes.iter_mut().enumerate() {
+                for (i, v) in plane.iter_mut().enumerate() {
+                    // lanes span roughly [-70000, 70000]: in-range,
+                    // rails, and beyond-the-rails values
+                    *v = ((i as u64)
+                        .wrapping_mul(2_654_435_761)
+                        .wrapping_add((s * 3 + c) as u64 * 0x9E37)
+                        % 140_001) as i32
+                        - 70_000;
+                }
+            }
+            for &(offset, upb) in &params {
+                let (mut dr, mut dg, mut db) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+                let (mut rr, mut rg, mut rb) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+                j2k_sycc444_to_rgb(
+                    &planes[0], &planes[1], &planes[2],
+                    &mut dr, &mut dg, &mut db, n, offset, upb,
+                );
+                ref_j2k_sycc444_to_rgb(
+                    &planes[0], &planes[1], &planes[2],
+                    &mut rr, &mut rg, &mut rb, n, offset, upb,
+                );
+                for k in 0..n {
+                    assert_eq!(dr[k], rr[k], "shape {n} r lane {k}");
+                    assert_eq!(dg[k], rg[k], "shape {n} g lane {k}");
+                    assert_eq!(db[k], rb[k], "shape {n} b lane {k}");
+                    assert!((0..=upb).contains(&dr[k]), "r clamped {k}");
+                    assert!((0..=upb).contains(&dg[k]), "g clamped {k}");
+                    assert!((0..=upb).contains(&db[k]), "b clamped {k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sycc444_degenerate_guards_no_op() {
+        let (offset, upb) = (128, 255);
+        // zero pixels: outputs untouched
+        let (mut r, mut g, mut b) = (vec![9i32; 4], vec![9i32; 4], vec![9i32; 4]);
+        j2k_sycc444_to_rgb(&[1; 4], &[1; 4], &[1; 4], &mut r, &mut g, &mut b, 0, offset, upb);
+        assert_eq!((r, g, b), (vec![9; 4], vec![9; 4], vec![9; 4]));
+        // empty planes with live dims: no panic, no writes possible
+        let empty: Vec<i32> = vec![];
+        let (mut r, mut g, mut b) = (vec![9i32; 2], vec![9i32; 2], vec![9i32; 2]);
+        j2k_sycc444_to_rgb(&empty, &empty, &empty, &mut r, &mut g, &mut b, 2, offset, upb);
+        assert_eq!((r, g, b), (vec![9; 2], vec![9; 2], vec![9; 2]));
+        // truncated source: written prefix converts fully, the unwritten
+        // tail stays untouched
+        let (mut r, mut g, mut b) = (vec![9i32; 4], vec![9i32; 4], vec![9i32; 4]);
+        j2k_sycc444_to_rgb(&[100, 100], &[128, 128], &[128, 128], &mut r, &mut g, &mut b, 4, offset, upb);
+        assert_eq!(&r[..2], &[100, 100]);
+        assert_eq!(&r[2..], &[9, 9]);
+        // truncated output: no panic, partial planes never partially written
+        let (mut r, mut g, mut b) = (vec![9i32; 1], vec![9i32; 4], vec![9i32; 4]);
+        j2k_sycc444_to_rgb(
+            &[100, 100], &[128, 128], &[128, 128],
+            &mut r, &mut g, &mut b, 2, offset, upb,
+        );
+        assert_eq!(r, vec![100]);
+        assert_eq!(&g[..1], &[100]);
+        assert_eq!(&g[2..], &[9, 9]);
+    }
+
+    #[test]
+    fn sycc444_ffi_round_trip() {
+        let n = 37usize;
+        let (offset, upb) = (2048, 4095);
+        let mut planes = [vec![0i32; n], vec![0i32; n], vec![0i32; n]];
+        for (c, plane) in planes.iter_mut().enumerate() {
+            for (i, v) in plane.iter_mut().enumerate() {
+                *v = ((i as u64).wrapping_mul(2_654_435_761).wrapping_add(c as u64 * 0x9E37)
+                    % 6000) as i32
+                    - 1000;
+            }
+        }
+        let (mut fr, mut fg, mut fb) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+        let (mut dr, mut dg, mut db) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+        unsafe {
+            darkroom_j2k_sycc444_to_rgb(
+                planes[0].as_ptr(),
+                planes[1].as_ptr(),
+                planes[2].as_ptr(),
+                fr.as_mut_ptr(),
+                fg.as_mut_ptr(),
+                fb.as_mut_ptr(),
+                n,
+                offset,
+                upb,
+            );
+        }
+        j2k_sycc444_to_rgb(
+            &planes[0], &planes[1], &planes[2],
+            &mut dr, &mut dg, &mut db, n, offset, upb,
+        );
+        assert_eq!((fr, fg, fb), (dr, dg, db));
+    }
+
+    #[test]
+    fn sycc444_ffi_guards() {
+        let src = vec![100i32; 4];
+        let (mut r, mut g, mut b) = (vec![9i32; 4], vec![9i32; 4], vec![9i32; 4]);
+        unsafe {
+            // each null plane in turn
+            darkroom_j2k_sycc444_to_rgb(
+                std::ptr::null(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 1, 128, 255,
+            );
+            darkroom_j2k_sycc444_to_rgb(
+                src.as_ptr(), std::ptr::null(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 1, 128, 255,
+            );
+            darkroom_j2k_sycc444_to_rgb(
+                src.as_ptr(), src.as_ptr(), std::ptr::null(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 1, 128, 255,
+            );
+            darkroom_j2k_sycc444_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                std::ptr::null_mut(), g.as_mut_ptr(), b.as_mut_ptr(), 1, 128, 255,
+            );
+            darkroom_j2k_sycc444_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), std::ptr::null_mut(), b.as_mut_ptr(), 1, 128, 255,
+            );
+            darkroom_j2k_sycc444_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), std::ptr::null_mut(), 1, 128, 255,
+            );
+            // zero pixels
+            darkroom_j2k_sycc444_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 0, 128, 255,
+            );
+            // unsliceable dims
+            darkroom_j2k_sycc444_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), usize::MAX, 128, 255,
+            );
+        }
+        assert_eq!((r, g, b), (vec![9; 4], vec![9; 4], vec![9; 4])); // untouched
     }
 }

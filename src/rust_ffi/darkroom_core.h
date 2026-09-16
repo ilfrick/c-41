@@ -3882,6 +3882,22 @@ void darkroom_j2k_rgb_to_float(float *buf, const int *comp0, const int *comp1,
                                const long *offsets, const int *divs);
 
 /*
+ * JPEG2000 sYCC 4:4:4 conversion (imageio_j2k.c, sycc444_to_rgb, m4-212).
+ *
+ * darkroom_j2k_sycc444_to_rgb replaces the former DT_OMP_FOR pixel loop:
+ * per pixel index, r/g/b take the sycc_to_rgb values (offset-subtracted
+ * Cb/Cr, f64 products 1.402/0.344/0.714/1.772 truncated toward zero,
+ * each lane clamped to [0, upb]). y/cb/cr each hold npixels int lanes;
+ * r/g/b each hold npixels int lanes. The calloc allocation, the
+ * NULL-alloc early return, and the plane hand-off stay in C, as do the
+ * subsampled 4:2:2 / 4:2:0 variants. Null pointers, a zero npixels, and
+ * unsliceable dims are guarded no-ops; the buffers must not overlap.
+ */
+void darkroom_j2k_sycc444_to_rgb(const int *y, const int *cb, const int *cr,
+                                 int *r, int *g, int *b, size_t npixels,
+                                 int offset, int upb);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the

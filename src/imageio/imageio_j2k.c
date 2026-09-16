@@ -19,7 +19,7 @@
 #include "common/darktable.h"
 #include "common/exif.h"
 #include "imageio/imageio_j2k.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_j2k_{grey,rgb}_to_float
+#include "rust_ffi/darkroom_core.h" // for darkroom_j2k_{grey,rgb}_to_float, darkroom_j2k_sycc444_to_rgb
 
 #include <assert.h>
 #include <math.h>
@@ -396,11 +396,13 @@ static void sycc444_to_rgb(opj_image_t *img)
     return;
   }
 
-  DT_OMP_FOR()
-  for(size_t k = 0; k < max; ++k)
-  {
-    sycc_to_rgb(offset, upb, y[k], cb[k], cr[k], r+k, g+k, b+k);
-  }
+  // sYCC 4:4:4 conversion loop ported to Rust FFI (m4-212): per-pixel
+  // int arithmetic identical to sycc_to_rgb above (f64 products,
+  // truncation toward zero, clamp to [0, upb]), now serial instead of
+  // OpenMP (pixels are independent). The calloc allocation,
+  // the NULL-alloc early return, and the plane hand-off below stay in C,
+  // as do the subsampled 4:2:2 / 4:2:0 variants.
+  darkroom_j2k_sycc444_to_rgb(y, cb, cr, r, g, b, max, offset, upb);
   free(img->comps[0].data);
   img->comps[0].data = r;
   free(img->comps[1].data);
