@@ -30,6 +30,7 @@
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_avif_float_to_u16/u8
 
 #include <avif/avif.h>
 
@@ -478,36 +479,23 @@ int write_image(struct dt_imageio_module_data_t *data,
     case 12:
     case 10:
     {
-    DT_OMP_FOR_SIMD(collapse(2))
-    for(size_t y = 0; y < height; y++)
-    {
-      for(size_t x = 0; x < width; x++)
-      {
-          const float *in_pixel = &in_data[(size_t)4 * ((y * width) + x)];
-          uint16_t *out_pixel = (uint16_t *)&out[(y * rowbytes) + (3 * sizeof(uint16_t) * x)];
-
-          out_pixel[0] = (uint16_t)roundf(CLAMP(in_pixel[0] * max_channel_f, 0, max_channel_f));
-          out_pixel[1] = (uint16_t)roundf(CLAMP(in_pixel[1] * max_channel_f, 0, max_channel_f));
-          out_pixel[2] = (uint16_t)roundf(CLAMP(in_pixel[2] * max_channel_f, 0, max_channel_f));
-      }
-    }
+    // Pixel loop ported to Rust FFI (darkroom_avif_float_to_u16 in
+    // crates/c41-core/src/avif.rs): the same per-lane
+    // roundf(CLAMP(v * max, 0, max)) over the tightly packed RGBA input
+    // into the rowbytes-strided libavif RGB plane, now serial instead of
+    // OpenMP (pixels are independent). The case 8 branch below is the u8
+    // sibling (darkroom_avif_float_to_u8).
+    darkroom_avif_float_to_u16(in_data, out, width, height, rowbytes, max_channel_f);
     break;
     }
     case 8:
     {
-    DT_OMP_FOR_SIMD(collapse(2))
-    for(size_t y = 0; y < height; y++)
-    {
-      for(size_t x = 0; x < width; x++)
-      {
-          const float *in_pixel = &in_data[(size_t)4 * ((y * width) + x)];
-          uint8_t *out_pixel = (uint8_t *)&out[(y * rowbytes) + (3 * sizeof(uint8_t) * x)];
-
-          out_pixel[0] = (uint8_t)roundf(CLAMP(in_pixel[0] * max_channel_f, 0, max_channel_f));
-          out_pixel[1] = (uint8_t)roundf(CLAMP(in_pixel[1] * max_channel_f, 0, max_channel_f));
-          out_pixel[2] = (uint8_t)roundf(CLAMP(in_pixel[2] * max_channel_f, 0, max_channel_f));
-      }
-    }
+    // Pixel loop ported to Rust FFI (darkroom_avif_float_to_u8 in
+    // crates/c41-core/src/avif.rs): the same per-lane
+    // roundf(CLAMP(v * max, 0, max)) over the tightly packed RGBA input
+    // into the rowbytes-strided libavif RGB plane, now serial instead of
+    // OpenMP (pixels are independent).
+    darkroom_avif_float_to_u8(in_data, out, width, height, rowbytes, max_channel_f);
     break;
     }
     default:

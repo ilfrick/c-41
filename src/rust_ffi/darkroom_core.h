@@ -3895,6 +3895,54 @@ void darkroom_avif_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
  * the buffers must not overlap.
  */
 void darkroom_avif_u8_to_float(const unsigned char *rgb_buf, float *mipbuf,
+                                size_t width, size_t height, size_t rowbytes,
+                                float max_channel);
+
+/*
+ * AVIF 10/12-bit RGB export (format/avif.c, write_image case 12/10,
+ * m4-216).
+ *
+ * darkroom_avif_float_to_u16 replaces the former DT_OMP_FOR_SIMD pixel
+ * loop: per pixel (y, x), out[y*rowbytes + 6*x + 2*c .. +2] =
+ * (uint16_t)roundf(CLAMP(in[4*(y*width+x) + c] * max_channel, 0,
+ * max_channel)) in little-endian byte order for c in 0..2, where in is
+ * the tightly packed RGBA float export buffer (its alpha lane is never
+ * read) and out is the libavif RGB plane at AVIF_RGB_FORMAT_RGB with
+ * 10- or 12-bit depth (host-order u16 lanes, written little-endian;
+ * darktable only runs on little-endian hosts). Input rows are tightly
+ * packed; output rows may carry padding (rowbytes >= 6*width). The
+ * libavif image/plane setup and the color-profile handling stay in C;
+ * format/avif.c now has zero DT_OMP_FOR sites. in_data holds
+ * 4*width*height floats, out holds (height-1)*rowbytes + 6*width bytes;
+ * max_channel is the C max_channel_f ((float)((1 << bit_depth) - 1),
+ * 1023.0 at 10-bit depth, 4095.0 at 12-bit depth). Null pointers, zero
+ * dims, a non-positive or non-finite max_channel, a rowbytes narrower
+ * than one pixel row, and overflowing dim products are guarded no-ops;
+ * the buffers must not overlap.
+ */
+void darkroom_avif_float_to_u16(const float *in_data, unsigned char *out,
+                                size_t width, size_t height, size_t rowbytes,
+                                float max_channel);
+
+/*
+ * AVIF 8-bit RGB export (format/avif.c, write_image case 8, m4-216).
+ *
+ * darkroom_avif_float_to_u8 replaces the former DT_OMP_FOR_SIMD pixel
+ * loop: per pixel (y, x), out[y*rowbytes + 3*x + c] =
+ * (uint8_t)roundf(CLAMP(in[4*(y*width+x) + c] * max_channel, 0,
+ * max_channel)) for c in 0..2, where in is the tightly packed RGBA float
+ * export buffer (its alpha lane is never read) and out is the libavif
+ * RGB plane at AVIF_RGB_FORMAT_RGB with 8-bit depth. Input rows are
+ * tightly packed; output rows may carry padding (rowbytes >= 3*width).
+ * The libavif image/plane setup and the color-profile handling stay in
+ * C. in_data holds 4*width*height floats, out holds
+ * (height-1)*rowbytes + 3*width bytes; max_channel is the C
+ * max_channel_f ((float)((1 << bit_depth) - 1), 255.0 at 8-bit depth).
+ * Null pointers, zero dims, a non-positive or non-finite max_channel, a
+ * rowbytes narrower than one pixel row, and overflowing dim products are
+ * guarded no-ops; the buffers must not overlap.
+ */
+void darkroom_avif_float_to_u8(const float *in_data, unsigned char *out,
                                size_t width, size_t height, size_t rowbytes,
                                float max_channel);
 
