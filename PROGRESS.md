@@ -5170,3 +5170,28 @@ encoding). Also noted the serial-vs-OMP change in the C comment.
 tests (incl. the new discriminating pin), and the `c41-rs` release link.
 Header addition scanned for embedded `*/` (only the block terminator).
 Remaining warnings are pre-existing and outside this change.
+
+---
+
+## 2026-09-16 08:20 UTC — m4-213: port HEIF float export loop to Rust FFI
+
+**Commit** `8c80dfa67c` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `case 8` export loop of `write_image`
+(`src/imageio/format/heif.c`), replacing it with `darkroom_heif_float_to_u8`.
+Extended `c41-core::heif` (safe kernel, divergent reference, validated FFI,
+6 tests — multiply-before-clamp in f32 exactly as parenthesised, glib CLAMP
+order high-bound-first, NaN falls through to round then saturates to 0,
+half-away rounding, alpha never read); declared the export in
+`src/rust_ffi/darkroom_core.h` after the u16 block. The 10/12-bit branch,
+libheif setup, and profile handling untouched. Left all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, one P2
+comment nit (fixed in-session: sweep padding-sentinel comment says 0xCD to
+match the code, not 0xFF).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
