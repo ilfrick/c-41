@@ -3812,8 +3812,9 @@ void darkroom_heif_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
  * max_channel)) for c in 0..2, where in is the tightly packed RGBA float
  * export buffer (its alpha lane is never read) and out is the libheif
  * interleaved RGB plane. Input rows are tightly packed; output rows may
- * carry padding (rowbytes >= 3*width). The libheif image/plane setup, the
- * color-profile handling, and the 10/12-bit branch stay in C. in_data
+ * carry padding (rowbytes >= 3*width). The libheif image/plane setup and
+ * the color-profile handling stay in C; the 10/12-bit branch stayed in C
+ * until m4-214 (now `darkroom_heif_float_to_u16` below). in_data
  * holds 4*width*height floats, out holds (height-1)*rowbytes + 3*width
  * bytes; max_channel is the C max_channel_f
  * ((float)((1 << bit_depth) - 1), 255.0 at 8-bit depth). Null pointers,
@@ -3824,6 +3825,30 @@ void darkroom_heif_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
 void darkroom_heif_float_to_u8(const float *in_data, unsigned char *out,
                                size_t width, size_t height, size_t rowbytes,
                                float max_channel);
+
+/*
+ * HEIF 10/12-bit RGB export (format/heif.c, write_image case 10/12,
+ * m4-214).
+ *
+ * darkroom_heif_float_to_u16 replaces the former DT_OMP_FOR pixel loop:
+ * per pixel (y, x), out[y*rowbytes + 6*x + 2*c .. +2] =
+ * (uint16_t)roundf(CLAMP(in[4*(y*width+x) + c] * max_channel, 0,
+ * max_channel)) in little-endian byte order for c in 0..2, where in is
+ * the tightly packed RGBA float export buffer (its alpha lane is never
+ * read) and out is the libheif interleaved RRGGBB_LE plane. Input rows
+ * are tightly packed; output rows may carry padding (rowbytes >=
+ * 6*width). The libheif image/plane setup and the color-profile handling
+ * stay in C; format/heif.c now has zero DT_OMP_FOR sites. in_data holds
+ * 4*width*height floats, out holds (height-1)*rowbytes + 6*width bytes;
+ * max_channel is the C max_channel_f ((float)((1 << bit_depth) - 1),
+ * 1023.0 at 10-bit depth, 4095.0 at 12-bit depth). Null pointers, zero
+ * dims, a non-positive max_channel, a rowbytes narrower than one pixel
+ * row, and overflowing dim products are guarded no-ops; the buffers must
+ * not overlap.
+ */
+void darkroom_heif_float_to_u16(const float *in_data, unsigned char *out,
+                                size_t width, size_t height, size_t rowbytes,
+                                float max_channel);
 
 /*
  * AVIF 10/12-bit RGB normalize (imageio_avif.c, dt_imageio_open_avif,
