@@ -5272,3 +5272,28 @@ divergence).
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-16 11:20 UTC — m4-217: port J2K 12-bit export pack to Rust FFI
+
+**Commit** `d5d7f8e8a4` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported the only live `DT_OMP_FOR` site in `src/imageio/format/j2k.c`
+(`write_image` `case 12`), replacing it with `darkroom_j2k_float_to_12bit`.
+Extended `c41-core::j2k` (safe kernel, divergent reference, validated FFI, 6
+tests — branch-on-raw-lane spelling, half-away rounding, NaN divergence pinned
+honestly, alpha never read); declared the export in `src/rust_ffi/darkroom_core.h`
+after the sycc444 block. 8/16-bit commented-out cases, NULL-image early return,
+and encode/profile handling untouched. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0
+(one P1 process gate; three P2 notes). Fixed in-session: NaN-divergence pointer
+added to the header block. The isize-guard element-size note matches the m4-212
+precedent (optional repo-wide tightening, out of scope); reference/kernel
+truncation sharing documented as intended.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
