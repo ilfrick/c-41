@@ -5246,3 +5246,29 @@ recorded — no changes requested).
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-16 10:40 UTC — m4-216: port AVIF export packs to Rust FFI
+
+**Commit** `31a2429e7d` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported both AVIF export pack loops (`write_image` `case 12/10`
+and `case 8` in `src/imageio/format/avif.c`), replacing them with
+`darkroom_avif_float_to_u16` / `darkroom_avif_float_to_u8`. Extended
+`c41-core::avif` (safe kernels, divergent references, validated FFI, 12
+tests — multiply-before-clamp in f32, glib CLAMP order, NaN falls through
+to round then saturates to 0, half-away rounding, explicit LE encode, alpha
+never read); declared both exports in `src/rust_ffi/darkroom_core.h` after
+the import block. `format/avif.c` now has zero `DT_OMP_FOR` sites. Left
+all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no code
+defects (P1 was the unexecuted gate; two P2 notes recorded as acceptable:
+documented Safety-contract slicing, saturating-vs-checked test-only
+divergence).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
