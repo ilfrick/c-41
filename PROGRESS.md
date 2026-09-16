@@ -4845,6 +4845,36 @@ this change.
 
 ---
 
+## 2026-09-13 13:10 UTC — m4-200: port imagebuf copy-ROI fallback to Rust FFI
+
+**Commit** `ca6ffa6300` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `dt_iop_copy_image_roi` inconsistent-ROI fallback
+(`src/common/imagebuf.c:223`), replacing it with `darkroom_imagebuf_copy_roi`.
+Extended `c41-core::imagebuf` (safe kernel, divergent reference, validated FFI,
+10 tests — bounds-conditional copy-or-zero, signed offsets in i64, `+0.0`
+zero branch); declared the export in `src/rust_ffi/darkroom_core.h`. Fast
+whole-buffer and per-row `memcpy` paths stay in C under identical selection;
+~25 call sites untouched via shared-body replacement. Not the excluded bulk-
+memcpy class. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
+notes only: serial-vs-OpenMP perf-only, one comment wording nit).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+**Notes — resumed after rate limit.** The delegated m4-199 dev subagent hit a
+provider rate limit after writing the Rust side (`blur_line_z` FFI +
+reference + tests) but before the C/header wiring; the main session verified
+the kernel op-by-op against the C original, applied the small C + header edits
+itself (call-site swap, static deletion, decl, stale-comment touch-ups), and
+ran the normal independent review + gate from there.
+
+---
+
 ## 2026-09-13 13:45 UTC — m4-201: port RGBE clamp-pack loop to Rust FFI
 
 **Commit** `0ff9ad15b2` (GitHub + Gitea via `git push origin master`)
@@ -4918,6 +4948,53 @@ this change.
 
 ---
 
+## 2026-09-13 15:20 UTC — m4-204: port PNG 16-bit normalize loop to Rust FFI
+
+**Commit** `39bc5572cd` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `bpp >= 16` else-branch of `dt_imageio_open_png`
+(`src/imageio/imageio_png.c:241`), replacing it with `darkroom_png_u16_to_float`.
+Extended `c41-core::png` (safe kernel, divergent reference, validated FFI,
+6 new tests — big-endian pairs times identical `1.0f32/65535.0f32` normalizer,
+blue-lane LSB quirk replicated bit-exactly and pinned against accidental
+"fix", alpha never written, dead `normalizer` removed); declared the export in
+`src/rust_ffi/darkroom_core.h` after the u8 block. Decode/alloc/flags and the
+u8 branch untouched; single call site. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (four P2
+nits; applied the actionable one in-session: blue-interior assertion added to
+the rails test).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
+## 2026-09-13 15:50 UTC — m4-205: port imageio RB swap tail to Rust FFI
+
+**Commit** `b4683555f2` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `!display_byteorder` R/B swap tail of
+`dt_imageio_export_with_flags` (`src/imageio/imageio.c:1438`), replacing it
+with `darkroom_imageio_swap_rb`. Added new `c41-core::imageio` (safe kernel,
+divergent reference, validated FFI, 6 tests — pure byte permutation, G/A never
+touched, in-place by contract); registered `pub mod imageio`; declared the
+export in `src/rust_ffi/darkroom_core.h` after the PNG block. Branch structure
+and buffer provenance untouched; single call site. Left all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
+notes only, left as-is).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
 ## 2026-09-13 16:20 UTC — m4-206: port imageio u8 fast path to Rust FFI
 
 **Commit** `cbe83c159b` (GitHub + Gitea via `git push origin master`)
@@ -4942,22 +5019,48 @@ this change.
 
 ---
 
-## 2026-09-13 15:20 UTC — m4-204: port PNG 16-bit normalize loop to Rust FFI
+## 2026-09-13 16:50 UTC — m4-207: port WebP u8 normalize loop to Rust FFI
 
-**Commit** `39bc5572cd` (GitHub + Gitea via `git push origin master`)
+**Commit** `b6aa9a0e8c` (GitHub + Gitea via `git push origin master`)
 
-**What.** Ported only the `bpp >= 16` else-branch of `dt_imageio_open_png`
-(`src/imageio/imageio_png.c:241`), replacing it with `darkroom_png_u16_to_float`.
-Extended `c41-core::png` (safe kernel, divergent reference, validated FFI,
-6 new tests — big-endian pairs times identical `1.0f32/65535.0f32` normalizer,
-blue-lane LSB quirk replicated bit-exactly and pinned against accidental
-"fix", alpha never written, dead `normalizer` removed); declared the export in
-`src/rust_ffi/darkroom_core.h` after the u8 block. Decode/alloc/flags and the
-u8 branch untouched; single call site. Left all unrelated files untouched.
+**What.** Ported only the `dt_imageio_open_webp` normalize loop
+(`src/imageio/imageio_webp.c:148`), replacing it with `darkroom_webp_u8_to_float`.
+Added new `c41-core::webp` (safe kernel, divergent reference, validated FFI,
+5 tests — true division `/ 255.0f32`, alpha zeroed even for opaque input,
+unlike QOI/PNG neighbours); registered `pub mod webp`; declared the export in
+`src/rust_ffi/darkroom_core.h` after the m4-206 block. Decode/alloc/flags
+orchestration untouched; single call site. Left all unrelated files untouched.
 
-**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (four P2
-nits; applied the actionable one in-session: blue-interior assertion added to
-the rails test).
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, P2-only.
+Fixed all three in-session (reverted unrelated one-space reindent in the m4-206
+decl; lane-range notation unified to house `0..2`; short-buffer clamp semantics
+pinned with first-quad/tail assertions).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
+
+---
+
+## 2026-09-13 17:30 UTC — m4-208: port HEIF u16 normalize loop to Rust FFI
+
+**Commit** `5862fcc5ea` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the `dt_imageio_open_heif` normalize loop
+(`src/imageio/imageio_heif.c:245`, the file's only `DT_OMP_FOR` site),
+replacing it with `darkroom_heif_u16_to_float`. Added new `c41-core::heif`
+(safe kernel, divergent reference, validated FFI, 5 tests — hoisted
+`1/max_channel` reciprocal-multiply, explicit LE decode, alpha zeroed,
+rowbytes padding skipped); registered `pub mod heif`; declared the export in
+`src/rust_ffi/darkroom_core.h` after the WebP block. Decode/alloc/flags/ICC
+orchestration untouched; single call site. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES** (code
+correct; gates unexecuted at review time). Fixed in-session: NaN/Inf
+`max_channel` FFI guard lines added. The negative-rowbytes doc note was
+evaluated and needed no code change (the claim lived in the dev report, not
+the code; the guard behavior for real callers is a correct no-op).
 
 **Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
@@ -5016,34 +5119,6 @@ this change.
 
 ---
 
-## 2026-09-13 19:30 UTC — m4-212: port J2K sycc444 loop to Rust FFI
-
-**Commit** `60c0c3e308` (GitHub + Gitea via `git push origin master`)
-
-**What.** Ported only `sycc444_to_rgb` (`src/imageio/imageio_j2k.c:399`),
-replacing it with `darkroom_j2k_sycc444_to_rgb`. Extended `c41-core::j2k`
-(safe kernel, divergent two-phase reference, validated FFI, 6 tests — f64
-products with truncation, glib CLAMP order, wrapping int arithmetic, alpha
-planes untouched); declared the export in `src/rust_ffi/darkroom_core.h`. The
-422/420 variants, `sycc_to_rgb`, calloc/plane hand-off, and all unrelated
-files untouched.
-
-**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, one P1.
-The `sycc444_precision_spelling_is_f64` pins were vacuous (both spellings
-truncate identically at r=4435/b=3296 — verified by the reviewer's f32
-emulation, and confirmed in-session with an independent python3/f32 model).
-Replaced with a genuinely discriminating pin (y=60000, crs=-41500 → f64
-r=1817 vs f32 r=1818; the truncation lands on the product before the yv add,
-which is why the first check attempt mis-modeled it — corrected before
-encoding). Also noted the serial-vs-OMP change in the C comment.
-
-**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
-tests (incl. the new discriminating pin), and the `c41-rs` release link.
-Header addition scanned for embedded `*/` (only the block terminator).
-Remaining warnings are pre-existing and outside this change.
-
----
-
 ## 2026-09-13 19:00 UTC — m4-211: port J2K int normalize loops to Rust FFI
 
 **Commit** `0129d8e378` (GitHub + Gitea via `git push origin master`)
@@ -5070,104 +5145,28 @@ this change.
 
 ---
 
-## 2026-09-13 17:30 UTC — m4-208: port HEIF u16 normalize loop to Rust FFI
+## 2026-09-13 19:30 UTC — m4-212: port J2K sycc444 loop to Rust FFI
 
-**Commit** `5862fcc5ea` (GitHub + Gitea via `git push origin master`)
+**Commit** `60c0c3e308` (GitHub + Gitea via `git push origin master`)
 
-**What.** Ported only the `dt_imageio_open_heif` normalize loop
-(`src/imageio/imageio_heif.c:245`, the file's only `DT_OMP_FOR` site),
-replacing it with `darkroom_heif_u16_to_float`. Added new `c41-core::heif`
-(safe kernel, divergent reference, validated FFI, 5 tests — hoisted
-`1/max_channel` reciprocal-multiply, explicit LE decode, alpha zeroed,
-rowbytes padding skipped); registered `pub mod heif`; declared the export in
-`src/rust_ffi/darkroom_core.h` after the WebP block. Decode/alloc/flags/ICC
-orchestration untouched; single call site. Left all unrelated files untouched.
+**What.** Ported only `sycc444_to_rgb` (`src/imageio/imageio_j2k.c:399`),
+replacing it with `darkroom_j2k_sycc444_to_rgb`. Extended `c41-core::j2k`
+(safe kernel, divergent two-phase reference, validated FFI, 6 tests — f64
+products with truncation, glib CLAMP order, wrapping int arithmetic, alpha
+planes untouched); declared the export in `src/rust_ffi/darkroom_core.h`. The
+422/420 variants, `sycc_to_rgb`, calloc/plane hand-off, and all unrelated
+files untouched.
 
-**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES** (code
-correct; gates unexecuted at review time). Fixed in-session: NaN/Inf
-`max_channel` FFI guard lines added. The negative-rowbytes doc note was
-evaluated and needed no code change (the claim lived in the dev report, not
-the code; the guard behavior for real callers is a correct no-op).
-
-**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
-tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
-(only the block terminator). Remaining warnings are pre-existing and outside
-this change.
-
----
-
-## 2026-09-13 16:50 UTC — m4-207: port WebP u8 normalize loop to Rust FFI
-
-**Commit** `b6aa9a0e8c` (GitHub + Gitea via `git push origin master`)
-
-**What.** Ported only the `dt_imageio_open_webp` normalize loop
-(`src/imageio/imageio_webp.c:148`), replacing it with `darkroom_webp_u8_to_float`.
-Added new `c41-core::webp` (safe kernel, divergent reference, validated FFI,
-5 tests — true division `/ 255.0f32`, alpha zeroed even for opaque input,
-unlike QOI/PNG neighbours); registered `pub mod webp`; declared the export in
-`src/rust_ffi/darkroom_core.h` after the m4-206 block. Decode/alloc/flags
-orchestration untouched; single call site. Left all unrelated files untouched.
-
-**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, P2-only.
-Fixed all three in-session (reverted unrelated one-space reindent in the m4-206
-decl; lane-range notation unified to house `0..2`; short-buffer clamp semantics
-pinned with first-quad/tail assertions).
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, one P1.
+The `sycc444_precision_spelling_is_f64` pins were vacuous (both spellings
+truncate identically at r=4435/b=3296 — verified by the reviewer's f32
+emulation, and confirmed in-session with an independent python3/f32 model).
+Replaced with a genuinely discriminating pin (y=60000, crs=-41500 → f64
+r=1817 vs f32 r=1818; the truncation lands on the product before the yv add,
+which is why the first check attempt mis-modeled it — corrected before
+encoding). Also noted the serial-vs-OMP change in the C comment.
 
 **Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
-tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
-(only the block terminator). Remaining warnings are pre-existing and outside
-this change.
-
----
-
-## 2026-09-13 15:50 UTC — m4-205: port imageio RB swap tail to Rust FFI
-
-**Commit** `b4683555f2` (GitHub + Gitea via `git push origin master`)
-
-**What.** Ported only the `!display_byteorder` R/B swap tail of
-`dt_imageio_export_with_flags` (`src/imageio/imageio.c:1438`), replacing it
-with `darkroom_imageio_swap_rb`. Added new `c41-core::imageio` (safe kernel,
-divergent reference, validated FFI, 6 tests — pure byte permutation, G/A never
-touched, in-place by contract); registered `pub mod imageio`; declared the
-export in `src/rust_ffi/darkroom_core.h` after the PNG block. Branch structure
-and buffer provenance untouched; single call site. Left all unrelated files
-untouched.
-
-**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
-notes only, left as-is).
-
-**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
-tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
-(only the block terminator). Remaining warnings are pre-existing and outside
-this change.
-
----
-
-## 2026-09-13 13:10 UTC — m4-200: port imagebuf copy-ROI fallback to Rust FFI
-
-**Commit** `ca6ffa6300` (GitHub + Gitea via `git push origin master`)
-
-**What.** Ported only the `dt_iop_copy_image_roi` inconsistent-ROI fallback
-(`src/common/imagebuf.c:223`), replacing it with `darkroom_imagebuf_copy_roi`.
-Extended `c41-core::imagebuf` (safe kernel, divergent reference, validated FFI,
-10 tests — bounds-conditional copy-or-zero, signed offsets in i64, `+0.0`
-zero branch); declared the export in `src/rust_ffi/darkroom_core.h`. Fast
-whole-buffer and per-row `memcpy` paths stay in C under identical selection;
-~25 call sites untouched via shared-body replacement. Not the excluded bulk-
-memcpy class. Left all unrelated files untouched.
-
-**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
-notes only: serial-vs-OpenMP perf-only, one comment wording nit).
-
-**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
-tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
-(only the block terminator). Remaining warnings are pre-existing and outside
-this change.
-
-**Notes — resumed after rate limit.** The delegated m4-199 dev subagent hit a
-provider rate limit after writing the Rust side (`blur_line_z` FFI +
-reference + tests) but before the C/header wiring; the main session verified
-the kernel op-by-op against the C original, applied the small C + header edits
-itself (call-site swap, static deletion, decl, stale-comment touch-ups), and
-ran the normal independent review + gate from there.
-
+tests (incl. the new discriminating pin), and the `c41-rs` release link.
+Header addition scanned for embedded `*/` (only the block terminator).
+Remaining warnings are pre-existing and outside this change.
