@@ -32,6 +32,7 @@ pub mod interp;
 pub mod iop;
 pub mod iop_profile;
 pub mod j2k;
+pub mod jxl;
 pub mod locallaplacian;
 pub mod masks;
 pub mod math;

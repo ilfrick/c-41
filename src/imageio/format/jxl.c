@@ -23,6 +23,7 @@
 #include "control/conf.h"
 #include "imageio/imageio_common.h"
 #include "imageio/format/imageio_format_api.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_jxl_rgba_to_rgb_float
 
 #include <jxl/encode.h>
 #include <jxl/resizable_parallel_runner.h>
@@ -346,19 +347,12 @@ int write_image(struct dt_imageio_module_data_t *data,
   if(!pixels)
     JXL_FAIL("could not allocate output pixel buffer of size %zu", pixels_size);
 
-  DT_OMP_FOR_SIMD(collapse(2))
-  for(uint32_t y = 0; y < height; ++y)
-  {
-    for(uint32_t x = 0; x < width; ++x)
-    {
-      const float *in_pixel = (const float *)in_tmp + 4 * ((y * width) + x);
-      float *out_pixel = pixels + 3 * ((y * width) + x);
-
-      out_pixel[0] = in_pixel[0];
-      out_pixel[1] = in_pixel[1];
-      out_pixel[2] = in_pixel[2];
-    }
-  }
+  // Pixel loop ported to Rust FFI (darkroom_jxl_rgba_to_rgb_float in
+  // crates/c41-core/src/jxl.rs): the same per-pixel RGBA (4 floats) to
+  // RGB (3 floats) repack with the alpha lane dropped, over the tightly
+  // packed export buffer into the freshly allocated frame, now serial
+  // instead of OpenMP (pixels are independent).
+  darkroom_jxl_rgba_to_rgb_float((const float *)in_tmp, pixels, (size_t)width, (size_t)height);
 
   LIBJXL_ASSERT(JxlEncoderAddImageFrame(frame_settings, &pixel_format, pixels, pixels_size));
 

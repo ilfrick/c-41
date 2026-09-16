@@ -4394,6 +4394,22 @@ void darkroom_flip_and_zoom_8(const unsigned char *in_buf,
                               unsigned int *width,
                               unsigned int *height);
 
+/*
+ * JXL export RGBA-to-RGB float repack (src/imageio/format/jxl.c, m4-215).
+ *
+ * darkroom_jxl_rgba_to_rgb_float replaces the DT_OMP_FOR_SIMD loop body of
+ * write_image(): per pixel, out[3k+c] = in[4k+c] for c in 0..2, dropping
+ * the alpha lane (the frame is encoded as 3-channel float). Both buffers
+ * are tightly packed: in holds 4*width*height floats, out holds
+ * 3*width*height floats. Plain assignment copies every bit including NaN
+ * payloads and signed zeros. Null pointers and degenerate dims are
+ * guarded no-ops.
+ */
+void darkroom_jxl_rgba_to_rgb_float(const float *in_data,
+                                    float *out,
+                                    size_t width,
+                                    size_t height);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
