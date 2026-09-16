@@ -5297,3 +5297,28 @@ truncation sharing documented as intended.
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-16 12:10 UTC — m4-218: port XCF mask packs to Rust FFI
+
+**Commit** `0c2c23f56b` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported both raster-mask channel packs in `write_image`
+(`src/imageio/format/xcf.c:202/:213`, the file's only OMP sites),
+replacing them with `darkroom_xcf_mask_to_u8` / `darkroom_xcf_mask_to_u16`.
+Added new `c41-core::xcf` (safe kernels, divergent references, validated
+FFI, 7 tests — clamp-first in f32 exactly as parenthesised, branch-by-branch
+CLIP, NaN yields 0 in both languages with no divergence, half-away rounding,
+final cast in-range exact); registered `pub mod xcf`; declared both exports
+in `src/rust_ffi/darkroom_core.h`. malloc/NULL guards, bpp branches, 32-bit
+passthrough, and hand-off untouched. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (one P2
+doc nit, fixed in-session: trimmed the self-hedging clamp-order paragraph to
+one sentence).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
