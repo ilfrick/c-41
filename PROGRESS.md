@@ -5222,3 +5222,27 @@ well-formed-only comparison); negative-max FFI guard line added.
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-16 10:00 UTC — m4-215: port JXL RGBA export pack to Rust FFI
+
+**Commit** `8e63ae9d66` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported the only `DT_OMP_FOR` site in `src/imageio/format/jxl.c`
+(`write_image` RGBA→RGB float pack), replacing it with
+`darkroom_jxl_rgba_to_rgb_float`. Added new `c41-core::jxl` (safe kernel,
+divergent reference, validated FFI, 6 tests — pure copy, NaN payload / Inf /
+`-0.0` preserved bit-exactly, alpha dropped); registered `pub mod jxl`;
+declared the export in `src/rust_ffi/darkroom_core.h` after the
+`flip_and_zoom_8` block. libjxl setup/encode untouched; single call site.
+Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
+notes only: OMP→serial throughput note, inner-index arithmetic reasoning
+recorded — no changes requested).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
