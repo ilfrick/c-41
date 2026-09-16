@@ -57,6 +57,7 @@
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_j2k_float_to_12bit
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -395,12 +396,14 @@ int write_image(dt_imageio_module_data_t *j2k_tmp, const char *filename, const v
 //        }
 //        break;
       case 12:
-        DT_OMP_FOR_SIMD(collapse(2))
-        for(int i = 0; i < w * h; ++i)
-        {
-          for(int k = 0; k < numcomps; ++k)
-            image->comps[k].data[i] = DOWNSAMPLE_FLOAT_TO_12BIT(in[i * 4 + k]);
-        }
+        // Ported to Rust FFI (m4-217): per-pixel branch quantize identical
+        // to DOWNSAMPLE_FLOAT_TO_12BIT above (<= 0 -> 0, >= 1 -> 4095,
+        // else (int)roundf(4095*v) in f32; alpha never read), now serial
+        // instead of OpenMP (pixels are independent). The
+        // opj_image_create/NULL-image early return above and the
+        // encode/profile handling below stay in C.
+        darkroom_j2k_float_to_12bit(in, image->comps[0].data, image->comps[1].data,
+                                    image->comps[2].data, (size_t)(w * h));
         break;
 //      case 16:
 //        for(int i = 0; i < w * h; i++)

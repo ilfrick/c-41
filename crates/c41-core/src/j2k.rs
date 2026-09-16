@@ -53,6 +53,24 @@
 //! the 4:2:0 tail passes the base `*cr` where the pattern calls for the
 //! local `curr_cr`); the calloc allocation, the NULL-alloc early return,
 //! and the plane hand-off stay in C with the converted call.
+//!
+//! 12-bit export pack (m4-217): `j2k_float_to_12bit` replaces the loop
+//! body of the `case 12` branch of `write_image()` in
+//! `src/imageio/format/j2k.c` (the only live `DT_OMP_FOR` site in that
+//! file; the 8/16-bit cases are commented out and `prec` is hardcoded to
+//! 12). Per pixel it runs the `DOWNSAMPLE_FLOAT_TO_12BIT` macro: branch
+//! on the raw lane (`<= 0.0` yields 0, `>= 1.0` yields 4095), else
+//! `(int)roundf(4095.0 * lane)` in f32. `roundf` is round-half-away, so
+//! the kernel uses `f32::round`; the `(int)` cast truncates, which is
+//! exact on the integral `round` output (range-bounded to `[0, 4095]`).
+//! The branch is spelled `<=`/`>=` exactly as the macro, so `-0.0` takes
+//! the zero branch in both languages. A NaN lane falls to the scale
+//! branch in both; there the languages diverge: Rust `as i32` saturates
+//! NaN to 0 (defined), while the C `(int)` cast on x86 yields INT_MIN
+//! via cvttss2si. The kernel keeps the defined saturating behaviour and
+//! the divergence is pinned by a test; real export buffers hold
+//! pipeline floats, so both spellings only ever see it on degenerate
+//! input. The alpha lane (`src[4*i + 3]`) is never read, as in C.
 
 /// Scale one signed OpenJPEG component lane into the R/G/B lanes.
 ///
@@ -432,6 +450,136 @@ pub unsafe extern "C" fn darkroom_j2k_sycc444_to_rgb(
     let g = std::slice::from_raw_parts_mut(g, npixels);
     let b = std::slice::from_raw_parts_mut(b, npixels);
     j2k_sycc444_to_rgb(y, cb, cr, r, g, b, npixels, offset, upb);
+}
+
+// ── 12-bit export pack (m4-217) ──────────────────────────────────────────────
+
+/// 12-bit full-scale value of the `DOWNSAMPLE_FLOAT_TO_12BIT` macro
+/// (`src/imageio/format/j2k.c`): lanes at or above 1.0 quantize to this.
+pub const J2K_12BIT_MAX: i32 = 4095;
+
+/// Quantize one float lane exactly as `DOWNSAMPLE_FLOAT_TO_12BIT` spells
+/// it: at or below zero yields 0, at or above one yields 4095, otherwise
+/// `(int)roundf(4095.0 * v)` in f32. Shared by the kernel and the
+/// divergent reference below so the two cannot drift on the spelling
+/// while still differing structurally. NaN falls to the scale branch
+/// and saturates to 0 via `as i32` (see the module docs for the x86 C
+/// divergence this deliberately accepts).
+fn downsample_12bit_lane(v: f32) -> i32 {
+    if v <= 0.0 {
+        0
+    } else if v >= 1.0 {
+        J2K_12BIT_MAX
+    } else {
+        (4095.0f32 * v).round() as i32
+    }
+}
+
+/// Quantize float RGB lanes into three 12-bit OpenJPEG component planes.
+///
+/// Port of the former element-wise loop in the `case 12` branch of
+/// `write_image()` (`src/imageio/format/j2k.c`): per pixel `i`,
+/// `c[k][i] = DOWNSAMPLE_FLOAT_TO_12BIT(src[4*i + k])` for `k` in
+/// `0..2`; the alpha lane (`src[4*i + 3]`) is never read. `npixels` is
+/// the C loop bound (`w * h`); short buffers iterate clamped (no panic,
+/// no out-of-bounds access). A zero `npixels` is a no-op.
+///
+/// The Rust kernel is single-threaded sequential; the C loop was
+/// `DT_OMP_FOR_SIMD(collapse(2))` over pixels and components, but each
+/// output lane reads only its own source lane, so thread scheduling
+/// cannot change the result.
+pub fn j2k_float_to_12bit(
+    src: &[f32],
+    c0: &mut [i32],
+    c1: &mut [i32],
+    c2: &mut [i32],
+    npixels: usize,
+) {
+    let n = npixels
+        .min(src.len() / 4)
+        .min(c0.len())
+        .min(c1.len())
+        .min(c2.len());
+    for i in 0..n {
+        let s = 4 * i;
+        c0[i] = downsample_12bit_lane(src[s]);
+        c1[i] = downsample_12bit_lane(src[s + 1]);
+        c2[i] = downsample_12bit_lane(src[s + 2]);
+    }
+}
+
+/// Structurally divergent reference for `j2k_float_to_12bit`: walks the
+/// output in per-pixel triples zipped with 4-lane source chunks (the
+/// kernel indexes the source quad and the three planes with `4*i`/`i`),
+/// so the sweep test cross-checks indexing as well as values. The lane
+/// arithmetic is the shared `downsample_12bit_lane` helper by
+/// construction (see the module docs: a clamp-then-round or
+/// divide-then-scale respelling must not be used). Same
+/// well-formed-buffers precondition, enforced here by the same
+/// clamping.
+#[cfg(test)]
+fn ref_j2k_float_to_12bit(
+    src: &[f32],
+    c0: &mut [i32],
+    c1: &mut [i32],
+    c2: &mut [i32],
+    npixels: usize,
+) {
+    let n = npixels
+        .min(src.len() / 4)
+        .min(c0.len())
+        .min(c1.len())
+        .min(c2.len());
+    let outs = c0
+        .iter_mut()
+        .zip(c1.iter_mut())
+        .zip(c2.iter_mut())
+        .zip(src.chunks_exact(4))
+        .take(n);
+    for (((o0, o1), o2), quad) in outs {
+        *o0 = downsample_12bit_lane(quad[0]);
+        *o1 = downsample_12bit_lane(quad[1]);
+        *o2 = downsample_12bit_lane(quad[2]);
+    }
+}
+
+/// # Safety
+/// `in_data` must hold at least `4 * npixels` floats (the C caller
+/// passes the export pipeline buffer, tightly packed RGBA whose alpha
+/// lane is never read) and `comp0`/`comp1`/`comp2` at least `npixels`
+/// `int` lanes each (the C caller passes `image->comps[0..2].data`,
+/// the 12-bit `prec` planes). No buffer may overlap another.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_j2k_float_to_12bit(
+    in_data: *const f32,
+    comp0: *mut i32,
+    comp1: *mut i32,
+    comp2: *mut i32,
+    npixels: usize,
+) {
+    if in_data.is_null()
+        || comp0.is_null()
+        || comp1.is_null()
+        || comp2.is_null()
+        || npixels == 0
+    {
+        return;
+    }
+    // validate the products BEFORE building the slices below (a misuse
+    // caller could otherwise wrap a length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let src_len = match npixels.checked_mul(4) {
+        Some(n) => n,
+        None => return,
+    };
+    if npixels > isize::MAX as usize {
+        return;
+    }
+    let src = std::slice::from_raw_parts(in_data, src_len);
+    let c0 = std::slice::from_raw_parts_mut(comp0, npixels);
+    let c1 = std::slice::from_raw_parts_mut(comp1, npixels);
+    let c2 = std::slice::from_raw_parts_mut(comp2, npixels);
+    j2k_float_to_12bit(src, c0, c1, c2, npixels);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -932,5 +1080,180 @@ mod tests {
             );
         }
         assert_eq!((r, g, b), (vec![9; 4], vec![9; 4], vec![9; 4])); // untouched
+    }
+
+    // ── 12-bit export pack (m4-217) ──────────────────────────────────────
+
+    // Rails of DOWNSAMPLE_FLOAT_TO_12BIT: 0.0 and -0.0 take the zero
+    // branch (the macro spells `<= 0.0f`), 1.0 and above take the 4095
+    // branch, 0.5 pins the scale-then-round spelling (0.5 * 4095 =
+    // 2047.5 -> 2048, round-half-away). The alpha lane is never read:
+    // garbage (including NaN) there must not affect any output lane.
+    #[test]
+    fn float12_rails_pin() {
+        let src = [
+            0.0f32, 0.5, 1.0, f32::NAN, // px0: alpha NaN unread
+            -0.0, 2.0, -1.0, -3.25, // px1: alpha garbage unread
+        ];
+        let (mut c0, mut c1, mut c2) = (vec![-1i32; 2], vec![-1i32; 2], vec![-1i32; 2]);
+        j2k_float_to_12bit(&src, &mut c0, &mut c1, &mut c2, 2);
+        assert_eq!((c0[0], c1[0], c2[0]), (0, 2048, 4095));
+        assert_eq!((c0[1], c1[1], c2[1]), (0, 4095, 0));
+    }
+
+    // Round-half-away (roundf) spelling: 0.5/4095 scales to exactly 0.5
+    // and rounds to 1 (round-half-even would give 0), 1.5/4095 rounds to
+    // 2. A tiny negative takes the `<= 0.0` branch to 0 (scaling first
+    // would give round(-0.5) = -1). NaN falls to the scale branch and
+    // saturates to 0 via `as i32` — the x86 C cast instead yields
+    // INT_MIN there (see the module docs); the pin locks the defined
+    // Rust behaviour.
+    #[test]
+    fn float12_rounding_and_branch_spelling() {
+        let unit = 1.0f32 / 4095.0;
+        let src = [0.5 * unit, 1.5 * unit, -0.5 * unit, 0.0];
+        let (mut c0, mut c1, mut c2) = (vec![-1i32; 1], vec![-1i32; 1], vec![-1i32; 1]);
+        j2k_float_to_12bit(&src, &mut c0, &mut c1, &mut c2, 1);
+        assert_eq!((c0[0], c1[0], c2[0]), (1, 2, 0));
+        let nan = [f32::NAN, 0.0, 0.0, 0.0];
+        let (mut n0, mut n1, mut n2) = (vec![-1i32; 1], vec![-1i32; 1], vec![-1i32; 1]);
+        j2k_float_to_12bit(&nan, &mut n0, &mut n1, &mut n2, 1);
+        assert_eq!((n0[0], n1[0], n2[0]), (0, 0, 0));
+    }
+
+    // Kernel and reference must agree exactly over several shapes with
+    // inputs spanning below 0 and above 1, so both rails and the
+    // rounding are exercised on every lane.
+    #[test]
+    fn float12_matches_reference_over_sweep() {
+        for n in [1usize, 2, 7, 20, 64] {
+            let mut src = vec![0.0f32; 4 * n];
+            for (i, v) in src.iter_mut().enumerate() {
+                // deterministic sweep across [-0.5, 1.5]
+                let k =
+                    ((i as u64).wrapping_mul(2_654_435_761).wrapping_add(0x9E37) % 2001) as f32;
+                *v = k / 1000.0 - 0.5;
+            }
+            let (mut d0, mut d1, mut d2) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+            let (mut r0, mut r1, mut r2) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+            j2k_float_to_12bit(&src, &mut d0, &mut d1, &mut d2, n);
+            ref_j2k_float_to_12bit(&src, &mut r0, &mut r1, &mut r2, n);
+            assert_eq!((&d0, &d1, &d2), (&r0, &r1, &r2), "shape {n}");
+            for k in 0..n {
+                assert!((0..=J2K_12BIT_MAX).contains(&d0[k]), "c0 clamped {k}");
+                assert!((0..=J2K_12BIT_MAX).contains(&d1[k]), "c1 clamped {k}");
+                assert!((0..=J2K_12BIT_MAX).contains(&d2[k]), "c2 clamped {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn float12_degenerate_guards_no_op() {
+        let src = vec![1.0f32; 8];
+        // zero pixels: outputs untouched
+        let (mut c0, mut c1, mut c2) = (vec![9i32; 2], vec![9i32; 2], vec![9i32; 2]);
+        j2k_float_to_12bit(&src, &mut c0, &mut c1, &mut c2, 0);
+        assert_eq!((c0, c1, c2), (vec![9; 2], vec![9; 2], vec![9; 2]));
+        // empty source with live dims: no panic, no writes possible
+        let empty_src: Vec<f32> = vec![];
+        let (mut f0, mut f1, mut f2) = (vec![9i32; 2], vec![9i32; 2], vec![9i32; 2]);
+        j2k_float_to_12bit(&empty_src, &mut f0, &mut f1, &mut f2, 2);
+        assert_eq!((f0, f1, f2), (vec![9; 2], vec![9; 2], vec![9; 2]));
+        // empty output plane with live dims: no panic, nothing written
+        // anywhere (the clamped bound collapses to zero for all planes)
+        let mut empty_plane: Vec<i32> = vec![];
+        let (mut g1, mut g2) = (vec![9i32; 2], vec![9i32; 2]);
+        j2k_float_to_12bit(&[1.0; 8], &mut empty_plane, &mut g1, &mut g2, 2);
+        assert!(empty_plane.is_empty());
+        assert_eq!((g1, g2), (vec![9; 2], vec![9; 2]));
+        // truncated source: written prefix converts fully, the unwritten
+        // tail stays untouched
+        let (mut t0, mut t1, mut t2) = (vec![9i32; 4], vec![9i32; 4], vec![9i32; 4]);
+        j2k_float_to_12bit(&[1.0, 1.0, 1.0, 0.0], &mut t0, &mut t1, &mut t2, 4);
+        assert_eq!(&t0[..1], &[4095]);
+        assert_eq!(&t0[1..], &[9, 9, 9]);
+        // truncated output: no panic, partial planes never partially written
+        let (mut s0, mut s1, mut s2) = (vec![9i32; 1], vec![9i32; 4], vec![9i32; 4]);
+        j2k_float_to_12bit(&[1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0], &mut s0, &mut s1, &mut s2, 2);
+        assert_eq!(s0, vec![4095]);
+        assert_eq!(&s1[..1], &[4095]);
+        assert_eq!(&s1[1..], &[9, 9, 9]);
+    }
+
+    #[test]
+    fn float12_ffi_round_trip() {
+        let n = 37usize;
+        let mut src = vec![0.0f32; 4 * n];
+        for (i, v) in src.iter_mut().enumerate() {
+            let k = ((i as u64).wrapping_mul(2_654_435_761) % 2001) as f32;
+            *v = k / 1000.0 - 0.5;
+        }
+        let (mut f0, mut f1, mut f2) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+        let (mut d0, mut d1, mut d2) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+        unsafe {
+            darkroom_j2k_float_to_12bit(
+                src.as_ptr(),
+                f0.as_mut_ptr(),
+                f1.as_mut_ptr(),
+                f2.as_mut_ptr(),
+                n,
+            );
+        }
+        j2k_float_to_12bit(&src, &mut d0, &mut d1, &mut d2, n);
+        assert_eq!((f0, f1, f2), (d0, d1, d2));
+    }
+
+    #[test]
+    fn float12_ffi_guards() {
+        let src = vec![1.0f32; 16];
+        let (mut c0, mut c1, mut c2) = (vec![9i32; 4], vec![9i32; 4], vec![9i32; 4]);
+        unsafe {
+            // each null plane in turn
+            darkroom_j2k_float_to_12bit(
+                std::ptr::null(),
+                c0.as_mut_ptr(),
+                c1.as_mut_ptr(),
+                c2.as_mut_ptr(),
+                1,
+            );
+            darkroom_j2k_float_to_12bit(
+                src.as_ptr(),
+                std::ptr::null_mut(),
+                c1.as_mut_ptr(),
+                c2.as_mut_ptr(),
+                1,
+            );
+            darkroom_j2k_float_to_12bit(
+                src.as_ptr(),
+                c0.as_mut_ptr(),
+                std::ptr::null_mut(),
+                c2.as_mut_ptr(),
+                1,
+            );
+            darkroom_j2k_float_to_12bit(
+                src.as_ptr(),
+                c0.as_mut_ptr(),
+                c1.as_mut_ptr(),
+                std::ptr::null_mut(),
+                1,
+            );
+            // zero pixels
+            darkroom_j2k_float_to_12bit(
+                src.as_ptr(),
+                c0.as_mut_ptr(),
+                c1.as_mut_ptr(),
+                c2.as_mut_ptr(),
+                0,
+            );
+            // unsliceable dims
+            darkroom_j2k_float_to_12bit(
+                src.as_ptr(),
+                c0.as_mut_ptr(),
+                c1.as_mut_ptr(),
+                c2.as_mut_ptr(),
+                usize::MAX,
+            );
+        }
+        assert_eq!((c0, c1, c2), (vec![9; 4], vec![9; 4], vec![9; 4])); // untouched
     }
 }

@@ -3993,6 +3993,26 @@ void darkroom_j2k_sycc444_to_rgb(const int *y, const int *cb, const int *cr,
                                  int offset, int upb);
 
 /*
+ * JPEG2000 12-bit export pack (format/j2k.c, write_image case 12, m4-217).
+ *
+ * darkroom_j2k_float_to_12bit replaces the former DT_OMP_FOR_SIMD pixel
+ * loop: per pixel index, c[k][index] = DOWNSAMPLE_FLOAT_TO_12BIT(
+ * in[4*index + k]) for k in 0..2, i.e. at or below zero yields 0, at or
+ * above one yields 4095, else (int)roundf(4095.0 * lane) in f32. in is
+ * the tightly packed RGBA float export buffer (its alpha lane is never
+ * read) and c0/c1/c2 are the 12-bit prec OpenJPEG component planes. The
+ * opj_image_create/NULL-image early return above and the encode/profile
+ * handling below stay in C; the commented-out 8/16-bit cases are
+ * untouched. in_data holds 4*npixels floats; each comp plane holds
+ * npixels int lanes. Null pointers, a zero npixels, and unsliceable dims
+ * are guarded no-ops; the buffers must not overlap. (NaN lanes: Rust `as`
+ * saturates to 0 where the C cast yields INT_MIN on x86 — see the module
+ * docs; export buffers hold pipeline floats either way.)
+ */
+void darkroom_j2k_float_to_12bit(const float *in_data, int *comp0, int *comp1,
+                                 int *comp2, size_t npixels);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
