@@ -5005,14 +5005,42 @@ declared the export in `src/rust_ffi/darkroom_core.h` after the u16 block and
 repointed its stale "case 8 stays in C" line. `imageio_avif.c` now has zero
 `DT_OMP_FOR` sites. Left all unrelated files untouched.
 
-**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (two P2
-doc nits, both fixed in-session: include comment covers both exports, top module
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0/P1
+(two P2 nits, both fixed in-session: include comment covers both exports, top module
 paragraph scoped to the u16 branch).
 
 **Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-13 19:30 UTC — m4-212: port J2K sycc444 loop to Rust FFI
+
+**Commit** `60c0c3e308` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `sycc444_to_rgb` (`src/imageio/imageio_j2k.c:399`),
+replacing it with `darkroom_j2k_sycc444_to_rgb`. Extended `c41-core::j2k`
+(safe kernel, divergent two-phase reference, validated FFI, 6 tests — f64
+products with truncation, glib CLAMP order, wrapping int arithmetic, alpha
+planes untouched); declared the export in `src/rust_ffi/darkroom_core.h`. The
+422/420 variants, `sycc_to_rgb`, calloc/plane hand-off, and all unrelated
+files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, one P1.
+The `sycc444_precision_spelling_is_f64` pins were vacuous (both spellings
+truncate identically at r=4435/b=3296 — verified by the reviewer's f32
+emulation, and confirmed in-session with an independent python3/f32 model).
+Replaced with a genuinely discriminating pin (y=60000, crs=-41500 → f64
+r=1817 vs f32 r=1818; the truncation lands on the product before the yv add,
+which is why the first check attempt mis-modeled it — corrected before
+encoding). Also noted the serial-vs-OMP change in the C comment.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests (incl. the new discriminating pin), and the `c41-rs` release link.
+Header addition scanned for embedded `*/` (only the block terminator).
+Remaining warnings are pre-existing and outside this change.
 
 ---
 
