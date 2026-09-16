@@ -24,6 +24,7 @@
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_xcf_mask_to_u8/u16
 
 #include <math.h>
 #include <stdio.h>
@@ -193,15 +194,20 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
 
         void *channel_data = NULL;
         gboolean free_channel_data = TRUE;
+        const size_t npixels = (size_t)d->global.width * (size_t)d->global.height;
         if(d->bpp == 8)
         {
           channel_data = malloc(sizeof(uint8_t) * d->global.width * d->global.height);
           if(channel_data)
           {
             uint8_t *ch = (uint8_t *)channel_data;
-            DT_OMP_FOR_SIMD()
-              for(size_t i = 0; i < (size_t)d->global.width * d->global.height; ++i)
-                ch[i] = (uint8_t)roundf(CLIP(raster_mask[i]) * 255.0f);
+            // Pixel loop ported to Rust FFI (darkroom_xcf_mask_to_u8 in
+            // crates/c41-core/src/xcf.rs): the same per-lane
+            // (uint8_t)roundf(CLIP(mask) * 255) over the tightly packed
+            // single-channel raster mask, now serial instead of OpenMP
+            // (pixels are independent). The 16-bit branch below is the u16
+            // sibling (darkroom_xcf_mask_to_u16).
+            darkroom_xcf_mask_to_u8(raster_mask, ch, npixels);
           }
         }
         else if(d->bpp == 16)
@@ -210,9 +216,12 @@ int write_image(dt_imageio_module_data_t *data, const char *filename, const void
           if(channel_data)
           {
             uint16_t *ch = (uint16_t *)channel_data;
-            DT_OMP_FOR_SIMD()
-              for(size_t i = 0; i < (size_t)d->global.width * d->global.height; ++i)
-                ch[i] = (uint16_t)roundf(CLIP(raster_mask[i]) * 65535.0f);
+            // Pixel loop ported to Rust FFI (darkroom_xcf_mask_to_u16 in
+            // crates/c41-core/src/xcf.rs): the same per-lane
+            // (uint16_t)roundf(CLIP(mask) * 65535) over the tightly packed
+            // single-channel raster mask, now serial instead of OpenMP
+            // (pixels are independent).
+            darkroom_xcf_mask_to_u16(raster_mask, ch, npixels);
           }
         }
         else if(d->bpp == 32)

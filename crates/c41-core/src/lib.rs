@@ -48,6 +48,7 @@ pub mod roi;
 pub mod splines;
 pub mod thumbnail;
 pub mod webp;
+pub mod xcf;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;

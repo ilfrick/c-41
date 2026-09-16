@@ -4013,6 +4013,33 @@ void darkroom_j2k_float_to_12bit(const float *in_data, int *comp0, int *comp1,
                                  int *comp2, size_t npixels);
 
 /*
+ * XCF raster-mask channel packs (format/xcf.c, write_image, m4-218).
+ *
+ * darkroom_xcf_mask_to_u8 replaces the former DT_OMP_FOR_SIMD pixel loop
+ * of the d->bpp == 8 branch: per pixel index,
+ * out[index] = (uint8_t)roundf(CLIP(mask[index]) * 255.0f), where CLIP is
+ * darktable's src/common/math.h macro (((x) >= 0) ? ((x) <= 1 ? (x) : 1)
+ * : 0), so the clamp runs before the scale in f32 and a NaN lane takes
+ * the else branch to 0 in both languages (no divergence, unlike the
+ * scale-first AVIF/HEIF export kernels).
+ * darkroom_xcf_mask_to_u16 replaces the former DT_OMP_FOR_SIMD pixel loop
+ * of the d->bpp == 16 branch: per pixel index,
+ * out[index] = (uint16_t)roundf(CLIP(mask[index]) * 65535.0f) with the
+ * same clamp-first spelling. mask holds npixels single-channel floats
+ * (the raster mask from dt_dev_get_raster_mask, one lane per pixel);
+ * out holds npixels u8/u16 lanes (the malloc'd channel plane). The
+ * malloc/NULL guards, the bpp branch structure, the d->bpp == 32 float
+ * by-reference passthrough, and the xcf_add_data hand-off stay in C;
+ * format/xcf.c now has zero DT_OMP_FOR sites. Null pointers, a zero
+ * npixels, and unsliceable dims are guarded no-ops; the buffers must not
+ * overlap.
+ */
+void darkroom_xcf_mask_to_u8(const float *mask, unsigned char *out,
+                             size_t npixels);
+void darkroom_xcf_mask_to_u16(const float *mask, unsigned short *out,
+                              size_t npixels);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
