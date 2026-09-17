@@ -3984,13 +3984,32 @@ void darkroom_j2k_rgb_to_float(float *buf, const int *comp0, const int *comp1,
  * Cb/Cr, f64 products 1.402/0.344/0.714/1.772 truncated toward zero,
  * each lane clamped to [0, upb]). y/cb/cr each hold npixels int lanes;
  * r/g/b each hold npixels int lanes. The calloc allocation, the
- * NULL-alloc early return, and the plane hand-off stay in C, as do the
- * subsampled 4:2:2 / 4:2:0 variants. Null pointers, a zero npixels, and
+ * NULL-alloc early return, and the plane hand-off stay in C, as does
+ * the subsampled 4:2:0 variant. Null pointers, a zero npixels, and
  * unsliceable dims are guarded no-ops; the buffers must not overlap.
  */
 void darkroom_j2k_sycc444_to_rgb(const int *y, const int *cb, const int *cr,
-                                 int *r, int *g, int *b, size_t npixels,
-                                 int offset, int upb);
+                                  int *r, int *g, int *b, size_t npixels,
+                                  int offset, int upb);
+
+/*
+ * JPEG2000 sYCC 4:2:2 conversion (imageio_j2k.c, sycc422_to_rgb, m4-222).
+ *
+ * darkroom_j2k_sycc422_to_rgb replaces the former DT_OMP_FOR row loop:
+ * row i holds maxw / 2 pairs sharing one Cb/Cr sample at the
+ * full-stride index i * maxw + j, each pixel taking the sycc_to_rgb
+ * values (offset-subtracted Cb/Cr, f64 products 1.402/0.344/0.714/1.772
+ * truncated toward zero, each lane clamped to [0, upb]). y/r/g/b each
+ * hold maxw * maxh int lanes; cb/cr each hold
+ * (maxh - 1) * maxw + maxw / 2 lanes. The calloc allocation, the
+ * NULL-alloc early return, and the plane hand-off stay in C, as does
+ * the subsampled 4:2:0 variant. Null pointers, degenerate dims
+ * (maxw < 2, maxh == 0), and overflowing dim products are guarded
+ * no-ops; the buffers must not overlap.
+ */
+void darkroom_j2k_sycc422_to_rgb(const int *y, const int *cb, const int *cr,
+                                  int *r, int *g, int *b, size_t maxw,
+                                  size_t maxh, int offset, int upb);
 
 /*
  * JPEG2000 12-bit export pack (format/j2k.c, write_image case 12, m4-217).

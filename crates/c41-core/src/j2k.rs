@@ -48,11 +48,23 @@
 //! and `1.772*cb` to Y, and clamp each lane to `[0, upb]` (glib `CLAMP`
 //! order). The C constants are unsuffixed doubles, so each product runs
 //! in f64 over the exact `(float)lane` promotion — the kernel spells the
-//! same `as f32 as f64` chain rather than computing in f32. The 4:2:2 and
-//! 4:2:0 subsampled variants stay in C (shared-subsample indexing, and
-//! the 4:2:0 tail passes the base `*cr` where the pattern calls for the
-//! local `curr_cr`); the calloc allocation, the NULL-alloc early return,
-//! and the plane hand-off stay in C with the converted call.
+//! same `as f32 as f64` chain rather than computing in f32. The 4:2:0
+//! subsampled variant stays in C (2-D subsample indexing, and its tail
+//! passes the base `*cr` where the pattern calls for the local
+//! `curr_cr`); the calloc allocation, the NULL-alloc early return, and
+//! the plane hand-off stay in C with the converted call.
+//!
+//! sYCC 4:2:2 conversion (m4-222): `j2k_sycc422_to_rgb` replaces the loop
+//! body of `sycc422_to_rgb()` in the same C file. Each row holds `maxw /
+//! 2` pairs sharing one Cb/Cr sample at the full-stride index `i * maxw
+//! + j` (the C `cb[rowstart + j/2]` with `rowstart = i * maxw`, valid
+//! because the C caller only reaches the converter with full-size
+//! planes); each pixel of the pair runs the same `sycc_to_rgb` scalar as
+//! the 4:4:4 path via the shared helper below. A trailing odd column
+//! converts nothing (the C loop would step one past it, which is out of
+//! bounds; real 4:2:2 streams have even widths). Rows are independent,
+//! so the serial kernel matches the former OpenMP row loop exactly on
+//! well-formed buffers.
 //!
 //! 12-bit export pack (m4-217): `j2k_float_to_12bit` replaces the loop
 //! body of the `case 12` branch of `write_image()` in
@@ -350,15 +362,13 @@ pub fn j2k_sycc444_to_rgb(
     }
 }
 
-/// Structurally divergent reference for `j2k_sycc444_to_rgb`: folds the
-/// six planes through zipped iterators into a per-pixel scalar helper
-/// (the kernel indexes all six sides with `k`), so the sweep test
-/// cross-checks indexing as well as values. The arithmetic is the same
-/// f64-product-then-truncate-then-clamp spelling by construction (see
-/// the module docs: computing the products in f32 must not be used).
-/// Same well-formed-buffers precondition, enforced here by the same
-/// clamping.
-#[cfg(test)]
+/// Scalar sYCC pixel conversion shared by the 4:4:4 reference and the
+/// 4:2:2 kernel and its reference below, so the spellings cannot drift:
+/// subtract `offset` from the Cb/Cr lanes, add the truncated f64
+/// products `1.402*cr`, `-(0.344*cb + 0.714*cr)` and `1.772*cb` to Y
+/// (the C constants are unsuffixed doubles over the exact `(float)lane`
+/// promotion), and clamp each lane to `[0, upb]` in glib `CLAMP` order.
+/// A clamp-then-round or f32-product respelling must not be used.
 fn sycc_pixel(yv: i32, cbv: i32, crv: i32, offset: i32, upb: i32) -> (i32, i32, i32) {
     let cbs = cbv.wrapping_sub(offset);
     let crs = crv.wrapping_sub(offset);
@@ -379,6 +389,11 @@ fn sycc_pixel(yv: i32, cbv: i32, crv: i32, offset: i32, upb: i32) -> (i32, i32, 
     (clamp(rv), clamp(gv), clamp(bv))
 }
 
+/// Structurally divergent reference for `j2k_sycc444_to_rgb`: folds the
+/// six planes through zipped iterators into the shared per-pixel scalar
+/// (the kernel indexes all six sides with `k`), so the sweep test
+/// cross-checks indexing as well as values. Same well-formed-buffers
+/// precondition, enforced here by the same clamping.
 #[cfg(test)]
 fn ref_j2k_sycc444_to_rgb(
     y: &[i32],
@@ -450,6 +465,188 @@ pub unsafe extern "C" fn darkroom_j2k_sycc444_to_rgb(
     let g = std::slice::from_raw_parts_mut(g, npixels);
     let b = std::slice::from_raw_parts_mut(b, npixels);
     j2k_sycc444_to_rgb(y, cb, cr, r, g, b, npixels, offset, upb);
+}
+
+// ── sYCC 4:2:2 conversion (m4-222) ─────────────────────────────────────────────
+
+/// Convert sYCC 4:2:2 planes to RGB planes, one `int` lane per pixel.
+///
+/// Port of the former row loop in `sycc422_to_rgb()`
+/// (`src/imageio/imageio_j2k.c`): row `i` holds `maxw / 2` pairs, pair
+/// `j` sharing the Cb/Cr sample at the full-stride index `i * maxw + j`
+/// (the C `cb[rowstart + j/2]` with `rowstart = i * maxw`), and each
+/// pixel of the pair runs the shared `sycc_pixel` scalar on its own Y
+/// lane. `maxw`/`maxh` are the C `img->comps[0].w/h`; short buffers
+/// iterate clamped (no panic, no out-of-bounds access). A `maxw` below 2
+/// (no complete pair), a zero `maxh`, or an odd trailing column (left
+/// untouched — the C loop would step one past it) are no-ops for the
+/// affected lanes.
+///
+/// The Rust kernel is single-threaded sequential; the C loop was
+/// `DT_OMP_FOR` over the rows, but each output pair reads only its own
+/// Y lanes plus its shared chroma sample, so thread scheduling cannot
+/// change the result.
+#[allow(clippy::too_many_arguments)]
+pub fn j2k_sycc422_to_rgb(
+    y: &[i32],
+    cb: &[i32],
+    cr: &[i32],
+    r: &mut [i32],
+    g: &mut [i32],
+    b: &mut [i32],
+    maxw: usize,
+    maxh: usize,
+    offset: i32,
+    upb: i32,
+) {
+    let pairs = maxw / 2;
+    if pairs == 0 || maxh == 0 {
+        return;
+    }
+    // Rows fitting the full-stride planes; row i writes through
+    // i * maxw + maxw - 1 (even widths) or + maxw - 2 (odd widths,
+    // whose tail column stays untouched).
+    let mut rows = maxh;
+    for len in [y.len(), r.len(), g.len(), b.len()] {
+        rows = rows.min(len / maxw);
+    }
+    // Chroma row i is read through i * maxw + pairs - 1.
+    for len in [cb.len(), cr.len()] {
+        let chroma_rows = if len < pairs { 0 } else { (len - pairs) / maxw + 1 };
+        rows = rows.min(chroma_rows);
+    }
+    for i in 0..rows {
+        let rowstart = i * maxw;
+        for j in 0..pairs {
+            let (r0, g0, b0) = sycc_pixel(y[rowstart + 2 * j], cb[rowstart + j], cr[rowstart + j], offset, upb);
+            r[rowstart + 2 * j] = r0;
+            g[rowstart + 2 * j] = g0;
+            b[rowstart + 2 * j] = b0;
+            let (r1, g1, b1) =
+                sycc_pixel(y[rowstart + 2 * j + 1], cb[rowstart + j], cr[rowstart + j], offset, upb);
+            r[rowstart + 2 * j + 1] = r1;
+            g[rowstart + 2 * j + 1] = g1;
+            b[rowstart + 2 * j + 1] = b1;
+        }
+    }
+}
+
+/// Structurally divergent reference for `j2k_sycc422_to_rgb`: walks each
+/// row as full-stride chunks (luma/output) zipped with the chroma rows,
+/// then each row as zipped 2-lane Y chunks against the chroma lane
+/// iterator (the kernel indexes all six sides with `rowstart +` sums),
+/// so the sweep test cross-checks indexing as well as values. The pixel
+/// arithmetic is the shared `sycc_pixel` helper by construction.
+/// Same well-formed-buffers precondition, enforced here by the same
+/// clamping.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn ref_j2k_sycc422_to_rgb(
+    y: &[i32],
+    cb: &[i32],
+    cr: &[i32],
+    r: &mut [i32],
+    g: &mut [i32],
+    b: &mut [i32],
+    maxw: usize,
+    maxh: usize,
+    offset: i32,
+    upb: i32,
+) {
+    let pairs = maxw / 2;
+    if pairs == 0 || maxh == 0 {
+        return;
+    }
+    let mut rows = maxh;
+    for len in [y.len(), r.len(), g.len(), b.len()] {
+        rows = rows.min(len / maxw);
+    }
+    for len in [cb.len(), cr.len()] {
+        let chroma_rows = if len < pairs { 0 } else { (len - pairs) / maxw + 1 };
+        rows = rows.min(chroma_rows);
+    }
+    let yrows = y.chunks_exact(maxw).take(rows);
+    let cbrows = cb.chunks_exact(maxw).take(rows);
+    let crrows = cr.chunks_exact(maxw).take(rows);
+    let rrows = r.chunks_exact_mut(maxw).take(rows);
+    let grows = g.chunks_exact_mut(maxw).take(rows);
+    let brows = b.chunks_exact_mut(maxw).take(rows);
+    let ins = yrows.zip(cbrows).zip(crrows);
+    let outs = rrows.zip(grows).zip(brows);
+    for (((yrow, cbrow), crrow), ((rrow, grow), brow)) in ins.zip(outs) {
+        let yquads = yrow.chunks_exact(2).take(pairs);
+        let rquads = rrow.chunks_exact_mut(2).take(pairs);
+        let gquads = grow.chunks_exact_mut(2).take(pairs);
+        let bquads = brow.chunks_exact_mut(2).take(pairs);
+        let chroma = cbrow.iter().zip(crrow.iter()).take(pairs);
+        let yout = yquads.zip(rquads).zip(gquads).zip(bquads).zip(chroma);
+        for ((((yq, rq), gq), bq), (&cbs, &crs)) in yout {
+            let (r0, g0, b0) = sycc_pixel(yq[0], cbs, crs, offset, upb);
+            let (r1, g1, b1) = sycc_pixel(yq[1], cbs, crs, offset, upb);
+            rq[0] = r0;
+            gq[0] = g0;
+            bq[0] = b0;
+            rq[1] = r1;
+            gq[1] = g1;
+            bq[1] = b1;
+        }
+    }
+}
+
+/// # Safety
+/// `y`/`r`/`g`/`b` must each hold at least `maxw * maxh` `int` lanes and
+/// `cb`/`cr` at least `(maxh - 1) * maxw + maxw / 2` lanes (the highest
+/// full-stride chroma index the C loop touches; the C caller passes the
+/// OpenJPEG component planes, which the C loop already indexes at full
+/// stride, and the calloc allocations that replace the planes). No
+/// buffer may overlap another. `maxw`/`maxh` are the C
+/// `img->comps[0].w/h`; `offset`/`upb` are the C `1 << (prec - 1)` /
+/// `(1 << prec) - 1`.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_j2k_sycc422_to_rgb(
+    y: *const i32,
+    cb: *const i32,
+    cr: *const i32,
+    r: *mut i32,
+    g: *mut i32,
+    b: *mut i32,
+    maxw: usize,
+    maxh: usize,
+    offset: i32,
+    upb: i32,
+) {
+    if y.is_null()
+        || cb.is_null()
+        || cr.is_null()
+        || r.is_null()
+        || g.is_null()
+        || b.is_null()
+        || maxw < 2
+        || maxh == 0
+    {
+        return;
+    }
+    // validate the product BEFORE building the slices below (a misuse
+    // caller could otherwise wrap a length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let npixels = match maxw.checked_mul(maxh) {
+        Some(n) => n,
+        None => return,
+    };
+    if npixels > isize::MAX as usize {
+        return;
+    }
+    // Highest chroma lane the row loop touches is
+    // (maxh - 1) * maxw + maxw / 2 - 1; maxh >= 1 here, so the
+    // subtraction cannot underflow.
+    let chroma_len = npixels - maxw + maxw / 2;
+    let y = std::slice::from_raw_parts(y, npixels);
+    let cb = std::slice::from_raw_parts(cb, chroma_len);
+    let cr = std::slice::from_raw_parts(cr, chroma_len);
+    let r = std::slice::from_raw_parts_mut(r, npixels);
+    let g = std::slice::from_raw_parts_mut(g, npixels);
+    let b = std::slice::from_raw_parts_mut(b, npixels);
+    j2k_sycc422_to_rgb(y, cb, cr, r, g, b, maxw, maxh, offset, upb);
 }
 
 // ── 12-bit export pack (m4-217) ──────────────────────────────────────────────
@@ -1080,6 +1277,264 @@ mod tests {
             );
         }
         assert_eq!((r, g, b), (vec![9; 4], vec![9; 4], vec![9; 4])); // untouched
+    }
+
+    // ── sYCC 4:2:2 (m4-222) ──────────────────────────────────────────────
+
+    // Achromatic pairs pass through, rails clamp, both pixels of a pair
+    // share one chroma sample: 8-bit (offset 128, upb 255) with
+    // Cb == Cr == 128 reproduces each pixel's own Y; a hot Cb rails
+    // both pixels' blue while their reds stay on Y.
+    #[test]
+    fn sycc422_neutral_and_rails_pin() {
+        let (offset, upb) = (128, 255);
+        let (maxw, maxh) = (4usize, 1usize);
+        let run = |y: &[i32], cb: &[i32], cr: &[i32]| {
+            let n = y.len();
+            let (mut r, mut g, mut b) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+            j2k_sycc422_to_rgb(y, cb, cr, &mut r, &mut g, &mut b, maxw, maxh, offset, upb);
+            (r, g, b)
+        };
+        // neutral chroma: each pixel reproduces its own Y, so the pair
+        // converts independently despite sharing the sample
+        let (r, g, b) = run(&[0, 100, 200, 255], &[128, 128], &[128, 128]);
+        assert_eq!((r, g, b), (vec![0, 100, 200, 255], vec![0, 100, 200, 255], vec![0, 100, 200, 255]));
+        // hot Cb on the first pair only: b = 50 + (int)(1.772 * 127) =
+        // 50 + 225 rails at 255 for both pair pixels; g takes the
+        // partial hit: 50 - (int)(0.344 * 127) = 50 - 43 = 7
+        let (r, g, b) = run(&[50, 60, 70, 80], &[255, 128], &[128, 128]);
+        assert_eq!(r, vec![50, 60, 70, 80]);
+        assert_eq!(g, vec![7, 17, 70, 80]);
+        assert_eq!(b, vec![255, 255, 70, 80]);
+        // cold Cr rails both reds of the pair at 0:
+        // r = 10 + (int)(1.402 * -128) = 10 - 179;
+        // g = 10 - (int)(0.714 * -128) = 10 + 91
+        let (r, g, b) = run(&[10, 20, 30, 40], &[128, 128], &[0, 128]);
+        assert_eq!(r, vec![0, 0, 30, 40]);
+        assert_eq!(g, vec![101, 111, 30, 40]);
+        assert_eq!(b, vec![10, 20, 30, 40]);
+    }
+
+    // Pin the full-stride chroma indexing against a packed-stride
+    // misreading: with maxw = 4 over two rows, row 1 must sample
+    // cb[4 + j] (the C `cb[rowstart + j/2]`), not cb[2 + j]. A neutral
+    // sample at the packed position passes Y through under the wrong
+    // stride, while the hot sample at the true stride rails blue.
+    #[test]
+    fn sycc422_chroma_uses_full_stride_rows() {
+        let (offset, upb) = (128, 255);
+        let (maxw, maxh) = (4usize, 2usize);
+        let y = vec![100i32; 8];
+        // packed-stride reading would see row 1 chroma at [2..4]
+        // (neutral here); full-stride reading sees [4..6] (hot Cb on
+        // the first pair, neutral on the second).
+        let cb = vec![128, 128, 128, 128, 255, 128, 0, 0];
+        let cr = vec![128i32; 8];
+        let (mut r, mut g, mut b) = (vec![0i32; 8], vec![0i32; 8], vec![0i32; 8]);
+        j2k_sycc422_to_rgb(&y, &cb, &cr, &mut r, &mut g, &mut b, maxw, maxh, offset, upb);
+        // row 0 neutral: Y straight through
+        assert_eq!(&r[..4], &[100, 100, 100, 100]);
+        assert_eq!(&b[..4], &[100, 100, 100, 100]);
+        // row 1 hot Cb: b = 100 + 225 rails, g = 100 - 43 = 57
+        assert_eq!(&r[4..], &[100, 100, 100, 100]);
+        assert_eq!(&g[4..], &[57, 57, 100, 100]);
+        assert_eq!(&b[4..], &[255, 255, 100, 100]);
+    }
+
+    // Kernel and reference must agree exactly over several shapes
+    // (including odd widths, whose tail column both leave untouched),
+    // precisions (8/12/16-bit offsets and rails), and full-span lanes
+    // including out-of-range values that must clamp rather than wrap.
+    #[test]
+    fn sycc422_matches_reference_over_sweep() {
+        let shapes = [(1usize, 1usize), (2, 1), (4, 3), (7, 2), (8, 5), (16, 9)];
+        let params = [(128i32, 255i32), (2048, 4095), (32768, 65535)];
+        for (s, (maxw, maxh)) in shapes.iter().enumerate() {
+            let (maxw, maxh) = (*maxw, *maxh);
+            let n = maxw * maxh;
+            let mut planes = [vec![0i32; n], vec![0i32; n], vec![0i32; n]];
+            for (c, plane) in planes.iter_mut().enumerate() {
+                for (i, v) in plane.iter_mut().enumerate() {
+                    // lanes span roughly [-70000, 70000]: in-range,
+                    // rails, and beyond-the-rails values
+                    *v = ((i as u64)
+                        .wrapping_mul(2_654_435_761)
+                        .wrapping_add((s * 3 + c) as u64 * 0x9E37)
+                        % 140_001) as i32
+                        - 70_000;
+                }
+            }
+            for &(offset, upb) in &params {
+                let (mut dr, mut dg, mut db) = (vec![7i32; n], vec![7i32; n], vec![7i32; n]);
+                let (mut rr, mut rg, mut rb) = (vec![7i32; n], vec![7i32; n], vec![7i32; n]);
+                j2k_sycc422_to_rgb(
+                    &planes[0], &planes[1], &planes[2],
+                    &mut dr, &mut dg, &mut db, maxw, maxh, offset, upb,
+                );
+                ref_j2k_sycc422_to_rgb(
+                    &planes[0], &planes[1], &planes[2],
+                    &mut rr, &mut rg, &mut rb, maxw, maxh, offset, upb,
+                );
+                for k in 0..n {
+                    assert_eq!(dr[k], rr[k], "shape {maxw}x{maxh} r lane {k}");
+                    assert_eq!(dg[k], rg[k], "shape {maxw}x{maxh} g lane {k}");
+                    assert_eq!(db[k], rb[k], "shape {maxw}x{maxh} b lane {k}");
+                    // every WRITTEN lane is clamped; an odd-width tail
+                    // column is never written and keeps its sentinel
+                    let tail = maxw % 2 == 1 && k % maxw == maxw - 1;
+                    if tail {
+                        assert_eq!(dr[k], 7, "odd tail r lane {k}");
+                        assert_eq!(dg[k], 7, "odd tail g lane {k}");
+                        assert_eq!(db[k], 7, "odd tail b lane {k}");
+                    } else {
+                        assert!((0..=upb).contains(&dr[k]), "r clamped {k}");
+                        assert!((0..=upb).contains(&dg[k]), "g clamped {k}");
+                        assert!((0..=upb).contains(&db[k]), "b clamped {k}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sycc422_degenerate_guards_no_op() {
+        let (offset, upb) = (128, 255);
+        // zero dims: outputs untouched (maxw < 2 has no complete pair,
+        // maxh == 0 has no rows)
+        let (mut r, mut g, mut b) = (vec![9i32; 4], vec![9i32; 4], vec![9i32; 4]);
+        j2k_sycc422_to_rgb(&[1; 4], &[1; 4], &[1; 4], &mut r, &mut g, &mut b, 0, 1, offset, upb);
+        j2k_sycc422_to_rgb(&[1; 4], &[1; 4], &[1; 4], &mut r, &mut g, &mut b, 1, 1, offset, upb);
+        j2k_sycc422_to_rgb(&[1; 4], &[1; 4], &[1; 4], &mut r, &mut g, &mut b, 4, 0, offset, upb);
+        assert_eq!((r, g, b), (vec![9; 4], vec![9; 4], vec![9; 4]));
+        // empty planes with live dims: no panic, no writes possible
+        let empty: Vec<i32> = vec![];
+        let (mut r, mut g, mut b) = (vec![9i32; 2], vec![9i32; 2], vec![9i32; 2]);
+        j2k_sycc422_to_rgb(&empty, &empty, &empty, &mut r, &mut g, &mut b, 2, 1, offset, upb);
+        assert_eq!((r, g, b), (vec![9; 2], vec![9; 2], vec![9; 2]));
+        // truncated source: only the fitting rows convert; later rows
+        // stay untouched
+        let (mut r, mut g, mut b) = (vec![9i32; 8], vec![9i32; 8], vec![9i32; 8]);
+        let y = vec![100i32; 8];
+        let c = vec![128i32; 8];
+        j2k_sycc422_to_rgb(&y[..4], &c, &c, &mut r, &mut g, &mut b, 4, 2, offset, upb);
+        assert_eq!(&r[..4], &[100, 100, 100, 100]);
+        assert_eq!(&r[4..], &[9, 9, 9, 9]);
+        // truncated output: the fitting row converts fully into the
+        // short plane; the missing rows convert nowhere and nothing
+        // panics
+        let (mut r, mut g, mut b) = (vec![9i32; 4], vec![9i32; 8], vec![9i32; 8]);
+        j2k_sycc422_to_rgb(&y, &c, &c, &mut r, &mut g, &mut b, 4, 2, offset, upb);
+        assert_eq!(&r[..], &[100, 100, 100, 100]);
+        assert_eq!(&g[..4], &[100, 100, 100, 100]);
+        assert_eq!(&g[4..], &[9, 9, 9, 9]);
+        // truncated chroma: rows whose sample is missing do not run
+        let (mut r, mut g, mut b) = (vec![9i32; 8], vec![9i32; 8], vec![9i32; 8]);
+        let short_c = vec![128i32; 2];
+        j2k_sycc422_to_rgb(&y, &short_c, &short_c, &mut r, &mut g, &mut b, 4, 2, offset, upb);
+        assert_eq!(&r[..4], &[100, 100, 100, 100]);
+        assert_eq!(&r[4..], &[9, 9, 9, 9]);
+    }
+
+    #[test]
+    fn sycc422_ffi_round_trip() {
+        let (maxw, maxh) = (6usize, 7usize);
+        let n = maxw * maxh;
+        let (offset, upb) = (2048, 4095);
+        let mut planes = [vec![0i32; n], vec![0i32; n], vec![0i32; n]];
+        for (c, plane) in planes.iter_mut().enumerate() {
+            for (i, v) in plane.iter_mut().enumerate() {
+                *v = ((i as u64).wrapping_mul(2_654_435_761).wrapping_add(c as u64 * 0x9E37)
+                    % 6000) as i32
+                    - 1000;
+            }
+        }
+        // chroma buffers sized exactly as the FFI builds them
+        let chroma_len = n - maxw + maxw / 2;
+        let (mut fr, mut fg, mut fb) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+        let (mut dr, mut dg, mut db) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+        unsafe {
+            darkroom_j2k_sycc422_to_rgb(
+                planes[0].as_ptr(),
+                planes[1].as_ptr(),
+                planes[2].as_ptr(),
+                fr.as_mut_ptr(),
+                fg.as_mut_ptr(),
+                fb.as_mut_ptr(),
+                maxw,
+                maxh,
+                offset,
+                upb,
+            );
+        }
+        j2k_sycc422_to_rgb(
+            &planes[0],
+            &planes[1][..chroma_len],
+            &planes[2][..chroma_len],
+            &mut dr,
+            &mut dg,
+            &mut db,
+            maxw,
+            maxh,
+            offset,
+            upb,
+        );
+        assert_eq!((fr, fg, fb), (dr, dg, db));
+    }
+
+    #[test]
+    fn sycc422_ffi_guards() {
+        let src = vec![100i32; 16];
+        let (mut r, mut g, mut b) = (vec![9i32; 16], vec![9i32; 16], vec![9i32; 16]);
+        unsafe {
+            // each null plane in turn
+            darkroom_j2k_sycc422_to_rgb(
+                std::ptr::null(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 4, 4, 128, 255,
+            );
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), std::ptr::null(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 4, 4, 128, 255,
+            );
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), std::ptr::null(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 4, 4, 128, 255,
+            );
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                std::ptr::null_mut(), g.as_mut_ptr(), b.as_mut_ptr(), 4, 4, 128, 255,
+            );
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), std::ptr::null_mut(), b.as_mut_ptr(), 4, 4, 128, 255,
+            );
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), std::ptr::null_mut(), 4, 4, 128, 255,
+            );
+            // degenerate dims: no complete pair, no rows
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 0, 4, 128, 255,
+            );
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 1, 4, 128, 255,
+            );
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 4, 0, 128, 255,
+            );
+            // overflowing dims
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), usize::MAX, 2, 128, 255,
+            );
+            darkroom_j2k_sycc422_to_rgb(
+                src.as_ptr(), src.as_ptr(), src.as_ptr(),
+                r.as_mut_ptr(), g.as_mut_ptr(), b.as_mut_ptr(), 4, usize::MAX, 128, 255,
+            );
+        }
+        assert_eq!((r, g, b), (vec![9; 16], vec![9; 16], vec![9; 16])); // untouched
     }
 
     // ── 12-bit export pack (m4-217) ──────────────────────────────────────

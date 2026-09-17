@@ -19,7 +19,7 @@
 #include "common/darktable.h"
 #include "common/exif.h"
 #include "imageio/imageio_j2k.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_j2k_{grey,rgb}_to_float, darkroom_j2k_sycc444_to_rgb
+#include "rust_ffi/darkroom_core.h" // for darkroom_j2k_{grey,rgb}_to_float, darkroom_j2k_sycc444_to_rgb, darkroom_j2k_sycc422_to_rgb
 
 #include <assert.h>
 #include <math.h>
@@ -401,7 +401,7 @@ static void sycc444_to_rgb(opj_image_t *img)
   // truncation toward zero, clamp to [0, upb]), now serial instead of
   // OpenMP (pixels are independent). The calloc allocation,
   // the NULL-alloc early return, and the plane hand-off below stay in C,
-  // as do the subsampled 4:2:2 / 4:2:0 variants.
+  // as does the subsampled 4:2:0 variant.
   darkroom_j2k_sycc444_to_rgb(y, cb, cr, r, g, b, max, offset, upb);
   free(img->comps[0].data);
   img->comps[0].data = r;
@@ -437,18 +437,14 @@ static void sycc422_to_rgb(opj_image_t *img)
     return;
   }
 
-  DT_OMP_FOR()
-  for(size_t i = 0; i < maxh; ++i)
-  {
-    size_t rowstart = i * maxw;
-    for(size_t j = 0; j < maxw; j += 2)
-    {
-      const int curr_cb = cb[rowstart + j/2];
-      const int curr_cr = cr[rowstart + j/2];
-      sycc_to_rgb(offset, upb, y[rowstart+j], curr_cb, curr_cr, r+rowstart+j, g+rowstart+j, b+rowstart+j);
-      sycc_to_rgb(offset, upb, y[rowstart+j+1], curr_cb, curr_cr, r+rowstart+j+1, g+rowstart+j+1, b+rowstart+j+1);
-    }
-  }
+  // sYCC 4:2:2 conversion loop ported to Rust FFI (m4-222): each row
+  // holds maxw / 2 pairs sharing one Cb/Cr sample at full-stride index
+  // i * maxw + j, running the same sycc_to_rgb arithmetic as the 4:4:4
+  // path (f64 products, truncation toward zero, clamp to [0, upb]),
+  // now serial instead of OpenMP (rows are independent). The calloc
+  // allocation, the NULL-alloc early return, and the plane hand-off
+  // below stay in C, as does the 4:2:0 variant.
+  darkroom_j2k_sycc422_to_rgb(y, cb, cr, r, g, b, maxw, maxh, offset, upb);
   free(img->comps[0].data);
   img->comps[0].data = r;
   free(img->comps[1].data);
