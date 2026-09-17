@@ -5322,3 +5322,27 @@ one sentence).
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-17 06:10 UTC — m4-219: port TIFF grey detect to Rust FFI
+
+**Commit** `3aea3defd8` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the 8bpp grayscale-detection scan of `write_image`
+(`src/imageio/format/tiff.c:210`), replacing it with
+`darkroom_tiff_u8_is_grayscale`. Added new `c41-core::tiff` (safe kernel,
+divergent reference, validated FFI returning int 1=grey/0=colour, 7 tests —
+interior-only scan, strict `> 2` per-pair threshold incl. the (0,2,4)
+outer-pair case, alpha never read, border exclusion); registered
+`pub mod tiff`; declared the export in `src/rust_ffi/darkroom_core.h` after
+the JXL block. u16/float siblings, shortfile/dims gates, and TIFF field writes
+untouched; single call site. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (one P2
+process gate only — no code changes requested).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
