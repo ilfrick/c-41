@@ -1,35 +1,38 @@
-//! Grayscale-detection scan ported from `src/imageio/format/tiff.c`
-//! (`write_image`, the 8bpp `shortfile` branch, m4-219). The C loop walks
-//! the 1-pixel-border-excluded interior of the 4-channel u8 export buffer
-//! and flips the shared `layers` header field from 1 (grayscale) back to 3
-//! (RGB) at the first pixel whose R/G/B lanes differ.
+//! Grayscale-detection scans ported from `src/imageio/format/tiff.c`
+//! (`write_image`, the `shortfile` branches: 8bpp in m4-219, 16-bit in
+//! m4-220). Each C loop walks the 1-pixel-border-excluded interior of the
+//! 4-channel export buffer and flips the shared `layers` header field from
+//! 1 (grayscale) back to 3 (RGB) at the first pixel whose R/G/B lanes
+//! differ.
 //!
-//! What the C loop does, per interior pixel (`x` in `1..width - 1`,
+//! What each C loop does, per interior pixel (`x` in `1..width - 1`,
 //! `y` in `1..height - 1`):
 //! - read lanes 0..2 of the RGBA quad (the alpha lane is never read);
-//! - if `abs(r - g) > 2 || abs(r - b) > 2 || abs(g - b) > 2`, set the
-//!   shared flag to 3 (otherwise leave it).
+//! - 8bpp: if `abs(r - g) > 2 || abs(r - b) > 2 || abs(g - b) > 2`, set
+//!   the shared flag to 3 (otherwise leave it);
+//! - 16-bit: the same shape with threshold 165 instead of 2.
 //!
-//! Bit-exactness notes:
+//! Bit-exactness notes (both branches):
 //! - The C flag is written idempotently (1 -> 3 only, never back), so
-//!   although the loop ran under OpenMP with a shared flag, the final
+//!   although the loops ran under OpenMP with a shared flag, the final
 //!   flag is schedule-independent: 3 iff some interior pixel differs. A
 //!   serial scan returning false at the first differing pixel is
 //!   result-identical by construction.
-//! - `u8::abs_diff` is exactly the C `abs((int)a - (int)b)` on u8 inputs,
-//!   with the same `> 2` threshold spelling (a lane pair differing by
-//!   exactly 2 still counts as grey).
+//! - `u8::abs_diff` / `u16::abs_diff` are exactly the C
+//!   `abs((int)a - (int)b)` on inputs of that width, with the same
+//!   strict-greater-than threshold spelling (a lane pair differing by
+//!   exactly the threshold still counts as grey).
 //! - The 1-pixel border is never read, as in C: pipeline edge artefacts
 //!   are excluded from the decision on both sides.
 //! - The `shortfile` / dims-greater-than-4 / bpp gates stay in C; the
-//!   kernel treats an empty interior (width or height below 3) as
+//!   kernels treat an empty interior (width or height below 3) as
 //!   grayscale, matching the C behaviour of leaving the flag untouched
 //!   when there is nothing to scan.
 //!
-//! The 16-bit (threshold 165) and float (ratio 1.01) sibling scans stay
-//! in C for a follow-up increment; only the 8bpp branch is replaced.
+//! The float (ratio 1.01) sibling scan stays in C for a follow-up
+//! increment; only the 8bpp and 16-bit branches are replaced.
 //!
-//! The Rust kernel is single-threaded sequential; see the first note for
+//! The Rust kernels are single-threaded sequential; see the first note for
 //! why thread scheduling cannot change the result.
 
 /// True when one pixel's R/G/B lanes differ pairwise by more than the C
@@ -86,6 +89,56 @@ pub fn tiff_u8_is_grayscale(inp: &[u8], width: usize, height: usize) -> bool {
     true
 }
 
+/// True when one 16-bit pixel's R/G/B lanes differ pairwise by more than
+/// the C threshold of the 16-bit branch: `abs(r-g) > 165` etc. Shared by
+/// the kernel and the divergent reference below so the two cannot drift
+/// on the spelling while still differing structurally.
+fn rgb_triple_differs_u16(r: u16, g: u16, b: u16) -> bool {
+    r.abs_diff(g) > 165 || r.abs_diff(b) > 165 || g.abs_diff(b) > 165
+}
+
+/// Scan the interior of a 16-bit RGBA buffer for colour.
+///
+/// Port of the former element-wise loop in the `d->bpp == 16 &&
+/// !d->pixelformat` branch of `write_image()`
+/// (`src/imageio/format/tiff.c`): returns false at the first interior
+/// pixel whose R/G/B lanes trip `rgb_triple_differs_u16`, true when the
+/// whole interior is grey. Same traversal, guards, and
+/// schedule-independence argument as `tiff_u8_is_grayscale`; `width` and
+/// `height` are the full-frame dims and `inp` holds `4 * width * height`
+/// u16 lanes.
+pub fn tiff_u16_is_grayscale(inp: &[u16], width: usize, height: usize) -> bool {
+    if width <= 2 || height <= 2 {
+        return true;
+    }
+    let Some(stride) = width.checked_mul(4) else {
+        return true;
+    };
+    for y in 1..height - 1 {
+        let Some(row) = y.checked_mul(stride) else {
+            break;
+        };
+        let Some(row_end) = row.checked_add(stride) else {
+            break;
+        };
+        // The whole row must be addressable: every interior read below
+        // stays under row_end, so one check per row keeps all indexing
+        // panic-free without per-pixel bounds tests.
+        if row_end > inp.len() {
+            break;
+        }
+        for x in 1..width - 1 {
+            // x < width and width * 4 did not overflow, so x * 4 cannot
+            // overflow; row + x * 4 + 2 stays under row_end.
+            let b = row + x * 4;
+            if rgb_triple_differs_u16(inp[b], inp[b + 1], inp[b + 2]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // ── Independent reference implementation for bit-exactness tests ─────────────
 
 /// Structurally divergent reference for `tiff_u8_is_grayscale`: walks
@@ -127,6 +180,41 @@ fn ref_tiff_u8_is_grayscale(inp: &[u8], width: usize, height: usize) -> bool {
     true
 }
 
+/// Structurally divergent reference for `tiff_u16_is_grayscale`: the same
+/// chunks-and-combinators traversal as `ref_tiff_u8_is_grayscale` over
+/// u16 lanes with the 165-threshold predicate shared by construction.
+/// Same well-formed-buffers precondition for the sweep; short buffers
+/// scan only the whole rows present.
+#[cfg(test)]
+fn ref_tiff_u16_is_grayscale(inp: &[u16], width: usize, height: usize) -> bool {
+    if width <= 2 || height <= 2 {
+        return true;
+    }
+    let Some(stride) = width.checked_mul(4) else {
+        return true;
+    };
+    if stride == 0 {
+        return true;
+    }
+    let rows = (inp.len() / stride).min(height);
+    if rows <= 2 {
+        return true;
+    }
+    for row in inp
+        .chunks_exact(stride)
+        .take(rows)
+        .skip(1)
+        .take(rows - 2)
+    {
+        for q in row.chunks_exact(4).skip(1).take(width - 2) {
+            if rgb_triple_differs_u16(q[0], q[1], q[2]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // ── FFI export ───────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -160,6 +248,45 @@ pub unsafe extern "C" fn darkroom_tiff_u8_is_grayscale(
     }
     let buf = std::slice::from_raw_parts(inp, len);
     if tiff_u8_is_grayscale(buf, width, height) {
+        1
+    } else {
+        0
+    }
+}
+
+/// # Safety
+/// `inp` must hold at least `4 * width * height` u16 lanes (the C caller
+/// passes the 16-bit RGBA export buffer for a `width * height` image).
+/// Returns 1 when every interior pixel is grey (lanes pairwise within
+/// 165), 0 as soon as one pixel differs. Null pointers, degenerate dims,
+/// and overflowing dim products are guarded no-ops returning 1 (no
+/// evidence of colour, so the C header keeps its grayscale assumption —
+/// the same value the C flag holds when the loop never trips).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_tiff_u16_is_grayscale(
+    inp: *const u16,
+    width: usize,
+    height: usize,
+) -> i32 {
+    if inp.is_null() {
+        return 1;
+    }
+    // validate the products BEFORE building the slice below (a misuse
+    // caller could otherwise wrap the length; the safe kernel re-checks
+    // defensively via clamped iteration). The byte count needs its own
+    // checked step since one lane is two bytes.
+    let Some(lanes) = width.checked_mul(height).and_then(|n| n.checked_mul(4))
+    else {
+        return 1;
+    };
+    let Some(bytes) = lanes.checked_mul(2) else {
+        return 1;
+    };
+    if bytes > isize::MAX as usize {
+        return 1;
+    }
+    let buf = std::slice::from_raw_parts(inp, lanes);
+    if tiff_u16_is_grayscale(buf, width, height) {
         1
     } else {
         0
@@ -357,6 +484,206 @@ mod tests {
             );
             assert_eq!(
                 darkroom_tiff_u8_is_grayscale(buf.as_ptr(), usize::MAX, usize::MAX),
+                1
+            );
+        }
+    }
+
+    fn grey_frame_u16(w: usize, h: usize, v: u16, alpha: u16) -> Vec<u16> {
+        let mut buf = vec![0u16; 4 * w * h];
+        for q in buf.chunks_exact_mut(4) {
+            q[0] = v;
+            q[1] = v;
+            q[2] = v;
+            q[3] = alpha;
+        }
+        buf
+    }
+
+    // Solid grey frames stay grayscale on every rail; the alpha lane is
+    // never read, so garbage there must not matter.
+    #[test]
+    fn solid_grey_is_grayscale_u16() {
+        for v in [0u16, 1, 165, 32768, 65534, 65535] {
+            for alpha in [0u16, 7, 32768, 65535] {
+                let buf = grey_frame_u16(6, 5, v, alpha);
+                assert!(tiff_u16_is_grayscale(&buf, 6, 5), "v {v} alpha {alpha}");
+                assert!(ref_tiff_u16_is_grayscale(&buf, 6, 5), "v {v} alpha {alpha}");
+            }
+        }
+        // a 3x3 frame has exactly one interior pixel; grey there is grey
+        let buf = grey_frame_u16(3, 3, 40000, 0);
+        assert!(tiff_u16_is_grayscale(&buf, 3, 3));
+    }
+
+    // Each of the three lane pairs trips the scan on its own, and the
+    // threshold is strictly greater-than: a pair differing by exactly 165
+    // still counts as grey, 166 does not.
+    #[test]
+    fn each_pair_trips_and_threshold_is_strict_u16() {
+        let plant = |w: usize, h: usize, x: usize, y: usize, px: [u16; 4]| {
+            let mut buf = grey_frame_u16(w, h, 10000, 65535);
+            let b = 4 * (y * w + x);
+            buf[b..b + 4].copy_from_slice(&px);
+            buf
+        };
+        // r-g pair only
+        assert!(!tiff_u16_is_grayscale(&plant(5, 5, 2, 2, [10166, 10000, 10000, 0]), 5, 5));
+        // r-b pair only
+        assert!(!tiff_u16_is_grayscale(&plant(5, 5, 2, 2, [10000, 10000, 10166, 0]), 5, 5));
+        // g-b pair only
+        assert!(!tiff_u16_is_grayscale(&plant(5, 5, 1, 3, [10000, 10166, 10000, 0]), 5, 5));
+        // the (0,165,330) shape: neighbours agree within 165 but the
+        // outer pair does not, so only the third comparison can catch it
+        assert!(!tiff_u16_is_grayscale(&plant(5, 5, 2, 2, [0, 165, 330, 0]), 5, 5));
+        // boundary: diff of exactly 165 on every pair stays grey
+        assert!(tiff_u16_is_grayscale(&plant(5, 5, 2, 2, [10000, 10165, 10000, 0]), 5, 5));
+        assert!(tiff_u16_is_grayscale(&plant(5, 5, 2, 2, [10000, 10165, 10165, 0]), 5, 5));
+    }
+
+    // The 1-pixel border is never read: colour anywhere on the outer
+    // ring must not flip the verdict (pipeline edge artefacts are
+    // excluded by construction, as in C).
+    #[test]
+    fn border_pixels_ignored_u16() {
+        let (w, h) = (7, 6);
+        let mut buf = grey_frame_u16(w, h, 20000, 65535);
+        let paint = |buf: &mut [u16], x: usize, y: usize| {
+            let b = 4 * (y * w + x);
+            buf[b] = 0;
+            buf[b + 1] = 65535;
+            buf[b + 2] = 1234;
+        };
+        paint(&mut buf, 0, 0);
+        paint(&mut buf, 3, 0);
+        paint(&mut buf, w - 1, 2);
+        paint(&mut buf, 0, h - 1);
+        paint(&mut buf, 5, h - 1);
+        paint(&mut buf, 2, h - 1);
+        assert!(tiff_u16_is_grayscale(&buf, w, h));
+        assert!(ref_tiff_u16_is_grayscale(&buf, w, h));
+        // one step inside the border the same colour trips immediately
+        paint(&mut buf, 1, 1);
+        assert!(!tiff_u16_is_grayscale(&buf, w, h));
+        assert!(!ref_tiff_u16_is_grayscale(&buf, w, h));
+    }
+
+    // Kernel and reference must agree exactly over several shapes, both
+    // on near-grey noise (threshold neighbourhood) and on frames with
+    // sparse planted colour pixels (both verdicts exercised).
+    #[test]
+    fn matches_reference_over_sweep_u16() {
+        let shapes = [
+            (1usize, 1usize),
+            (2, 5),
+            (5, 2),
+            (3, 3),
+            (4, 4),
+            (5, 5),
+            (7, 9),
+            (16, 16),
+            (32, 21),
+        ];
+        for (si, (w, h)) in shapes.iter().enumerate() {
+            let (w, h) = (*w, *h);
+            // near-grey noise: lanes within +-165 of a per-pixel base
+            let mut buf = vec![0u16; 4 * w * h];
+            for (i, q) in buf.chunks_exact_mut(4).enumerate() {
+                let base = ((i as u64).wrapping_mul(2_654_435_761).wrapping_add(si as u64)) % 65536;
+                let base16 = base as u16;
+                let tweak = (i % 331) as u16; // 0..330: some quads trip, most do not
+                q[0] = base16;
+                q[1] = base16.saturating_add(tweak.min(200));
+                q[2] = base16.saturating_sub((tweak + 1) / 2);
+                q[3] = (i % 65535) as u16;
+            }
+            assert_eq!(
+                tiff_u16_is_grayscale(&buf, w, h),
+                ref_tiff_u16_is_grayscale(&buf, w, h),
+                "shape {w}x{h} noise"
+            );
+            // mostly grey with a sparse planted colour pixel inside the
+            // interior (when the frame has one)
+            let mut buf2 = grey_frame_u16(w, h, 30000, 65535);
+            if w > 2 && h > 2 {
+                let b = 4 * (1 * w + 1);
+                buf2[b] = 40000;
+            }
+            assert_eq!(
+                tiff_u16_is_grayscale(&buf2, w, h),
+                ref_tiff_u16_is_grayscale(&buf2, w, h),
+                "shape {w}x{h} planted"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_guards_no_op_u16() {
+        // empty buffer with live dims: no panic, no evidence of colour
+        assert!(tiff_u16_is_grayscale(&[], 6, 5));
+        // zero / sub-interior dims: nothing to scan
+        let buf = grey_frame_u16(6, 5, 0, 0);
+        assert!(tiff_u16_is_grayscale(&buf, 0, 0));
+        assert!(tiff_u16_is_grayscale(&buf, 6, 0));
+        assert!(tiff_u16_is_grayscale(&buf, 0, 5));
+        assert!(tiff_u16_is_grayscale(&buf, 2, 5));
+        assert!(tiff_u16_is_grayscale(&buf, 6, 2));
+        // truncated buffer: the addressable row prefix decides; colour
+        // past the cut is not read
+        let mut full = grey_frame_u16(6, 6, 20000, 65535);
+        let b = 4 * (4 * 6 + 4); // interior pixel in the last interior row
+        full[b] = 50000;
+        let cut = full.len() - 2 * 4 * 6; // drop rows 4..5 entirely
+        assert!(tiff_u16_is_grayscale(&full[..cut], 6, 6));
+        assert!(!tiff_u16_is_grayscale(&full, 6, 6));
+        // colour inside the addressable prefix still trips
+        let b2 = 4 * (1 * 6 + 1);
+        full[b2] = 50000;
+        assert!(!tiff_u16_is_grayscale(&full[..cut], 6, 6));
+    }
+
+    #[test]
+    fn ffi_round_trip_u16() {
+        let (w, h) = (9, 7);
+        let grey = grey_frame_u16(w, h, 30000, 65535);
+        let mut colour = grey.clone();
+        let b = 4 * (3 * w + 4);
+        colour[b] = 1000;
+        colour[b + 1] = 60000;
+        unsafe {
+            assert_eq!(darkroom_tiff_u16_is_grayscale(grey.as_ptr(), w, h), 1);
+            assert_eq!(darkroom_tiff_u16_is_grayscale(colour.as_ptr(), w, h), 0);
+        }
+        assert!(tiff_u16_is_grayscale(&grey, w, h));
+        assert!(!tiff_u16_is_grayscale(&colour, w, h));
+    }
+
+    #[test]
+    fn ffi_guards_u16() {
+        let buf = grey_frame_u16(4, 4, 1000, 65535);
+        unsafe {
+            // null pointer: no evidence of colour, grayscale assumed
+            assert_eq!(darkroom_tiff_u16_is_grayscale(std::ptr::null(), 4, 4), 1);
+            // zero dims
+            assert_eq!(darkroom_tiff_u16_is_grayscale(buf.as_ptr(), 0, 4), 1);
+            assert_eq!(darkroom_tiff_u16_is_grayscale(buf.as_ptr(), 4, 0), 1);
+            // overflowing dim product: guarded before any slice is built
+            assert_eq!(
+                darkroom_tiff_u16_is_grayscale(buf.as_ptr(), usize::MAX, 2),
+                1
+            );
+            assert_eq!(
+                darkroom_tiff_u16_is_grayscale(buf.as_ptr(), usize::MAX, usize::MAX),
+                1
+            );
+            // lanes product fits but the byte count (lanes * 2) overflows:
+            // guarded by the separate byte-count step
+            assert_eq!(
+                darkroom_tiff_u16_is_grayscale(
+                    buf.as_ptr(),
+                    1usize << 31,
+                    (1usize << 31) - 1
+                ),
                 1
             );
         }
