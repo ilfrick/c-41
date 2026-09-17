@@ -5346,3 +5346,29 @@ process gate only — no code changes requested).
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-17 07:00 UTC — m4-220: port TIFF u16 grey detect to Rust FFI
+
+**Commit** `b8908302cd` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the 16-bit grayscale-detection scan of `write_image`
+(`src/imageio/format/tiff.c:194`), replacing it with
+`darkroom_tiff_u16_is_grayscale`. Extended `c41-core::tiff` (safe kernel,
+divergent reference, validated FFI returning int 1=grey/0=colour, 7 tests —
+interior-only scan, strict `> 165` per-pair threshold incl. the (0,165,330)
+outer-pair case, alpha never read, separate lanes/bytes overflow steps);
+declared the export in `src/rust_ffi/darkroom_core.h` after the u8 entry.
+The float sibling, shortfile/dims gates, and field writes untouched. Left all
+unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0/P1
+(three P2 nits). Fixed in-session: stale 16-bit sibling mentions repointed at
+m4-220 in both the C and header comments; lanes-fit-but-bytes-overflow guard
+path pinned with a dedicated (2^31, 2^31-1) case.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
