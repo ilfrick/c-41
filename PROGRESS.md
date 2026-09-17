@@ -5372,3 +5372,27 @@ path pinned with a dedicated (2^31, 2^31-1) case.
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-17 08:10 UTC — m4-221: port TIFF float grey detect to Rust FFI
+
+**Commit** `cdcf4cdb44` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only the float grayscale-detection scan of `write_image`
+(`src/imageio/format/tiff.c:176`), replacing it with
+`darkroom_tiff_f32_is_grayscale`. Extended `c41-core::tiff` (safe kernel,
+divergent reference, validated FFI returning int 1=grey/0=colour, 9 tests —
+explicit 0.001 branch clamp, same op order/precision, one-direction-per-pair
+asymmetry preserved, strict > 1.01, alpha ignored); declared the export in
+`src/rust_ffi/darkroom_core.h` after the u16 entry. `format/tiff.c` now has
+zero `DT_OMP_FOR` sites. Left all unrelated files untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE**, no P0/P1 (three P2
+nits). Fixed in-session: explicit `f32` suffixes on the clamp/threshold
+literals.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
