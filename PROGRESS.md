@@ -5482,3 +5482,36 @@ target permissions and an extra full-debug run aborted in the existing
 bilateral test; the new module tests and required release suite passed.
 No UI-parity audit item is resolved by this shared-infrastructure-only port.
 Remote CI for this increment is pending publication.
+
+### m4-225 — mono-preview RGB scan → Rust (2026-09-17 20:17 UTC)
+
+**Previous increment.** m4-224 commit `a49a9f4fbd` is verified on both remotes;
+Docker image, Rust checks/tests/Clippy, and Release CMake CI all succeeded.
+
+**What.** Ported the serial RGB equality scan in `dt_imageio_has_mono_preview`
+to `darkroom_imageio_has_mono_rgbx`, with a safe helper and eight tests in
+`c41-core::imageio`. Every pixel including borders must have exactly equal
+RGB; X is ignored. Thumbnail decode, minimum 32-by-32 policy, logging and
+cleanup remain in C. This is a shared-imageio serial loop, not a reduction
+in the remaining OpenMP-site inventory; no UI parity item is resolved.
+
+**FFI contract.** For positive dimensions with accepted checked lengths, input
+must belong to a live allocation spanning at least `4 * width * height - 1`
+bytes, with no concurrent mutation. RGB bytes visited through the first colored
+pixel (or all pixels for a monochrome image) must be initialized and readable.
+X bytes may be uninitialized and the final X may be absent; raw reads never
+access X. Invalid null/dimensions/overflow return 0 without reading. The safe
+slice helper additionally checks slice length and requires initialized bytes
+as normal for a byte slice. Arithmetic checks cannot establish allocation size.
+
+**Review.** Independent senior reviewer approved correctness and tests. A new
+missing-safety-doc warning was handled with a function-local Clippy allowance,
+independently re-reviewed, with the contract recorded here under the no-new-
+code-comments instruction. No executable review fix was needed.
+
+**Verified.** Docker imageio release tests: 28 passed. After review,
+`scripts/ci-local.sh` exited 0 (workspace check, all-targets Clippy, workspace
+release tests, release application link). The changed C translation unit
+compiled in the dependency-equipped Docker image with Release `-Werror`,
+exit 0. `git diff --check` passed. Existing unrelated warnings remain;
+remote CI for m4-225 is pending publication.

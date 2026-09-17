@@ -836,19 +836,7 @@ gboolean dt_imageio_has_mono_preview(const char *filename)
   if((thumb_width < 32) || (thumb_height < 32) || (tmp == NULL))
     goto cleanup;
 
-  mono = TRUE;
-  for(int y = 0; y < thumb_height; y++)
-  {
-    uint8_t *in = (uint8_t *)tmp + (size_t)4 * y * thumb_width;
-    for(int x = 0; x < thumb_width; x++, in += 4)
-    {
-      if((in[0] != in[1]) || (in[0] != in[2]) || (in[1] != in[2]))
-      {
-        mono = FALSE;
-        goto cleanup;
-      }
-    }
-  }
+  mono = darkroom_imageio_has_mono_rgbx(tmp, thumb_width, thumb_height);
 
   cleanup:
 

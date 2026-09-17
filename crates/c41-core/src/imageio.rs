@@ -240,6 +240,59 @@ pub unsafe extern "C" fn darkroom_imageio_u8_to_float(
     u8_to_float(out_slice, inp_slice, black, white, chu, wdu, htu, strideu);
 }
 
+fn mono_rgbx_lengths(width: usize, height: usize) -> Option<(usize, usize)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let npixels = width.checked_mul(height)?;
+    let span = npixels.checked_mul(4)?.checked_sub(1)?;
+    if span > isize::MAX as usize {
+        return None;
+    }
+    Some((npixels, span))
+}
+
+pub fn has_mono_rgbx(inp: &[u8], width: usize, height: usize) -> bool {
+    let Some((npixels, span)) = mono_rgbx_lengths(width, height) else {
+        return false;
+    };
+    if inp.len() < span {
+        return false;
+    }
+    for k in 0..npixels {
+        let b = 4 * k;
+        if inp[b] != inp[b + 1] || inp[b] != inp[b + 2] {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imageio_has_mono_rgbx(
+    inp: *const u8,
+    width: i32,
+    height: i32,
+) -> std::ffi::c_int {
+    if inp.is_null() || width <= 0 || height <= 0 {
+        return 0;
+    }
+    let Some((npixels, _)) = mono_rgbx_lengths(width as usize, height as usize) else {
+        return 0;
+    };
+    for k in 0..npixels {
+        let pixel = inp.add(4 * k);
+        let r = pixel.read();
+        let g = pixel.add(1).read();
+        let b = pixel.add(2).read();
+        if r != g || r != b {
+            return 0;
+        }
+    }
+    1
+}
+
 fn unoriented_lengths(
     bpp: usize,
     wd: usize,
@@ -326,6 +379,196 @@ pub unsafe extern "C" fn darkroom_imageio_flip_buffers_unoriented(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ref_has_mono_rgbx(inp: &[u8], width: usize, height: usize) -> bool {
+        let mut colored = 0;
+        for row in inp.chunks(4 * width).take(height) {
+            for pixel in row.chunks(4) {
+                colored += usize::from(pixel[..3].windows(2).any(|pair| pair[0] != pair[1]));
+            }
+        }
+        colored == 0
+    }
+
+    fn assert_mono_rgbx(inp: &[u8], width: usize, height: usize, expected: bool) {
+        assert_eq!(has_mono_rgbx(inp, width, height), expected);
+        assert_eq!(
+            unsafe { darkroom_imageio_has_mono_rgbx(inp.as_ptr(), width as i32, height as i32) },
+            std::ffi::c_int::from(expected)
+        );
+    }
+
+    #[test]
+    fn mono_rgbx_matches_reference_over_sweep() {
+        let mut state = 0x9E37_79B9u32;
+        for (width, height) in [(1, 1), (1, 33), (35, 1), (3, 5), (31, 32), (32, 32), (37, 41)] {
+            for mode in 0..3 {
+                let mut inp = vec![0u8; 4 * width * height];
+                for pixel in inp.chunks_exact_mut(4) {
+                    for byte in pixel.iter_mut() {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        *byte = (state >> 24) as u8;
+                    }
+                    if mode != 0 {
+                        pixel[1] = pixel[0];
+                        pixel[2] = pixel[0];
+                    }
+                }
+                if mode == 2 {
+                    let k = state as usize % (width * height);
+                    inp[4 * k + 1] ^= 1;
+                }
+                let original = inp.clone();
+                let expected = ref_has_mono_rgbx(&inp, width, height);
+                assert_eq!(expected, mode == 1);
+                assert_mono_rgbx(&inp, width, height, expected);
+                assert_eq!(inp, original);
+            }
+        }
+    }
+
+    #[test]
+    fn mono_rgbx_every_pixel_and_channel_plus_minus_one() {
+        for (width, height) in [(1, 1), (1, 5), (5, 1), (7, 5), (32, 33)] {
+            let mut inp = vec![128u8; 4 * width * height];
+            for k in 0..width * height {
+                for channel in 0..3 {
+                    for value in [127, 129] {
+                        inp[4 * k + channel] = value;
+                        assert_mono_rgbx(&inp, width, height, false);
+                        inp[4 * k + channel] = 128;
+                    }
+                }
+            }
+            assert_mono_rgbx(&inp, width, height, true);
+        }
+    }
+
+    #[test]
+    fn mono_rgbx_varying_x_and_exact_span() {
+        for gray in [0, 1, 127, 128, 254, 255] {
+            for x in 0..=255 {
+                assert_mono_rgbx(&[gray, gray, gray, x], 1, 1, true);
+            }
+            for (width, height) in [(1, 1), (1, 7), (9, 1), (3, 5), (32, 32)] {
+                let mut inp = vec![gray; 4 * width * height - 1].into_boxed_slice();
+                for (k, byte) in inp.iter_mut().skip(3).step_by(4).enumerate() {
+                    *byte = k as u8;
+                }
+                assert_mono_rgbx(&inp, width, height, true);
+                let last = inp.len() - 1;
+                inp[last] ^= 1;
+                assert_mono_rgbx(&inp, width, height, false);
+            }
+        }
+        assert_mono_rgbx(&[8, 8, 8, 255, 1, 2, 3], 1, 1, true);
+    }
+
+    #[test]
+    fn mono_rgbx_ffi_uninitialized_x() {
+        use std::mem::MaybeUninit;
+
+        for (width, height) in [(1, 1), (3, 5), (32, 33)] {
+            for omit_last_x in [false, true] {
+                let span = 4 * width * height - usize::from(omit_last_x);
+                let mut inp = vec![MaybeUninit::<u8>::uninit(); span].into_boxed_slice();
+                for k in 0..width * height {
+                    for channel in 0..3 {
+                        inp[4 * k + channel].write(k as u8);
+                    }
+                }
+                assert_eq!(
+                    unsafe {
+                        darkroom_imageio_has_mono_rgbx(inp.as_ptr().cast(), width as i32, height as i32)
+                    },
+                    1
+                );
+                let last = 4 * (width * height - 1) + 2;
+                inp[last].write(((width * height - 1) as u8) ^ 1);
+                assert_eq!(
+                    unsafe {
+                        darkroom_imageio_has_mono_rgbx(inp.as_ptr().cast(), width as i32, height as i32)
+                    },
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mono_rgbx_ffi_short_circuits_colored_pixel() {
+        use std::mem::MaybeUninit;
+
+        let mut inp = [MaybeUninit::<u8>::uninit(); 15];
+        inp[0].write(8);
+        inp[1].write(9);
+        inp[2].write(8);
+        assert_eq!(
+            unsafe { darkroom_imageio_has_mono_rgbx(inp.as_ptr().cast(), 2, 2) },
+            0
+        );
+    }
+
+    #[test]
+    fn mono_rgbx_safe_invalid_and_short_buffers() {
+        for (width, height) in [
+            (0, 1),
+            (1, 0),
+            (usize::MAX, 2),
+            (2, usize::MAX),
+            (usize::MAX / 4 + 1, 1),
+            (isize::MAX as usize / 4 + 2, 1),
+        ] {
+            assert!(!has_mono_rgbx(&[7; 16], width, height));
+            assert_eq!(mono_rgbx_lengths(width, height), None);
+        }
+        for len in 0..15 {
+            assert!(!has_mono_rgbx(&[7; 16][..len], 2, 2));
+        }
+        assert!(has_mono_rgbx(&[7; 15], 2, 2));
+    }
+
+    #[test]
+    fn mono_rgbx_span_boundary() {
+        let limit = isize::MAX as usize;
+        let npixels = limit / 4 + 1;
+        assert_eq!(mono_rgbx_lengths(npixels, 1), Some((npixels, limit)));
+        assert_eq!(mono_rgbx_lengths(1, npixels), Some((npixels, limit)));
+        assert_eq!(mono_rgbx_lengths(npixels + 1, 1), None);
+        assert_eq!(mono_rgbx_lengths(usize::MAX / 4 + 1, 1), None);
+    }
+
+    #[test]
+    fn mono_rgbx_ffi_null_dimension_and_overflow_guards() {
+        let inp = [7u8; 3];
+        assert_eq!(
+            unsafe { darkroom_imageio_has_mono_rgbx(std::ptr::null(), 1, 1) },
+            0
+        );
+        for (width, height) in [
+            (0, 1),
+            (1, 0),
+            (-1, 1),
+            (1, -1),
+            (i32::MIN, 1),
+            (1, i32::MIN),
+            (i32::MAX, i32::MAX),
+        ] {
+            assert_eq!(
+                unsafe { darkroom_imageio_has_mono_rgbx(inp.as_ptr(), width, height) },
+                0
+            );
+        }
+        if usize::BITS == 32 {
+            for (width, height) in [(i32::MAX, 1), (1, i32::MAX), (65536, 65536)] {
+                assert_eq!(
+                    unsafe { darkroom_imageio_has_mono_rgbx(inp.as_ptr(), width, height) },
+                    0
+                );
+            }
+        }
+        assert_eq!(inp, [7; 3]);
+    }
 
     fn ref_flip_buffers_unoriented(
         out: &mut [u8],
