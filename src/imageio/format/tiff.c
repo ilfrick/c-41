@@ -26,7 +26,7 @@
 #include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
 #include "develop/pixelpipe_hb.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_tiff_u8/u16_is_grayscale
+#include "rust_ffi/darkroom_core.h" // for darkroom_tiff_u8/u16/f32_is_grayscale
 
 #include <inttypes.h>
 #include <memory.h>
@@ -173,20 +173,17 @@ int write_image(dt_imageio_module_data_t *d_tmp, const char *filename, const voi
     layers = 1;    // let's now assume a grayscale
     if(d->bpp == 32 || (d->bpp == 16 && d->pixelformat))
     {
-      DT_OMP_FOR(shared(layers) collapse(2))
-      for(int y = 1; y < d->global.height - 1; ++y)
+      // Grayscale scan ported to Rust FFI (darkroom_tiff_f32_is_grayscale
+      // in crates/c41-core/src/tiff.rs): result-identical serial scan of
+      // the same 1-px-border-excluded interior, tripping on the first
+      // pixel whose 0.001-clamped R/G/B lane ratios exceed 1.01. The C
+      // flag was written idempotently, so the OpenMP schedule could not
+      // change the outcome.
+      if(!darkroom_tiff_f32_is_grayscale((const float *)in_void,
+                                         (size_t)d->global.width,
+                                         (size_t)d->global.height))
       {
-        for(int x = 1; x < d->global.width - 1; ++x)
-        {
-          if(layers == 3) continue;
-          float *in = (float *)in_void + (size_t)(4 * (y * d->global.width + x));
-          if((fabsf(MAX(in[0], 0.001f) / MAX(in[1], 0.001f)) > 1.01f)
-             || (fabsf(MAX(in[0], 0.001f) / MAX(in[2], 0.001f)) > 1.01f)
-             || (fabsf(MAX(in[1], 0.001f) / MAX(in[2], 0.001f)) > 1.01f))
-          {
-            layers = 3;
-          }
-        }
+        layers = 3;
       }
     }
     else if(d->bpp == 16 && !d->pixelformat)
@@ -196,7 +193,8 @@ int write_image(dt_imageio_module_data_t *d_tmp, const char *filename, const voi
       // the same 1-px-border-excluded interior, tripping on the first
       // pixel whose R/G/B lanes differ pairwise by more than 165. The C
       // flag was written idempotently, so the OpenMP schedule could not
-      // change the outcome. The float sibling scan stays in C.
+      // change the outcome. The float sibling scan is
+      // `darkroom_tiff_f32_is_grayscale` above.
       if(!darkroom_tiff_u16_is_grayscale((const uint16_t *)in_void,
                                          (size_t)d->global.width,
                                          (size_t)d->global.height))
@@ -211,7 +209,8 @@ int write_image(dt_imageio_module_data_t *d_tmp, const char *filename, const voi
       // the same 1-px-border-excluded interior, tripping on the first
       // pixel whose R/G/B lanes differ pairwise by more than 2. The C
       // flag was written idempotently, so the OpenMP schedule could not
-      // change the outcome. The float sibling scan stays in C.
+      // change the outcome. The float sibling scan is
+      // `darkroom_tiff_f32_is_grayscale` above.
       if(!darkroom_tiff_u8_is_grayscale((const unsigned char *)in_void,
                                         (size_t)d->global.width,
                                         (size_t)d->global.height))

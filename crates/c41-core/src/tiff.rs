@@ -1,18 +1,20 @@
 //! Grayscale-detection scans ported from `src/imageio/format/tiff.c`
 //! (`write_image`, the `shortfile` branches: 8bpp in m4-219, 16-bit in
-//! m4-220). Each C loop walks the 1-pixel-border-excluded interior of the
-//! 4-channel export buffer and flips the shared `layers` header field from
-//! 1 (grayscale) back to 3 (RGB) at the first pixel whose R/G/B lanes
-//! differ.
+//! m4-220, float in m4-221). Each C loop walks the 1-pixel-border-excluded
+//! interior of the 4-channel export buffer and flips the shared `layers`
+//! header field from 1 (grayscale) back to 3 (RGB) at the first pixel
+//! whose R/G/B lanes differ.
 //!
 //! What each C loop does, per interior pixel (`x` in `1..width - 1`,
 //! `y` in `1..height - 1`):
 //! - read lanes 0..2 of the RGBA quad (the alpha lane is never read);
 //! - 8bpp: if `abs(r - g) > 2 || abs(r - b) > 2 || abs(g - b) > 2`, set
 //!   the shared flag to 3 (otherwise leave it);
-//! - 16-bit: the same shape with threshold 165 instead of 2.
+//! - 16-bit: the same shape with threshold 165 instead of 2;
+//! - float: clamp each lane up at 0.001 (`MAX(v, 0.001f)`) and trip when
+//!   any pairwise ratio's absolute value exceeds 1.01.
 //!
-//! Bit-exactness notes (both branches):
+//! Bit-exactness notes (all three branches):
 //! - The C flag is written idempotently (1 -> 3 only, never back), so
 //!   although the loops ran under OpenMP with a shared flag, the final
 //!   flag is schedule-independent: 3 iff some interior pixel differs. A
@@ -22,6 +24,13 @@
 //!   `abs((int)a - (int)b)` on inputs of that width, with the same
 //!   strict-greater-than threshold spelling (a lane pair differing by
 //!   exactly the threshold still counts as grey).
+//! - The float branch spells the clamp as the C `MAX(v, 0.001f)` ternary
+//!   (`v > 0.001f ? v : 0.001f`, via glib), written here as an explicit
+//!   branch so NaN and sub-floor inputs (zeros, negatives) take the floor
+//!   exactly as in C rather than depending on any `f32::max` NaN rule.
+//!   Division, `fabsf`, and the `> 1.01f` comparison are plain IEEE-754
+//!   single-precision on both sides, issued in the same order, so the
+//!   verdict is bit-identical lane for lane.
 //! - The 1-pixel border is never read, as in C: pipeline edge artefacts
 //!   are excluded from the decision on both sides.
 //! - The `shortfile` / dims-greater-than-4 / bpp gates stay in C; the
@@ -29,8 +38,8 @@
 //!   grayscale, matching the C behaviour of leaving the flag untouched
 //!   when there is nothing to scan.
 //!
-//! The float (ratio 1.01) sibling scan stays in C for a follow-up
-//! increment; only the 8bpp and 16-bit branches are replaced.
+//! All three precision branches are replaced; no grayscale scan remains
+//! in C.
 //!
 //! The Rust kernels are single-threaded sequential; see the first note for
 //! why thread scheduling cannot change the result.
@@ -215,6 +224,109 @@ fn ref_tiff_u16_is_grayscale(inp: &[u16], width: usize, height: usize) -> bool {
     true
 }
 
+/// Clamp one float lane exactly as the C `MAX(v, 0.001f)` ternary does:
+/// `v > 0.001f ? v : 0.001f`. The explicit branch (rather than
+/// `f32::max`) keeps NaN on the floor side just like the C comparison
+/// (`NaN > 0.001f` is false), so zeros, negatives, and NaNs all read as
+/// 0.001 on both sides.
+#[inline]
+fn clamp_floor(v: f32) -> f32 {
+    if v > 0.001f32 {
+        v
+    } else {
+        0.001f32
+    }
+}
+
+/// True when one float pixel's R/G/B lanes trip the C ratio test:
+/// `fabsf(cr / cg) > 1.01f` for any of the three lane pairs after the
+/// `clamp_floor` step. Shared by the kernel and the divergent reference
+/// below so the two cannot drift on the spelling while still differing
+/// structurally.
+fn f32_triple_differs(r: f32, g: f32, b: f32) -> bool {
+    let cr = clamp_floor(r);
+    let cg = clamp_floor(g);
+    let cb = clamp_floor(b);
+    (cr / cg).abs() > 1.01f32 || (cr / cb).abs() > 1.01f32 || (cg / cb).abs() > 1.01f32
+}
+
+/// Scan the interior of a float RGBA buffer for colour.
+///
+/// Port of the former element-wise loop in the `d->bpp == 32 ||
+/// (d->bpp == 16 && d->pixelformat)` branch of `write_image()`
+/// (`src/imageio/format/tiff.c`): returns false at the first interior
+/// pixel whose clamped R/G/B lanes trip `f32_triple_differs`, true when
+/// the whole interior is grey. Same traversal, guards, and
+/// schedule-independence argument as `tiff_u8_is_grayscale`; `width` and
+/// `height` are the full-frame dims and `inp` holds `4 * width * height`
+/// f32 lanes.
+pub fn tiff_f32_is_grayscale(inp: &[f32], width: usize, height: usize) -> bool {
+    if width <= 2 || height <= 2 {
+        return true;
+    }
+    let Some(stride) = width.checked_mul(4) else {
+        return true;
+    };
+    for y in 1..height - 1 {
+        let Some(row) = y.checked_mul(stride) else {
+            break;
+        };
+        let Some(row_end) = row.checked_add(stride) else {
+            break;
+        };
+        // The whole row must be addressable: every interior read below
+        // stays under row_end, so one check per row keeps all indexing
+        // panic-free without per-pixel bounds tests.
+        if row_end > inp.len() {
+            break;
+        }
+        for x in 1..width - 1 {
+            // x < width and width * 4 did not overflow, so x * 4 cannot
+            // overflow; row + x * 4 + 2 stays under row_end.
+            let b = row + x * 4;
+            if f32_triple_differs(inp[b], inp[b + 1], inp[b + 2]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Structurally divergent reference for `tiff_f32_is_grayscale`: the same
+/// chunks-and-combinators traversal as `ref_tiff_u8_is_grayscale` over
+/// f32 lanes with the ratio predicate shared by construction.
+/// Same well-formed-buffers precondition for the sweep; short buffers
+/// scan only the whole rows present.
+#[cfg(test)]
+fn ref_tiff_f32_is_grayscale(inp: &[f32], width: usize, height: usize) -> bool {
+    if width <= 2 || height <= 2 {
+        return true;
+    }
+    let Some(stride) = width.checked_mul(4) else {
+        return true;
+    };
+    if stride == 0 {
+        return true;
+    }
+    let rows = (inp.len() / stride).min(height);
+    if rows <= 2 {
+        return true;
+    }
+    for row in inp
+        .chunks_exact(stride)
+        .take(rows)
+        .skip(1)
+        .take(rows - 2)
+    {
+        for q in row.chunks_exact(4).skip(1).take(width - 2) {
+            if f32_triple_differs(q[0], q[1], q[2]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // ── FFI export ───────────────────────────────────────────────────────────────
 
 /// # Safety
@@ -287,6 +399,46 @@ pub unsafe extern "C" fn darkroom_tiff_u16_is_grayscale(
     }
     let buf = std::slice::from_raw_parts(inp, lanes);
     if tiff_u16_is_grayscale(buf, width, height) {
+        1
+    } else {
+        0
+    }
+}
+
+/// # Safety
+/// `inp` must hold at least `4 * width * height` f32 lanes (the C caller
+/// passes the float RGBA export buffer for a `width * height` image).
+/// Returns 1 when every interior pixel is grey (clamped pairwise ratios
+/// within 1.01), 0 as soon as one pixel differs. Null pointers,
+/// degenerate dims, and overflowing dim products are guarded no-ops
+/// returning 1 (no evidence of colour, so the C header keeps its
+/// grayscale assumption — the same value the C flag holds when the loop
+/// never trips).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_tiff_f32_is_grayscale(
+    inp: *const f32,
+    width: usize,
+    height: usize,
+) -> i32 {
+    if inp.is_null() {
+        return 1;
+    }
+    // validate the products BEFORE building the slice below (a misuse
+    // caller could otherwise wrap the length; the safe kernel re-checks
+    // defensively via clamped iteration). The byte count needs its own
+    // checked step since one lane is four bytes.
+    let Some(lanes) = width.checked_mul(height).and_then(|n| n.checked_mul(4))
+    else {
+        return 1;
+    };
+    let Some(bytes) = lanes.checked_mul(4) else {
+        return 1;
+    };
+    if bytes > isize::MAX as usize {
+        return 1;
+    }
+    let buf = std::slice::from_raw_parts(inp, lanes);
+    if tiff_f32_is_grayscale(buf, width, height) {
         1
     } else {
         0
@@ -683,6 +835,276 @@ mod tests {
                     buf.as_ptr(),
                     1usize << 31,
                     (1usize << 31) - 1
+                ),
+                1
+            );
+        }
+    }
+
+    fn grey_frame_f32(w: usize, h: usize, v: f32, alpha: f32) -> Vec<f32> {
+        let mut buf = vec![0f32; 4 * w * h];
+        for q in buf.chunks_exact_mut(4) {
+            q[0] = v;
+            q[1] = v;
+            q[2] = v;
+            q[3] = alpha;
+        }
+        buf
+    }
+
+    // Solid grey frames stay grayscale on every rail, including zeros,
+    // negatives, and sub-floor values (all clamped to 0.001 before the
+    // ratio, so they read as equal); the alpha lane is never read, so
+    // garbage there must not matter.
+    #[test]
+    fn solid_grey_is_grayscale_f32() {
+        for v in [0.0f32, -3.5, 0.0005, 0.001, 0.5, 1.0, 100.0] {
+            for alpha in [0.0f32, -1.0, 0.5, 1.0] {
+                let buf = grey_frame_f32(6, 5, v, alpha);
+                assert!(tiff_f32_is_grayscale(&buf, 6, 5), "v {v} alpha {alpha}");
+                assert!(ref_tiff_f32_is_grayscale(&buf, 6, 5), "v {v} alpha {alpha}");
+            }
+        }
+        // a 3x3 frame has exactly one interior pixel; grey there is grey
+        let buf = grey_frame_f32(3, 3, 2.5, 0.0);
+        assert!(tiff_f32_is_grayscale(&buf, 3, 3));
+    }
+
+    // Each lane pair can trip the scan (ratio 2.0 through that pair),
+    // and the threshold is strictly greater-than: a ratio of exactly
+    // 1.01f still counts as grey (exact in f32: x * 1.0 == x and
+    // x / 1.0 == x), while 1.02 trips. Note the C spells each pair in
+    // one direction only (r/g, r/b, g/b), so a lane that is SMALLER than
+    // its partners trips through a later pair, not its own: [1,2,1]
+    // trips via (g,b), and [1,1,0.5] via (r,b) and (g,b) together.
+    #[test]
+    fn each_pair_trips_and_threshold_is_strict_f32() {
+        let plant = |w: usize, h: usize, x: usize, y: usize, px: [f32; 4]| {
+            let mut buf = grey_frame_f32(w, h, 1.0, 1.0);
+            let b = 4 * (y * w + x);
+            buf[b..b + 4].copy_from_slice(&px);
+            buf
+        };
+        // trips via the (r,g) pair (and (r,b))
+        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [2.0, 1.0, 1.0, 1.0]), 5, 5));
+        // trips via the (g,b) pair: r smaller trips through g/b, not r/g
+        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.0, 2.0, 1.0, 1.0]), 5, 5));
+        // trips via the (r,b) pair (and (g,b)): b smaller
+        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.0, 1.0, 0.5, 1.0]), 5, 5));
+        // g-b pair at another interior spot
+        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 1, 3, [1.0, 2.0, 1.0, 1.0]), 5, 5));
+        // boundary: exactly 1.01 stays grey, 1.02 does not
+        assert!(tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.01, 1.0, 1.0, 1.0]), 5, 5));
+        assert!(ref_tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.01, 1.0, 1.0, 1.0]), 5, 5));
+        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.02, 1.0, 1.0, 1.0]), 5, 5));
+        // just under the threshold stays grey
+        assert!(tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.009, 1.0, 1.0, 1.0]), 5, 5));
+        // a below-one ratio whose inverse exceeds the threshold trips
+        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.0, 0.5, 1.0, 1.0]), 5, 5));
+    }
+
+    // The 0.001 clamp happens before the ratio: values that would trip
+    // unclamped (raw ratio far above 1.01) stay grey once both sides hit
+    // the floor. NaN takes the floor too (NaN > 0.001 is false, as in C),
+    // so NaN lanes read as grey with no divergence between languages.
+    #[test]
+    fn clamp_floor_before_ratio_f32() {
+        let plant = |px: [f32; 4]| {
+            let mut buf = grey_frame_f32(5, 5, 1.0, 1.0);
+            let b = 4 * (2 * 5 + 2);
+            buf[b..b + 4].copy_from_slice(&px);
+            buf
+        };
+        // raw ratios up to 1.8 that would trip unclamped stay grey once
+        // every lane hits the floor (all three clamp to 0.001)
+        assert!(tiff_f32_is_grayscale(&plant([0.0005, 0.0009, 0.0008, 1.0]), 5, 5));
+        // all zeros: every lane clamps to the floor, ratio exactly 1
+        assert!(tiff_f32_is_grayscale(&plant([0.0, 0.0, 0.0, 1.0]), 5, 5));
+        // negatives clamp the same way
+        assert!(tiff_f32_is_grayscale(&plant([-5.0, -0.2, 0.0, 1.0]), 5, 5));
+        // NaN lanes are grey, in kernel and reference alike
+        assert!(tiff_f32_is_grayscale(&plant([f32::NAN, 1.0, 1.0, 1.0]), 5, 5));
+        assert!(ref_tiff_f32_is_grayscale(&plant([f32::NAN, 1.0, 1.0, 1.0]), 5, 5));
+        assert!(tiff_f32_is_grayscale(
+            &plant([f32::NAN, f32::NAN, f32::NAN, f32::NAN]),
+            5,
+            5
+        ));
+        // a clamped lane against a live one still trips when the ratio
+        // genuinely exceeds the threshold in a tested direction
+        // (0.5 / 0.001 = 500 via the (r,g) pair)
+        assert!(!tiff_f32_is_grayscale(&plant([0.5, 0.0, 0.0, 1.0]), 5, 5));
+        // directional asymmetry is C's own: each pair is tested in one
+        // direction only, so a dark lane 0 against bright lanes 1 and 2
+        // reads grey (0.001/0.5 and 0.001/0.5 both below 1.01, and
+        // 0.5/0.5 is 1) — mirrored exactly, not "fixed"
+        assert!(tiff_f32_is_grayscale(&plant([0.0, 0.5, 0.5, 1.0]), 5, 5));
+        assert!(ref_tiff_f32_is_grayscale(&plant([0.0, 0.5, 0.5, 1.0]), 5, 5));
+    }
+
+    // The 1-pixel border is never read: colour anywhere on the outer
+    // ring must not flip the verdict (pipeline edge artefacts are
+    // excluded by construction, as in C).
+    #[test]
+    fn border_pixels_ignored_f32() {
+        let (w, h) = (7, 6);
+        let mut buf = grey_frame_f32(w, h, 1.0, 1.0);
+        let paint = |buf: &mut [f32], x: usize, y: usize| {
+            let b = 4 * (y * w + x);
+            buf[b] = 0.0;
+            buf[b + 1] = 50.0;
+            buf[b + 2] = 0.3;
+        };
+        paint(&mut buf, 0, 0);
+        paint(&mut buf, 3, 0);
+        paint(&mut buf, w - 1, 2);
+        paint(&mut buf, 0, h - 1);
+        paint(&mut buf, 5, h - 1);
+        paint(&mut buf, 2, h - 1);
+        assert!(tiff_f32_is_grayscale(&buf, w, h));
+        assert!(ref_tiff_f32_is_grayscale(&buf, w, h));
+        // one step inside the border the same colour trips immediately
+        paint(&mut buf, 1, 1);
+        assert!(!tiff_f32_is_grayscale(&buf, w, h));
+        assert!(!ref_tiff_f32_is_grayscale(&buf, w, h));
+    }
+
+    // Kernel and reference must agree exactly over several shapes, over
+    // magnitudes spanning the clamp floor (sub-floor, floor neighbourhood,
+    // unit, large) plus negatives and sparse planted colour pixels (both
+    // verdicts exercised).
+    #[test]
+    fn matches_reference_over_sweep_f32() {
+        // Magnitudes chosen to straddle the 0.001 floor and the 1.01
+        // ratio: exact lanes, bit patterns via u32 shares, and
+        // near-threshold neighbours.
+        let mags = [
+            0.0f32,
+            -2.0,
+            0.0004,
+            0.0009,
+            0.001,
+            0.00101,
+            0.5,
+            1.0,
+            1.009,
+            1.01,
+            1.02,
+            3.25,
+            1e6,
+        ];
+        let shapes = [
+            (1usize, 1usize),
+            (2, 5),
+            (5, 2),
+            (3, 3),
+            (4, 4),
+            (5, 5),
+            (7, 9),
+            (16, 16),
+            (32, 21),
+        ];
+        for (si, (w, h)) in shapes.iter().enumerate() {
+            let (w, h) = (*w, *h);
+            let mut buf = vec![0f32; 4 * w * h];
+            for (i, q) in buf.chunks_exact_mut(4).enumerate() {
+                let pick = (i.wrapping_mul(2_654_435_761).wrapping_add(si)) % mags.len();
+                let base = mags[pick];
+                // neighbour lanes: same magnitude, one scaled by a
+                // near-threshold factor so some quads trip and most do not
+                let tweak = [1.0f32, 1.005, 1.02, 0.999, 0.5][i % 5];
+                q[0] = base;
+                q[1] = base * tweak;
+                q[2] = base / tweak;
+                q[3] = (i % 251) as f32;
+            }
+            assert_eq!(
+                tiff_f32_is_grayscale(&buf, w, h),
+                ref_tiff_f32_is_grayscale(&buf, w, h),
+                "shape {w}x{h} noise"
+            );
+            // mostly grey with a sparse planted colour pixel inside the
+            // interior (when the frame has one)
+            let mut buf2 = grey_frame_f32(w, h, 2.0, 1.0);
+            if w > 2 && h > 2 {
+                let b = 4 * (1 * w + 1);
+                buf2[b] = 9.0;
+            }
+            assert_eq!(
+                tiff_f32_is_grayscale(&buf2, w, h),
+                ref_tiff_f32_is_grayscale(&buf2, w, h),
+                "shape {w}x{h} planted"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_guards_no_op_f32() {
+        // empty buffer with live dims: no panic, no evidence of colour
+        assert!(tiff_f32_is_grayscale(&[], 6, 5));
+        // zero / sub-interior dims: nothing to scan
+        let buf = grey_frame_f32(6, 5, 0.0, 0.0);
+        assert!(tiff_f32_is_grayscale(&buf, 0, 0));
+        assert!(tiff_f32_is_grayscale(&buf, 6, 0));
+        assert!(tiff_f32_is_grayscale(&buf, 0, 5));
+        assert!(tiff_f32_is_grayscale(&buf, 2, 5));
+        assert!(tiff_f32_is_grayscale(&buf, 6, 2));
+        // truncated buffer: the addressable row prefix decides; colour
+        // past the cut is not read
+        let mut full = grey_frame_f32(6, 6, 1.0, 1.0);
+        let b = 4 * (4 * 6 + 4); // interior pixel in the last interior row
+        full[b] = 99.0;
+        let cut = full.len() - 2 * 4 * 6; // drop rows 4..5 entirely
+        assert!(tiff_f32_is_grayscale(&full[..cut], 6, 6));
+        assert!(!tiff_f32_is_grayscale(&full, 6, 6));
+        // colour inside the addressable prefix still trips
+        let b2 = 4 * (1 * 6 + 1);
+        full[b2] = 99.0;
+        assert!(!tiff_f32_is_grayscale(&full[..cut], 6, 6));
+    }
+
+    #[test]
+    fn ffi_round_trip_f32() {
+        let (w, h) = (9, 7);
+        let grey = grey_frame_f32(w, h, 3.0, 1.0);
+        let mut colour = grey.clone();
+        let b = 4 * (3 * w + 4);
+        colour[b] = 0.25;
+        colour[b + 1] = 7.5;
+        unsafe {
+            assert_eq!(darkroom_tiff_f32_is_grayscale(grey.as_ptr(), w, h), 1);
+            assert_eq!(darkroom_tiff_f32_is_grayscale(colour.as_ptr(), w, h), 0);
+        }
+        assert!(tiff_f32_is_grayscale(&grey, w, h));
+        assert!(!tiff_f32_is_grayscale(&colour, w, h));
+    }
+
+    #[test]
+    fn ffi_guards_f32() {
+        let buf = grey_frame_f32(4, 4, 1.0, 1.0);
+        unsafe {
+            // null pointer: no evidence of colour, grayscale assumed
+            assert_eq!(darkroom_tiff_f32_is_grayscale(std::ptr::null(), 4, 4), 1);
+            // zero dims
+            assert_eq!(darkroom_tiff_f32_is_grayscale(buf.as_ptr(), 0, 4), 1);
+            assert_eq!(darkroom_tiff_f32_is_grayscale(buf.as_ptr(), 4, 0), 1);
+            // overflowing dim product: guarded before any slice is built
+            assert_eq!(
+                darkroom_tiff_f32_is_grayscale(buf.as_ptr(), usize::MAX, 2),
+                1
+            );
+            assert_eq!(
+                darkroom_tiff_f32_is_grayscale(buf.as_ptr(), usize::MAX, usize::MAX),
+                1
+            );
+            // lanes product fits but the byte count (lanes * 4) overflows:
+            // guarded by the separate byte-count step (2^60 lanes fit,
+            // 2^62 bytes do not)
+            assert_eq!(
+                darkroom_tiff_f32_is_grayscale(
+                    buf.as_ptr(),
+                    1usize << 31,
+                    1usize << 29
                 ),
                 1
             );

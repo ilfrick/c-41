@@ -4517,10 +4517,11 @@ void darkroom_jxl_rgba_to_rgb_float(const float *in_data,
  * was written idempotently (1 -> 3 only, never back), so the OpenMP
  * schedule could not change the outcome and the serial scan is
  * result-identical. in holds 4*width*height bytes (RGBA). The shortfile
- * and dims gates, the float sibling scan, and the TIFF field writes stay
- * in C (the 16-bit sibling scan is `darkroom_tiff_u16_is_grayscale`
- * below). Null pointers, degenerate dims, and overflowing dim products
- * are guarded no-ops returning 1.
+ * and dims gates and the TIFF field writes stay in C (the 16-bit sibling
+ * scan is `darkroom_tiff_u16_is_grayscale` below, the float sibling
+ * `darkroom_tiff_f32_is_grayscale` further below). Null pointers,
+ * degenerate dims, and overflowing dim products are guarded no-ops
+ * returning 1.
  */
 int darkroom_tiff_u8_is_grayscale(const unsigned char *in, size_t width,
                                   size_t height);
@@ -4537,11 +4538,31 @@ int darkroom_tiff_u8_is_grayscale(const unsigned char *in, size_t width,
  * read. The C flag was written idempotently (1 -> 3 only, never back), so
  * the OpenMP schedule could not change the outcome and the serial scan is
  * result-identical. in holds 4*width*height uint16_t lanes (RGBA). The
- * shortfile and dims gates, the float sibling scan, and the TIFF field
- * writes stay in C. Null pointers, degenerate dims, and overflowing dim
- * products are guarded no-ops returning 1.
+ * shortfile and dims gates, and the TIFF field writes stay in C (the
+ * float sibling scan is `darkroom_tiff_f32_is_grayscale` below). Null
+ * pointers, degenerate dims, and overflowing dim products are guarded
+ * no-ops returning 1.
  */
 int darkroom_tiff_u16_is_grayscale(const uint16_t *in, size_t width,
+                                   size_t height);
+
+/*
+ * TIFF float grayscale detection (src/imageio/format/tiff.c, write_image,
+ * m4-221).
+ *
+ * darkroom_tiff_f32_is_grayscale replaces the former DT_OMP_FOR pixel loop
+ * of the 32bpp / 16-bit-float shortfile branch: returns 1 when every
+ * interior pixel has its 0.001-clamped R/G/B lane ratios within 1.01
+ * (absolute value), 0 at the first pixel that differs. The 1-pixel border
+ * is never read (pipeline edge artefacts stay excluded, as in C), and the
+ * alpha lane is never read. The C flag was written idempotently (1 -> 3
+ * only, never back), so the OpenMP schedule could not change the outcome
+ * and the serial scan is result-identical. in holds 4*width*height float
+ * lanes (RGBA). The shortfile and dims gates and the TIFF field writes
+ * stay in C. Null pointers, degenerate dims, and overflowing dim products
+ * are guarded no-ops returning 1.
+ */
+int darkroom_tiff_f32_is_grayscale(const float *in, size_t width,
                                    size_t height);
 
 #ifdef __cplusplus
