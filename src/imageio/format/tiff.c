@@ -26,6 +26,7 @@
 #include "imageio/imageio_module.h"
 #include "imageio/format/imageio_format_api.h"
 #include "develop/pixelpipe_hb.h"
+#include "rust_ffi/darkroom_core.h" // for darkroom_tiff_u8_is_grayscale
 
 #include <inttypes.h>
 #include <memory.h>
@@ -207,19 +208,17 @@ int write_image(dt_imageio_module_data_t *d_tmp, const char *filename, const voi
     }
     else // 8bpp
     {
-      DT_OMP_FOR(shared(layers) collapse(2))
-      for(int y = 1; y < d->global.height - 1; ++y)
+      // Grayscale scan ported to Rust FFI (darkroom_tiff_u8_is_grayscale
+      // in crates/c41-core/src/tiff.rs): result-identical serial scan of
+      // the same 1-px-border-excluded interior, tripping on the first
+      // pixel whose R/G/B lanes differ pairwise by more than 2. The C
+      // flag was written idempotently, so the OpenMP schedule could not
+      // change the outcome. The 16-bit and float sibling scans stay in C.
+      if(!darkroom_tiff_u8_is_grayscale((const unsigned char *)in_void,
+                                        (size_t)d->global.width,
+                                        (size_t)d->global.height))
       {
-        for(int x = 1; x < d->global.width - 1; ++x)
-        {
-          if(layers == 3) continue;
-          uint8_t *in = (uint8_t *)in_void + (size_t)(4 * (y * d->global.width + x));
-          if((abs((int)in[0] - (int)in[1]) > 2) || (abs((int)in[0] - (int)in[2]) > 2)
-             || (abs((int)in[1] - (int)in[2]) > 2))
-          {
-            layers = 3;
-          }
-        }
+        layers = 3;
       }
     }
   }
