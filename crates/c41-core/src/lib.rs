@@ -41,6 +41,7 @@ pub mod pfm;
 pub mod pipeline;
 pub mod png;
 pub mod qoi;
+pub mod ras2vect;
 pub mod raw;
 pub mod rawimage;
 pub mod rgbe;

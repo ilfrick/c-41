@@ -5421,3 +5421,32 @@ sweep-arithmetic note recorded as intended (pins carry the arithmetic).
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+### m4-223 — ras2vect bitmap threshold → Rust (2026-09-17 UTC)
+
+**Commit** (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported the bitmap threshold loop in `ras2forms`
+(`src/common/ras2vect.c:156`) to `darkroom_ras2vect_threshold_bitmap` in new
+`c41-core::ras2vect`: safe kernel + validated FFI (null/dims/stride/checked
+byte lengths, degenerate = no-op) + 7 deterministic tests (MSB-first bit order,
+word boundaries, NaN/inf pins, sweep vs reference, FFI guards). Replaced the
+C `DT_OMP_FOR` loop with the FFI call; declaration added to
+`src/rust_ffi/darkroom_core.h`. Review fix applied in-session: guard the
+previously unchecked `_bm_new()` result and initialize `*out_signs` on early
+return (reviewer judged the allocation deref a should-fix adjacent to the port).
+
+**Review.** Independent senior-reviewer agent: no introduced correctness or FFI
+defects; one should-fix (pre-existing unchecked `_bm_new()` deref + signed
+stride overflow), fixed in-session and re-reviewed: the follow-up review
+approved the guard diff (checked `size_t` stride with INT_MAX/SIZE_MAX/
+PTRDIFF_MAX bounds; `*out_signs` initialized before every early return) and
+confirmed all three callers (`rasterfile.c`, `object.c` ×2) handle NULL safely.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy --all-targets,
+release tests, `c41-rs` link), re-run after the guard fix. One hiccup: a
+root-owned `target/release/.fingerprint` directory (from a prior Docker run as
+root) blocked the local cargo test build; removed/chowned via the `rust:1`
+image. Changed C translation unit compiled locally under Release `-Werror`
+(GCC 13, real deps, compile_commands entry) exit 0; full C app build still
+only covered by the CI "CMake + Rust workspace" job after push.

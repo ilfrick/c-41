@@ -16,10 +16,14 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <potracelib.h>
 
 #include "develop/masks.h"
+
+#include "rust_ffi/darkroom_core.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -39,13 +43,21 @@
 static potrace_bitmap_t *_bm_new(const int w,
                                  const int h)
 {
+  if(w <= 0 || h <= 0) return NULL;
+
+  const size_t dy = (size_t)w / BM_WORDBITS + ((size_t)w % BM_WORDBITS != 0);
+  if(dy > INT_MAX
+     || dy > SIZE_MAX / sizeof(potrace_word) / (size_t)h
+     || dy > PTRDIFF_MAX / sizeof(potrace_word) / (size_t)h)
+    return NULL;
+
+  const size_t total_words = dy * (size_t)h;
   potrace_bitmap_t *bm = calloc(1, sizeof(*bm));
   if(!bm) return NULL;
 
   bm->w = w;
   bm->h = h;
-  bm->dy = (w + BM_WORDBITS - 1) / BM_WORDBITS; /* words per scanline */
-  const size_t total_words = (size_t)bm->dy * h;
+  bm->dy = (int)dy;
   bm->map = calloc(total_words, sizeof(potrace_word));
 
   if(!bm->map)
@@ -144,30 +156,21 @@ GList *ras2forms(const float *mask,
                  const double alphamax,
                  GList **out_signs)
 {
+  if(out_signs) *out_signs = NULL;
+  if(!mask || width <= 0 || height <= 0) return NULL;
+  if((size_t)width > SIZE_MAX / sizeof(*mask) / (size_t)height
+     || (size_t)width > PTRDIFF_MAX / sizeof(*mask) / (size_t)height)
+    return NULL;
+
   GList *forms = NULL;
   GList *signs = NULL;
 
   //  create bitmap mask for potrace
 
   potrace_bitmap_t *bm = _bm_new(width, height);
+  if(!bm) return NULL;
 
-  DT_OMP_FOR()
-  for(int y=0; y < height; y++)
-  {
-    for(int x=0; x < width; x++)
-    {
-      const int index = x + y * width;
-      if(mask[index] < threshold)
-      {
-        // black enough to be a point of the form
-        BM_USET(bm, x, y);
-      }
-      else
-      {
-        BM_UCLR(bm, x, y);
-      }
-    }
-  }
+  darkroom_ras2vect_threshold_bitmap(bm->map, bm->dy, width, height, mask, threshold);
 
   potrace_param_t *param = potrace_param_default();
   // finer path possible

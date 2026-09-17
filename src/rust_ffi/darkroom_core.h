@@ -4059,6 +4059,27 @@ void darkroom_xcf_mask_to_u16(const float *mask, unsigned short *out,
                               size_t npixels);
 
 /*
+ * Raster-to-vector threshold scan (common/ras2vect.c, ras2forms, m4-223).
+ *
+ * darkroom_ras2vect_threshold_bitmap replaces the former DT_OMP_FOR row
+ * loop that seeds the potrace bitmap: per pixel (x, y),
+ * map[y * dy + x / WORD_BITS] has bit HIBIT >> (x % WORD_BITS) set when
+ * mask[y * width + x] < threshold, cleared otherwise (MSB-first layout,
+ * matching the BM_USET/BM_UCLR macros in ras2vect.c). Upstream
+ * potracelib.h defines potrace_word as unsigned long, so the Rust
+ * c_ulong plane tracks the C word width on every platform. The C caller
+ * passes the freshly calloc'd bm->map with bm->dy words per scanline;
+ * bitmap allocation, potrace tracing, and path building stay in C;
+ * ras2vect.c now has zero DT_OMP_FOR sites. Null pointers,
+ * non-positive dims, insufficient row stride, overflowing products and
+ * lengths exceeding Rust's slice byte limit are guarded no-ops. Buffers
+ * must be initialized, aligned and non-overlapping; row padding is preserved.
+ */
+void darkroom_ras2vect_threshold_bitmap(unsigned long *map, int dy, int width,
+                                        int height, const float *mask,
+                                        float threshold);
+
+/*
  * Heal split-subtract (heal.c, _heal_sub, m4-177).
  *
  * darkroom_heal_sub replaces the former DT_OMP_FOR row loop plus the
