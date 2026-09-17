@@ -3749,6 +3749,9 @@ void darkroom_png_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
  */
 void darkroom_imageio_swap_rb(unsigned char *buf, size_t npixels);
 
+void darkroom_imageio_flip_buffers_unoriented(char *out, const char *in,
+                                              size_t bpp, int wd, int ht, int stride);
+
 /*
  * 8-bit to float normalise (imageio.c, dt_imageio_flip_buffers_ui8_to_float,
  * m4-206).

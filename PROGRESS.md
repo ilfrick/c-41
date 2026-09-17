@@ -5450,3 +5450,35 @@ root) blocked the local cargo test build; removed/chowned via the `rust:1`
 image. Changed C translation unit compiled locally under Release `-Werror`
 (GCC 13, real deps, compile_commands entry) exit 0; full C app build still
 only covered by the CI "CMake + Rust workspace" job after push.
+
+### m4-224 — unoriented imageio byte-row copy → Rust (2026-09-17 19:45 UTC)
+
+**Previous increment.** m4-223 commit `358c1c823e` is verified on GitHub and
+Gitea. All three active CI checks completed successfully, including the full
+Release CMake job. Earlier local full-build attempts failed at missing
+intltool or remote cloning; the dependency-equipped attempt failed in
+RawSpeed ZLIB configuration. The local changed-TU compile passed separately.
+
+**What.** Replaced only the unoriented row-copy loop in
+`dt_imageio_flip_buffers` with `darkroom_imageio_flip_buffers_unoriented`.
+Added a safe byte kernel, checked exact spans, raw bulk-copy FFI and eight
+unit tests in `c41-core::imageio`. Oriented branches and callers are unchanged.
+Zero stride repeats a row; a single row ignores even negative stride. Raw
+copies preserve uninitialized storage without creating foreign slices.
+
+**Review.** Independent senior review found three fidelity/contract issues:
+zero-stride and negative-single-row rejection, an unnecessary stride-times-
+height bound, and an overly strict source initialization contract. All were
+fixed and independently re-reviewed with approval. Tests cover bytes-per-pixel
+1/2/3/4/16, short and padded strides, exact spans, sentinels, overflow guards,
+and uninitialized output/input padding. Removing OpenMP remains unbenchmarked.
+
+**Verified.** After review fixes, `scripts/ci-local.sh` exited 0 for workspace
+check, all-targets Clippy, release tests, and the release application link.
+`src/imageio/imageio.c` compiled in Docker with real dependencies and cached
+Release flags including `-O3 -DNDEBUG -Werror`, exit 0. `git diff --check`
+passed. Existing warnings remain. During development, host tests encountered
+target permissions and an extra full-debug run aborted in the existing
+bilateral test; the new module tests and required release suite passed.
+No UI-parity audit item is resolved by this shared-infrastructure-only port.
+Remote CI for this increment is pending publication.

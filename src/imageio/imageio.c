@@ -871,9 +871,7 @@ void dt_imageio_flip_buffers(char *out,
 {
   if(!orientation)
   {
-    DT_OMP_FOR()
-    for(int j = 0; j < ht; j++)
-      memcpy(out + (size_t)j * bpp * wd, in + (size_t)j * stride, bpp * wd);
+    darkroom_imageio_flip_buffers_unoriented(out, in, bpp, wd, ht, stride);
     return;
   }
   int ii = 0;
