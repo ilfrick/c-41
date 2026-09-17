@@ -5396,3 +5396,28 @@ literals.
 tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
 (only the block terminator). Remaining warnings are pre-existing and outside
 this change.
+
+---
+
+## 2026-09-17 08:40 UTC — m4-222: port J2K sycc422 loop to Rust FFI
+
+**Commit** `f7079c18f9` (GitHub + Gitea via `git push origin master`)
+
+**What.** Ported only `sycc422_to_rgb` (`src/imageio/imageio_j2k.c`) replacing
+it with `darkroom_j2k_sycc422_to_rgb`. Extended `c41-core::j2k` (safe kernel,
+divergent reference, validated FFI, 6 tests — full-stride chroma rows, shared
+`sycc_pixel` scalar so kernel and ref cannot drift, odd-width tail left
+untouched where C steps OOB, exact-touched-length chroma slices); declared the
+export in `src/rust_ffi/darkroom_core.h` after the 444 entry. The 420 variant
+(with suspected *cr bug), calloc/plane hand-off, and all unrelated files
+untouched.
+
+**Review.** Independent senior-reviewer agent: **APPROVE-WITH-FIXES**, no P0
+(P1 was the unexecuted gate; three P2 notes). Fixed in-session: include comment
+covers all three j2k imports, kernel doc says maxw-below-2. The shared-helper
+sweep-arithmetic note recorded as intended (pins carry the arithmetic).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: cargo check, clippy, release
+tests, and the `c41-rs` release link. Header addition scanned for embedded `*/`
+(only the block terminator). Remaining warnings are pre-existing and outside
+this change.
