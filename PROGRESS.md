@@ -5550,5 +5550,12 @@ signed-OOB behavior is intentionally safer, unreachable from real callers;
 `git diff --check` clean. Remaining warnings are pre-existing and outside this
 change (color parens, highlights assignments, bilateral/dwt dead-code refs,
 `clone!` deprecations, `style_context`). Host `cargo test` was not used (no
-host toolchain; missing lensfun). Changed-C Release `-Werror` compile and
-remote CI confirmation follow commit/push per workflow.
+host toolchain; missing lensfun). Remote CI on `2d2b3de1d0` is green:
+`check + test + clippy`, `CMake + Rust workspace, Ubuntu 24.04 (Release, GCC)`
+(which covers the changed-C Release `-Werror` compile), and `Build & push
+Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
+remotes (`origin` GitHub + Gitea) verified at `2d2b3de1d0`. Note: the first
+`git push origin master` failed on GitHub auth (stale `gh` helper token
+overriding `.netrc`); `git push gitea master` succeeded, and after the GitHub
+token in `~/.netrc` was refreshed the push succeeded with the `gh` helpers
+bypassed (`-c credential.https://github.com.helper=`).
