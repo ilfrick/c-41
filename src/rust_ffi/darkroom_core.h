@@ -3734,6 +3734,21 @@ void darkroom_png_u8_to_float(const unsigned char *rgb_buf, float *mipbuf,
 void darkroom_png_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
                                size_t npixels);
 
+// PNM PGM 8-bit gray-row normalize (imageio_pnm.c, dt_imageio_open_pnm,
+// m4-228).
+//
+// darkroom_pnm_pgm_u8_row_to_float replaces the inner per-pixel loop of
+// the max <= 255 branch of _read_pgm: per column x, out[4*x + c] =
+// (float)line[x] / (float)max for c in 0..2, and out[4*x + 3] = 0.0
+// (the explicitly zeroed alpha lane). The division is replayed per
+// lane, not via a precomputed reciprocal. The row fread, the line
+// allocation, and the PBM/PPM/16-bit sibling branches stay in C. out
+// holds 4*width floats, line holds width bytes; null pointers, a zero
+// width, a zero max, and an overflowing 4*width product are guarded
+// no-ops; the buffers must not overlap.
+void darkroom_pnm_pgm_u8_row_to_float(float *out, const unsigned char *line,
+                                      size_t width, unsigned int max);
+
 /*
  * 8-bit export R/B lane swap (imageio.c, dt_imageio_export_with_flags,
  * m4-205).

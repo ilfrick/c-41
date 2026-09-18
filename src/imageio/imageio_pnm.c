@@ -19,6 +19,7 @@
 #include "common/darktable.h"
 #include "develop/imageop.h"         // for IOP_CS_RGB
 #include "imageio/imageio_pfm.h"
+#include "rust_ffi/darkroom_core.h"  // for darkroom_pnm_pgm_u8_row_to_float
 
 #include <assert.h>
 #include <errno.h>
@@ -95,13 +96,12 @@ static dt_imageio_retval_t _read_pgm(dt_image_t *img, FILE*f, float *buf)
         result = DT_IMAGEIO_FILE_CORRUPTED;
         break;
       }
-      for(size_t x = 0; x < img->width; x++)
-      {
-        float value = (float)line[x] / (float)max;
-        buf_iter[0] = buf_iter[1] = buf_iter[2] = value;
-        buf_iter[3] = 0.0;
-        buf_iter += 4;
-      }
+      // 8-bit gray-row normalize loop ported to Rust FFI (m4-228): each
+      // line byte scales by 1/max into the RGB lanes of the 4-channel
+      // float mipmap row, alpha lane zeroed, as before. The row fread
+      // above and the 16-bit pair branch below stay in C.
+      darkroom_pnm_pgm_u8_row_to_float(buf_iter, line, (size_t)img->width, max);
+      buf_iter += (size_t)4 * img->width;
     }
     free(line);
   }

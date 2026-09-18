@@ -5601,3 +5601,40 @@ overran the 64-lane stack fixture at FFI level, SIGSEGV — FFI takes no lengths
 by C-signature necessity; fixed by skipping that row at FFI level with a
 documented caller-size-contract comment, covered in the safe-kernel test).
 Remote CI confirmation follows commit/push per workflow.
+
+### m4-228 — PNM PGM 8-bit gray-row normalize → Rust (2026-09-18 UTC)
+
+**Previous increment.** m4-227 commit `b09f6f00f2` verified on both remotes;
+Docker image, Rust checks/tests/Clippy, and Release CMake CI all succeeded.
+
+**What.** Ported the 8-bit row loop of `_read_pgm` (`src/imageio/imageio_pnm.c`,
+`max <= 255` branch) to `darkroom_pnm_pgm_u8_row_to_float` in
+`c41-core::imageio`: safe kernel `pnm_pgm_u8_row_to_float` + divergent
+reference + `void` FFI + 5 tests, header declaration, C inner loop replaced
+by the FFI call with cursor advance preserved. Per-pixel
+`line[x] as f32 / max as f32` (denominator hoisted once — bit-identical, true
+division, never reciprocal-multiply), RGB fan-out, alpha explicitly `+0.0`.
+Row `fread`, PBM/PPM/16-bit branches untouched. **LIVE in production**: the
+branch runs on every 8-bit PGM import (`dt_imageio_open_pnm` registered for
+P4/P5/P6). Developer survey note: remaining `DT_OMP_FOR`s in common/develop/
+imageio are ported, classified-out, dead, or GUI/debug-only (not
+independently audited here).
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**. Verified C promotion fidelity, `max==0` pre-rejection at
+`imageio_pnm.c:85`, P4/P5/P6 registration, cursor-advance equivalence, FFI
+guards (null/width/max/checked `4*width`), genuine reference divergence
+(source-enumerate vs output-quad walk), `to_bits` + sentinel + `MaybeUninit`
+coverage, C-side include/`-Werror` cleanliness. Three wording/coverage nits;
+fixed in-session: header + kernel docs now say "explicitly zeroed alpha lane"
+and state hoisting bit-identicalness precisely. The optional exhaustive
+`0..=255` sweep was declined to keep the diff minimal (rails + LCG sweep
+deemed adequate). Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, all-targets Clippy
+with warning count byte-identical to the stashed baseline — zero new, release
+tests, `c41-rs` link). Changed TU `src/imageio/imageio_pnm.c` compiled in the
+dependency image with cached Release flags + `-Werror -Wfatal-errors`, exit 0,
+no output. `git diff --check` clean; no `/*`/`*/` in added lines. Release
+`c41-core` suite: 1606 passed (1601 existing + 5 new), 0 failed.
+Remote CI confirmation follows commit/push per workflow.
