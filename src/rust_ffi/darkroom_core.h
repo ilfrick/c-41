@@ -3754,6 +3754,10 @@ int darkroom_imageio_has_mono_rgbx(const unsigned char *inp, int32_t width, int3
 void darkroom_imageio_flip_buffers_unoriented(char *out, const char *in,
                                               size_t bpp, int wd, int ht, int stride);
 
+int darkroom_imageio_flip_buffers_oriented(char *out, const char *in,
+                                         size_t bpp, int wd, int ht, int fwd, int fht,
+                                         int stride, int orientation);
+
 /*
  * 8-bit to float normalise (imageio.c, dt_imageio_flip_buffers_ui8_to_float,
  * m4-206).

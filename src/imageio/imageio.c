@@ -862,37 +862,7 @@ void dt_imageio_flip_buffers(char *out,
     darkroom_imageio_flip_buffers_unoriented(out, in, bpp, wd, ht, stride);
     return;
   }
-  int ii = 0;
-  int jj = 0;
-  int si = bpp;
-  int sj = wd * bpp;
-  if(orientation & ORIENTATION_SWAP_XY)
-  {
-    sj = bpp;
-    si = ht * bpp;
-  }
-  if(orientation & ORIENTATION_FLIP_Y)
-  {
-    jj = (int)fht - jj - 1;
-    sj = -sj;
-  }
-  if(orientation & ORIENTATION_FLIP_X)
-  {
-    ii = (int)fwd - ii - 1;
-    si = -si;
-  }
-  DT_OMP_FOR()
-  for(int j = 0; j < ht; j++)
-  {
-    char *out2 = out + (size_t)labs(sj) * jj + (size_t)labs(si) * ii + (size_t)sj * j;
-    const char *in2 = in + (size_t)stride * j;
-    for(int i = 0; i < wd; i++)
-    {
-      memcpy(out2, in2, bpp);
-      in2 += bpp;
-      out2 += si;
-    }
-  }
+  darkroom_imageio_flip_buffers_oriented(out, in, bpp, wd, ht, fwd, fht, stride, (int)orientation);
 }
 
 void dt_imageio_flip_buffers_ui8_to_float(float *out,

@@ -5515,3 +5515,40 @@ release tests, release application link). The changed C translation unit
 compiled in the dependency-equipped Docker image with Release `-Werror`,
 exit 0. `git diff --check` passed. Existing unrelated warnings remain;
 remote CI for m4-225 is pending publication.
+
+### m4-226 — oriented imageio flip_buffers branch → Rust (2026-09-18 07:20 UTC)
+
+**What.** Ported the oriented branch of `dt_imageio_flip_buffers`
+(`src/imageio/imageio.c`) to `darkroom_imageio_flip_buffers_oriented` in
+`c41-core::imageio`: checked `OrientedLayout` helper, safe byte-slice kernel,
+raw `copy_nonoverlapping` FFI returning 1/0 (C call-site discards the result),
+declaration in `src/rust_ffi/darkroom_core.h`. The `DT_OMP_FOR` row loop and
+`si/sj/ii/jj` bookkeeping are replaced by a single FFI call; the m4-224
+unoriented branch and all callers (`flip.c` ×2 oriented with `fwd==wd`,
+`fht==ht`; libraw/rawspeed pass `ORIENTATION_NONE`) are untouched. Flips apply
+in source axes then transpose; destination pitch uses `wd`/`ht` while
+`fwd`/`fht` only define flip origins. Degenerate dims/stride/overflow/length
+failures are checked no-ops (return 0, `out` untouched); `ht==1` ignores
+stride; `orientation` low 3 bits masked so `-1 ≡ 7`.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no blockers. Three should-fix + four nits; four applied in a
+follow-up subagent: (1) new `oriented_golden_vectors_from_c_formula` test with
+hand-derived goldens from the pre-m4-226 C loop (`wd=2, ht=3, bpp=1`: ori 5 →
+`[4,2,0,5,3,1]`, ori 6 → `[1,3,5,0,2,4]`, ori -1≡7 → `[5,3,1,4,2,0]`,
+safe + FFI asserted); (2) 64-bit-only skip now has a caller-size-contract
+comment; (4) unrelated rustfmt churn reverted so `imageio.rs` is a pure
++610-line addition; (6) `-1` transverse coverage added. Deferred: (3) serial
+port drops `DT_OMP_FOR` row parallelism — correctness unaffected, recorded
+here as an unbenchmarked perf trade-off; (5) degenerate-input no-op vs old C
+signed-OOB behavior is intentionally safer, unreachable from real callers;
+(7) optional `debug_assert`s skipped to keep the diff minimal.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: `cargo check --workspace`,
+`cargo clippy --workspace --all-targets`, `cargo test --workspace --release`
+(403 passed), and the `cargo build --release -p c41 --bin c41-rs` link.
+`git diff --check` clean. Remaining warnings are pre-existing and outside this
+change (color parens, highlights assignments, bilateral/dwt dead-code refs,
+`clone!` deprecations, `style_context`). Host `cargo test` was not used (no
+host toolchain; missing lensfun). Changed-C Release `-Werror` compile and
+remote CI confirmation follow commit/push per workflow.

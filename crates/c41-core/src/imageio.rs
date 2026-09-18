@@ -374,11 +374,621 @@ pub unsafe extern "C" fn darkroom_imageio_flip_buffers_unoriented(
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct OrientedLayout {
+    x_origin: Option<usize>,
+    y_origin: Option<usize>,
+    x_pitch: usize,
+    y_pitch: usize,
+    in_bytes: usize,
+    out_bytes: usize,
+}
+
+fn oriented_layout(
+    bpp: usize,
+    wd: usize,
+    ht: usize,
+    fwd: usize,
+    fht: usize,
+    stride: usize,
+    orientation: i32,
+) -> Option<OrientedLayout> {
+    if bpp == 0 || wd == 0 || ht == 0 || fwd == 0 || fht == 0 {
+        return None;
+    }
+    let x_origin = if orientation & 2 != 0 {
+        fwd.checked_sub(wd)?;
+        Some(fwd - 1)
+    } else {
+        None
+    };
+    let y_origin = if orientation & 1 != 0 {
+        fht.checked_sub(ht)?;
+        Some(fht - 1)
+    } else {
+        None
+    };
+    let (x_pitch, y_pitch) = if orientation & 4 != 0 {
+        (ht, 1)
+    } else {
+        (1, wd)
+    };
+    let out_bytes = x_origin
+        .unwrap_or(wd - 1)
+        .checked_mul(x_pitch)?
+        .checked_add(y_origin.unwrap_or(ht - 1).checked_mul(y_pitch)?)?
+        .checked_add(1)?
+        .checked_mul(bpp)?;
+    let in_bytes = (ht - 1)
+        .checked_mul(stride)?
+        .checked_add(wd.checked_mul(bpp)?)?;
+    if out_bytes > isize::MAX as usize || in_bytes > isize::MAX as usize {
+        return None;
+    }
+    Some(OrientedLayout {
+        x_origin,
+        y_origin,
+        x_pitch,
+        y_pitch,
+        in_bytes,
+        out_bytes,
+    })
+}
+
+impl OrientedLayout {
+    fn destination(&self, i: usize, j: usize, bpp: usize) -> usize {
+        let x = self.x_origin.map_or(i, |origin| origin - i);
+        let y = self.y_origin.map_or(j, |origin| origin - j);
+        (x * self.x_pitch + y * self.y_pitch) * bpp
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flip_buffers_oriented(
+    out: &mut [u8],
+    inp: &[u8],
+    bpp: usize,
+    wd: usize,
+    ht: usize,
+    fwd: usize,
+    fht: usize,
+    stride: usize,
+    orientation: i32,
+) {
+    let Some(layout) = oriented_layout(bpp, wd, ht, fwd, fht, stride, orientation) else {
+        return;
+    };
+    if out.len() < layout.out_bytes || inp.len() < layout.in_bytes {
+        return;
+    }
+    for j in 0..ht {
+        for i in 0..wd {
+            let src = j * stride + i * bpp;
+            let dst = layout.destination(i, j, bpp);
+            out[dst..dst + bpp].copy_from_slice(&inp[src..src + bpp]);
+        }
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imageio_flip_buffers_oriented(
+    out: *mut std::ffi::c_char,
+    inp: *const std::ffi::c_char,
+    bpp: usize,
+    wd: std::ffi::c_int,
+    ht: std::ffi::c_int,
+    fwd: std::ffi::c_int,
+    fht: std::ffi::c_int,
+    stride: std::ffi::c_int,
+    orientation: std::ffi::c_int,
+) -> std::ffi::c_int {
+    if out.is_null()
+        || inp.is_null()
+        || wd <= 0
+        || ht <= 0
+        || fwd <= 0
+        || fht <= 0
+        || (stride < 0 && ht > 1)
+    {
+        return 0;
+    }
+    let stride = if ht == 1 { 0 } else { stride as usize };
+    let (wd, ht) = (wd as usize, ht as usize);
+    let Some(layout) =
+        oriented_layout(bpp, wd, ht, fwd as usize, fht as usize, stride, orientation)
+    else {
+        return 0;
+    };
+    for j in 0..ht {
+        for i in 0..wd {
+            std::ptr::copy_nonoverlapping(
+                inp.cast::<u8>().add(j * stride + i * bpp),
+                out.cast::<u8>().add(layout.destination(i, j, bpp)),
+                bpp,
+            );
+        }
+    }
+    1
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ref_oriented_mapping(
+        bpp: usize,
+        wd: usize,
+        ht: usize,
+        fwd: usize,
+        fht: usize,
+        stride: usize,
+        orientation: i32,
+    ) -> Vec<(usize, usize)> {
+        let (dx, dy) = if orientation & 4 == 0 {
+            (1i128, wd as i128)
+        } else {
+            (ht as i128, 1i128)
+        };
+        let (base_x, step_x) = if orientation & 2 == 0 {
+            (0, dx)
+        } else {
+            ((fwd as i128 - 1) * dx, -dx)
+        };
+        let (base_y, step_y) = if orientation & 1 == 0 {
+            (0, dy)
+        } else {
+            ((fht as i128 - 1) * dy, -dy)
+        };
+        (0..bpp * wd * ht)
+            .map(|byte| {
+                let pixel = byte / bpp;
+                let dst_pixel =
+                    base_x + base_y + step_x * (pixel % wd) as i128 + step_y * (pixel / wd) as i128;
+                let dst = usize::try_from(dst_pixel).unwrap() * bpp + byte % bpp;
+                let src = (pixel / wd) * stride + byte % (wd * bpp);
+                (dst, src)
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_oriented_case(
+        bpp: usize,
+        wd: usize,
+        ht: usize,
+        fwd: usize,
+        fht: usize,
+        stride: usize,
+        orientation: i32,
+        bits: bool,
+    ) {
+        let mapping = ref_oriented_mapping(bpp, wd, ht, fwd, fht, stride, orientation);
+        let in_bytes = mapping.iter().map(|&(_, src)| src + 1).max().unwrap();
+        let out_bytes = mapping.iter().map(|&(dst, _)| dst + 1).max().unwrap();
+        let pattern: Vec<u8> = [0x7fc1_2345u32, 0x8000_0000, 0, 0xffa5_4321]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        let inp: Box<[u8]> = (0..in_bytes)
+            .map(|i| {
+                if bits {
+                    pattern[i % pattern.len()]
+                } else {
+                    ((i as u64 * 2_654_435_761 + 0x9E37) % 256) as u8
+                }
+            })
+            .collect();
+        let original = inp.clone();
+        let mut expected = vec![0xCD; out_bytes + 2];
+        for &(dst, src) in &mapping {
+            expected[1 + dst] = inp[src];
+        }
+        let mut safe = vec![0xCD; out_bytes + 2];
+        let mut ffi = safe.clone();
+        flip_buffers_oriented(
+            &mut safe[1..1 + out_bytes],
+            &inp,
+            bpp,
+            wd,
+            ht,
+            fwd,
+            fht,
+            stride,
+            orientation,
+        );
+        assert_eq!(
+            safe, expected,
+            "safe: {bpp}/{wd}/{ht}/{fwd}/{fht}/{stride}/{orientation}"
+        );
+        assert_eq!(
+            unsafe {
+                darkroom_imageio_flip_buffers_oriented(
+                    ffi.as_mut_ptr().add(1).cast(),
+                    inp.as_ptr().cast(),
+                    bpp,
+                    wd as i32,
+                    ht as i32,
+                    fwd as i32,
+                    fht as i32,
+                    stride as i32,
+                    orientation,
+                )
+            },
+            1
+        );
+        assert_eq!(
+            ffi, expected,
+            "ffi: {bpp}/{wd}/{ht}/{fwd}/{fht}/{stride}/{orientation}"
+        );
+        let mut exact = vec![0xCD; out_bytes].into_boxed_slice();
+        assert_eq!(
+            unsafe {
+                darkroom_imageio_flip_buffers_oriented(
+                    exact.as_mut_ptr().cast(),
+                    inp.as_ptr().cast(),
+                    bpp,
+                    wd as i32,
+                    ht as i32,
+                    fwd as i32,
+                    fht as i32,
+                    stride as i32,
+                    orientation,
+                )
+            },
+            1
+        );
+        assert_eq!(&*exact, &expected[1..1 + out_bytes]);
+        assert_eq!(inp, original);
+    }
+
+    #[test]
+    fn oriented_matches_reference_all_flags_shapes_bpp_strides() {
+        for orientation in 0..8 {
+            for (wd, ht) in [(1, 1), (7, 1), (1, 9), (3, 5), (5, 3), (17, 9)] {
+                for bpp in [1, 2, 3, 4, 16] {
+                    for stride in [0, 1, bpp * wd - 1, bpp * wd, bpp * wd + 7] {
+                        assert_oriented_case(bpp, wd, ht, wd, ht, stride, orientation, false);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oriented_displaced_and_unused_extents_exact_spans_and_gaps() {
+        for orientation in 0..8 {
+            for (wd, ht) in [(1, 1), (1, 7), (9, 1), (3, 5), (5, 3)] {
+                for fwd in [wd, wd + 1, wd + 7] {
+                    for fht in [ht, ht + 2, ht + 9] {
+                        assert_oriented_case(3, wd, ht, fwd, fht, 3 * wd + 5, orientation, false);
+                    }
+                }
+                let fwd = if orientation & 2 == 0 { 1 } else { wd };
+                let fht = if orientation & 1 == 0 { 1 } else { ht };
+                assert_oriented_case(2, wd, ht, fwd, fht, 0, orientation, false);
+            }
+        }
+        assert_oriented_case(4, 3, 5, 3, 5, 12, 0x78, false);
+    }
+
+    #[test]
+    fn oriented_preserves_nan_signed_zero_and_alpha_bytes() {
+        for orientation in 0..8 {
+            for bpp in [1, 2, 3, 4, 16] {
+                for (wd, ht) in [(3, 5), (5, 3)] {
+                    for stride in [0, bpp * wd - 1, bpp * wd, bpp * wd + 5] {
+                        assert_oriented_case(bpp, wd, ht, wd, ht, stride, orientation, true);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oriented_single_row_ignores_signed_stride() {
+        let inp = [1u8, 2, 3, 4, 5, 6];
+        for orientation in 0..8 {
+            let mut expected = [0; 6];
+            for (dst, src) in ref_oriented_mapping(2, 3, 1, 3, 1, 0, orientation) {
+                expected[dst] = inp[src];
+            }
+            for stride in [i32::MIN, -1, 0, 1, i32::MAX] {
+                let mut out = [0; 6];
+                assert_eq!(
+                    unsafe {
+                        darkroom_imageio_flip_buffers_oriented(
+                            out.as_mut_ptr().cast(),
+                            inp.as_ptr().cast(),
+                            2,
+                            3,
+                            1,
+                            3,
+                            1,
+                            stride,
+                            orientation,
+                        )
+                    },
+                    1
+                );
+                assert_eq!(out, expected);
+            }
+            let mut out = [0; 6];
+            flip_buffers_oriented(&mut out, &inp, 2, 3, 1, 3, 1, usize::MAX, orientation);
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn oriented_ffi_maybe_uninit_payload_padding_and_output() {
+        use std::mem::MaybeUninit;
+
+        for orientation in 0..8 {
+            for bpp in [1, 2, 3, 4, 16] {
+                let (wd, ht, fwd, fht) = (3, 5, 6, 7);
+                for stride in [0, 1, bpp * wd, bpp * wd + 5] {
+                    let mapping = ref_oriented_mapping(bpp, wd, ht, fwd, fht, stride, orientation);
+                    let in_bytes = mapping.iter().map(|&(_, src)| src + 1).max().unwrap();
+                    let out_bytes = mapping.iter().map(|&(dst, _)| dst + 1).max().unwrap();
+                    for partial_payload in [false, true] {
+                        let mut inp =
+                            vec![MaybeUninit::<u8>::uninit(); in_bytes].into_boxed_slice();
+                        let mut out =
+                            vec![MaybeUninit::<u8>::uninit(); out_bytes].into_boxed_slice();
+                        for &(_, src) in &mapping {
+                            if !partial_payload || src % 3 == 0 {
+                                inp[src].write((src % 251) as u8);
+                            }
+                        }
+                        assert_eq!(
+                            unsafe {
+                                darkroom_imageio_flip_buffers_oriented(
+                                    out.as_mut_ptr().cast(),
+                                    inp.as_ptr().cast(),
+                                    bpp,
+                                    wd as i32,
+                                    ht as i32,
+                                    fwd as i32,
+                                    fht as i32,
+                                    stride as i32,
+                                    orientation,
+                                )
+                            },
+                            1
+                        );
+                        for &(dst, src) in &mapping {
+                            if !partial_payload || src % 3 == 0 {
+                                assert_eq!(unsafe { out[dst].assume_init() }, (src % 251) as u8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oriented_safe_degenerate_overflow_and_short_buffers() {
+        let limit = isize::MAX as usize;
+        for (bpp, wd, ht, fwd, fht, stride, orientation) in [
+            (0, 2, 2, 2, 2, 2, 7),
+            (1, 0, 2, 2, 2, 2, 7),
+            (1, 2, 0, 2, 2, 2, 7),
+            (1, 2, 2, 0, 2, 2, 0),
+            (1, 2, 2, 2, 0, 2, 0),
+            (1, 2, 2, 1, 2, 2, 2),
+            (1, 2, 2, 2, 1, 2, 1),
+            (usize::MAX, 2, 1, 2, 1, 0, 2),
+            (1, 1, 2, 1, 2, usize::MAX, 1),
+            (1, 1, 2, 1, 2, limit, 1),
+            (limit + 1, 1, 1, 1, 1, 0, 7),
+            (limit, 1, 2, 1, 2, 0, 7),
+            (1, 2, 2, usize::MAX, 2, 0, 6),
+            (1, 2, 2, 2, usize::MAX, 0, 1),
+            (1, 1, 1, usize::MAX, 2, 0, 3),
+            (1, usize::MAX, 1, usize::MAX, 1, 0, 0),
+            (1, 1, usize::MAX, 1, usize::MAX, 0, 0),
+        ] {
+            assert_eq!(
+                oriented_layout(bpp, wd, ht, fwd, fht, stride, orientation),
+                None
+            );
+            let mut out = [7; 16];
+            flip_buffers_oriented(
+                &mut out,
+                &[9; 16],
+                bpp,
+                wd,
+                ht,
+                fwd,
+                fht,
+                stride,
+                orientation,
+            );
+            assert_eq!(out, [7; 16]);
+        }
+        for orientation in 0..8 {
+            let mapping = ref_oriented_mapping(3, 3, 5, 6, 7, 11, orientation);
+            let out_bytes = mapping.iter().map(|&(dst, _)| dst + 1).max().unwrap();
+            let in_bytes = 53;
+            let inp = vec![9; in_bytes];
+            for short in 0..out_bytes {
+                let mut out = vec![7; out_bytes];
+                flip_buffers_oriented(&mut out[..short], &inp, 3, 3, 5, 6, 7, 11, orientation);
+                assert!(out.iter().all(|&byte| byte == 7));
+            }
+            for short in 0..in_bytes {
+                let mut out = vec![7; out_bytes];
+                flip_buffers_oriented(&mut out, &inp[..short], 3, 3, 5, 6, 7, 11, orientation);
+                assert!(out.iter().all(|&byte| byte == 7));
+            }
+        }
+    }
+
+    #[test]
+    fn oriented_layout_actual_span_boundaries() {
+        let limit = isize::MAX as usize;
+        let layout = oriented_layout(1, 1, 2, 1, 2, limit - 1, 7).unwrap();
+        assert_eq!((layout.in_bytes, layout.out_bytes), (limit, 2));
+        assert_eq!(oriented_layout(1, 1, 2, 1, 2, limit, 7), None);
+        for orientation in 0..8 {
+            let layout = oriented_layout(limit, 1, 1, 1, 1, usize::MAX, orientation).unwrap();
+            assert_eq!((layout.in_bytes, layout.out_bytes), (limit, limit));
+            assert_eq!(oriented_layout(limit + 1, 1, 1, 1, 1, 0, orientation), None);
+        }
+        for (fwd, fht, orientation) in [(limit, 1, 2), (1, limit, 1)] {
+            let layout = oriented_layout(1, 1, 1, fwd, fht, 0, orientation).unwrap();
+            assert_eq!((layout.in_bytes, layout.out_bytes), (1, limit));
+            assert_eq!(
+                oriented_layout(1, 1, 1, fwd + 1, fht + 1, 0, orientation),
+                None
+            );
+        }
+        let layout = oriented_layout(1, 2, 3, usize::MAX, usize::MAX, 2, 4).unwrap();
+        assert_eq!((layout.in_bytes, layout.out_bytes), (6, 6));
+    }
+
+    #[test]
+    fn oriented_ffi_null_dimension_negative_stride_and_overflow_guards() {
+        let inp = [9u8; 16];
+        let mut out = [7u8; 16];
+        unsafe {
+            assert_eq!(
+                darkroom_imageio_flip_buffers_oriented(
+                    std::ptr::null_mut(),
+                    inp.as_ptr().cast(),
+                    1,
+                    2,
+                    2,
+                    2,
+                    2,
+                    2,
+                    7,
+                ),
+                0
+            );
+            assert_eq!(
+                darkroom_imageio_flip_buffers_oriented(
+                    out.as_mut_ptr().cast(),
+                    std::ptr::null(),
+                    1,
+                    2,
+                    2,
+                    2,
+                    2,
+                    2,
+                    7,
+                ),
+                0
+            );
+        }
+        for (bpp, wd, ht, fwd, fht, stride, orientation) in [
+            (0, 2, 2, 2, 2, 2, 7),
+            (1, 0, 2, 2, 2, 2, 7),
+            (1, -1, 2, 2, 2, 2, 7),
+            (1, 2, 0, 2, 2, 2, 7),
+            (1, 2, -1, 2, 2, 2, 7),
+            (1, 2, 2, 0, 2, 2, 0),
+            (1, 2, 2, -1, 2, 2, 0),
+            (1, 2, 2, 2, 0, 2, 0),
+            (1, 2, 2, 2, -1, 2, 0),
+            (1, 2, 2, 1, 2, 2, 2),
+            (1, 2, 2, 2, 1, 2, 1),
+            (1, 2, 2, 2, 2, -1, 7),
+            (1, 2, 2, 2, 2, i32::MIN, 7),
+            (usize::MAX, 2, 1, 2, 1, 0, 2),
+            (isize::MAX as usize + 1, 1, 1, 1, 1, 0, 7),
+            (isize::MAX as usize, 1, 2, 1, 2, 0, 7),
+            (16, i32::MAX, i32::MAX, i32::MAX, i32::MAX, i32::MAX, 7),
+            (16, 1, 2, i32::MAX, i32::MAX, 0, 1),
+        ] {
+            // On 64-bit this row is a legitimate Some layout (the span fits
+            // isize) but the 16-byte stack fixture would be overrun since the
+            // FFI takes no length args, so skip it per the caller-size
+            // contract, cf. m4-224.
+            if bpp == 16 && wd == 1 && usize::BITS > 32 {
+                continue;
+            }
+            assert_eq!(
+                unsafe {
+                    darkroom_imageio_flip_buffers_oriented(
+                        out.as_mut_ptr().cast(),
+                        inp.as_ptr().cast(),
+                        bpp,
+                        wd,
+                        ht,
+                        fwd,
+                        fht,
+                        stride,
+                        orientation,
+                    )
+                },
+                0
+            );
+            assert_eq!(out, [7; 16]);
+        }
+        assert_eq!(inp, [9; 16]);
+    }
+
+    #[test]
+    fn oriented_golden_vectors_from_c_formula() {
+        // Hand-derived from the pre-m4-226 C si/sj loop in
+        // src/imageio/imageio.c: si starts at bpp (1), sj at wd * bpp (2);
+        // ORIENTATION_SWAP_XY swaps them to sj = 1, si = ht * bpp = 3;
+        // ORIENTATION_FLIP_Y (flag 1) sets jj = fht - 1 = 2 and negates sj;
+        // ORIENTATION_FLIP_X (flag 2) sets ii = fwd - 1 = 1 and negates si
+        // (flag values per src/common/image.h: FLIP_Y = 1, FLIP_X = 2,
+        // SWAP_XY = 4). Input rows are [0, 1], [2, 3], [4, 5].
+        // Orientation 5 (FLIP_Y plus SWAP): jj = 2, sj = -1, ii = 0, si = 3,
+        // so row j = 0 writes out[2] = in[0], out[5] = in[1]; j = 1 writes
+        // out[1] = in[2], out[4] = in[3]; j = 2 writes out[0] = in[4],
+        // out[3] = in[5], giving [4, 2, 0, 5, 3, 1].
+        // Orientation 6 (FLIP_X plus SWAP): jj = 0, sj = 1, ii = 1, si = -3,
+        // so row j = 0 writes out[3] = in[0], out[0] = in[1]; j = 1 writes
+        // out[4] = in[2], out[1] = in[3]; j = 2 writes out[5] = in[4],
+        // out[2] = in[5], giving [1, 3, 5, 0, 2, 4].
+        // Orientation -1 has every low bit set, so it takes the same
+        // branches as 7 (transverse): jj = 2, sj = -1, ii = 1, si = -3;
+        // j = 0 writes out[5] = in[0], out[2] = in[1]; j = 1 writes
+        // out[4] = in[2], out[1] = in[3]; j = 2 writes out[3] = in[4],
+        // out[0] = in[5], giving [5, 3, 1, 4, 2, 0].
+        fn run_safe(inp: &[u8; 6], orientation: i32) -> [u8; 6] {
+            let mut out = [0xCD; 6];
+            flip_buffers_oriented(&mut out, inp, 1, 2, 3, 2, 3, 2, orientation);
+            out
+        }
+        fn run_ffi(inp: &[u8; 6], orientation: i32) -> [u8; 6] {
+            let mut out = [0xCD; 6];
+            assert_eq!(
+                unsafe {
+                    darkroom_imageio_flip_buffers_oriented(
+                        out.as_mut_ptr().cast(),
+                        inp.as_ptr().cast(),
+                        1,
+                        2,
+                        3,
+                        2,
+                        3,
+                        2,
+                        orientation,
+                    )
+                },
+                1
+            );
+            out
+        }
+        let inp = [0u8, 1, 2, 3, 4, 5];
+        assert_eq!(run_safe(&inp, 5), [4, 2, 0, 5, 3, 1]);
+        assert_eq!(run_ffi(&inp, 5), [4, 2, 0, 5, 3, 1]);
+        assert_eq!(run_safe(&inp, 6), [1, 3, 5, 0, 2, 4]);
+        assert_eq!(run_ffi(&inp, 6), [1, 3, 5, 0, 2, 4]);
+        assert_eq!(run_safe(&inp, -1), [5, 3, 1, 4, 2, 0]);
+        assert_eq!(run_safe(&inp, 7), [5, 3, 1, 4, 2, 0]);
+        assert_eq!(run_ffi(&inp, -1), run_ffi(&inp, 7));
+        assert_eq!(run_ffi(&inp, -1), [5, 3, 1, 4, 2, 0]);
+    }
 
     fn ref_has_mono_rgbx(inp: &[u8], width: usize, height: usize) -> bool {
         let mut colored = 0;
