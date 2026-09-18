@@ -3776,6 +3776,28 @@ void darkroom_imageio_u8_to_float(float *out, const unsigned char *in,
                                   float black, float white,
                                   int ch, int wd, int ht, int stride);
 
+// Oriented 8-bit to float normalise (imageio.c,
+// dt_imageio_flip_buffers_ui8_to_float, m4-227).
+//
+// darkroom_imageio_u8_to_float_oriented replaces the former DT_OMP_FOR pixel
+// loop of the oriented branch: per pixel (col, row) and lane k < ch,
+// out[4 * dest + k] = (in[row * stride + ch * col + k] - black) * scale
+// with scale = 1.0f / (white - black) hoisted once, exactly as the C loop,
+// where dest is the orientation-mapped quad index (flag
+// values per src/common/image.h: FLIP_Y = 1, FLIP_X = 2, SWAP_XY = 4).
+// Lanes ch..4 of each output quad are never written and input row padding
+// is skipped. The !orientation fast path and the single imageio_jpeg.c
+// caller stay in C. out holds 4 * dest_span floats (4 * wd * ht when
+// fwd == wd and fht == ht, more with displaced extents), in holds
+// (ht - 1) * stride + ch * wd bytes, ch is 1..4 by contract. Null
+// pointers, non-positive dims, ch outside 1..4, a negative stride with
+// more than one row, flipped extents smaller than the image, and
+// overflowing dim products are guarded no-ops.
+void darkroom_imageio_u8_to_float_oriented(float *out, const unsigned char *in,
+                                           float black, float white,
+                                           int ch, int wd, int ht, int fwd, int fht,
+                                           int stride, int orientation);
+
 /*
  * WebP 8-bit RGBA normalize (imageio_webp.c, dt_imageio_open_webp, m4-207).
  *

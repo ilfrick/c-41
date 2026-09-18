@@ -5559,3 +5559,45 @@ remotes (`origin` GitHub + Gitea) verified at `2d2b3de1d0`. Note: the first
 overriding `.netrc`); `git push gitea master` succeeded, and after the GitHub
 token in `~/.netrc` was refreshed the push succeeded with the `gh` helpers
 bypassed (`-c credential.https://github.com.helper=`).
+
+### m4-227 — oriented u8-to-float import branch → Rust (2026-09-18 UTC)
+
+**What.** Ported the oriented branch `DT_OMP_FOR` loop of
+`dt_imageio_flip_buffers_ui8_to_float` (`src/imageio/imageio.c:909`) to
+`darkroom_imageio_u8_to_float_oriented` in `c41-core::imageio`: safe kernel
+`u8_to_float_oriented` + `void`-returning FFI (matches the `darkroom_imageio_u8_to_float`
+sibling; the C wrapper is `void`) + 8 tests, header declaration, C
+`ii/jj/si/sj` setup + loop replaced by the FFI call (the now-unused hoisted
+`scale` removed, two adjacent comments refreshed). Destination geometry reuses
+the m4-226 `oriented_layout` mapping in pixel units ×4 lanes (multiply
+distributes, algebraically identical to `bpp=4`); the test reference replays
+the C `si/sj` text instead, so traversal is cross-checked. `ch` 1..=4 refused
+(C would scribble past the quad); lanes `ch..4` never stored; stride padding
+skipped; one hoisted IEEE division `1.0/(white-black)` with exact `u8 as f32`
+promotion — bit-identical to C including `white==black`/`white<black`.
+Honest scope note from review: the sole production caller
+(`src/imageio/imageio_jpeg.c:787`) passes `orientation = 0` with `ch = 4` and
+tight stride, so the oriented branch is currently **dead in production** —
+this port is exercised by tests and future callers only.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE** (hand-verified the C `si/sj/ii/jj` scheme against
+`oriented_layout().destination()*4` on all 8 orientations incl. displaced
+extents; goldens independently re-derived). Two doc findings, both fixed
+in-session: (1) header formula said per-element division — reworded to the
+hoisted `* scale` form; (2) added `out`/`inp` must-not-overlap to both safety
+docs. Reminder (3): untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0: `cargo check --workspace`,
+`cargo clippy --workspace --all-targets` (1442 warnings, byte-identical count
+to the stashed pre-change baseline — zero new), `cargo test --workspace
+--release` (403 passed), `c41-rs` release link. Changed TU
+`src/imageio/imageio.c` compiled in the dependency image with the cached
+Release flags + `-Werror -Wfatal-errors`, exit 0, no output. `git diff --check`
+clean; no `/*`/`*/` in added lines. New tests use `to_bits` float comparison,
+sentinel-guarded offset windows, and `MaybeUninit` FFI storage. One real bug
+was caught during development (a guard-test row with a valid-but-giant span
+overran the 64-lane stack fixture at FFI level, SIGSEGV — FFI takes no lengths
+by C-signature necessity; fixed by skipping that row at FFI level with a
+documented caller-size-contract comment, covered in the safe-kernel test).
+Remote CI confirmation follows commit/push per workflow.

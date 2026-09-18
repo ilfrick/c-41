@@ -30,6 +30,10 @@
 //! `!orientation` fast path of `dt_imageio_flip_buffers_ui8_to_float`
 //! (same C file). The oriented stride path stays in C; see that kernel's
 //! docs for the split.
+//!
+//! m4-227 adds the oriented counterpart `u8_to_float_oriented`, closing the
+//! last `DT_OMP_FOR` in `src/imageio/imageio.c`. It shares the m4-226
+//! `oriented_layout` geometry in pixel units, scaled to float lanes.
 
 /// Swap the R and B lanes of an 8-bit RGBA buffer in place.
 ///
@@ -238,6 +242,181 @@ pub unsafe extern "C" fn darkroom_imageio_u8_to_float(
     let out_slice = std::slice::from_raw_parts_mut(out, need_out);
     let inp_slice = std::slice::from_raw_parts(inp, need_in);
     u8_to_float(out_slice, inp_slice, black, white, chu, wdu, htu, strideu);
+}
+
+// ── Oriented 8-bit to float normalise (m4-227) ───────────────────────────────
+
+/// Safe 8-bit to float normalisation kernel for the oriented import path.
+///
+/// Port of the oriented `DT_OMP_FOR` row loop of
+/// `dt_imageio_flip_buffers_ui8_to_float` (src/imageio/imageio.c): per
+/// pixel `(i, j)` and lane `k < ch`,
+/// `out[4 * dest(i, j) + k] = (inp[j * stride + ch * i + k] as f32 - black) * scale`
+/// with `scale = 1.0 / (white - black)` derived once up front, exactly as
+/// the C's hoisted `const float scale`. The destination pixel `dest(i, j)`
+/// is the [`oriented_layout`] mapping of `flip_buffers_oriented` (m4-226)
+/// evaluated in pixel units and scaled to lanes, so the orientation
+/// semantics (flag values per src/common/image.h: FLIP_Y = 1, FLIP_X = 2,
+/// SWAP_XY = 4) are shared, not re-derived.
+///
+/// Fidelity notes:
+/// - `u8 as f32` is exact, so the subtraction and multiply replay the C
+///   loop's promotion bit for bit; the single hoisted division cannot drift
+///   per element on either side.
+/// - Output lanes `ch..4` of each written quad are never stored, matching
+///   the C loop (which only stores lanes below `ch`); callers must not
+///   expect them zeroed. Input row padding (`stride > ch * wd`) is skipped.
+/// - `ch` is 1..=4 by contract: the C loop would scribble past the RGBA
+///   quad for larger values, so the kernel refuses those instead of
+///   reproducing the overflow. Dims are non-zero and `fwd`/`fht` cover the
+///   flipped extents (validated by the layout helper).
+/// - `out` and `inp` must not overlap.
+/// - Stride follows the m4-226 oriented convention: zero repeats the source
+///   row (well-defined in C), a negative stride with more than one row
+///   would read out of bounds in C so the FFI wrapper rejects it, and any
+///   stride is accepted for a single row (the C loop never advances).
+///   Short rows (`stride < ch * wd`) overlap exactly as in C.
+/// - The C loop is `DT_OMP_FOR` over rows, but each output float reads only
+///   its own input byte and every destination quad is written by exactly
+///   one source pixel (the mapping is a permutation onto its span), so
+///   sequential iteration is identical.
+#[allow(clippy::too_many_arguments)]
+pub fn u8_to_float_oriented(
+    out: &mut [f32],
+    inp: &[u8],
+    black: f32,
+    white: f32,
+    ch: usize,
+    wd: usize,
+    ht: usize,
+    fwd: usize,
+    fht: usize,
+    stride: usize,
+    orientation: i32,
+) {
+    if !(1..=4).contains(&ch) {
+        return;
+    }
+    let Some(layout) = oriented_layout(1, wd, ht, fwd, fht, stride, orientation) else {
+        return;
+    };
+    let Some(out_lanes) = layout.out_bytes.checked_mul(4) else {
+        return;
+    };
+    let Some(row_bytes) = ch.checked_mul(wd) else {
+        return;
+    };
+    // Last input byte read is (ht - 1) * stride + ch * wd - 1, hence +1
+    // for the length; ht >= 1 here so ht - 1 cannot underflow, and ht == 1
+    // ignores the stride exactly as the C row loop does.
+    let Some(need_in) = (ht - 1)
+        .checked_mul(stride)
+        .and_then(|base| base.checked_add(row_bytes))
+    else {
+        return;
+    };
+    if out.len() < out_lanes || inp.len() < need_in {
+        return;
+    }
+
+    let scale = 1.0f32 / (white - black);
+    for j in 0..ht {
+        for i in 0..wd {
+            let src = j * stride + ch * i;
+            let dst = layout.destination(i, j, 1) * 4;
+            for k in 0..ch {
+                out[dst + k] = (inp[src + k] as f32 - black) * scale;
+            }
+        }
+    }
+}
+
+/// Oriented 8-bit to float normalisation for the import path.
+///
+/// Replaces the oriented `DT_OMP_FOR` loop of
+/// `dt_imageio_flip_buffers_ui8_to_float` (src/imageio/imageio.c); the C
+/// wrapper keeps its signature and the `!orientation` fast path, so the
+/// single `imageio_jpeg.c` caller is unchanged. `black`/`white` are the C
+/// parameters (the scale is derived inside, one IEEE division, exactly as
+/// the C's hoisted `const float scale`).
+///
+/// `out` must hold at least `4 * dest_span` floats where `dest_span` is the
+/// `oriented_layout` pixel span (`wd * ht` when `fwd == wd` and
+/// `fht == ht`, larger with displaced extents), `inp` at least
+/// `(ht - 1) * stride + ch * wd` bytes. Null pointers, non-positive dims,
+/// `ch` outside 1..=4, a negative stride with more than one row, flipped
+/// extents smaller than the image, and overflowing dim products are guarded
+/// no-ops that never touch memory. A zero stride repeats the source row
+/// and any stride is accepted for a single row, matching the C loop.
+///
+/// # Safety
+/// The buffers must hold the documented lengths and must not overlap; the
+/// wrapper validates
+/// the products with checked arithmetic (plus an `isize::MAX` cap before
+/// building the slices) but takes the lengths themselves on trust, matching
+/// the module's `darkroom_imageio_u8_to_float` contract.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imageio_u8_to_float_oriented(
+    out: *mut f32,
+    inp: *const u8,
+    black: f32,
+    white: f32,
+    ch: std::ffi::c_int,
+    wd: std::ffi::c_int,
+    ht: std::ffi::c_int,
+    fwd: std::ffi::c_int,
+    fht: std::ffi::c_int,
+    stride: std::ffi::c_int,
+    orientation: std::ffi::c_int,
+) {
+    if out.is_null() || inp.is_null() {
+        return;
+    }
+    if wd <= 0 || ht <= 0 || fwd <= 0 || fht <= 0 || !(1..=4).contains(&ch) {
+        return;
+    }
+    if stride < 0 && ht > 1 {
+        return;
+    }
+    let strideu = if ht == 1 { 0 } else { stride as usize };
+    let (wdu, htu, fwdu, fhtu, chu) = (
+        wd as usize,
+        ht as usize,
+        fwd as usize,
+        fht as usize,
+        ch as usize,
+    );
+    let Some(layout) = oriented_layout(1, wdu, htu, fwdu, fhtu, strideu, orientation) else {
+        return;
+    };
+    let Some(out_lanes) = layout.out_bytes.checked_mul(4) else {
+        return;
+    };
+    let Some(row_bytes) = chu.checked_mul(wdu) else {
+        return;
+    };
+    // Last input byte read is (ht - 1) * stride + ch * wd - 1, hence +1
+    // for the length; ht >= 1 here so ht - 1 cannot underflow.
+    let Some(need_in) = (htu - 1)
+        .checked_mul(strideu)
+        .and_then(|base| base.checked_add(row_bytes))
+    else {
+        return;
+    };
+    // Slices can never span more than isize::MAX bytes; bail before
+    // building one. out_lanes counts f32 lanes, so its byte span is 4x.
+    let Some(out_span) = out_lanes.checked_mul(4) else {
+        return;
+    };
+    if out_span > isize::MAX as usize || need_in > isize::MAX as usize {
+        return;
+    }
+    let out_slice = std::slice::from_raw_parts_mut(out, out_lanes);
+    let inp_slice = std::slice::from_raw_parts(inp, need_in);
+    u8_to_float_oriented(
+        out_slice, inp_slice, black, white, chu, wdu, htu, fwdu, fhtu, strideu, orientation,
+    );
 }
 
 fn mono_rgbx_lengths(width: usize, height: usize) -> Option<(usize, usize)> {
@@ -1723,5 +1902,511 @@ mod tests {
         }
         assert_eq!(out, vec![3.0f32; 64]); // untouched
         assert_eq!(inp, vec![9u8; 64]); // untouched
+    }
+
+    // ── Oriented 8-bit to float normalise (m4-227) ───────────────────────────
+
+    /// Structurally divergent reference for `u8_to_float_oriented`: a textual
+    /// port of the pre-m4-227 C loop (si starts at 4 lanes, sj at wd * 4;
+    /// SWAP_XY exchanges them to sj = 4, si = ht * 4; FLIP_Y sets jj =
+    /// fht - 1 and negates sj; FLIP_X sets ii = fwd - 1 and negates si)
+    /// instead of the kernel's pitch/origin mapping, so the sweep test
+    /// cross-checks traversal as well as values. Must return bit-identical
+    /// output to [`u8_to_float_oriented`] (compared with `to_bits`, so even
+    /// NaN payloads from a `white == black` caller must agree).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn ref_u8_to_float_oriented(
+        out: &mut [f32],
+        inp: &[u8],
+        black: f32,
+        white: f32,
+        ch: usize,
+        wd: usize,
+        ht: usize,
+        fwd: usize,
+        fht: usize,
+        stride: usize,
+        orientation: i32,
+    ) {
+        let scale = 1.0f32 / (white - black);
+        let (mut ii, mut jj) = (0i128, 0i128);
+        let (mut si, mut sj) = (4i128, wd as i128 * 4);
+        if orientation & 4 != 0 {
+            sj = 4;
+            si = ht as i128 * 4;
+        }
+        if orientation & 1 != 0 {
+            jj = fht as i128 - 1;
+            sj = -sj;
+        }
+        if orientation & 2 != 0 {
+            ii = fwd as i128 - 1;
+            si = -si;
+        }
+        // C base: out + |sj| * jj + |si| * ii lanes, input rows at stride * j.
+        for j in 0..ht {
+            for i in 0..wd {
+                let dst = (sj.abs() * jj + si.abs() * ii + sj * j as i128 + si * i as i128)
+                    as usize;
+                let src = j * stride + ch * i;
+                for k in 0..ch {
+                    out[dst + k] = (inp[src + k] as f32 - black) * scale;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn assert_u8_oriented_case(
+        ch: usize,
+        wd: usize,
+        ht: usize,
+        fwd: usize,
+        fht: usize,
+        stride: usize,
+        orientation: i32,
+        black: f32,
+        white: f32,
+    ) {
+        // Exact touched spans: sentinel-guarded buffers with the work window
+        // offset by one element, so an over/under-run by a single lane or
+        // byte fails. Both the reference and the kernel start from the same
+        // sentinel, so agreement on the whole window also pins the untouched
+        // lanes (ch..4) and displaced-extent gaps.
+        const SENTINEL: f32 = -7.0;
+        let layout = oriented_layout(1, wd, ht, fwd, fht, stride, orientation).unwrap();
+        let out_lanes = layout.out_bytes * 4;
+        let need_in = (ht - 1) * stride + ch * wd;
+        let inp: Box<[u8]> = (0..need_in)
+            .map(|i| ((i as u64 * 2_654_435_761 + 0x9E37) % 256) as u8)
+            .collect();
+        let original = inp.clone();
+        let mut expected = vec![SENTINEL; out_lanes + 2];
+        ref_u8_to_float_oriented(
+            &mut expected[1..1 + out_lanes],
+            &inp,
+            black,
+            white,
+            ch,
+            wd,
+            ht,
+            fwd,
+            fht,
+            stride,
+            orientation,
+        );
+        let mut safe = vec![SENTINEL; out_lanes + 2];
+        u8_to_float_oriented(
+            &mut safe[1..1 + out_lanes],
+            &inp,
+            black,
+            white,
+            ch,
+            wd,
+            ht,
+            fwd,
+            fht,
+            stride,
+            orientation,
+        );
+        assert_bits_eq(&safe, &expected);
+        let mut ffi = vec![SENTINEL; out_lanes + 2];
+        unsafe {
+            darkroom_imageio_u8_to_float_oriented(
+                ffi.as_mut_ptr().add(1),
+                inp.as_ptr(),
+                black,
+                white,
+                ch as i32,
+                wd as i32,
+                ht as i32,
+                fwd as i32,
+                fht as i32,
+                stride as i32,
+                orientation,
+            );
+        }
+        assert_bits_eq(&ffi, &expected);
+        assert_eq!(inp, original);
+    }
+
+    #[test]
+    fn u8_to_float_oriented_matches_reference_over_sweep() {
+        for orientation in [0, 1, 2, 3, 4, 5, 6, 7, -1] {
+            for (wd, ht) in [(1, 1), (7, 1), (1, 9), (3, 5), (5, 3), (17, 9)] {
+                for ch in [1usize, 2, 3, 4] {
+                    for stride in [0, ch * wd - 1, ch * wd, ch * wd + 7] {
+                        for (black, white) in [
+                            (0.0f32, 255.0f32),
+                            (16.0, 235.0),
+                            (255.0, 0.0),
+                            (5.0, 5.0),
+                        ] {
+                            assert_u8_oriented_case(
+                                ch,
+                                wd,
+                                ht,
+                                wd,
+                                ht,
+                                stride,
+                                orientation,
+                                black,
+                                white,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn u8_to_float_oriented_displaced_extents_and_gaps() {
+        for orientation in [0, 1, 2, 3, 4, 5, 6, 7, -1] {
+            for (wd, ht) in [(1, 1), (1, 7), (9, 1), (3, 5), (5, 3)] {
+                for (fwd, fht) in [(wd, ht), (wd + 1, ht), (wd, ht + 2), (wd + 7, ht + 9)] {
+                    assert_u8_oriented_case(3, wd, ht, fwd, fht, 3 * wd + 5, orientation, 0.0, 255.0);
+                }
+                let fwd = if orientation & 2 == 0 { 1 } else { wd };
+                let fht = if orientation & 1 == 0 { 1 } else { ht };
+                assert_u8_oriented_case(2, wd, ht, fwd, fht, 0, orientation, 16.0, 235.0);
+            }
+        }
+    }
+
+    #[test]
+    fn u8_to_float_oriented_golden_vectors_from_c_formula() {
+        // Hand-derived from the pre-m4-227 C si/sj loop in
+        // src/imageio/imageio.c with wd = 2, ht = 3, ch = 1, fwd = 2,
+        // fht = 3, stride = 2, black = 0, white = 255: si starts at 4
+        // lanes, sj at wd * 4 = 8; SWAP_XY swaps them to sj = 4,
+        // si = ht * 4 = 12. Input bytes are [0, 1, 2, 3, 4, 5].
+        // Orientation 5 (FLIP_Y plus SWAP): jj = 2, sj = -4, ii = 0, so
+        // row j = 0 writes quads 2, 5; j = 1 writes quads 1, 4; j = 2
+        // writes quads 0, 3, giving lane 0 == [4, 2, 0, 5, 3, 1] / 255.
+        // Orientation 6 (FLIP_X plus SWAP): jj = 0, sj = 4, ii = 1,
+        // si = -12, so row j = 0 writes quads 3, 0; j = 1 writes quads 4,
+        // 1; j = 2 writes quads 5, 2, giving [1, 3, 5, 0, 2, 4] / 255.
+        // Orientation -1 has every low bit set, so it takes the same
+        // branches as 7 (transverse): jj = 2, sj = -4, ii = 1, si = -12,
+        // giving [5, 3, 1, 4, 2, 0] / 255.
+        const SENTINEL: f32 = -7.0;
+        fn run_safe(inp: &[u8; 6], orientation: i32) -> [f32; 26] {
+            let mut out = [SENTINEL; 26];
+            u8_to_float_oriented(&mut out[1..25], inp, 0.0, 255.0, 1, 2, 3, 2, 3, 2, orientation);
+            out
+        }
+        fn run_ffi(inp: &[u8; 6], orientation: i32) -> [f32; 26] {
+            let mut out = [SENTINEL; 26];
+            unsafe {
+                darkroom_imageio_u8_to_float_oriented(
+                    out.as_mut_ptr().add(1),
+                    inp.as_ptr(),
+                    0.0,
+                    255.0,
+                    1,
+                    2,
+                    3,
+                    2,
+                    3,
+                    2,
+                    orientation,
+                );
+            }
+            out
+        }
+        fn lane0(order: [u8; 6]) -> [f32; 6] {
+            order.map(|b| b as f32 * (1.0f32 / 255.0))
+        }
+        let inp = [0u8, 1, 2, 3, 4, 5];
+        for (orientation, order) in [
+            (5, [4u8, 2, 0, 5, 3, 1]),
+            (6, [1u8, 3, 5, 0, 2, 4]),
+            (7, [5u8, 3, 1, 4, 2, 0]),
+            (-1, [5u8, 3, 1, 4, 2, 0]),
+        ] {
+            let want = lane0(order);
+            for out in [run_safe(&inp, orientation), run_ffi(&inp, orientation)] {
+                // Lane 0 of each quad is one element per 4 lanes, not a
+                // contiguous run: gather it before comparing.
+                let got: Vec<f32> = (0..6).map(|q| out[1 + 4 * q]).collect();
+                assert_bits_eq(&got, &want);
+                // Only lane 0 of each quad is stored with ch == 1; lanes
+                // 1..4 keep the sentinel, as do the guard elements.
+                for q in 0..6 {
+                    for lane in 1..4 {
+                        assert_eq!(out[1 + 4 * q + lane].to_bits(), SENTINEL.to_bits());
+                    }
+                }
+                assert_eq!(out[0].to_bits(), SENTINEL.to_bits());
+                assert_eq!(out[25].to_bits(), SENTINEL.to_bits());
+            }
+        }
+        assert_bits_eq(&run_safe(&inp, -1)[1..25], &run_safe(&inp, 7)[1..25]);
+        assert_bits_eq(&run_ffi(&inp, -1)[1..25], &run_ffi(&inp, 7)[1..25]);
+    }
+
+    #[test]
+    fn u8_to_float_oriented_skips_stride_padding() {
+        let (wd, ht, ch) = (3usize, 2usize, 4usize);
+        let tight: Vec<u8> = (0..(ch * wd * ht) as u8).collect();
+        let stride = ch * wd + 2;
+        let mut padded = vec![0xABu8; ht * stride];
+        for j in 0..ht {
+            padded[j * stride..j * stride + ch * wd]
+                .copy_from_slice(&tight[j * ch * wd..(j + 1) * ch * wd]);
+        }
+        for orientation in [0, 1, 2, 3, 4, 5, 6, 7] {
+            let layout = oriented_layout(1, wd, ht, wd, ht, stride, orientation).unwrap();
+            let out_lanes = layout.out_bytes * 4;
+            let mut from_tight = vec![0.0f32; out_lanes];
+            let mut from_padded = vec![0.0f32; out_lanes];
+            u8_to_float_oriented(
+                &mut from_tight,
+                &tight,
+                16.0,
+                235.0,
+                ch,
+                wd,
+                ht,
+                wd,
+                ht,
+                ch * wd,
+                orientation,
+            );
+            u8_to_float_oriented(
+                &mut from_padded,
+                &padded,
+                16.0,
+                235.0,
+                ch,
+                wd,
+                ht,
+                wd,
+                ht,
+                stride,
+                orientation,
+            );
+            assert_bits_eq(&from_tight, &from_padded);
+        }
+    }
+
+    #[test]
+    fn u8_to_float_oriented_single_row_ignores_signed_stride() {
+        let inp = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        for orientation in [0, 1, 2, 3, 4, 5, 6, 7, -1] {
+            let mut baseline = vec![-7.0f32; 16];
+            u8_to_float_oriented(&mut baseline, &inp, 0.0, 255.0, 4, 2, 1, 2, 1, 0, orientation);
+            for stride in [i32::MIN, -1, 0, 1, 7, i32::MAX] {
+                let mut out = vec![-7.0f32; 16];
+                unsafe {
+                    darkroom_imageio_u8_to_float_oriented(
+                        out.as_mut_ptr(),
+                        inp.as_ptr(),
+                        0.0,
+                        255.0,
+                        4,
+                        2,
+                        1,
+                        2,
+                        1,
+                        stride,
+                        orientation,
+                    );
+                }
+                assert_bits_eq(&out, &baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn u8_to_float_oriented_ffi_maybe_uninit_storage() {
+        use std::mem::MaybeUninit;
+
+        for orientation in [0, 1, 2, 3, 4, 5, 6, 7] {
+            for ch in [1usize, 2, 3, 4] {
+                let (wd, ht) = (3usize, 5usize);
+                let stride = ch * wd + 5;
+                let layout = oriented_layout(1, wd, ht, wd, ht, stride, orientation).unwrap();
+                let out_lanes = layout.out_bytes * 4;
+                let need_in = (ht - 1) * stride + ch * wd;
+                // Payload rows initialised, padding left uninitialised: the
+                // kernel must never read padding (compared lane-exactly
+                // against the safe kernel over fully initialised copies).
+                let mut init_inp = vec![0u8; need_in];
+                let mut partial =
+                    vec![MaybeUninit::<u8>::uninit(); need_in].into_boxed_slice();
+                for j in 0..ht {
+                    for k in 0..ch * wd {
+                        let byte = ((j * ch * wd + k) % 251) as u8;
+                        init_inp[j * stride + k] = byte;
+                        partial[j * stride + k].write(byte);
+                    }
+                }
+                let mut init_out = vec![-7.0f32; out_lanes];
+                u8_to_float_oriented(
+                    &mut init_out,
+                    &init_inp,
+                    16.0,
+                    235.0,
+                    ch,
+                    wd,
+                    ht,
+                    wd,
+                    ht,
+                    stride,
+                    orientation,
+                );
+                let mut ffi_out =
+                    vec![MaybeUninit::<f32>::uninit(); out_lanes].into_boxed_slice();
+                unsafe {
+                    darkroom_imageio_u8_to_float_oriented(
+                        ffi_out.as_mut_ptr().cast(),
+                        partial.as_ptr().cast(),
+                        16.0,
+                        235.0,
+                        ch as i32,
+                        wd as i32,
+                        ht as i32,
+                        wd as i32,
+                        ht as i32,
+                        stride as i32,
+                        orientation,
+                    );
+                }
+                // Every written lane agrees; lanes ch..4 were never stored.
+                for j in 0..ht {
+                    for i in 0..wd {
+                        let dst = layout.destination(i, j, 1) * 4;
+                        for k in 0..ch {
+                            assert_eq!(
+                                unsafe { ffi_out[dst + k].assume_init() }.to_bits(),
+                                init_out[dst + k].to_bits()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn u8_to_float_oriented_safe_degenerate_and_short_buffers() {
+        const SENTINEL: f32 = -7.0;
+        let mut out = [SENTINEL; 16];
+        let inp = [9u8; 16];
+        for (ch, wd, ht, fwd, fht, stride, orientation) in [
+            (0, 2, 2, 2, 2, 8, 0),
+            (5, 2, 2, 2, 2, 8, 0),
+            (4, 0, 2, 2, 2, 8, 0),
+            (4, 2, 0, 2, 2, 8, 0),
+            (4, 2, 2, 0, 2, 8, 0),
+            (4, 2, 2, 2, 0, 8, 0),
+            (4, 2, 2, 1, 2, 8, 2),
+            (4, 2, 2, 2, 1, 8, 1),
+            (4, 2, 2, 2, 2, usize::MAX, 0),
+            (4, 1, 2, 1, 2, usize::MAX, 0),
+            (usize::MAX, 2, 1, 2, 1, 0, 0),
+            // Accepted layouts whose spans dwarf the fixtures: the safe
+            // kernel re-checks real slice lengths, so these are genuine
+            // no-ops here (the FFI cannot take this path, having no length
+            // args to re-check against).
+            (4, 1, 2, i32::MAX as usize, i32::MAX as usize, 0, 1),
+            (
+                4,
+                i32::MAX as usize,
+                i32::MAX as usize,
+                i32::MAX as usize,
+                i32::MAX as usize,
+                i32::MAX as usize,
+                7,
+            ),
+        ] {
+            u8_to_float_oriented(&mut out, &inp, 0.0, 255.0, ch, wd, ht, fwd, fht, stride, orientation);
+            assert_eq!(out, [SENTINEL; 16]);
+        }
+        // Short buffers on either side are no-ops.
+        u8_to_float_oriented(&mut out[..15], &inp, 0.0, 255.0, 4, 2, 2, 2, 2, 8, 0);
+        u8_to_float_oriented(&mut out, &inp[..15], 0.0, 255.0, 4, 2, 2, 2, 2, 8, 0);
+        u8_to_float_oriented(&mut [], &[], 0.0, 255.0, 1, 1, 1, 1, 1, 1, 0);
+        assert_eq!(out, [SENTINEL; 16]);
+        assert_eq!(inp, [9u8; 16]);
+    }
+
+    #[test]
+    fn u8_to_float_oriented_ffi_null_dimension_stride_and_overflow_guards() {
+        const SENTINEL: f32 = 3.0;
+        let inp = [9u8; 64];
+        let mut out = [SENTINEL; 64];
+        unsafe {
+            darkroom_imageio_u8_to_float_oriented(
+                std::ptr::null_mut(),
+                inp.as_ptr(),
+                0.0,
+                255.0,
+                4,
+                2,
+                2,
+                2,
+                2,
+                8,
+                0,
+            );
+            darkroom_imageio_u8_to_float_oriented(
+                out.as_mut_ptr(),
+                std::ptr::null(),
+                0.0,
+                255.0,
+                4,
+                2,
+                2,
+                2,
+                2,
+                8,
+                0,
+            );
+            for (ch, wd, ht, fwd, fht, stride, orientation) in [
+                (0, 2, 2, 2, 2, 8, 0),
+                (5, 2, 2, 2, 2, 8, 0),
+                (-1, 2, 2, 2, 2, 8, 0),
+                (4, 0, 2, 2, 2, 8, 0),
+                (4, -1, 2, 2, 2, 8, 0),
+                (4, 2, 0, 2, 2, 8, 0),
+                (4, 2, -1, 2, 2, 8, 0),
+                (4, 2, 2, 0, 2, 8, 0),
+                (4, 2, 2, -1, 2, 8, 0),
+                (4, 2, 2, 2, 0, 8, 0),
+                (4, 2, 2, 2, -1, 8, 0),
+                (4, 2, 2, 1, 2, 8, 2),
+                (4, 2, 2, 2, 1, 8, 1),
+                (4, 2, 2, 2, 2, -1, 0),
+                (4, 2, 2, 2, 2, i32::MIN, 7),
+                (4, i32::MAX, i32::MAX, i32::MAX, i32::MAX, i32::MAX, 7),
+                // (4, 1, 2, i32::MAX, i32::MAX, 0, 1) is a legitimate
+                // accepted layout (the span fits isize) but the 64-lane
+                // stack fixture would be overrun since the FFI takes no
+                // length args, so it is skipped per the caller-size
+                // contract, cf. m4-226; the safe kernel covers it below.
+            ] {
+                darkroom_imageio_u8_to_float_oriented(
+                    out.as_mut_ptr(),
+                    inp.as_ptr(),
+                    0.0,
+                    255.0,
+                    ch,
+                    wd,
+                    ht,
+                    fwd,
+                    fht,
+                    stride,
+                    orientation,
+                );
+                assert_eq!(out, [SENTINEL; 64]);
+            }
+        }
+        assert_eq!(out, [SENTINEL; 64]);
+        assert_eq!(inp, [9u8; 64]);
     }
 }

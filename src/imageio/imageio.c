@@ -31,7 +31,7 @@
 #include "develop/imageop.h"
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb, darkroom_imageio_u8_to_float
+#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb, darkroom_imageio_u8_to_float, darkroom_imageio_u8_to_float_oriented
 
 #ifdef HAVE_OPENEXR
 #include "imageio/imageio_exr.h"
@@ -877,47 +877,22 @@ void dt_imageio_flip_buffers_ui8_to_float(float *out,
                                           const int stride,
                                           const dt_image_orientation_t orientation)
 {
-  const float scale = 1.0f / (white - black);
   if(!orientation)
   {
     // Pixel loop ported to Rust FFI (darkroom_imageio_u8_to_float in
     // crates/c41-core/src/imageio.rs), which recomputes scale once exactly
-    // as the hoisting above did; the oriented stride path below stays in C,
-    // as does the orientation bookkeeping.
+    // as the C formerly hoisted; the oriented stride path below is ported
+    // too (darkroom_imageio_u8_to_float_oriented), so no pixel loop remains
+    // in C here.
     darkroom_imageio_u8_to_float(out, in, black, white, ch, wd, ht, stride);
     return;
   }
-  int ii = 0;
-  int jj = 0;
-  int si = 4;
-  int sj = wd * 4;
-  if(orientation & ORIENTATION_SWAP_XY)
-  {
-    sj = 4;
-    si = ht * 4;
-  }
-  if(orientation & ORIENTATION_FLIP_Y)
-  {
-    jj = (int)fht - jj - 1;
-    sj = -sj;
-  }
-  if(orientation & ORIENTATION_FLIP_X)
-  {
-    ii = (int)fwd - ii - 1;
-    si = -si;
-  }
-  DT_OMP_FOR()
-  for(int j = 0; j < ht; j++)
-  {
-    float *out2 = out + (size_t)labs(sj) * jj + (size_t)labs(si) * ii + sj * j;
-    const uint8_t *in2 = in + (size_t)stride * j;
-    for(int i = 0; i < wd; i++)
-    {
-      for(int k = 0; k < ch; k++) out2[k] = (in2[k] - black) * scale;
-      in2 += ch;
-      out2 += si;
-    }
-  }
+  // Oriented pixel loop ported to Rust FFI
+  // (darkroom_imageio_u8_to_float_oriented in
+  // crates/c41-core/src/imageio.rs), which derives the normalising scale
+  // from black/white exactly as the removed hoisted scale did.
+  darkroom_imageio_u8_to_float_oriented(out, in, black, white, ch, wd, ht, fwd, fht, stride,
+                                        (int)orientation);
 }
 
 gboolean dt_imageio_is_ldr(const char *filename)
