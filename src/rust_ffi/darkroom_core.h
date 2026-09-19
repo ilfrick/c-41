@@ -3749,6 +3749,27 @@ void darkroom_png_u16_to_float(const unsigned char *rgb_buf, float *mipbuf,
 void darkroom_pnm_pgm_u8_row_to_float(float *out, const unsigned char *line,
                                       size_t width, unsigned int max);
 
+// PNM PGM 16-bit gray-row normalize (imageio_pnm.c, dt_imageio_open_pnm,
+// m4-229).
+//
+// darkroom_pnm_pgm_u16_row_to_float replaces the inner per-pixel loop of
+// the max > 255 branch of _read_pgm: per column x, the line word is
+// byte-swapped from big-endian file order (PGM stores the most significant
+// byte first; the C loop swaps under G_BYTE_ORDER != G_BIG_ENDIAN and
+// darktable supports only little-endian hosts
+// (src/imageio/imageio_heif.c:167), so the swap is
+// unconditional), then out[4*x + c] = (float)decoded / (float)max for c in
+// 0..2, and out[4*x + 3] = 0.0 (the explicitly zeroed alpha lane). The
+// division is replayed per pixel, not via a precomputed reciprocal; the
+// denominator conversion is hoisted once, which is bit-identical because
+// max is loop-invariant and the conversion is exact. The row fread, the
+// line allocation, and the PBM/PPM sibling branches stay in C. out holds
+// 4*width floats, line holds width words; null pointers, a zero width, a
+// zero max, and an overflowing 4*width product are guarded no-ops; the
+// buffers must not overlap.
+void darkroom_pnm_pgm_u16_row_to_float(float *out, const uint16_t *line,
+                                       size_t width, unsigned int max);
+
 /*
  * 8-bit export R/B lane swap (imageio.c, dt_imageio_export_with_flags,
  * m4-205).

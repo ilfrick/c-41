@@ -19,7 +19,7 @@
 #include "common/darktable.h"
 #include "develop/imageop.h"         // for IOP_CS_RGB
 #include "imageio/imageio_pfm.h"
-#include "rust_ffi/darkroom_core.h"  // for darkroom_pnm_pgm_u8_row_to_float
+#include "rust_ffi/darkroom_core.h"  // for darkroom_pnm_pgm_u8/u16_row_to_float
 
 #include <assert.h>
 #include <errno.h>
@@ -117,19 +117,13 @@ static dt_imageio_retval_t _read_pgm(dt_image_t *img, FILE*f, float *buf)
         result = DT_IMAGEIO_FILE_CORRUPTED;
         break;
       }
-      for(size_t x = 0; x < img->width; x++)
-      {
-        uint16_t intvalue = line[x];
-        // PGM files are big endian, the most significant byte is first
-        // in the case where the value must be represented by two bytes.
-        // See http://netpbm.sourceforge.net/doc/pgm.html
-        if(G_BYTE_ORDER != G_BIG_ENDIAN)
-          intvalue = GUINT16_SWAP_LE_BE(intvalue);
-        float value = (float)intvalue / (float)max;
-        buf_iter[0] = buf_iter[1] = buf_iter[2] = value;
-        buf_iter[3] = 0.0;
-        buf_iter += 4;
-      }
+      // 16-bit gray-row normalize loop ported to Rust FFI (m4-229): each
+      // line word byte-swaps from big-endian file order and scales by
+      // 1/max into the RGB lanes of the 4-channel float mipmap row,
+      // alpha lane zeroed, as before. The row fread above and the
+      // PBM/PPM sibling branches stay in C.
+      darkroom_pnm_pgm_u16_row_to_float(buf_iter, line, (size_t)img->width, max);
+      buf_iter += (size_t)4 * img->width;
     }
     free(line);
   }

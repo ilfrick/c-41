@@ -5641,3 +5641,54 @@ Remote CI on `768bed34f4` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `768bed34f4`.
+
+### m4-229 — PNM PGM 16-bit gray-row normalize → Rust (2026-09-19 UTC)
+
+**Previous increment.** m4-228 commit `768bed34f4` verified on both remotes;
+Docker image, Rust checks/tests/Clippy, and Release CMake CI all succeeded.
+
+**What.** Ported the 16-bit row loop of `_read_pgm` (`src/imageio/imageio_pnm.c`,
+`max > 255` branch, old lines 120-132) to `darkroom_pnm_pgm_u16_row_to_float`
+in `c41-core::imageio`, the direct sibling of m4-228's u8 port: safe kernel
+`pnm_pgm_u16_row_to_float` + divergent reference (output-quad walk via
+`as_chunks_mut` vs the kernel's source-enumerate stride writes) + `void` FFI
++ 5 tests, header declaration (`const uint16_t *line`, matching the
+`darkroom_rawprepare_mosaic_u16` / `darkroom_xcf_mask_to_u16` precedent),
+C inner loop replaced by the FFI call with cursor advance preserved
+(`buf_iter += 4*width`, arithmetically identical to the per-pixel `+=4`).
+Per-pixel `swap_bytes() as f32 / max as f32` (PGM big-endian file order;
+unconditional swap — darktable is LE-only per `imageio_heif.c:167`, same
+explicit-decode stance as m4-208/209; denominator hoisted once, bit-identical
+true division, never reciprocal-multiply), RGB fan-out, alpha explicitly
+`+0.0`. Row `fread`, PBM/PPM branches and both `_read_ppm` triplet branches
+untouched. **LIVE in production**: the branch runs on every 16-bit PGM import.
+`_read_ppm` u8/u16 triplet branches are the natural m4-230/231 follow-ups.
+Survey note for the next increment: `focus.h:49` row pass classified
+GUI-only (runs only under the `display_focus`-gated thumbnail overlay in the
+transitional C GUI, same class as the retouch/colorequal/toneequal GUI loops),
+`segmentation.c:227` upsample deferred (AI-mask path), both recorded here so
+the next session doesn't re-survey them.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, no correctness or FFI-safety defect. One MINOR (the
+degenerate-guard test never asserted the clamped short-buffer contents) +
+three NITs (header `unsigned short` → exact `uint16_t`; stale m4-228-only
+include comment; LE-stance citation), all fixed in-session, plus the
+`imageio_heif.c:167` citation carried into the kernel docs. Post-review, the
+local clippy capture caught one NEW warn-level lint in the new test helper
+(`chunks_exact(2)` → `chunks_exact_to_as_chunks` suggestion); fixed by
+switching to the suggested `as_chunks::<2>().0.iter()` form already used
+elsewhere in the file, restoring the zero-new bar. The delegated dev report's
+"no diagnostic in new ranges" claim is corrected here — it missed this one,
+cargo-freshness non-determinism per the m4-153 lesson. Untracked
+`install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+all-targets Clippy with warning count 1420, byte-identical to the stashed
+pre-change baseline — zero new, release tests, `c41-rs` link). Changed TU
+`src/imageio/imageio_pnm.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1611 passed (1606 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
