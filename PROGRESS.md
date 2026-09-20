@@ -5789,3 +5789,48 @@ Remote CI on `726265d42c` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `726265d42c`.
+
+### m4-232 — JPEG compress RGBA→RGB24 row strip → Rust (2026-09-20 UTC)
+
+**Previous increment.** m4-231 commit `726265d42c` verified on both remotes;
+Docker image, Rust checks/tests/Clippy, and Release CMake CI all succeeded.
+
+**What.** Ported the RGBA→RGB24 row-strip loop of `dt_imageio_jpeg_compress`
+(`src/imageio/imageio_jpeg.c` lines 299-300: `for i<width for k<3:
+row[3*i+k] = buf[4*i+k]`) to `darkroom_jpeg_rgba_row_to_rgb24` in
+`c41-core::imageio`: safe kernel `jpeg_rgba_row_to_rgb24` + divergent
+reference (zipped `as_chunks::<4>` × `as_chunks_mut::<3>` iterators vs the
+kernel's explicit stride writes) + `void` FFI + 5 tests (byte `assert_eq`,
+sentinel-guarded offset windows, `MaybeUninit`, alpha-drop pin with flipped
+alphas, lane-interleave pins, LCG sweep widths [1,3,17,65]), header
+declaration, C nest replaced by the FFI call with `(size_t)width` cast.
+Pure byte shuffle, no arithmetic; alpha never read/written. The `:561`
+duplicate nest in `dt_imageio_jpeg_write_with_icc_profile` deliberately stays
+in C (m4-233 follow-up). The `darkroom_core.h` include was genuinely absent
+and is required (no transitive include; fails `-Werror` without it).
+**LIVE in production**: the strip runs per scanline of every JPEG export via
+`dt_imageio_jpeg_compress`.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no findings. Negative-width hazard analyzed: none (`(size_t)width`
+≥ 2⁶³ on `width < 0` always trips `checked_mul(3)` → observably identical
+zero-trip no-op). FFI guards complete (null/width-zero + checked `3*width`
+AND checked `4*width` before either `from_raw_parts`; overlap correctly
+excluded by contract — `row` is a fresh strip allocation, `buf` a cursor into
+`in`). m4-229 first-quad-contents lesson applied; `git diff --check` clean;
+no `/*`/`*/`. Two NITs recorded, no action: ~5 new-line `rustfmt --check`
+spots reproduce the file's pre-existing flagged idiom class (~40 baseline
+hunks; CI has no fmt gate; whole-file `cargo fmt` would be unrelated churn
+per m4-226) — the dev's "one nit" undercount corrected here; sweep zeroes but
+doesn't assert the first triplet (no coverage gap — rails + degenerate asserts
+pin content). Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new. Changed TU
+`src/imageio/imageio_jpeg.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1626 passed (1621 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
