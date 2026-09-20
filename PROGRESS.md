@@ -5736,4 +5736,7 @@ byte-identical to the stashed pre-change baseline — zero new. Changed TU
 -Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
 in added lines. Release `c41-core` suite: 1616 passed (1611 existing + 5 new),
 0 failed; release `c41-ui` suite 403 passed.
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `d0dde43234` is green: `check + test + clippy`, `CMake + Rust workspace, Ubuntu 24.04 (Release, GCC)`
+(which covers the changed-C Release `-Werror` compile), and `Build & push
+Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
+remotes (`origin` GitHub + Gitea) verified at `d0dde43234`.
