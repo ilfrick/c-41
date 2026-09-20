@@ -5837,3 +5837,40 @@ Remote CI on `45351f5620` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `45351f5620`.
+
+### m4-233 — JPEG icc-profile-path row strip reuses m4-232 kernel (2026-09-20 UTC)
+
+**Previous increment.** m4-232 commit `45351f5620` verified on both remotes;
+Docker image, Rust checks/tests/Clippy, and Release CMake CI all succeeded.
+
+**What.** Wired the duplicate RGBA→RGB24 row-strip nest in
+`dt_imageio_jpeg_write_with_icc_profile` (`src/imageio/imageio_jpeg.c` lines
+561-562, byte-identical to the m4-232 nest) to the existing m4-232 kernel
+`darkroom_jpeg_rgba_row_to_rgb24` — call-site-only change, no new Rust code:
+`crates/c41-core/src/imageio.rs` untouched, header gains only a doc touch-up
+(the m4-232 comment's "duplicate nest stays in C" is now stale; it names both
+call sites and both increments). Both JPEG export paths
+(`dt_imageio_jpeg_compress` + icc-profile write) now share the one reviewed
+kernel. **LIVE in production**: the strip runs per scanline of every JPEG
+export through either path.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no findings — verified the removed nest byte-identical to the
+m4-232 nest (same indexing/bounds/surrounding setup), the new call string
+identical to the m4-232 call site (arg order, `(size_t)` cast, decl/kernel
+signatures), identical `width`/`row`/`buf` provenance in both functions
+(same `const int width`, same `3*width` strip alloc, same `image_width*4`
+stride, same `while(row && ...)` guard), degenerate `width <= 0` preserving
+the old zero-trip no-op via guards, `git diff --check` clean. One doc NIT
+(the stale header comment) fixed in-session. Untracked
+`install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+unchanged from baseline — zero new (no Rust code touched). Changed TU
+`src/imageio/imageio_jpeg.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean. Release
+`c41-core` suite: 1626 passed, 0 failed (unchanged — kernel/tests untouched);
+release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.

@@ -558,8 +558,7 @@ int dt_imageio_jpeg_write_with_icc_profile(const char *filename,
   {
     JSAMPROW tmp[1];
     buf = in + jpg.cinfo.next_scanline * jpg.cinfo.image_width * 4;
-    for(int i = 0; i < width; i++)
-      for(int k = 0; k < 3; k++) row[3 * i + k] = buf[4 * i + k];
+    darkroom_jpeg_rgba_row_to_rgb24(row, buf, (size_t)width);
     tmp[0] = row;
     jpeg_write_scanlines(&(jpg.cinfo), tmp, 1);
   }

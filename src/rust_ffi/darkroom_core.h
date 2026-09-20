@@ -3811,14 +3811,14 @@ void darkroom_pnm_ppm_u16_row_to_float(float *out, const uint16_t *line,
                                        size_t width, unsigned int max);
 
 // JPEG RGBA row strip to RGB24 (imageio_jpeg.c, dt_imageio_jpeg_compress,
-// m4-232).
+// m4-232; duplicate nest in dt_imageio_jpeg_write_with_icc_profile wired in
+// m4-233).
 //
 // darkroom_jpeg_rgba_row_to_rgb24 replaces the inner i/k nest of the
-// compress scanline loop: per column i, row[3*i + k] = buf[4*i + k] for
-// k in 0..2; the alpha lane buf[4*i + 3] is dropped. Pure byte shuffle,
-// no arithmetic. The row allocation, the scanline loop, the libjpeg calls,
-// and the duplicate nest in dt_imageio_jpeg_write_with_icc_profile stay in
-// C. row holds 3*width bytes, buf holds 4*width bytes; null pointers, a
+// compress scanline loop (and its twin in the icc-profile write path): per
+// column i, row[3*i + k] = buf[4*i + k] for k in 0..2; the alpha lane
+// buf[4*i + 3] is dropped. Pure byte shuffle, no arithmetic. The row
+// allocation, the scanline loop, and the libjpeg calls stay in C. row holds 3*width bytes, buf holds 4*width bytes; null pointers, a
 // zero width, and an overflowing 3*width or 4*width product are guarded
 // no-ops; the buffers must not overlap.
 void darkroom_jpeg_rgba_row_to_rgb24(unsigned char *row, const unsigned char *buf,
