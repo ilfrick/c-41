@@ -1024,6 +1024,131 @@ pub unsafe extern "C" fn darkroom_pnm_ppm_u8_row_to_float(
     pnm_ppm_u8_row_to_float(out, line, width, max);
 }
 
+// ── PNM PPM 16-bit RGB-triplet normalize (m4-231) ───────────────────────────
+
+// Safe 16-bit RGB-triplet row to float RGBA kernel.
+//
+// Port of the inner per-pixel loop of the `max > 255` branch of `_read_ppm`
+// (src/imageio/imageio_pnm.c): per column `x < width` and lane `c < 3`,
+// `decoded = line[3*x + c].swap_bytes()` (PPM file order is big-endian with
+// the most significant byte first; the C loop swaps under
+// `G_BYTE_ORDER != G_BIG_ENDIAN`, and darktable supports only
+// little-endian hosts (src/imageio/imageio_heif.c:167), so the swap is
+// unconditional here — the same
+// explicit-decode stance as the m4-208/m4-209 little-endian kernels and
+// the m4-229 gray u16 sibling), then `out[4*x + c] = decoded as f32 / max
+// as f32`, and `out[4*x + 3] = 0.0` (the explicitly zeroed alpha lane).
+// The row `fread`, the line allocation, and the PBM/PGM/8-bit sibling
+// branches stay in C.
+//
+// Fidelity notes:
+// - The kernel must stay a division: `decoded as f32 / max as f32` replays
+//   the C usual-arithmetic-conversion promotion bit for bit, while
+//   `decoded as f32 * (1.0 / max as f32)` can round differently (the
+//   reciprocal is itself inexact). The denominator conversion is hoisted
+//   once; this is bit-identical because `max` is loop-invariant and the
+//   conversion itself is exact over the contracted `256..=65535` range
+//   (every u16 and every u32 below 2^24 widens to f32 exactly), applied in
+//   the same order the C performs it (numerator conversion, denominator
+//   conversion, then one IEEE division per lane).
+// - Unlike the gray PGM sibling (m4-229) there is no fan-out: each RGB
+//   output lane reads its own triplet word, so lane interleave is pinned
+//   by the tests below.
+// - `max` is `256..=65535` by contract (the C `_read_ppm` rejects `max == 0`
+//   and `max > 65535` at entry, and `max <= 255` takes the m4-230 u8 triplet
+//   branch); a zero `max` is a guarded no-op instead of reproducing a
+//   divide-by-zero.
+// - The serial C row loop has no cross-pixel dependencies, so sequential
+//   iteration is identical.
+//
+// Degenerate `width == 0` is a no-op; short buffers are handled by
+// clamped iteration (no panic, no out-of-bounds access). For the
+// well-formed row buffers the C caller passes the clamp never engages
+// and the behaviour is exactly the C loop's.
+pub fn pnm_ppm_u16_row_to_float(out: &mut [f32], line: &[u16], width: usize, max: u32) {
+    if max == 0 {
+        return;
+    }
+    let n = width.min(line.len() / 3).min(out.len() / 4);
+    let denom = max as f32;
+    for x in 0..n {
+        let s = 3 * x;
+        let b = 4 * x;
+        out[b] = line[s].swap_bytes() as f32 / denom;
+        out[b + 1] = line[s + 1].swap_bytes() as f32 / denom;
+        out[b + 2] = line[s + 2].swap_bytes() as f32 / denom;
+        out[b + 3] = 0.0;
+    }
+}
+
+// ── Independent reference implementation for bit-exactness tests ─────────────
+
+/// Structurally divergent reference for `pnm_ppm_u16_row_to_float`: walks the
+/// source triplets and the output quads as zipped `as_chunks` chunk
+/// iterators (the kernel walks columns with explicit stride writes), so the
+/// sweep test cross-checks indexing as well as values. The big-endian decode
+/// and the per-lane `word as f32 / max as f32` division match by construction
+/// (see the kernel docs: the reciprocal-multiply form is not bit-identical
+/// and must not be used). Well-formed buffers only: short inputs are an early
+/// return here rather than clamping.
+#[cfg(test)]
+fn ref_pnm_ppm_u16_row_to_float(line: &[u16], out: &mut [f32], width: usize, max: u32) {
+    if max == 0 {
+        return;
+    }
+    let Some(out_need) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(line_need) = width.checked_mul(3) else {
+        return;
+    };
+    if line.len() < line_need || out.len() < out_need {
+        return;
+    }
+    let denom = max as f32;
+    let (triplets, _) = line.as_chunks::<3>();
+    let (quads, _) = out.as_chunks_mut::<4>();
+    for (triplet, quad) in triplets.iter().take(width).zip(quads.iter_mut().take(width)) {
+        quad[0] = triplet[0].swap_bytes() as f32 / denom;
+        quad[1] = triplet[1].swap_bytes() as f32 / denom;
+        quad[2] = triplet[2].swap_bytes() as f32 / denom;
+        quad[3] = 0.0;
+    }
+}
+
+// ── FFI export ───────────────────────────────────────────────────────────────
+
+/// # Safety
+/// `out` must hold at least `4 * width` floats (the C caller passes the
+/// mipmap-row cursor for an `img->width` row) and `line` at least
+/// `3 * width` u16 words (the row `fread` buffer of RGB triplets, still in
+/// big-endian file order — the kernel performs the byte swap). The two
+/// buffers must not overlap. `max` is the PPM maxval of the `max > 255`
+/// branch (`256..=65535`).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_pnm_ppm_u16_row_to_float(
+    out: *mut f32,
+    line: *const u16,
+    width: usize,
+    max: std::ffi::c_uint,
+) {
+    if out.is_null() || line.is_null() || width == 0 || max == 0 {
+        return;
+    }
+    // validate the products BEFORE building the slices below (a misuse
+    // caller could otherwise wrap a length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let Some(out_len) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(line_len) = width.checked_mul(3) else {
+        return;
+    };
+    let out = std::slice::from_raw_parts_mut(out, out_len);
+    let line = std::slice::from_raw_parts(line, line_len);
+    pnm_ppm_u16_row_to_float(out, line, width, max);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3285,6 +3410,222 @@ mod tests {
                 line.as_ptr(),
                 usize::MAX / 3 + 1,
                 255,
+            );
+        }
+        assert_eq!(out, vec![7.0f32; 16]); // untouched
+    }
+
+    // rails pinned as exact bit patterns for the 16-bit PPM triplet row
+    // (m4-231): 0 scales to +0.0, maxval to exactly 1.0, and every alpha
+    // lane is exactly +0.0. The asymmetric 0x1234 word pins the byte swap
+    // itself (unswapped it would decode as 0x3412), the odd 0x0001 word
+    // pins a swap that changes only the low byte, and the distinct lanes
+    // of the third triplet pin the direct per-lane write (a gray fan-out
+    // would collapse them). Both rails are forced by IEEE arithmetic (not
+    // by the implementation), so they pin the kernel to the C operation.
+    #[test]
+    fn pnm_ppm_u16_row_rails_pin() {
+        let line = pgm_u16_words_from_file_bytes(&[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // black triplet
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // white triplet
+            0x12, 0x34, 0x00, 0x01, 0xFF, 0xFE, // asymmetric triplet
+        ]);
+        let mut out = vec![7.0f32; 12];
+        pnm_ppm_u16_row_to_float(&mut out, &line, 3, 65535);
+        assert_eq!(out[0].to_bits(), 0x0000_0000); // 0 -> +0.0
+        assert_eq!(out[4].to_bits(), 0x3F80_0000); // 0xFFFF -> 1.0
+        assert_eq!(out[5].to_bits(), 0x3F80_0000);
+        assert_eq!(out[6].to_bits(), 0x3F80_0000);
+        // interior lanes follow the same division the C loop performs
+        // (u16 widens to f32 exactly, so float expressions pin the bits)
+        assert_eq!(out[8].to_bits(), (0x1234u16 as f32 / 65535.0).to_bits());
+        assert_eq!(out[9].to_bits(), (1.0f32 / 65535.0).to_bits());
+        assert_eq!(out[10].to_bits(), (0xFFFEu16 as f32 / 65535.0).to_bits());
+        // lanes stay distinct: a fan-out bug would collapse them
+        assert_ne!(out[8].to_bits(), out[9].to_bits());
+        assert_ne!(out[9].to_bits(), out[10].to_bits());
+        assert_ne!(out[8].to_bits(), out[10].to_bits());
+        // zeroed alpha on every quad
+        for x in 0..3 {
+            assert_eq!(out[4 * x + 3].to_bits(), 0x0000_0000, "x={x}");
+        }
+        // smallest maxval of this branch: 0x0000 -> +0.0, 0x0100 -> 1.0
+        let tiny = pgm_u16_words_from_file_bytes(&[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // black triplet
+            0x01, 0x00, 0x01, 0x00, 0x01, 0x00, // white triplet at max 256
+        ]);
+        let mut tiny_out = vec![7.0f32; 8];
+        pnm_ppm_u16_row_to_float(&mut tiny_out, &tiny, 2, 256);
+        assert_eq!(tiny_out[0].to_bits(), 0x0000_0000);
+        assert_eq!(tiny_out[4].to_bits(), 0x3F80_0000);
+        assert_eq!(tiny_out[5].to_bits(), 0x3F80_0000);
+        assert_eq!(tiny_out[6].to_bits(), 0x3F80_0000);
+        assert_eq!(tiny_out[7].to_bits(), 0x0000_0000);
+    }
+
+    // LCG word sweep at several widths and maxvals, sentinel-padded:
+    // kernel and reference must agree bit-exactly on every lane, and only
+    // the exact 4*width span may be written. Words run through big-endian
+    // file bytes (swap-direction coverage) and the three lanes of each
+    // triplet generally differ (interleave coverage, not just
+    // fan-out-compatible grays).
+    #[test]
+    fn pnm_ppm_u16_row_matches_reference() {
+        for width in [1usize, 3, 17, 65] {
+            for max in [256u32, 1000, 32768, 65535] {
+                // native words covering the full 0..=0xFFFF range, built
+                // from big-endian file bytes as fread would leave them
+                let mut file_bytes = Vec::with_capacity(6 * width);
+                for i in 0..3 * width {
+                    // LCG over the full 0..=0xFFFF word range
+                    let v = (i as u64)
+                        .wrapping_mul(2_654_435_761)
+                        .wrapping_add(0x9E37) % 65536;
+                    file_bytes.extend_from_slice(&(v as u16).to_be_bytes());
+                }
+                // pin the rails at the sweep edges: first triplet 0x0000,
+                // second triplet exactly maxval (in file order)
+                for b in file_bytes.iter_mut().take(6) {
+                    *b = 0;
+                }
+                if width > 1 {
+                    let max_bytes = (max as u16).to_be_bytes();
+                    for c in 0..3 {
+                        file_bytes[6 + 2 * c] = max_bytes[0];
+                        file_bytes[6 + 2 * c + 1] = max_bytes[1];
+                    }
+                }
+                let line = pgm_u16_words_from_file_bytes(&file_bytes);
+                // head/tail sentinel lanes around the exact 4*width span
+                let mut direct = vec![-1.0f32; 4 * width + 8];
+                let mut reference = vec![-2.0f32; 4 * width + 8];
+                pnm_ppm_u16_row_to_float(&mut direct[4..4 + 4 * width], &line, width, max);
+                ref_pnm_ppm_u16_row_to_float(
+                    &line,
+                    &mut reference[4..4 + 4 * width],
+                    width,
+                    max,
+                );
+                assert_eq!(direct[..4], [-1.0; 4], "direct head");
+                assert_eq!(direct[4 + 4 * width..], [-1.0; 4], "direct tail");
+                assert_eq!(reference[..4], [-2.0; 4], "reference head");
+                assert_eq!(reference[4 + 4 * width..], [-2.0; 4], "reference tail");
+                for k in 0..4 * width {
+                    assert_eq!(
+                        direct[4 + k].to_bits(),
+                        reference[4 + k].to_bits(),
+                        "lane {k}"
+                    );
+                }
+                // rails decode through the swap: black -> +0.0, maxval -> 1.0
+                assert_eq!(direct[4].to_bits(), 0x0000_0000);
+                assert_eq!(direct[5].to_bits(), 0x0000_0000);
+                assert_eq!(direct[6].to_bits(), 0x0000_0000);
+                if width > 1 {
+                    assert_eq!(direct[8].to_bits(), 0x3F80_0000);
+                    assert_eq!(direct[9].to_bits(), 0x3F80_0000);
+                    assert_eq!(direct[10].to_bits(), 0x3F80_0000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pnm_ppm_u16_row_degenerate_guards_no_op() {
+        let line = vec![0x3412u16; 16];
+        // zero width: output untouched
+        let mut out = vec![9.0f32; 16];
+        pnm_ppm_u16_row_to_float(&mut out, &line, 0, 65535);
+        assert_eq!(out, vec![9.0f32; 16]);
+        // zero maxval: output untouched (the C branch never sees this)
+        let mut out = vec![9.0f32; 16];
+        pnm_ppm_u16_row_to_float(&mut out, &line, 4, 0);
+        assert_eq!(out, vec![9.0f32; 16]);
+        // truncated buffers: clamped iteration must neither panic nor write
+        // out of bounds; well-formed callers never hit this path.
+        let mut short_out = vec![0.0f32; 7]; // short for 2 quads
+        pnm_ppm_u16_row_to_float(&mut short_out, &line, 2, 65535);
+        // clamped to a single triplet: first quad decodes 0x3412 (swapped)
+        // per lane, remaining lanes untouched
+        let short_expected = (0x3412u16.swap_bytes() as f32 / 65535.0).to_bits();
+        assert_eq!(short_out[0].to_bits(), short_expected);
+        assert_eq!(short_out[1].to_bits(), short_expected);
+        assert_eq!(short_out[2].to_bits(), short_expected);
+        assert_eq!(short_out[3].to_bits(), 0.0f32.to_bits());
+        assert_eq!(short_out[4..], [0.0f32; 3]);
+        let short_line = [0x3412u16; 4]; // one triplet plus a stray word: short for 2 columns
+        let mut out2 = vec![-3.0f32; 8];
+        pnm_ppm_u16_row_to_float(&mut out2, &short_line, 2, 65535);
+        assert_eq!(out2[0].to_bits(), short_expected);
+        assert_eq!(out2[3].to_bits(), 0.0f32.to_bits());
+        assert_eq!(out2[4..], vec![-3.0f32; 4]); // second quad untouched
+        let empty: Vec<u16> = vec![];
+        let mut out3 = vec![5.0f32; 4];
+        pnm_ppm_u16_row_to_float(&mut out3, &empty, 1, 65535);
+        assert_eq!(out3, vec![5.0f32; 4]);
+    }
+
+    #[test]
+    fn pnm_ppm_u16_row_ffi_uninit_row() {
+        use std::mem::MaybeUninit;
+
+        // uninitialized row storage is realistic: the C row cursor points
+        // into the mipmap-cache allocation, whose lanes the kernel fully
+        // overwrites before any read.
+        for (width, max) in [(1usize, 256u32), (3, 1000), (65, 65535)] {
+            let line: Vec<u16> = (0..3 * width)
+                .map(|i| {
+                    let v = ((i as u64 * 2_654_435_761 + 0x9E37) % 65536) as u16;
+                    u16::from_le_bytes(v.to_be_bytes())
+                })
+                .collect();
+            let mut ffi_out = vec![MaybeUninit::<f32>::uninit(); 4 * width]
+                .into_boxed_slice();
+            unsafe {
+                darkroom_pnm_ppm_u16_row_to_float(
+                    ffi_out.as_mut_ptr().cast(),
+                    line.as_ptr(),
+                    width,
+                    max,
+                );
+            }
+            // every lane initialized by the call: safe to assume_init now
+            let ffi_out =
+                unsafe { Box::<[f32]>::from_raw(Box::into_raw(ffi_out) as *mut [f32]) };
+            let mut direct = vec![0.0f32; 4 * width];
+            pnm_ppm_u16_row_to_float(&mut direct, &line, width, max);
+            assert_eq!(ffi_out.len(), direct.len());
+            for (k, (f, d)) in ffi_out.iter().zip(direct.iter()).enumerate() {
+                assert_eq!(f.to_bits(), d.to_bits(), "lane {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn pnm_ppm_u16_row_ffi_guards() {
+        let line = [0x3412u16; 48];
+        let mut out = vec![7.0f32; 16];
+        unsafe {
+            // null pointers
+            darkroom_pnm_ppm_u16_row_to_float(std::ptr::null_mut(), line.as_ptr(), 4, 65535);
+            darkroom_pnm_ppm_u16_row_to_float(out.as_mut_ptr(), std::ptr::null(), 4, 65535);
+            // zero width and zero maxval
+            darkroom_pnm_ppm_u16_row_to_float(out.as_mut_ptr(), line.as_ptr(), 0, 65535);
+            darkroom_pnm_ppm_u16_row_to_float(out.as_mut_ptr(), line.as_ptr(), 4, 0);
+            // overflowing lane counts (either product wraps — rejected
+            // before building any slice)
+            darkroom_pnm_ppm_u16_row_to_float(out.as_mut_ptr(), line.as_ptr(), usize::MAX, 65535);
+            darkroom_pnm_ppm_u16_row_to_float(
+                out.as_mut_ptr(),
+                line.as_ptr(),
+                usize::MAX / 4 + 1,
+                65535,
+            );
+            darkroom_pnm_ppm_u16_row_to_float(
+                out.as_mut_ptr(),
+                line.as_ptr(),
+                usize::MAX / 3 + 1,
+                65535,
             );
         }
         assert_eq!(out, vec![7.0f32; 16]); // untouched

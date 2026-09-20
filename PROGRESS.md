@@ -5740,3 +5740,49 @@ Remote CI on `d0dde43234` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `d0dde43234`.
+
+### m4-231 — PNM PPM 16-bit RGB-triplet normalize → Rust (2026-09-20 UTC)
+
+**Previous increment.** m4-230 commit `d0dde43234` verified on both remotes;
+Docker image, Rust checks/tests/Clippy, and Release CMake CI all succeeded.
+
+**What.** Ported the 16-bit row loop of `_read_ppm` (`src/imageio/imageio_pnm.c`,
+`max > 255` branch) to `darkroom_pnm_ppm_u16_row_to_float` in
+`c41-core::imageio`, the fourth and final PNM sibling (m4-228 PGM u8, m4-229
+PGM u16, m4-230 PPM u8) — completing `_read_ppm` and the PNM reader: safe
+kernel `pnm_ppm_u16_row_to_float` + divergent reference (zipped
+`as_chunks::<3>` × `as_chunks_mut::<4>` iterators vs the kernel's explicit
+`3*x`/`4*x` stride writes; reuses the existing `pgm_u16_words_from_file_bytes`
+BE-staging helper rather than duplicating it) + `void` FFI + 5 tests, header
+declaration (`const uint16_t *line`), C inner `x`/`c` loops replaced by the FFI
+call with cursor advance preserved (`buf_iter += 4*width`). Per-lane
+`swap_bytes() as f32 / max as f32` (PGM-big-endian file order, unconditional
+swap — LE-only stance per `imageio_heif.c:167`, same as m4-229; denominator
+hoisted once, true division, never reciprocal-multiply), direct per-lane
+writes with NO fan-out (lane interleave pinned by asymmetric-triplet
+`assert_ne!`), alpha explicitly `+0.0`. Row `fread`, allocation, `line &&`
+guard, and all sibling branches untouched. **LIVE in production**: the branch
+runs on every 16-bit PPM import. Single in-session touch-up: the line-22
+include comment now names all four `pnm_pgm/ppm_u8/u16` symbols.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no findings — verified against the HEAD originals, not dev
+claims. C fidelity, endianness (asymmetric `0x1234` rail pins swap direction),
+FFI guards complete (null/width/max + checked `4*width` AND checked `3*width`
+before either `from_raw_parts`; `usize::MAX`, `MAX/4+1`, `MAX/3+1` covered),
+`max==0` pre-rejection stays in C, reference genuinely divergent, clamped
+first-quad contents + `MaybeUninit` + sentinel windows present, header
+types/docs precise, single-loop scope. Two non-blocking NITs recorded and
+deliberately left (line-pinned `heif.c:167` citation matches house style;
+`pgm_`-named helper reused for triplets — functionally identical BE staging,
+renaming would churn). Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new. Changed TU
+`src/imageio/imageio_pnm.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1621 passed (1616 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
