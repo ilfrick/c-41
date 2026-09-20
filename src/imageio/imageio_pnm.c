@@ -19,7 +19,7 @@
 #include "common/darktable.h"
 #include "develop/imageop.h"         // for IOP_CS_RGB
 #include "imageio/imageio_pfm.h"
-#include "rust_ffi/darkroom_core.h"  // for darkroom_pnm_pgm_u8/u16_row_to_float
+#include "rust_ffi/darkroom_core.h"  // for darkroom_pnm_pgm_u8/u16 + ppm_u8 row_to_float
 
 #include <assert.h>
 #include <errno.h>
@@ -158,15 +158,12 @@ static dt_imageio_retval_t _read_ppm(dt_image_t *img, FILE*f, float *buf)
         result = DT_IMAGEIO_LOAD_FAILED;
         break;
       }
-      for(size_t x = 0; x < img->width; x++)
-      {
-        for(int c = 0; c < 3; c++)
-        {
-          float value = (float)line[x * 3 + c] / (float)max;
-          *buf_iter++ = value;
-        }
-        *buf_iter++ = 0.0;
-      }
+      // 8-bit RGB-triplet normalize loop ported to Rust FFI (m4-230): each
+      // line triplet scales by 1/max into the RGB lanes of the 4-channel
+      // float mipmap row, alpha lane zeroed, as before. The row fread
+      // above and the 16-bit triplet branch below stay in C.
+      darkroom_pnm_ppm_u8_row_to_float(buf_iter, line, (size_t)img->width, max);
+      buf_iter += (size_t)4 * img->width;
     }
     free(line);
   }

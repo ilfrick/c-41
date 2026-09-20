@@ -5695,3 +5695,45 @@ Remote CI on `fac23b65c2` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `fac23b65c2`.
+
+### m4-230 — PNM PPM 8-bit RGB-triplet normalize → Rust (2026-09-20 UTC)
+
+**Previous increment.** m4-229 commit `fac23b65c2` verified on both remotes;
+Docker image, Rust checks/tests/Clippy, and Release CMake CI all succeeded.
+
+**What.** Ported the 8-bit row loop of `_read_ppm` (`src/imageio/imageio_pnm.c`,
+`max <= 255` branch, old lines 161-169) to `darkroom_pnm_ppm_u8_row_to_float`
+in `c41-core::imageio`, the third PNM sibling after m4-228 (PGM u8) and m4-229
+(PGM u16): safe kernel `pnm_ppm_u8_row_to_float` + divergent reference (zipped
+`as_chunks::<3>` × `as_chunks_mut::<4>` iterators vs the kernel's explicit
+column stride writes) + `void` FFI + 5 tests, header declaration, C inner
+`x`/`c` loops replaced by the FFI call with cursor advance preserved
+(`buf_iter += 4*width`, arithmetically identical to the old 4×`++` per pixel).
+Per-lane `(float)line[3*x+c] / (float)max` with hoisted denominator (true
+division, never reciprocal-multiply), direct per-lane writes with NO fan-out
+(unlike the gray PGM sibling — lane interleave pinned by an asymmetric-triplet
+`assert_ne!` test), alpha explicitly `+0.0`. Row `fread`, PBM/PGM branches and
+the `_read_ppm` 16-bit triplet branch untouched. **LIVE in production**: the
+branch runs on every 8-bit PPM import. The `_read_ppm` u16 triplet branch is
+the natural m4-231 follow-up and completes `_read_ppm` / the PNM reader.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no findings. Verified C fidelity (promotion order, no fan-out,
+cursor advance), FFI guards complete (null/width/max + checked `4*width` AND
+checked `3*width` before either `from_raw_parts` — this increment correctly
+adds the `3*width` check its triplet shape needs), `max==0` pre-rejection
+stays in C, reference genuinely divergent, first-quad contents asserted on
+clamped paths (m4-229 review lesson applied by the dev), C-side single-hunk
+scope, header types/docs precise. Two in-session doc/comment touch-ups only
+(include-line wording, kernel `max`-contract phrasing — no code changes).
+Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new. Changed TU
+`src/imageio/imageio_pnm.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1616 passed (1611 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
