@@ -5994,3 +5994,56 @@ Remote CI on `baed244253` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `baed244253`.
+
+### m4-236 — export bpp==8 R/B-swapped float→u8 downconvert → Rust (2026-09-21 UTC)
+
+**Previous increment.** m4-235 commit `baed244253` verified on both remotes;
+`check + test + clippy`, CMake, and Docker image all `success`.
+
+**What.** Ported the `display_byteorder`, `hq_process` `bpp == 8` R/B-swapped
+float→u8 branch of `dt_imageio_export_with_flags` (`src/imageio/imageio.c`)
+to `darkroom_imageio_float_to_u8_swap_rb` in `c41-core::imageio`, completing
+the export-downconvert family (m4-234 u16, m4-235 plain u8, m4-236 swapped
+u8): in-place kernel `float_to_u8_swap_rb_inplace` + divergent reference
+(`ref_float_to_u8_swap_rb`: separate-slice zipped `as_chunks` quads with
+explicit `[(0,2),(1,1),(2,0)]` mapping) + `void` FFI (null/zero/
+`checked_mul(16)`/`isize::MAX` guards) + 5 tests, header declaration with
+explicit swap-mapping doc, C branch body replaced by the FFI call. Read lanes
+`(2,1,0)` → slots `(0,1,2)` (G stays); `inbuf` confirmed to be just
+`(float *)outbuf` over `pipe.backbuf` — same in-place contract as the plain
+twin. The one place the twin pattern could NOT be copied blindly: slot-0's
+write byte overlaps lane 0's unread f32 read span while carrying lane 2's
+value, so per-lane read-then-write would clobber the input — the kernel
+hoists all three float reads into locals before any store, exactly like the
+C `r/g/b` locals (doc states this precisely). `v*255.0`, glib-CLAMP order
+replica, half-away `round`, alpha byte untouched. **LIVE in production**: the
+branch runs on every 8-bit display-byteorder export.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, no code changes needed — verified cold against the
+HEAD source. Swap mapping exact, in-place confirmed, aliasing claim verified
+genuine (reviewer constructed the failing-input mechanism: lane-2 `1.0` at
+pixel 0 writes `0xFF` into lane 0's unread span and flips the rounded output
+under the naive pattern), fidelity exact, NaN honestly graded (manual
+if/else *required* here — inherent `clamp` would not propagate NaN the same
+way), FFI guards complete, reference genuinely divergent with the swap
+replicated (not plain order), tests prove the cross (asymmetric
+`(0,0.5,1)→(255,128,0)` + `assert_ne!` vs unswapped mirror; swap pinned on
+the clamped short path `(1.0,0.0,0.5)→(128,0,255)`), C-side minimal,
+header precise, scope clean. Fixes applied in-session: two stale C-site
+comments (plain-branch + bpp==16 bodies still said the swapped twin "stays
+in C") now name `darkroom_imageio_float_to_u8_swap_rb` (m4-236), and the
+include-line inventory extended. Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new (the `#[allow
+(clippy::manual_clamp)]` on kernel + reference was applied by the dev
+up-front per the m4-234/235 lesson). Changed TU `src/imageio/imageio.c`
+compiled in the dependency image (`c41-m4-223-verify-deps`) with cached
+Release flags + `-Werror -Wfatal-errors`, exit 0, no output.
+`git diff --check` clean; no `/*`/`*/` in added lines. Release `c41-core`
+suite: 1641 passed (1636 existing + 5 new), 0 failed; release `c41-ui` suite
+403 passed.
+Remote CI confirmation follows commit/push per workflow.

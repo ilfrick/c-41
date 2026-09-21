@@ -1502,6 +1502,144 @@ pub unsafe extern "C" fn darkroom_imageio_float_to_u8(buf: *mut u8, npixels: usi
     float_to_u8_inplace(buf, npixels);
 }
 
+// ── 8-bit export float-to-u8 downconvert, R/B-swapped lane order (m4-236) ───
+
+// Safe in-place float-to-u8 export kernel, R/B-swapped lane order.
+//
+// Port of the per-pixel k loop of the `bpp == 8` `display_byteorder`
+// `hq_process` branch of `dt_imageio_export_with_flags`
+// (src/imageio/imageio.c): per pixel `k`,
+// `r = roundf(CLAMP(inbuf[4*k+2] * 0xff, 0, 0xff))`,
+// `g = roundf(CLAMP(inbuf[4*k+1] * 0xff, 0, 0xff))`,
+// `b = roundf(CLAMP(inbuf[4*k+0] * 0xff, 0, 0xff))`,
+// then `outbuf[4*k+0] = r`, `outbuf[4*k+1] = g`, `outbuf[4*k+2] = b`,
+// where `inbuf` (float) and `outbuf` (u8) are two views of the same
+// `pipe.backbuf` allocation (`npixels * 16` bytes: 4 floats per pixel).
+// Read lane order is (2, 1, 0) into write slots (0, 1, 2): R and B cross
+// while G stays. Lane 3 (alpha) is never read nor written, matching the C
+// loop (which only stores lanes 0..2); this is the swapped twin of the
+// m4-235 `float_to_u8_inplace` plain branch.
+//
+// Fidelity notes:
+// - `v * 255.0` replays the C `inbuf[...] * 0xff` bit for bit: the int
+//   literal widens to f32 exactly (255 is below 2^24) and the single
+//   multiply rounds once, in the same order the C performs it.
+// - The clamp mirrors the glib `CLAMP(v, 0, 0xff)` expansion order
+//   (`v > hi ? hi : v < lo ? lo : v`) with both bounds as f32 (exact for
+//   0 and 255); NaN therefore passes through, exactly as in C.
+// - `f32::round` is round-half-away-from-zero, the same as C `roundf`.
+// - The final conversion sees an integral value in `[0, 255]`, except
+//   for NaN input (which survives the clamp on both sides): C leaves a
+//   NaN-to-integer conversion undefined, while Rust `as` saturates NaN
+//   to 0, which is what the assignment produces on x86-64 in practice
+//   (the convert instruction yields `0x80000000`, whose low 8 bits are
+//   0). No other input can reach the conversion unclamped.
+// - In-place aliasing: the u8 writes for pixel k land at byte offsets
+//   `4*k..4*k+3`, strictly below the float reads of every later pixel
+//   (`16*j..` for `j > k`); within the pixel ALL THREE float lanes are
+//   read into locals before ANY lane is written, because write slot 0
+//   overlaps lane 0's bytes at `k == 0` while its value comes from lane
+//   2 — a per-lane read-then-write in slot order would clobber the
+//   unread lane-0 input. The C loop hoists the same way (r/g/b locals
+//   first, stores after). The single `&mut [u8]` view keeps this
+//   aliasing inside safe code (the m4-235 `float_to_u8_inplace`
+//   precedent: one pointer in, one slice built).
+//
+// Degenerate `npixels == 0` is a no-op; short buffers are handled by
+// clamped iteration (no panic, no out-of-bounds access). For the
+// well-formed export buffer the C caller passes the clamp never engages
+// and the behaviour is exactly the C loop's.
+#[allow(clippy::manual_clamp)]
+pub fn float_to_u8_swap_rb_inplace(buf: &mut [u8], npixels: usize) {
+    let n = npixels.min(buf.len() / 16);
+    for k in 0..n {
+        let r = 16 * k;
+        let w = 4 * k;
+        let v0 = f32::from_ne_bytes([buf[r], buf[r + 1], buf[r + 2], buf[r + 3]]);
+        let v1 = f32::from_ne_bytes([buf[r + 4], buf[r + 5], buf[r + 6], buf[r + 7]]);
+        let v2 = f32::from_ne_bytes([buf[r + 8], buf[r + 9], buf[r + 10], buf[r + 11]]);
+        for (i, v) in [v2, v1, v0].into_iter().enumerate() {
+            let scaled = v * 255.0;
+            let clamped = if scaled > 255.0 {
+                255.0
+            } else if scaled < 0.0 {
+                0.0
+            } else {
+                scaled
+            };
+            buf[w + i] = clamped.round() as u8;
+        }
+    }
+}
+
+// ── Independent reference implementation for bit-exactness tests ─────────────
+
+/// Structurally divergent reference for `float_to_u8_swap_rb_inplace`:
+/// walks separate source/destination slices as zipped `as_chunks` quad
+/// iterators (the kernel walks one aliased byte buffer with explicit
+/// stride reads and writes), so the sweep test cross-checks indexing as
+/// well as values. The `v * 255.0` multiply, the high-test-first clamp,
+/// the half-away `round`, and the (2, 1, 0) read-to-(0, 1, 2) slot swap
+/// match by construction (see the kernel docs: a reciprocal multiply or
+/// a banker's rounding would not be bit-identical and must not be used).
+/// Well-formed buffers only: short inputs are an early return here
+/// rather than clamping.
+#[cfg(test)]
+#[allow(clippy::manual_clamp)]
+fn ref_float_to_u8_swap_rb(src: &[f32], dst: &mut [u8], npixels: usize) {
+    let Some(src_need) = npixels.checked_mul(4) else {
+        return;
+    };
+    let Some(dst_need) = npixels.checked_mul(4) else {
+        return;
+    };
+    if src.len() < src_need || dst.len() < dst_need {
+        return;
+    }
+    let (quads, _) = src.as_chunks::<4>();
+    let (bytes, _) = dst.as_chunks_mut::<4>();
+    for (quad, word) in quads.iter().take(npixels).zip(bytes.iter_mut().take(npixels)) {
+        for (slot, lane) in [(0, 2), (1, 1), (2, 0)] {
+            let scaled = quad[lane] * 255.0;
+            let clamped = if scaled > 255.0 {
+                255.0
+            } else if scaled < 0.0 {
+                0.0
+            } else {
+                scaled
+            };
+            word[slot] = clamped.round() as u8;
+        }
+    }
+}
+
+// ── FFI export ───────────────────────────────────────────────────────────────
+
+/// # Safety
+/// `buf` must hold at least `16 * npixels` bytes (the C caller passes
+/// `pipe.backbuf` for a `processed_width * processed_height` float-RGBA
+/// image, converted in place with R/B lanes swapped). Lane 3 of every
+/// pixel and all bytes past `4 * npixels` keep their values. No
+/// alignment requirement: the kernel only performs byte loads and
+/// stores.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_imageio_float_to_u8_swap_rb(buf: *mut u8, npixels: usize) {
+    if buf.is_null() || npixels == 0 {
+        return;
+    }
+    // validate the product BEFORE building the slice below (a misuse
+    // caller could otherwise wrap the length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let Some(len) = npixels.checked_mul(16) else {
+        return;
+    };
+    if len > isize::MAX as usize {
+        return;
+    }
+    let buf = std::slice::from_raw_parts_mut(buf, len);
+    float_to_u8_swap_rb_inplace(buf, npixels);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4491,6 +4629,170 @@ mod tests {
             darkroom_imageio_float_to_u8(guarded.as_mut_ptr(), 0);
             darkroom_imageio_float_to_u8(guarded.as_mut_ptr(), usize::MAX);
             darkroom_imageio_float_to_u8(guarded.as_mut_ptr(), usize::MAX / 16 + 1);
+        }
+        assert_eq!(guarded, vec![7u8; 32]); // untouched
+    }
+
+    // rails pinned as exact ints for the R/B-swapped 8-bit export
+    // downconvert (m4-236): read lane order is (2, 1, 0) into write slots
+    // (0, 1, 2), so asymmetric R != B inputs prove the lanes cross — an
+    // unswapped implementation would produce the mirror image.
+    #[test]
+    fn float_to_u8_swap_rb_rails_pin() {
+        let alpha = 0.5f32;
+        let pixels = [
+            0.0f32, 0.5, 1.0, alpha, // R=0 G=0.5 B=1 crosses to (255, 128, 0)
+            1.0, 0.25, 0.0, alpha, // R=1 G=0.25 B=0 crosses to (0, 64, 255)
+            -1.0, 2.0, -0.0, alpha, // clamp rails plus negative zero
+        ];
+        let mut buf = pack_float_pixels(&pixels);
+        let original = buf.clone();
+        float_to_u8_swap_rb_inplace(&mut buf, 3);
+        assert_eq!((buf[0], buf[1], buf[2]), (255, 128, 0));
+        assert_ne!((buf[0], buf[1], buf[2]), (0, 128, 255), "lanes must cross");
+        assert_eq!((buf[4], buf[5], buf[6]), (0, 64, 255));
+        assert_ne!((buf[4], buf[5], buf[6]), (255, 64, 0), "lanes must cross");
+        assert_eq!((buf[8], buf[9], buf[10]), (0, 255, 0));
+        // lane 3 of every pixel is never written: its byte keeps its
+        // original value (the C loop only stores lanes 0..2)
+        for k in 0..3 {
+            assert_eq!(&buf[4 * k + 3..4 * k + 4], &original[4 * k + 3..4 * k + 4], "alpha lane {k}");
+        }
+        // everything past the 4*npixels u8 span is untouched input
+        assert_eq!(&buf[12..], &pack_float_pixels(&pixels)[12..]);
+    }
+
+    // rounding pins for the swapped 8-bit export downconvert (m4-236): the
+    // exact halves below are verified bit-exact through the f32
+    // divide/multiply (IEEE-754, hence deterministic), and the odd-half
+    // cases pin round-half-away-from-zero against banker's rounding,
+    // matching C roundf. Symmetric values (swap-invisible) isolate the
+    // formula from the lane mapping pinned above.
+    #[test]
+    fn float_to_u8_swap_rb_rounding_half_away() {
+        // (input float, expected u8): scaled products are exactly 127.5,
+        // 2.5, 1.5, 0.5, and 1.0 respectively.
+        for (value, expected) in [
+            (0.5f32, 128u8),
+            (2.5f32 / 255.0, 3),
+            (1.5f32 / 255.0, 2),
+            (0.5f32 / 255.0, 1),
+            (1.0f32 / 255.0, 1),
+        ] {
+            let mut buf = pack_float_pixels(&[value, value, value, 0.25]);
+            float_to_u8_swap_rb_inplace(&mut buf, 1);
+            assert_eq!((buf[0], buf[1], buf[2]), (expected, expected, expected), "value {value}");
+            // cross-check the divergent reference on the same value
+            let mut dst = [0x77u8; 4];
+            ref_float_to_u8_swap_rb(&[value, value, value, 0.25], &mut dst, 1);
+            assert_eq!((dst[0], dst[1], dst[2]), (expected, expected, expected));
+        }
+        // negative half-away: -0.5 scales to exactly -127.5, which rounds
+        // away from zero to -128 and clamps to the zero rail.
+        let mut buf = pack_float_pixels(&[-0.5f32, -0.5, -0.5, 0.25]);
+        float_to_u8_swap_rb_inplace(&mut buf, 1);
+        assert_eq!((buf[0], buf[1], buf[2]), (0, 0, 0));
+    }
+
+    // LCG sweep over raw float bit patterns (covers negatives, denormals,
+    // infinities, and NaNs) at several image sizes: kernel and reference
+    // must agree exactly on lanes 0..2 of every pixel, lane 3 must keep
+    // its byte, and all bytes past the 4*npixels u8 span must be
+    // untouched input.
+    #[test]
+    fn float_to_u8_swap_rb_matches_reference_lcg_sweep() {
+        for npixels in [1usize, 2, 3, 17, 65] {
+            let mut state = 0x9E37_79B9u32;
+            let pixels: Vec<f32> = (0..4 * npixels)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    f32::from_bits(state)
+                })
+                .collect();
+            let mut buf = pack_float_pixels(&pixels);
+            let original = buf.clone();
+            let mut expected = vec![0x77u8; 4 * npixels];
+            ref_float_to_u8_swap_rb(&pixels, &mut expected, npixels);
+            float_to_u8_swap_rb_inplace(&mut buf, npixels);
+            for k in 0..npixels {
+                for i in 0..3 {
+                    assert_eq!(buf[4 * k + i], expected[4 * k + i], "pixel {k} lane {i}");
+                }
+                assert_eq!(
+                    &buf[4 * k + 3..4 * k + 4],
+                    &original[4 * k + 3..4 * k + 4],
+                    "alpha lane {k}"
+                );
+            }
+            assert_eq!(&buf[4 * npixels..], &original[4 * npixels..], "tail");
+        }
+    }
+
+    #[test]
+    fn float_to_u8_swap_rb_ffi_uninit_window() {
+        use std::mem::MaybeUninit;
+
+        // uninitialized export storage is realistic: pipe.backbuf is a
+        // fresh pipeline allocation whose float lanes the kernel reads
+        // only after the pixel pipeline wrote them, and whose u8 lanes
+        // it fully overwrites for lanes 0..2.
+        for npixels in [1usize, 3, 17] {
+            let pixels: Vec<f32> = (0..4 * npixels)
+                .map(|i| ((i as u64 * 2_654_435_761 + 0x9E37) % 256) as f32 / 255.0 - 0.25)
+                .collect();
+            let bytes = pack_float_pixels(&pixels);
+            // head/tail sentinel bytes around the exact 16*npixels span,
+            // window offset by 4 so a single-byte over/under-run fails.
+            let mut storage = vec![MaybeUninit::<u8>::uninit(); 16 * npixels + 8];
+            storage[..4].iter_mut().for_each(|b| {
+                b.write(0xA5);
+            });
+            storage[4 + 16 * npixels..].iter_mut().for_each(|b| {
+                b.write(0x5A);
+            });
+            for (slot, byte) in storage[4..4 + 16 * npixels].iter_mut().zip(bytes.iter()) {
+                slot.write(*byte);
+            }
+            unsafe {
+                darkroom_imageio_float_to_u8_swap_rb(storage.as_mut_ptr().add(4).cast(), npixels);
+            }
+            let storage_init: Vec<u8> =
+                unsafe { storage.iter().map(|b| b.assume_init()).collect() };
+            assert_eq!(&storage_init[..4], &[0xA5u8; 4], "head");
+            assert_eq!(&storage_init[4 + 16 * npixels..], &[0x5Au8; 4], "tail");
+            let mut direct = bytes.clone();
+            float_to_u8_swap_rb_inplace(&mut direct, npixels);
+            assert_eq!(&storage_init[4..4 + 16 * npixels], &direct[..]);
+        }
+    }
+
+    #[test]
+    fn float_to_u8_swap_rb_degenerate_guards_no_op() {
+        // zero pixels: buffer untouched
+        let mut buf = pack_float_pixels(&[0.5f32, 0.5, 0.5, 0.5]);
+        float_to_u8_swap_rb_inplace(&mut buf, 0);
+        assert_eq!(buf, pack_float_pixels(&[0.5f32, 0.5, 0.5, 0.5]));
+        // truncated buffer: clamped iteration converts only the complete
+        // pixel, never panics nor writes out of bounds; well-formed
+        // callers never hit this path. Lanes (1.0, 0.0, 0.5) cross to
+        // slots (128, 0, 255), pinning the swap on the short path too.
+        let full = pack_float_pixels(&[1.0f32, 0.0, 0.5, 0.25, 1.0, 0.0, 0.5, 0.25]);
+        let mut short = full[..20].to_vec(); // one pixel plus 4 stray bytes
+        float_to_u8_swap_rb_inplace(&mut short, 2);
+        assert_eq!((short[0], short[1], short[2]), (128, 0, 255));
+        assert_eq!(&short[4..], &full[4..20]);
+        // empty buffer with nonzero count: no-op
+        let mut empty: Vec<u8> = vec![];
+        float_to_u8_swap_rb_inplace(&mut empty, 1);
+        assert!(empty.is_empty());
+        // FFI guards: null, zero count, and overflowing 16*npixels
+        // products are no-ops that never touch memory.
+        let mut guarded = vec![7u8; 32];
+        unsafe {
+            darkroom_imageio_float_to_u8_swap_rb(std::ptr::null_mut(), 2);
+            darkroom_imageio_float_to_u8_swap_rb(guarded.as_mut_ptr(), 0);
+            darkroom_imageio_float_to_u8_swap_rb(guarded.as_mut_ptr(), usize::MAX);
+            darkroom_imageio_float_to_u8_swap_rb(guarded.as_mut_ptr(), usize::MAX / 16 + 1);
         }
         assert_eq!(guarded, vec![7u8; 32]); // untouched
     }

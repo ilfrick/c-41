@@ -3833,7 +3833,8 @@ void darkroom_jpeg_rgba_row_to_rgb24(unsigned char *row, const unsigned char *bu
 // (float) and buf16 (uint16_t) aliasing the same buffer; lane 3 is never
 // read nor written. The bpp == 8 !display_byteorder plain-lane branch is
 // now darkroom_imageio_float_to_u8 below (m4-235); the display_byteorder
-// R/B-swapped twin branch stays in C. buf holds
+// R/B-swapped twin branch is darkroom_imageio_float_to_u8_swap_rb below
+// (m4-236). buf holds
 // 16*npixels bytes; a null pointer, a zero npixels, and an overflowing
 // 16*npixels product are guarded no-ops.
 void darkroom_imageio_float_to_u16(unsigned char *buf, size_t npixels);
@@ -3846,10 +3847,24 @@ void darkroom_imageio_float_to_u16(unsigned char *buf, size_t npixels);
 // i < 3, outbuf[4*k+i] = roundf(CLAMP(inbuf[4*k+i] * 0xff, 0, 0xff))
 // with inbuf (float) and outbuf (uint8_t) aliasing the same buffer;
 // lane 3 is never read nor written. The display_byteorder R/B-swapped
-// twin branch stays in C as the m4-236 follow-up. buf holds
+// twin branch is darkroom_imageio_float_to_u8_swap_rb below (m4-236).
+// buf holds 16*npixels bytes; a null pointer, a zero npixels, and an
+// overflowing 16*npixels product are guarded no-ops.
+void darkroom_imageio_float_to_u8(unsigned char *buf, size_t npixels);
+
+// 8-bit export float-to-u8 downconvert, R/B-swapped lane order (imageio.c,
+// dt_imageio_export_with_flags, m4-236).
+//
+// darkroom_imageio_float_to_u8_swap_rb replaces the per-pixel k loop of
+// the bpp == 8 display_byteorder hq_process branch: per pixel k,
+// outbuf[4*k+0] = roundf(CLAMP(inbuf[4*k+2] * 0xff, 0, 0xff)),
+// outbuf[4*k+1] = roundf(CLAMP(inbuf[4*k+1] * 0xff, 0, 0xff)),
+// outbuf[4*k+2] = roundf(CLAMP(inbuf[4*k+0] * 0xff, 0, 0xff))
+// with inbuf (float) and outbuf (uint8_t) aliasing the same buffer;
+// lane 3 is never read nor written. buf holds
 // 16*npixels bytes; a null pointer, a zero npixels, and an overflowing
 // 16*npixels product are guarded no-ops.
-void darkroom_imageio_float_to_u8(unsigned char *buf, size_t npixels);
+void darkroom_imageio_float_to_u8_swap_rb(unsigned char *buf, size_t npixels);
 
 /*
  * 8-bit export R/B lane swap (imageio.c, dt_imageio_export_with_flags,
