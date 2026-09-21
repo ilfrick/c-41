@@ -3824,6 +3824,18 @@ void darkroom_pnm_ppm_u16_row_to_float(float *out, const uint16_t *line,
 void darkroom_jpeg_rgba_row_to_rgb24(unsigned char *row, const unsigned char *buf,
                                      size_t width);
 
+// 16-bit export float-to-u16 downconvert (imageio.c,
+// dt_imageio_export_with_flags, m4-234).
+//
+// darkroom_imageio_float_to_u16 replaces the y/x/i nest of the bpp == 16
+// branch: per pixel k and lane i < 3,
+// buf16[4*k+i] = roundf(CLAMP(buff[4*k+i] * 0xffff, 0, 0xffff)) with buff
+// (float) and buf16 (uint16_t) aliasing the same buffer; lane 3 is never
+// read nor written. The bpp == 8 twin branches stay in C. buf holds
+// 16*npixels bytes; a null pointer, a zero npixels, and an overflowing
+// 16*npixels product are guarded no-ops.
+void darkroom_imageio_float_to_u16(unsigned char *buf, size_t npixels);
+
 /*
  * 8-bit export R/B lane swap (imageio.c, dt_imageio_export_with_flags,
  * m4-205).

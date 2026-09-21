@@ -31,7 +31,7 @@
 #include "develop/imageop.h"
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb, darkroom_imageio_u8_to_float, darkroom_imageio_u8_to_float_oriented
+#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb, darkroom_imageio_u8_to_float, darkroom_imageio_u8_to_float_oriented, darkroom_imageio_float_to_u16
 
 #ifdef HAVE_OPENEXR
 #include "imageio/imageio_exr.h"
@@ -1375,17 +1375,11 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
   }
   else if(bpp == 16)
   {
-    // uint16_t per color channel
-    float *buff = (float *)outbuf;
-    uint16_t *buf16 = (uint16_t *)outbuf;
-    for(int y = 0; y < processed_height; y++)
-      for(int x = 0; x < processed_width; x++)
-      {
-        // convert in place
-        const size_t k = (size_t)processed_width * y + x;
-        for(int i = 0; i < 3; i++)
-          buf16[4 * k + i] = roundf(CLAMP(buff[4 * k + i] * 0xffff, 0, 0xffff));
-      }
+    // uint16_t per color channel: float RGBA downconversion ported to
+    // Rust FFI (darkroom_imageio_float_to_u16 in
+    // crates/c41-core/src/imageio.rs), in place over pipe.backbuf; the
+    // bpp == 8 twin branches above stay in C.
+    darkroom_imageio_float_to_u16(outbuf, (size_t)processed_width * processed_height);
   }
   // else output float, no further harm done to the pixels :)
 

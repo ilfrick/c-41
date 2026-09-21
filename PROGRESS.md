@@ -5881,3 +5881,59 @@ out (`.github/workflows/rust.yml` triggers only on `crates/**`/Cargo files;
 m4-233 touched no Rust code, and the local gate ran check + all-targets Clippy
 + release tests + `c41-rs` link with exit 0). Both remotes (`origin` GitHub +
 Gitea) verified at `3d75bc4f49`.
+
+### m4-234 — export bpp==16 float→u16 downconvert → Rust (2026-09-21 UTC)
+
+**Previous increment.** m4-233 commit `3d75bc4f49` verified on both remotes
+(CMake + Docker `success`; `check + test + clippy` correctly path-filtered
+out — no Rust code touched; local gate covered it).
+
+**What.** Ported the `bpp == 16` float→u16 nest of `dt_imageio_export_with_flags`
+(`src/imageio/imageio.c`, old lines ~1376-1390) to `darkroom_imageio_float_to_u16`
+in `c41-core::imageio`: in-place whole-image kernel `float_to_u16_inplace`
+(single `&mut [u8]`, safe code per the m4-205 `swap_rb` precedent) + divergent
+reference (separate `&[f32]`/`&mut [u16]` zipped `as_chunks` quads vs the
+kernel's single aliased byte buffer — the sweep cross-checks aliasing as well
+as values) + `void` FFI + 5 tests, header declaration, C body replaced by one
+FFI call passing `(size_t)processed_width * processed_height` (same expression
+shape as the three sibling call sites). Per lane `i<3`: `v*65535.0`, glib-CLAMP
+order replica (high-test-first, NaN passes through exactly as in C), `round`
+(half-away = `roundf`); lane 3 never read/written on either side. Branch
+condition, `outbuf` setup/NULL-guard, both `bpp == 8` twins, and the float
+passthrough untouched. **LIVE in production**: the branch runs on every 16-bit
+export. Follow-ups left in C: both `bpp == 8` hq downconvert twins.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no BLOCKER/MAJOR/MINOR — verified against the HEAD originals.
+Fidelity (bounds, lane coverage, CLAMP order incl. NaN passthrough, exact
+`0xffff` widening, single multiply, half-away rounding), aliasing soundness
+(pixel-k writes strictly below later reads; ascending lane order +
+read-before-write within the pixel — same order C relies on), NaN honestly
+graded (only NaN reaches conversion unclamped; C formally UB there, Rust `as`
+saturates to 0 = observed x86-64 C result; documented, no observable-input
+divergence), FFI guards complete (null/zero/`checked_mul(16)`/`isize::MAX`;
+16 = 4 lanes × 4 bytes), tests pin the formula with literal values
+(`2.5→3`/`0.5→1` banker's-discriminators verified exact by integer arithmetic,
+not flaky; would catch reciprocal-multiply) plus LCG sweep over NaN/denormal/
+Inf with alpha/tail sentinels and `MaybeUninit` ±1 over/under-run coverage,
+header precise, single-branch scope. Two in-session fixes: (1) the kernel
+aliasing doc overstated "strictly below ... own unread lanes" (lane-2 writes
+overlap lane-1's consumed span) — reworded to state the ascending-order +
+read-before-write argument precisely; (2) post-review clippy capture caught
+TWO new warn-level lints (`manual_clamp` on kernel + reference — the dev's
+"no diagnostic in new ranges" claim corrected again, same cargo-freshness
+lesson as m4-229) — fixed with targeted `#[allow(clippy::manual_clamp)]`
+matching the file's 9 existing intentional-deviation allows (the if/else
+deliberately mirrors the glib expansion verbatim; `.clamp()` avoided to keep
+the reviewed arithmetic untouched). Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new. Changed TU
+`src/imageio/imageio.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1631 passed (1626 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
