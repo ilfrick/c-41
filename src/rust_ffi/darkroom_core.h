@@ -3831,10 +3831,25 @@ void darkroom_jpeg_rgba_row_to_rgb24(unsigned char *row, const unsigned char *bu
 // branch: per pixel k and lane i < 3,
 // buf16[4*k+i] = roundf(CLAMP(buff[4*k+i] * 0xffff, 0, 0xffff)) with buff
 // (float) and buf16 (uint16_t) aliasing the same buffer; lane 3 is never
-// read nor written. The bpp == 8 twin branches stay in C. buf holds
+// read nor written. The bpp == 8 !display_byteorder plain-lane branch is
+// now darkroom_imageio_float_to_u8 below (m4-235); the display_byteorder
+// R/B-swapped twin branch stays in C. buf holds
 // 16*npixels bytes; a null pointer, a zero npixels, and an overflowing
 // 16*npixels product are guarded no-ops.
 void darkroom_imageio_float_to_u16(unsigned char *buf, size_t npixels);
+
+// 8-bit export float-to-u8 downconvert, plain lane order (imageio.c,
+// dt_imageio_export_with_flags, m4-235).
+//
+// darkroom_imageio_float_to_u8 replaces the per-pixel k loop of the
+// bpp == 8 !display_byteorder hq_process branch: per pixel k and lane
+// i < 3, outbuf[4*k+i] = roundf(CLAMP(inbuf[4*k+i] * 0xff, 0, 0xff))
+// with inbuf (float) and outbuf (uint8_t) aliasing the same buffer;
+// lane 3 is never read nor written. The display_byteorder R/B-swapped
+// twin branch stays in C as the m4-236 follow-up. buf holds
+// 16*npixels bytes; a null pointer, a zero npixels, and an overflowing
+// 16*npixels product are guarded no-ops.
+void darkroom_imageio_float_to_u8(unsigned char *buf, size_t npixels);
 
 /*
  * 8-bit export R/B lane swap (imageio.c, dt_imageio_export_with_flags,

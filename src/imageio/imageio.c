@@ -31,7 +31,7 @@
 #include "develop/imageop.h"
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
-#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb, darkroom_imageio_u8_to_float, darkroom_imageio_u8_to_float_oriented, darkroom_imageio_float_to_u16
+#include "rust_ffi/darkroom_core.h" // for darkroom_imageio_swap_rb, darkroom_imageio_u8_to_float, darkroom_imageio_u8_to_float_oriented, darkroom_imageio_float_to_u16, darkroom_imageio_float_to_u8
 
 #ifdef HAVE_OPENEXR
 #include "imageio/imageio_exr.h"
@@ -1351,17 +1351,11 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
       // ldr output: char
       if(hq_process)
       {
-        const float *const inbuf = (float *)outbuf;
-        for(size_t k = 0; k < (size_t)processed_width * processed_height; k++)
-        {
-          // convert in place, this is unfortunately very serial..
-          const uint8_t r = roundf(CLAMP(inbuf[4 * k + 0] * 0xff, 0, 0xff));
-          const uint8_t g = roundf(CLAMP(inbuf[4 * k + 1] * 0xff, 0, 0xff));
-          const uint8_t b = roundf(CLAMP(inbuf[4 * k + 2] * 0xff, 0, 0xff));
-          outbuf[4 * k + 0] = r;
-          outbuf[4 * k + 1] = g;
-          outbuf[4 * k + 2] = b;
-        }
+        // float RGBA downconversion ported to Rust FFI
+        // (darkroom_imageio_float_to_u8 in
+        // crates/c41-core/src/imageio.rs), in place over pipe.backbuf; the
+        // display_byteorder R/B-swapped twin branch above stays in C.
+        darkroom_imageio_float_to_u8(outbuf, (size_t)processed_width * processed_height);
       }
       else
       { // !display_byteorder, need to swap:
@@ -1378,7 +1372,7 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
     // uint16_t per color channel: float RGBA downconversion ported to
     // Rust FFI (darkroom_imageio_float_to_u16 in
     // crates/c41-core/src/imageio.rs), in place over pipe.backbuf; the
-    // bpp == 8 twin branches above stay in C.
+    // bpp == 8 display_byteorder twin branch above stays in C.
     darkroom_imageio_float_to_u16(outbuf, (size_t)processed_width * processed_height);
   }
   // else output float, no further harm done to the pixels :)

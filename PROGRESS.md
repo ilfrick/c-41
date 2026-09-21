@@ -5940,3 +5940,54 @@ Remote CI on `62f7990586` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `62f7990586`.
+
+### m4-235 — export bpp==8 plain float→u8 downconvert → Rust (2026-09-21 UTC)
+
+**Previous increment.** m4-234 commit `62f7990586` verified on both remotes;
+`check + test + clippy`, CMake, and Docker image all `success`.
+
+**What.** Ported the PLAIN (`!display_byteorder`, `hq_process`) `bpp == 8`
+float→u8 branch of `dt_imageio_export_with_flags` (`src/imageio/imageio.c`)
+to `darkroom_imageio_float_to_u8` in `c41-core::imageio`: in-place kernel
+`float_to_u8_inplace` (single `&mut [u8]`, explicit-stride walk, clamped
+iteration) + divergent reference (`ref_float_to_u8`: separate `&[f32]`/`&mut
+[u8]` zipped `as_chunks` quads — cross-checks indexing/aliasing; formula
+intentionally identical and pinned instead by literal tests) + `void` FFI
+(null/zero/`checked_mul(16)`/`isize::MAX` guards) + 5 tests, header
+declaration, C branch body replaced by
+`darkroom_imageio_float_to_u8(outbuf, (size_t)processed_width * processed_height)`.
+Per lane `i<3`: `v*255.0` (exact, single multiply), glib-CLAMP order replica
+(NaN passes through as in C), `round` (half-away = `roundf`); identity lane
+order, NO R/B swap; alpha byte never read/written on either side (survives in
+place). The `display_byteorder` R/B-swapped twin stays in C (m4-236
+follow-up); `swap_rb`, `bpp==16`, and passthrough untouched. Related doc
+touch-ups only: m4-234 comments narrowed to name the surviving twin,
+include-line symbol list extended. **LIVE in production**: the branch runs on
+every 8-bit non-byteorder export.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no findings — verified cold against the HEAD source. Twin
+identification correct (swapped twin reads `inbuf[+2,+1,+0]`; ported branch
+reads `[+0,+1,+2]`), fidelity exact, aliasing sound (writes `4k..4k+2`,
+later reads at `16(k+1)`; ascending lanes + read-before-write; byte `4k+3`
+untouched), NaN honestly graded (C UB, Rust `as` saturates to 0 = observed
+x86-64 result, documented), FFI guards complete, reference genuinely
+divergent, tests pin the formula (`0→0, 1→255, 127.5→128, 2.5→3` kills
+banker's rounding; LCG raw-bit sweep incl. NaN/Inf/denormals; lane-3 + tail
+asserted untouched on every path; first-quad `(255,0,128)` asserted on the
+clamped short-buffer path; `MaybeUninit` + `0xA5/0x5A` sentinels), header
+precise, single-branch scope. One informational NIT (half-away cases built
+via divide-then-multiply are IEEE-deterministic but fragile by construction)
+— no action. The m4-234 `manual_clamp` lesson was applied by the dev
+up-front (`#[allow]` on kernel + reference); post-review clippy capture
+confirms zero new. Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new. Changed TU
+`src/imageio/imageio.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1636 passed (1631 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
