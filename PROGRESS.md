@@ -5873,4 +5873,11 @@ unchanged from baseline — zero new (no Rust code touched). Changed TU
 -Wfatal-errors`, exit 0, no output. `git diff --check` clean. Release
 `c41-core` suite: 1626 passed, 0 failed (unchanged — kernel/tests untouched);
 release `c41-ui` suite 403 passed.
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `3d75bc4f49` is green: `CMake + Rust workspace, Ubuntu 24.04 (Release, GCC)`
+(which covers the changed-C Release `-Werror` compile) and `Build & push
+Docker image` both `success`; matrix/full-c/nightly jobs skipped as expected.
+`check + test + clippy` did not run on this commit — correctly path-filtered
+out (`.github/workflows/rust.yml` triggers only on `crates/**`/Cargo files;
+m4-233 touched no Rust code, and the local gate ran check + all-targets Clippy
++ release tests + `c41-rs` link with exit 0). Both remotes (`origin` GitHub +
+Gitea) verified at `3d75bc4f49`.
