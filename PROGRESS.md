@@ -6147,4 +6147,7 @@ unchanged from baseline — zero new (no Rust logic touched). Changed TU
 -Wfatal-errors`, exit 0, no output. `git diff --check` clean. Release
 `c41-core` suite: 1646 passed, 0 failed (unchanged — kernel/tests untouched);
 release `c41-ui` suite 403 passed.
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `64f0dabab4` is green: `check + test + clippy`, `CMake + Rust workspace, Ubuntu 24.04 (Release, GCC)`
+(which covers the changed-C Release `-Werror` compile), and `Build & push
+Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
+remotes (`origin` GitHub + Gitea) verified at `64f0dabab4`.
