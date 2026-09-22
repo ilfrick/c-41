@@ -23,7 +23,7 @@
 #include "control/conf.h"
 #include "develop/develop.h"
 #include "imageio_common.h"
-#include "rust_ffi/darkroom_core.h"  // for darkroom_tiff_chunky_f_row_to_float
+#include "rust_ffi/darkroom_core.h"  // for darkroom_tiff_chunky_f/8_row_to_float
 
 #include <inttypes.h>
 #include <memory.h>
@@ -98,25 +98,11 @@ static inline int _read_chunky_8(tiff_t *t, uint16_t photometric)
     /* read scanline */
     if(TIFFReadScanline(t->tiff, in, row, 0) == -1) return -1;
 
-    for(uint32_t i = 0; i < t->width; i++, in += t->spp, out += 4)
-    {
-      /* set rgb to first sample from scanline */
-      out[0] = need_invert
-               ? 1.0f - ((float)in[0]) * (1.0f / 255.0f)
-               :        ((float)in[0]) * (1.0f / 255.0f);
-
-      if(t->spp < 3)  // mono, maybe plus alpha channel
-      {
-        out[1] = out[2] = out[0];
-      }
-      else
-      {
-        out[1] = ((float)in[1]) * (1.0f / 255.0f);
-        out[2] = ((float)in[2]) * (1.0f / 255.0f);
-      }
-
-      out[3] = 0;
-    }
+    // Chunky 8-bit row normalize ported to Rust FFI (m4-241): per column,
+    // out[0] = in[0]*(1/255) or its MINISWHITE invert, mono splat
+    // (spp < 3) or in[1]/in[2] scaled but never inverted, alpha zeroed,
+    // as before. The TIFFReadScanline above stays in C.
+    darkroom_tiff_chunky_8_row_to_float(out, in, (size_t)t->width, (size_t)t->spp, (int)need_invert);
   }
 
   return 1;

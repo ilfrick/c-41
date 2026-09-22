@@ -6257,3 +6257,57 @@ Remote CI on `a1458eeff6` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `a1458eeff6`.
+
+### m4-241 — TIFF chunky-u8 row → Rust (2026-09-22 UTC)
+
+**Previous increment.** m4-240 commit `a1458eeff6` verified on both remotes;
+`check + test + clippy`, CMake, and Docker image all `success`.
+
+**What.** Ported the `_read_chunky_8` inner pixel loop
+(`src/imageio/imageio_tiff.c`, old lines 101-119) to
+`darkroom_tiff_chunky_8_row_to_float` in `c41-core::imageio`, mirroring the
+m4-240 float sibling: safe kernel `tiff_chunky_8_row_to_float` (early
+`spp == 0` return, clamped `n`, stride indexing, `spp < 3` splat vs color
+branch, alpha `+0.0`) + divergent reference (`as_chunks_mut::<4>` +
+`chunks_exact(spp)` zip) + `void` FFI (`out, inp, width, spp, need_invert:
+c_int`; nulls, zero width/spp, both `checked_mul` products, `isize::MAX`
+byte-span cap; a zero flag is data, never a guard) + 5 tests, header
+declaration, C loop replaced by one FFI call. LOAD-BEARING fidelity point:
+C scales with RECIPROCAL-MULTIPLY `(float)in * (1.0f/255.0f)`, not division
+— 126/256 bytes differ by 1 ulp (byte 3: mul `0x3C40C0C2` vs div
+`0x3C40C0C1`); the kernel uses `inp as f32 * SCALE` with
+`const SCALE: f32 = 1.0/255.0` (single IEEE round, bit-identical quotient
+regardless of fold timing), hoisted once (loop-invariant, exact widening).
+Invert affects lane 0 only (`1.0 - scaled`, multiply first per C precedence;
+splat repeats the inverted value; color G/B scaled, never inverted):
+0→1.0, 255→+0.0 exact. File alpha never read; output alpha `+0.0`. Per-row
+`TIFFReadScanline`, `need_invert` derivation (`PHOTOMETRIC_MINISWHITE`),
+row setup/cursor, and both Lab/`cmsDoTransform` variants untouched.
+**LIVE in production**: the loop runs on every 8-bit TIFF import row.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no defect — verified cold against the HEAD source. Exact C
+spelling quoted (`1.0f - ((float)in[0]) * (1.0f/255.0f)`), invert order
+(`*` binds tighter — matched), lane-0-only invert, spp branches, alpha
+(`out[3] = 0` int literal → `+0.0`), `need_invert` truthiness (`gboolean`
+→ `c_int`, `!= 0`), FFI guards complete (color branch implies `spp ≥ 3`
+so `s+2` in-bounds), reference genuinely divergent (shares the scale
+spelling by design — independence comes from the rails instead), tests
+genuinely independent where it matters (byte-3 pin `0x3C40_C0C2` PLUS
+`assert_ne!` vs the division spelling — fails loudly under a `/255.0`
+rewrite; negative control confirmed by the dev), C-side minimal (include
+already added by m4-240 — no duplicate), header precise, scope clean, no
+new `#[allow]`. Two in-session fixes: (1) MINOR — added the dedicated
+`isize::MAX` byte-span-cap guard test (width `isize::MAX/16+1`, spp 1:
+products valid, `out_bytes` over the cap); (2) NIT — include-line inventory
+now names both symbols. Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new. Changed TU
+`src/imageio/imageio_tiff.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1661 passed (1656 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.

@@ -3983,6 +3983,26 @@ void darkroom_imageio_u8_to_float_oriented(float *out, const unsigned char *in,
 void darkroom_tiff_chunky_f_row_to_float(float *out, const float *in,
                                          size_t width, size_t spp);
 
+// TIFF chunky 8-bit row normalize (imageio_tiff.c, _read_chunky_8, m4-241).
+//
+// darkroom_tiff_chunky_8_row_to_float replaces the inner per-pixel loop of
+// _read_chunky_8: per column i, r = in[spp*i] * (1.0f/255.0f) (the C
+// reciprocal-multiply spelling, not a division), then out[4*i] = r or its
+// MINISWHITE invert (1.0f - r) when need_invert is nonzero, then the
+// spp < 3 mono-splat branch (out[4*i+1] = out[4*i+2] = out[4*i], so
+// scanline lanes 1 and up are never read) or the color branch
+// (out[4*i+1] = in[spp*i+1] * (1.0f/255.0f), out[4*i+2] with in[spp*i+2],
+// scaled but never inverted), then out[4*i+3] = 0.0 (the explicitly
+// zeroed alpha lane: the file alpha lane in[spp*i+3], present when
+// spp == 2 or spp >= 4, is never read). The per-row TIFFReadScanline,
+// the row setup, the cursor advance, and the Lab cmsDoTransform sibling
+// variants stay in C. out holds 4*width floats, in holds spp*width
+// bytes; null pointers, a zero width, a zero spp, and an overflowing
+// 4*width or spp*width product are guarded no-ops; the buffers must not
+// overlap.
+void darkroom_tiff_chunky_8_row_to_float(float *out, const unsigned char *in,
+                                         size_t width, size_t spp, int need_invert);
+
 /*
  * WebP 8-bit RGBA normalize (imageio_webp.c, dt_imageio_open_webp, m4-207).
  *
