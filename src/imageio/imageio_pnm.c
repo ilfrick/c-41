@@ -19,7 +19,7 @@
 #include "common/darktable.h"
 #include "develop/imageop.h"         // for IOP_CS_RGB
 #include "imageio/imageio_pfm.h"
-#include "rust_ffi/darkroom_core.h"  // for darkroom_pnm_pgm/ppm_u8/u16_row_to_float
+#include "rust_ffi/darkroom_core.h"  // for darkroom_pnm_pbm/pgm/ppm_u8/u16_row_to_float
 
 #include <assert.h>
 #include <errno.h>
@@ -50,18 +50,13 @@ static dt_imageio_retval_t _read_pbm(dt_image_t *img, FILE*f, float *buf)
       result = DT_IMAGEIO_IOERROR;
       break;
     }
-    for(size_t x = 0; x < bytes_needed; x++)
-    {
-      uint8_t byte = line[x] ^ 0xff;
-      for(int bit = 0; bit < 8 && x * 8 + bit < img->width; bit++)
-      {
-        float value = ((byte & 0x80) >> 7) * 1.0;
-        buf_iter[0] = buf_iter[1] = buf_iter[2] = value;
-        buf_iter[3] = 0.0;
-        buf_iter += 4;
-        byte <<= 1;
-      }
-    }
+    // Packed-bit row unpack loop ported to Rust FFI (m4-239): each pack
+    // byte contributes its bits MSB-first, inverted (PBM 1 is black, so a
+    // set file bit decodes to 0.0) into the RGB lanes of the 4-channel
+    // float mipmap row, alpha lane zeroed, bits past img->width in the
+    // last pack byte ignored, as before. The row fread above stays in C.
+    darkroom_pnm_pbm_row_to_float(buf_iter, line, (size_t)img->width);
+    buf_iter += (size_t)4 * img->width;
   }
 
   free(line);

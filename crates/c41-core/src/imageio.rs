@@ -1149,6 +1149,119 @@ pub unsafe extern "C" fn darkroom_pnm_ppm_u16_row_to_float(
     pnm_ppm_u16_row_to_float(out, line, width, max);
 }
 
+// ── PNM PBM bit-unpack row to float RGBA (m4-239) ──────────────────────────
+
+// Safe packed-bit row to float RGBA kernel.
+//
+// Port of the inner byte/bit nest of `_read_pbm`
+// (src/imageio/imageio_pnm.c): per column `x < width`, the file bit is
+// MSB-first within its pack byte (`(line[x / 8] >> (7 - x % 8)) & 1`,
+// the per-pixel form of the C loop's `byte & 0x80` test plus `byte <<= 1`
+// shift register), INVERTED (`line[x] ^ 0xff` in C: PBM 1 is black, so a
+// set file bit decodes to 0.0 and a clear file bit to 1.0), then
+// `out[4*x + c] = value` for `c` in 0..2 and `out[4*x + 3] = 0.0` (the
+// explicitly zeroed alpha lane). Bits past `width` in the last pack byte
+// are never read (the C `x * 8 + bit < width` tail guard). PBM has no
+// maxval. The row `fread`, the line allocation, and the PGM/PPM sibling
+// branches stay in C.
+//
+// Fidelity notes:
+// - Pure bit shuffle plus exact 0.0/1.0 selection: no arithmetic, no
+//   rounding, so bit-exactness holds by construction as long as the bit
+//   order and the polarity match. `f32::from(1 - bit)` selects the same
+//   rails the C `((byte & 0x80) >> 7) * 1.0` computes (`* 1.0` is exact).
+// - The serial C row loop has no cross-pixel dependencies, so sequential
+//   iteration is identical.
+//
+// Degenerate `width == 0` is a no-op; short buffers are handled by
+// clamped iteration (no panic, no out-of-bounds access): the pixel count
+// is capped by both the output quads and the pack bytes on hand. For the
+// well-formed row buffers the C caller passes the clamp never engages
+// and the behaviour is exactly the C loop's.
+pub fn pnm_pbm_row_to_float(out: &mut [f32], line: &[u8], width: usize) {
+    let have = line.len().saturating_mul(8).min(width);
+    let n = have.min(out.len() / 4);
+    for x in 0..n {
+        let bit = (line[x / 8] >> (7 - x % 8)) & 1;
+        let value = f32::from(1 - bit);
+        let b = 4 * x;
+        out[b] = value;
+        out[b + 1] = value;
+        out[b + 2] = value;
+        out[b + 3] = 0.0;
+    }
+}
+
+// ── Independent reference implementation for bit-exactness tests ─────────────
+
+/// Structurally divergent reference for `pnm_pbm_row_to_float`: walks the
+/// pack bytes outer / bits inner with a mutating `byte <<= 1` shift
+/// register exactly like the C nest (the kernel walks pixels with the
+/// per-pixel shift expression), so the sweep test cross-checks traversal
+/// as well as values. The `^ 0xff` inversion, the MSB-first order, the
+/// `x < width` tail guard, and the zeroed alpha match by construction.
+/// Well-formed buffers only: short inputs are an early return here rather
+/// than clamping.
+#[cfg(test)]
+fn ref_pnm_pbm_row_to_float(line: &[u8], out: &mut [f32], width: usize) {
+    let Some(out_need) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(line_need) = width.checked_add(7).map(|w| w / 8) else {
+        return;
+    };
+    if line.len() < line_need || out.len() < out_need {
+        return;
+    }
+    let mut x = 0usize;
+    for &raw in line.iter().take(line_need) {
+        let mut byte = raw ^ 0xff;
+        for _ in 0..8 {
+            if x >= width {
+                break;
+            }
+            let value = f32::from((byte >> 7) & 1);
+            let b = 4 * x;
+            out[b] = value;
+            out[b + 1] = value;
+            out[b + 2] = value;
+            out[b + 3] = 0.0;
+            byte <<= 1;
+            x += 1;
+        }
+    }
+}
+
+// ── FFI export ───────────────────────────────────────────────────────────────
+
+/// # Safety
+/// `out` must hold at least `4 * width` floats (the C caller passes the
+/// mipmap-row cursor for an `img->width` row) and `line` at least
+/// `(width + 7) / 8` bytes (the row `fread` buffer of packed MSB-first
+/// bits). The two buffers must not overlap. PBM has no maxval.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_pnm_pbm_row_to_float(
+    out: *mut f32,
+    line: *const u8,
+    width: usize,
+) {
+    if out.is_null() || line.is_null() || width == 0 {
+        return;
+    }
+    // validate the products BEFORE building the slices below (a misuse
+    // caller could otherwise wrap a length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let Some(out_len) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(line_len) = width.checked_add(7).map(|w| w / 8) else {
+        return;
+    };
+    let out = std::slice::from_raw_parts_mut(out, out_len);
+    let line = std::slice::from_raw_parts(line, line_len);
+    pnm_pbm_row_to_float(out, line, width);
+}
+
 // ── JPEG RGBA row strip to RGB24 (m4-232) ──────────────────────────────────
 
 // Safe RGBA to RGB24 row-strip kernel.
@@ -4222,6 +4335,184 @@ mod tests {
                 usize::MAX / 3 + 1,
                 65535,
             );
+        }
+        assert_eq!(out, vec![7.0f32; 16]); // untouched
+    }
+
+    // rails pinned as exact bit patterns for the PBM bit-unpack row
+    // (m4-239): a clear file bit decodes to exactly 1.0 (PBM 0 is white),
+    // a set file bit to exactly +0.0 (PBM 1 is black — the INVERTED
+    // polarity of the C `line[x] ^ 0xff`), MSB-first within each pack
+    // byte, and every alpha lane exactly +0.0. The asymmetric 0x9C byte
+    // pins the bit order itself (it is not a bit-palindrome, so LSB-first
+    // would give an observably different vector),
+    // and the width-5 case pins the tail guard (the 3 padding bits of the
+    // last pack byte are never read). All rails are forced by the C
+    // operation (exact 0.0/1.0 selection, no arithmetic), so they pin the
+    // kernel directly.
+    #[test]
+    fn pnm_pbm_row_rails_pin() {
+        // full bytes: 0x00 -> all white, 0xFF -> all black
+        let mut out = vec![7.0f32; 8];
+        pnm_pbm_row_to_float(&mut out, &[0x00], 8);
+        assert_eq!(out[0].to_bits(), 0x3F80_0000);
+        let mut black = vec![7.0f32; 8];
+        pnm_pbm_row_to_float(&mut black, &[0xFF], 8);
+        assert_eq!(black[0].to_bits(), 0x0000_0000);
+        // asymmetric byte 0x9C = file bits 1,0,0,1,1,1,0,0 MSB-first, so
+        // decoded values are 0,1,1,0,0,0,1,1. 0x9C is not a bit-palindrome:
+        // an LSB-first misread would decode 1,1,0,0,0,1,1,0 instead, so the
+        // first- and last-pixel pins below catch a reversed bit order.
+        let mut asym = vec![7.0f32; 32];
+        pnm_pbm_row_to_float(&mut asym, &[0x9C], 8);
+        let expected = [
+            0x0000_0000u32,
+            0x3F80_0000,
+            0x3F80_0000,
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000,
+            0x3F80_0000,
+            0x3F80_0000,
+        ];
+        for x in 0..8 {
+            assert_eq!(asym[4 * x].to_bits(), expected[x], "x={x}");
+            assert_eq!(asym[4 * x + 1].to_bits(), expected[x], "x={x}");
+            assert_eq!(asym[4 * x + 2].to_bits(), expected[x], "x={x}");
+            assert_eq!(asym[4 * x + 3].to_bits(), 0x0000_0000, "x={x}");
+        }
+        // bit-order pins: an LSB-first misread of 0x9C would give 1.0 at
+        // pixel 0 and 0.0 at pixel 7 — the reverse of the pins above.
+        assert_eq!(asym[0].to_bits(), 0x0000_0000);
+        assert_eq!(asym[28].to_bits(), 0x3F80_0000);
+        // tail guard: width 5 reads only the top 5 bits of 0b10110_000
+        // (file bits 1,0,1,1,0 -> values 0,1,0,0,1); the 3 padding bits
+        // are ignored, so padding 000 and padding 111 decode identically
+        for padding in [0x00u8, 0x07] {
+            let mut tail = vec![7.0f32; 20];
+            pnm_pbm_row_to_float(&mut tail, &[0xB0 | padding], 5);
+            let values: Vec<u32> = (0..5).map(|x| tail[4 * x].to_bits()).collect();
+            assert_eq!(
+                values,
+                vec![0x0000_0000, 0x3F80_0000, 0x0000_0000, 0x0000_0000, 0x3F80_0000],
+                "padding={padding:#04x}"
+            );
+            for x in 0..5 {
+                assert_eq!(tail[4 * x + 3].to_bits(), 0x0000_0000, "x={x}");
+            }
+        }
+    }
+
+    // LCG bit sweep at several widths (including non-multiples of 8, so
+    // the tail guard is covered), sentinel-padded: kernel and reference
+    // must agree bit-exactly on every lane, and only the exact 4*width
+    // span may be written.
+    #[test]
+    fn pnm_pbm_row_matches_reference() {
+        for width in [1usize, 3, 5, 7, 8, 9, 17, 65] {
+            let packed = width.div_ceil(8);
+            let mut line = Vec::with_capacity(packed);
+            let mut state = 0x9E37_79B9u32;
+            for _ in 0..packed {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                line.push((state >> 24) as u8);
+            }
+            // head/tail sentinel lanes around the exact 4*width span
+            let mut direct = vec![-1.0f32; 4 * width + 8];
+            let mut reference = vec![-2.0f32; 4 * width + 8];
+            pnm_pbm_row_to_float(&mut direct[4..4 + 4 * width], &line, width);
+            ref_pnm_pbm_row_to_float(&line, &mut reference[4..4 + 4 * width], width);
+            assert_eq!(direct[..4], [-1.0; 4], "direct head");
+            assert_eq!(direct[4 + 4 * width..], [-1.0; 4], "direct tail");
+            assert_eq!(reference[..4], [-2.0; 4], "reference head");
+            assert_eq!(reference[4 + 4 * width..], [-2.0; 4], "reference tail");
+            for k in 0..4 * width {
+                assert_eq!(
+                    direct[4 + k].to_bits(),
+                    reference[4 + k].to_bits(),
+                    "lane {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pnm_pbm_row_degenerate_guards_no_op() {
+        let line = vec![0xA5u8; 16];
+        // zero width: output untouched
+        let mut out = vec![9.0f32; 16];
+        pnm_pbm_row_to_float(&mut out, &line, 0);
+        assert_eq!(out, vec![9.0f32; 16]);
+        // truncated buffers: clamped iteration must neither panic nor write
+        // out of bounds; well-formed callers never hit this path.
+        let mut short_out = vec![0.0f32; 7]; // short for 2 quads
+        pnm_pbm_row_to_float(&mut short_out, &[0x00], 2);
+        // clamped to a single quad: first pixel decodes clear-bit 1.0,
+        // remaining lanes untouched
+        assert_eq!(short_out[0].to_bits(), 0x3F80_0000);
+        assert_eq!(short_out[1].to_bits(), 0x3F80_0000);
+        assert_eq!(short_out[2].to_bits(), 0x3F80_0000);
+        assert_eq!(short_out[3].to_bits(), 0x0000_0000);
+        assert_eq!(short_out[4..], [0.0f32; 3]);
+        let empty: Vec<u8> = vec![];
+        let mut out2 = vec![-3.0f32; 8];
+        pnm_pbm_row_to_float(&mut out2, &empty, 2);
+        assert_eq!(out2, vec![-3.0f32; 8]); // no pack bytes: nothing written
+        let mut out3 = vec![5.0f32; 4];
+        pnm_pbm_row_to_float(&mut out3, &empty, 1);
+        assert_eq!(out3, vec![5.0f32; 4]);
+    }
+
+    #[test]
+    fn pnm_pbm_row_ffi_uninit_row() {
+        use std::mem::MaybeUninit;
+
+        // uninitialized row storage is realistic: the C row cursor points
+        // into the mipmap-cache allocation, whose lanes the kernel fully
+        // overwrites before any read.
+        for width in [1usize, 5, 9, 65] {
+            let packed = width.div_ceil(8);
+            let mut line = Vec::with_capacity(packed);
+            for i in 0..packed {
+                line.push(((i as u64 * 2_654_435_761 + 0x9E37) % 256) as u8);
+            }
+            let mut ffi_out = vec![MaybeUninit::<f32>::uninit(); 4 * width]
+                .into_boxed_slice();
+            unsafe {
+                darkroom_pnm_pbm_row_to_float(ffi_out.as_mut_ptr().cast(), line.as_ptr(), width);
+            }
+            // every lane initialized by the call: safe to assume_init now
+            let ffi_out =
+                unsafe { Box::<[f32]>::from_raw(Box::into_raw(ffi_out) as *mut [f32]) };
+            let mut direct = vec![0.0f32; 4 * width];
+            pnm_pbm_row_to_float(&mut direct, &line, width);
+            assert_eq!(ffi_out.len(), direct.len());
+            for (k, (f, d)) in ffi_out.iter().zip(direct.iter()).enumerate() {
+                assert_eq!(f.to_bits(), d.to_bits(), "lane {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn pnm_pbm_row_ffi_guards() {
+        let line = [0xA5u8; 16];
+        let mut out = vec![7.0f32; 16];
+        unsafe {
+            // null pointers
+            darkroom_pnm_pbm_row_to_float(std::ptr::null_mut(), line.as_ptr(), 4);
+            darkroom_pnm_pbm_row_to_float(out.as_mut_ptr(), std::ptr::null(), 4);
+            // zero width
+            darkroom_pnm_pbm_row_to_float(out.as_mut_ptr(), line.as_ptr(), 0);
+            // overflowing lane count (4 * width wraps — rejected before
+            // building any slice) and overflowing pack span (width + 7
+            // wraps — rejected likewise)
+            darkroom_pnm_pbm_row_to_float(out.as_mut_ptr(), line.as_ptr(), usize::MAX);
+            darkroom_pnm_pbm_row_to_float(
+                out.as_mut_ptr(),
+                line.as_ptr(),
+                usize::MAX / 4 + 1,
+            );
+            darkroom_pnm_pbm_row_to_float(out.as_mut_ptr(), line.as_ptr(), usize::MAX - 3);
         }
         assert_eq!(out, vec![7.0f32; 16]); // untouched
     }

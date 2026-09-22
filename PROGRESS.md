@@ -6151,3 +6151,51 @@ Remote CI on `64f0dabab4` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `64f0dabab4`.
+
+### m4-239 — PNM PBM bit-unpack row → Rust, PNM reader complete (2026-09-22 UTC)
+
+**Previous increment.** m4-238 commit `64f0dabab4` verified on both remotes;
+`check + test + clippy`, CMake, and Docker image all `success`.
+
+**What.** Ported the `_read_pbm` bit-unpack row loop (`src/imageio/imageio_pnm.c`,
+old lines ~46-65) to `darkroom_pnm_pbm_row_to_float` in `c41-core::imageio`,
+COMPLETING the PNM reader (m4-228 PGM u8, m4-229 PGM u16, m4-230 PPM u8,
+m4-231 PPM u16, m4-239 PBM): safe kernel `pnm_pbm_row_to_float` (pixel-first:
+`bit = (line[x/8] >> (7 - x%8)) & 1`, `value = f32::from(1 - bit)`, RGB
+fan-out + `0.0` alpha; no `max` — PBM has none) + divergent reference
+(byte-outer/bit-inner shift register exactly like C) + `void` FFI
+(null/width-zero, checked `4*width`, checked `(width+7)/8` via
+`checked_add(7)` before either slice) + 5 tests, header declaration, C nest
+replaced by the FFI call with cursor advance preserved. INVERTED polarity
+(`^0xff`: file set bit = black = 0.0), MSB-first order, tail guard
+(`x*8+bit < width` → kernel writes exactly `width` quads, padding never
+read). Row `fread`, `bytes_needed` alloc, header parsing, all other branches
+untouched. **LIVE in production**: the loop runs on every PBM import.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no findings — verified against the HEAD source. Bit order
+exactly equivalent (`((a^0xff)>>s)&1 == 1-((a>>s)&1)` per bit), polarity
+bit-identical (exact `0.0/1.0` rails both sides), no over-read (padding never
+touched; short buffers clamp with `(n-1)/8 < line.len()` proven), FFI guards
+complete (`usize::MAX-3` fails `checked_add` → no-op; no wrap hole),
+kernel clamp sound (identity on well-formed rows), reference genuinely
+divergent with MSB-first pinned INDEPENDENTLY by non-palindromic `0x9C`
+rails (bit-reverse `0x39` differs at 6 lanes — an MSB/LSB swap fails loudly),
+padding invariance (`0xB0|000` vs `0xB0|111`), sweep widths incl.
+non-multiples of 8, first-quad contents asserted on clamped paths,
+`MaybeUninit`, header precise, single-loop scope, no new `#[allow]`, no
+`chunks_exact`. Two cosmetic NITs recorded, no action (guard-comment
+mislabels which guard fires first — the pack-span guard is unreachable
+defense-in-depth since `4w ≤ MAX ⟹ w ≪ MAX-7`; clamped-path sentinel `0.0`
+coincides with the alpha value). Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new. Changed TU
+`src/imageio/imageio_pnm.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1651 passed (1646 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.

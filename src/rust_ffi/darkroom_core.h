@@ -3810,6 +3810,24 @@ void darkroom_pnm_ppm_u8_row_to_float(float *out, const unsigned char *line,
 void darkroom_pnm_ppm_u16_row_to_float(float *out, const uint16_t *line,
                                        size_t width, unsigned int max);
 
+// PNM PBM bit-unpack row (imageio_pnm.c, dt_imageio_open_pnm,
+// m4-239).
+//
+// darkroom_pnm_pbm_row_to_float replaces the inner byte/bit nest of
+// _read_pbm: per column x, the file bit is MSB-first within its pack
+// byte ((line[x / 8] >> (7 - x % 8)) & 1), inverted (PBM 1 is black,
+// so a set file bit decodes to 0.0 and a clear file bit to 1.0),
+// then out[4*x + c] = value for c in 0..2, and out[4*x + 3] = 0.0
+// (the explicitly zeroed alpha lane). Bits past width in the last
+// pack byte are never read (the x * 8 + bit < width tail guard); PBM
+// has no maxval. The row fread, the line allocation, and the PGM/PPM
+// sibling branches stay in C. out holds 4*width floats, line holds
+// (width + 7) / 8 bytes; null pointers, a zero width, and an
+// overflowing 4*width or (width + 7) / 8 product are guarded no-ops;
+// the buffers must not overlap.
+void darkroom_pnm_pbm_row_to_float(float *out, const unsigned char *line,
+                                   size_t width);
+
 // JPEG RGBA row strip to RGB24 (imageio_jpeg.c, dt_imageio_jpeg_compress,
 // m4-232; duplicate nest in dt_imageio_jpeg_write_with_icc_profile wired in
 // m4-233).
