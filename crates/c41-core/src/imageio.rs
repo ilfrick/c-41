@@ -1245,7 +1245,7 @@ pub unsafe extern "C" fn darkroom_jpeg_rgba_row_to_rgb24(
 
 // Safe RGB24 to RGBA row-expand kernel.
 //
-// Port of the inner i/k nest of `decompress_plain`
+// Port of the inner i/k nest of `decompress_plain`/`read_plain`
 // (src/imageio/imageio_jpeg.c:184-186): per column `i < width` and lane
 // `k < 3`, `tmp[4*i + k] = row[3*i + k]`. Lane 3 (`tmp[4*i + 3]`) is
 // never written: the C loop stores only lanes 0..2, so whatever byte was
@@ -1259,8 +1259,9 @@ pub unsafe extern "C" fn darkroom_jpeg_rgba_row_to_rgb24(
 // exact inverse of the m4-232 `jpeg_rgba_row_to_rgb24` strip kernel.
 //
 // The row allocation, the scanline while-loop, the setjmp handling, and
-// the libjpeg calls stay in C, as does the duplicate i/k nest in
-// `read_plain` (imageio_jpeg.c:647-648, the m4-238 follow-up).
+// the libjpeg calls stay in C; the duplicate i/k nest in `read_plain`
+// (imageio_jpeg.c:644) was wired to this same symbol in m4-238, so both
+// plain paths now call it (call sites at imageio_jpeg.c:184 and :644).
 //
 // Fidelity notes:
 // - Pure byte shuffle: no arithmetic, no conversion, no rounding, so
@@ -1316,11 +1317,11 @@ fn ref_jpeg_rgb24_row_to_rgba(row: &[u8], tmp: &mut [u8], width: usize) {
 // ── FFI export ───────────────────────────────────────────────────────────────
 
 /// # Safety
-/// `tmp` must hold at least `4 * width` bytes (the C caller passes the
-/// RGBA row cursor of the `decompress_plain` output buffer; its alpha
-/// slots are never written, see the kernel docs) and `row` at least
-/// `3 * width` bytes (the libjpeg scanline strip). The two buffers must
-/// not overlap.
+/// `tmp` must hold at least `4 * width` bytes (the C callers pass the
+/// RGBA row cursor of the `decompress_plain`/`read_plain` output buffer;
+/// its alpha slots are never written, see the kernel docs) and `row` at
+/// least `3 * width` bytes (the libjpeg scanline strip). The two buffers
+/// must not overlap.
 #[no_mangle]
 pub unsafe extern "C" fn darkroom_jpeg_rgb24_row_to_rgba(
     tmp: *mut u8,

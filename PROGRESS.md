@@ -6104,3 +6104,47 @@ Remote CI on `1acb67d837` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `1acb67d837`.
+
+### m4-238 — JPEG read_plain expand reuses m4-237 kernel (2026-09-22 UTC)
+
+**Previous increment.** m4-237 commit `1acb67d837` verified on both remotes;
+`check + test + clippy`, CMake, and Docker image all `success`.
+
+**What.** Wired the duplicate RGB24→RGBA row-expand nest in `read_plain`
+(`src/imageio/imageio_jpeg.c` lines 645-646, braceless 2-line form of the
+same loop) to the existing m4-237 kernel `darkroom_jpeg_rgb24_row_to_rgba`
+— call-site-only change, no new Rust code:
+`darkroom_jpeg_rgb24_row_to_rgba(tmp, row_pointer[0],
+(size_t)jpg->dinfo.image_width)` byte-identical to the m4-237 call site.
+Both JPEG plain decompress paths (`decompress_plain` mem path + `read_plain`
+file path) now share the one reviewed kernel. Doc-only touch-ups: the header
+decl comment and kernel doc no longer say the duplicate "stays in C" (now
+name both call sites at `:184`/`:644`); the FFI `# Safety` doc names both
+plain-path callers. The m4-237 PROGRESS entry stands as the historical
+record. **LIVE in production**: the expand runs per scanline of every JPEG
+decompress through either plain path.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, code correct, doc fixes only — verified cold against
+HEAD. Replaced nest semantically identical to the m4-237 nest (brace style
+the only difference: 2 deletions here vs 4 there), call string identical,
+single-file scope, `git diff --check` clean. Caller-size contract holds
+identically at both sites (`tmp` = cursor into caller-owned 4·w·h `out`;
+strip alloc textually identical `output_width * num_components` with 3
+components in the plain path; the `4 * jpg->width` stride quirk and the
+never-enabled libjpeg-scaling/`num_components != 3` edges behave no worse
+than the old loop at either site — the kernel's clamped iteration is
+strictly safer against OOB). All three review findings fixed in-session
+(header + kernel-doc "stays in C" reworded with corrected `:644` anchor;
+FFI safety doc names both callers). Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+unchanged from baseline — zero new (no Rust logic touched). Changed TU
+`src/imageio/imageio_jpeg.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean. Release
+`c41-core` suite: 1646 passed, 0 failed (unchanged — kernel/tests untouched);
+release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.

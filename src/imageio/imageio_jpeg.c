@@ -641,8 +641,7 @@ static int read_plain(dt_imageio_jpeg_t *jpg, uint8_t *out)
       fclose(jpg->f);
       return 1;
     }
-    for(unsigned int i = 0; i < jpg->dinfo.image_width; i++)
-      for(int k = 0; k < 3; k++) tmp[4 * i + k] = row_pointer[0][3 * i + k];
+    darkroom_jpeg_rgb24_row_to_rgba(tmp, row_pointer[0], (size_t)jpg->dinfo.image_width);
     tmp += 4 * jpg->width;
   }
   dt_free_align(row_pointer[0]);

@@ -3825,13 +3825,14 @@ void darkroom_jpeg_rgba_row_to_rgb24(unsigned char *row, const unsigned char *bu
                                      size_t width);
 
 // JPEG RGB24 row expand to RGBA (imageio_jpeg.c, decompress_plain, m4-237;
-// duplicate nest in read_plain stays in C as the m4-238 follow-up).
+// duplicate nest in read_plain wired in m4-238; both plain paths now call
+// this symbol).
 //
 // darkroom_jpeg_rgb24_row_to_rgba replaces the inner i/k nest of the
-// decompress_plain scanline loop: per column i, tmp[4*i + k] =
+// decompress_plain and read_plain scanline loops: per column i, tmp[4*i + k] =
 // row_pointer[0][3*i + k] for k in 0..2; the alpha lane tmp[4*i + 3] is
-// never written and keeps whatever byte was already there (at the C call
-// site that slot holds uninitialized allocator output, not zeroes).
+// never written and keeps whatever byte was already there (at both C call
+// sites that slot holds uninitialized allocator output, not zeroes).
 // Pure byte shuffle, no arithmetic. The row allocation, the scanline loop,
 // the setjmp handling, and the libjpeg calls stay in C. tmp holds
 // 4*width bytes, row holds 3*width bytes; null pointers, a zero width,
