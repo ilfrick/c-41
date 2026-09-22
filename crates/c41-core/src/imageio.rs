@@ -1857,6 +1857,140 @@ pub unsafe extern "C" fn darkroom_imageio_float_to_u8_swap_rb(buf: *mut u8, npix
     float_to_u8_swap_rb_inplace(buf, npixels);
 }
 
+// ── TIFF chunky float row copy (m4-240) ────────────────────────────────────
+
+// Safe chunky-float row to float RGBA kernel.
+//
+// Port of the inner per-pixel loop of `_read_chunky_f`
+// (src/imageio/imageio_tiff.c): per column `i < width`,
+// `out[4*i] = inp[spp*i]`, then the `spp < 3` mono-splat branch
+// (`out[4*i+1] = out[4*i+2] = out[4*i]`, so scanline lanes 1 and up are
+// never read) or the color branch (`out[4*i+1] = inp[spp*i+1]`,
+// `out[4*i+2] = inp[spp*i+2]`), then `out[4*i+3] = 0.0` (the explicitly
+// zeroed alpha lane: the file alpha lane `inp[spp*i+3]`, present when
+// `spp == 2` or `spp >= 4`, is never read). Pure float copies, no
+// arithmetic, no scaling. The per-row `TIFFReadScanline`, the row setup,
+// the cursor advance, and the Lab `cmsDoTransform` sibling variants stay
+// in C.
+//
+// Fidelity notes:
+// - Bit-exactness holds by construction: every stored lane is a copy of
+//   a source float (or the exact literal `0.0`), so no rounding can
+//   occur on either side; NaN payloads and signed zeroes survive intact.
+// - `spp == 1` (gray) and `spp == 2` (gray+alpha) take the splat branch,
+//   exactly matching the C `spp < 3` test; `spp >= 3` (RGB, RGB+alpha,
+//   or further extra samples) takes the color branch with stride `spp`.
+// - The serial C row loop has no cross-pixel dependencies, so sequential
+//   iteration is identical.
+//
+// Degenerate `width == 0` or `spp == 0` is a no-op; short buffers are
+// handled by clamped iteration (no panic, no out-of-bounds access). For
+// the well-formed row buffers the C caller passes the clamp never engages
+// and the behaviour is exactly the C loop's.
+pub fn tiff_chunky_f_row_to_float(out: &mut [f32], inp: &[f32], width: usize, spp: usize) {
+    if spp == 0 {
+        return;
+    }
+    let n = width.min(out.len() / 4).min(inp.len() / spp);
+    for i in 0..n {
+        let s = spp * i;
+        let b = 4 * i;
+        let r = inp[s];
+        out[b] = r;
+        if spp < 3 {
+            out[b + 1] = r;
+            out[b + 2] = r;
+        } else {
+            out[b + 1] = inp[s + 1];
+            out[b + 2] = inp[s + 2];
+        }
+        out[b + 3] = 0.0;
+    }
+}
+
+// ── Independent reference implementation for bit-exactness tests ─────────────
+
+/// Structurally divergent reference for `tiff_chunky_f_row_to_float`:
+/// walks the source pixels and the output quads as zipped chunk iterators
+/// (`chunks_exact(spp)` over the scanline with `as_chunks_mut` quads,
+/// versus the kernel's explicit stride indexing), so the sweep test
+/// cross-checks indexing as well as values. The `spp < 3` splat branch,
+/// the color branch, and the zeroed alpha match by construction (pure
+/// copies either way). Well-formed buffers only: short inputs are an
+/// early return here rather than clamping.
+#[cfg(test)]
+fn ref_tiff_chunky_f_row_to_float(inp: &[f32], out: &mut [f32], width: usize, spp: usize) {
+    if spp == 0 {
+        return;
+    }
+    let Some(out_need) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(inp_need) = width.checked_mul(spp) else {
+        return;
+    };
+    if inp.len() < inp_need || out.len() < out_need {
+        return;
+    }
+    let (quads, _) = out.as_chunks_mut::<4>();
+    for (quad, px) in quads.iter_mut().take(width).zip(inp.chunks_exact(spp)) {
+        quad[0] = px[0];
+        if spp < 3 {
+            quad[1] = px[0];
+            quad[2] = px[0];
+        } else {
+            quad[1] = px[1];
+            quad[2] = px[2];
+        }
+        quad[3] = 0.0;
+    }
+}
+
+// ── FFI export ───────────────────────────────────────────────────────────────
+
+/// # Safety
+/// `out` must hold at least `4 * width` floats (the C caller passes the
+/// mipmap-row cursor for a `t->width` row) and `inp` at least
+/// `spp * width` floats (the `TIFFReadScanline` buffer). The two buffers
+/// must not overlap. `spp` is the TIFF samples-per-pixel (1 = gray,
+/// 2 = gray+alpha, 3 = RGB, 4+ = RGB+alpha/extras); the file alpha lane,
+/// when present, is never read and the output alpha lane is always 0.0.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_tiff_chunky_f_row_to_float(
+    out: *mut f32,
+    inp: *const f32,
+    width: usize,
+    spp: usize,
+) {
+    if out.is_null() || inp.is_null() || width == 0 || spp == 0 {
+        return;
+    }
+    // validate the products BEFORE building the slices below (a misuse
+    // caller could otherwise wrap a length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let Some(out_len) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(inp_len) = width.checked_mul(spp) else {
+        return;
+    };
+    // Slices can never span more than isize::MAX bytes; bail before
+    // building one (debug builds abort on the from_raw_parts precondition
+    // otherwise). Both lengths count f32 lanes, so each byte span is 4x.
+    let Some(out_bytes) = out_len.checked_mul(4) else {
+        return;
+    };
+    let Some(inp_bytes) = inp_len.checked_mul(4) else {
+        return;
+    };
+    if out_bytes > isize::MAX as usize || inp_bytes > isize::MAX as usize {
+        return;
+    }
+    let out = std::slice::from_raw_parts_mut(out, out_len);
+    let inp = std::slice::from_raw_parts(inp, inp_len);
+    tiff_chunky_f_row_to_float(out, inp, width, spp);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5375,5 +5509,217 @@ mod tests {
             darkroom_imageio_float_to_u8_swap_rb(guarded.as_mut_ptr(), usize::MAX / 16 + 1);
         }
         assert_eq!(guarded, vec![7u8; 32]); // untouched
+    }
+
+    // rails pinned as exact bits for the TIFF chunky-float row (m4-240):
+    // pure copies, so distinct lane values (including -0.0, infinities,
+    // and a NaN payload) must survive bit-identically, and every alpha
+    // lane is exactly +0.0.
+    #[test]
+    fn tiff_chunky_f_row_rails_pin() {
+        // color branch (spp == 3): each lane reads its own scanline lane
+        let inp = [1.0f32, -0.0, f32::from_bits(0x7FC0_1234), 2.5, -3.75, f32::INFINITY];
+        let mut out = vec![7.0f32; 8];
+        tiff_chunky_f_row_to_float(&mut out, &inp, 2, 3);
+        for i in 0..2 {
+            for c in 0..3 {
+                assert_eq!(out[4 * i + c].to_bits(), inp[3 * i + c].to_bits(), "pixel {i} lane {c}");
+            }
+            assert_eq!(out[4 * i + 3].to_bits(), 0x0000_0000, "alpha {i}");
+        }
+        // mono splat (spp == 1): lanes 1 and 2 repeat lane 0
+        let mut mono = vec![7.0f32; 4];
+        tiff_chunky_f_row_to_float(&mut mono, &[f32::NEG_INFINITY], 1, 1);
+        assert_eq!(mono[0].to_bits(), f32::NEG_INFINITY.to_bits());
+        assert_eq!(mono[1].to_bits(), f32::NEG_INFINITY.to_bits());
+        assert_eq!(mono[2].to_bits(), f32::NEG_INFINITY.to_bits());
+        assert_eq!(mono[3].to_bits(), 0x0000_0000);
+    }
+
+    // spp branches plus file-alpha handling (m4-240): spp 1..=6, the file
+    // alpha slots (spp == 2 lane 1, spp >= 4 lane 3) carry sentinel values
+    // that must never leak into the output, and the output alpha is
+    // always exactly +0.0. The input slice is untouched throughout.
+    #[test]
+    fn tiff_chunky_f_row_spp_branches_and_alpha() {
+        for spp in [1usize, 2, 3, 4, 5, 6] {
+            let width = 3usize;
+            let mut inp = Vec::with_capacity(spp * width);
+            for i in 0..width {
+                for lane in 0..spp {
+                    // file alpha slots (lane 1 when spp == 2, lane 3
+                    // otherwise present) get unmistakable sentinels
+                    let v = if (spp == 2 && lane == 1) || (spp >= 3 && lane == 3) {
+                        1234.5 + i as f32
+                    } else {
+                        100.0 * i as f32 + lane as f32 + 0.25
+                    };
+                    inp.push(v);
+                }
+            }
+            let original = inp.clone();
+            let mut out = vec![-9.0f32; 4 * width];
+            tiff_chunky_f_row_to_float(&mut out, &inp, width, spp);
+            for i in 0..width {
+                let b = 4 * i;
+                let s = spp * i;
+                assert_eq!(out[b].to_bits(), inp[s].to_bits(), "spp {spp} pixel {i} R");
+                if spp < 3 {
+                    assert_eq!(out[b + 1].to_bits(), inp[s].to_bits(), "spp {spp} splat G");
+                    assert_eq!(out[b + 2].to_bits(), inp[s].to_bits(), "spp {spp} splat B");
+                } else {
+                    assert_eq!(out[b + 1].to_bits(), inp[s + 1].to_bits(), "spp {spp} G");
+                    assert_eq!(out[b + 2].to_bits(), inp[s + 2].to_bits(), "spp {spp} B");
+                }
+                assert_eq!(out[b + 3].to_bits(), 0x0000_0000, "spp {spp} alpha");
+            }
+            assert_eq!(inp, original, "spp {spp} input untouched");
+        }
+    }
+
+    // LCG sweep over raw float bit patterns (covers negatives, denormals,
+    // infinities, and NaNs) at several widths and spp values,
+    // sentinel-padded: kernel and reference must agree bit-exactly on
+    // every lane, and only the exact 4*width span may be written.
+    #[test]
+    fn tiff_chunky_f_row_matches_reference() {
+        for width in [1usize, 2, 3, 17, 65] {
+            for spp in [1usize, 2, 3, 4, 5] {
+                let mut state = 0x9E37_79B9u32;
+                let inp: Vec<f32> = (0..spp * width)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        f32::from_bits(state)
+                    })
+                    .collect();
+                // head/tail sentinel lanes around the exact 4*width span
+                let mut direct = vec![-1.0f32; 4 * width + 8];
+                let mut reference = vec![-2.0f32; 4 * width + 8];
+                tiff_chunky_f_row_to_float(&mut direct[4..4 + 4 * width], &inp, width, spp);
+                ref_tiff_chunky_f_row_to_float(
+                    &inp,
+                    &mut reference[4..4 + 4 * width],
+                    width,
+                    spp,
+                );
+                assert_eq!(direct[..4], [-1.0; 4], "direct head w={width} spp={spp}");
+                assert_eq!(direct[4 + 4 * width..], [-1.0; 4], "direct tail");
+                assert_eq!(reference[..4], [-2.0; 4], "reference head");
+                assert_eq!(reference[4 + 4 * width..], [-2.0; 4], "reference tail");
+                for k in 0..4 * width {
+                    assert_eq!(
+                        direct[4 + k].to_bits(),
+                        reference[4 + k].to_bits(),
+                        "lane {k} w={width} spp={spp}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiff_chunky_f_row_ffi_uninit_row() {
+        use std::mem::MaybeUninit;
+
+        // uninitialized row storage is realistic: the C row cursor points
+        // into the mipmap-cache allocation, whose lanes the kernel fully
+        // overwrites before any read.
+        for (width, spp) in [(1usize, 1usize), (3, 2), (5, 3), (17, 4), (65, 5)] {
+            let mut state = 0x51ED_270Bu32;
+            let inp: Vec<f32> = (0..spp * width)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    f32::from_bits(state)
+                })
+                .collect();
+            let original = inp.clone();
+            let mut ffi_out = vec![MaybeUninit::<f32>::uninit(); 4 * width]
+                .into_boxed_slice();
+            unsafe {
+                darkroom_tiff_chunky_f_row_to_float(
+                    ffi_out.as_mut_ptr().cast(),
+                    inp.as_ptr(),
+                    width,
+                    spp,
+                );
+            }
+            // every lane initialized by the call: safe to assume_init now
+            let ffi_out =
+                unsafe { Box::<[f32]>::from_raw(Box::into_raw(ffi_out) as *mut [f32]) };
+            let mut direct = vec![0.0f32; 4 * width];
+            tiff_chunky_f_row_to_float(&mut direct, &inp, width, spp);
+            assert_eq!(ffi_out.len(), direct.len());
+            for (k, (f, d)) in ffi_out.iter().zip(direct.iter()).enumerate() {
+                assert_eq!(f.to_bits(), d.to_bits(), "lane {k} w={width} spp={spp}");
+            }
+            // bitwise: the LCG bit stream contains NaN payloads, for which
+            // plain == is always false even with identical bits.
+            assert_eq!(inp.len(), original.len(), "w={width} spp={spp}");
+            for (k, (a, b)) in inp.iter().zip(original.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "input lane {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn tiff_chunky_f_row_degenerate_guards_no_op() {
+        let inp = vec![1.5f32; 16];
+        // zero width and zero spp: output untouched (spp == 0 can never
+        // reach the C loop, whose spp comes from a defaulted TIFF field)
+        let mut out = vec![9.0f32; 16];
+        tiff_chunky_f_row_to_float(&mut out, &inp, 0, 3);
+        assert_eq!(out, vec![9.0f32; 16]);
+        let mut out = vec![9.0f32; 16];
+        tiff_chunky_f_row_to_float(&mut out, &inp, 4, 0);
+        assert_eq!(out, vec![9.0f32; 16]);
+        // truncated buffers: clamped iteration must neither panic nor write
+        // out of bounds; well-formed callers never hit this path.
+        let mut short_out = vec![0.0f32; 7]; // short for 2 quads
+        tiff_chunky_f_row_to_float(&mut short_out, &inp, 2, 3);
+        // clamped to a single quad: first quad copies 1.5/1.5/1.5 with a
+        // zeroed alpha lane, remaining lanes untouched
+        assert_eq!(short_out[0].to_bits(), 1.5f32.to_bits());
+        assert_eq!(short_out[1].to_bits(), 1.5f32.to_bits());
+        assert_eq!(short_out[2].to_bits(), 1.5f32.to_bits());
+        assert_eq!(short_out[3].to_bits(), 0.0f32.to_bits());
+        assert_eq!(&short_out[4..], &[0.0f32; 3]); // second quad untouched
+        let short_in = [1.5f32; 5]; // short for 2 pixels at spp 3
+        let mut out2 = vec![-3.0f32; 8];
+        tiff_chunky_f_row_to_float(&mut out2, &short_in, 2, 3);
+        assert_eq!(&out2[0..4], &[1.5f32, 1.5f32, 1.5f32, 0.0f32]);
+        assert_eq!(&out2[4..], &[-3.0f32; 4]); // second quad untouched
+        let empty: Vec<f32> = Vec::new();
+        let mut out3 = vec![5.0f32; 4];
+        tiff_chunky_f_row_to_float(&mut out3, &empty, 1, 1);
+        assert_eq!(out3, vec![5.0f32; 4]);
+        // FFI guards: null pointers, zero width/spp, and overflowing lane
+        // counts are no-ops that never touch memory.
+        let guarded_in = [1.5f32; 16];
+        let mut guarded = vec![7.0f32; 16];
+        unsafe {
+            darkroom_tiff_chunky_f_row_to_float(std::ptr::null_mut(), guarded_in.as_ptr(), 4, 3);
+            darkroom_tiff_chunky_f_row_to_float(guarded.as_mut_ptr(), std::ptr::null(), 4, 3);
+            darkroom_tiff_chunky_f_row_to_float(guarded.as_mut_ptr(), guarded_in.as_ptr(), 0, 3);
+            darkroom_tiff_chunky_f_row_to_float(guarded.as_mut_ptr(), guarded_in.as_ptr(), 4, 0);
+            darkroom_tiff_chunky_f_row_to_float(
+                guarded.as_mut_ptr(),
+                guarded_in.as_ptr(),
+                usize::MAX,
+                3,
+            );
+            darkroom_tiff_chunky_f_row_to_float(
+                guarded.as_mut_ptr(),
+                guarded_in.as_ptr(),
+                usize::MAX / 4 + 1,
+                3,
+            );
+            darkroom_tiff_chunky_f_row_to_float(
+                guarded.as_mut_ptr(),
+                guarded_in.as_ptr(),
+                4,
+                usize::MAX,
+            );
+        }
+        assert_eq!(guarded, vec![7.0f32; 16]); // untouched
     }
 }

@@ -6202,3 +6202,55 @@ Remote CI on `7c9291bae2` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `7c9291bae2`.
+
+### m4-240 — TIFF chunky-float row → Rust, first read-path kernel (2026-09-22 UTC)
+
+**Previous increment.** m4-239 commit `7c9291bae2` verified on both remotes;
+`check + test + clippy`, CMake, and Docker image all `success`. (Note: the
+dev brief's "FIRST TIFF port" is stale — `c41-core::tiff` already exports
+three `darkroom_tiff_*_is_grayscale` symbols from m4-219..221; m4-240 is the
+first TIFF *read-path* row kernel, placed in `c41-core::imageio` per the
+m4-228..239 sibling convention.)
+
+**What.** Ported the `_read_chunky_f` inner pixel loop
+(`src/imageio/imageio_tiff.c`) to `darkroom_tiff_chunky_f_row_to_float` in
+`c41-core::imageio`: safe kernel `tiff_chunky_f_row_to_float` + divergent
+reference (`as_chunks_mut::<4>` + dynamic `chunks_exact(spp)` zip vs the
+kernel's stride indexing) + `void` FFI (`out, inp, width, spp`; nulls, zero
+width/spp, both `checked_mul` products, `isize::MAX` byte-span cap) + 5
+tests, header declaration, C inner loop replaced by one FFI call. Pure float
+copies, no scaling (unlike the u8/u16/half siblings — the right function was
+ported): `spp<3` splat reads only lane 0 (covers spp 1 AND 2); spp≥3 reads
+`in[0..2]` with stride spp (extras incl. file alpha never read); output
+alpha unconditionally `+0.0` (C `out[3]=0`, bit `0x00000000`). Per-row
+`TIFFReadScanline`, row setup/cursor, and ALL other functions (incl. both
+Lab/`cmsDoTransform` variants) untouched. **LIVE in production**: the loop
+runs on every float-TIFF import row.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, no correctness/safety defect — verified against the
+HEAD source. Loop fidelity exact (splat/color branches, stride-`spp`
+modeling of `in += spp`/`out += 4`, extras beyond 4 handled), no-scaling
+genuine, buffer setup/call args correct (`spp` from
+`TIFFGetFieldDefaulted(SAMPLESPERPIXEL)` defaulting to 1 — `spp==0`
+unreachable from C, guard strictly safer), FFI guards complete (no wrap
+hole even at `spp=usize::MAX`), `spp==0` early return precedes the division,
+reference genuinely divergent with both branches replicated, tests pin exact
+bits (NaN payload `0x7FC01234` survives copies; spp 1..6 with file-alpha
+sentinels proving no leak; LCG raw-bit sweep; `MaybeUninit`; degenerate +
+`usize::MAX` overflow guards), C-side minimal (include genuinely missing at
+HEAD), header precise, scope clean. Two in-session fixes: (1) MINOR —
+clamped-path asserts now check first-quad CONTENTS (`[1.5,1.5,1.5,0.0]`, the
+m4-229 lesson applied a third time); (2) NIT — `useless_vec` residuals
+cleaned (`&[-3.0; 4]`, `Vec::new()`). Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new (no new
+`#[allow]`). Changed TU `src/imageio/imageio_tiff.c` compiled in the
+dependency image (`c41-m4-223-verify-deps`) with cached Release flags +
+`-Werror -Wfatal-errors`, exit 0, no output. `git diff --check` clean; no
+`/*`/`*/` in added lines. Release `c41-core` suite: 1656 passed (1651
+existing + 5 new), 0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
