@@ -1241,6 +1241,109 @@ pub unsafe extern "C" fn darkroom_jpeg_rgba_row_to_rgb24(
     jpeg_rgba_row_to_rgb24(row, buf, width);
 }
 
+// ── JPEG RGB24 row expand to RGBA (m4-237) ──────────────────────────────────
+
+// Safe RGB24 to RGBA row-expand kernel.
+//
+// Port of the inner i/k nest of `decompress_plain`
+// (src/imageio/imageio_jpeg.c:184-186): per column `i < width` and lane
+// `k < 3`, `tmp[4*i + k] = row[3*i + k]`. Lane 3 (`tmp[4*i + 3]`) is
+// never written: the C loop stores only lanes 0..2, so whatever byte was
+// already in the destination alpha slot survives. At the C call site that
+// slot holds uninitialized allocator output: `tmp` is a cursor into `out`,
+// which the `dt_imageio_jpeg_decompress` caller provides as a fresh
+// `dt_alloc_align_uint8(4 * width * height)` allocation
+// (src/imageio/imageio.c:680) that nothing zeroes before the row loop.
+// The kernel therefore must not touch lane 3 either (no zeroing, no
+// sentinel fill); callers must not expect it initialized. This is the
+// exact inverse of the m4-232 `jpeg_rgba_row_to_rgb24` strip kernel.
+//
+// The row allocation, the scanline while-loop, the setjmp handling, and
+// the libjpeg calls stay in C, as does the duplicate i/k nest in
+// `read_plain` (imageio_jpeg.c:647-648, the m4-238 follow-up).
+//
+// Fidelity notes:
+// - Pure byte shuffle: no arithmetic, no conversion, no rounding, so
+//   bit-exactness holds by construction as long as lane selection matches.
+// - The serial C row loop has no cross-pixel dependencies, so sequential
+//   iteration is identical.
+//
+// Degenerate `width == 0` is a no-op; short buffers are handled by
+// clamped iteration (no panic, no out-of-bounds access). For the
+// well-formed row buffers the C caller passes the clamp never engages
+// and the behaviour is exactly the C loop's.
+pub fn jpeg_rgb24_row_to_rgba(tmp: &mut [u8], row: &[u8], width: usize) {
+    let n = width.min(tmp.len() / 4).min(row.len() / 3);
+    for i in 0..n {
+        let d = 4 * i;
+        let s = 3 * i;
+        tmp[d] = row[s];
+        tmp[d + 1] = row[s + 1];
+        tmp[d + 2] = row[s + 2];
+    }
+}
+
+// ── Independent reference implementation for bit-exactness tests ─────────────
+
+/// Structurally divergent reference for `jpeg_rgb24_row_to_rgba`: walks the
+/// source triplets and the destination quads as zipped `as_chunks` chunk
+/// iterators (the kernel walks columns with explicit stride writes), so the
+/// sweep test cross-checks indexing as well as values. The alpha lane is
+/// never stored by construction (only slots 0..2 are assigned, mirroring
+/// the C loop leaving lane 3 untouched).
+/// Well-formed buffers only: short inputs are an early return here rather
+/// than clamping.
+#[cfg(test)]
+fn ref_jpeg_rgb24_row_to_rgba(row: &[u8], tmp: &mut [u8], width: usize) {
+    let Some(row_need) = width.checked_mul(3) else {
+        return;
+    };
+    let Some(tmp_need) = width.checked_mul(4) else {
+        return;
+    };
+    if row.len() < row_need || tmp.len() < tmp_need {
+        return;
+    }
+    let (triplets, _) = row.as_chunks::<3>();
+    let (quads, _) = tmp.as_chunks_mut::<4>();
+    for (triplet, quad) in triplets.iter().take(width).zip(quads.iter_mut().take(width)) {
+        quad[0] = triplet[0];
+        quad[1] = triplet[1];
+        quad[2] = triplet[2];
+    }
+}
+
+// ── FFI export ───────────────────────────────────────────────────────────────
+
+/// # Safety
+/// `tmp` must hold at least `4 * width` bytes (the C caller passes the
+/// RGBA row cursor of the `decompress_plain` output buffer; its alpha
+/// slots are never written, see the kernel docs) and `row` at least
+/// `3 * width` bytes (the libjpeg scanline strip). The two buffers must
+/// not overlap.
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_jpeg_rgb24_row_to_rgba(
+    tmp: *mut u8,
+    row: *const u8,
+    width: usize,
+) {
+    if tmp.is_null() || row.is_null() || width == 0 {
+        return;
+    }
+    // validate the products BEFORE building the slices below (a misuse
+    // caller could otherwise wrap a length; the safe kernel re-checks
+    // defensively via clamped iteration)
+    let Some(tmp_len) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(row_len) = width.checked_mul(3) else {
+        return;
+    };
+    let tmp = std::slice::from_raw_parts_mut(tmp, tmp_len);
+    let row = std::slice::from_raw_parts(row, row_len);
+    jpeg_rgb24_row_to_rgba(tmp, row, width);
+}
+
 // ── 16-bit export float-to-u16 downconvert (m4-234) ─────────────────────────
 
 // Safe in-place float-to-u16 export kernel.
@@ -4280,6 +4383,191 @@ mod tests {
             );
         }
         assert_eq!(row, vec![7u8; 12]); // untouched
+    }
+
+    // rails pinned as exact bytes for the JPEG RGB24 row expand (m4-237):
+    // each quad lane copies its own triplet lane, the alpha lane keeps
+    // whatever byte was already there (the C loop never stores lane 3),
+    // and lanes stay distinct (a lane-rotation bug would move them).
+    // Pure byte shuffle, so `assert_eq` on bytes pins the kernel to the
+    // C operation directly.
+    #[test]
+    fn jpeg_rgb24_row_rails_pin() {
+        let row = [
+            1u8, 2, 3, // column 0
+            0, 128, 255, // black-to-white spread across lanes
+            10, 20, 30, // asymmetric: pins per-lane copy, not rotation
+        ];
+        // alpha slots pre-filled with sentinels: the kernel must not write them
+        let mut tmp = vec![
+            9u8, 9, 9, 0xA5, // column 0 keeps 0xA5
+            9u8, 9, 9, 0x5A, // column 1 keeps 0x5A
+            9u8, 9, 9, 0x00, // column 2 keeps 0x00
+        ];
+        jpeg_rgb24_row_to_rgba(&mut tmp, &row, 3);
+        assert_eq!(
+            tmp,
+            vec![1u8, 2, 3, 0xA5, 0, 128, 255, 0x5A, 10, 20, 30, 0x00]
+        );
+        // lanes stay distinct: a rotation bug would collapse or shift them
+        assert_ne!(tmp[0], tmp[1]);
+        assert_ne!(tmp[1], tmp[2]);
+        assert_ne!(tmp[4], tmp[5]);
+        assert_ne!(tmp[5], tmp[6]);
+        // same RGB with a different source has no alpha to leak: output
+        // lanes 0..2 follow the source exactly
+        let mut single = [9u8, 9, 9, 0xC3];
+        jpeg_rgb24_row_to_rgba(&mut single, &[250u8, 251, 252], 1);
+        assert_eq!(single, [250u8, 251, 252, 0xC3]);
+    }
+
+    // LCG byte sweep at several widths, sentinel-padded: kernel and
+    // reference must agree exactly on lanes 0..2, alpha slots must keep
+    // their sentinel values on both paths, and only the exact 4*width
+    // span may be written. The LCG keeps the three lanes of each
+    // triplet generally distinct (interleave coverage, not just grays).
+    #[test]
+    fn jpeg_rgb24_row_matches_reference() {
+        for width in [1usize, 3, 17, 65] {
+            let mut row = Vec::with_capacity(3 * width);
+            for i in 0..3 * width {
+                let v = (i as u64)
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(0x9E37) % 256;
+                row.push(v as u8);
+            }
+            row[0] = 0;
+            row[1] = 0;
+            row[2] = 0;
+            // alpha slots pre-filled with a distinct sentinel pattern
+            let mut direct = vec![0xA5u8; 4 * width + 8];
+            let mut reference = vec![0x5Au8; 4 * width + 8];
+            for k in 0..width {
+                direct[4 + 4 * k + 3] = 0x3C;
+                reference[4 + 4 * k + 3] = 0xC3;
+            }
+            jpeg_rgb24_row_to_rgba(&mut direct[4..4 + 4 * width], &row, width);
+            ref_jpeg_rgb24_row_to_rgba(
+                &row,
+                &mut reference[4..4 + 4 * width],
+                width,
+            );
+            assert_eq!(direct[..4], [0xA5u8; 4], "direct head");
+            assert_eq!(direct[4 + 4 * width..], [0xA5u8; 4], "direct tail");
+            assert_eq!(reference[..4], [0x5Au8; 4], "reference head");
+            assert_eq!(reference[4 + 4 * width..], [0x5Au8; 4], "reference tail");
+            for k in 0..width {
+                assert_eq!(&direct[4 + 4 * k..4 + 4 * k + 3], &reference[4 + 4 * k..4 + 4 * k + 3]);
+                assert_eq!(direct[4 + 4 * k + 3], 0x3C, "direct alpha untouched {k}");
+                assert_eq!(reference[4 + 4 * k + 3], 0xC3, "reference alpha untouched {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn jpeg_rgb24_row_degenerate_guards_no_op() {
+        let row = vec![200u8; 64];
+        // zero width: output untouched
+        let mut tmp = vec![9u8; 16];
+        jpeg_rgb24_row_to_rgba(&mut tmp, &row, 0);
+        assert_eq!(tmp, vec![9u8; 16]);
+        // truncated buffers: clamped iteration must neither panic nor write
+        // out of bounds; well-formed callers never hit this path.
+        let mut short_tmp = vec![0xAAu8; 7]; // short for 2 quads
+        jpeg_rgb24_row_to_rgba(&mut short_tmp, &row, 2);
+        // clamped to a single column: first triplet copied per lane,
+        // its alpha slot and remaining bytes untouched
+        assert_eq!(short_tmp[..3], [200u8; 3]);
+        assert_eq!(short_tmp[3..], [0xAAu8; 4]);
+        let short_row = [200u8; 5]; // one triplet plus stray bytes: short for 2 columns
+        let mut tmp2 = vec![7u8; 8];
+        jpeg_rgb24_row_to_rgba(&mut tmp2, &short_row, 2);
+        assert_eq!(tmp2[..3], [200u8; 3]);
+        assert_eq!(tmp2[3..], vec![7u8; 5]); // second quad untouched
+        let empty: Vec<u8> = vec![];
+        let mut tmp3 = vec![5u8; 4];
+        jpeg_rgb24_row_to_rgba(&mut tmp3, &empty, 1);
+        assert_eq!(tmp3, vec![5u8; 4]);
+        let mut tmp4 = vec![5u8; 4];
+        jpeg_rgb24_row_to_rgba(&mut tmp4, &row, 1);
+        // empty tmp with a live source: nothing to write, no panic
+        let mut empty_tmp: Vec<u8> = vec![];
+        jpeg_rgb24_row_to_rgba(&mut empty_tmp, &row, 1);
+        assert!(empty_tmp.is_empty());
+        assert_eq!(tmp4[..3], vec![200u8; 3]);
+        assert_eq!(tmp4[3], 5u8); // alpha slot untouched
+    }
+
+    #[test]
+    fn jpeg_rgb24_row_ffi_uninit_row() {
+        use std::mem::MaybeUninit;
+
+        // uninitialized tmp storage is realistic: the C destination is a
+        // cursor into the fresh `dt_alloc_align_uint8(4 * width * height)`
+        // output buffer, whose alpha slots the kernel never writes. Lanes
+        // 0..2 are fully overwritten before any read; lane 3 keeps a
+        // pre-written sentinel, so only lanes 0..2 go through assume_init.
+        for width in [1usize, 3, 17, 65] {
+            let mut row = Vec::with_capacity(3 * width);
+            for i in 0..3 * width {
+                row.push(((i as u64 * 2_654_435_761 + 0x9E37) % 256) as u8);
+            }
+            let mut ffi_tmp = vec![MaybeUninit::<u8>::uninit(); 4 * width]
+                .into_boxed_slice();
+            for k in 0..width {
+                ffi_tmp[4 * k + 3].write(0x3C);
+            }
+            unsafe {
+                darkroom_jpeg_rgb24_row_to_rgba(
+                    ffi_tmp.as_mut_ptr().cast(),
+                    row.as_ptr(),
+                    width,
+                );
+            }
+            for k in 0..width {
+                for lane in 0..3 {
+                    assert_eq!(unsafe { ffi_tmp[4 * k + lane].assume_init() }, row[3 * k + lane]);
+                }
+                assert_eq!(unsafe { ffi_tmp[4 * k + 3].assume_init() }, 0x3C);
+            }
+            let mut direct = vec![0x3Cu8; 4 * width];
+            for k in 0..width {
+                direct[4 * k + 3] = 0x3C;
+            }
+            jpeg_rgb24_row_to_rgba(&mut direct, &row, width);
+            for k in 0..width {
+                for lane in 0..3 {
+                    assert_eq!(unsafe { ffi_tmp[4 * k + lane].assume_init() }, direct[4 * k + lane]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jpeg_rgb24_row_ffi_guards() {
+        let row = [200u8; 64];
+        let mut tmp = vec![7u8; 16];
+        unsafe {
+            // null pointers
+            darkroom_jpeg_rgb24_row_to_rgba(std::ptr::null_mut(), row.as_ptr(), 4);
+            darkroom_jpeg_rgb24_row_to_rgba(tmp.as_mut_ptr(), std::ptr::null(), 4);
+            // zero width
+            darkroom_jpeg_rgb24_row_to_rgba(tmp.as_mut_ptr(), row.as_ptr(), 0);
+            // overflowing lane counts (either product wraps — rejected
+            // before building any slice)
+            darkroom_jpeg_rgb24_row_to_rgba(tmp.as_mut_ptr(), row.as_ptr(), usize::MAX);
+            darkroom_jpeg_rgb24_row_to_rgba(
+                tmp.as_mut_ptr(),
+                row.as_ptr(),
+                usize::MAX / 4 + 1,
+            );
+            darkroom_jpeg_rgb24_row_to_rgba(
+                tmp.as_mut_ptr(),
+                row.as_ptr(),
+                usize::MAX / 3 + 1,
+            );
+        }
+        assert_eq!(tmp, vec![7u8; 16]); // untouched
     }
 
     // test helpers: pack float quads to the aliased byte view the kernel

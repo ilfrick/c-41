@@ -6050,3 +6050,54 @@ Remote CI on `4e5d445fea` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `4e5d445fea`.
+
+### m4-237 — JPEG decompress RGB24→RGBA row expand → Rust (2026-09-22 UTC)
+
+**Previous increment.** m4-236 commit `4e5d445fea` verified on both remotes;
+`check + test + clippy`, CMake, and Docker image all `success`.
+
+**What.** Ported the RGB24→RGBA row-expand nest of `decompress_plain`
+(`src/imageio/imageio_jpeg.c:184-186`: `for i<width { for k<3
+tmp[4*i+k] = row_pointer[0][3*i+k] }`) to `darkroom_jpeg_rgb24_row_to_rgba`
+in `c41-core::imageio` — the exact inverse of the m4-232 kernel: safe kernel
+`jpeg_rgb24_row_to_rgba` + divergent reference (zipped `as_chunks::<3>` ×
+`as_chunks_mut::<4>` iterators vs the kernel's explicit stride writes) +
+`void` FFI (null/width-zero + checked `4*width` AND checked `3*width`
+before either slice) + 5 tests, header declaration, C nest replaced by
+`darkroom_jpeg_rgb24_row_to_rgba(tmp, row_pointer[0],
+(size_t)jpg->dinfo.image_width)` (`image_width` is `JDIMENSION`/unsigned —
+no negative-width hazard, lossless widening). Lane 3 NEVER written on any
+path (kernel, reference, clamped short paths): the C loop stores only
+`k<3`, and `tmp` holds uninitialized allocator output (`dt_alloc_aligned`
+is malloc-without-memset; all three `out` providers hand uninitialized
+bytes; zeroing lives only in the unused-here `dt_calloc_aligned` wrapper) —
+documented as "callers must not expect lane 3 initialized". The `read_plain`
+`:647-648` duplicate deliberately stays in C (m4-238 follow-up). **LIVE in
+production**: the expand runs per scanline of every JPEG decompress through
+the plain path (fallback where `JCS_EXTENSIONS` is unavailable).
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no findings — verified cold against the HEAD source. Call-site
+fidelity (arg order, cast, pre-existing bound/stride mismatch preserved),
+alpha lane verified as claimed (allocation path traced through all three
+providers), FFI guards complete (no wrap-to-small-slice hole; distinct
+allocations — libjpeg strip vs caller-owned `out` cursor), reference
+genuinely divergent, tests pin the expand direction (not the m4-232 strip:
+triplets→quads, asymmetric lanes, `assert_ne!` anti-rotation, alpha
+sentinels preserved; `MaybeUninit` lane-3 `.write(0x3C)` makes the later
+`assume_init` sound; overflow guards cover `MAX/4+1` then `MAX/3+1`),
+C-side minimal, header precise, scope clean (include already present at
+HEAD — correctly no include change). Three non-blocking NITs, two fixed
+in-session (comment line-range `:184-187`→`:184-186`; include-line inventory
+now names both symbols); third (test-only guard-idiom duplication) left
+as-is. Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+release tests, `c41-rs` link). All-targets Clippy warning count 1420,
+byte-identical to the stashed pre-change baseline — zero new (no new
+`#[allow]` needed). Changed TU `src/imageio/imageio_jpeg.c` compiled in the
+dependency image (`c41-m4-223-verify-deps`) with cached Release flags +
+`-Werror -Wfatal-errors`, exit 0, no output. `git diff --check` clean; no
+`/*`/`*/` in added lines. Release `c41-core` suite: 1646 passed (1641
+existing + 5 new), 0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
