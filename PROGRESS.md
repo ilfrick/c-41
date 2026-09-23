@@ -6314,3 +6314,65 @@ Remote CI on `ca3ac89a62` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `ca3ac89a62`.
+
+### m4-242 — TIFF chunky-u16 row → Rust (2026-09-23 UTC)
+
+**What.** Ported the `_read_chunky_16` inner pixel loop
+(`src/imageio/imageio_tiff.c`, old lines 121-136) to
+`darkroom_tiff_chunky_16_row_to_float` in `c41-core::imageio`, mirroring the
+m4-240 (float) and m4-241 (u8) siblings: safe kernel
+`tiff_chunky_16_row_to_float` (early `spp == 0` return, clamped `n`, stride
+indexing, `spp < 3` splat vs color branch, alpha `+0.0`) + divergent
+reference (`as_chunks_mut::<4>` + `chunks_exact(spp)` zip vs stride
+indexing) + `void` FFI (`out, inp, width, spp`; nulls, zero width/spp, both
+`checked_mul` products, both `isize::MAX` byte-span caps with the correct
+lane-size factors — `out_bytes = out_len*4`, `inp_bytes = inp_len*2`, the 2x
+`u16` factor being the genuine delta vs the u8 sibling) + 5 tests, header
+declaration, C loop replaced by one FFI call. LOAD-BEARING fidelity points:
+(1) C scales with RECIPROCAL-MULTIPLY `((float)in[c]) * (1.0f/65535.0f)`,
+not division — 512 of 65536 u16 values differ by 1 ulp (first: u16 257,
+mul `0x3B808080` vs div `0x3B808081`); kernel uses `inp as f32 * SCALE`
+with `const SCALE: f32 = 1.0/65535.0` (single IEEE round, bit-identical
+quotient regardless of fold timing). (2) NO invert flag: `_read_chunky_16`
+takes no photometric argument (unlike `_read_chunky_8`), so lane 0 is never
+flipped — correct absence. (3) Endianness: `in` is the `uint16_t *t->buf`
+scanline filled by `TIFFReadScanline`, which libtiff returns in host byte
+order — native `u16` reads, NO swap (contrast PGM m4-229, whose on-disk
+bytes need explicit LE decode; C itself does zero swapping here). Per-row
+`TIFFReadScanline`, row setup/cursor, and both Lab/`cmsDoTransform`
+variants untouched. **LIVE in production**: the loop runs on every 16-bit
+TIFF import row.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no correctness/safety defect — verified cold against the HEAD
+source. Exact C spelling quoted, invert absence confirmed from the function
+signature, spp branches/stride/extras matched, alpha (`out[3] = 0` int
+literal → `+0.0`) bit-identical, endianness difference justified, call args
+preserve types (`uint32_t width`→`size_t`, `uint16_t spp`→`size_t`), FFI
+guards complete (color branch implies `spp ≥ 3` so `s+2` in-bounds),
+reference genuinely divergent, tests genuinely independent where it matters
+(u16-257 pin `0x3B80_8080` PLUS `assert_ne!` vs the division spelling —
+fails loudly under a `/65535.0` rewrite), C-side minimal (include already
+added by m4-240 — updated in place, no duplicate), header precise
+(`uint16_t` needs no new include), scope clean, no new `#[allow]`. Two
+in-session fixes: (1) NIT — kernel doc "unscaled `r`" → "scaled `r`"
+(`r` is defined as the scaled value one clause earlier); (2) REAL test bug
+the review missed but the Docker gate caught: `a.to_bits()` on `&u16`
+inputs in the `MaybeUninit` input-untouched check (copied from an
+f32-input sibling) — `u16` has no `to_bits`, so lib-test compilation
+failed; fixed to `assert_eq!(a, b)`. Post-fix, the clippy capture caught
+TWO new warn-level lints (`unnecessary_cast` on `200u16 as f32` test
+literals) — fixed to the m4-241 sibling spelling `200f32 * scale`
+(bit-identical: `200u16 as f32 == 200f32`). Untracked
+`install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy warning set
+identical to the stashed pre-change baseline — zero new (normalized
+message comparison; only unrelated c41-ui summary-rollup noise differs).
+Changed TU `src/imageio/imageio_tiff.c` compiled in the dependency image
+(`c41-m4-223-verify-deps`) with cached Release flags + `-Werror
+-Wfatal-errors`, exit 0, no output. `git diff --check` clean; no `/*`/`*/`
+in added lines. Release `c41-core` suite: 1666 passed (1661 existing + 5 new),
+0 failed; release `c41-ui` suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.

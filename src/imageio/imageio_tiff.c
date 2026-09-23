@@ -23,7 +23,7 @@
 #include "control/conf.h"
 #include "develop/develop.h"
 #include "imageio_common.h"
-#include "rust_ffi/darkroom_core.h"  // for darkroom_tiff_chunky_f/8_row_to_float
+#include "rust_ffi/darkroom_core.h"  // for darkroom_tiff_chunky_f/8/16_row_to_float
 
 #include <inttypes.h>
 #include <memory.h>
@@ -118,22 +118,10 @@ static inline int _read_chunky_16(tiff_t *t)
     /* read scanline */
     if(TIFFReadScanline(t->tiff, in, row, 0) == -1) return -1;
 
-    for(uint32_t i = 0; i < t->width; i++, in += t->spp, out += 4)
-    {
-      out[0] = ((float)in[0]) * (1.0f / 65535.0f);
-
-      if(t->spp < 3)  // mono, maybe plus alpha channel
-      {
-        out[1] = out[2] = out[0];
-      }
-      else
-      {
-        out[1] = ((float)in[1]) * (1.0f / 65535.0f);
-        out[2] = ((float)in[2]) * (1.0f / 65535.0f);
-      }
-
-      out[3] = 0;
-    }
+    // Chunky 16-bit row normalize ported to Rust FFI (m4-242): per column,
+    // out[0] = in[0]*(1/65535), mono splat (spp < 3) or in[1]/in[2] scaled,
+    // alpha zeroed, as before. The TIFFReadScanline above stays in C.
+    darkroom_tiff_chunky_16_row_to_float(out, in, (size_t)t->width, (size_t)t->spp);
   }
 
   return 1;
