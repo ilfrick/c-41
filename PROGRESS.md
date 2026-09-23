@@ -6447,3 +6447,55 @@ Remote CI on `243c7bccdc` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `243c7bccdc`.
+
+### m4-244 — colorout gamut-check cyan fill → Rust (2026-09-23 UTC)
+
+**What.** Ported the gamutcheck cyan-fill inner loop in `_transform_lcms`
+(`src/iop/colorout.c`, old lines ~483-493) to
+`darkroom_colorout_gamutcheck_fill` in `c41-core/src/iop/colorout.rs` —
+the last remaining LIVE flat pixel loop found by survey (IOP OMP remainders
+re-verified: colorin/colorout drivers route through the m4-129 Rust engine
+or LCMS fallback; channelmixerrgb is `#ifdef AI_ACTIVATED` dead code;
+colorequal is a cairo graph renderer; toneequal is `#else`-guarded dead
+code; colortransfer k-means is nondeterministic-PRNG; `src/common` flat
+loops exhausted — residue/memcpy-only/traps). Safe kernel
+`colorout_gamutcheck_fill` (stride indexing) + divergent reference (chunk
+iterator + `any()` over lanes 0-2) + `void` FFI (null/zero-count/
+`checked_mul` length + byte-span/`isize::MAX` guards) + 5 tests, header
+declaration, C `if(gamutcheck)` body replaced by one FFI call. Semantics:
+strict `< 0.0f` on ANY of lanes 0-2 (plain `<`, so NaN never triggers
+alone and `-0.0` stays clean); triggered pixels get the full cyan quad
+`{0,1,1,0}` (alpha overwritten to 0.0), clean pixels fully untouched
+incl. alpha. `copy_pixel_nontemporal` is the same bytes on all standard
+paths (nontemporal hint is throughput-only); `dt_omploop_sfence()` stays
+in C. Now-unused `cyan` constant removed (no other use in TU).
+**LIVE in production**: runs on every softproof gamut-check export through
+the LCMS-fallback path.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no defect — verified cold against HEAD (`_transform_lcms`,
+`imageop.h:611-624`, `dttypes.h:60-114`). Trigger/cyan/NaN/-0.0/alpha both
+paths/nontemporal-equivalence/`cyan`-removal/call-arg types (`float*` ×
+`size_t`; `int j`→`size_t` a strict improvement past INT_MAX)/FFI
+guards/genuine divergence/tests (boundary rails, NaN×3 + NaN+negative,
+alpha both paths, 512-px LCG sweep with sentinel tail, `MaybeUninit`,
+degenerate + both overflow guards)/C-side minimality/header/scope all
+PASS; placement follows the file's code-after-tests layout. One NIT fixed
+in-session (softened "byte-identical" nontemporal claim to standard
+paths, kernel + header comments). Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero new
+warnings touching m4-244 code — post-fix capture shows no `colorout.rs`
+diagnostic in the new ranges (the file's 6 diagnostics are all
+pre-existing, one line-shifted 243→373). Changed C TU verified in the
+dependency image (`c41-m4-223-verify-deps`): IOP sources compile via the
+`introspection_colorout.c` TU (which `#include`s the real `colorout.c`
+per `tools/introspection/parser.pl:104`); forced recompile of that TU
+with the cached Release flags + `-Werror -Wfatal-errors`, exit 0, no
+colorout diagnostics (plugin links `libcolorout.so` clean).
+`git diff --check` clean; no `/*`/`*/` in added lines. Release `c41-core`
+suite: 1676 passed (1671 existing + 5 new), 0 failed; release `c41-ui`
+suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.

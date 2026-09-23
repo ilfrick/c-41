@@ -225,6 +225,136 @@ mod tests {
         assert!((out[2] - 0.8249).abs() < 1e-4,  "B={}", out[2]);
         assert_eq!(out[3], 0.0); // alpha always zeroed
     }
+
+    #[test]
+    fn gamutcheck_trigger_rails_and_alpha() {
+        let cyan_bits: Vec<u32> = [0.0f32, 1.0, 1.0, 0.0].iter().map(|v| v.to_bits()).collect();
+        let mut buf = vec![
+            0.5f32, 0.25, 0.125, 0.7, // clean: untouched incl. alpha
+            -0.0, 0.25, 0.125, 0.7,   // -0.0 is NOT < 0: untouched
+            -1e-45, 0.25, 0.125, 0.7, // tiny negative lane 0: triggers
+            0.5, -2.0, 0.125, 0.7,    // lane 1 triggers
+            0.5, 0.25, -3.0, 0.7,     // lane 2 triggers
+            -1.0, -1.0, -1.0, 0.9,    // all lanes negative: triggers
+        ];
+        let before = buf.clone();
+        colorout_gamutcheck_fill(&mut buf, 6);
+        for (k, px) in buf.as_chunks::<4>().0.iter().enumerate() {
+            let bits: Vec<u32> = px.iter().map(|v| v.to_bits()).collect();
+            if k < 2 {
+                let want: Vec<u32> = before[k * 4..k * 4 + 4].iter().map(|v| v.to_bits()).collect();
+                assert_eq!(bits, want, "pixel {k} must be untouched");
+            } else {
+                assert_eq!(bits, cyan_bits, "pixel {k} must be cyan");
+            }
+        }
+        assert_eq!(buf[3].to_bits(), 0.7f32.to_bits(), "clean alpha preserved");
+        assert_eq!(buf[23].to_bits(), 0.0f32.to_bits(), "triggered alpha overwritten");
+    }
+
+    #[test]
+    fn gamutcheck_nan_lane_does_not_trigger() {
+        let nan = f32::NAN;
+        // NaN in each lane with the other two non-negative: untouched.
+        for lane in 0..3 {
+            let mut px = [0.5f32, 0.25, 0.125, 0.7];
+            px[lane] = nan;
+            let mut buf = px.to_vec();
+            colorout_gamutcheck_fill(&mut buf, 1);
+            assert_eq!(buf[0].to_bits(), px[0].to_bits(), "lane {lane}");
+            assert_eq!(buf[1].to_bits(), px[1].to_bits(), "lane {lane}");
+            assert_eq!(buf[2].to_bits(), px[2].to_bits(), "lane {lane}");
+            assert_eq!(buf[3].to_bits(), px[3].to_bits(), "lane {lane}");
+        }
+        // NaN alongside a genuinely negative lane: the negative still fires.
+        let mut buf = vec![nan, -0.5, 0.125, 0.7];
+        colorout_gamutcheck_fill(&mut buf, 1);
+        assert_eq!(buf, vec![0.0f32, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn gamutcheck_matches_reference_lcg_sweep() {
+        // LCG over raw u32 bits -> f32: negatives, subnormals, zeros,
+        // infinities and NaNs all appear; kernel must equal the divergent
+        // reference bit-exactly, and the sentinel tail must stay untouched.
+        const N: usize = 512;
+        let mut state: u32 = 0x12345678;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            f32::from_bits(state)
+        };
+        let mut input = vec![0.0f32; N * 4 + 8];
+        for v in input[..N * 4].iter_mut() {
+            *v = next();
+        }
+        for v in input[N * 4..].iter_mut() {
+            *v = 42.0;
+        }
+        let mut a = input.clone();
+        let mut b = input.clone();
+        colorout_gamutcheck_fill(&mut a, N);
+        colorout_gamutcheck_fill_ref(&mut b, N);
+        for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "lane {k}");
+        }
+        assert!(a[N * 4..].iter().all(|&v| v == 42.0), "sentinel tail untouched");
+    }
+
+    #[test]
+    fn gamutcheck_ffi_maybeuninit_matches_kernel() {
+        use std::mem::MaybeUninit;
+        const N: usize = 64;
+        let mut state: u32 = 0xdeadbeef;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            f32::from_bits(state)
+        };
+        let src: Vec<f32> = (0..N * 4).map(|_| next()).collect();
+        let mut ffi_buf: Box<[MaybeUninit<f32>]> = Box::new_uninit_slice(N * 4);
+        for (slot, &v) in ffi_buf.iter_mut().zip(src.iter()) {
+            slot.write(v);
+        }
+        unsafe {
+            darkroom_colorout_gamutcheck_fill(ffi_buf.as_mut_ptr() as *mut f32, N);
+        }
+        let ffi_out = unsafe { Box::<[f32]>::from_raw(Box::into_raw(ffi_buf) as *mut [f32]) };
+        let mut direct = src.clone();
+        colorout_gamutcheck_fill(&mut direct, N);
+        assert_eq!(ffi_out.len(), direct.len());
+        for (k, (f, d)) in ffi_out.iter().zip(direct.iter()).enumerate() {
+            assert_eq!(f.to_bits(), d.to_bits(), "lane {k}");
+        }
+    }
+
+    #[test]
+    fn gamutcheck_ffi_guards_and_degenerate() {
+        // Null pointer and zero count are no-ops (must not trap).
+        unsafe {
+            darkroom_colorout_gamutcheck_fill(std::ptr::null_mut(), 4);
+            darkroom_colorout_gamutcheck_fill(std::ptr::null_mut(), 0);
+            let mut z = [1.0f32, 2.0, 3.0, 4.0];
+            darkroom_colorout_gamutcheck_fill(z.as_mut_ptr(), 0);
+            assert_eq!(z, [1.0, 2.0, 3.0, 4.0], "zero count leaves buffer alone");
+            // Checked-product overflow: returns before dereferencing.
+            let mut small = [0.5f32, 0.5, 0.5, 0.5];
+            darkroom_colorout_gamutcheck_fill(small.as_mut_ptr(), usize::MAX);
+            assert_eq!(small, [0.5, 0.5, 0.5, 0.5]);
+            // isize byte-span cap: products valid, byte span over the cap.
+            darkroom_colorout_gamutcheck_fill(small.as_mut_ptr(), isize::MAX as usize / 16 + 1);
+            assert_eq!(small, [0.5, 0.5, 0.5, 0.5]);
+        }
+        // Degenerate first-quad contents through the FFI.
+        let mut clean = [0.0f32, 0.0, 0.0, 0.0];
+        unsafe {
+            darkroom_colorout_gamutcheck_fill(clean.as_mut_ptr(), 1);
+        }
+        assert_eq!(clean, [0.0, 0.0, 0.0, 0.0]);
+        let mut dirty = [0.0f32, 0.0, -1e-30, 5.0];
+        unsafe {
+            darkroom_colorout_gamutcheck_fill(dirty.as_mut_ptr(), 1);
+        }
+        assert_eq!(dirty, [0.0, 1.0, 1.0, 0.0]);
+    }
 }
 
 /// Fused Lab->linearRGB (via pre-transposed cmatrix) + per-channel tone curve.
@@ -277,4 +407,66 @@ pub unsafe extern "C" fn darkroom_colorout_cmatrix_tonecurve(
         output[k * 4 + 2] = rgb[2];
         output[k * 4 + 3] = input[k * 4 + 3];
     }
+}
+
+// Gamut-check cyan fill (m4-244).
+//
+// Matches the `if(gamutcheck)` block in `_transform_lcms()` in
+// src/iop/colorout.c: per 4-lane pixel, when ANY of lanes 0-2 is strictly
+// less than 0.0, all 4 lanes are overwritten with cyan
+// { 0.0, 1.0, 1.0, 0.0 } (hardcoded here to match the C `cyan` constant);
+// otherwise the pixel is left fully untouched, alpha included. The trigger
+// comparison is plain `<`, so a NaN lane compares false and never triggers
+// on its own -- replicate exactly, do NOT add `is_sign_negative` or NaN
+// checks. `copy_pixel_nontemporal` in C is the same bytes on all standard
+// (vectorized/SSE/aarch64) paths — a full 4-lane copy with a nontemporal
+// store hint (throughput only); plain stores write the same bytes, and the
+// `dt_omploop_sfence()` after the outer loop stays in C.
+const COLOROUT_GAMUTCHECK_CYAN: [f32; 4] = [0.0, 1.0, 1.0, 0.0];
+
+// In-place cyan fill over the first `npixels` quads of `out`.
+// Defensive guards (length/overflow) return without touching `out`; the FFI
+// wrapper below already validates, so these only fire on direct misuse.
+pub fn colorout_gamutcheck_fill(out: &mut [f32], npixels: usize) {
+    let Some(len) = npixels.checked_mul(4) else { return; };
+    if out.len() < len {
+        return;
+    }
+    for j in 0..npixels {
+        let b = j * 4;
+        if out[b] < 0.0 || out[b + 1] < 0.0 || out[b + 2] < 0.0 {
+            out[b..b + 4].copy_from_slice(&COLOROUT_GAMUTCHECK_CYAN);
+        }
+    }
+}
+
+#[cfg(test)]
+fn colorout_gamutcheck_fill_ref(out: &mut [f32], npixels: usize) {
+    // Divergent traversal (chunk iterator plus `any()` over lanes 0-2)
+    // against the kernel's stride indexing plus `||` chain; same strict-`<`
+    // trigger, same cyan value, same leave-clean-pixels-alone rule.
+    let (quads, _) = out.as_chunks_mut::<4>();
+    quads.iter_mut().take(npixels).for_each(|px| {
+        if px[0..3].iter().any(|&v| v < 0.0) {
+            px.copy_from_slice(&COLOROUT_GAMUTCHECK_CYAN);
+        }
+    });
+}
+
+/// # Safety
+/// `out` must be non-null and valid for `npixels*4` floats. Null pointer,
+/// `npixels == 0`, `4*npixels` overflow and `isize::MAX` byte-span overflow
+/// are guarded (no-op return).
+#[no_mangle]
+pub unsafe extern "C" fn darkroom_colorout_gamutcheck_fill(out: *mut f32, npixels: usize) {
+    if out.is_null() || npixels == 0 {
+        return;
+    }
+    let Some(len) = npixels.checked_mul(4) else { return; };
+    let Some(nbytes) = len.checked_mul(4) else { return; };
+    if nbytes > isize::MAX as usize {
+        return;
+    }
+    let out = std::slice::from_raw_parts_mut(out, len);
+    colorout_gamutcheck_fill(out, npixels);
 }

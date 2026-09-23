@@ -1117,6 +1117,19 @@ void darkroom_colorout_cmatrix_tonecurve(const float *in_buf,
                                          const float *cmatrix,
                                          const float *lut,
                                          const float *unbounded_coeffs);
+// colorout gamut-check cyan fill -- in-place per-pixel overwrite.
+// Replaces the inner j-loop of the if(gamutcheck) block in _transform_lcms()
+// in colorout.c. Per pixel j < npixels: when ANY of lanes 0-2 is strictly
+// less than 0.0f, all 4 lanes are overwritten with cyan { 0.0f, 1.0f, 1.0f,
+// 0.0f } (hardcoded in Rust to match the C constant); otherwise the pixel
+// is left fully untouched, alpha included. The comparison is plain <, so a
+// NaN lane compares false and never triggers on its own. Triggered pixels
+// get alpha 0.0 (part of the cyan value); clean pixels keep their alpha.
+// Plain stores write the same bytes as the C copy_pixel_nontemporal on all
+// standard (vectorized/SSE/aarch64) paths; the dt_omploop_sfence() after
+// the outer loop stays in C.
+void darkroom_colorout_gamutcheck_fill(float *out_buf,
+                                       size_t npixels);
 
 /*
  * Filmic IOP pixel loop (Lab-space filmic tone-mapping).

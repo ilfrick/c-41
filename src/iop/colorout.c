@@ -482,14 +482,7 @@ static void _transform_lcms(const dt_iop_colorout_data_t *const d,
 
     if(gamutcheck)
     {
-      static const dt_aligned_pixel_t cyan = { 0.0f, 1.0f, 1.0f, 0.0f };
-      for(int j = 0; j < count; j++)
-      {
-        if(outp[4*j+0] < 0.0f || outp[4*j+1] < 0.0f || outp[4*j+2] < 0.0f)
-        {
-          copy_pixel_nontemporal(outp + 4*j, cyan);
-        }
-      }
+      darkroom_colorout_gamutcheck_fill(outp, count);
     }
   }
   dt_omploop_sfence();
