@@ -6530,3 +6530,9 @@ classified-out items stay in C (LCMS paths, C++ formats, IIR/Kahan/fn-ptr
 cores, nondeterministic clustering); UI parity stays deferred; lcms2
 retirement remains a parked later increment (user declined it for now);
 ROADMAP Lightroom-gap features untouched.
+
+Remote CI on `6f36d1bdf9` (docs-only: PROGRESS.md + RUST_MIGRATION_PLAN.md):
+`Build & push Docker image` `success`, full-c skipped as expected;
+`check + test + clippy` and CMake correctly path-filtered out (no code
+touched — and the pre-push hook ran all four local CI steps green before
+push). Both remotes (`origin` GitHub + Gitea) verified at `6f36d1bdf9`.
