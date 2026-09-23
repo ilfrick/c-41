@@ -6379,3 +6379,68 @@ Remote CI on `3040e04758` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `3040e04758`.
+
+### m4-243 — TIFF chunky half-float row → Rust (2026-09-23 UTC)
+
+**What.** Ported the `_read_chunky_h` inner pixel loop
+(`src/imageio/imageio_tiff.c`, old lines 140-164, both `#ifdef HAVE_IMATH`
+spellings) to `darkroom_tiff_chunky_h_row_to_float` in `c41-core::imageio`,
+mirroring the m4-240/241/242 siblings: private `half_to_f32(h: u16) -> f32`
+(canonical binary16→binary32 widening via integer bit ops, `leading_zeros`
+closed-form subnormal renormalization) + safe kernel
+`tiff_chunky_h_row_to_float` (no invert flag, clamped `n`, stride indexing,
+`spp < 3` splat vs color branch, alpha `+0.0`) + divergent reference
+(`ref_half_to_f32` iterative shift-loop renormalization AND
+`as_chunks_mut::<4>`/`chunks_exact(spp)` zip traversal — divergent decode
+and traversal) + `void` FFI (nulls, zero width/spp, both `checked_mul`
+products, both `isize` byte-span caps with the u16 2x input factor) + 5
+tests, header declaration, C loop replaced by one FFI call. LOAD-BEARING
+fidelity point: production uses `imath_half_to_float` (`-DHAVE_IMATH` is in
+the `imageio_tiff.c` flags in `build/compile_commands.json`, added globally
+by `src/CMakeLists.txt:351` when Imath 3.1 C API is found). Bit-exactness
+verified three ways on all 65536 inputs (harnesses in /tmp, nothing added
+to the repo): Rust `half_to_f32` ≡ C `_half_to_float` fallback, and Imath
+`imath_half_to_float` ≡ the same fallback — so the kernel replicates the
+production spelling by transitivity, atop the exactness argument (binary32
+strictly contains binary16; both spellings shift NaN payloads through
+without quieting). No invert (signature takes no photometric arg, unlike
+`_read_chunky_8`); native `u16` reads, no swap (libtiff returns host order,
+same as m4-242). Per-row `TIFFReadScanline`, row setup/cursor, and both
+Lab/`cmsDoTransform` variants untouched. **LIVE in production**: the loop
+runs on every half-float TIFF import row.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no defect — decode math hand-derived cold against the fallback
+for every input class (Inf/NaN arm preserves payload + quiet bit;
+subnormal closed form `k = leading_zeros-22`, exponent `112-k` derived from
+scratch; endpoints `0x0001→0x33800000`, `0x03FF→0x387FC000`,
+`0x8001→0xB3800000` check out; no underflow/overflow possible), HAVE_IMATH
+finding confirmed, transitivity sound (with the honest caveat that NaN
+payload propagation is conventional rather than axiomatic — nil practical
+impact: sNaN half pixels are essentially nonexistent, and the build already
+uses `-ffast-math`), reference genuinely divergent on both axes, spp/alpha/
+no-invert/endianness/call all match, FFI guards complete (both cap arms
+exercised by dedicated cases), tests comprehensive (10 bit-exact rails
+incl. NaN payload + `is_nan`, negative subnormal; EXHAUSTIVE all-65536
+sweep through splat AND each color lane; LCG traversal sweep spp 1-5 +
+spp-6 file-alpha sentinels; `MaybeUninit`; degenerate first-quad contents),
+C-side minimal (include updated in place, no duplicate), header/scope
+clean, no new `#[allow]`, compiles by inspection. Two in-session doc
+tweaks: softened "exactly one correct result per input" → "per non-NaN
+input" (kernel + header comments); the reported "rygorous" typo NIT was a
+false positive on re-check (all three files already spell it `rygorous`,
+matching upstream). The `#include "Imath/half.h"` stays (conservative —
+still covers the fallback `#else` path conceptually). Untracked
+`install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero new
+warnings — the only `imageio.rs` diagnostics are the 5 pre-existing ones,
+line-shifted by the addition (75/126/158 unchanged; `chunks_exact` pair at
+2821/3291 → 3048/3518, same warnings). Changed TU `src/imageio/imageio_tiff.c`
+compiled in the dependency image (`c41-m4-223-verify-deps`) with cached
+Release flags + `-Werror -Wfatal-errors`, exit 0, no output.
+`git diff --check` clean; no `/*`/`*/` in added lines. Release `c41-core`
+suite: 1671 passed (1666 existing + 5 new), 0 failed; release `c41-ui`
+suite 403 passed.
+Remote CI confirmation follows commit/push per workflow.
