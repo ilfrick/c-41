@@ -6502,3 +6502,31 @@ Remote CI on `5fc97bb806` is green: `check + test + clippy`, `CMake + Rust works
 (which covers the changed-C Release `-Werror` compile), and `Build & push
 Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
 remotes (`origin` GitHub + Gitea) verified at `5fc97bb806`.
+
+### Loop-port phase closed (2026-09-23 UTC, user decision)
+
+**What.** The one-loop-per-increment C→Rust FFI chain is declared complete
+at m4-244, per explicit user decision (option 1 of three offered). The chain
+(m4-228→m4-244) ported: the full PNM reader (PGM u8/u16, PPM u8/u16, PBM
+bit-unpack), both JPEG RGBA→RGB24 strips, both JPEG RGB24→RGBA expands, the
+full export-downconvert family (`bpp==16`, plain u8, swapped u8), the TIFF
+chunky readers (float/u8/u16/half), and the colorout gamut-check fill —
+each reviewed (APPROVE), locally gated, pushed, CI-green on both remotes,
+and logged above.
+
+**Why stop.** Exhaustion verified in-session, not inherited: `src/imageio`
+C pixel loops exhausted (remainders LCMS-coupled / lib-coupled / memcpy-only
+/ C++); `src/common` flat loops exhausted (ported residue, classified-out
+multi-stage/C++/IIR/fn-ptr, dead/GUI-only); `src/iop` OMP remainders all
+accounted for (engine-routed drivers, `#ifdef`-dead, GUI/dead-guarded,
+nondeterministic-PRNG k-means). The only unported LIVE loops are memcpy-only
+(interpolation 1:1, PFM strips) — porting them buys nothing, and the plan's
+own principle keeps such code "in C behind the existing FFI where a port
+buys nothing." Force-porting would contradict that economy for zero
+behavioral gain.
+
+**What remains (unchanged, as documented in RUST_MIGRATION_PLAN.md):**
+classified-out items stay in C (LCMS paths, C++ formats, IIR/Kahan/fn-ptr
+cores, nondeterministic clustering); UI parity stays deferred; lcms2
+retirement remains a parked later increment (user declined it for now);
+ROADMAP Lightroom-gap features untouched.

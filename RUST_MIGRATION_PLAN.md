@@ -28,6 +28,11 @@ Work front splits into four tiers:
 
 **Decision: execute A → B to completion; defer C; leave D untouched.**
 
+> **2026-09-23 closure note:** the A→B loop-port chain is declared complete
+> at m4-244 (user decision; see PROGRESS.md "Loop-port phase closed"). All
+> portable live loops are ported; remainders are classified-out, deferred,
+> or zero-value memcpy-only per the principle above.
+
 ---
 
 ## Current status -- 2026-06-04
