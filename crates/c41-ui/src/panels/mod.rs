@@ -2716,6 +2716,17 @@ impl MetadataPanel {
         export_btn.set_action_name(Some("win.export-selected"));
         panel.append(&export_btn);
 
+        // Print composer entry point, beside Export: same one-action pattern
+        // (the `win.print-selected` implementation lives with the other window
+        // actions in lib.rs), print-to-PDF only.
+        let print_btn = gtk4::Button::builder()
+            .label("Print to PDF…")
+            .tooltip_text("Compose a print layout and export PDF")
+            .margin_start(10).margin_end(10).margin_top(2).margin_bottom(8)
+            .build();
+        print_btn.set_action_name(Some("win.print-selected"));
+        panel.append(&print_btn);
+
         // Commit a metadata field on Enter or on losing focus.
         //
         // Two guards, both taken from upstream, because either alone is not enough:

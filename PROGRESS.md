@@ -6536,3 +6536,48 @@ Remote CI on `6f36d1bdf9` (docs-only: PROGRESS.md + RUST_MIGRATION_PLAN.md):
 `check + test + clippy` and CMake correctly path-filtered out (no code
 touched — and the pre-push hook ran all four local CI steps green before
 push). Both remotes (`origin` GitHub + Gitea) verified at `6f36d1bdf9`.
+
+### u1 — Print composer, print-to-PDF (2026-09-24 UTC)
+
+**What.** First leg of PARITY_AUDIT 3.4 (map/print/tethering): a Print
+composer page — new `crates/c41-ui/src/print.rs` (pure layout model:
+A4/Letter/10×15/13×18, portrait/landscape, clamped margins,
+fit-contain-centered rect math, 6 headless tests; GTK composer with
+DrawingArea page preview, paper/orientation/margin/page controls, and
+"Export PDF" via `GtkPrintOperation` in Export mode, one image per page
+decoded through the full-preview path). Entry: "Print to PDF…" button
+beside Export (`panels/mod.rs`) + `win.print-selected` action
+(`lib.rs`, empty-selection no-op, culling-safe). Page tag `"print"` is
+slash-free so the `popped` cell re-sync ignores it; the `pushed` switcher
+mirror now lights Darkroom only for slash-tagged darkroom pages.
+Deliberately out of scope: printer discovery/CUPS, ICC print profiles —
+no new sys deps (gtk4 only). View switcher and "Other" placeholder
+untouched; map + tethering legs still open.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**BLOCK** — one real defect: landscape exports double-rotated (custom
+`PaperSize` built from already-oriented dims, then `set_orientation`
+swapped again → portrait PDF surface under landscape layout coords).
+Fixed in-session (custom size from canonical portrait dims; oriented dims
+for layout only). Two MINORs fixed: dead `_db_path` param removed;
+`pushed` handler no longer lights Darkroom for auxiliary pages. All other
+checklist items PASS (layout math hand-recomputed: A4 y=85.1667, Letter
+pillar x=31.75; all GTK APIs exist with matching signatures; threading
+clean; decode genuinely reused with justified 3000px bound; 6 tests
+independently recomputed, none tautological; failure paths correct).
+Post-fix gate caught TWO compile errors the review missed (`connect_pushed`
+takes 1 arg in gtk4-rs 0.9 — fixed via `visible_page()` readback;
+`move`-closure capturing borrowed `win` — fixed by pre-cloning); post-fix
+clippy capture caught THREE new warn-level lints in print.rs
+(`neg_cmp_op_on_partial_ord`, `unnecessary_min_or_max`,
+`needless_borrows_for_generic_args`) — all fixed (`<=` + `is_finite` is
+provably equivalent here since NaN is caught by the second disjunct).
+Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero warnings
+in `print.rs` post-fix. `git diff --check` clean; no `/*`/`*/` in added
+lines. Release `c41-ui` suite: 409 passed (403 existing + 6 new),
+0 failed; `c41-core` unchanged at 1676. PARITY_AUDIT.md 3.4 updated in
+the same commit (print leg landed; map + tethering open).
+Remote CI confirmation follows commit/push per workflow.

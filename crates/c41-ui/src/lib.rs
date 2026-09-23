@@ -21,6 +21,7 @@ pub mod lighttable;
 pub mod panels;
 pub mod persist;
 pub mod preview;
+pub mod print;
 pub mod raw_preview;
 pub mod snapshots;
 pub mod stylemodules;
@@ -1736,8 +1737,23 @@ fn build_main_window(app: &Application) {
         // the switcher regardless of entry point (switcher / double-click /
         // keyboard push), so the toggle never lies about which view is active.
         // These fire only for pushes AFTER this point — the initial lighttable
-        // root was pushed earlier, so startup keeps Lighttable active.
-        nav.connect_pushed(clone!(@weak dr_btn => move |_| dr_btn.set_active(true)));
+        // root was pushed earlier, so startup keeps Lighttable active. The
+        // `pushed` signal carries no page, so read back `visible-page` (already
+        // the incoming page when this fires): only darkroom pages (tagged with
+        // the image path, containing `/`) light the Darkroom toggle —
+        // auxiliary pages like Print carry slash-free tags and leave the
+        // switcher alone, mirroring the `popped` filter.
+        nav.connect_pushed(clone!(@weak dr_btn, @weak nav => move |_| {
+            let is_darkroom = nav
+                .visible_page()
+                .and_then(|p| p.tag())
+                .map(|s| s.to_string())
+                .filter(|p| p.contains('/'))
+                .is_some();
+            if is_darkroom {
+                dr_btn.set_active(true);
+            }
+        }));
         nav.connect_popped(clone!(@weak lt_btn => move |_, _| lt_btn.set_active(true)));
     }
 
@@ -1784,6 +1800,24 @@ fn build_main_window(app: &Application) {
             );
         }));
         window.add_action(&export_act);
+
+        // win.print-selected — pushes the print composer for the selection.
+        // Empty selection is a no-op, matching export-selected's guard (the
+        // dialog/page constructors also tolerate it, but navigation must not
+        // push a page for nothing).
+        let print_nav = nav.clone();
+        let print_act = gtk4::gio::SimpleAction::new("print-selected", None);
+        print_act.connect_activate(clone!(@weak lt_selection => move |_, _| {
+            let paths: Vec<String> =
+                lighttable::selected_path(&lt_selection).into_iter().collect();
+            if paths.is_empty() {
+                return;
+            }
+            // Slash-free tag: the `popped` handler above re-syncs grid cells
+            // only for tags containing `/`, so it ignores this page.
+            print_nav.push(&crate::print::print_page(paths));
+        }));
+        window.add_action(&print_act);
     }
 
     // ── Wire toast overlay + present ───────────────────────────────────────
