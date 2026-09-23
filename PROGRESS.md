@@ -6498,4 +6498,7 @@ colorout diagnostics (plugin links `libcolorout.so` clean).
 `git diff --check` clean; no `/*`/`*/` in added lines. Release `c41-core`
 suite: 1676 passed (1671 existing + 5 new), 0 failed; release `c41-ui`
 suite 403 passed.
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `5fc97bb806` is green: `check + test + clippy`, `CMake + Rust workspace, Ubuntu 24.04 (Release, GCC)`
+(which covers the changed-C Release `-Werror` compile), and `Build & push
+Docker image` all `success`; matrix/full-c jobs skipped as expected. Both
+remotes (`origin` GitHub + Gitea) verified at `5fc97bb806`.
