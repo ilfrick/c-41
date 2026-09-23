@@ -6580,4 +6580,8 @@ in `print.rs` post-fix. `git diff --check` clean; no `/*`/`*/` in added
 lines. Release `c41-ui` suite: 409 passed (403 existing + 6 new),
 0 failed; `c41-core` unchanged at 1676. PARITY_AUDIT.md 3.4 updated in
 the same commit (print leg landed; map + tethering open).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `d6b5af713e` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run on this commit — correctly path-filtered
+out (u1 touches no C code; the changed-C compile bar is N/A). Both remotes
+(`origin` GitHub + Gitea) verified at `d6b5af713e`.
