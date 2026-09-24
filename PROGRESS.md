@@ -6867,4 +6867,14 @@ link). All-targets Clippy: zero diagnostics in `ai/` files. `git diff
 1716 passed (1691 + 25 new), others unchanged (db 97, ui 452), 0 failed.
 PARITY_AUDIT.md 2.7 updated in the same commit (infra landed; inference +
 panel = u7b).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI: `check + test + clippy` green, but `Build & push Docker image`
+FAILED — the shipping builder lacked OpenSSL headers for `openssl-sys`,
+pulled in by `ort-sys`'s build-dependency on `ureq` with `native-tls`
+(`cargo tree`: ort-sys → ureq → native-tls → openssl-sys; the dev/CI
+images already ship `libssl-dev`, the shipping builder did not).
+Follow-up commit adds `libssl-dev` (builder) + `libssl3` (runtime,
+load-time insurance — the final binary currently elides the DT_NEEDED,
+verified via `ldd`) to `docker/Dockerfile`; the shipping image was
+rebuilt AND load-checked locally (exit 0, zero "not found" libs).
+Remote Docker build green on the fixup. Both remotes (`origin` GitHub +
+Gitea) verified at the fixup commit.
