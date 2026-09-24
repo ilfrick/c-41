@@ -32,6 +32,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config git curl ca-certificates \
     libgtk-4-dev libadwaita-1-dev libgraphene-1.0-dev \
     libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
+    # openssl-sys build dep (u7a): ort-sys builds its model downloader on
+    # ureq with native-tls, so the OpenSSL headers must exist at compile
+    # time even though runtime TLS is rustls (pure Rust).
+    libssl-dev \
     # c41-sys links liblensfun (lens-correction stage, m4-130): the dev
     # package's .so is needed at link time only; the runtime stage below ships
     # the calibration database (liblensfun-data-v1).
@@ -102,6 +106,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     liblensfun1 liblensfun-data-v1 \
     # libgphoto2 runtime (tethered capture, u6; noble t64 name)
     libgphoto2-6t64 \
+    # libssl3 runtime (u7a): the ort-sys build dep compiles ureq with
+    # native-tls, so the linked binary wants libssl at load time.
+    libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     # Regenerate the GDK pixbuf loader cache so SVG icons load (binary not in PATH)
     && (/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache || true) \
