@@ -1,12 +1,15 @@
-//! Tethering shell, watch-folder slice only (u4; parity audit 3.4, tethering leg).
+//! Tethering page: live camera capture plus watch-folder auto-import
+//! (u6; parity audit 3.4, tethering leg).
 //!
-//! Scope is deliberately narrow: there is NO live camera capture here.
-//! libgphoto2 is absent from the shipping image and there is no Rust binding
-//! for it, so live capture stays BLOCKED (like slippy-map tiles and neural
-//! restore). The page says exactly that in its status area rather than
-//! showing a fake "camera connected" state. What the page DOES do is watch a
-//! user-chosen folder and auto-import new images through the SAME folder
-//! import the import dialog uses.
+//! Live capture is real: `c41_core::camera` drives libgphoto2 (detect plus
+//! capture-from-the-first-camera; no burst/timelapse/liveview). The page's
+//! camera section holds a Detect button (lists attached models, or none),
+//! a Capture button (always enabled — with no camera it reports a status
+//! error, never a crash), and a status line for each outcome. Captures land
+//! in the watch folder when one is set, else in a session `incoming` dir
+//! under the catalogue dir (see [`capture_dest_dir`]), then register through
+//! the single-file import ([`crate::dialogs::import_single_file_sync`]) and
+//! reload the grid through the import sites' exact `on_done`.
 //!
 //! The file follows the established pure-model-then-widget discipline (see
 //! [`crate::map`]): the diffing ([`new_files`]), the extension gate
@@ -43,11 +46,10 @@ use std::rc::Rc;
 /// tags) both ignore it — the same contract as the print and map pages.
 pub const TETHER_PAGE_TAG: &str = "tether";
 
-/// The honest no-camera line shown in the page's status area. Pinned by test
-/// so a rewording stays deliberate: the shell must never imply a camera path
-/// exists in this build.
-pub const TETHER_NO_CAMERA_TEXT: &str =
-    "No camera detected — live capture needs libgphoto2, which this build does not ship";
+/// The camera status line before the first Detect press. Pinned by test so a
+/// rewording stays deliberate; after Detect the line shows
+/// [`c41_core::camera::format_detect_status`] instead.
+pub const TETHER_NO_CAMERA_TEXT: &str = "No camera detected";
 
 /// Seconds between watch-folder scans. Slow enough that the walk plus the
 /// occasional import never contends with interactive use; fast enough that a
@@ -94,6 +96,26 @@ pub fn new_files(known: &HashSet<String>, current: &[String]) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// Where a capture is saved: the watch folder when one is set, else a
+/// session `incoming` dir under the catalogue dir (the parent of `db_path`).
+/// With no catalogue open (empty `db_path`, demo mode) the system temp dir
+/// backs the capture and the import step is skipped by the caller.
+pub fn capture_dest_dir(watch_path: Option<&str>, db_path: &str) -> std::path::PathBuf {
+    match watch_path {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            let catalogue = (!db_path.is_empty())
+                .then(|| std::path::Path::new(db_path).parent())
+                .flatten()
+                .filter(|p| !p.as_os_str().is_empty());
+            match catalogue {
+                Some(dir) => c41_core::camera::tether_capture_dir(dir),
+                None => std::env::temp_dir().join("c41-tether"),
+            }
+        }
+    }
 }
 
 /// The watch-folder row text: the chosen path, or "none" before one is picked.
@@ -266,12 +288,142 @@ pub fn tether_page(db_path: String, on_done: Rc<dyn Fn()>) -> adw::NavigationPag
     content.set_margin_top(12);
     content.set_margin_bottom(12);
 
-    // Camera status: the honest line — no capture path in this build.
+    // Camera status: live detect/capture state (u6). Starts at the honest
+    // none-line; Detect refreshes it from `format_detect_status`, Capture
+    // reports each outcome here.
     let camera = gtk4::Label::new(Some(TETHER_NO_CAMERA_TEXT));
     camera.set_wrap(true);
     camera.set_halign(gtk4::Align::Start);
     camera.add_css_class("dim-label");
     content.append(&camera);
+
+    // Detect + Capture row. Capture stays enabled with no camera — the
+    // handler reports a status error instead of crashing.
+    let cam_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let detect_btn = gtk4::Button::with_label("Detect camera");
+    let capture_btn = gtk4::Button::with_label("Capture");
+    cam_row.append(&detect_btn);
+    cam_row.append(&capture_btn);
+    content.append(&cam_row);
+
+    {
+        let status_w = camera.downgrade();
+        let btn_w = detect_btn.downgrade();
+        detect_btn.connect_clicked(move |_| {
+            if let Some(b) = btn_w.upgrade() {
+                b.set_sensitive(false);
+            }
+            if let Some(lbl) = status_w.upgrade() {
+                lbl.set_text("Detecting…");
+            }
+            let status_w = status_w.clone();
+            let btn_w = btn_w.clone();
+            glib::spawn_future_local(async move {
+                let cams = gio::spawn_blocking(c41_core::camera::detect_cameras)
+                    .await
+                    .unwrap_or_default();
+                if let Some(lbl) = status_w.upgrade() {
+                    lbl.set_text(&c41_core::camera::format_detect_status(&cams));
+                }
+                if let Some(b) = btn_w.upgrade() {
+                    b.set_sensitive(true);
+                }
+            });
+        });
+    }
+
+    {
+        let state = state.clone();
+        let db = db_path.clone();
+        let done = on_done.clone();
+        let status_w = camera.downgrade();
+        let busy = Rc::new(std::cell::Cell::new(false));
+        capture_btn.connect_clicked(move |btn| {
+            if busy.get() {
+                return;
+            }
+            busy.set(true);
+            btn.set_sensitive(false);
+            if let Some(lbl) = status_w.upgrade() {
+                lbl.set_text("Capturing…");
+            }
+            let watch = state.borrow().watch_path.clone();
+            let dest_dir = capture_dest_dir(watch.as_deref(), &db);
+            let db_inner = db.clone();
+            let done_inner = done.clone();
+            let status_w = status_w.clone();
+            let busy_inner = busy.clone();
+            let btn_w = btn.downgrade();
+            // Cloned up front: the async block below is `move`, and `state`
+            // belongs to the `Fn` button closure that outlives it.
+            let state_inner = state.clone();
+            glib::spawn_future_local(async move {
+                // USB I/O off-thread; the join error (panicked worker) is a
+                // status line, never a crash.
+                let outcome = gio::spawn_blocking(move || {
+                    c41_core::camera::capture_into(&dest_dir)
+                })
+                .await;
+                let release = |text: &str| {
+                    if let Some(lbl) = status_w.upgrade() {
+                        lbl.set_text(text);
+                    }
+                    busy_inner.set(false);
+                    if let Some(b) = btn_w.upgrade() {
+                        b.set_sensitive(true);
+                    }
+                };
+                let saved = match outcome {
+                    Ok(Ok(path)) => Some(path),
+                    Ok(Err(e)) => {
+                        release(&format!("Capture failed: {e}"));
+                        None
+                    }
+                    Err(_) => {
+                        release("Capture failed: capture task did not complete");
+                        None
+                    }
+                };
+                let Some(path) = saved else { return };
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let dir = path
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if db_inner.is_empty() {
+                    release(&format!("Captured {name} (no catalogue open — not imported)"));
+                    return;
+                }
+                // Single-file import, off-thread like the watch scans: only
+                // this file registers, never a re-walk of the whole folder.
+                // Cloned for the worker: `name` is still needed below for the
+                // status line and the watch-set insert.
+                let name_inner = name.clone();
+                let imported = gio::spawn_blocking(move || {
+                    crate::dialogs::import_single_file_sync(&dir, &name_inner, &db_inner)
+                })
+                .await
+                .unwrap_or(false);
+                if imported {
+                    // Teach the watch set about the capture: without this the
+                    // next tick would re-report the just-captured file as new
+                    // (the DB upsert dedupes the row, but the status line
+                    // would lie). Same spelling the walk yields — dest_dir
+                    // joined with the saved name — so the set agrees.
+                    // Cloned: this async block is `move` and `state` belongs
+                    // to the `Fn` button closure that outlives it.
+                    state_inner.borrow_mut().known.insert(path.to_string_lossy().to_string());
+                    release(&format!("Captured {name} — imported"));
+                    done_inner();
+                } else {
+                    release(&format!("Captured {name} but the import failed — see log"));
+                }
+            });
+        });
+    }
 
     content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
@@ -446,12 +598,10 @@ mod tests {
 
     #[test]
     fn no_camera_line_is_exact() {
-        // The shell's honesty is the feature: pin the wording so it can only
-        // change deliberately, never by an idle edit.
-        assert_eq!(
-            TETHER_NO_CAMERA_TEXT,
-            "No camera detected — live capture needs libgphoto2, which this build does not ship"
-        );
+        // The honest starting state: pin the wording so it can only change
+        // deliberately, never by an idle edit. Detect refreshes the line
+        // from `c41_core::camera::format_detect_status`.
+        assert_eq!(TETHER_NO_CAMERA_TEXT, "No camera detected");
     }
 
     #[test]
@@ -555,6 +705,42 @@ mod tests {
         assert!(list_watch_candidates(base.join("absent").to_str().unwrap()).is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn capture_dest_prefers_the_watch_folder() {
+        // Watch folder set: captures land there whatever the catalogue is.
+        assert_eq!(
+            capture_dest_dir(Some("/photos/watch"), "/config/darkroom/library.db"),
+            std::path::PathBuf::from("/photos/watch")
+        );
+        assert_eq!(
+            capture_dest_dir(Some("/photos/watch"), ""),
+            std::path::PathBuf::from("/photos/watch")
+        );
+    }
+
+    #[test]
+    fn capture_dest_falls_back_to_catalogue_incoming() {
+        // No watch folder: a session `incoming` dir under the catalogue dir.
+        assert_eq!(
+            capture_dest_dir(None, "/config/darkroom/library.db"),
+            std::path::PathBuf::from("/config/darkroom/incoming")
+        );
+        assert_eq!(
+            capture_dest_dir(Some(""), "/config/darkroom/library.db"),
+            std::path::PathBuf::from("/config/darkroom/incoming")
+        );
+    }
+
+    #[test]
+    fn capture_dest_without_catalogue_is_temp() {
+        // Demo mode (no catalogue): temp-backed so the capture still lands
+        // somewhere; the caller skips the import there.
+        assert_eq!(
+            capture_dest_dir(None, ""),
+            std::env::temp_dir().join("c41-tether")
+        );
     }
 
     #[test]

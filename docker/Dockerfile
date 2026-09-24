@@ -36,6 +36,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # package's .so is needed at link time only; the runtime stage below ships
     # the calibration database (liblensfun-data-v1).
     liblensfun-dev \
+    # c41-sys links libgphoto2 (tethered capture, u6): same arrangement —
+    # headers + .so for the build, runtime .so ships in the stage below.
+    libgphoto2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the toolchain WITH the components rust-toolchain.toml pins (rustfmt,
@@ -97,6 +100,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdk-pixbuf2.0-bin shared-mime-info python3-xdg xkb-data \
     # liblensfun runtime + calibration database (lens-correction stage)
     liblensfun1 liblensfun-data-v1 \
+    # libgphoto2 runtime (tethered capture, u6; noble t64 name)
+    libgphoto2-6t64 \
     && rm -rf /var/lib/apt/lists/* \
     # Regenerate the GDK pixbuf loader cache so SVG icons load (binary not in PATH)
     && (/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache || true) \

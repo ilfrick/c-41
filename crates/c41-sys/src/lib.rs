@@ -2,4 +2,5 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+pub mod gphoto;
 pub mod lensfun;

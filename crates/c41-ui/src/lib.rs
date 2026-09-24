@@ -1842,8 +1842,8 @@ fn build_main_window(app: &Application) {
         });
         window.add_action(&map_act);
 
-        // win.open-tether — pushes the tethering shell (watch-folder
-        // auto-import; no live capture in this build). Never a no-op on
+        // win.open-tether — pushes the tethering page (live capture plus
+        // watch-folder auto-import). Never a no-op on
         // content: with no watch folder chosen the page opens anyway and says
         // so, mirroring `win.open-map` (same guards — i.e. none: no selection
         // is needed, so the page always pushes). The tag is slash-free

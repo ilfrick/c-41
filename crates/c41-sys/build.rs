@@ -8,6 +8,12 @@ fn main() {
     // `liblensfun-dev` installed in the dev/CI image (runtime images ship
     // liblensfun1 + liblensfun-data-v1).
     println!("cargo:rustc-link-lib=dylib=lensfun");
+    // libgphoto2 (src/gphoto.rs, tethered capture u6): same arrangement —
+    // only `libgphoto2-dev` in the dev/CI image, `libgphoto2-6t64` at runtime.
+    println!("cargo:rustc-link-lib=dylib=gphoto2");
+    // The port-list entry points (gp_port_info_list_*) live in the separate
+    // port library that -dev ships alongside (libgphoto2-port12t64 runtime).
+    println!("cargo:rustc-link-lib=dylib=gphoto2_port");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Default: copy the pre-generated bindings committed in src/bindings.rs.

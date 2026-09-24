@@ -634,6 +634,62 @@ pub(crate) fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
     Some(count)
 }
 
+/// Register ONE already-saved file (`dir` + `filename`) in the catalogue at
+/// `db_path`, returning true when the row exists afterwards (newly inserted
+/// or already present — `image_insert` dedupes on film-plus-filename).
+/// This is the single-file import the tether capture uses: calling
+/// `import_folder_sync` on the capture's parent would re-walk and re-count
+/// the whole folder on every shot, while this touches exactly one row.
+/// Probing, EXIF and the film-roll upsert mirror `import_folder_sync`'s
+/// per-file body, so a captured file and a manually imported one register
+/// identically. Empty `db_path` (demo mode) reports false.
+pub(crate) fn import_single_file_sync(dir: &str, filename: &str, db_path: &str) -> bool {
+    use c41_db::film;
+    use c41_db::image;
+
+    if db_path.is_empty() || dir.is_empty() || filename.is_empty() {
+        return false;
+    }
+    // Deliberately NO extension gate here (unlike the folder importer):
+    // the sole caller is tethered capture, whose filename extension was
+    // already validated when the capture was named (see camera_extension —
+    // always alnum, defaulting to jpg), so re-gating would only refuse
+    // files the camera path just produced.
+    let path = std::path::Path::new(dir).join(filename);
+    if !path.is_file() {
+        return false;
+    }
+    // Same fallbacks as the folder importer: unreadable headers register
+    // 0x0, absent EXIF tags stay NULL — never invented values.
+    let (w, h) = probe_dims(&path).unwrap_or((0, 0));
+    let meta = c41_core::exif::probe_or_none(&path);
+    let conn = match c41_db::schema::open_catalog(db_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let tx = match conn.unchecked_transaction() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let film_id = match film::film_new(&conn, dir) {
+        Ok(Some(id)) => id,
+        _ => return false,
+    };
+    let exif = image::ImageExif {
+        exposure: meta.exposure,
+        aperture: meta.aperture,
+        iso: meta.iso,
+        focal_length: meta.focal_length,
+        latitude: meta.latitude,
+        longitude: meta.longitude,
+        altitude: meta.altitude,
+    };
+    if image::image_insert(&conn, film_id, filename, w, h, exif).is_err() {
+        return false;
+    }
+    tx.commit().is_ok()
+}
+
 /// Read image dimensions without fully decoding the file.
 fn probe_dims(path: &std::path::Path) -> Option<(i32, i32)> {
     // Use gdk_pixbuf's file-info path (header-only probe, very fast)
@@ -978,6 +1034,50 @@ mod tests {
         drop(check);
         // Empty db path stays a no-op (demo mode, no library).
         assert_eq!(import_folder_sync(photos.to_str().unwrap(), ""), None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn import_single_file_registers_exactly_one_row() {
+        // The tether capture path: one already-saved file lands as one row,
+        // with the folder importer's per-file semantics (empty file probes
+        // 0x0 but still registers; repeat calls dedupe instead of doubling).
+        let base = std::env::temp_dir().join(format!(
+            "darkroom_import_one_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = base.join("config");
+        let photos = base.join("photos");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&photos).unwrap();
+        std::fs::write(photos.join("tether-20260924-120000.cr3"), b"").unwrap();
+        let dbs = cfg.join("library.db").to_str().unwrap().to_string();
+        let dir = photos.to_str().unwrap();
+
+        assert!(import_single_file_sync(dir, "tether-20260924-120000.cr3", &dbs));
+        let check = c41_db::schema::open_catalog(&dbs).unwrap();
+        assert_eq!(c41_db::image::image_count_all(&check).unwrap(), 1);
+        drop(check);
+        // Second call is a dedupe hit, not a second row — and still true.
+        assert!(import_single_file_sync(dir, "tether-20260924-120000.cr3", &dbs));
+        let check = c41_db::schema::open_catalog(&dbs).unwrap();
+        assert_eq!(c41_db::image::image_count_all(&check).unwrap(), 1);
+        drop(check);
+        // A neighbour file in the same folder is untouched by the single
+        // import: this is the whole point versus import_folder_sync.
+        std::fs::write(photos.join("other.dng"), b"").unwrap();
+        let check = c41_db::schema::open_catalog(&dbs).unwrap();
+        assert_eq!(c41_db::image::image_count_all(&check).unwrap(), 1);
+        drop(check);
+        // Missing file and empty db path report false, never a row.
+        assert!(!import_single_file_sync(dir, "absent.dng", &dbs));
+        assert!(!import_single_file_sync(dir, "other.dng", ""));
+        assert!(!import_single_file_sync("", "other.dng", &dbs));
 
         let _ = std::fs::remove_dir_all(&base);
     }

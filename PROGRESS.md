@@ -6774,3 +6774,50 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u5
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `ca9d9b5fe6`.
+
+### u6 — live tethered capture via libgphoto2 (2026-09-24 UTC)
+
+**What.** Tethering leg of PARITY_AUDIT 3.4 closed (capture): live camera
+capture — `docker/Dockerfile` (+`libgphoto2-dev` builder,
++`libgphoto2-6t64` runtime, noble t64 name) and
+`docker/Dockerfile.rust-dev` (+`libgphoto2-dev`; `Dockerfile.full-c`
+untouched — legacy dispatch-only image), new `c41-sys/src/gphoto.rs`
+hand bindings (lensfun.rs discipline: context/camera/abilities/port-list/
+capture/file/autodetect/list/errors) + `build.rs` link lines + `pub mod`,
+new `c41-core/src/camera.rs` safe wrapper (`detect_cameras`,
+`capture_to`/`capture_into`, `CameraError`, pure naming/status helpers,
+tests), new `dialogs::import_single_file_sync` (film upsert + one insert,
+no extension re-gate — camera ext already validated), tether page Detect
+(model list, honest empty) + Capture (watch folder else `incoming/`,
+staging+rename, single import + grid reload, busy-guarded). No
+burst/timelapse/liveview.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — verified against `camera_control.c` order. Open
+sequence mirrors darktable exactly; cleanup complete on every path;
+CString reads bounded; ext validated with jpg fallback; detect list
+null-checked; constants consistent with C usage; single-file import
+mirrors folder body; UI states correct; Docker names exact; tests
+hardware-independent; scope clean; single `links` key correct. All
+findings fixed in-session: (1) dead `sanitize_capture_basename` DELETED
+(camera basename never reaches the fs — only its validated ext does);
+(2) captured name inserted into the watch `known` set (else the next tick
+re-reports it); (3) extension-gate absence documented. Header layouts
+(`CameraFilePath{name[128],folder[1024]}`, full 19-field
+`CameraAbilities`) verified against the real 2.5.31 headers in Docker —
+exact match. Post-fix gate caught what review couldn't: (a) two
+`Fn`-closure move errors in new async code, (b) the REAL linker gap —
+`gp_port_info_list_*` live in the SEPARATE `libgphoto2_port` lib (fixed
+with a second `rustc-link-lib` line; runtime pulls
+`libgphoto2-port12t64` as a dep). The `c41-rust-dev` image was rebuilt
+with libgphoto2-dev for the gate. Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `camera.rs`/`gphoto.rs`/`tether.rs`. `git diff --check`
+clean; no `/*`/`*/` in added lines. Release suites: `c41-core` 1691
+passed, `c41-db` 97, `c41-ui` 452 passed, 0 failed. PARITY_AUDIT.md 3.4
+updated in the same commit (tethering closed; neural restore still
+BLOCKED).
+Remote CI confirmation follows commit/push per workflow.

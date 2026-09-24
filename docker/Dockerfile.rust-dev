@@ -26,6 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig-dev libfreetype-dev \
     # c41-sys links liblensfun (m4-130); data lets its probe test find gear
     liblensfun-dev liblensfun-data-v1 \
+    # c41-sys links libgphoto2 (tethered capture, u6)
+    libgphoto2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust stable

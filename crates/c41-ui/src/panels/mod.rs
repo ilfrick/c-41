@@ -2813,8 +2813,8 @@ impl MetadataPanel {
 
         // Tether entry point, beside Map: same one-action pattern (the
         // `win.open-tether` implementation lives with the other window
-        // actions in lib.rs). Watch-folder auto-import only — live capture
-        // needs libgphoto2, which this build does not ship.
+        // actions in lib.rs). Watch-folder auto-import plus live capture
+        // (u6, via libgphoto2).
         let tether_btn = gtk4::Button::builder()
             .label("Tether…")
             .tooltip_text("Watch a folder for new images")
