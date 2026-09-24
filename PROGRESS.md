@@ -6711,4 +6711,8 @@ diagnostics in `tether.rs` post-fix. `git diff --check` clean; no
 `c41-db` 97 unchanged, `c41-ui` 428 passed (418 + 10 new), 0 failed.
 PARITY_AUDIT.md 3.4 updated in the same commit (tethering shell landed;
 slippy-map + live capture BLOCKED).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `558c3f44dd` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u4
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`558c3f44dd`.
