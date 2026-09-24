@@ -6666,4 +6666,8 @@ clean — nearby hits verified pre-existing context lines). `git diff
 1682 unchanged, `c41-db` 97 passed (95 + 2 new), `c41-ui` 418 passed
 (412 + 6 new), 0 failed. PARITY_AUDIT.md 3.4 updated in the same commit
 (map list landed; tethering open).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `3a73f6ba72` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u3
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`3a73f6ba72`.
