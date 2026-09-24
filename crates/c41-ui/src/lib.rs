@@ -18,6 +18,7 @@ pub mod export;
 pub mod export_panel;
 pub mod history;
 pub mod lighttable;
+pub mod map;
 pub mod panels;
 pub mod persist;
 pub mod preview;
@@ -1449,29 +1450,32 @@ fn build_main_window(app: &Application) {
     let nav = adw::NavigationView::new();
     nav.push(&lt_page);
 
+    // The open-the-editor body, shared verbatim by the grid's `activate`
+    // signal, the zoomable canvas's double-click (m4-139), and the map list's
+    // row activation (u3), so all entry points stay behaviourally identical by
+    // construction. Hoisted out of the double-click block so the `win.open-map`
+    // action below can call the same function rather than reimplementing it.
+    let open_in_darkroom: std::rc::Rc<dyn Fn(String)> = {
+        let nav = nav.clone();
+        let db_path = db_path.clone();
+        let preview_for_activate = preview.clone();
+        std::rc::Rc::new(move |path| {
+            // Leaving the lighttable closes the preview, or coming back from
+            // the editor would land on a full-screen image of whatever was up
+            // before — over a grid that has since moved on.
+            preview_for_activate.close();
+            let page = darkroom::darkroom_page(&path, &db_path);
+            // Tag the page with its image path so the pop handler below can
+            // recover which cell to re-sync (m4-25), regardless of how the
+            // page was dismissed (back button / Escape / swipe gesture).
+            page.set_tag(Some(&path));
+            nav.push(&page);
+        })
+    };
+
     // Double-click → darkroom page; F1–F5 → toggle colour label on selection.
     {
         let grid = lt_grid.clone();
-        // The open-the-editor body, shared verbatim by the grid's `activate`
-        // signal and the zoomable canvas's double-click (m4-139), so both entry
-        // points stay behaviourally identical by construction.
-        let open_in_darkroom: std::rc::Rc<dyn Fn(String)> = {
-            let nav = nav.clone();
-            let db_path = db_path.clone();
-            let preview_for_activate = preview.clone();
-            std::rc::Rc::new(move |path| {
-                // Leaving the lighttable closes the preview, or coming back from
-                // the editor would land on a full-screen image of whatever was up
-                // before — over a grid that has since moved on.
-                preview_for_activate.close();
-                let page = darkroom::darkroom_page(&path, &db_path);
-                // Tag the page with its image path so the pop handler below can
-                // recover which cell to re-sync (m4-25), regardless of how the
-                // page was dismissed (back button / Escape / swipe gesture).
-                page.set_tag(Some(&path));
-                nav.push(&page);
-            })
-        };
         lt_zoom.set_activate_callback(open_in_darkroom.clone());
 
         // `pos` is an index into the model the GRID is showing, which is not the
@@ -1818,6 +1822,23 @@ fn build_main_window(app: &Application) {
             print_nav.push(&crate::print::print_page(paths));
         }));
         window.add_action(&print_act);
+
+        // win.open-map — pushes the map list of geotagged images. Never a
+        // no-op on content: with no geotagged images (or no catalogue at all)
+        // the page shows its empty state instead. Every activation builds a
+        // fresh page, so leaving and re-entering the map refreshes the list.
+        // The tag is slash-free (`crate::map::MAP_PAGE_TAG`), so the `popped`
+        // cell re-sync above ignores it — the same contract as the print page.
+        // Row activation calls the hoisted `open_in_darkroom`, the exact
+        // function the grid's `activate` signal uses.
+        let map_nav = nav.clone();
+        let map_db = db_path.clone();
+        let map_open = open_in_darkroom.clone();
+        let map_act = gtk4::gio::SimpleAction::new("open-map", None);
+        map_act.connect_activate(move |_, _| {
+            map_nav.push(&crate::map::map_page(map_db.clone(), map_open.clone()));
+        });
+        window.add_action(&map_act);
     }
 
     // ── Wire toast overlay + present ───────────────────────────────────────

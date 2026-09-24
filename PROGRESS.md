@@ -6630,3 +6630,40 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u2
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `b308cd51ee`.
+
+### u3 — map list page (2026-09-24 UTC)
+
+**What.** Map leg of PARITY_AUDIT 3.4 (list only — no tiles): a Map page
+listing every geotagged image — new `crates/c41-ui/src/map.rs` (`map_page`
+tag `"map"`, row model + `build_map_rows`, empty state with Geotagging
+hint, row click opens the darkroom), new DAO `GeoImage` +
+`image_list_geotagged` (film join for paths, both-axes + ±90/±180 range
+filter, filename/folder/id order), `win.open-map` action + "Map…" button
+beside Print/Export, `open_in_darkroom` hoisted in `lib.rs` so grid,
+zoomable canvas, and map rows share one push path, and `mod thumbs` →
+`pub(crate)` for thumbnail-service reuse. Slippy-map tiles, network, and
+new deps deliberately out of scope. Tethering leg still open.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no defects — verified cold. DAO join byte-identical to
+`image_get_full_path`, deterministic order, zero injection surface; hoist
+behaviorally identical with no cycle change; widget-name path stash safe
+by house precedent; thumbnails genuinely the shared service (off-thread
+decode); both tag filters ignore `"map"`; all empty/error states render
+text (pre-migration catalog → empty, never crash); visibility widening
+minimal with one external caller; tests non-tautological; static API scan
+clean. All findings fixed in-session: (1) NIT-1 ORDER BY gains `i.id`
+tiebreak; (2) NIT-2 DAO excludes out-of-range/non-finite axes (NaN/Inf
+can't reach the list even past the panel); (3) NIT-3 vacuous title test
+now covers `"/"`; (4) MINOR-1 paint duplication deleted — `paint_thumb`
+is `pub(crate)` and shared instead of cloned.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in any u3 code (`c41-ui/src/map.rs` clean; DAO/panel ranges
+clean — nearby hits verified pre-existing context lines). `git diff
+--check` clean; no `/*`/`*/` in added lines. Release suites: `c41-core`
+1682 unchanged, `c41-db` 97 passed (95 + 2 new), `c41-ui` 418 passed
+(412 + 6 new), 0 failed. PARITY_AUDIT.md 3.4 updated in the same commit
+(map list landed; tethering open).
+Remote CI confirmation follows commit/push per workflow.

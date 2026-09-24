@@ -2800,6 +2800,17 @@ impl MetadataPanel {
         print_btn.set_action_name(Some("win.print-selected"));
         panel.append(&print_btn);
 
+        // Map entry point, beside Export/Print: same one-action pattern
+        // (the `win.open-map` implementation lives with the other window
+        // actions in lib.rs). List-only for now — no map tiles yet.
+        let map_btn = gtk4::Button::builder()
+            .label("Map…")
+            .tooltip_text("Show geotagged images")
+            .margin_start(10).margin_end(10).margin_top(2).margin_bottom(8)
+            .build();
+        map_btn.set_action_name(Some("win.open-map"));
+        panel.append(&map_btn);
+
         // Commit a metadata field on Enter or on losing focus.
         //
         // Two guards, both taken from upstream, because either alone is not enough:

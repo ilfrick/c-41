@@ -232,6 +232,47 @@ pub fn image_set_geo(
     Ok(())
 }
 
+/// One geotagged image for the map list (u3): the catalogue id, the full
+/// `folder/filename` path (same join as [`image_get_full_path`]), and the fix.
+/// Latitude and longitude are always populated here — the query only returns
+/// rows where both are non-NULL; altitude stays optional because an unknown
+/// altitude is still a plottable fix.
+#[derive(Debug, Clone)]
+pub struct GeoImage {
+    pub id:        dt_imgid_t,
+    pub path:      String,
+    pub latitude:  f64,
+    pub longitude: f64,
+    pub altitude:  Option<f64>,
+}
+
+/// List every image carrying a full lat+lon fix, ordered by filename (ties
+/// broken by folder, then id) — the map list's stable display order. Rows
+/// with only one axis set are excluded: a half-known fix is not a position.
+/// Out-of-range or non-finite axes (only writable by bypassing the panel's
+/// range-validated parse) are excluded too: they are not positions either.
+pub fn image_list_geotagged(conn: &Connection) -> rusqlite::Result<Vec<GeoImage>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, f.folder || '/' || i.filename, i.latitude, i.longitude, i.altitude \
+         FROM main.images i JOIN main.film_rolls f ON f.id = i.film_id \
+         WHERE i.latitude IS NOT NULL AND i.longitude IS NOT NULL \
+            AND abs(i.latitude) <= 90.0 AND abs(i.longitude) <= 180.0 \
+         ORDER BY i.filename, f.folder, i.id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(GeoImage {
+                id:        row.get(0)?,
+                path:      row.get(1)?,
+                latitude:  row.get(2)?,
+                longitude: row.get(3)?,
+                altitude:  row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Return the film_id for a given image.
 pub fn image_get_film_id(conn: &Connection, imgid: dt_imgid_t) -> rusqlite::Result<Option<i32>> {
     conn.query_row(
@@ -411,5 +452,81 @@ mod tests {
         let db = open_test_db();
         let r = image_insert(&db, 1, "nogeo.dng", 10, 10, ImageExif::default());
         assert!(r.is_err());
+    }
+
+    fn open_geo_test_db() -> Connection {
+        // Same shape ensure_exif_columns produces: the four pre-existing
+        // numeric columns plus the three geo ones, since image_insert and
+        // image_list_geotagged both name them.
+        let db = open_test_db();
+        db.execute_batch(
+            "ALTER TABLE main.images ADD COLUMN exposure REAL;
+             ALTER TABLE main.images ADD COLUMN aperture REAL;
+             ALTER TABLE main.images ADD COLUMN iso REAL;
+             ALTER TABLE main.images ADD COLUMN focal_length REAL;
+             ALTER TABLE main.images ADD COLUMN longitude REAL;
+             ALTER TABLE main.images ADD COLUMN latitude REAL;
+             ALTER TABLE main.images ADD COLUMN altitude REAL;
+             INSERT INTO main.film_rolls (id, folder) VALUES (2, '/photos/other');",
+        )
+        .unwrap();
+        db
+    }
+
+    fn insert_geo(
+        db: &Connection,
+        film_id: i32,
+        name: &str,
+        lat: Option<f64>,
+        lon: Option<f64>,
+        alt: Option<f64>,
+    ) -> dt_imgid_t {
+        image_insert(
+            db,
+            film_id,
+            name,
+            100,
+            100,
+            ImageExif { latitude: lat, longitude: lon, altitude: alt, ..Default::default() },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn geotagged_list_needs_both_axes_with_paths_in_filename_order() {
+        let db = open_geo_test_db();
+        insert_geo(&db, 1, "b_athens.dng", Some(37.98), Some(23.73), None);
+        insert_geo(&db, 1, "a_sydney.dng", Some(-33.85), Some(151.2), Some(-5.5));
+        insert_geo(&db, 2, "0_first.dng", Some(51.5), Some(-0.12), None);
+        // No fix at all, and both half-known shapes: none of these is a position.
+        insert_geo(&db, 1, "c_plain.dng", None, None, None);
+        insert_geo(&db, 1, "d_no_lon.dng", Some(10.0), None, None);
+        insert_geo(&db, 1, "e_no_lat.dng", None, Some(20.0), None);
+        // Out-of-range and non-finite axes (only writable past the panel's
+        // validated parse) are not positions either.
+        insert_geo(&db, 1, "f_far_lat.dng", Some(91.0), Some(0.0), None);
+        insert_geo(&db, 1, "g_far_lon.dng", Some(0.0), Some(181.0), None);
+        insert_geo(&db, 1, "h_nan.dng", Some(f64::NAN), Some(0.0), None);
+        insert_geo(&db, 1, "i_inf.dng", Some(0.0), Some(f64::INFINITY), None);
+        let listed = image_list_geotagged(&db).unwrap();
+        assert_eq!(listed.len(), 3, "only in-range both-axes rows list, got {listed:?}");
+        // Filename order across folders, with the folder join resolved per row.
+        assert_eq!(listed[0].path, "/photos/other/0_first.dng");
+        assert_eq!(listed[1].path, "/photos/test/a_sydney.dng");
+        assert_eq!(listed[2].path, "/photos/test/b_athens.dng");
+        // Negative coords and a below-sea-level altitude survive the REAL
+        // round trip; unknown altitude stays None rather than becoming 0.
+        assert_eq!((listed[1].latitude, listed[1].longitude), (-33.85, 151.2));
+        assert_eq!(listed[1].altitude, Some(-5.5));
+        assert_eq!(listed[2].altitude, None);
+        assert_eq!((listed[0].latitude, listed[0].longitude), (51.5, -0.12));
+    }
+
+    #[test]
+    fn geotagged_list_is_empty_when_nothing_carries_a_fix() {
+        let db = open_geo_test_db();
+        insert_geo(&db, 1, "plain.dng", None, None, None);
+        insert_geo(&db, 1, "half.dng", Some(10.0), None, None);
+        assert!(image_list_geotagged(&db).unwrap().is_empty());
     }
 }

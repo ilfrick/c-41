@@ -12,7 +12,7 @@ pub(crate) mod selection;
 pub mod timeline;
 pub mod zoomable;
 
-mod thumbs;
+pub(crate) mod thumbs;
 
 use adw::prelude::*;
 use gtk4::{GridView, ListItem, ScrolledWindow, SignalListItemFactory, SingleSelection};
@@ -1934,8 +1934,9 @@ pub(crate) fn fit_inside(src_w: i32, src_h: i32, box_w: i32, box_h: i32) -> Opti
 /// Paint a decoded thumbnail into a grid cell's Picture: packed RGB8 straight
 /// into an R8G8B8 texture — no pixbuf intermediate. The pixel copy is the price
 /// of painting from the shared cache's `Rc` without moving bytes out from under
-/// it; at thumbnail sizes it's noise next to any decode.
-fn paint_thumb(thumb: &gtk4::Picture, img: &thumbs::ThumbImage) {
+/// it; at thumbnail sizes it's noise next to any decode. Shared with the map
+/// list rows (same paint path, stable rows instead of grid cells).
+pub(crate) fn paint_thumb(thumb: &gtk4::Picture, img: &thumbs::ThumbImage) {
     let bytes = glib::Bytes::from_owned(img.rgb.clone());
     thumb.set_paintable(Some(&gtk4::gdk::MemoryTexture::new(
         img.width,
