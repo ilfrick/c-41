@@ -138,17 +138,22 @@ pub fn image_get_id_by_path(
     .optional()
 }
 
-/// The EXIF numeric subset stored alongside an image row (m4-135). Owned here
-/// rather than borrowed from `c41-core` so this crate keeps its dependency
-/// graph minimal; the importer maps its probe struct onto this one-for-one.
-/// `None` fields insert NULL — never 0, because 0 would match numeric rules
-/// (`exposure < 1`) that unknown values must not satisfy.
+/// The EXIF numeric subset stored alongside an image row (m4-135) plus the
+/// geotagging triple (u2). Owned here rather than borrowed from `c41-core` so
+/// this crate keeps its dependency graph minimal; the importer maps its probe
+/// struct onto this one-for-one. `None` fields insert NULL — never 0, because
+/// 0 would match numeric rules (`exposure < 1`) that unknown values must not
+/// satisfy. Column names mirror darktable's `main.images` exactly
+/// (`longitude`, `latitude`, `altitude` — see `schema::ensure_base_schema`).
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct ImageExif {
     pub exposure: Option<f64>,
     pub aperture: Option<f64>,
     pub iso: Option<f64>,
     pub focal_length: Option<f64>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub altitude: Option<f64>,
 }
 
 /// Insert a new image record. Returns the new image id.
@@ -174,8 +179,8 @@ pub fn image_insert(
     }
     conn.execute(
         "INSERT INTO main.images (film_id, filename, width, height, flags, \
-         exposure, aperture, iso, focal_length) \
-         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
+         exposure, aperture, iso, focal_length, latitude, longitude, altitude) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             film_id,
             filename,
@@ -185,9 +190,46 @@ pub fn image_insert(
             exif.aperture,
             exif.iso,
             exif.focal_length,
+            exif.latitude,
+            exif.longitude,
+            exif.altitude,
         ],
     )?;
     Ok(conn.last_insert_rowid() as dt_imgid_t)
+}
+
+/// Read an image's geotagging triple as `(latitude, longitude, altitude)`.
+/// `None` per field when the column is NULL (never probed, or cleared) —
+/// mirrors darktable's nullable REAL columns. Errors only on a genuinely
+/// broken query (e.g. a catalog predating the geo migration); callers showing
+/// read-only state should treat that as absent, not as zero.
+pub fn image_get_geo(
+    conn: &Connection,
+    imgid: dt_imgid_t,
+) -> rusqlite::Result<(Option<f64>, Option<f64>, Option<f64>)> {
+    conn.query_row(
+        "SELECT latitude, longitude, altitude FROM main.images WHERE id = ?1",
+        params![imgid],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+}
+
+/// Write an image's geotagging triple. `None` fields store NULL (unknown /
+/// cleared) — never 0, which on the equator or at sea level would be a real
+/// claimed position. Single-image only: the caller resolves exactly one imgid.
+pub fn image_set_geo(
+    conn: &Connection,
+    imgid: dt_imgid_t,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    altitude: Option<f64>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE main.images SET latitude = ?1, longitude = ?2, altitude = ?3 \
+         WHERE id = ?4",
+        params![latitude, longitude, altitude, imgid],
+    )?;
+    Ok(())
 }
 
 /// Return the film_id for a given image.
@@ -313,5 +355,61 @@ mod tests {
     fn get_film_id_returns_correct_parent() {
         let db = open_test_db();
         assert_eq!(image_get_film_id(&db, 100).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn geo_triple_roundtrips_through_insert_and_update() {
+        // Same shape ensure_exif_columns produces: nullable REAL columns
+        // added idempotently onto an existing images table — the four
+        // pre-existing numeric columns plus the three new geo ones, since
+        // image_insert names them all.
+        let db = open_test_db();
+        db.execute_batch(
+            "ALTER TABLE main.images ADD COLUMN exposure REAL;
+             ALTER TABLE main.images ADD COLUMN aperture REAL;
+             ALTER TABLE main.images ADD COLUMN iso REAL;
+             ALTER TABLE main.images ADD COLUMN focal_length REAL;
+             ALTER TABLE main.images ADD COLUMN longitude REAL;
+             ALTER TABLE main.images ADD COLUMN latitude REAL;
+             ALTER TABLE main.images ADD COLUMN altitude REAL;",
+        )
+        .unwrap();
+        let id = image_insert(
+            &db,
+            1,
+            "geo.dng",
+            100,
+            100,
+            ImageExif {
+                latitude: Some(48.8581),
+                longitude: Some(2.3525),
+                altitude: Some(35.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            image_get_geo(&db, id).unwrap(),
+            (Some(48.8581), Some(2.3525), Some(35.0))
+        );
+        // Clearing writes NULL, never 0 — 0 lat/lon is a real claimed position.
+        image_set_geo(&db, id, None, None, None).unwrap();
+        assert_eq!(image_get_geo(&db, id).unwrap(), (None, None, None));
+        // A below-sea-level fix keeps its sign through the REAL column.
+        image_set_geo(&db, id, Some(-33.85), Some(151.2), Some(-5.5)).unwrap();
+        assert_eq!(
+            image_get_geo(&db, id).unwrap(),
+            (Some(-33.85), Some(151.2), Some(-5.5))
+        );
+    }
+
+    #[test]
+    fn insert_without_geo_columns_fails_loudly() {
+        // Documents the coupling: image_insert names the geo columns, so a
+        // catalog that never ran the migration fails the insert loudly (an
+        // Err the importer logs) rather than silently dropping the fix.
+        let db = open_test_db();
+        let r = image_insert(&db, 1, "nogeo.dng", 10, 10, ImageExif::default());
+        assert!(r.is_err());
     }
 }

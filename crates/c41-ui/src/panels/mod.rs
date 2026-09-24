@@ -1854,6 +1854,14 @@ pub struct MetadataPanel {
     iso_lbl:      gtk4::Label,
     focal_lbl:    gtk4::Label,
     taken_lbl:    gtk4::Label,
+    /// Geotagging section (u2, parity 2.7 leg): manual latitude/longitude/
+    /// altitude entries plus the status line, refreshed in `update()` on
+    /// every selection change like the metadata editor's entries.
+    geo_lat_entry: gtk4::Entry,
+    geo_lon_entry: gtk4::Entry,
+    geo_alt_entry: gtk4::Entry,
+    /// One-line fix readout ("no coordinates" / "lat …, lon …, alt … m").
+    geo_status_lbl: gtk4::Label,
     tags_flow:    gtk4::FlowBox,
     tag_entry:    gtk4::Entry,
     /// Shared (path, db_path) for the add-tag handler
@@ -2424,6 +2432,71 @@ impl MetadataPanel {
         meta_scope_lbl.set_visible(false);
         panel.append(&meta_scope_lbl);
 
+        // ── Geotagging (u2, parity 2.7 leg) ───────────────────────────────
+        // darktable's geotagging/map module, foundation only: show the fix
+        // stored on darktable's own `main.images` latitude/longitude/altitude
+        // columns and allow manual entry for the selected image. No map
+        // widget, no GPX import, no batch-apply — single selected image only,
+        // like the metadata editor's target rule for one path.
+        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        panel.append(&section_header("Geotagging"));
+
+        let geo_status_lbl = gtk4::Label::builder()
+            .label("no coordinates")
+            .halign(gtk4::Align::Start)
+            .margin_start(12).margin_end(12).margin_top(2)
+            .build();
+        geo_status_lbl.add_css_class("dim-label");
+        panel.append(&geo_status_lbl);
+
+        let geo_grid = gtk4::Grid::builder()
+            .row_spacing(4).column_spacing(8)
+            .margin_start(12).margin_end(12).margin_top(4).margin_bottom(2)
+            .build();
+        let geo_lat_entry = gtk4::Entry::builder()
+            .hexpand(true).width_chars(8)
+            .placeholder_text("48.8581")
+            .tooltip_text("Latitude in decimal degrees, +N / -S")
+            .build();
+        let geo_lon_entry = gtk4::Entry::builder()
+            .hexpand(true).width_chars(8)
+            .placeholder_text("2.3525")
+            .tooltip_text("Longitude in decimal degrees, +E / -W")
+            .build();
+        let geo_alt_entry = gtk4::Entry::builder()
+            .hexpand(true).width_chars(8)
+            .placeholder_text("35.0")
+            .tooltip_text("Altitude in metres above sea level (negative when below)")
+            .build();
+        for (i, (key, entry)) in [
+            ("Latitude", &geo_lat_entry),
+            ("Longitude", &geo_lon_entry),
+            ("Altitude (m)", &geo_alt_entry),
+        ].iter().enumerate() {
+            geo_grid.attach(&mk_key(key), 0, i as i32, 1, 1);
+            geo_grid.attach(*entry, 1, i as i32, 1, 1);
+        }
+        panel.append(&geo_grid);
+
+        let geo_btns = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .margin_start(10).margin_end(10).margin_top(4).margin_bottom(6)
+            .build();
+        let geo_save_btn = gtk4::Button::builder()
+            .label("Save")
+            .tooltip_text("Save these coordinates onto the selected image")
+            .hexpand(true)
+            .build();
+        let geo_clear_btn = gtk4::Button::builder()
+            .label("Clear")
+            .tooltip_text("Remove the coordinates from the selected image")
+            .hexpand(true)
+            .build();
+        geo_btns.append(&geo_save_btn);
+        geo_btns.append(&geo_clear_btn);
+        panel.append(&geo_btns);
+
         // ── Tags section ──────────────────────────────────────────────────
         let tags_header = gtk4::Label::builder()
             .label("Tags")
@@ -2871,11 +2944,104 @@ impl MetadataPanel {
             }
         }
 
+        // ── Geotagging commit (u2) ────────────────────────────────────────
+        // Explicit Save — or Enter in any of the three fields — writes the
+        // entries onto the image selected RIGHT NOW. The target is read from
+        // ctx at click time, like the add-tag handler: there is no
+        // focus-enter snapshot because there is no focus-out commit to race
+        // with selection changes. Single image only (deliberate deviation
+        // from the metadata editor's fan-out): stamping one fix onto a whole
+        // multi-selection would claim many photos were taken in one place.
+        let geo_commit = {
+            let ctx = ctx.clone();
+            let notify = on_notify.clone();
+            let lat_e = geo_lat_entry.clone();
+            let lon_e = geo_lon_entry.clone();
+            let alt_e = geo_alt_entry.clone();
+            let status = geo_status_lbl.clone();
+            std::rc::Rc::new(move || {
+                let (path, db) = ctx.borrow().clone();
+                if path.is_empty() || db.is_empty() {
+                    return;
+                }
+                let parsed = [
+                    ("latitude", parse_geo_field(&lat_e.text(), GeoAxis::Latitude)),
+                    ("longitude", parse_geo_field(&lon_e.text(), GeoAxis::Longitude)),
+                    ("altitude", parse_geo_field(&alt_e.text(), GeoAxis::Altitude)),
+                ];
+                let mut bad = Vec::new();
+                let mut vals = [None, None, None];
+                for (i, (name, r)) in parsed.into_iter().enumerate() {
+                    match r {
+                        Ok(v) => vals[i] = v,
+                        Err(_) => bad.push(name),
+                    }
+                }
+                if !bad.is_empty() {
+                    if let Some(n) = notify.borrow().as_ref() {
+                        n(format!(
+                            "Could not save coordinates — invalid {}: use decimal numbers",
+                            bad.join(", ")
+                        ));
+                    }
+                    return;
+                }
+                if !save_geo(&path, &db, vals[0], vals[1], vals[2]) {
+                    if let Some(n) = notify.borrow().as_ref() {
+                        n("Could not save coordinates".into());
+                    }
+                    return;
+                }
+                // Success is silent (the metadata editor's contract) — the
+                // repainted entries and status line are the confirmation.
+                // Re-normalise the entries so "48.858100" reads "48.8581".
+                // Focus is intentionally not preserved here: this only runs
+                // on explicit commit (Save/Enter), unlike update().
+                lat_e.set_text(&format_geo_num(vals[0]));
+                lon_e.set_text(&format_geo_num(vals[1]));
+                alt_e.set_text(&format_geo_num(vals[2]));
+                status.set_text(&format_geo_status(vals[0], vals[1], vals[2]));
+            })
+        };
+        {
+            let commit = geo_commit.clone();
+            geo_save_btn.connect_clicked(move |_| commit());
+        }
+        for entry in [&geo_lat_entry, &geo_lon_entry, &geo_alt_entry] {
+            let commit = geo_commit.clone();
+            entry.connect_activate(move |_| commit());
+        }
+        {
+            let ctx = ctx.clone();
+            let notify = on_notify.clone();
+            let lat_e = geo_lat_entry.clone();
+            let lon_e = geo_lon_entry.clone();
+            let alt_e = geo_alt_entry.clone();
+            let status = geo_status_lbl.clone();
+            geo_clear_btn.connect_clicked(move |_| {
+                let (path, db) = ctx.borrow().clone();
+                if path.is_empty() || db.is_empty() {
+                    return;
+                }
+                if !save_geo(&path, &db, None, None, None) {
+                    if let Some(n) = notify.borrow().as_ref() {
+                        n("Could not clear coordinates".into());
+                    }
+                    return;
+                }
+                lat_e.set_text("");
+                lon_e.set_text("");
+                alt_e.set_text("");
+                status.set_text(&format_geo_status(None, None, None));
+            });
+        }
+
         Self { widget: panel, styles_list, style_save_btn, style_apply_btn,
                style_delete_btn,
                history_copy_btn, history_paste_btn, history_discard_btn,
                history_lbl, history_clipboard,
                meta_entries, meta_targets, on_notify, meta_scope_lbl,
+               geo_lat_entry, geo_lon_entry, geo_alt_entry, geo_status_lbl,
                styles_wired: std::rc::Rc::new(std::cell::Cell::new(false)),
                filename_lbl, folder_lbl, dims_lbl, size_lbl,
                camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
@@ -3050,6 +3216,25 @@ impl MetadataPanel {
                 self.meta_scope_lbl.set_visible(true);
             }
             None => self.meta_scope_lbl.set_visible(false),
+        }
+
+        // Geotagging section: repaint the fix for THIS image. The selection
+        // change is this section's only refresh hook (the observer bus drives
+        // update() — same as the metadata editor, no separate subscription).
+        // An entry holding focus keeps the user's in-progress typing — Save or
+        // Enter commits it explicitly — while unfocused entries repaint from
+        // the catalog, so arrow-keying through images never shows a stale fix.
+        let (geo_lat, geo_lon, geo_alt) = load_geo(full_path, db_path);
+        self.geo_status_lbl
+            .set_text(&format_geo_status(geo_lat, geo_lon, geo_alt));
+        if !self.geo_lat_entry.has_focus() {
+            self.geo_lat_entry.set_text(&format_geo_num(geo_lat));
+        }
+        if !self.geo_lon_entry.has_focus() {
+            self.geo_lon_entry.set_text(&format_geo_num(geo_lon));
+        }
+        if !self.geo_alt_entry.has_focus() {
+            self.geo_alt_entry.set_text(&format_geo_num(geo_alt));
         }
 
         // NOTE: the styles list is deliberately NOT refreshed here. It is
@@ -3233,6 +3418,70 @@ fn detach_tag_from_image(full_path: &str, db_path: &str, tag_id: u32) {
     if let Err(e) = c41_db::tags::tag_detach(&conn, tag_id, imgid) {
         eprintln!("darkroom: tag detach failed: {e}");
     }
+}
+
+/// Read the image's geotagging triple as `(latitude, longitude, altitude)`.
+///
+/// Best-effort display read, mirroring `load_tags`: an empty db path, an
+/// uncatalogued image, or a catalog predating the geo migration all yield
+/// all-`None` (the section then shows "no coordinates"), with structural
+/// faults logged. Session-only open: this fires on every selection change, so
+/// it skips the durable-schema DDL bootstrapped once at startup.
+fn load_geo(
+    full_path: &str,
+    db_path: &str,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if db_path.is_empty() {
+        return (None, None, None);
+    }
+    let conn = match c41_db::schema::open_catalog_session(db_path) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("darkroom: cannot open library db to load geo: {e}"); return (None, None, None); }
+    };
+    let imgid = match c41_db::image::image_get_id_by_path(&conn, full_path) {
+        Ok(Some(id)) => id,
+        Ok(None) => return (None, None, None),
+        Err(e) => { eprintln!("darkroom: image lookup failed on load geo: {e}"); return (None, None, None); }
+    };
+    match c41_db::image::image_get_geo(&conn, imgid) {
+        Ok(g) => g,
+        Err(e) => { eprintln!("darkroom: cannot read geo fix: {e}"); (None, None, None) }
+    }
+}
+
+/// Write the image's geotagging triple straight onto its `main.images` row.
+///
+/// `false` when there is nothing to write to (no db, image not catalogued) or
+/// the write failed — the caller toasts either way instead of pretending the
+/// Save landed. Full `open_catalog`: a rare write self-heals the durable
+/// schema (vs the session opener the read-hot paths use); see
+/// `add_tag_to_image`. The imgid resolves via the same folder+filename join
+/// the metadata editor uses (`persist::imgid_for_path`), through the public
+/// `image_get_id_by_path` this file already reads selections with.
+fn save_geo(
+    full_path: &str,
+    db_path: &str,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    altitude: Option<f64>,
+) -> bool {
+    if db_path.is_empty() {
+        return false;
+    }
+    let conn = match c41_db::schema::open_catalog(db_path) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("darkroom: cannot open library db to save geo: {e}"); return false; }
+    };
+    let imgid = match c41_db::image::image_get_id_by_path(&conn, full_path) {
+        Ok(Some(id)) => id,
+        Ok(None) => return false,
+        Err(e) => { eprintln!("darkroom: image lookup failed on save geo: {e}"); return false; }
+    };
+    if let Err(e) = c41_db::image::image_set_geo(&conn, imgid, latitude, longitude, altitude) {
+        eprintln!("darkroom: geo save failed: {e}");
+        return false;
+    }
+    true
 }
 
 /// Create the tag if needed and attach it to the image at `full_path`
@@ -3470,6 +3719,81 @@ pub(crate) fn format_opt(v: Option<&str>) -> String {
     }
 }
 
+/// One geotagging coordinate as a trimmed decimal (`48.8581`, not
+/// `48.858100`), or blank for the entries when there is no fix. A blank
+/// (rather than the em dash) keeps the entries honestly empty: an empty entry
+/// parses back to NULL, while a dash would not round-trip. Pure.
+pub(crate) fn format_geo_num(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x.is_finite() => {
+            let t = format!("{x:.6}");
+            t.trim_end_matches('0').trim_end_matches('.').to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// The Geotagging status line: `no coordinates` when the image carries no fix
+/// at all, otherwise the labelled triple. A half-known fix still shows, with
+/// the unknown side as the em dash — dropping the whole line for one missing
+/// axis would hide the axes that ARE known. Pure.
+pub(crate) fn format_geo_status(
+    lat: Option<f64>,
+    lon: Option<f64>,
+    alt: Option<f64>,
+) -> String {
+    if lat.is_none() && lon.is_none() && alt.is_none() {
+        return "no coordinates".into();
+    }
+    let or_dash = |v: Option<f64>| {
+        let t = format_geo_num(v);
+        if t.is_empty() { NO_VALUE.into() } else { t }
+    };
+    // No " m" suffix when altitude is unknown — "alt — m" reads as if metres
+    // of something were measured.
+    let alt_txt = match alt {
+        Some(_) => format!("alt {} m", or_dash(alt)),
+        None => format!("alt {}", NO_VALUE),
+    };
+    format!("lat {}, lon {}, {}", or_dash(lat), or_dash(lon), alt_txt)
+}
+
+/// Parse one geotagging entry: blank means NULL (unknown / being cleared), a
+/// finite in-range decimal means that fix, anything else is an error the
+/// caller toasts about. Never invents a value for garbage — the write is
+/// refused instead. Ranges are the geographic ones (latitude ±90, longitude
+/// ±180; altitude any finite value — the plausible band is far wider than any
+/// photo location, so only non-finite input is refused there). Pure.
+pub(crate) fn parse_geo_field(text: &str, axis: GeoAxis) -> Result<Option<f64>, ()> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match t.parse::<f64>() {
+        Ok(v) if v.is_finite() && axis.contains(v) => Ok(Some(v)),
+        _ => Err(()),
+    }
+}
+
+/// Which geographic axis an entry edits — drives the accepted range in
+/// [`parse_geo_field`]. Pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeoAxis {
+    Latitude,
+    Longitude,
+    Altitude,
+}
+
+impl GeoAxis {
+    fn contains(self, v: f64) -> bool {
+        match self {
+            GeoAxis::Latitude => (-90.0..=90.0).contains(&v),
+            GeoAxis::Longitude => (-180.0..=180.0).contains(&v),
+            GeoAxis::Altitude => true, // finiteness already checked by the caller
+        }
+    }
+}
+
 // (`query_dims` was retired in m4-100: dimensions now ride along with the rest of
 // the EXIF row in `query_exif`'s single query, instead of opening their own
 // connection for two columns.)
@@ -3478,6 +3802,66 @@ fn format_bytes(n: u64) -> String {
     if n < 1024 { format!("{n} B") }
     else if n < 1024 * 1024 { format!("{:.1} KB", n as f64 / 1024.0) }
     else { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) }
+}
+
+#[cfg(test)]
+mod geo_tests {
+    use super::*;
+
+    #[test]
+    fn geo_numbers_trim_but_never_invent() {
+        assert_eq!(format_geo_num(Some(48.8581)), "48.8581");
+        assert_eq!(format_geo_num(Some(35.0)), "35");
+        assert_eq!(format_geo_num(Some(-33.85)), "-33.85");
+        // Blank round-trips to NULL through parse_geo_field.
+        assert_eq!(format_geo_num(None), "");
+        assert_eq!(format_geo_num(Some(f64::NAN)), "");
+        assert_eq!(format_geo_num(Some(f64::INFINITY)), "");
+        assert_eq!(parse_geo_field(&format_geo_num(None), GeoAxis::Latitude), Ok(None));
+    }
+
+    #[test]
+    fn geo_status_names_the_fix_or_its_absence() {
+        assert_eq!(
+            format_geo_status(None, None, None),
+            "no coordinates"
+        );
+        assert_eq!(
+            format_geo_status(Some(48.8581), Some(2.3525), Some(35.0)),
+            "lat 48.8581, lon 2.3525, alt 35 m"
+        );
+        // A half-known fix still shows the known axes; the unknown side is a
+        // dash, not a silent drop of the whole line (and no dangling unit).
+        assert_eq!(
+            format_geo_status(Some(48.8581), None, None),
+            format!("lat 48.8581, lon {NO_VALUE}, alt {NO_VALUE}")
+        );
+    }
+
+    #[test]
+    fn geo_fields_parse_blank_as_null_and_reject_garbage() {
+        use GeoAxis::{Altitude, Latitude, Longitude};
+        assert_eq!(parse_geo_field("", Latitude), Ok(None));
+        assert_eq!(parse_geo_field("   ", Longitude), Ok(None));
+        assert_eq!(parse_geo_field("48.8581", Latitude), Ok(Some(48.8581)));
+        assert_eq!(parse_geo_field(" -33.85 ", Latitude), Ok(Some(-33.85)));
+        assert_eq!(parse_geo_field("48,8581", Latitude), Err(()));
+        assert_eq!(parse_geo_field("north", Longitude), Err(()));
+        assert_eq!(parse_geo_field("NaN", Latitude), Err(()));
+        assert_eq!(parse_geo_field("inf", Altitude), Err(()));
+        // Geographic ranges: out-of-range input is refused, not stored.
+        assert_eq!(parse_geo_field("90", Latitude), Ok(Some(90.0)));
+        assert_eq!(parse_geo_field("-90", Latitude), Ok(Some(-90.0)));
+        assert_eq!(parse_geo_field("90.0001", Latitude), Err(()));
+        assert_eq!(parse_geo_field("999", Latitude), Err(()));
+        assert_eq!(parse_geo_field("180", Longitude), Ok(Some(180.0)));
+        assert_eq!(parse_geo_field("-180.0001", Longitude), Err(()));
+        assert_eq!(parse_geo_field("200", Longitude), Err(()));
+        // Altitude accepts any finite value (photo locations span a wider
+        // band than any sane bound); only non-finite input is refused.
+        assert_eq!(parse_geo_field("-430", Altitude), Ok(Some(-430.0)));
+        assert_eq!(parse_geo_field("8848", Altitude), Ok(Some(8848.0)));
+    }
 }
 
 #[cfg(test)]

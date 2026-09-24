@@ -604,6 +604,9 @@ fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
             aperture: meta.aperture,
             iso: meta.iso,
             focal_length: meta.focal_length,
+            latitude: meta.latitude,
+            longitude: meta.longitude,
+            altitude: meta.altitude,
         };
         match image::image_insert(&conn, film_id, filename, *w, *h, exif) {
             Ok(_) => count += 1,

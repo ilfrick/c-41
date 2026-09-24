@@ -64,17 +64,25 @@ pub fn ensure_base_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// The four numeric EXIF columns darktable's collection rules filter on
-/// (m4-135). `CREATE TABLE IF NOT EXISTS` can't widen a table an older C-41 or
-/// C-app database already created, so these are idempotent `ADD COLUMN`s: each
-/// runs only when `pragma_table_info` says it's missing. Nullable throughout —
-/// existing rows and unprobed imports keep NULL, which numeric rules treat as
-/// not-matching (see `c41-ui`'s `rule_stack`).
+/// (m4-135) plus the three geotagging columns darktable keeps on the same row
+/// (u2, parity 2.7 leg): `longitude` / `latitude` / `altitude`, all REAL, in
+/// darktable's exact column names and shapes (`src/common/database.c`, the
+/// `main.images` ADD COLUMN block and the v10->v11 `altitude` migration), so
+/// the C app and the Rust UI share the catalogue. `CREATE TABLE IF NOT EXISTS`
+/// can't widen a table an older C-41 or C-app database already created, so
+/// these are idempotent `ADD COLUMN`s: each runs only when `pragma_table_info`
+/// says it's missing. Nullable throughout — existing rows and unprobed imports
+/// keep NULL, which numeric rules treat as not-matching (see `c41-ui`'s
+/// `rule_stack`).
 fn ensure_exif_columns(conn: &Connection) -> rusqlite::Result<()> {
     for (name, decl) in [
         ("exposure", "exposure REAL"),
         ("aperture", "aperture REAL"),
         ("iso", "iso REAL"),
         ("focal_length", "focal_length REAL"),
+        ("longitude", "longitude REAL"),
+        ("latitude", "latitude REAL"),
+        ("altitude", "altitude REAL"),
     ] {
         let have = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('images') WHERE name = ?1",
@@ -207,6 +215,40 @@ mod tests {
         let img = image::image_insert(&conn, film_id, "IMG_0001.dng", 4000, 3000,
                             image::ImageExif::default()).unwrap();
         assert!(img > 0);
+        assert_eq!(image::image_count_all(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn geo_columns_arrive_nullable_and_keep_existing_nulls() {
+        // darktable's exact column names/shapes (src/common/database.c):
+        // longitude REAL, latitude REAL, altitude REAL — nullable, so
+        // pre-migration rows stay NULL rather than gaining an invented fix.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_base_schema(&conn).unwrap();
+        let film_id = film::film_new(&conn, "/photos/a").unwrap().unwrap();
+        let id = image::image_insert(&conn, film_id, "IMG_0001.dng", 100, 100,
+                            image::ImageExif::default()).unwrap();
+        let cols: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT name, type FROM pragma_table_info('images') \
+                 WHERE name IN ('longitude', 'latitude', 'altitude') ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            cols,
+            vec![
+                ("altitude".to_string(), "REAL".to_string()),
+                ("latitude".to_string(), "REAL".to_string()),
+                ("longitude".to_string(), "REAL".to_string()),
+            ]
+        );
+        assert_eq!(image::image_get_geo(&conn, id).unwrap(), (None, None, None));
+        // Second bootstrap is a no-op (idempotent ADD COLUMN, rows preserved).
+        ensure_base_schema(&conn).unwrap();
         assert_eq!(image::image_count_all(&conn).unwrap(), 1);
     }
 

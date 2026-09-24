@@ -6585,3 +6585,44 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run on this commit — correctly path-filtered
 out (u1 touches no C code; the changed-C compile bar is N/A). Both remotes
 (`origin` GitHub + Gitea) verified at `d6b5af713e`.
+
+### u2 — geotagging foundation (2026-09-24 UTC)
+
+**What.** Geotagging leg of PARITY_AUDIT 2.7: per-image GPS fix persisted
+and editable across four layers — `c41-core/src/exif.rs` (`ExifMeta` gains
+`latitude/longitude/altitude`, probe reads the six GPS tags: DMS triple +
+N/S/E/W ref → decimal, altitude signed by ref byte, missing/incomplete →
+None, never invented), `c41-db/src/image.rs` (`ImageExif` + `image_insert`
+params ?9-?11, new `image_get_geo`/`image_set_geo`), `c41-db/src/schema.rs`
+(idempotent migration adding darktable-named nullable
+`longitude/latitude/altitude REAL`, same path covers fresh DBs),
+`dialogs/mod.rs` import pass-through, and a "Geotagging" right-panel
+section after the Metadata editor (status line, three numeric entries +
+Save/Clear, single selected image only — one fix stamped onto N images
+would fabricate positions). Out of scope: map widget, GPX import,
+batch-apply, neural restore (needs an ONNX-runtime dependency decision).
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — verified cold. GPS formula/div-zero/NUL-ref/
+unsigned-DMS/spec-matched altitude, schema names + fresh-DB coverage,
+insert param order, DAO get/set (no lat/lon swap), import plumbing, UI
+imgid/refresh/toast discipline, no `unwrap` in production lines, tests pin
+real values (Paris 48.8581/2.3525), scope clean. All findings fixed
+in-session: (1) MINOR — no range validation → `parse_geo_field` now takes
+`GeoAxis` (lat ±90, lon ±180, alt any-finite) with boundary tests;
+(2) MINOR — SHORT-typed altitude ref now also negates on 1 (lenient,
+spec-BYTE-first); (3) three NITs (dangling " m" on unknown alt, misleading
+test name, focus comment). Post-fix gate caught ONE real test bug the
+review missed: the new roundtrip test's ALTER batch omitted the four
+pre-existing EXIF columns so `image_insert` failed loudly — fixed by
+adding them (which also proves the coupling the test documents).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero new
+warnings (no diagnostics in any u2 range; the two nearby hits are
+pre-existing context lines). `git diff --check` clean; no `/*`/`*/` in
+added lines. Release suites: `c41-core` 1682 passed (1676 existing + 6
+new), `c41-db` 95 passed (92 + 3 new), `c41-ui` 412 passed (409 + 3 new),
+0 failed. PARITY_AUDIT.md 2.7 updated in the same commit (geotagging
+landed; neural restore open).
+Remote CI confirmation follows commit/push per workflow.
