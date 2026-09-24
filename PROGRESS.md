@@ -6820,4 +6820,11 @@ clean; no `/*`/`*/` in added lines. Release suites: `c41-core` 1691
 passed, `c41-db` 97, `c41-ui` 452 passed, 0 failed. PARITY_AUDIT.md 3.4
 updated in the same commit (tethering closed; neural restore still
 BLOCKED).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI: the u6 commit's `check + test + clippy` FAILED remotely while
+the local gate was green — `rust.yml` installs its own apt list and it
+lacked `libgphoto2-dev` (link failure; remote logs are 403 to this
+account so the cause was diagnosed by reading the workflow file, not the
+log). Follow-up commit `1ec6dd4dda` adds it (2-line diff); remote CI on
+the fixup is green (`check + test + clippy` + Docker `success`;
+matrix/full-c skipped; CMake path-filtered — no C touched). Both remotes
+(`origin` GitHub + Gitea) verified at `1ec6dd4dda`.
