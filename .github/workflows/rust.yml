@@ -32,7 +32,8 @@ jobs:
       # packages cargo can't even type-check the workspace. Cairo / pango /
       # gdk-pixbuf / graphene cover the transitive crates; clang/libclang are
       # for any future bindgen consumer. c41-sys links liblensfun (m4-130);
-      # the -data package feeds its probe test. NOTE: unlike Docker RUN
+      # the -data package feeds its probe test. c41-sys also links libgphoto2
+      # (tethered capture, u6). NOTE: unlike Docker RUN
       # instructions, Actions passes this script verbatim to bash, which does
       # NOT strip `#` lines inside backslash continuations — comments must
       # stay outside the continued command.
@@ -44,7 +45,7 @@ jobs:
             libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
             libsqlite3-dev libssl-dev zlib1g-dev libclang-dev clang \
             libfontconfig-dev libfreetype-dev pkg-config \
-            liblensfun-dev liblensfun-data-v1
+            liblensfun-dev liblensfun-data-v1 libgphoto2-dev
 
       - name: Install Rust toolchain
         run: |
