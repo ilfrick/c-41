@@ -13,6 +13,7 @@ anyhow       = "1"
 rayon        = "1"
 rusqlite     = { version = "0.31", features = ["bundled"] }
 tracing      = "0.1"
+ureq         = "3"
 walkdir      = "2"
 c41-sys  = { path = "crates/c41-sys" }
 c41-core = { path = "crates/c41-core" }

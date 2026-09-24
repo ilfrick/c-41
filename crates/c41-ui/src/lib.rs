@@ -27,6 +27,7 @@ pub mod raw_preview;
 pub mod snapshots;
 pub mod stylemodules;
 pub mod tether;
+pub mod tiles;
 pub mod xmp;
 
 pub const APP_ID:        &str = "org.c41.C41";

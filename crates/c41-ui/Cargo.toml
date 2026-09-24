@@ -21,3 +21,7 @@ image         = { version = "0.25", default-features = false, features = ["png",
 # XMP sidecar writing (m4-142): event-stream XML reader/writer for merge-preserving
 # updates of darktable-compatible sidecars next to image files.
 quick-xml     = "0.38"
+# Slippy-map tile fetches (u5): blocking HTTPS client used exclusively inside
+# `gio::spawn_blocking`. Pure-Rust rustls TLS, no system library, so the
+# shipping image needs no change.
+ureq          = { workspace = true }

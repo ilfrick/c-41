@@ -6716,3 +6716,57 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u4
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `558c3f44dd`.
+
+### u5 — slippy-map tile canvas (2026-09-24 UTC)
+
+**What.** Map leg of PARITY_AUDIT 3.4 closed (canvas): custom slippy-map
+renderer on the Map page — new `crates/c41-ui/src/tiles.rs` (Web-Mercator
+math, tile cache, blocking fetch+decode, 19 headless tests) + canvas
+section in `map.rs` (integer zoom 0–19 with wheel steps, drag-pan,
+placeholders + post-paint spawn, one 300 ms retry timer per frame,
+clickable markers routing the page's existing opener, always-visible OSM
+attribution) above the untouched list. Tile policy enforced at one funnel
+each: UA `c41-darkroom/<version>` on every request, zoom/host/shape
+normalisation (no invalid URL constructible), ≤4 concurrent fetches,
+256-entry memory LRU, 128 MiB disk store (`$XDG_CACHE_HOME/c41/tiles`,
+atomic tmp+rename, startup prune, `C41_TILE_CACHE_DIR` override),
+session-only negative cache, 4 MiB body + 1024px decode caps, corrupt
+entries deleted for network heal. New dep `ureq = "3"` (workspace +
+c41-ui; pure-Rust rustls TLS — no system lib, no Docker change;
+`Cargo.lock` already carried ureq 3.4.2 with the edge, verified
+unmodified). PNG decode via the vendored `image` crate.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE** — verified cold (tile math hand-derived incl. hemisphere
+direction, URL totality, ureq chain method-for-method against vendored
+3.4.2 sources, bounded caches, threading, canvas, lat/lon order end to
+end with a Paris/London centre recompute, attribution, antimeridian
+shape, 4 spot-checked tests, scope, policy funnels). Findings, all fixed
+or dispositioned in-session: (1) REAL BUG the review mis-called
+harmless — `(y0, y0.min(y1).max(y0))` is identically `(y0, y0)`,
+collapsing every viewport to ONE tile row (reviewer claimed it equalled
+`(y0, y1)`); fixed to `(y0, y1.max(y0))` mirroring the x-form, plus a
+tall-viewport multi-row regression test that fails on the old code;
+(2) REAL `!Send` defect the review waved through — `FetchedTile { pix:
+Pixbuf }` cannot cross `spawn_blocking` (gtk Pixbuf is !Send despite the
+atomic refcount); restructured to raw RGB+dims across the boundary with
+`tile_pixbuf()` built on the GTK loop at completion; (3) REAL ureq API
+bug caught pre-gate by source check — `body_mut()` does not exist in
+3.4.2, fixed to `into_body()`; (4) doc bound corrected (1024px cap ⇒
+768 MB theoretical, OSM-typical ~50 MB); (5) five clippy lints fixed
+(`neg_cmp` ×3 with NaN-preserving rewrites, `type_complexity` alias,
+`ok()`→`if let Ok`, `RangeInclusive::contains` ×2); (6) `let mut resp`
+→ `let resp`; (7) tmp-orphan NIT analyzed and DECLINED (narrow `.png`
+filter means orphans are budget-counted and swept, not leaked — renaming
+extensionless would hide them forever). Post-fix gate caught the
+Pixbuf-`Send` errors the review missed entirely. Untracked
+`install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `tiles.rs`/`map.rs` new code post-fix. `git diff --check`
+clean; no `/*`/`*/` in added lines. Release suites: `c41-core` 1682 and
+`c41-db` 97 unchanged, `c41-ui` 448 passed (428 + 20 new: 19 tiles + 1
+markers), 0 failed. PARITY_AUDIT.md 3.4 updated in the same commit (map
+leg closed; live capture still BLOCKED).
+Remote CI confirmation follows commit/push per workflow.
