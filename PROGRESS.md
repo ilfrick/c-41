@@ -6769,4 +6769,8 @@ clean; no `/*`/`*/` in added lines. Release suites: `c41-core` 1682 and
 `c41-db` 97 unchanged, `c41-ui` 448 passed (428 + 20 new: 19 tiles + 1
 markers), 0 failed. PARITY_AUDIT.md 3.4 updated in the same commit (map
 leg closed; live capture still BLOCKED).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `ca9d9b5fe6` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u5
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`ca9d9b5fe6`.
