@@ -10,11 +10,16 @@ members = [
 
 [workspace.dependencies]
 anyhow       = "1"
+ort          = "2.0.0-rc"
 rayon        = "1"
 rusqlite     = { version = "0.31", features = ["bundled"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+sha2         = "0.10"
 tracing      = "0.1"
 ureq         = "3"
 walkdir      = "2"
+zip          = "2"
 c41-sys  = { path = "crates/c41-sys" }
 c41-core = { path = "crates/c41-core" }
 c41-db   = { path = "crates/c41-db" }

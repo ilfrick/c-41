@@ -12,7 +12,13 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 c41-sys = { workspace = true }
 anyhow       = { workspace = true }
+ort          = { workspace = true }
 rayon        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+sha2         = { workspace = true }
+ureq         = { workspace = true }
+zip          = { workspace = true }
 # Pinned exactly: Cargo.lock is gitignored (CI resolves fresh), and a silent
 # minor bump in the raw decoder must not change how irreplaceable raws decode.
 rawloader    = "=0.37.1"

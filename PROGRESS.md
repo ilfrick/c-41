@@ -6828,3 +6828,43 @@ log). Follow-up commit `1ec6dd4dda` adds it (2-line diff); remote CI on
 the fixup is green (`check + test + clippy` + Docker `success`;
 matrix/full-c skipped; CMake path-filtered — no C touched). Both remotes
 (`origin` GitHub + Gitea) verified at `1ec6dd4dda`.
+
+### u7a — AI model infrastructure (2026-09-24 UTC)
+
+**What.** Neural-restore leg of PARITY_AUDIT 2.7, infra slice (no
+inference, no UI — u7b builds the denoise task on this): `ort` linkage
+(CPU-only default) + model registry (GitHub releases API at
+`darktable-org/darktable-ai`, task-prefix routing `denoise-/rawdenoise-/
+upscale-/mask-`, `versions.json` excluded, digest-required-before-download)
++ streaming downloader (byte-progress callback, sha256-verify-or-delete,
+atomic tmp+rename store under `$XDG_DATA_HOME/c41/models`, skip-if-hashed)
++ `.dtmodel` handling (zip list/extract with traversal guard, `config.json`
+manifest parse, per-variant `.onnx` extract) in new
+`c41-core/src/ai/` (`mod.rs`, `registry.rs`, `download.rs`,
+`package.rs`, 25 headless tests). New deps, all pure Rust (no system
+libs, no Docker changes): `ort = "2.0.0-rc"`, `serde`+derive,
+`serde_json`, `sha2`, `zip` defaults, `ureq` (already in tree).
+(`Cargo.lock` is gitignored — no lock diff.)
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**BLOCK** — one load-bearing defect: `parse_manifest` stored flat dotted
+keys, but the C `_attribute_node` (`src/ai/backend_common.c:538-578`,
+confirmed in-source by the main session) descends NESTED objects, so every
+real multi-model pack would miss. Fixed in-session by flattening nested
+objects to dotted paths on load (literal flat keys still land; nested
+wins on collision — what C reads), plus a nested-shape fixture test using
+the reviewer's exact failing input and a legacy/collision test. Also
+fixed: (M1) env-mutating test race via a static `ENV_LOCK` held by both
+readers; (M2) untrusted-zip-header `with_capacity` → plain `Vec::new` at
+both read sites. Verified N1–N5 need no action (component-walk traversal
+guard is strictly safer than C's substring reject; tmp scheme fine).
+Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests incl. `ort` binary download at build time, `c41-rs`
+link). All-targets Clippy: zero diagnostics in `ai/` files. `git diff
+--check` clean; no `/*`/`*/` in added lines. Release suites: `c41-core`
+1716 passed (1691 + 25 new), others unchanged (db 97, ui 452), 0 failed.
+PARITY_AUDIT.md 2.7 updated in the same commit (infra landed; inference +
+panel = u7b).
+Remote CI confirmation follows commit/push per workflow.
