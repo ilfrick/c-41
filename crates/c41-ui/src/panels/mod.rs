@@ -2811,6 +2811,18 @@ impl MetadataPanel {
         map_btn.set_action_name(Some("win.open-map"));
         panel.append(&map_btn);
 
+        // Tether entry point, beside Map: same one-action pattern (the
+        // `win.open-tether` implementation lives with the other window
+        // actions in lib.rs). Watch-folder auto-import only — live capture
+        // needs libgphoto2, which this build does not ship.
+        let tether_btn = gtk4::Button::builder()
+            .label("Tether…")
+            .tooltip_text("Watch a folder for new images")
+            .margin_start(10).margin_end(10).margin_top(2).margin_bottom(8)
+            .build();
+        tether_btn.set_action_name(Some("win.open-tether"));
+        panel.append(&tether_btn);
+
         // Commit a metadata field on Enter or on losing focus.
         //
         // Two guards, both taken from upstream, because either alone is not enough:

@@ -490,7 +490,7 @@ fn render_nonraw_export(
 
 // ── Import folder dialog ──────────────────────────────────────────────────
 
-const RAW_EXTENSIONS: &[&str] = &[
+pub(crate) const RAW_EXTENSIONS: &[&str] = &[
     "cr2", "cr3", "nef", "nrw", "arw", "rw2", "orf", "pef", "raf",
     "dng", "raw", "rwl", "srw", "x3f", "jpg", "jpeg", "tiff", "tif",
     "png", "heic", "heif", "avif",
@@ -543,7 +543,7 @@ pub fn show_import_dialog(
 
 /// Walk `folder` recursively, create a film roll in the DB, and insert each
 /// found image file. Returns the number of newly registered images.
-fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
+pub(crate) fn import_folder_sync(folder: &str, db_path: &str) -> Option<usize> {
     use c41_db::film;
     use c41_db::image;
 

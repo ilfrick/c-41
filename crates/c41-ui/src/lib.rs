@@ -26,6 +26,7 @@ pub mod print;
 pub mod raw_preview;
 pub mod snapshots;
 pub mod stylemodules;
+pub mod tether;
 pub mod xmp;
 
 pub const APP_ID:        &str = "org.c41.C41";
@@ -1839,6 +1840,32 @@ fn build_main_window(app: &Application) {
             map_nav.push(&crate::map::map_page(map_db.clone(), map_open.clone()));
         });
         window.add_action(&map_act);
+
+        // win.open-tether — pushes the tethering shell (watch-folder
+        // auto-import; no live capture in this build). Never a no-op on
+        // content: with no watch folder chosen the page opens anyway and says
+        // so, mirroring `win.open-map` (same guards — i.e. none: no selection
+        // is needed, so the page always pushes). The tag is slash-free
+        // (`crate::tether::TETHER_PAGE_TAG`), so the `popped` cell re-sync
+        // above ignores it — the same contract as the print and map pages.
+        // Auto-imports reload the grid through the same on_done the import
+        // dialog's callers pass (clear highlights, drop the tag filter, reload).
+        let tether_nav = nav.clone();
+        let tether_db = db_path.clone();
+        let tether_act = gtk4::gio::SimpleAction::new("open-tether", None);
+        tether_act.connect_activate(clone!(@weak lt_model => move |_, _| {
+            let db_inner = tether_db.clone();
+            let lp_inner = left.clone();
+            let at_inner = active_tag.clone();
+            let lm_inner = lt_model.clone();
+            let on_done: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+                lp_inner.clear_filter_highlights();
+                *at_inner.borrow_mut() = None;
+                lighttable::lighttable_load_from_db(&lm_inner, &db_inner);
+            });
+            tether_nav.push(&crate::tether::tether_page(tether_db.clone(), on_done));
+        }));
+        window.add_action(&tether_act);
     }
 
     // ── Wire toast overlay + present ───────────────────────────────────────

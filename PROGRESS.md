@@ -6671,3 +6671,44 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u3
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `3a73f6ba72`.
+
+### u4 — tethering shell + watch-folder auto-import (2026-09-24 UTC)
+
+**What.** Tethering leg of PARITY_AUDIT 3.4 (shell only — live capture
+stays BLOCKED: libgphoto2 absent from the shipping image, no Rust
+binding): a Tether page — new `crates/c41-ui/src/tether.rs` (`tether_page`
+tag `"tether"`, honest no-camera status line, watch-folder picker +
+Start/Stop + scan status), entry "Tether…" button + `win.open-tether`
+action, and two `pub(crate)` visibility widenings in `dialogs/mod.rs`
+(`RAW_EXTENSIONS`, `import_folder_sync` — reuse, don't reimplement).
+Watching = 5 s poll over the importer's exact extension list/depth,
+shared folder import off-thread, page-level known-set + busy guard, quiet
+scans skip the DB entirely, successful imports report the watcher's own
+fresh count and reload the grid through the import sites' exact on_done.
+Slippy-map tiles stay BLOCKED with live capture (both need new-dep
+decisions, recorded in the audit).
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — all three MAJORs fixed in-session: (1) status
+overcount (importer return counts whole-folder dedupe hits — now reports
+`fresh.len()`); (2) missing grid reload (no on_done — now threaded
+through, mirroring the import call sites); (3) `connect_unmap` killing
+watches on minimize (now a map/unmap pair: unmap parks the timer, map
+re-arms while watching — a popped page never maps again so no
+resurrection; verified no teardown-map path re-arms a dead page).
+Also fixed: module-doc dedupe model (film_new upserts — safer than
+documented), chooser callbacks downgraded to WeakRef, missing-folder
+"unavailable" status, folder walk moved off the tick thread, one
+constant-value test assertion. Post-fix gate caught closure-capture
+compile errors the review couldn't (WeakRef/Rc moves out of Fn closures
+— fixed with per-closure clones) plus one new `constant-value` clippy
+lint — all green now. Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `tether.rs` post-fix. `git diff --check` clean; no
+`/*`/`*/` in added lines. Release suites: `c41-core` 1682 unchanged,
+`c41-db` 97 unchanged, `c41-ui` 428 passed (418 + 10 new), 0 failed.
+PARITY_AUDIT.md 3.4 updated in the same commit (tethering shell landed;
+slippy-map + live capture BLOCKED).
+Remote CI confirmation follows commit/push per workflow.
