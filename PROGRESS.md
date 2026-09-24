@@ -6625,4 +6625,8 @@ added lines. Release suites: `c41-core` 1682 passed (1676 existing + 6
 new), `c41-db` 95 passed (92 + 3 new), `c41-ui` 412 passed (409 + 3 new),
 0 failed. PARITY_AUDIT.md 2.7 updated in the same commit (geotagging
 landed; neural restore open).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `b308cd51ee` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u2
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`b308cd51ee`.
