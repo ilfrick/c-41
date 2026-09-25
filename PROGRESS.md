@@ -6970,4 +6970,8 @@ diagnostics in `detail.rs`/`neural.rs`/`thumbs.rs` new ranges post-fix.
 `c41-core` 1741 passed (1733 + 8 new), `c41-db` 97 unchanged, `c41-ui`
 473 passed (461 + 12 new), 0 failed. PARITY_AUDIT.md 2.7 updated in the
 same commit (detail + split landed; raw/upscale still future).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `9505b919d6` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u7c
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`9505b919d6`.
