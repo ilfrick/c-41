@@ -6975,3 +6975,40 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u7c
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `9505b919d6`.
+
+### u7d — upscale task 2x/4x (2026-09-25 UTC)
+
+**What.** Upscale leg of PARITY_AUDIT 2.7: 2x/4x super-resolution end to
+end — `ai/infer.rs` gains a scaled tiled driver (`run_tiled_scaled`;
+`run_denoise_tiled` is now pure delegation, behavior identical) with
+O=16 for S>1, stem tile ladders (`model_x2`/`model_x4` first entry,
+top-level fallback, missing → refusal), `{1,3,T·S,T·S}` output checks,
+model-output-as-is + inverse gamma, input-sized noise map; new model
+entries (BSRGAN 124 MB, RealPLKSR 55 MB) + `upscale-*` store scan +
+prepare; panel gains task/scale pickers, per-task model lists, Run flows
+per task with scaled-dims TIFF (`_upscale-2x`/`_upscale-4x` suffixes,
+has_suffix skip, collision loop, past-9999 error), Strength parked for
+upscale with prior cache cleared. Raw denoise is the last open leg (u7e).
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — denoise preserved (pure delegation, pre-existing
+tests untouched), scaled math/naming/gating all match C (grid in input
+space, strips scaled, noise input-sized, suffix/collision/scale-picker
+semantics, cache-clearing safety choice). Findings fixed in-session:
+(1) MINOR stem-`[0]` fall-through → hard refusal like C (present stem
+array wins even when non-positive; new test pins it); (2) NIT
+`task_from_ui` default-arm doc corrected (C defaults to upscale, ours to
+denoise — unreachable, pinned, safer); (3) stale `variant_tile_size`
+doc reference updated. Post-fix gate caught what review couldn't: two
+new `doc-list-item` lints + one `unnecessary-clone-for-slice` in new
+test/doc code. Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `infer.rs`/`package.rs`/`neural.rs` u7d ranges post-fix.
+`git diff --check` clean; no `/*`/`*/` in added lines. Release suites:
+`c41-core` 1757 passed (1741 + 16 new: 15 upscale + 1 stem-zero),
+`c41-db` 97 unchanged, `c41-ui` 480 passed (473 + 7 new), 0 failed.
+PARITY_AUDIT.md 2.7 updated in the same commit (upscale landed; raw
+denoise last open).
+Remote CI confirmation follows commit/push per workflow.

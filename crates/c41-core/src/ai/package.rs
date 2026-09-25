@@ -173,20 +173,27 @@ pub fn top_level_tile_size(manifest: &PackageManifest) -> Option<i64> {
 /// `<stem>.input_sizes`, else first entry of top-level `input_sizes`
 /// (restore.c `_resolve_tile_size`). Non-integer entries do not count.
 pub fn variant_tile_size(manifest: &PackageManifest, stem: &str) -> Option<i64> {
-    for key in [format!("{stem}.input_sizes"), "input_sizes".to_string()] {
-        if let Some(first) = manifest
-            .attributes
-            .get(&key)
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-            .and_then(|n| n.as_i64())
-        {
-            if first > 0 {
-                return Some(first);
-            }
+    // Stem-first like `_resolve_tile_size`, INCLUDING its hard-error shape:
+    // when the stem array is present (non-empty), its first integer entry
+    // wins even when non-positive — the caller refuses those downstream,
+    // exactly like the C refusing `tile_size <= 0`. Only a missing/empty
+    // stem array falls through to the top-level key.
+    let stem_vals = manifest
+        .attributes
+        .get(&format!("{stem}.input_sizes"))
+        .and_then(|v| v.as_array());
+    if let Some(arr) = stem_vals {
+        if let Some(n) = arr.first().and_then(|n| n.as_i64()) {
+            return Some(n);
         }
     }
-    None
+    manifest
+        .attributes
+        .get("input_sizes")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|n| n.as_i64())
+        .filter(|t| *t > 0)
 }
 
 /// Payload filename for a variant stem: `<stem>.onnx` (restore.c `_load`).
@@ -427,6 +434,18 @@ mod tests {
         let zero = parse_manifest(r#"{"attributes":{"input_sizes":[0]}}"#).unwrap();
         assert_eq!(variant_tile_size(&zero, "s"), None);
         assert_eq!(variant_onnx_name("model_bayer"), "model_bayer.onnx");
+    }
+
+    #[test]
+    fn tile_size_stem_zero_is_a_hard_error_not_a_fallback() {
+        // A present stem array wins even when non-positive (C `_resolve_tile
+        // size` returns sizes[0] verbatim; the caller refuses tile_size<=0).
+        // Here the top-level 128 must NOT leak through the stem [0].
+        let m = parse_manifest(
+            r#"{"attributes": {"model_x2": {"input_sizes": [0]}, "input_sizes": [128]}}"#,
+        )
+        .unwrap();
+        assert_eq!(variant_tile_size(&m, "model_x2"), Some(0));
     }
 
     #[test]

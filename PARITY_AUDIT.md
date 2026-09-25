@@ -92,7 +92,12 @@ work). **Detail recovery + split landed 2026-09-25 (u7c):** wavelet
 texture restoration (`apply_detail_recovery` over the m4-79 DWT port) behind
 a Strength slider (0..100, re-blend without re-inference, same-TIFF
 overwrite with thumbnail eviction) plus a draggable before/after split
-preview. | low priority; listed for completeness |
+preview. **Upscale task landed 2026-09-25 (u7d):** 2x/4x super-resolution
+end to end — scaled tiled driver (O=16, `model_x2`/`model_x4` stem ladders,
+output-as-is + inverse gamma), BSRGAN/RealPLKSR download-on-demand,
+task+scale pickers, per-task model lists, `_upscale-2x`/`_upscale-4x` naming
+with has_suffix skip + collision loop, scaled-dims TIFF + import + reload.
+Raw denoise is the last open leg (u7e). | low priority; listed for completeness |
 
 ## Severity 3 — parity polish
 

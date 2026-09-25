@@ -1,12 +1,12 @@
-//! Neural restore panel (u7b + u7c): the "Neural restore" sidebar section
-//! that runs the RGB denoise task on the selected image.
+//! Neural restore panel (u7b + u7c + u7d): the "Neural restore" sidebar
+//! section that runs the RGB denoise and upscale tasks on the selected image.
 //!
 //! darktable's neural-restore lib (src/libs/neural_restore.c) drives the AI
 //! denoise/raw-denoise/upscale tasks from the lighttable. This panel covers
-//! **Denoise** plus its **Strength slider and before/after split preview**
-//! (u7c). Raw denoise and upscale are shown but greyed ("coming next" — they
-//! are separate tasks with their own CFA-style preprocessing and tile
-//! ladders, still future work).
+//! **Denoise** (u7b) plus its **Strength slider and before/after split
+//! preview** (u7c), and **Upscale 2x/4x** (u7d). Raw denoise is shown but
+//! greyed ("coming next" — a separate task with its own CFA-style
+//! preprocessing, still future work, u7e).
 //!
 //! The Run path mirrors the export flow: decode the source to linear RGBA,
 //! call [`c41_core::ai::infer::denoise_rgb`] (the tiled ORT run), encode the
@@ -67,7 +67,7 @@
 
 use adw::prelude::*;
 use c41_core::ai::detail::strength_to_alpha;
-use c41_core::ai::infer::{known_denoise_models, KnownModel};
+use c41_core::ai::infer::{known_denoise_models, known_upscale_models, KnownModel};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -85,9 +85,126 @@ pub const STRENGTH_DEBOUNCE: std::time::Duration = std::time::Duration::from_mil
 pub const PREVIEW_MAX_DIM: u32 = 480;
 /// The picker row shown before any model exists.
 const EMPTY_ROWS_TEXT: &str = "(no denoise models)";
+/// The picker row shown before any upscale model exists.
+const EMPTY_UPSCALE_ROWS_TEXT: &str = "(no upscale models)";
 /// Suffix the result TIFF beside the source: `<stem>_denoise.tif`
 /// (neural_restore.c `_task_suffix` for NEURAL_TASK_DENOISE).
 const DENOISE_SUFFIX: &str = "_denoise";
+
+// ── Pure task model (GTK-free, headless-tested) ─────────────────────────────
+
+/// The runnable task, mirroring `dt_neural_task_t` minus raw denoise
+/// (still future work, u7e). The C picks the task from the notebook page
+/// plus the scale combo (`_task_from_page`, neural_restore.c:3162-3177);
+/// the panel below picks it from the task + scale combos the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeuralTask {
+    Denoise,
+    Upscale2x,
+    Upscale4x,
+}
+
+/// Map the task + scale combo positions to a task: task 0 is denoise, task
+/// 1 is upscale with the scale combo picking 2x/4x — the same shape as the
+/// C `_task_from_page` (page 1 = denoise, page 2 + scale_pos 1 = 4x, else
+/// 2x). Out-of-range positions fall back to denoise / 2x rather than
+/// panicking on a corrupt combo state. (The C default arm yields upscale;
+/// ours yields denoise — unreachable with the 2-row combo, pinned by test,
+/// and denoise is the safer fallback since it needs no scale choice.)
+pub fn task_from_ui(task_idx: u32, scale_idx: u32) -> NeuralTask {
+    if task_idx == 1 {
+        if scale_idx == 1 {
+            NeuralTask::Upscale4x
+        } else {
+            NeuralTask::Upscale2x
+        }
+    } else {
+        NeuralTask::Denoise
+    }
+}
+
+/// Output scale factor: `_task_scale` (neural_restore.c:1029-1035).
+pub fn task_scale(task: NeuralTask) -> u32 {
+    match task {
+        NeuralTask::Denoise => 1,
+        NeuralTask::Upscale2x => 2,
+        NeuralTask::Upscale4x => 4,
+    }
+}
+
+/// Output filename suffix: `_task_suffix` (neural_restore.c:1017-1027).
+pub fn task_suffix(task: NeuralTask) -> &'static str {
+    match task {
+        NeuralTask::Denoise => DENOISE_SUFFIX,
+        NeuralTask::Upscale2x => "_upscale-2x",
+        NeuralTask::Upscale4x => "_upscale-4x",
+    }
+}
+
+/// Short task name for logs and toasts: `_task_log_name`
+/// (neural_restore.c:678-691) minus the raw-denoise arm.
+pub fn task_log_name(task: NeuralTask) -> &'static str {
+    match task {
+        NeuralTask::Denoise => "denoise",
+        NeuralTask::Upscale2x => "upscale 2x",
+        NeuralTask::Upscale4x => "upscale 4x",
+    }
+}
+
+/// Run button label for the task.
+pub fn run_button_label(task: NeuralTask) -> &'static str {
+    match task {
+        NeuralTask::Denoise => "Run denoise",
+        NeuralTask::Upscale2x | NeuralTask::Upscale4x => "Run upscale",
+    }
+}
+
+/// Live per-tile run status line: `Denoising 3/12…`, or
+/// `Upscaling 2x 3/12…` — the C batch messages (`neural_restore.c:1500-1503`:
+/// "denoising/upscaling 2x/4x image %d/%d...").
+pub fn format_task_progress(task: NeuralTask, done: u32, total: u32) -> String {
+    match task {
+        NeuralTask::Denoise => format!("Denoising {done}/{total}…"),
+        NeuralTask::Upscale2x => format!("Upscaling 2x {done}/{total}…"),
+        NeuralTask::Upscale4x => format!("Upscaling 4x {done}/{total}…"),
+    }
+}
+
+/// Output-dims status line for upscale, e.g. `Output 6000×4000`: the C
+/// shows the final developed size times the scale for scale > 1
+/// (neural_restore.c:1626-1635).
+pub fn format_output_dims(w: u32, h: u32, scale: u32) -> String {
+    format!("Output {}×{}", w * scale, h * scale)
+}
+
+/// The result path stem for a source under a task: `<dir>/<stem><suffix>`
+/// beside the source, mirroring neural_restore.c:1421-1447 (the
+/// `$(FILE_FOLDER)` plus basename plus suffix construction). A bare filename
+/// roots at "." like the export template expansion does. When the stem
+/// already ends with the suffix (re-processing) it is NOT appended again —
+/// the C `has_suffix` skip (neural_restore.c:1440).
+pub fn task_output_stem(src_path: &str, task: NeuralTask) -> String {
+    let suffix = task_suffix(task);
+    let p = std::path::Path::new(src_path);
+    let dir = match p.parent().and_then(|d| d.to_str()) {
+        None | Some("") => ".".to_string(),
+        Some(d) => d.trim_end_matches('/').to_string(),
+    };
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("img");
+    if stem.ends_with(suffix) {
+        format!("{dir}/{stem}")
+    } else {
+        format!("{dir}/{stem}{suffix}")
+    }
+}
+
+/// Placeholder picker text when the store holds no model for the task.
+pub fn empty_rows_text(task: NeuralTask) -> &'static str {
+    match task {
+        NeuralTask::Denoise => EMPTY_ROWS_TEXT,
+        NeuralTask::Upscale2x | NeuralTask::Upscale4x => EMPTY_UPSCALE_ROWS_TEXT,
+    }
+}
 
 // ── Pure model (GTK-free, headless-tested) ─────────────────────────────────
 
@@ -122,6 +239,33 @@ pub fn model_rows(downloaded: &[String], known: &[KnownModel]) -> Vec<NeuralRow>
     rows
 }
 
+/// The picker's row set for a task (task→model-list mapping): denoise sees
+/// the `denoise-*` store scan plus the denoise releases; upscale sees the
+/// `upscale-*` scan plus the BSRGAN/RealPLKSR releases. Same merge rule as
+/// [`model_rows`] in both cases.
+pub fn model_rows_for_task(task: NeuralTask) -> Vec<NeuralRow> {
+    match task {
+        NeuralTask::Denoise => model_rows(
+            &c41_core::ai::infer::downloaded_denoise_models(),
+            &known_denoise_models(),
+        ),
+        NeuralTask::Upscale2x | NeuralTask::Upscale4x => model_rows(
+            &c41_core::ai::infer::downloaded_upscale_models(),
+            &known_upscale_models(),
+        ),
+    }
+}
+
+/// The combo-row text for a row under a task: downloaded names and
+/// download actions are task-independent; only the empty placeholder names
+/// the task whose store is empty.
+pub fn row_label_in_task(row: &NeuralRow, task: NeuralTask) -> String {
+    match row {
+        NeuralRow::Empty => empty_rows_text(task).to_string(),
+        _ => row_label(row),
+    }
+}
+
 /// The combo-row text for a row.
 pub fn row_label(row: &NeuralRow) -> String {
     match row {
@@ -138,9 +282,10 @@ pub fn row_is_runnable(row: &NeuralRow) -> bool {
     matches!(row, NeuralRow::Model { .. })
 }
 
-/// Live per-tile run status line, e.g. `Denoising 3/12…`.
+/// Live per-tile run status line, e.g. `Denoising 3/12…` — the denoise arm
+/// of [`format_task_progress`] (kept because the tick names it directly).
 pub fn format_run_progress(done: u32, total: u32) -> String {
-    format!("Denoising {done}/{total}…")
+    format_task_progress(NeuralTask::Denoise, done, total)
 }
 
 /// Live download status line with byte counts in MiB, e.g.
@@ -157,23 +302,10 @@ pub fn format_download_progress(done: u64, total: Option<u64>) -> String {
 }
 
 /// The result path stem for a source: `<dir>/<stem>_denoise` beside the
-/// source, mirroring neural_restore.c:1421-1447 (`$(FILE_FOLDER)` +
-/// basename + `_denoise`). A bare filename has no parent, so the stem roots
-/// at "." (CWD-relative) like the export template expansion does. When the
-/// stem already ends with the suffix (re-processing a denoised file) it is
-/// NOT appended again — the C `has_suffix` skip (neural_restore.c:1440).
+/// source — [`task_output_stem`] for the denoise task (kept because the
+/// worker and the tests name it directly).
 pub fn denoise_output_stem(src_path: &str) -> String {
-    let p = std::path::Path::new(src_path);
-    let dir = match p.parent().and_then(|d| d.to_str()) {
-        None | Some("") => ".".to_string(),
-        Some(d) => d.trim_end_matches('/').to_string(),
-    };
-    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("img");
-    if stem.ends_with(DENOISE_SUFFIX) {
-        format!("{dir}/{stem}")
-    } else {
-        format!("{dir}/{stem}{}", DENOISE_SUFFIX)
-    }
+    task_output_stem(src_path, NeuralTask::Denoise)
 }
 
 /// The first free `<stem>.tif`, `<stem>_1.tif`, … (the C collision loop,
@@ -347,6 +479,14 @@ pub struct RunReport {
     pub imported: bool,
 }
 
+/// A finished run, either task: the continuation below matches on this to
+/// install the right preview state (blend cache for denoise, plain
+/// before/after for upscale).
+enum TaskDone {
+    Denoise(RunReport, BlendCache),
+    Upscale(RunReport, UpscaleResult),
+}
+
 /// Decode `path` to interleaved linear RGBA f32 at `w`×`h` — the
 /// [`c41_core::ai::infer::denoise_rgb`] input contract. Raws develop through
 /// the c41-core decoder (`to_linear_rgba_with`, defaults: no colour edits are
@@ -449,6 +589,89 @@ fn run_denoise_worker(
     };
     Ok((RunReport { out_path: dest, imported }, cache))
 }
+/// The whole upscale run for one image: decode → prepare the `model_x{S}`
+/// variant → [`c41_core::ai::infer::upscale_rgb`] (tiled ORT inference at
+/// `w*S × h*S`, progress forwarded) → quantise → write the result TIFF
+/// beside the source through the export writer → register it with the
+/// catalogue. Runs entirely on a blocking worker; GTK is never touched
+/// here. Returns the report plus an [`UpscaleResult`] for the split preview.
+/// There is deliberately NO blend cache: the C has no detail recovery for
+/// upscale (no pixel-to-pixel correspondence), so Strength stays insensitive
+/// and nothing re-blends.
+fn run_upscale_worker(
+    path: &str,
+    db: &str,
+    model_name: &str,
+    scale: u32,
+    progress: impl FnMut(u32, u32),
+) -> Result<(RunReport, UpscaleResult), String> {
+    let (w, h, rgba) = decode_linear_rgba(path)?;
+    let prepared = c41_core::ai::infer::prepare_upscale_model(model_name, scale)
+        .map_err(|e| format!("model prepare: {e}"))?;
+    let out_rgb = c41_core::ai::infer::upscale_rgb(
+        &rgba,
+        w,
+        h,
+        &prepared.onnx_path,
+        prepared.tile_size,
+        scale,
+        progress,
+    )
+    .map_err(|e| format!("inference: {e}"))?;
+    let rgb16 = quantize_srgb16(&out_rgb);
+    let task = if scale == 4 { NeuralTask::Upscale4x } else { NeuralTask::Upscale2x };
+    let dest = match unique_output_path(&task_output_stem(path, task)) {
+        Some(d) => d,
+        None => return Err("too many output files beside the source".to_string()),
+    };
+    crate::dialogs::write_rgb16_tiff_atomic(&dest, w * scale, h * scale, rgb16)
+        .map_err(|e| format!("write tiff: {e}"))?;
+    let dir = std::path::Path::new(&dest)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let filename = std::path::Path::new(&dest)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut imported = false;
+    if !db.is_empty() && !dir.is_empty() && !filename.is_empty() {
+        imported = crate::dialogs::import_single_file_sync(&dir, &filename, db);
+    }
+    let result = UpscaleResult { w, h, scale, original: rgba, upscaled: out_rgb };
+    Ok((RunReport { out_path: dest, imported }, result))
+}
+
+/// What a completed upscale run produced: the source dims plus the linear
+/// float buffers the split preview paints from (original RGBA + upscaled
+/// packed RGB). No blend cache — upscale has no Strength re-blend.
+#[derive(Clone, Debug)]
+pub struct UpscaleResult {
+    pub w: u32,
+    pub h: u32,
+    pub scale: u32,
+    pub original: Vec<f32>,
+    pub upscaled: Vec<f32>,
+}
+
+/// Download-or-verify one [`KnownModel`] for the task into the store: the
+/// same sha256-gated path in both cases, parameterised by the task's
+/// ensure fn (the registry listing is shared; the asset name picks the row).
+fn ensure_task_model(
+    task: NeuralTask,
+    model: &KnownModel,
+    assets: &[c41_core::ai::registry::ModelAsset],
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<std::path::PathBuf, c41_core::ai::infer::InferError> {
+    match task {
+        NeuralTask::Denoise => {
+            c41_core::ai::infer::ensure_denoise_model(model, assets, progress)
+        }
+        NeuralTask::Upscale2x | NeuralTask::Upscale4x => {
+            c41_core::ai::infer::ensure_upscale_model(model, assets, progress)
+        }
+    }
+}
 
 /// One Strength re-blend pass: `denoised + alpha * filtered_residual` via
 /// [`c41_core::ai::detail::apply_detail_recovery`] (NO re-inference),
@@ -480,7 +703,7 @@ fn run_reblend_worker(cache: &BlendCache, strength: f32) -> Result<(Vec<u8>, u32
 pub enum RunPhase {
     Idle,
     Downloading { done: u64, total: Option<u64> },
-    Denoising { done: u32, total: u32 },
+    Running { done: u32, total: u32, task: NeuralTask },
 }
 
 /// Mutable panel state, shared between the GTK handlers (main thread) and
@@ -492,6 +715,11 @@ struct NeuralState {
     selected: u32,
     busy: bool,
     run_phase: RunPhase,
+    /// Task combo position: 0 = denoise, 1 = upscale (with `scale_idx`
+    /// picking 2x/4x) — the C notebook-page half of `_task_from_page`.
+    task_idx: u32,
+    /// Scale combo position: 0 = 2x, 1 = 4x — the C `scale_combo` half.
+    scale_idx: u32,
     /// Full-frame buffers from the last completed run; `None` until then.
     blend: Option<BlendCache>,
     /// Last applied Strength value (slider domain 0..100).
@@ -507,12 +735,21 @@ struct NeuralState {
 }
 
 impl NeuralState {
+    /// The task the combos currently select (`_task_from_page` shape).
+    fn current_task(&self) -> NeuralTask {
+        task_from_ui(self.task_idx, self.scale_idx)
+    }
+}
+
+impl NeuralState {
     fn new() -> Self {
         Self {
             rows: Vec::new(),
             selected: 0,
             busy: false,
             run_phase: RunPhase::Idle,
+            task_idx: 0,
+            scale_idx: 0,
             blend: None,
             applied_strength: 100.0,
             reblend_busy: false,
@@ -559,14 +796,14 @@ fn pixbuf_from_srgb8(bytes: Vec<u8>, w: u32, h: u32) -> Option<gtk4::gdk_pixbuf:
 
 // ── Widget helpers (main thread only) ──────────────────────────────────────
 
-/// Rebuild the picker's row list from the store + known releases, keeping the
-/// current selection when it still exists. Called on construction and after a
-/// download lands.
+/// Rebuild the picker's row list for the current task (task→model-list
+/// mapping), keeping the current selection when it still exists. Called on
+/// construction, on task switches, and after a download lands.
 fn refresh_model_picker(combo: &adw::ComboRow, state: &mut NeuralState) {
-    let downloaded = c41_core::ai::infer::downloaded_denoise_models();
-    let known = known_denoise_models();
-    state.rows = model_rows(&downloaded, &known);
-    let labels: Vec<String> = state.rows.iter().map(row_label).collect();
+    let task = state.current_task();
+    state.rows = model_rows_for_task(task);
+    let labels: Vec<String> =
+        state.rows.iter().map(|r| row_label_in_task(r, task)).collect();
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     combo.set_model(Some(&gtk4::StringList::new(&label_refs)));
     if state.selected >= state.rows.len() as u32 {
@@ -575,15 +812,21 @@ fn refresh_model_picker(combo: &adw::ComboRow, state: &mut NeuralState) {
     combo.set_selected(state.selected);
 }
 
-/// Recompute the Run button's sensitivity from the current selection, switch
-/// and busy state.
+/// Recompute the Run button's sensitivity from the current task, selection,
+/// switch and busy state. The denoise switch gates denoise runs only —
+/// upscale has no enable switch (the C upscale page has none either; the
+/// scale combo is the only control).
 fn refresh_run_sensitive(
     run_btn: &gtk4::Button,
     denoise_sw: &adw::SwitchRow,
     state: &NeuralState,
 ) {
+    let task_on = match state.current_task() {
+        NeuralTask::Denoise => denoise_sw.is_active(),
+        NeuralTask::Upscale2x | NeuralTask::Upscale4x => true,
+    };
     let runnable = !state.busy
-        && denoise_sw.is_active()
+        && task_on
         && state
             .rows
             .get(state.selected as usize)
@@ -615,8 +858,8 @@ fn arm_progress_tick(
                 lbl.set_text(&format_download_progress(done, total));
                 glib::ControlFlow::Continue
             }
-            RunPhase::Denoising { done, total } => {
-                lbl.set_text(&format_run_progress(done, total));
+            RunPhase::Running { done, total, task } => {
+                lbl.set_text(&format_task_progress(task, done, total));
                 glib::ControlFlow::Continue
             }
         }
@@ -781,7 +1024,7 @@ pub fn neural_restore_box(
     panel.append(&header);
 
     let hint = gtk4::Label::builder()
-        .label("AI denoise for the selected image (experimental)")
+        .label("AI denoise and upscale for the selected image (experimental)")
         .halign(gtk4::Align::Start)
         .margin_start(12)
         .margin_end(12)
@@ -790,21 +1033,42 @@ pub fn neural_restore_box(
     hint.add_css_class("dim-label");
     panel.append(&hint);
 
-    // Task rows: Denoise is live; raw denoise / upscale are explicit
-    // placeholders so the section says what is and is not wired. The task
-    // toggle is an `adw::SwitchRow` because that is the one widget whose
-    // `active`-property notify connect the tree already proves
-    // (export_panel.rs `resize_row.connect_active_notify`); `gtk4::Switch`
-    // has `is_active`/`set_active` but no notify hook in gtk4 0.9.7.
+    // Task rows: Denoise is live (u7b) and Upscale 2x/4x is live (u7d); raw
+    // denoise stays an explicit placeholder so the section says what is and
+    // is not wired. The denoise toggle is an `adw::SwitchRow` because that
+    // is the one widget whose `active`-property notify connect the tree
+    // already proves (export_panel.rs `resize_row.connect_active_notify`);
+    // `gtk4::Switch` has `is_active`/`set_active` but no notify hook in
+    // gtk4 0.9.7. The task/scale combos mirror the C notebook tabs + scale
+    // combo (neural_restore.c:3162-3177, gui_init :4134-4187).
     let denoise_sw = adw::SwitchRow::builder()
         .title("Denoise")
         .active(true)
         .build();
     panel.append(&denoise_sw);
 
-    for text in ["Raw denoise — coming next", "Upscale — coming next"] {
+    let task_row = adw::ComboRow::builder().title("Task").build();
+    task_row.set_model(Some(&gtk4::StringList::new(&["Denoise", "Upscale"])));
+    task_row.set_selected(0);
+    let task_margins = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    task_margins.set_margin_start(8);
+    task_margins.set_margin_end(8);
+    task_margins.append(&task_row);
+    panel.append(&task_margins);
+
+    let scale_row = adw::ComboRow::builder().title("Scale").build();
+    scale_row.set_model(Some(&gtk4::StringList::new(&["2x", "4x"])));
+    scale_row.set_selected(0);
+    scale_row.set_sensitive(false);
+    let scale_margins = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    scale_margins.set_margin_start(8);
+    scale_margins.set_margin_end(8);
+    scale_margins.append(&scale_row);
+    panel.append(&scale_margins);
+
+    {
         let dead = gtk4::Label::builder()
-            .label(text)
+            .label("Raw denoise — coming next")
             .halign(gtk4::Align::Start)
             .margin_start(12)
             .margin_end(12)
@@ -870,7 +1134,7 @@ pub fn neural_restore_box(
     // white divider line — the C split draw (neural_restore.c:3432-3466).
     // Hidden until the first run caches its pixbufs.
     let split_hint = gtk4::Label::builder()
-        .label("Run denoise to preview detail recovery")
+        .label("Run to preview before/after")
         .halign(gtk4::Align::Start)
         .margin_start(12)
         .margin_end(12)
@@ -1002,6 +1266,78 @@ pub fn neural_restore_box(
         });
     }
 
+    // Task + scale combos (u7d): mirror the C notebook tabs + scale combo
+    // (`_task_from_page`, neural_restore.c:3162-3177). A switch rebuilds
+    // the picker for the task's model list, resets the selection, retitles
+    // Run, and parks Strength (denoise-only). Switches while a
+    // download/run is in flight are reverted — the busy worker owns the
+    // picker rows until its completion handler rebuilds them.
+    {
+        let state = state.clone();
+        let run_btn_w = run_btn.downgrade();
+        let denoise_sw_w = denoise_sw.downgrade();
+        let combo_w = model_row.downgrade();
+        let scale_w = scale_row.downgrade();
+        let strength_w = strength_scale.downgrade();
+        task_row.connect_selected_notify(move |row| {
+            let idx = row.selected();
+            let busy = state.lock().map(|st| st.busy).unwrap_or(true);
+            if busy {
+                row.set_selected(state.lock().map(|st| st.task_idx).unwrap_or(0));
+                return;
+            }
+            {
+                let Ok(mut st) = state.lock() else { return };
+                st.task_idx = idx;
+                st.selected = 0;
+            }
+            if let Some(combo) = combo_w.upgrade() {
+                let Ok(mut st) = state.lock() else { return };
+                refresh_model_picker(&combo, &mut st);
+            }
+            let Ok(st) = state.lock() else { return };
+            let task = st.current_task();
+            if let Some(scale) = scale_w.upgrade() {
+                scale.set_sensitive(task != NeuralTask::Denoise);
+            }
+            if let Some(run_btn) = run_btn_w.upgrade() {
+                run_btn.set_label(run_button_label(task));
+                if let Some(denoise_sw) = denoise_sw_w.upgrade() {
+                    refresh_run_sensitive(&run_btn, &denoise_sw, &st);
+                }
+            }
+            if let Some(strength) = strength_w.upgrade() {
+                strength.set_sensitive(task == NeuralTask::Denoise && st.blend.is_some());
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let run_btn_w = run_btn.downgrade();
+        let denoise_sw_w = denoise_sw.downgrade();
+        scale_row.connect_selected_notify(move |row| {
+            let idx = row.selected();
+            let busy = state.lock().map(|st| st.busy).unwrap_or(true);
+            if busy {
+                row.set_selected(state.lock().map(|st| st.scale_idx).unwrap_or(0));
+                return;
+            }
+            {
+                let Ok(mut st) = state.lock() else { return };
+                st.scale_idx = idx;
+            }
+            // Both scales share the upscale-* model list, so no picker
+            // rebuild — just retitle Run and re-gate it.
+            if let Some(run_btn) = run_btn_w.upgrade() {
+                let Ok(st) = state.lock() else { return };
+                run_btn.set_label(run_button_label(st.current_task()));
+                if let Some(denoise_sw) = denoise_sw_w.upgrade() {
+                    refresh_run_sensitive(&run_btn, &denoise_sw, &st);
+                }
+            }
+        });
+    }
+
     // Model picker: selecting a download-on-demand row starts the download.
     {
         let state = state.clone();
@@ -1064,6 +1400,7 @@ pub fn neural_restore_box(
             // report the outcome.
             let known_name = name.clone();
             let known = KnownModel { name, size_mi_b };
+            let task = state.lock().map(|st| st.current_task()).unwrap_or(NeuralTask::Denoise);
             glib::spawn_future_local(async move {
                 // Worker-side clones: the blocking closure is `move` and the
                 // continuation below reuses these bindings afterwards.
@@ -1077,7 +1414,8 @@ pub fn neural_restore_box(
                         );
                     match assets {
                         Ok(assets) => {
-                            let done = c41_core::ai::infer::ensure_denoise_model(
+                            let done = ensure_task_model(
+                                task,
                                 &known,
                                 &assets,
                                 |done, total| {
@@ -1178,23 +1516,31 @@ pub fn neural_restore_box(
                 notify("Select an image first".into());
                 return;
             };
-            let model_name = {
+            let (model_name, task) = {
                 let Ok(st) = state.lock() else {
                     notify("Neural restore is unavailable right now".into());
                     return;
                 };
-                match st.rows.get(st.selected as usize) {
+                let task = st.current_task();
+                let name = match st.rows.get(st.selected as usize) {
                     Some(NeuralRow::Model { name }) => name.clone(),
                     Some(NeuralRow::Download { .. }) => {
                         notify("Download the model first".into());
                         return;
                     }
                     _ => {
-                        notify("No denoise model downloaded".into());
+                        match task {
+                            NeuralTask::Denoise => notify("No denoise model downloaded".into()),
+                            NeuralTask::Upscale2x | NeuralTask::Upscale4x => {
+                                notify("No upscale model downloaded".into())
+                            }
+                        }
                         return;
                     }
-                }
+                };
+                (name, task)
             };
+            let task_name = task_log_name(task);
             let db_empty = db.is_empty();
             {
                 let Ok(mut st) = state.lock() else {
@@ -1247,11 +1593,38 @@ pub fn neural_restore_box(
                 // the continuation below reuses `state`.
                 let state_b = state.clone();
                 let outcome = gio::spawn_blocking(move || {
-                    run_denoise_worker(&path, &db, &model_name, |d, total| {
-                        if let Ok(mut st) = state_b.lock() {
-                            st.run_phase = RunPhase::Denoising { done: d, total };
+                    // The task is captured at click time: a switch mid-run
+                    // is reverted by the combo handlers, but the worker must
+                    // not re-read the combo state anyway.
+                    let task_done: Result<TaskDone, String> = match task {
+                        NeuralTask::Denoise => run_denoise_worker(
+                            &path,
+                            &db,
+                            &model_name,
+                            |d, total| {
+                                if let Ok(mut st) = state_b.lock() {
+                                    st.run_phase = RunPhase::Running { done: d, total, task };
+                                }
+                            },
+                        )
+                        .map(|(report, cache)| TaskDone::Denoise(report, cache)),
+                        NeuralTask::Upscale2x | NeuralTask::Upscale4x => {
+                            let scale = task_scale(task);
+                            run_upscale_worker(
+                                &path,
+                                &db,
+                                &model_name,
+                                scale,
+                                |d, total| {
+                                    if let Ok(mut st) = state_b.lock() {
+                                        st.run_phase = RunPhase::Running { done: d, total, task };
+                                    }
+                                },
+                            )
+                            .map(|(report, result)| TaskDone::Upscale(report, result))
                         }
-                    })
+                    };
+                    task_done
                 })
                 .await;
                 let release = |text: &str| {
@@ -1270,16 +1643,18 @@ pub fn neural_restore_box(
                     if let Some(combo) = combo_w.upgrade() {
                         combo.set_sensitive(true);
                     }
-                    // The Strength slider lives off the blend cache: it
-                    // stays usable across failures when an older run's
-                    // cache (and TIFF) is still valid.
+                    // The Strength slider lives off the denoise blend cache:
+                    // it stays usable across failures when an older run's
+                    // cache (and TIFF) is still valid, and stays parked
+                    // for upscale (no re-blend there).
                     if let Some(strength) = strength_w.upgrade() {
                         let Ok(st) = state.lock() else { return };
-                        strength.set_sensitive(st.blend.is_some());
+                        let is_denoise = st.current_task() == NeuralTask::Denoise;
+                        strength.set_sensitive(is_denoise && st.blend.is_some());
                     }
                 };
                 match outcome {
-                    Ok(Ok((report, cache))) => {
+                    Ok(Ok(TaskDone::Denoise(report, cache))) => {
                         // Install the u7c blend cache + split pixbufs: the
                         // "after" side at strength 100 is the denoised frame
                         // itself (alpha 0 → bit-exact, no DWT needed).
@@ -1341,8 +1716,77 @@ pub fn neural_restore_box(
                             done();
                         }
                     }
+                    Ok(Ok(TaskDone::Upscale(report, result))) => {
+                        // Install the before/after pixbufs at the UPSCALED
+                        // thumb size so both sides align (same aspect, so
+                        // one cap covers both), and drop any denoise blend
+                        // cache: Strength must not re-blend stale denoise
+                        // bytes over an upscale preview.
+                        let (tw, th) = thumbnail_dims(
+                            result.w * result.scale,
+                            result.h * result.scale,
+                            PREVIEW_MAX_DIM,
+                        );
+                        let before_bytes = shrink_rgba_to_srgb8(
+                            &result.original,
+                            result.w,
+                            result.h,
+                            tw,
+                            th,
+                        );
+                        let after_bytes = shrink_rgb_to_srgb8(
+                            &result.upscaled,
+                            result.w * result.scale,
+                            result.h * result.scale,
+                            tw,
+                            th,
+                        );
+                        {
+                            let Ok(mut st) = state.lock() else { return };
+                            st.blend = None;
+                            st.applied_strength = 100.0;
+                            st.pending_strength = None;
+                        }
+                        {
+                            let mut pv = preview_run.borrow_mut();
+                            if let Some(pb) = pixbuf_from_srgb8(before_bytes, tw, th) {
+                                pv.before = Some(pb);
+                            }
+                            if let Some(pb) = pixbuf_from_srgb8(after_bytes, tw, th) {
+                                pv.after = Some(pb);
+                            }
+                            pv.split = 0.5;
+                        }
+                        if let Some(area) = area_w.upgrade() {
+                            area.set_visible(true);
+                            area.queue_draw();
+                        }
+                        if let Some(hint) = hint_w.upgrade() {
+                            hint.set_visible(false);
+                        }
+                        // Park Strength at full (it stays insensitive: no
+                        // re-blend for upscale) so the next denoise run
+                        // starts from a consistent slider value.
+                        if let Some(scale) = strength_scale_set.upgrade() {
+                            scale.set_value(100.0);
+                            scale.set_sensitive(false);
+                        }
+                        let done_line = format_output_dims(result.w, result.h, result.scale);
+                        let msg = if report.imported {
+                            format!("Upscaled — written and imported ({done_line})")
+                        } else if db_empty {
+                            format!("Upscaled — written, no catalogue open ({done_line})")
+                        } else {
+                            format!("Upscaled — written, not imported ({done_line})")
+                        };
+                        release(&msg);
+                        notify(format!("Neural {task_name}: {}", report.out_path));
+                        if report.imported {
+                            done();
+                        }
+                    }
                     Ok(Err(e)) => {
-                        release(&format!("Denoise failed: {e}"));
+                        release(&format!("Neural {task_name} failed: {e}"));
                         // A value parked while the failed run was in flight
                         // still wants applying against the surviving
                         // (previous) cache — otherwise slider and applied
@@ -1364,7 +1808,7 @@ pub fn neural_restore_box(
                         }
                     }
                     Err(_) => {
-                        release("Denoise did not complete");
+                        release("Neural run did not complete");
                         let next = state
                             .lock()
                             .ok()
@@ -1401,7 +1845,10 @@ pub fn neural_restore_box(
             let v = scale.value() as f32;
             {
                 let Ok(mut st) = state.lock() else { return };
-                if st.blend.is_none() {
+                // Denoise-only: upscale installs no blend cache (and clears
+                // any older one), so without the task gate a drag in
+                // upscale mode would re-blend stale denoise bytes.
+                if st.current_task() != NeuralTask::Denoise || st.blend.is_none() {
                     return;
                 }
                 if (v - st.applied_strength).abs() < f32::EPSILON
@@ -1515,6 +1962,139 @@ mod tests {
             denoise_output_stem("/p/x_denoise.tif"),
             "/p/x_denoise"
         );
+    }
+
+    // ── u7d: task mapping, scale, upscale naming ────────────────────────────
+
+    #[test]
+    fn task_from_ui_mirrors_the_c_page_plus_scale_combo() {
+        // neural_restore.c:3162-3177: page 1 = denoise, page 2 + scale 1 =
+        // 4x else 2x. Out-of-range positions degrade, never panic.
+        assert_eq!(task_from_ui(0, 0), NeuralTask::Denoise);
+        assert_eq!(task_from_ui(0, 1), NeuralTask::Denoise);
+        assert_eq!(task_from_ui(1, 0), NeuralTask::Upscale2x);
+        assert_eq!(task_from_ui(1, 1), NeuralTask::Upscale4x);
+        assert_eq!(task_from_ui(9, 9), NeuralTask::Denoise);
+        assert_eq!(task_from_ui(1, 9), NeuralTask::Upscale2x);
+    }
+
+    #[test]
+    fn task_scale_and_suffix_match_the_c_tables() {
+        // _task_scale (:1029-1035) and _task_suffix (:1017-1027).
+        assert_eq!(task_scale(NeuralTask::Denoise), 1);
+        assert_eq!(task_scale(NeuralTask::Upscale2x), 2);
+        assert_eq!(task_scale(NeuralTask::Upscale4x), 4);
+        assert_eq!(task_suffix(NeuralTask::Denoise), "_denoise");
+        assert_eq!(task_suffix(NeuralTask::Upscale2x), "_upscale-2x");
+        assert_eq!(task_suffix(NeuralTask::Upscale4x), "_upscale-4x");
+        assert_eq!(task_log_name(NeuralTask::Upscale2x), "upscale 2x");
+        assert_eq!(task_log_name(NeuralTask::Upscale4x), "upscale 4x");
+        assert_eq!(run_button_label(NeuralTask::Denoise), "Run denoise");
+        assert_eq!(run_button_label(NeuralTask::Upscale4x), "Run upscale");
+    }
+
+    #[test]
+    fn task_progress_names_the_scale() {
+        // Batch messages (:1500-1503): denoising / upscaling 2x / 4x.
+        assert_eq!(
+            format_task_progress(NeuralTask::Denoise, 3, 12),
+            "Denoising 3/12…"
+        );
+        assert_eq!(
+            format_task_progress(NeuralTask::Upscale2x, 3, 12),
+            "Upscaling 2x 3/12…"
+        );
+        assert_eq!(
+            format_task_progress(NeuralTask::Upscale4x, 1, 2),
+            "Upscaling 4x 1/2…"
+        );
+        // The denoise helper is the denoise arm.
+        assert_eq!(
+            format_run_progress(3, 12),
+            format_task_progress(NeuralTask::Denoise, 3, 12)
+        );
+    }
+
+    #[test]
+    fn upscale_stems_carry_scale_suffixes_without_doubling() {
+        assert_eq!(
+            task_output_stem("/photos/a/IMG_1.CR2", NeuralTask::Upscale2x),
+            "/photos/a/IMG_1_upscale-2x"
+        );
+        assert_eq!(
+            task_output_stem("/photos/a/IMG_1.CR2", NeuralTask::Upscale4x),
+            "/photos/a/IMG_1_upscale-4x"
+        );
+        assert_eq!(
+            task_output_stem("nopath.raw", NeuralTask::Upscale2x),
+            "./nopath_upscale-2x"
+        );
+        // Re-processing does NOT double the suffix (the C has_suffix skip).
+        assert_eq!(
+            task_output_stem("/p/x_upscale-2x.tif", NeuralTask::Upscale2x),
+            "/p/x_upscale-2x"
+        );
+        assert_eq!(
+            task_output_stem("/p/x_upscale-4x.tif", NeuralTask::Upscale4x),
+            "/p/x_upscale-4x"
+        );
+        // Denoise helper is the denoise arm.
+        assert_eq!(
+            denoise_output_stem("/p/x.tif"),
+            task_output_stem("/p/x.tif", NeuralTask::Denoise)
+        );
+    }
+
+    #[test]
+    fn empty_placeholder_names_the_task() {
+        assert_eq!(empty_rows_text(NeuralTask::Denoise), "(no denoise models)");
+        assert_eq!(empty_rows_text(NeuralTask::Upscale2x), "(no upscale models)");
+        assert_eq!(empty_rows_text(NeuralTask::Upscale4x), "(no upscale models)");
+        assert_eq!(
+            row_label_in_task(&NeuralRow::Empty, NeuralTask::Upscale2x),
+            "(no upscale models)"
+        );
+        assert_eq!(
+            row_label_in_task(&NeuralRow::Empty, NeuralTask::Denoise),
+            row_label(&NeuralRow::Empty)
+        );
+        // Non-empty rows are task-independent.
+        let dl = NeuralRow::Download { name: "m".to_string(), size_mi_b: 124 };
+        assert_eq!(
+            row_label_in_task(&dl, NeuralTask::Upscale4x),
+            row_label(&dl)
+        );
+    }
+
+    #[test]
+    fn output_dims_line_multiplies_by_scale() {
+        // The C shows fw*scale x fh*scale for scale > 1 (:1626-1635).
+        assert_eq!(format_output_dims(3000, 2000, 2), "Output 6000×4000");
+        assert_eq!(format_output_dims(3000, 2000, 4), "Output 12000×8000");
+    }
+
+    #[test]
+    fn upscale_rows_merge_upscale_store_first() {
+        // Task→model-list mapping over synthetic lists (the shared merge
+        // rule): a downloaded upscale archive first, then the missing
+        // release as a download row. The store scans behind this are pinned
+        // per-prefix in c41-core (`downloaded_upscale_models` only ever
+        // yields `upscale-*`, so denoise archives cannot leak across).
+        let up_known = known_upscale_models();
+        let bsrgan = c41_core::ai::infer::UPSCALE_BSRGAN_ASSET.to_string();
+        let rows = model_rows(std::slice::from_ref(&bsrgan), &up_known);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], NeuralRow::Model { name: bsrgan });
+        assert_eq!(
+            rows[1],
+            NeuralRow::Download {
+                name: c41_core::ai::infer::UPSCALE_REALPLKSR_ASSET.to_string(),
+                size_mi_b: 55,
+            }
+        );
+        assert!(row_is_runnable(&rows[0]));
+        assert!(!row_is_runnable(&rows[1]));
+        assert!(row_label(&rows[1]).contains("55 MB"));
     }
 
     #[test]
