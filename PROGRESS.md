@@ -6926,4 +6926,8 @@ clean; no `/*`/`*/` in added lines. Release suites: `c41-core` 1733
 passed (1716 + 17 new), `c41-db` 97 unchanged, `c41-ui` 461 passed
 (452 + 9 new), 0 failed. PARITY_AUDIT.md 2.7 updated in the same commit
 (denoise closed; u7c+ recorded).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `40b9cd9a66` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u7b
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`40b9cd9a66`.
