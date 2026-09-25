@@ -6878,3 +6878,52 @@ verified via `ldd`) to `docker/Dockerfile`; the shipping image was
 rebuilt AND load-checked locally (exit 0, zero "not found" libs).
 Remote Docker build green on the fixup. Both remotes (`origin` GitHub +
 Gitea) verified at the fixup commit.
+
+### u7b — RGB-denoise inference + Neural restore panel (2026-09-25 UTC)
+
+**What.** Neural-restore leg of PARITY_AUDIT 2.7 closed (denoise): RGB
+denoise end to end — new `c41-core/src/ai/infer.rs` (gamma pair, tile
+grid/strip/mirror math, `run_denoise_tiled` driver with injectable
+`run_tile` seam, per-call `RtSession`, `denoise_rgb`, model
+download/prepare helpers, 17 tests) + new `crates/c41-ui/src/neural.rs`
+(pure row/label/progress/output-name model + "Neural restore" sidebar
+section: Denoise active, raw-denoise/upscale greyed "coming next", model
+picker with download-on-demand + progress, Run → sRGB TIFF beside source
+→ single-file import → grid reload, busy-guarded) + sidebar wiring in
+`lib.rs` + TIFF-writer refactor in `dialogs/mod.rs` (single
+`save_rgb16_buf` encoder + `write_rgb16_tiff_atomic`). Raw denoise,
+upscale, detail slider, before/after split stay FUTURE (u7c+).
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — inference math exact (gamma constants, grid,
+mirror, strip, O=64 all hand-verified vs C), every ort call verified
+against vendored 2.0.0-rc.13 sources, NCHW shapes, noise-map gating,
+`&mut` confinement on the worker, manifest wiring, scope clean. All
+findings fixed in-session: (1) MAJOR quantize truncation → `+ 0.5`
+round-half-up like the export arms; (2) MAJOR linear-vs-sRGB TIFF →
+`linear_to_srgb` encode on write (TIFF consumers read sRGB); (3) MAJOR
+dead progress tick (armed once at construction while Idle) → re-armed at
+each op start; (4) MINOR stem-first tile lookup → top-level-only NULL-stem
+semantics like the C denoise loader (+ `top_level_tile_size` helper);
+(5) MINOR suffix double-append → C `has_suffix` skip; (6) MINOR
+past-9999 collision → error instead of overwrite (C skips the file);
+(7) MINOR main-thread mutex unwraps → let-else returns; (8) MINOR combo
+stays sensitive during download → disabled + re-enabled; NITs
+(`is_empty` N/A — no such method; tick/size pins documented; `ndarray`
+feature REMOVED as gratuitous after verifying `try_extract_tensor` is
+ungated). Post-fix gate caught what review couldn't: `Fn`-closure
+move-out errors across both handlers (fixed with per-activation shadow
+clones), one bad test expectation (stem strips `.tif`), one const-value
+clippy lint. All ort shapes were pre-verified method-by-method against
+vendored sources by the main session (`[i64;N]: ToShape`,
+`(D,&[T]) impls`, `Index<usize>`, `Shape: Deref→[i64]`). Untracked
+`install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `infer.rs`/`neural.rs` post-fix. `git diff --check`
+clean; no `/*`/`*/` in added lines. Release suites: `c41-core` 1733
+passed (1716 + 17 new), `c41-db` 97 unchanged, `c41-ui` 461 passed
+(452 + 9 new), 0 failed. PARITY_AUDIT.md 2.7 updated in the same commit
+(denoise closed; u7c+ recorded).
+Remote CI confirmation follows commit/push per workflow.

@@ -19,6 +19,7 @@ pub mod export_panel;
 pub mod history;
 pub mod lighttable;
 pub mod map;
+pub mod neural;
 pub mod panels;
 pub mod persist;
 pub mod preview;
@@ -707,6 +708,36 @@ fn build_main_window(app: &Application) {
 
     // Metadata editor (parity 2.3) reports failed writes the same way.
     right.set_on_notify(make_toast.clone());
+
+    // Neural restore (u7b): the "Neural restore" sidebar section at the foot
+    // of the right panel. Runs the RGB-denoise model on the selected image
+    // and writes a `_denoise.tif` beside the source through the export TIFF
+    // writer, importing the result and reloading the grid through the same
+    // on_done the tether page's auto-imports use. The selection is a getter
+    // (read at Run time) exactly like the styles panel's — the panel is built
+    // once and the selection changes constantly.
+    {
+        let sel = lt_selection.clone();
+        let get_selected: std::rc::Rc<dyn Fn() -> Option<String>> =
+            std::rc::Rc::new(move || lighttable::selected_path(&sel));
+        let db_n = db_path.clone();
+        let lp = left.clone();
+        let at = active_tag.clone();
+        let mdl = lt_model.clone();
+        let on_done: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+            lp.clear_filter_highlights();
+            *at.borrow_mut() = None;
+            lighttable::lighttable_load_from_db(&mdl, &db_n);
+        });
+        let notify: std::rc::Rc<dyn Fn(String)> = std::rc::Rc::new(make_toast.clone());
+        let neural = crate::neural::neural_restore_box(
+            db_path.clone(),
+            get_selected,
+            on_done,
+            notify,
+        );
+        right.widget.append(&neural);
+    }
 
     // The full preview follows the SELECTION, not just its own keys — the same
     // observer shape the metadata panel uses. Without this the ← / → step moves

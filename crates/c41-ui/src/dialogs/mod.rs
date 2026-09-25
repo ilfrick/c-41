@@ -283,7 +283,7 @@ fn render_raw_export(
                 if let Some((tw, th)) = target(w, h) {
                     buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
                 }
-                write_jpeg_rgb8(&buf, settings.quality, out)?;
+                write_jpeg_rgb8(&buf, settings.quality, out)
             }
             ExportFormat::Png | ExportFormat::Tiff => {
                 let (w, h, rgb) = crate::export::render_export_rgb16_gear(
@@ -305,10 +305,9 @@ fn render_raw_export(
                     ExportFormat::Png => image::ImageFormat::Png,
                     _ => image::ImageFormat::Tiff,
                 };
-                buf.save_with_format(out, fmt).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+                save_rgb16_buf(&buf, out, fmt)
             }
         }
-        Ok(())
     })
 }
 
@@ -366,6 +365,41 @@ fn write_jpeg_rgb8(
         .map_err(|e| anyhow::anyhow!("encode jpeg: {e}"))?;
     f.into_inner().map_err(|e| anyhow::anyhow!("flush jpeg: {e}"))?;
     Ok(())
+}
+
+/// The ONE 16-bit RGB encode primitive every TIFF/PNG write in the app goes
+/// through: `ImageBuffer::<Rgb<u16>>::save_with_format`. The export arms call
+/// it after their optional resize; the neural-restore panel's result TIFF
+/// calls it through [`write_rgb16_tiff_atomic`]. Keeping a single call site
+/// means the encoder choice (and any format quirk that ever needs handling)
+/// lives in one place instead of three copies.
+fn save_rgb16_buf(
+    buf: &image::ImageBuffer<image::Rgb<u16>, Vec<u16>>,
+    out: &str,
+    fmt: image::ImageFormat,
+) -> Result<()> {
+    buf.save_with_format(out, fmt).map_err(|e| anyhow::anyhow!("encode: {e}"))
+}
+
+/// Write the neural-restore result as a TIFF beside the source: the exact
+/// export-path encode (16-bit RGB through [`save_rgb16_buf`] with
+/// `ImageFormat::Tiff`) behind the export path's atomic+fsync write
+/// ([`atomic_write`]). `dest` is the exact destination path (already carrying
+/// the `.tif` extension — callers own uniqueness); `rgb` is packed RGB u16.
+/// Reusing the export writer — not a second TIFF encoder — is deliberate.
+pub(crate) fn write_rgb16_tiff_atomic(
+    dest: &str,
+    w: u32,
+    h: u32,
+    rgb: Vec<u16>,
+) -> Result<()> {
+    let path = dest.to_string();
+    atomic_write(&path, move |out| {
+        let buf: image::ImageBuffer<image::Rgb<u16>, _> =
+            image::ImageBuffer::from_raw(w, h, rgb)
+                .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+        save_rgb16_buf(&buf, out, image::ImageFormat::Tiff)
+    })
 }
 
 /// Non-raw formats the pure-Rust `image` crate can decode/encode (its enabled
@@ -482,7 +516,7 @@ fn render_nonraw_export(
                 if let Some((tw, th)) = target {
                     buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
                 }
-                buf.save_with_format(out, fmt).map_err(|e| anyhow::anyhow!("encode: {e}"))
+                save_rgb16_buf(&buf, out, fmt)
             })
         }
     }

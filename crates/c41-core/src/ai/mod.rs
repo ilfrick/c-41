@@ -1,10 +1,11 @@
-//! AI model infrastructure (u7a, parity audit 2.7 neural-restore leg).
+//! AI model infrastructure (u7a, parity audit 2.7 neural-restore leg) plus the
+//! u7b RGB-denoise inference on top of it.
 //!
-//! This module is infra only: it finds model releases, downloads the
-//! `.dtmodel` archives, verifies them, and unpacks plus interprets the
-//! manifest. There is NO inference and NO UI here — both arrive in u7b,
-//! which will build ONNX Runtime sessions on top of the paths this module
-//! produces.
+//! `registry` finds model releases, `download` streams them with sha256
+//! verification into the store, `package` unpacks and interprets the
+//! `.dtmodel` manifest, and `infer` builds ONNX Runtime sessions on the
+//! extracted payload and runs the tiled denoise. There is NO UI here — the
+//! neural-restore panel lives in c41-ui and drives `infer`.
 //!
 //! Store layout (all paths derived here, never string-built by callers):
 //!
@@ -36,6 +37,7 @@
 //! and the `ort` linkage proven here becomes session construction.
 
 pub mod download;
+pub mod infer;
 pub mod package;
 pub mod registry;
 

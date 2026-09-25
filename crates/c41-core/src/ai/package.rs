@@ -154,6 +154,21 @@ pub fn variant_string(manifest: &PackageManifest, stem: &str, field: &str) -> Op
         .map(str::to_string)
 }
 
+/// Static input dim from the TOP-LEVEL `input_sizes` only: this is the
+/// NULL-stem lookup `restore.c::_resolve_tile_size` performs for the
+/// denoise task (non-variant tasks pass stem=NULL and a default file, so a
+/// nested `model.*` key is never consulted for them — even when present).
+/// Non-integer entries do not count.
+pub fn top_level_tile_size(manifest: &PackageManifest) -> Option<i64> {
+    manifest
+        .attributes
+        .get("input_sizes")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|n| n.as_i64())
+        .filter(|t| *t > 0)
+}
+
 /// Static input dim for a variant stem: first entry of
 /// `<stem>.input_sizes`, else first entry of top-level `input_sizes`
 /// (restore.c `_resolve_tile_size`). Non-integer entries do not count.
