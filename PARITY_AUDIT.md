@@ -97,7 +97,12 @@ end to end — scaled tiled driver (O=16, `model_x2`/`model_x4` stem ladders,
 output-as-is + inverse gamma), BSRGAN/RealPLKSR download-on-demand,
 task+scale pickers, per-task model lists, `_upscale-2x`/`_upscale-4x` naming
 with has_suffix skip + collision loop, scaled-dims TIFF + import + reload.
-Raw denoise is the last open leg (u7e). | low priority; listed for completeness |
+**Raw denoise landed 2026-09-25 (u7e):** Bayer raw-denoise end to end —
+CFA pack (force-RGGB origin, per-site black/range/WB norm), tiled RawNIND
+inference with PixelShuffle-aware reassembly, match_gain, re-mosaic to a
+minimal CFA DNG writer (no-preview tag set, verified by rawloader decode
+roundtrip), RawDenoise panel task with NIND download-on-demand. Item 2.7
+neural-restore leg CLOSED except the linear raw variant (future). | low priority; listed for completeness |
 
 ## Severity 3 — parity polish
 

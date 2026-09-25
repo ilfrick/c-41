@@ -7016,3 +7016,48 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u7d
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `e21977c1d9`.
+
+### u7e — Bayer raw denoise + CFA DNG writer (2026-09-25 UTC)
+
+**What.** Last open leg of PARITY_AUDIT 2.7 (neural restore): Bayer
+raw-denoise end to end — new `c41-core/src/ai/raw.rs` (CFA origin table +
+force-RGGB crop, per-site `(raw-black)/range*wb` normalize, packed
+half-res planar tiling with O=32, per-tile session run, PixelShuffle-aware
+3ch reassembly, match_gain, re-mosaic with clip + round-half-up, minimal
+CFA DNG writer mirroring the no-preview tag set of
+`dt_imageio_dng_write_cfa_bayer`, CFA metadata sourced from rawloader
+decode) + RawDenoise panel task (model picker over `rawdenoise-*`,
+`_raw-denoise` suffix, `.dng` collision loop, import + reload).
+X-Trans/Foveon/non-Bayer refused honestly; linear variant stays future.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — origin/normalize/gain/remosaic/tiling/DNG tags/
+metadata/refusals/UI all verified cold against C + headers + rawloader
+sources; DNG genuinely round-trips rawloader's parse; scope clean. All
+findings fixed in-session: (1) MAJOR suffix `_rawdenoise` → `_raw-denoise`
+(C `_task_suffix`); the bulk rename also caught a REAL latent bug — the
+release asset is `rawdenoise-nind.dtmodel` (57 MB, verified in the live
+release listing), not the invented `rawdenoise-bayer.dtmodel`, which
+would have made every download miss; sizes pinned from asset fields
+(55 MiB). (2) MAJOR fallback matrix was the INVERSE direction
+(sRGB→XYZ values where DNG ColorMatrix1 needs XYZ→sRGB) → substituted
+`xyz_to_srgb_d65` verbatim + fixed the enshrining test pin (cross-checked
+that rawloader reads the tag verbatim, so the pin is meaningful).
+(3) MINOR output-init now clamps to white like C (margins keep clipped
+source, verified `clip_max == white`). (4) MINOR BaselineExposure
+RATIONAL → SRATIONAL per spec. NITs: black quantize rounds, `w*h*2`
+u32-overflow guarded, UniqueCameraModel loss documented. Post-fix gate
+caught what review couldn't: `u16.min(f32-white)` type error, an invalid
+test-fn identifier from the bulk rename, 4 unresolved `*_raw_denoise_*`
+call sites, a stale ColorMatrix test pin, and one `excessive_precision`
+lint (kept C-verbatim bits behind a justified `#[allow]`). Untracked
+`install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `raw.rs`/`neural.rs` post-fix. `git diff --check` clean;
+no `/*`/`*/` in added lines. Release suites: `c41-core` 1782 passed
+(1757 + 25 new), `c41-db` 97 unchanged, `c41-ui` 485 passed (480 + 5
+new), 0 failed. PARITY_AUDIT.md 2.7 updated in the same commit (raw
+denoise landed; linear variant future).
+Remote CI confirmation follows commit/push per workflow.

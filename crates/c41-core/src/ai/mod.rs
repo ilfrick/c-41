@@ -9,6 +9,10 @@
 //! extracted payload and runs the tiled denoise. There is NO UI here — the
 //! neural-restore panel lives in c41-ui and drives `infer`.
 //!
+//! `raw` is the u7e Bayer raw-denoise leg on the same session idiom: CFA
+//! mosaic in, CFA mosaic out, plus the minimal CFA DNG writer that carries
+//! the result back into the catalogue.
+//!
 //! Store layout (all paths derived here, never string-built by callers):
 //!
 //! * Downloaded archives live under `$XDG_DATA_HOME/c41/models/<asset-name>`
@@ -42,6 +46,7 @@ pub mod detail;
 pub mod download;
 pub mod infer;
 pub mod package;
+pub mod raw;
 pub mod registry;
 
 /// Proves the ONNX Runtime linkage: returns the ORT release line this
