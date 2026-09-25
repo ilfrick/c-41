@@ -6931,3 +6931,43 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u7b
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `40b9cd9a66`.
+
+### u7c — detail recovery + before/after split (2026-09-25 UTC)
+
+**What.** Neural-restore polish on the u7b denoise path: wavelet detail
+recovery + split preview — new `c41-core/src/ai/detail.rs`
+(`apply_detail_recovery`: Rec.709 luma residual orig−den, f64
+population-sigma × [0.25,0.15,0.05,0.02,0.01] adaptive noise, in-place
+5-band `dwt::denoise`, `denoised + alpha·residual` blend; alpha=0
+short-circuits bit-exact) + panel Strength slider (0..100, default 100,
+`alpha = 1 − strength/100`, 50 ms debounce, serialised busy/pending/seq
+workers) + before/after split preview (DrawingArea, draggable divider,
+repaint-only) in `crates/c41-ui/src/neural.rs`. Strength moves re-blend
+with NO re-inference and overwrite the same TIFF in place (no re-import);
+`thumbs::evict_path` (new) evicts the path from the pixel cache before
+the grid reload so the new bytes show. Raw denoise / upscale stay future.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**BLOCK** — one real defect: in-place TIFF overwrite without cache
+eviction leaves the grid painting STALE bytes (pixel cache keys
+`(path,bucket)` with no mtime check; `fill_grid` only clears failures).
+Fixed in-session (`evict_path` on the main-thread continuation before
+`on_done`; module doc corrected — it had claimed the reload sufficed).
+Also fixed: (MINOR) parked strength lost on run-failure — drain-and-kick
+on stale completions AND run failure (verified convergence: kicks
+re-check busy/cache, run success resets slider+pending); NITs (scale-floor
+doc attribution, alpha-contract line). Verified no-action: adaptive-noise
+hardening (stricter than C, bit-identical otherwise), test-value
+independence (adequate pins present). Post-fix gate caught what review
+couldn't: five `chunks_exact`-with-constant lints in new code → `as_chunks`
+form per house rule (m4-229 lesson). Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `detail.rs`/`neural.rs`/`thumbs.rs` new ranges post-fix.
+`git diff --check` clean; no `/*`/`*/` in added lines. Release suites:
+`c41-core` 1741 passed (1733 + 8 new), `c41-db` 97 unchanged, `c41-ui`
+473 passed (461 + 12 new), 0 failed. PARITY_AUDIT.md 2.7 updated in the
+same commit (detail + split landed; raw/upscale still future).
+Remote CI confirmation follows commit/push per workflow.

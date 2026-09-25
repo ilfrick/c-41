@@ -585,6 +585,17 @@ pub(crate) fn clear_failed() {
     FAILED.with(|f| f.borrow_mut().clear());
 }
 
+/// Forget every cached entry for `path`, across all buckets. Called after an
+/// in-place rewrite (the neural-restore strength re-blend overwrites its
+/// result TIFF): the pixel cache is keyed `(path, bucket)` with no mtime
+/// check, so without this the grid would repaint stale bytes until eviction
+/// or restart. Main-thread only, like every other piece of session state.
+pub(crate) fn evict_path(path: &str) {
+    CACHE.with(|c| {
+        c.borrow_mut().retain(|e| e.key.0 != path);
+    });
+}
+
 // ── In-flight dedupe ────────────────────────────────────────────────────────
 
 thread_local! {

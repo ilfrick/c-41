@@ -1,5 +1,7 @@
 //! AI model infrastructure (u7a, parity audit 2.7 neural-restore leg) plus the
-//! u7b RGB-denoise inference on top of it.
+//! u7b RGB-denoise inference on top of it, plus the u7c DWT detail
+//! recovery (`detail`) that re-blends filtered original texture into the
+//! denoised frame under the panel Strength slider.
 //!
 //! `registry` finds model releases, `download` streams them with sha256
 //! verification into the store, `package` unpacks and interprets the
@@ -36,6 +38,7 @@
 //! (tile size per variant stem) plus the extracted `.onnx` payload path,
 //! and the `ort` linkage proven here becomes session construction.
 
+pub mod detail;
 pub mod download;
 pub mod infer;
 pub mod package;
