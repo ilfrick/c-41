@@ -7011,4 +7011,8 @@ diagnostics in `infer.rs`/`package.rs`/`neural.rs` u7d ranges post-fix.
 `c41-db` 97 unchanged, `c41-ui` 480 passed (473 + 7 new), 0 failed.
 PARITY_AUDIT.md 2.7 updated in the same commit (upscale landed; raw
 denoise last open).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `e21977c1d9` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u7d
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`e21977c1d9`.
