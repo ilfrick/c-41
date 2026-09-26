@@ -1,13 +1,14 @@
-//! Neural restore panel (u7b + u7c + u7d + u7e): the "Neural restore"
-//! sidebar section that runs the RGB denoise, upscale and Bayer raw-denoise
-//! tasks on the selected image.
+//! Neural restore panel (u7b + u7c + u7d + u7e + u7f): the "Neural restore"
+//! sidebar section that runs the RGB denoise, upscale, Bayer raw-denoise
+//! and linear (X-Trans) raw-denoise tasks on the selected image.
 //!
 //! darktable's neural-restore lib (src/libs/neural_restore.c) drives the AI
 //! denoise/raw-denoise/upscale tasks from the lighttable. This panel covers
 //! **Denoise** (u7b) plus its **Strength slider and before/after split
-//! preview** (u7c), **Upscale 2x/4x** (u7d), and **Raw denoise for Bayer
-//! sensors** (u7e). X-Trans/Foveon sensors stay honestly refused (a status
-//! line, never a crash); the linear (demosaiced) raw variant is future work.
+//! preview** (u7c), **Upscale 2x/4x** (u7d), **Raw denoise for Bayer
+//! sensors** (u7e) and **linear raw denoise for X-Trans sensors** (u7f).
+//! Foveon/stacked sensors stay honestly refused (a status line, never a
+//! crash).
 //!
 //! The Run path mirrors the export flow: decode the source to linear RGBA,
 //! call [`c41_core::ai::infer::denoise_rgb`] (the tiled ORT run), encode the
@@ -689,47 +690,108 @@ fn run_upscale_worker(
     Ok((RunReport { out_path: dest, imported }, result))
 }
 
-/// The whole raw-denoise run for one image (u7e): load the Bayer mosaic +
-/// metadata → prepare the `model_bayer` variant →
-/// [`c41_core::ai::raw::rawdenoise_bayer`] (tiled ORT inference, progress
-/// forwarded) → write the denoised CFA beside the source as
-/// `<stem>_raw-denoise.dng` through the minimal CFA DNG writer → register
-/// it with the catalogue. Runs entirely on a blocking worker; GTK is never
-/// touched here. A non-Bayer sensor (or anything else unloadable) is an
-/// `Err` carrying the honest message the status line shows — never a
-/// crash. There is deliberately NO blend cache and NO split preview: raw
-/// denoise has no Strength re-blend (the C previews it through the pipe,
-/// which this panel does not run).
+/// The whole raw-denoise run for one image (u7e Bayer, u7f linear):
+/// sensor-dispatched source load → variant model prepare → tiled ORT
+/// inference → DNG beside the source through the minimal DNG writers →
+/// register it with the catalogue. Runs entirely on a blocking worker; GTK
+/// is never touched here. Foveon/stacked sensors (and anything else
+/// unloadable) are an `Err` carrying the honest message the status line
+/// shows — never a crash. There is deliberately NO blend cache and NO split
+/// preview: raw denoise has no Strength re-blend (the C previews it through
+/// the pipe, which this panel does not run).
 fn run_raw_denoise_worker(
     path: &str,
     db: &str,
     model_name: &str,
     progress: impl FnMut(u32, u32),
 ) -> Result<RunReport, String> {
-    let src = c41_core::ai::raw::load_bayer_source(std::path::Path::new(path))
+    use c41_core::ai::raw::RawDenoiseSource;
+    let src = c41_core::ai::raw::load_rawdenoise_source(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
-    let prepared = c41_core::ai::raw::prepare_rawdenoise_model(model_name)
-        .map_err(|e| format!("model prepare: {e}"))?;
-    let out_cfa = c41_core::ai::raw::rawdenoise_bayer(
-        &src.raw,
-        src.w,
-        src.h,
-        src.pattern,
-        src.black,
-        src.white,
-        src.wb,
-        &prepared.onnx_path,
-        prepared.tile_size,
-        progress,
-    )
-    .map_err(|e| format!("inference: {e}"))?;
-    let meta = c41_core::ai::raw::DngMeta::from_source(&src);
-    let dest = match unique_output_path_with_ext(&task_output_stem(path, NeuralTask::RawDenoise), "dng") {
-        Some(d) => d,
-        None => return Err("too many output files beside the source".to_string()),
+    // The DNG writer + suffix are shared by both sensor pipelines; only the
+    // inference input and the payload differ.
+    let dest = match src {
+        RawDenoiseSource::Bayer(src) => {
+            let prepared = c41_core::ai::raw::prepare_rawdenoise_model(model_name)
+                .map_err(|e| format!("model prepare: {e}"))?;
+            let out_cfa = c41_core::ai::raw::rawdenoise_bayer(
+                &src.raw,
+                src.w,
+                src.h,
+                src.pattern,
+                src.black,
+                src.white,
+                src.wb,
+                &prepared.onnx_path,
+                prepared.tile_size,
+                progress,
+            )
+            .map_err(|e| format!("inference: {e}"))?;
+            let meta = c41_core::ai::raw::DngMeta::from_source(&src);
+            let dest = match unique_output_path_with_ext(&task_output_stem(path, NeuralTask::RawDenoise), "dng") {
+                Some(d) => d,
+                None => return Err("too many output files beside the source".to_string()),
+            };
+            c41_core::ai::raw::write_cfa_dng(
+                std::path::Path::new(&dest),
+                &out_cfa,
+                src.w,
+                src.h,
+                &meta,
+            )
+            .map_err(|e| format!("write dng: {e}"))?;
+            dest
+        }
+        RawDenoiseSource::Linear(src) => {
+            let prepared = c41_core::ai::raw::prepare_rawdenoise_linear_model(model_name)
+                .map_err(|e| format!("model prepare: {e}"))?;
+            let wb = c41_core::ai::raw::resolve_linear_wb(
+                prepared.knobs.wb_mode,
+                src.xyz_to_cam,
+                src.wb_coeffs,
+            );
+            let (cam_to_input, input_to_cam) =
+                match c41_core::ai::raw::build_cam_matrices(src.xyz_to_cam, prepared.knobs.colorspace)
+                {
+                    Some(m) => m,
+                    None => {
+                        return Err("model prepare: no camRGB matrices for this file".to_string())
+                    }
+                };
+            let absolute = matches!(
+                prepared.knobs.output_scale,
+                c41_core::ai::raw::LinearOutputScale::Absolute
+            );
+            let out_rgb = c41_core::ai::raw::rawdenoise_linear(
+                &src.rgb,
+                src.w,
+                src.h,
+                wb,
+                cam_to_input,
+                input_to_cam,
+                prepared.knobs.target_mean,
+                absolute,
+                &prepared.onnx_path,
+                prepared.tile_size,
+                progress,
+            )
+            .map_err(|e| format!("inference: {e}"))?;
+            let meta = c41_core::ai::raw::LinearDngMeta::from_linear_source(&src);
+            let dest = match unique_output_path_with_ext(&task_output_stem(path, NeuralTask::RawDenoise), "dng") {
+                Some(d) => d,
+                None => return Err("too many output files beside the source".to_string()),
+            };
+            c41_core::ai::raw::write_linear_dng(
+                std::path::Path::new(&dest),
+                &out_rgb,
+                src.w,
+                src.h,
+                &meta,
+            )
+            .map_err(|e| format!("write dng: {e}"))?;
+            dest
+        }
     };
-    c41_core::ai::raw::write_cfa_dng(std::path::Path::new(&dest), &out_cfa, src.w, src.h, &meta)
-        .map_err(|e| format!("write dng: {e}"))?;
     let dir = std::path::Path::new(&dest)
         .parent()
         .map(|p| p.to_string_lossy().to_string())
@@ -1142,9 +1204,9 @@ pub fn neural_restore_box(
     hint.add_css_class("dim-label");
     panel.append(&hint);
 
-    // Task rows: Denoise is live (u7b), Upscale 2x/4x is live (u7d) and Raw
-    // denoise is live for Bayer sensors (u7e; X-Trans stays refused with a
-    // status line). The denoise toggle is an `adw::SwitchRow` because that
+    // Task rows: Denoise is live (u7b), Upscale 2x/4x is live (u7d), Raw
+    // denoise is live for Bayer (u7e) and X-Trans via the linear variant
+    // (u7f; Foveon stays refused with a status line). The denoise toggle is an `adw::SwitchRow` because that
     // is the one widget whose `active`-property notify connect the tree
     // already proves (export_panel.rs `resize_row.connect_active_notify`);
     // `gtk4::Switch` has `is_active`/`set_active` but no notify hook in

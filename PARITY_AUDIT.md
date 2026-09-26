@@ -101,8 +101,11 @@ with has_suffix skip + collision loop, scaled-dims TIFF + import + reload.
 CFA pack (force-RGGB origin, per-site black/range/WB norm), tiled RawNIND
 inference with PixelShuffle-aware reassembly, match_gain, re-mosaic to a
 minimal CFA DNG writer (no-preview tag set, verified by rawloader decode
-roundtrip), RawDenoise panel task with NIND download-on-demand. Item 2.7
-neural-restore leg CLOSED except the linear raw variant (future). | low priority; listed for completeness |
+roundtrip), RawDenoise panel task with NIND download-on-demand.
+**Linear raw variant landed 2026-09-26 (u7f):** X-Trans/non-Bayer sensors
+route to demosaiced linear camRGB inference (WB/matrix/boost/match_gain/
+inversion per `restore_raw_linear`) with LinearRaw DNG output. Item 2.7
+neural-restore leg CLOSED. | low priority; listed for completeness |
 
 ## Severity 3 — parity polish
 

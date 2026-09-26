@@ -7065,3 +7065,36 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u7e
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `e7150e8e7a`.
+
+### u7f — linear raw variant for X-Trans/non-Bayer (2026-09-26 UTC)
+
+**What.** Last open leg of PARITY_AUDIT 2.7: X-Trans and other demosaicable
+non-Bayer sensors route to demosaiced linear camRGB inference instead of
+refusal — `load_rawdenoise_source` dispatches on CFA kind (Bayer →
+existing packed path; X-Trans → new linear path; Foveon/stacked still
+refused). Core linear pipeline in `ai/raw.rs` (WB resolve default
+as-shot, camRGB→input-space matrices, exposure boost to 0.30 unless
+null, per-tile gain, folded M inversion) + LinearRaw DNG writer
+(`build_linear_dng`, tag set mirroring `dt_imageio_dng_write_linear`) +
+`run_raw_denoise_worker` dispatch in `neural.rs`. Item 2.7 CLOSED.
+
+**Review.** Independent-reviewer subagents were unreachable this session
+(provider timeouts on every attempt), so verification was done directly
+by the main session instead — documented here rather than claimed as a
+third-party review: (1) linear contract spot-checked against
+`restore.h:175-200` (WB-first, matrix, boost-to-0.30-unless-null,
+match_gain-unless-absolute, invert) and `restore_raw_linear.c` key
+functions; (2) UI dispatch compiles and routes (gate green); (3) the
+prior session's 44 core tests (tiling/WB/matrix/boost/gain/inversion/
+DNG roundtrip) all pass unmodified; (4) clippy zero-new. Residual risk
+stated plainly: no cold second pair of eyes on the linear math — the
+mitigation is the passing test suite plus the small, review-shaped diff
+(UI dispatch only; core was already in-tree).
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `raw.rs`/`neural.rs` post-fix. `git diff --check` clean;
+no `/*`/`*/` in added lines. Release suites: `c41-core` 1801 passed,
+`c41-db` 97 unchanged, `c41-ui` 485 passed, 0 failed. PARITY_AUDIT.md 2.7
+updated in the same commit (neural-restore leg fully closed).
+Remote CI confirmation follows commit/push per workflow.
