@@ -7102,3 +7102,15 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u7f
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `4c8c8aa664`.
+
+### UI parity closed (2026-09-26 UTC)
+
+**What.** With u7f green on both remotes, every UI-parity leg from the
+2026-08-31 deferred scope is landed: geotagging (u2), print-to-PDF (u1),
+map list + slippy canvas (u3/u5), tethering shell + watch-folder + live
+capture (u4/u6), neural-restore infra + denoise + detail/split + upscale
++ Bayer raw + linear raw (u7a–u7f). PARITY_AUDIT.md items 2.7 and 3.4
+marked CLOSED (plus a closure note on the 08-31 deferral itself);
+RUST_MIGRATION_PLAN.md item C marked DONE. No code in this commit beyond
+the audit/plan/log updates — verification is the green u7f CI already
+confirmed on both remotes.

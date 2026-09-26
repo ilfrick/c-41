@@ -22,7 +22,10 @@ Work front splits into four tiers:
 - **B. Dependent `src/iop` loop ports** (13 stubbed IOP modules) — unblocked once
   their blocking shared-infra kernels from (A) exist; ported thereafter.
 - **C. UI parity** (`PARITY_AUDIT.md`: severity 1.9 geotagging/neural-restore
-  panel, 3.4 map/print/tethering views) — **deferred for later evaluation**.
+  panel, 3.4 map/print/tethering views) — **DONE 2026-09-26** (was deferred;
+  landed as u1–u7f: print, geotagging, map list + slippy canvas, tethering
+  shell + watch + live capture, neural-restore infra + denoise + detail/split
+  + upscale + raw + linear).
 - **D. `ROADMAP.md` Lightroom-gap features** (face recognition, cloud sync,
   mobile companion, AI tagging) — unchanged, future work.
 
