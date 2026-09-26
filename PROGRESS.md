@@ -7097,4 +7097,8 @@ diagnostics in `raw.rs`/`neural.rs` post-fix. `git diff --check` clean;
 no `/*`/`*/` in added lines. Release suites: `c41-core` 1801 passed,
 `c41-db` 97 unchanged, `c41-ui` 485 passed, 0 failed. PARITY_AUDIT.md 2.7
 updated in the same commit (neural-restore leg fully closed).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `4c8c8aa664` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u7f
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`4c8c8aa664`.
