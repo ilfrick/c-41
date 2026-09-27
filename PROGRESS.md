@@ -7194,7 +7194,9 @@ modules alone right) before commit.
 **Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
 tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 97,
 `c41-ui` 500, 0 failed. `git diff --check` clean.
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `53066195f7` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c skipped, `CMake + Rust workspace`
+path-filtered out (Rust-only change). Both remotes verified at `53066195f7`.
 
 ### UI parity closed (2026-09-26 UTC)
 
