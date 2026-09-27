@@ -7257,6 +7257,33 @@ Remote CI on `e576d89a40` is green: `check + test + clippy` and `Build & push
 Docker image` both `success`; matrix/full-c skipped, `CMake + Rust workspace`
 path-filtered out (Rust-only change). Both remotes verified at `e576d89a40`.
 
+### w4 — per-module reset button (2026-09-27 UTC)
+
+**What.** Every live module header gets a small reset icon (darktable's reset
+button, RESET ONLY — no presets, no multi-instance): `reset_module` resets
+exactly that module's `PreviewParams` fields (all 236 fields partitioned
+across 34 module arms, verified one-owner), records `"Reset <name>"`, rebuilds
+the panel so the switch + sliders follow, and re-renders (highlights
+re-decodes through its pre-demosaic path). Inert/elsewhere rows get none; the
+enable switch / expansion semantics are untouched.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — the 34 reset arms are an exact non-overlapping
+partition of all 236 fields (verified programmatically and against
+`describe_change` and the UI write-sites); no clobber, no double-owner;
+history wording/ordering/dedup and rebuild-reentrancy verified against the
+global Reset and snapshot-remove precedents. One MINOR (future-regression
+guard) addressed in-session with an exhaustive `PreviewParams` destructure
+test mirroring `history.rs`'s compile-time drift guard; the two NITs
+(no-op reset doesn't clear the before/after peek; `basicadj_preserve_colors`
+reset though not slider-driven) dispositioned as deliberate. Visually verified
+with the Xvfb rig: reset icons render on live rows, none on inert rows.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 97,
+`c41-ui` 508 (503 + 5 new reset tests), 0 failed. `git diff --check` clean.
+Remote CI confirmation follows commit/push per workflow.
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the

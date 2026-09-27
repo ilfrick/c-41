@@ -235,6 +235,18 @@ struct PreviewCtx {
     module_filter: Rc<std::cell::Cell<ModuleFilter>>,
     /// Module-list search text, same session-only lifetime as `module_filter`.
     module_search: Rc<RefCell<String>>,
+    /// The rebuildable modules box (see [`build_modules_panel`]). Weak so the
+    /// per-module reset can clear + repopulate it (the same mechanism the global
+    /// Reset uses) without a widget→closure→widget cycle. Set once when the
+    /// panel is built; empty in contexts created before that (which never reset).
+    panel_box: glib::WeakRef<gtk4::Box>,
+    /// The history list, refreshed after a per-module reset records its explicit
+    /// entry. Built before `ctx`, so seeded at construction.
+    history_list: glib::WeakRef<gtk4::ListBox>,
+    /// The before/after toggle. A per-module reset clears the peek like the
+    /// global Reset does, so the two paths leave the viewport in the same state.
+    /// Set once after the button is built (before the modules are built).
+    before_after: glib::WeakRef<gtk4::ToggleButton>,
 }
 
 /// Debounced recorder that appends one [`HistoryStack`] entry per *settled* edit
@@ -1216,6 +1228,9 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         db_path: Rc::from(db_path),
         module_filter: Rc::new(std::cell::Cell::new(ModuleFilter::All)),
         module_search: Rc::new(RefCell::new(String::new())),
+        panel_box: glib::WeakRef::new(),
+        history_list: history_list.downgrade(),
+        before_after: glib::WeakRef::new(),
     };
     // Show the seed entry immediately.
     refresh_history_list(&history_list, &ctx.history.borrow());
@@ -1337,11 +1352,9 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .build();
     image_area.append(&image_overlay);
 
-    // ── IOP module list (right panel) — hosts the live param widgets ───────
-    let (modules_panel, panel_box) = build_modules_panel(&ctx);
-
-    // Before/after toggle (created here so the history handlers below can clear
-    // its bypass state on restore; packed into the header later).
+    // Before/after toggle (built before the module list so a per-module reset
+    // handler can clear its bypass state and keep the toggle visual in sync;
+    // packed into the header later).
     let before_after_btn = gtk4::ToggleButton::builder()
         .icon_name("view-reveal-symbolic")
         .tooltip_text("Show original (before/after)")
@@ -1349,11 +1362,15 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // Tooltips aren't reliably exposed as the accessible name for icon-only
     // buttons, so set it explicitly.
     before_after_btn.update_property(&[gtk4::accessible::Property::Label("Show original")]);
+    ctx.before_after.set(Some(&before_after_btn));
     let before_after_ctx = ctx.clone();
     before_after_btn.connect_toggled(move |b| {
         before_after_ctx.bypass.set(b.is_active());
         render_preview(&before_after_ctx);
     });
+
+    // ── IOP module list (right panel) — hosts the live param widgets ───────
+    let (modules_panel, panel_box) = build_modules_panel(&ctx);
 
     // ── History panel (above the modules) — click an entry to jump to it ───
     // One `row-activated` handler (set here, never rebuilt) restores that entry's
@@ -2017,6 +2034,10 @@ fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
         .margin_start(12)
         .margin_end(12)
         .build();
+    // Record the box in `ctx` before the rows are built: every row's reset
+    // handler (and the later Reset / undo / style rebuilds) clears + refills
+    // this same box, so all paths share one panel handle.
+    ctx.panel_box.set(Some(&panel));
     populate_modules(&panel, ctx);
 
     // Scrollable so the (long) module list never blows out the window height.
@@ -2489,6 +2510,319 @@ const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Mon
 // takes a short-lived `borrow_mut()` (dropped at the statement end) before
 // `render_preview(&ctx)` snapshots params, so the two never overlap.
 
+/// Reset one live module's [`PreviewParams`] fields to their darktable defaults,
+/// leaving every other module's fields untouched — the per-module equivalent of
+/// the global Reset. `which` is the module's catalog label (the same string the
+/// row is titled with). Returns `false` for an unknown label so a caller can
+/// skip the rebuild.
+///
+/// The field groups mirror [`crate::history::describe_change`] exactly (same
+/// modules, same fields, plus `basicadj_hlcomprthresh`, which is a module field
+/// even though it has no slider), so a reset module can never land in a state
+/// the history labeler still reports as edited. Pure, so per-module isolation
+/// is unit-tested without a display.
+fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
+    let d = PreviewParams::default();
+    // Copy the named fields from the defaults; the local macro keeps each arm a
+    // flat field list (and stops a stray typo from compiling to a no-op).
+    macro_rules! set {
+        ($($f:ident),* $(,)?) => {{ $(params.$f = d.$f;)* }};
+    }
+    match which {
+        "Exposure" => set!(exposure_on, ev, black),
+        "Velvia" => set!(velvia_on, velvia_strength, velvia_bias),
+        "Split-toning" => set!(
+            split_on,
+            split_shadow_hue,
+            split_shadow_sat,
+            split_highlight_hue,
+            split_highlight_sat,
+            split_balance,
+            split_compress
+        ),
+        "Monochrome" => set!(mono_on, mono_r, mono_g, mono_b),
+        "Sigmoid" => set!(sigmoid_on, sigmoid_contrast, sigmoid_skew),
+        "Sharpen" => set!(sharpen_on, sharpen_radius, sharpen_amount, sharpen_threshold),
+        "Vibrance" => set!(vibrance_on, vibrance_amount),
+        "Color contrast" => set!(
+            color_contrast_on,
+            color_contrast_a_steepness,
+            color_contrast_b_steepness
+        ),
+        "Color correction" => set!(
+            color_correction_on,
+            color_correction_loa,
+            color_correction_hia,
+            color_correction_lob,
+            color_correction_hib,
+            color_correction_saturation
+        ),
+        "Color zones" => set!(
+            colorzones_on,
+            colorzones_strength,
+            colorzones_channel,
+            colorzones_mode,
+            colorzones_num_nodes,
+            colorzones_curve_type,
+            colorzones_curve_x,
+            colorzones_curve_y
+        ),
+        "Levels" => set!(levels_on, levels_black, levels_grey, levels_white),
+        "Vignetting" => set!(
+            vignette_on,
+            vignette_scale,
+            vignette_falloff,
+            vignette_brightness,
+            vignette_saturation,
+            vignette_center_x,
+            vignette_center_y,
+            vignette_shape
+        ),
+        "Lowlight vision" => set!(lowlight_on, lowlight_blueness, lowlight_transition),
+        "Graduated density" => set!(
+            gradnd_on,
+            gradnd_density,
+            gradnd_hardness,
+            gradnd_rotation,
+            gradnd_offset,
+            gradnd_hue,
+            gradnd_saturation
+        ),
+        "Contrast brightness saturation" => {
+            set!(colisa_on, colisa_contrast, colisa_brightness, colisa_saturation)
+        }
+        "Basic adjustments" => set!(
+            basicadj_on,
+            basicadj_black_point,
+            basicadj_exposure,
+            basicadj_hlcompr,
+            basicadj_hlcomprthresh,
+            basicadj_contrast,
+            basicadj_preserve_colors,
+            basicadj_middle_grey,
+            basicadj_brightness,
+            basicadj_saturation,
+            basicadj_vibrance
+        ),
+        "Shadows/Highlights" => set!(
+            shadhi_on,
+            shadhi_shadows,
+            shadhi_highlights,
+            shadhi_whitepoint,
+            shadhi_radius,
+            shadhi_compress,
+            shadhi_shadows_ccorrect,
+            shadhi_highlights_ccorrect
+        ),
+        "Local contrast" => set!(lc_on, lc_midtone, lc_shadows, lc_highlights, lc_detail),
+        "Lowpass" => set!(
+            lowpass_on,
+            lowpass_radius,
+            lowpass_contrast,
+            lowpass_brightness,
+            lowpass_saturation
+        ),
+        "Primaries" => set!(
+            primaries_on,
+            primaries_achromatic_tint_hue,
+            primaries_achromatic_tint_purity,
+            primaries_red_hue,
+            primaries_red_purity,
+            primaries_green_hue,
+            primaries_green_purity,
+            primaries_blue_hue,
+            primaries_blue_purity
+        ),
+        "Negadoctor" => set!(
+            negadoctor_on,
+            negadoctor_film_stock,
+            negadoctor_dmin_r,
+            negadoctor_dmin_g,
+            negadoctor_dmin_b,
+            negadoctor_wb_high_r,
+            negadoctor_wb_high_g,
+            negadoctor_wb_high_b,
+            negadoctor_wb_low_r,
+            negadoctor_wb_low_g,
+            negadoctor_wb_low_b,
+            negadoctor_d_max,
+            negadoctor_offset,
+            negadoctor_black,
+            negadoctor_gamma,
+            negadoctor_soft_clip,
+            negadoctor_exposure
+        ),
+        "Tone equalizer" => set!(
+            toneeq_on,
+            toneeq_noise,
+            toneeq_ultra_deep_blacks,
+            toneeq_deep_blacks,
+            toneeq_blacks,
+            toneeq_shadows,
+            toneeq_midtones,
+            toneeq_highlights,
+            toneeq_whites,
+            toneeq_speculars
+        ),
+        "Color balance RGB" => set!(
+            cb_on,
+            cb_shadows_y,
+            cb_shadows_c,
+            cb_shadows_h,
+            cb_midtones_y,
+            cb_midtones_c,
+            cb_midtones_h,
+            cb_highlights_y,
+            cb_highlights_c,
+            cb_highlights_h,
+            cb_global_y,
+            cb_global_c,
+            cb_global_h,
+            cb_shadows_weight,
+            cb_white_fulcrum,
+            cb_highlights_weight,
+            cb_chroma_shadows,
+            cb_chroma_highlights,
+            cb_chroma_global,
+            cb_chroma_midtones,
+            cb_saturation_global,
+            cb_saturation_highlights,
+            cb_saturation_midtones,
+            cb_saturation_shadows,
+            cb_hue_angle,
+            cb_brilliance_global,
+            cb_brilliance_highlights,
+            cb_brilliance_midtones,
+            cb_brilliance_shadows,
+            cb_mask_grey_fulcrum,
+            cb_vibrance,
+            cb_grey_fulcrum,
+            cb_contrast,
+            cb_formula
+        ),
+        "Filmic RGB" => set!(
+            filmic_on,
+            filmic_black_point_source,
+            filmic_white_point_source,
+            filmic_output_power,
+            filmic_latitude,
+            filmic_contrast,
+            filmic_balance,
+            filmic_saturation
+        ),
+        "Highlight reconstruction" => set!(hl_on, hl_opposed, hl_clip),
+        "Denoise (profiled)" => set!(dn_on, dn_mode_y0u0v0, dn_strength, dn_shadows, dn_bias),
+        "Lens correction" => set!(
+            lens_on,
+            lens_inverse,
+            lens_modify_flags,
+            lens_scale,
+            lens_focal,
+            lens_aperture,
+            lens_distance,
+            lens_target_geom
+        ),
+        "Bloom" => set!(bl_on, bl_size, bl_threshold, bl_strength),
+        "Tone curve" => set!(
+            tc_on,
+            tc_type,
+            tc_autoscale,
+            tc_unbound,
+            tc_preserve,
+            tc_nnodes,
+            tc_nodes_l
+        ),
+        "RGB curve" => set!(
+            rc_on,
+            rc_type_r,
+            rc_type_g,
+            rc_type_b,
+            rc_autoscale,
+            rc_preserve,
+            rc_nnodes_r,
+            rc_nnodes_g,
+            rc_nnodes_b,
+            rc_nodes_r,
+            rc_nodes_g,
+            rc_nodes_b
+        ),
+        "Base curve" => set!(
+            bc_on,
+            bc_type,
+            bc_preserve,
+            bc_nnodes,
+            bc_exposure_fusion,
+            bc_exposure_stops,
+            bc_exposure_bias,
+            bc_nodes
+        ),
+        "White balance" => set!(temperature_on, temperature_r, temperature_g, temperature_b),
+        "Invert" => set!(invert_on, invert_r, invert_g, invert_b),
+        "Colorize" => set!(
+            colorize_on,
+            colorize_hue,
+            colorize_sat,
+            colorize_lightness,
+            colorize_lightness_mix
+        ),
+        _ => return false,
+    }
+    true
+}
+
+/// Reset one module to its defaults and bring the UI back in sync: write the
+/// module's default fields, exit the before/after peek (like the global Reset),
+/// record an explicitly labelled `Reset <module>` history entry, clear and
+/// repopulate the modules panel so the row's switch + sliders show the defaults
+/// (the same full-rebuild mechanism the global Reset uses), then re-render.
+///
+/// `re_decode` selects the render path: `false` for a pipeline module
+/// ([`render_preview`]); `true` for Highlight reconstruction, whose params feed
+/// the pre-demosaic raw decode ([`spawn_decode`]).
+///
+/// A no-op (no rebuild, no history entry) when the module is already at its
+/// defaults, so clicking reset on an untouched module does nothing.
+fn reset_module_and_rebuild(ctx: &PreviewCtx, which: &str, re_decode: bool) {
+    let before = *ctx.params.borrow();
+    {
+        let mut p = ctx.params.borrow_mut();
+        if !reset_module(&mut p, which) {
+            return; // not a resettable module
+        }
+    }
+    if *ctx.params.borrow() == before {
+        return; // already at defaults — nothing changed
+    }
+    ctx.bypass.set(false); // exit the before/after peek, like the global Reset
+    if let Some(ba) = ctx.before_after.upgrade() {
+        ba.set_active(false); // keep the toggle visual in sync with bypass
+    }
+    // Explicit label: the render's debounced recorder would otherwise name the
+    // module via `describe_change`; "Reset Exposure" says what happened. The
+    // recorder dedups against this entry when the render settles.
+    let snapshot = *ctx.params.borrow();
+    let changed = ctx
+        .history
+        .borrow_mut()
+        .record(format!("Reset {which}"), snapshot);
+    if changed {
+        if let Some(list) = ctx.history_list.upgrade() {
+            refresh_history_list(&list, &ctx.history.borrow());
+        }
+    }
+    if let Some(panel) = ctx.panel_box.upgrade() {
+        while let Some(child) = panel.first_child() {
+            panel.remove(&child);
+        }
+        populate_modules(&panel, ctx);
+    }
+    if re_decode {
+        spawn_decode(ctx);
+    } else {
+        render_preview(ctx);
+    }
+}
+
 /// Build a live `ExpanderRow` for one IOP module: single-line title (no
 /// subtitle line, like darktable's icon + name + enable-switch header), a
 /// built-in enable switch wired to `set_enabled`, and the param sliders added
@@ -2517,6 +2851,25 @@ fn module_expander(
         set_enabled(&mut ctx_cl.params.borrow_mut(), e.enables_expansion());
         render_preview(&ctx_cl);
     });
+    // Per-module reset (w4): a small icon button in the header, like
+    // darktable's reset. It resets ONLY this module's fields to their defaults
+    // (via `reset_module`), records "Reset <title>", rebuilds the panel so the
+    // switch + sliders follow, and re-renders. The enable switch and expansion
+    // semantics are untouched — this is a separate suffix button.
+    let reset = gtk4::Button::builder()
+        .icon_name("edit-clear-symbolic")
+        .tooltip_text(format!("Reset {title} to defaults"))
+        .has_frame(false)
+        .valign(gtk4::Align::Center)
+        .build();
+    let reset_label = format!("Reset {title}");
+    reset.update_property(&[gtk4::accessible::Property::Label(reset_label.as_str())]);
+    let reset_ctx = ctx.clone();
+    let reset_title = title.to_string();
+    reset.connect_clicked(move |_| {
+        reset_module_and_rebuild(&reset_ctx, &reset_title, false);
+    });
+    expander.add_suffix(&reset);
     add_params(&expander, ctx);
     expander
 }
@@ -3383,6 +3736,23 @@ fn highlights_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         *c_debounce.borrow_mut() = Some(id);
     });
     expander.add_row(&clip.row);
+    // Per-module reset (w4): reset the pre-demosaic params and re-decode (this
+    // module's only render path — see the row doc). Same helper the pipeline
+    // modules use, with `re_decode = true`.
+    let reset = gtk4::Button::builder()
+        .icon_name("edit-clear-symbolic")
+        .tooltip_text("Reset Highlight reconstruction to defaults")
+        .has_frame(false)
+        .valign(gtk4::Align::Center)
+        .build();
+    reset.update_property(&[gtk4::accessible::Property::Label(
+        "Reset Highlight reconstruction",
+    )]);
+    let reset_ctx = ctx.clone();
+    reset.connect_clicked(move |_| {
+        reset_module_and_rebuild(&reset_ctx, "Highlight reconstruction", true);
+    });
+    expander.add_suffix(&reset);
     expander
 }
 
@@ -4191,5 +4561,644 @@ mod tests {
         // inert rows even when the query matches their label).
         assert!(!module_filter_matches(ModuleFilter::Active, 4, "Grain", "gra"));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Bloom", "loo"));
+    }
+
+    /// Distinctive non-default value used by the reset tests. Must differ from
+    /// every field's default; checked implicitly by the mutation tests (a field
+    /// already at `M` would make a mutation a no-op and fail `assert_ne!`).
+    const M: f32 = 1.234_567;
+
+    /// One mutation per live module, setting *every* field of that module to a
+    /// fixed non-default value. Idempotent (fixed assignments, not increments),
+    /// so re-applying it after a reset is a no-op iff the reset left the module
+    /// alone — that is what the no-clobber test relies on. Kept separate from
+    /// `reset_module`'s arms on purpose: it is an independent oracle.
+    const MODULE_MUTATIONS: &[(&str, fn(&mut PreviewParams))] = &[
+        ("Exposure", |p| {
+            p.exposure_on = false;
+            p.ev = M;
+            p.black = M;
+        }),
+        ("Velvia", |p| {
+            p.velvia_on = true;
+            p.velvia_strength = M;
+            p.velvia_bias = M;
+        }),
+        ("Split-toning", |p| {
+            p.split_on = true;
+            p.split_shadow_hue = M;
+            p.split_shadow_sat = M;
+            p.split_highlight_hue = M;
+            p.split_highlight_sat = M;
+            p.split_balance = M;
+            p.split_compress = M;
+        }),
+        ("Monochrome", |p| {
+            p.mono_on = true;
+            p.mono_r = M;
+            p.mono_g = M;
+            p.mono_b = M;
+        }),
+        ("Sigmoid", |p| {
+            p.sigmoid_on = true;
+            p.sigmoid_contrast = M;
+            p.sigmoid_skew = M;
+        }),
+        ("Sharpen", |p| {
+            p.sharpen_on = true;
+            p.sharpen_radius = M;
+            p.sharpen_amount = M;
+            p.sharpen_threshold = M;
+        }),
+        ("Vibrance", |p| {
+            p.vibrance_on = true;
+            p.vibrance_amount = M;
+        }),
+        ("Color contrast", |p| {
+            p.color_contrast_on = true;
+            p.color_contrast_a_steepness = M;
+            p.color_contrast_b_steepness = M;
+        }),
+        ("Color correction", |p| {
+            p.color_correction_on = true;
+            p.color_correction_loa = M;
+            p.color_correction_hia = M;
+            p.color_correction_lob = M;
+            p.color_correction_hib = M;
+            p.color_correction_saturation = M;
+        }),
+        ("Color zones", |p| {
+            p.colorzones_on = true;
+            p.colorzones_strength = M;
+            p.colorzones_channel = M;
+            p.colorzones_mode = M;
+            p.colorzones_num_nodes = [M; 3];
+            p.colorzones_curve_type = [M; 3];
+            p.colorzones_curve_x = [[M; 8]; 3];
+            p.colorzones_curve_y = [[M; 8]; 3];
+        }),
+        ("Levels", |p| {
+            p.levels_on = true;
+            p.levels_black = M;
+            p.levels_grey = M;
+            p.levels_white = M;
+        }),
+        ("Vignetting", |p| {
+            p.vignette_on = true;
+            p.vignette_scale = M;
+            p.vignette_falloff = M;
+            p.vignette_brightness = M;
+            p.vignette_saturation = M;
+            p.vignette_center_x = M;
+            p.vignette_center_y = M;
+            p.vignette_shape = M;
+        }),
+        ("Lowlight vision", |p| {
+            p.lowlight_on = true;
+            p.lowlight_blueness = M;
+            p.lowlight_transition = [M; 6];
+        }),
+        ("Graduated density", |p| {
+            p.gradnd_on = true;
+            p.gradnd_density = M;
+            p.gradnd_hardness = M;
+            p.gradnd_rotation = M;
+            p.gradnd_offset = M;
+            p.gradnd_hue = M;
+            p.gradnd_saturation = M;
+        }),
+        ("Contrast brightness saturation", |p| {
+            p.colisa_on = true;
+            p.colisa_contrast = M;
+            p.colisa_brightness = M;
+            p.colisa_saturation = M;
+        }),
+        ("Basic adjustments", |p| {
+            p.basicadj_on = true;
+            p.basicadj_black_point = M;
+            p.basicadj_exposure = M;
+            p.basicadj_hlcompr = M;
+            p.basicadj_hlcomprthresh = M;
+            p.basicadj_contrast = M;
+            p.basicadj_preserve_colors = M;
+            p.basicadj_middle_grey = M;
+            p.basicadj_brightness = M;
+            p.basicadj_saturation = M;
+            p.basicadj_vibrance = M;
+        }),
+        ("Shadows/Highlights", |p| {
+            p.shadhi_on = true;
+            p.shadhi_shadows = M;
+            p.shadhi_highlights = M;
+            p.shadhi_whitepoint = M;
+            p.shadhi_radius = M;
+            p.shadhi_compress = M;
+            p.shadhi_shadows_ccorrect = M;
+            p.shadhi_highlights_ccorrect = M;
+        }),
+        ("Local contrast", |p| {
+            p.lc_on = true;
+            p.lc_midtone = M;
+            p.lc_shadows = M;
+            p.lc_highlights = M;
+            p.lc_detail = M;
+        }),
+        ("Lowpass", |p| {
+            p.lowpass_on = true;
+            p.lowpass_radius = M;
+            p.lowpass_contrast = M;
+            p.lowpass_brightness = M;
+            p.lowpass_saturation = M;
+        }),
+        ("Primaries", |p| {
+            p.primaries_on = true;
+            p.primaries_achromatic_tint_hue = M;
+            p.primaries_achromatic_tint_purity = M;
+            p.primaries_red_hue = M;
+            p.primaries_red_purity = M;
+            p.primaries_green_hue = M;
+            p.primaries_green_purity = M;
+            p.primaries_blue_hue = M;
+            p.primaries_blue_purity = M;
+        }),
+        ("Negadoctor", |p| {
+            p.negadoctor_on = true;
+            p.negadoctor_film_stock = M;
+            p.negadoctor_dmin_r = M;
+            p.negadoctor_dmin_g = M;
+            p.negadoctor_dmin_b = M;
+            p.negadoctor_wb_high_r = M;
+            p.negadoctor_wb_high_g = M;
+            p.negadoctor_wb_high_b = M;
+            p.negadoctor_wb_low_r = M;
+            p.negadoctor_wb_low_g = M;
+            p.negadoctor_wb_low_b = M;
+            p.negadoctor_d_max = M;
+            p.negadoctor_offset = M;
+            p.negadoctor_black = M;
+            p.negadoctor_gamma = M;
+            p.negadoctor_soft_clip = M;
+            p.negadoctor_exposure = M;
+        }),
+        ("Tone equalizer", |p| {
+            p.toneeq_on = true;
+            p.toneeq_noise = M;
+            p.toneeq_ultra_deep_blacks = M;
+            p.toneeq_deep_blacks = M;
+            p.toneeq_blacks = M;
+            p.toneeq_shadows = M;
+            p.toneeq_midtones = M;
+            p.toneeq_highlights = M;
+            p.toneeq_whites = M;
+            p.toneeq_speculars = M;
+        }),
+        ("Color balance RGB", |p| {
+            p.cb_on = true;
+            p.cb_shadows_y = M;
+            p.cb_shadows_c = M;
+            p.cb_shadows_h = M;
+            p.cb_midtones_y = M;
+            p.cb_midtones_c = M;
+            p.cb_midtones_h = M;
+            p.cb_highlights_y = M;
+            p.cb_highlights_c = M;
+            p.cb_highlights_h = M;
+            p.cb_global_y = M;
+            p.cb_global_c = M;
+            p.cb_global_h = M;
+            p.cb_shadows_weight = M;
+            p.cb_white_fulcrum = M;
+            p.cb_highlights_weight = M;
+            p.cb_chroma_shadows = M;
+            p.cb_chroma_highlights = M;
+            p.cb_chroma_global = M;
+            p.cb_chroma_midtones = M;
+            p.cb_saturation_global = M;
+            p.cb_saturation_highlights = M;
+            p.cb_saturation_midtones = M;
+            p.cb_saturation_shadows = M;
+            p.cb_hue_angle = M;
+            p.cb_brilliance_global = M;
+            p.cb_brilliance_highlights = M;
+            p.cb_brilliance_midtones = M;
+            p.cb_brilliance_shadows = M;
+            p.cb_mask_grey_fulcrum = M;
+            p.cb_vibrance = M;
+            p.cb_grey_fulcrum = M;
+            p.cb_contrast = M;
+            p.cb_formula = M;
+        }),
+        ("Filmic RGB", |p| {
+            p.filmic_on = true;
+            p.filmic_black_point_source = M;
+            p.filmic_white_point_source = M;
+            p.filmic_output_power = M;
+            p.filmic_latitude = M;
+            p.filmic_contrast = M;
+            p.filmic_balance = M;
+            p.filmic_saturation = M;
+        }),
+        ("Highlight reconstruction", |p| {
+            p.hl_on = true;
+            p.hl_opposed = false;
+            p.hl_clip = M;
+        }),
+        ("Denoise (profiled)", |p| {
+            p.dn_on = true;
+            p.dn_mode_y0u0v0 = false;
+            p.dn_strength = M;
+            p.dn_shadows = M;
+            p.dn_bias = M;
+        }),
+        ("Lens correction", |p| {
+            p.lens_on = true;
+            p.lens_inverse = true;
+            p.lens_modify_flags = M;
+            p.lens_scale = M;
+            p.lens_focal = M;
+            p.lens_aperture = M;
+            p.lens_distance = M;
+            p.lens_target_geom = M;
+        }),
+        ("Bloom", |p| {
+            p.bl_on = true;
+            p.bl_size = M;
+            p.bl_threshold = M;
+            p.bl_strength = M;
+        }),
+        ("Tone curve", |p| {
+            p.tc_on = true;
+            p.tc_type = M;
+            p.tc_autoscale = M;
+            p.tc_unbound = false;
+            p.tc_preserve = M;
+            p.tc_nnodes = M;
+            p.tc_nodes_l = [(M, M); 20];
+        }),
+        ("RGB curve", |p| {
+            p.rc_on = true;
+            p.rc_type_r = M;
+            p.rc_type_g = M;
+            p.rc_type_b = M;
+            p.rc_autoscale = M;
+            p.rc_preserve = M;
+            p.rc_nnodes_r = M;
+            p.rc_nnodes_g = M;
+            p.rc_nnodes_b = M;
+            p.rc_nodes_r = [(M, M); 20];
+            p.rc_nodes_g = [(M, M); 20];
+            p.rc_nodes_b = [(M, M); 20];
+        }),
+        ("Base curve", |p| {
+            p.bc_on = true;
+            p.bc_type = M;
+            p.bc_preserve = M;
+            p.bc_nnodes = M;
+            p.bc_exposure_fusion = M;
+            p.bc_exposure_stops = M;
+            p.bc_exposure_bias = M;
+            p.bc_nodes = [(M, M); 20];
+        }),
+        ("White balance", |p| {
+            p.temperature_on = true;
+            p.temperature_r = M;
+            p.temperature_g = M;
+            p.temperature_b = M;
+        }),
+        ("Invert", |p| {
+            p.invert_on = true;
+            p.invert_r = M;
+            p.invert_g = M;
+            p.invert_b = M;
+        }),
+        ("Colorize", |p| {
+            p.colorize_on = true;
+            p.colorize_hue = M;
+            p.colorize_sat = M;
+            p.colorize_lightness = M;
+            p.colorize_lightness_mix = M;
+        }),
+    ];
+
+    /// `reset_module` restores exactly the named module's fields, and only those
+    /// — the mutation table sets *every* field of the module, so a missed field
+    /// (or a stray extra one) fails here.
+    #[test]
+    fn reset_module_restores_each_module_to_defaults() {
+        let d = PreviewParams::default();
+        for (label, mutate) in MODULE_MUTATIONS {
+            let mut p = d;
+            mutate(&mut p);
+            assert_ne!(p, d, "{label}: mutation must differ from the defaults");
+            assert!(reset_module(&mut p, label), "{label}: reset must be known");
+            assert_eq!(p, d, "{label}: reset must restore every module field");
+        }
+    }
+
+    /// Future-regression guard, mirroring
+    /// `history::tests::describe_change_covers_every_previewparams_field`:
+    /// this exhaustive destructure (no `..`) stops compiling the day a field is
+    /// added to `PreviewParams`, forcing whoever adds it to give it a home in
+    /// `reset_module` (and `MODULE_MUTATIONS`) rather than letting a per-module
+    /// reset silently ignore it. Compile-time check; the assertions above pin
+    /// the current mapping.
+    #[test]
+    fn reset_module_field_map_is_exhaustive() {
+        let PreviewParams {
+            exposure_on: _,
+            black: _,
+            ev: _,
+            velvia_on: _,
+            velvia_strength: _,
+            velvia_bias: _,
+            split_on: _,
+            split_shadow_hue: _,
+            split_shadow_sat: _,
+            split_highlight_hue: _,
+            split_highlight_sat: _,
+            split_balance: _,
+            split_compress: _,
+            mono_on: _,
+            mono_r: _,
+            mono_g: _,
+            mono_b: _,
+            sigmoid_on: _,
+            sigmoid_contrast: _,
+            sigmoid_skew: _,
+            sharpen_on: _,
+            sharpen_radius: _,
+            sharpen_amount: _,
+            sharpen_threshold: _,
+            vibrance_on: _,
+            vibrance_amount: _,
+            color_contrast_on: _,
+            color_contrast_a_steepness: _,
+            color_contrast_b_steepness: _,
+            invert_on: _,
+            invert_r: _,
+            invert_g: _,
+            invert_b: _,
+            temperature_on: _,
+            temperature_r: _,
+            temperature_g: _,
+            temperature_b: _,
+            colorize_on: _,
+            colorize_hue: _,
+            colorize_sat: _,
+            colorize_lightness: _,
+            colorize_lightness_mix: _,
+            color_correction_on: _,
+            color_correction_loa: _,
+            color_correction_hia: _,
+            color_correction_lob: _,
+            color_correction_hib: _,
+            color_correction_saturation: _,
+            colorzones_on: _,
+            colorzones_strength: _,
+            colorzones_channel: _,
+            colorzones_mode: _,
+            colorzones_num_nodes: _,
+            colorzones_curve_type: _,
+            colorzones_curve_x: _,
+            colorzones_curve_y: _,
+            levels_on: _,
+            levels_black: _,
+            levels_grey: _,
+            levels_white: _,
+            vignette_on: _,
+            vignette_scale: _,
+            vignette_falloff: _,
+            vignette_brightness: _,
+            vignette_saturation: _,
+            vignette_center_x: _,
+            vignette_center_y: _,
+            vignette_shape: _,
+            lowlight_on: _,
+            lowlight_blueness: _,
+            lowlight_transition: _,
+            gradnd_on: _,
+            gradnd_density: _,
+            gradnd_hardness: _,
+            gradnd_rotation: _,
+            gradnd_offset: _,
+            gradnd_hue: _,
+            gradnd_saturation: _,
+            colisa_on: _,
+            colisa_contrast: _,
+            colisa_brightness: _,
+            colisa_saturation: _,
+            basicadj_on: _,
+            basicadj_black_point: _,
+            basicadj_exposure: _,
+            basicadj_hlcompr: _,
+            basicadj_hlcomprthresh: _,
+            basicadj_contrast: _,
+            basicadj_preserve_colors: _,
+            basicadj_middle_grey: _,
+            basicadj_brightness: _,
+            basicadj_saturation: _,
+            basicadj_vibrance: _,
+            lowpass_on: _,
+            lowpass_radius: _,
+            lowpass_contrast: _,
+            lowpass_brightness: _,
+            lowpass_saturation: _,
+            shadhi_on: _,
+            shadhi_shadows: _,
+            shadhi_highlights: _,
+            shadhi_whitepoint: _,
+            shadhi_radius: _,
+            shadhi_compress: _,
+            shadhi_shadows_ccorrect: _,
+            shadhi_highlights_ccorrect: _,
+            lc_on: _,
+            lc_midtone: _,
+            lc_shadows: _,
+            lc_highlights: _,
+            lc_detail: _,
+            primaries_on: _,
+            primaries_achromatic_tint_hue: _,
+            primaries_achromatic_tint_purity: _,
+            primaries_red_hue: _,
+            primaries_red_purity: _,
+            primaries_green_hue: _,
+            primaries_green_purity: _,
+            primaries_blue_hue: _,
+            primaries_blue_purity: _,
+            negadoctor_on: _,
+            negadoctor_film_stock: _,
+            negadoctor_dmin_r: _,
+            negadoctor_dmin_g: _,
+            negadoctor_dmin_b: _,
+            negadoctor_wb_high_r: _,
+            negadoctor_wb_high_g: _,
+            negadoctor_wb_high_b: _,
+            negadoctor_wb_low_r: _,
+            negadoctor_wb_low_g: _,
+            negadoctor_wb_low_b: _,
+            negadoctor_d_max: _,
+            negadoctor_offset: _,
+            negadoctor_black: _,
+            negadoctor_gamma: _,
+            negadoctor_soft_clip: _,
+            negadoctor_exposure: _,
+            toneeq_on: _,
+            toneeq_noise: _,
+            toneeq_ultra_deep_blacks: _,
+            toneeq_deep_blacks: _,
+            toneeq_blacks: _,
+            toneeq_shadows: _,
+            toneeq_midtones: _,
+            toneeq_highlights: _,
+            toneeq_whites: _,
+            toneeq_speculars: _,
+            cb_on: _,
+            cb_shadows_y: _,
+            cb_shadows_c: _,
+            cb_shadows_h: _,
+            cb_midtones_y: _,
+            cb_midtones_c: _,
+            cb_midtones_h: _,
+            cb_highlights_y: _,
+            cb_highlights_c: _,
+            cb_highlights_h: _,
+            cb_global_y: _,
+            cb_global_c: _,
+            cb_global_h: _,
+            cb_shadows_weight: _,
+            cb_white_fulcrum: _,
+            cb_highlights_weight: _,
+            cb_chroma_shadows: _,
+            cb_chroma_highlights: _,
+            cb_chroma_global: _,
+            cb_chroma_midtones: _,
+            cb_saturation_global: _,
+            cb_saturation_highlights: _,
+            cb_saturation_midtones: _,
+            cb_saturation_shadows: _,
+            cb_hue_angle: _,
+            cb_brilliance_global: _,
+            cb_brilliance_highlights: _,
+            cb_brilliance_midtones: _,
+            cb_brilliance_shadows: _,
+            cb_mask_grey_fulcrum: _,
+            cb_vibrance: _,
+            cb_grey_fulcrum: _,
+            cb_contrast: _,
+            cb_formula: _,
+            filmic_on: _,
+            filmic_black_point_source: _,
+            filmic_white_point_source: _,
+            filmic_output_power: _,
+            filmic_latitude: _,
+            filmic_contrast: _,
+            filmic_balance: _,
+            filmic_saturation: _,
+            hl_on: _,
+            hl_opposed: _,
+            hl_clip: _,
+            dn_on: _,
+            dn_mode_y0u0v0: _,
+            dn_strength: _,
+            dn_shadows: _,
+            dn_bias: _,
+            bl_on: _,
+            bl_size: _,
+            bl_threshold: _,
+            bl_strength: _,
+            tc_on: _,
+            tc_type: _,
+            tc_autoscale: _,
+            tc_unbound: _,
+            tc_preserve: _,
+            tc_nnodes: _,
+            tc_nodes_l: _,
+            rc_on: _,
+            rc_type_r: _,
+            rc_type_g: _,
+            rc_type_b: _,
+            rc_autoscale: _,
+            rc_preserve: _,
+            rc_nnodes_r: _,
+            rc_nnodes_g: _,
+            rc_nnodes_b: _,
+            rc_nodes_r: _,
+            rc_nodes_g: _,
+            rc_nodes_b: _,
+            bc_on: _,
+            bc_type: _,
+            bc_preserve: _,
+            bc_nnodes: _,
+            bc_exposure_fusion: _,
+            bc_exposure_stops: _,
+            bc_exposure_bias: _,
+            bc_nodes: _,
+            lens_on: _,
+            lens_inverse: _,
+            lens_modify_flags: _,
+            lens_scale: _,
+            lens_focal: _,
+            lens_aperture: _,
+            lens_distance: _,
+            lens_target_geom: _,
+        } = PreviewParams::default();
+    }
+
+    /// Resetting one module must leave every other module's fields untouched.
+    /// With all modules edited at once, re-applying any other module's
+    /// (idempotent) mutation after a reset is a no-op iff that module survived.
+    #[test]
+    fn reset_module_leaves_other_modules_untouched() {
+        let mut all = PreviewParams::default();
+        for (_, mutate) in MODULE_MUTATIONS {
+            mutate(&mut all);
+        }
+        for (label, _) in MODULE_MUTATIONS {
+            let mut r = all;
+            assert!(reset_module(&mut r, label));
+            for (other, mutate) in MODULE_MUTATIONS {
+                if other == label {
+                    continue;
+                }
+                let before = r;
+                mutate(&mut r);
+                assert_eq!(r, before, "reset of {label} clobbered {other}");
+            }
+        }
+    }
+
+    /// The mutation table and `reset_module` cover the same module set as the
+    /// live-module list, so a newly ported module can't silently get a reset
+    /// button that does nothing (or a test row with no reset arm).
+    #[test]
+    fn reset_module_covers_every_live_label() {
+        for label in LIVE_MODULE_LABELS {
+            assert!(
+                MODULE_MUTATIONS.iter().any(|(l, _)| l == label),
+                "no mutation-table entry for live module {label:?}"
+            );
+            let mut p = PreviewParams { ev: 1.0, ..Default::default() };
+            assert!(reset_module(&mut p, label), "reset_module has no arm for {label:?}");
+        }
+        for (label, _) in MODULE_MUTATIONS {
+            assert!(
+                LIVE_MODULE_LABELS.contains(label),
+                "mutation-table entry {label:?} is not a live module"
+            );
+        }
+    }
+
+    /// An unknown label is rejected and leaves the params untouched, so a
+    /// non-live row can never be wired to a partial reset.
+    #[test]
+    fn reset_module_rejects_unknown_label() {
+        let mut p = PreviewParams {
+            ev: 2.0,
+            velvia_strength: 40.0,
+            ..Default::default()
+        };
+        let before = p;
+        assert!(!reset_module(&mut p, "Grain"));
+        assert_eq!(p, before);
     }
 }
