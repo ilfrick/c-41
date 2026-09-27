@@ -7223,7 +7223,9 @@ for a later density pass, not this increment.)
 **Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
 tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 97,
 `c41-ui` 501 (500 + 1 new filter test), 0 failed. `git diff --check` clean.
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `5d63f4e120` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c skipped, `CMake + Rust workspace`
+path-filtered out (Rust-only change). Both remotes verified at `5d63f4e120`.
 
 ### UI parity closed (2026-09-26 UTC)
 
