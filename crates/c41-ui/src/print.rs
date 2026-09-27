@@ -1,10 +1,12 @@
-//! Print composer, print-to-PDF only (u1; parity audit 3.4, print first).
+//! Print composer: print-to-PDF (u1) plus physical printing through the
+//! native GTK print dialog (u9; parity audit 3.4, print second leg).
 //!
-//! Scope is deliberately narrow: compose one image per page on a chosen paper
-//! size / orientation / margin and export the result to a PDF file via
-//! [`gtk4::PrintOperation`] in Export mode. There is no printer discovery, no
-//! CUPS interaction, and no ICC/print-profile handling — physical printing
-//! stays out of scope.
+//! Scope: compose one image per page on a chosen paper size / orientation /
+//! margin and render it either to a PDF file ([`gtk4::PrintOperation`] in
+//! Export mode) or to a physical printer (the same operation in PrintDialog
+//! mode — GTK owns printer discovery, so there is no CUPS-direct
+//! enumeration code here). No ICC/print-profile handling and no saved print
+//! layout templates — both stay out of scope.
 //!
 //! The file follows the established pure-model-then-widget discipline (see
 //! [`crate::export`]): all layout math ([`PaperSize`], [`Orientation`],
@@ -171,6 +173,61 @@ pub fn default_pdf_name(paths: &[String]) -> String {
         .unwrap_or_else(|| "print.pdf".to_string())
 }
 
+// ── Physical-print helpers (u9; GTK-free except the action map, headless) ──
+
+/// Printer hardware (non-printable) margins in millimetres, one per side.
+/// Mirrors the C print view's `printer.hw_margin_*` fields
+/// (`src/views/print.c`). Unlike C's borderless-driver path (which flags
+/// the driver and lets it handle the area), the GTK flow conservatively
+/// insets the uniform content box to clear the worst side — never printing
+/// into non-printable area.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HwMarginsMm {
+    pub top: f64,
+    pub bottom: f64,
+    pub left: f64,
+    pub right: f64,
+}
+
+impl HwMarginsMm {
+    /// Zero margins: no printer involved (PDF export, or hardware margins
+    /// unknown — the draw handler falls back to this when the print context
+    /// reports none).
+    pub const ZERO: HwMarginsMm = HwMarginsMm { top: 0.0, bottom: 0.0, left: 0.0, right: 0.0 };
+
+    /// Widest single side. The composer margin is uniform, so the effective
+    /// margin must clear every side at once.
+    pub fn max_side(self) -> f64 {
+        self.top.max(self.bottom).max(self.left).max(self.right)
+    }
+}
+
+/// Points to millimetres. The print operation runs in Points, so the print
+/// context reports hardware margins in points; layout math is in millimetres.
+pub fn pt_to_mm(pt: f64) -> f64 {
+    pt / PT_PER_MM
+}
+
+/// Effective uniform margin (mm): the user's margin raised — never lowered —
+/// to clear the printer's widest hardware margin, then clamped to the page
+/// exactly like [`clamp_margin_mm`]. A zero `hw` (PDF export or unknown
+/// hardware margins) reduces to `clamp_margin_mm` unchanged.
+pub fn effective_margin_mm(user_mm: f64, hw: HwMarginsMm, page_w: f64, page_h: f64) -> f64 {
+    clamp_margin_mm(user_mm.max(hw.max_side()), page_w, page_h)
+}
+
+/// Select the [`gtk4::PrintOperationAction`] for a destination: the native
+/// print dialog for a physical printer, Export mode for print-to-PDF.
+/// A plain enum-to-enum map — constructing the values needs no display, so
+/// this stays headless-tested like the rest of the pure model.
+pub fn operation_action(want_dialog: bool) -> gtk4::PrintOperationAction {
+    if want_dialog {
+        gtk4::PrintOperationAction::PrintDialog
+    } else {
+        gtk4::PrintOperationAction::Export
+    }
+}
+
 // ── Decode (the full preview's path, repackaged for print) ───────────────────
 
 /// Decode one print page to an sRGB pixbuf, reusing exactly the lighttable
@@ -305,6 +362,84 @@ impl Composer {
     }
 }
 
+/// Build the [`gtk4::PrintOperation`] shared by both destinations (u9): the
+/// default page setup carries the composer's paper + orientation with zero
+/// GTK margins (our own margin math owns the content box), and the draw
+/// handler reads the EFFECTIVE page setup back from the print context via
+/// `PrintContext::page_setup` — under PrintDialog that is what the user
+/// picked in the dialog (paper/orientation may differ from the composer),
+/// under Export it is this same default. Hardware margins come from
+/// `PrintContext::hard_margins` in the operation's unit (Points — converted
+/// with [`pt_to_mm`]); when the context reports none (PDF export),
+/// [`HwMarginsMm::ZERO`] keeps the export path identical to u1. With no
+/// printers configured GTK shows an empty printer list in its own dialog —
+/// no crash path, nothing to guard here.
+fn build_operation(
+    paper: PaperSize,
+    orient: Orientation,
+    user_margin_mm: f64,
+    pages: Rc<Vec<gtk4::gdk_pixbuf::Pixbuf>>,
+) -> gtk4::PrintOperation {
+    let op = gtk4::PrintOperation::new();
+    op.set_job_name("darkroom print");
+    op.set_unit(gtk4::Unit::Points);
+    let setup = gtk4::PageSetup::new();
+    // Canonical portrait dims here: GtkPageSetup applies the orientation on
+    // top of the stored paper size, so passing already-oriented dims would
+    // double-rotate landscape output (u1 review fix — kept here).
+    let (sw_mm, sh_mm) = paper.dims_mm();
+    let size =
+        gtk4::PaperSize::new_custom("c41-print", paper.label(), sw_mm, sh_mm, gtk4::Unit::Mm);
+    setup.set_paper_size(&size);
+    setup.set_orientation(match orient {
+        Orientation::Portrait => gtk4::PageOrientation::Portrait,
+        Orientation::Landscape => gtk4::PageOrientation::Landscape,
+    });
+    setup.set_top_margin(0.0, gtk4::Unit::Points);
+    setup.set_bottom_margin(0.0, gtk4::Unit::Points);
+    setup.set_left_margin(0.0, gtk4::Unit::Points);
+    setup.set_right_margin(0.0, gtk4::Unit::Points);
+    op.set_default_page_setup(Some(&setup));
+    let n_draw = pages.len();
+    op.connect_begin_print(move |op, _| {
+        op.set_n_pages(n_draw as i32);
+    });
+    op.connect_draw_page(move |_, ctx, nr| {
+        let Some(pb) = pages.get(nr as usize) else { return };
+        let cr = ctx.cairo_context();
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        let _ = cr.paint();
+        // Effective geometry: what the dialog (or the export default) settled
+        // on. PageSetup widths take orientation into account, so no manual
+        // swap is needed here.
+        let effective = ctx.page_setup();
+        let ew = effective.page_width(gtk4::Unit::Mm);
+        let eh = effective.page_height(gtk4::Unit::Mm);
+        let hw = ctx
+            .hard_margins()
+            .map(|(t, b, l, r)| HwMarginsMm {
+                top: pt_to_mm(t),
+                bottom: pt_to_mm(b),
+                left: pt_to_mm(l),
+                right: pt_to_mm(r),
+            })
+            .unwrap_or(HwMarginsMm::ZERO);
+        let m = effective_margin_mm(user_margin_mm, hw, ew, eh);
+        let aspect = f64::from(pb.width()) / f64::from(pb.height().max(1));
+        let r = layout_rect(ew, eh, m, aspect);
+        let _ = cr.save();
+        cr.translate(r.x * PT_PER_MM, r.y * PT_PER_MM);
+        cr.scale(
+            r.w * PT_PER_MM / f64::from(pb.width()),
+            r.h * PT_PER_MM / f64::from(pb.height().max(1)),
+        );
+        cr.set_source_pixbuf(pb, 0.0, 0.0);
+        let _ = cr.paint();
+        let _ = cr.restore();
+    });
+    op
+}
+
 /// Build the print composer page for `paths` (one image per page).
 /// Tag is `"print"` — deliberately slash-free, so the lighttable's `popped`
 /// handler (which re-syncs grid cells only for tags containing `/`) ignores it.
@@ -430,12 +565,17 @@ pub fn print_page(paths: Vec<String>) -> adw::NavigationPage {
         });
     }
 
-    // ── Export + status ────────────────────────────────────────────────────
+    // ── Print + Export + status ────────────────────────────────────────────
+    let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    actions.set_halign(gtk4::Align::Center);
+    let print_btn = gtk4::Button::with_label("Print…");
+    print_btn.set_sensitive(n > 0);
+    actions.append(&print_btn);
     let export_btn = gtk4::Button::with_label("Export PDF…");
-    export_btn.set_halign(gtk4::Align::Center);
     export_btn.add_css_class("suggested-action");
     export_btn.set_sensitive(n > 0);
-    content.append(&export_btn);
+    actions.append(&export_btn);
+    content.append(&actions);
 
     composer.status.set_wrap(true);
     composer.status.set_halign(gtk4::Align::Center);
@@ -454,8 +594,15 @@ pub fn print_page(paths: Vec<String>) -> adw::NavigationPage {
         let c = composer.clone();
         let page_w = content.downgrade();
         let status_w = composer.status.downgrade();
+        // Both buttons gate each other (mirrors the Print handler): an
+        // export in flight must not race a dialog-backed print over the
+        // shared status label and preview cache.
+        let other_w = print_btn.downgrade();
         export_btn.connect_clicked(move |btn| {
             let btn_w = btn.downgrade();
+            // Shadow-clone for the single-shot file-chooser callback below:
+            // `other_w` belongs to this `Fn` closure and cannot move into it.
+            let other_w = other_w.clone();
             let win: Option<gtk4::Window> = page_w
                 .upgrade()
                 .and_then(|w| w.root())
@@ -476,10 +623,12 @@ pub fn print_page(paths: Vec<String>) -> adw::NavigationPage {
                         None => return, // dismissed or non-local: nothing to do
                     };
                     let (paper, orient, margin) = c2.settings();
-                    let (pw_mm, ph_mm) = page_size_mm(paper, orient);
                     let paths = c2.paths.clone();
                     let pixbufs = c2.pixbufs.clone();
                     if let Some(b) = btn_w.upgrade() {
+                        b.set_sensitive(false);
+                    }
+                    if let Some(b) = other_w.clone().upgrade() {
                         b.set_sensitive(false);
                     }
                     if let Some(s) = status_w2.upgrade() {
@@ -487,6 +636,7 @@ pub fn print_page(paths: Vec<String>) -> adw::NavigationPage {
                     }
                     let status_w3 = status_w2.clone();
                     let btn_w2 = btn_w.clone();
+                    let other_w2 = other_w.clone();
                     glib::spawn_future_local(async move {
                         // Decode every page (reusing the preview cache when the
                         // user already viewed it); failures are counted and
@@ -513,64 +663,19 @@ pub fn print_page(paths: Vec<String>) -> adw::NavigationPage {
                             if let Some(b) = btn_w2.upgrade() {
                                 b.set_sensitive(true);
                             }
+                            if let Some(b) = other_w2.upgrade() {
+                                b.set_sensitive(true);
+                            }
                         };
                         if pages.is_empty() {
                             done("Export failed: none of the images could be decoded.".to_string());
                             return;
                         }
-                        let op = gtk4::PrintOperation::new();
-                        op.set_job_name("darkroom print");
-                        op.set_unit(gtk4::Unit::Points);
-                        let setup = gtk4::PageSetup::new();
-                        // Canonical portrait dims here: GtkPageSetup applies
-                        // the orientation on top of the stored paper size, so
-                        // passing already-oriented dims would double-rotate
-                        // landscape exports (portrait PDF surface under
-                        // landscape layout coords). The oriented dims stay
-                        // correct for layout_rect below.
-                        let (sw_mm, sh_mm) = paper.dims_mm();
-                        let size = gtk4::PaperSize::new_custom(
-                            "c41-print",
-                            paper.label(),
-                            sw_mm,
-                            sh_mm,
-                            gtk4::Unit::Mm,
-                        );
-                        setup.set_paper_size(&size);
-                        setup.set_orientation(match orient {
-                            Orientation::Portrait => gtk4::PageOrientation::Portrait,
-                            Orientation::Landscape => gtk4::PageOrientation::Landscape,
-                        });
-                        setup.set_top_margin(0.0, gtk4::Unit::Points);
-                        setup.set_bottom_margin(0.0, gtk4::Unit::Points);
-                        setup.set_left_margin(0.0, gtk4::Unit::Points);
-                        setup.set_right_margin(0.0, gtk4::Unit::Points);
-                        op.set_default_page_setup(Some(&setup));
-                        op.set_export_filename(&dest);
                         let drawable = Rc::new(pages);
                         let n_draw = drawable.len();
-                        op.connect_begin_print(move |op, _| {
-                            op.set_n_pages(n_draw as i32);
-                        });
-                        op.connect_draw_page(move |_, ctx, nr| {
-                            let Some(pb) = drawable.get(nr as usize) else { return };
-                            let cr = ctx.cairo_context();
-                            cr.set_source_rgb(1.0, 1.0, 1.0);
-                            let _ = cr.paint();
-                            let aspect =
-                                f64::from(pb.width()) / f64::from(pb.height().max(1));
-                            let r = layout_rect(pw_mm, ph_mm, margin, aspect);
-                            let _ = cr.save();
-                            cr.translate(r.x * PT_PER_MM, r.y * PT_PER_MM);
-                            cr.scale(
-                                r.w * PT_PER_MM / f64::from(pb.width()),
-                                r.h * PT_PER_MM / f64::from(pb.height().max(1)),
-                            );
-                            cr.set_source_pixbuf(pb, 0.0, 0.0);
-                            let _ = cr.paint();
-                            let _ = cr.restore();
-                        });
-                        match op.run(gtk4::PrintOperationAction::Export, win2.as_ref()) {
+                        let op = build_operation(paper, orient, margin, drawable);
+                        op.set_export_filename(&dest);
+                        match op.run(operation_action(false), win2.as_ref()) {
                             Ok(_) if failed == 0 => done(format!(
                                 "Exported {} page(s) to {}",
                                 n_draw,
@@ -587,6 +692,93 @@ pub fn print_page(paths: Vec<String>) -> adw::NavigationPage {
                     });
                 },
             );
+        });
+    }
+
+    // ── Physical printing via the native GTK dialog (u9) ───────────────────
+    // The same operation as Export, run in PrintDialog mode: GTK enumerates
+    // printers (CUPS) and shows its own dialog — an empty printer list
+    // renders as an empty list there, never as our crash path. The
+    // composer's paper/orientation/margins seed the dialog through the
+    // default page setup; the shared draw handler re-reads the effective
+    // setup, so dialog-side changes apply. Nothing is persisted.
+    {
+        let c = composer.clone();
+        let page_w = content.downgrade();
+        let status_w = composer.status.downgrade();
+        let export_w = export_btn.downgrade();
+        print_btn.connect_clicked(move |btn| {
+            let win: Option<gtk4::Window> = page_w
+                .upgrade()
+                .and_then(|w| w.root())
+                .and_then(|r| r.downcast::<gtk4::Window>().ok());
+            let (paper, orient, margin) = c.settings();
+            let paths = c.paths.clone();
+            let pixbufs = c.pixbufs.clone();
+            let btn_w = btn.downgrade();
+            if let Some(b) = btn_w.upgrade() {
+                b.set_sensitive(false);
+            }
+            if let Some(e) = export_w.upgrade() {
+                e.set_sensitive(false);
+            }
+            if let Some(s) = status_w.upgrade() {
+                s.set_label("Preparing pages…");
+            }
+            let status_w2 = status_w.clone();
+            let btn_w2 = btn_w.clone();
+            let export_w2 = export_w.clone();
+            glib::spawn_future_local(async move {
+                // Same decode-every-page pass as Export (preview cache first);
+                // failures are counted and reported, never silently dropped.
+                let mut pages: Vec<gtk4::gdk_pixbuf::Pixbuf> = Vec::new();
+                let mut failed = 0usize;
+                for (i, path) in paths.iter().enumerate() {
+                    let cached = pixbufs.borrow()[i].clone();
+                    match cached {
+                        Some(pb) => pages.push(pb),
+                        None => match decode_page_async(path.clone()).await {
+                            Some(pb) => {
+                                pixbufs.borrow_mut()[i] = Some(pb.clone());
+                                pages.push(pb);
+                            }
+                            None => failed += 1,
+                        },
+                    }
+                }
+                let done = |msg: String| {
+                    if let Some(s) = status_w2.upgrade() {
+                        s.set_label(&msg);
+                    }
+                    if let Some(b) = btn_w2.upgrade() {
+                        b.set_sensitive(true);
+                    }
+                    if let Some(e) = export_w2.upgrade() {
+                        e.set_sensitive(true);
+                    }
+                };
+                if pages.is_empty() {
+                    done("Print failed: none of the images could be decoded.".to_string());
+                    return;
+                }
+                let n_draw = pages.len();
+                let op = build_operation(paper, orient, margin, Rc::new(pages));
+                // Cancel is Ok(Cancel), not an error — only Apply means the
+                // job went to the printer.
+                match op.run(operation_action(true), win.as_ref()) {
+                    Ok(gtk4::PrintOperationResult::Apply) if failed == 0 => {
+                        done(format!("Sent {n_draw} page(s) to the printer"))
+                    }
+                    Ok(gtk4::PrintOperationResult::Apply) => done(format!(
+                        "Sent {n_draw} of {} page(s) ({failed} failed)",
+                        n_draw + failed
+                    )),
+                    // Cancel (and the unreachable-synchronous InProgress/Error
+                    // variants) land here; only Apply reports a send.
+                    Ok(_) => done("Print cancelled.".to_string()),
+                    Err(e) => done(format!("Print failed: {e}")),
+                }
+            });
         });
     }
 
@@ -693,5 +885,38 @@ mod tests {
         );
         assert_eq!(default_pdf_name(&[]), "print.pdf");
         assert_eq!(default_pdf_name(&["noext".to_string()]), "noext.pdf");
+    }
+
+    #[test]
+    fn pt_to_mm_converts_print_points() {
+        assert!(approx(pt_to_mm(72.0), MM_PER_INCH), "72pt {}", pt_to_mm(72.0));
+        assert!(approx(pt_to_mm(PT_PER_MM), 1.0), "unit {}", pt_to_mm(PT_PER_MM));
+        assert_eq!(pt_to_mm(0.0), 0.0);
+    }
+
+    #[test]
+    fn hw_margins_raise_but_never_lower_the_margin() {
+        let hw = HwMarginsMm { top: 3.0, bottom: 5.0, left: 4.0, right: 2.0 };
+        // The uniform composer margin must clear every side at once.
+        assert_eq!(hw.max_side(), 5.0);
+        assert_eq!(HwMarginsMm::ZERO.max_side(), 0.0);
+        // User margin below the widest hardware margin: hardware wins.
+        assert_eq!(effective_margin_mm(2.0, hw, 210.0, 297.0), 5.0);
+        // User margin above: unchanged.
+        assert_eq!(effective_margin_mm(10.0, hw, 210.0, 297.0), 10.0);
+        // Zero hardware margins (PDF export / unknown): plain clamp.
+        assert_eq!(
+            effective_margin_mm(10.0, HwMarginsMm::ZERO, 210.0, 297.0),
+            clamp_margin_mm(10.0, 210.0, 297.0)
+        );
+        assert_eq!(effective_margin_mm(-3.0, HwMarginsMm::ZERO, 210.0, 297.0), 0.0);
+        // The raised margin still clamps at half the short side, never below.
+        assert_eq!(effective_margin_mm(200.0, hw, 210.0, 297.0), 105.0);
+    }
+
+    #[test]
+    fn operation_action_selects_dialog_or_export() {
+        assert_eq!(operation_action(true), gtk4::PrintOperationAction::PrintDialog);
+        assert_eq!(operation_action(false), gtk4::PrintOperationAction::Export);
     }
 }

@@ -109,6 +109,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # libssl3 runtime (u7a): the ort-sys build dep compiles ureq with
     # native-tls, so the linked binary wants libssl at load time.
     libssl3 \
+    # libcups2t64 runtime (u9, physical printing): GtkPrintOperation in
+    # PrintDialog mode discovers printers through CUPS at runtime — no
+    # compile-time dep, GTK loads it dynamically, so the builder stage is
+    # untouched. Noble t64 name (same time_t transition as libgphoto2-6t64
+    # above; plain libcups2 has no noble candidate).
+    libcups2t64 \
     && rm -rf /var/lib/apt/lists/* \
     # Regenerate the GDK pixbuf loader cache so SVG icons load (binary not in PATH)
     && (/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache || true) \

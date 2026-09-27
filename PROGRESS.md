@@ -7154,3 +7154,39 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 `CMake + Rust workspace` did not run — correctly path-filtered out (u8
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `db69b0e94d`.
+
+### u9 — physical printing via native dialog (2026-09-27 UTC)
+
+**What.** Print leg extended past PDF: a "Print…" button beside Export-PDF
+running the SAME `PrintOperation` in `PrintDialog` action mode — the
+composer state seeds the dialog via `set_default_page_setup`, and the draw
+handler reads the dialog-settled, orientation-aware geometry from
+`ctx.page_setup()` (`page_width/height`) plus CUPS hardware margins from
+`ctx.hard_margins()` (Points → mm), insetting the uniform content box to
+clear the worst side (conservative vs C's borderless-driver flagging).
+Cancel/Apply/error states all reported; both buttons gate each other.
+`libcups2t64` added to the shipping runtime (GTK loads CUPS dynamically —
+no builder/link change). Deliberately out: CUPS-direct code, ICC print
+profiles, layout templates, persistence.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE** — Export path line-identical (geometry equal up to 1e-13
+pt→mm roundtrip), all new GTK calls verified against vendored 0.9.7
+sources, cancel/apply mapping correct, package name right, tests pin
+real behavior. Findings fixed in-session: (1) MINOR hw-margins doc
+overclaim corrected (we inset; C flags the driver); (2) MINOR asymmetric
+button guard symmetricized; NITs (explicit Cancel arm reverted — the
+enum has more variants; layout note acknowledged). Post-fix gate caught
+what review couldn't: `&T as &Widget` upcast compile errors (→
+`upcast_ref`) and `Fn`-closure move-outs across both handlers (fixed with
+per-activation shadow clones). Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `print.rs` post-fix. `git diff --check` clean; no
+`/*`/`*/` in added lines. Release suites: `c41-core` 1801 unchanged,
+`c41-db` 97 unchanged, `c41-ui` 498 passed (495 + 3 new), 0 failed.
+PARITY_AUDIT.md 3.4 updated in the same commit (physical printing
+landed; ICC/templates still out).
+Remote CI confirmation follows commit/push per workflow.
