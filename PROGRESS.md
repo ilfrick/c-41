@@ -7173,6 +7173,29 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `f8d26f25e8`.
 
+### w1 — darkroom left rail (2026-09-27 UTC)
+
+**What.** First leg of the darkroom-chrome pass (user-verified side-by-side:
+our darkroom had no left panel, histogram under the image, History/Snapshots
+crowding the module column — darktable puts scopes/history/snapshots left
+and modules alone right). Pure reparenting in `darkroom/mod.rs`: new 270px
+`left_box` (scrolled) holding `hist_area` + `picker_label` + History +
+Snapshots; right keeps Demosaic/Geometry/Modules/Styles. Zero behavior
+change — every handler/draw-func/list-model untouched.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — reparenting pure, all wiring verified; one MAJOR
+(left rail had no scroll wrapper, would clip on short viewports while the
+right column's module scroller absorbed shrink) — fixed in-session with a
+`ScrolledWindow` mirroring the modules-panel precedent. Visually verified
+with the Xvfb screenshot rig (histogram + History + Snapshots render left,
+modules alone right) before commit.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 97,
+`c41-ui` 500, 0 failed. `git diff --check` clean.
+Remote CI confirmation follows commit/push per workflow.
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the

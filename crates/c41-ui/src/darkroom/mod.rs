@@ -1307,7 +1307,7 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     });
     picture.add_controller(click);
 
-    // ── Left: image (+ snapshot wipe overlay) over histogram + picker ──────
+    // ── Center: image (+ snapshot wipe overlay) ────────────────────────────
     // ALIGNMENT INVARIANT: the Overlay allocates `wipe_area` the *same* rect as
     // `picture`, and both letterbox via `preview::contain_rect` — that equal
     // allocation + shared geometry is what makes a feature land at the same panel
@@ -1326,9 +1326,6 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         .hexpand(true)
         .build();
     image_area.append(&image_overlay);
-    image_area.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    image_area.append(&hist_area);
-    image_area.append(&picker_label);
 
     // ── IOP module list (right panel) — hosts the live param widgets ───────
     let (modules_panel, panel_box) = build_modules_panel(&ctx);
@@ -1494,7 +1491,33 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     // Seed the placeholder row.
     refresh_snapshot_list(&snapshot_list, &snapshots, &wipe);
 
-    // Right column: history over snapshots over modules.
+    // ── Left rail (darktable-style): scopes on top, then history, snapshots ─
+    // Reparents the already-built widgets above — no signal, draw func, or list
+    // model is rebuilt here, so every handler below keeps working unchanged.
+    let left_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .width_request(270)
+        .build();
+    left_box.append(&hist_area);
+    left_box.append(&picker_label);
+    left_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    left_box.append(&history_section);
+    left_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    left_box.append(&snapshot_section);
+
+    // Scrollable so short viewports clip nothing: the rail's children are all
+    // fixed-minimum (hist 120 + history/snapshot scrolled windows), with no
+    // elastic child to absorb shrink the way the modules panel does on the
+    // right (same builder shape as that panel's scroller below).
+    let left_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .width_request(270)
+        .child(&left_box)
+        .build();
+
+    // Right column: demosaic/geometry/modules/styles (history + snapshots moved
+    // to the left rail above).
     let right_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .width_request(320)
@@ -1666,10 +1689,6 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     }
 
-    right_box.append(&history_section);
-    right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    right_box.append(&snapshot_section);
-    right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     right_box.append(&modules_panel);
     right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     // Saved styles (m4-151), deliberately outside the rebuilt modules box so
@@ -1682,10 +1701,12 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         &history_list.downgrade(),
     ));
 
-    // ── Split view: image | (history / modules) ────────────────────────────
+    // ── Three-pane view: left rail | image | right modules ──────────────────
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
+    content.append(&left_scroll);
+    content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     content.append(&image_area);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     content.append(&right_box);
