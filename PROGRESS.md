@@ -7189,4 +7189,8 @@ diagnostics in `print.rs` post-fix. `git diff --check` clean; no
 `c41-db` 97 unchanged, `c41-ui` 498 passed (495 + 3 new), 0 failed.
 PARITY_AUDIT.md 3.4 updated in the same commit (physical printing
 landed; ICC/templates still out).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `5819fcfe20` is green: `check + test + clippy` and `Build & push
+Docker image` both `success` (the latter rebuilds the runtime with the new
+`libcups2t64` line); matrix/full-c jobs skipped as expected. `CMake + Rust
+workspace` did not run — correctly path-filtered out (u9 touches no C
+code). Both remotes (`origin` GitHub + Gitea) verified at `5819fcfe20`.
