@@ -227,6 +227,14 @@ struct PreviewCtx {
     /// Catalogue database path (`""` = no db), for per-image lens-choice
     /// persistence ([`crate::persist::save_lens`]). Set once, never mutated.
     db_path: Rc<str>,
+    /// Module-list scope tab (All / Active / one catalog group). Session-only
+    /// on purpose — darktable persists the tab, but that needs a pref key and
+    /// this pass keeps the filter as ephemeral panel state. Lives in `ctx`
+    /// (not in the rebuilt panel) so Reset / undo-jump / style-apply rebuilds
+    /// keep the selection and `populate_modules` can re-seed the toggles.
+    module_filter: Rc<std::cell::Cell<ModuleFilter>>,
+    /// Module-list search text, same session-only lifetime as `module_filter`.
+    module_search: Rc<RefCell<String>>,
 }
 
 /// Debounced recorder that appends one [`HistoryStack`] entry per *settled* edit
@@ -1206,6 +1214,8 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
         lens_cam_dd: glib::WeakRef::new(),
         lens_syncing: Rc::new(std::cell::Cell::new(false)),
         db_path: Rc::from(db_path),
+        module_filter: Rc::new(std::cell::Cell::new(ModuleFilter::All)),
+        module_search: Rc::new(RefCell::new(String::new())),
     };
     // Show the seed entry immediately.
     refresh_history_list(&history_list, &ctx.history.borrow());
@@ -2019,6 +2029,66 @@ fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
     (scrolled.upcast(), panel)
 }
 
+/// Module-list scope tab: which rows the filter bar keeps visible. `Group`
+/// holds a `module_catalog` index (never a label), so a catalog rename keeps
+/// pointing at the right slot. (The catalog is a program `static`, so there
+/// is no runtime reorder to defend against.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModuleFilter {
+    All,
+    Active,
+    Group(usize),
+}
+
+/// Whether the row `(group_idx, label)` passes `filter` plus the search
+/// `query` (a case-insensitive label substring; empty matches everything).
+/// Pure so it is unit-tested without GTK. `Active` reuses [`is_live_module`] —
+/// the same predicate behind the header count and the live-first ordering —
+/// so the three can never disagree about what "live" means.
+fn module_filter_matches(filter: ModuleFilter, group_idx: usize, label: &str, query: &str) -> bool {
+    let scope_ok = match filter {
+        ModuleFilter::All => true,
+        ModuleFilter::Active => is_live_module(label),
+        ModuleFilter::Group(gi) => gi == group_idx,
+    };
+    if !scope_ok {
+        return false;
+    }
+    if query.is_empty() {
+        return true;
+    }
+    label.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// Apply the current filter to an already-built module list: hide rows and
+/// whole empty groups, show the placeholder when nothing matches. Hiding uses
+/// `set_visible` only — rows are never destroyed, so enable switches, expanded
+/// state and slider values survive filter changes untouched, and no widget
+/// `notify` handler fires (nothing re-enters the seed-before-connect path or
+/// triggers a rebuild / re-render).
+fn apply_module_filter(
+    rows: &[(gtk4::Widget, usize, String)],
+    groups: &[adw::PreferencesGroup],
+    empty: &gtk4::Label,
+    filter: ModuleFilter,
+    query: &str,
+) {
+    let mut shown = 0usize;
+    let mut group_shown = vec![false; groups.len()];
+    for (w, gi, label) in rows {
+        let show = module_filter_matches(filter, *gi, label, query);
+        w.set_visible(show);
+        if show {
+            shown += 1;
+            group_shown[*gi] = true;
+        }
+    }
+    for (pg, show) in groups.iter().zip(group_shown) {
+        pg.set_visible(show);
+    }
+    empty.set_visible(shown == 0);
+}
+
 /// (Re)build the module rows into `panel`, seeding each live module's widgets
 /// from the current `ctx.params`. Called on first build and on Reset (after the
 /// panel is cleared) so the sliders reflect the reset defaults.
@@ -2032,7 +2102,10 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     // Count first so the header can state how much of the catalogue is real.
     // Without this the panel is 44 near-identical rows and the ~30 placeholders
     // are indistinguishable from working modules — which made every shipped
-    // increment invisible (see `is_live_module`).
+    // increment invisible (see `is_live_module`). These are UNFILTERED totals
+    // (live / catalog size), not the visible-row count: the filter only hides
+    // rows, and the count answers "how much is ported", which filtering must
+    // not change.
     let total: usize = crate::catalog::module_catalog()
         .iter()
         .map(|g| g.modules.len())
@@ -2042,6 +2115,58 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
         .flat_map(|g| g.modules.iter())
         .filter(|mi| is_live_module(mi.label))
         .count();
+
+    // Filter bar, above the header inside the scroller: scope toggles (All +
+    // Active + one per catalog group, labels read from the catalog) plus a
+    // search entry, mirroring darktable's modulegroups tab bar. The widgets
+    // are rebuilt with the panel, but the SELECTION lives in `ctx`
+    // (`module_filter` / `module_search`), so Reset / undo-jump / style-apply
+    // rebuilds re-seed and re-apply it instead of losing it.
+    let index: Rc<RefCell<Vec<(gtk4::Widget, usize, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    let filter_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    let toggle_flow = gtk4::FlowBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .max_children_per_line(4)
+        .row_spacing(4)
+        .column_spacing(4)
+        .build();
+    let mut toggles: Vec<(ModuleFilter, gtk4::ToggleButton)> = vec![
+        (ModuleFilter::All, gtk4::ToggleButton::with_label("All")),
+        (
+            ModuleFilter::Active,
+            gtk4::ToggleButton::with_label("Active"),
+        ),
+    ];
+    for (gi, group) in crate::catalog::module_catalog().iter().enumerate() {
+        let btn = gtk4::ToggleButton::with_label(group.name);
+        btn.set_tooltip_text(Some(&format!("Show {} modules", group.name)));
+        toggles.push((ModuleFilter::Group(gi), btn));
+    }
+    toggles[0].1.set_tooltip_text(Some("Show all modules"));
+    toggles[1]
+        .1
+        .set_tooltip_text(Some("Show only live (wired) modules"));
+    // Radio-like single select: joining a group keeps exactly one armed (a
+    // click on the armed button keeps it armed, so the filter never lands on
+    // "none selected"). Seed from ctx BEFORE connecting, so seeding fires no
+    // handler (the lib.rs view-switcher precedent).
+    if let Some((_, first)) = toggles.first() {
+        for (_, btn) in toggles.iter().skip(1) {
+            btn.set_group(Some(first));
+        }
+    }
+    for (_, btn) in &toggles {
+        toggle_flow.append(btn);
+    }
+    let search = gtk4::SearchEntry::builder()
+        .placeholder_text("Search modules")
+        .build();
+    filter_box.append(&toggle_flow);
+    filter_box.append(&search);
+    panel.append(&filter_box);
 
     let header = gtk4::Label::builder()
         .label("Modules")
@@ -2058,7 +2183,8 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     counter.add_css_class("caption");
     panel.append(&counter);
 
-    for group in crate::catalog::module_catalog() {
+    let mut group_widgets: Vec<adw::PreferencesGroup> = Vec::new();
+    for (gi, group) in crate::catalog::module_catalog().iter().enumerate() {
         let pg = adw::PreferencesGroup::builder().title(group.name).build();
         // Live modules first: the catalogue is authored in darktable's
         // presentation order, which front-loads unported modules (Base opens
@@ -2068,51 +2194,112 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
         let mut modules: Vec<&crate::catalog::ModuleInfo> = group.modules.iter().collect();
         modules.sort_by_key(|mi| !is_live_module(mi.label));
         for mi in modules {
-            match mi.label {
-                "Exposure" => pg.add(&exposure_module_row(ctx)),
-                "Velvia" => pg.add(&velvia_module_row(ctx)),
-                "Split-toning" => pg.add(&splittoning_module_row(ctx)),
-                "Monochrome" => pg.add(&monochrome_module_row(ctx)),
-                "Sigmoid" => pg.add(&sigmoid_module_row(ctx)),
-                "Sharpen" => pg.add(&sharpen_module_row(ctx)),
-                "Vibrance" => pg.add(&vibrance_module_row(ctx)),
-                "Colorize" => pg.add(&colorize_module_row(ctx)),
-                "Color correction" => pg.add(&colorcorrection_module_row(ctx)),
-                "Color contrast" => pg.add(&colorcontrast_module_row(ctx)),
-                "Primaries" => pg.add(&primaries_module_row(ctx)),
-                "Negadoctor" => pg.add(&negadoctor_module_row(ctx)),
-                "Tone equalizer" => pg.add(&toneequal_module_row(ctx)),
-                "Color balance RGB" => pg.add(&cbrgb_module_row(ctx)),
-                "Filmic RGB" => pg.add(&filmic_module_row(ctx)),
-                "Highlight reconstruction" => pg.add(&highlights_module_row(ctx)),
-                "Denoise (profiled)" => pg.add(&denoise_module_row(ctx)),
-                "Lens correction" => pg.add(&lens_module_row(ctx)),
-                "Bloom" => pg.add(&bloom_module_row(ctx)),
-                "Color zones" => pg.add(&colorzones_module_row(ctx)),
-                "Tone curve" => pg.add(&curve_editor::tonecurve_module_row(ctx)),
-                "RGB curve" => pg.add(&curve_editor::rgbcurve_module_row(ctx)),
-                "Base curve" => pg.add(&curve_editor::basecurve_module_row(ctx)),
-                "Levels" => pg.add(&levels_module_row(ctx)),
-                "Vignetting" => pg.add(&vignette_module_row(ctx)),
-                "Lowlight vision" => pg.add(&lowlight_module_row(ctx)),
-                "Graduated density" => pg.add(&gradnd_module_row(ctx)),
-                "Contrast brightness saturation" => pg.add(&colisa_module_row(ctx)),
-                "Basic adjustments" => pg.add(&basicadj_module_row(ctx)),
-                "Shadows/Highlights" => pg.add(&shadhi_module_row(ctx)),
-                "Local contrast" => pg.add(&localcontrast_module_row(ctx)),
-                "Lowpass" => pg.add(&lowpass_module_row(ctx)),
-                "White balance" => pg.add(&whitebalance_module_row(ctx)),
-                "Invert" => pg.add(&invert_module_row(ctx)),
+            let row: gtk4::Widget = match mi.label {
+                "Exposure" => exposure_module_row(ctx).upcast(),
+                "Velvia" => velvia_module_row(ctx).upcast(),
+                "Split-toning" => splittoning_module_row(ctx).upcast(),
+                "Monochrome" => monochrome_module_row(ctx).upcast(),
+                "Sigmoid" => sigmoid_module_row(ctx).upcast(),
+                "Sharpen" => sharpen_module_row(ctx).upcast(),
+                "Vibrance" => vibrance_module_row(ctx).upcast(),
+                "Colorize" => colorize_module_row(ctx).upcast(),
+                "Color correction" => colorcorrection_module_row(ctx).upcast(),
+                "Color contrast" => colorcontrast_module_row(ctx).upcast(),
+                "Primaries" => primaries_module_row(ctx).upcast(),
+                "Negadoctor" => negadoctor_module_row(ctx).upcast(),
+                "Tone equalizer" => toneequal_module_row(ctx).upcast(),
+                "Color balance RGB" => cbrgb_module_row(ctx).upcast(),
+                "Filmic RGB" => filmic_module_row(ctx).upcast(),
+                "Highlight reconstruction" => highlights_module_row(ctx).upcast(),
+                "Denoise (profiled)" => denoise_module_row(ctx).upcast(),
+                "Lens correction" => lens_module_row(ctx).upcast(),
+                "Bloom" => bloom_module_row(ctx).upcast(),
+                "Color zones" => colorzones_module_row(ctx).upcast(),
+                "Tone curve" => curve_editor::tonecurve_module_row(ctx).upcast(),
+                "RGB curve" => curve_editor::rgbcurve_module_row(ctx).upcast(),
+                "Base curve" => curve_editor::basecurve_module_row(ctx).upcast(),
+                "Levels" => levels_module_row(ctx).upcast(),
+                "Vignetting" => vignette_module_row(ctx).upcast(),
+                "Lowlight vision" => lowlight_module_row(ctx).upcast(),
+                "Graduated density" => gradnd_module_row(ctx).upcast(),
+                "Contrast brightness saturation" => colisa_module_row(ctx).upcast(),
+                "Basic adjustments" => basicadj_module_row(ctx).upcast(),
+                "Shadows/Highlights" => shadhi_module_row(ctx).upcast(),
+                "Local contrast" => localcontrast_module_row(ctx).upcast(),
+                "Lowpass" => lowpass_module_row(ctx).upcast(),
+                "White balance" => whitebalance_module_row(ctx).upcast(),
+                "Invert" => invert_module_row(ctx).upcast(),
                 other => match elsewhere_hint(other) {
                     // Implemented, but driven from its own control — point at it
                     // rather than calling it unwired.
-                    Some(hint) => pg.add(&elsewhere_module_row(other, hint)),
-                    None => pg.add(&inert_module_row(other, mi.default_on)),
+                    Some(hint) => elsewhere_module_row(other, hint).upcast(),
+                    None => inert_module_row(other, mi.default_on).upcast(),
                 },
-            }
+            };
+            // The filter index borrows nothing: `row.clone()` is a GObject ref
+            // bump, and hiding via `set_visible` (see `apply_module_filter`)
+            // never destroys the row, so filter changes keep widget state.
+            index
+                .borrow_mut()
+                .push((row.clone(), gi, mi.label.to_string()));
+            pg.add(&row);
         }
+        group_widgets.push(pg.clone());
         panel.append(&pg);
     }
+
+    // Empty result shows a dim placeholder, never a blank panel.
+    let empty = gtk4::Label::builder()
+        .label("No modules match.")
+        .halign(gtk4::Align::Center)
+        .build();
+    empty.add_css_class("dim-label");
+    empty.set_visible(false);
+    panel.append(&empty);
+
+    // One shared applier reading the ctx-held selection plus the per-build row
+    // index (the index dies with this build; the selection survives in ctx).
+    let apply: Rc<dyn Fn()> = {
+        let index = index.clone();
+        let empty = empty.clone();
+        let ctx_cl = ctx.clone();
+        Rc::new(move || {
+            let filter = ctx_cl.module_filter.get();
+            let query = ctx_cl.module_search.borrow().clone();
+            apply_module_filter(&index.borrow(), &group_widgets, &empty, filter, &query);
+        })
+    };
+    // Seed the toggles from the surviving selection, THEN connect (seeding via
+    // set_active would otherwise drive the handlers mid-build).
+    let selected = ctx.module_filter.get();
+    for (f, btn) in &toggles {
+        btn.set_active(*f == selected);
+    }
+    for (f, btn) in &toggles {
+        let f = *f;
+        let ctx_cl = ctx.clone();
+        let apply = apply.clone();
+        btn.connect_toggled(move |b| {
+            // Group deactivation of the previously-armed button also fires;
+            // only the newly-armed one acts, keeping exactly one selection.
+            if b.is_active() {
+                ctx_cl.module_filter.set(f);
+                apply();
+            }
+        });
+    }
+    search.set_text(&ctx.module_search.borrow());
+    {
+        let ctx_cl = ctx.clone();
+        let apply = apply.clone();
+        search.connect_search_changed(move |s| {
+            *ctx_cl.module_search.borrow_mut() = s.text().to_string();
+            apply();
+        });
+    }
+    // Re-apply the seeded selection on every rebuild (Reset / undo-jump /
+    // style-apply clear the panel and come back through here).
+    apply();
 }
 
 /// Saved-style application inside the darkroom (m4-151), pinned below the
@@ -3846,7 +4033,9 @@ mod tests {
     /// `LIVE_MODULE_LABELS` now drives presentation (ordering + the "N of M
     /// active" count), not just this test, so a module present in the dispatch
     /// but missing from the list would render live yet be sorted and counted as
-    /// a placeholder. Pin the two together by parsing the match arms from source.
+    /// a placeholder. Pin the two together by parsing the match arms from source
+    /// (live arms call a `*_module_row` builder; the `other` fallback and the
+    /// elsewhere/inert rows never do).
     #[test]
     fn live_module_labels_match_the_dispatch_arms() {
         let src = include_str!("mod.rs");
@@ -3856,7 +4045,8 @@ mod tests {
                 let l = l.trim();
                 let rest = l.strip_prefix('"')?;
                 let (label, tail) = rest.split_once('"')?;
-                tail.trim_start().starts_with("=> pg.add").then_some(label)
+                let expr = tail.trim_start().strip_prefix("=>")?;
+                expr.contains("_module_row(").then_some(label)
             })
             .collect();
         let declared: std::collections::BTreeSet<&str> =
@@ -3901,5 +4091,35 @@ mod tests {
                  LIVE_MODULE_LABELS and the build_modules_panel match arms"
             );
         }
+    }
+
+    /// The filter scope + search matcher behind the w2 module filter bar.
+    /// `Active` must agree with `is_live_module` (the count + ordering
+    /// predicate); the search is a case-insensitive label substring that
+    /// combines with the scope tab rather than replacing it.
+    #[test]
+    fn module_filter_matches_scope_and_search() {
+        // All shows everything, live or placeholder, on an empty query.
+        assert!(module_filter_matches(ModuleFilter::All, 0, "Grain", ""));
+        assert!(module_filter_matches(ModuleFilter::All, 2, "Exposure", ""));
+        // Active shows only live modules (Exposure is live, Grain is inert).
+        assert!(module_filter_matches(ModuleFilter::Active, 0, "Exposure", ""));
+        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Grain", ""));
+        // Group(gi) shows exactly that catalog group: Tone is index 1.
+        assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
+        assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
+        // Group holds a catalog index, so every index resolves in-bounds.
+        for gi in 0..crate::catalog::module_catalog().len() {
+            let label = crate::catalog::module_catalog()[gi].modules[0].label;
+            assert!(module_filter_matches(ModuleFilter::Group(gi), gi, label, ""));
+        }
+        // Search is a case-insensitive substring over the label.
+        assert!(module_filter_matches(ModuleFilter::All, 0, "Exposure", "expo"));
+        assert!(module_filter_matches(ModuleFilter::All, 0, "Exposure", "EXPO"));
+        assert!(!module_filter_matches(ModuleFilter::All, 0, "Exposure", "velvia"));
+        // ... and it combines with the scope tab (Active + query still hides
+        // inert rows even when the query matches their label).
+        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Grain", "gra"));
+        assert!(module_filter_matches(ModuleFilter::Active, 4, "Bloom", "loo"));
     }
 }

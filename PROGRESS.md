@@ -7198,6 +7198,33 @@ Remote CI on `53066195f7` is green: `check + test + clippy` and `Build & push
 Docker image` both `success`; matrix/full-c skipped, `CMake + Rust workspace`
 path-filtered out (Rust-only change). Both remotes verified at `53066195f7`.
 
+### w2 — module tab-bar + search + active-only (2026-09-27 UTC)
+
+**What.** Second chrome leg: the 52-row module column is now navigable —
+All/Active/Base/Tone/Color/Correct/Effect radio tabs (from the catalog, no
+hardcoded groups) + case-insensitive search entry above the list. Filter
+state lives in `PreviewCtx` (survives undo/redo/reset/style rebuilds);
+filtering only hides rows (switches/expansion/sliders survive); empty result
+shows a dim placeholder; the "N of M active" count stays unfiltered.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no defects (state placement, hide-vs-destroy, radio seeding,
+search borrows, placeholder, same `is_live_module` predicate everywhere all
+verified; 2 NITs — one stale comment fixed in-session, non-sticky bar
+accepted). The gate then caught what review couldn't: the refactor shape
+(`"Label" => xxx_module_row(ctx).upcast()`) broke the source-parsing
+`live_module_labels_match_the_dispatch_arms` invariant test (found zero
+arms) — fixed by matching the new builder-call shape (34 arms, no false
+positives). Visually verified with the Xvfb rig: bar renders, Base isolates
+its group, All restores, **Active hides every "not yet wired" row live**.
+(Screenshot poking also showed the armed-tab highlight is subtle — noted
+for a later density pass, not this increment.)
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 97,
+`c41-ui` 501 (500 + 1 new filter test), 0 failed. `git diff --check` clean.
+Remote CI confirmation follows commit/push per workflow.
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the
