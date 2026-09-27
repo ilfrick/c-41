@@ -7134,7 +7134,11 @@ diagnostics in `raw.rs`/`neural.rs`/`tiles.rs` u10 ranges. `git diff
 1811 passed (1801 + 10 new), `c41-db` 97 unchanged, `c41-ui` 500 passed
 (498 + 2 new), 0 failed. PARITY_AUDIT.md 2.7 updated in the same commit
 (deviations closed; Foveon/darktablerc terminally out).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `8faf63e9c4` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u10
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`8faf63e9c4`.
 
 ### UI parity closed (2026-09-26 UTC)
 
