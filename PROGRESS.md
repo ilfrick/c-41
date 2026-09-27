@@ -7227,6 +7227,34 @@ Remote CI on `5d63f4e120` is green: `check + test + clippy` and `Build & push
 Docker image` both `success`; matrix/full-c skipped, `CMake + Rust workspace`
 path-filtered out (Rust-only change). Both remotes verified at `5d63f4e120`.
 
+### w3 — compact single-line module headers (2026-09-27 UTC)
+
+**What.** Third chrome leg and the biggest density win: `module_expander`
+(34 live IOP rows), `highlights_module_row`, `inert_module_row` (the
+"not yet wired" rows that dominate Base/Effect) and `elsewhere_module_row`
+(Crop/Straighten hints) drop their subtitle line — the description folds
+into the row tooltip **and** an explicit accessible description. Row height
+halves (~2 lines → 1), so the module column shows far more per screen.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES** — no functional defect; info preservation, control
+wiring, param rename and the "no subtitle ⇒ no reserved line" claim all
+verified (the latter against the widget structure, not assumed). Two MINORs
+addressed in-session: (1) `AdwActionRow` statically binds `described-by` to
+its subtitle label, so an omitted subtitle would shadow the tooltip's
+accessible fallback — all four builders now set
+`Property::Description(..)` explicitly; (2) the expander-wide tooltip can
+surface over expanded body children — accepted as informative (documented);
+NITs: the source-scan guard now also handles `pub/async fn` and
+`.set_subtitle(`. Visually verified with the Xvfb rig: single-line rows,
+subtitle text gone, switches/expansion unchanged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). All-targets Clippy: no new diagnostics in the changed
+ranges. Release suites: `c41-core` 1811, `c41-db` 97, `c41-ui` 503
+(501 + 2 new header tests), 0 failed. `git diff --check` clean.
+Remote CI confirmation follows commit/push per workflow.
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the

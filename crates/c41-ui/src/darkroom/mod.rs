@@ -2409,11 +2409,15 @@ fn styles_module_group(
 /// broken" rather than "this module isn't wired yet", and buried each shipped
 /// module in a crowd of lookalikes. Now it is dimmed, labelled, and inert.
 fn inert_module_row(label: &str, _default_on: bool) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(label)
-        .subtitle("not yet wired")
-        .build();
+    // Single-line header (title only): the "not yet wired" status lives in the
+    // row tooltip + accessible description instead of a subtitle line, halving
+    // the row height. The description is set explicitly because AdwActionRow
+    // statically binds `described-by` to its subtitle label, and an empty
+    // subtitle would shadow the tooltip's accessible fallback.
+    let row = adw::ActionRow::builder().title(label).build();
     row.add_css_class("dim-label");
+    row.set_tooltip_text(Some("not yet wired"));
+    row.update_property(&[gtk4::accessible::Property::Description("not yet wired")]);
     // No switch at all: a disabled switch still suggests "turn me on", while an
     // icon reads as a status. Sensitivity off so it can't take focus either.
     let marker = gtk4::Image::from_icon_name("content-loading-symbolic");
@@ -2431,9 +2435,15 @@ fn inert_module_row(label: &str, _default_on: bool) -> adw::ActionRow {
 /// panel. Not dimmed — it is functional — but non-activatable, since its switch
 /// would have nothing to gate.
 fn elsewhere_module_row(label: &str, hint: &str) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title(label).subtitle(hint).build();
+    // Single-line header (title only): the hint folds into the tooltip +
+    // accessible description (empty subtitle would shadow the tooltip for
+    // screen readers on AdwActionRow, which binds `described-by` to it).
+    let row = adw::ActionRow::builder().title(label).build();
+    row.set_tooltip_text(Some(hint));
+    row.update_property(&[gtk4::accessible::Property::Description(hint)]);
     let marker = gtk4::Image::from_icon_name("go-up-symbolic");
     marker.set_valign(gtk4::Align::Center);
+    marker.set_tooltip_text(Some(hint));
     row.add_suffix(&marker);
     row.set_activatable(false);
     row
@@ -2479,23 +2489,29 @@ const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Mon
 // takes a short-lived `borrow_mut()` (dropped at the statement end) before
 // `render_preview(&ctx)` snapshots params, so the two never overlap.
 
-/// Build a live `ExpanderRow` for one IOP module: title/subtitle, a built-in
-/// enable switch wired to `set_enabled`, and the param sliders added by
-/// `add_params`. `enabled` seeds the switch from the current params.
+/// Build a live `ExpanderRow` for one IOP module: single-line title (no
+/// subtitle line, like darktable's icon + name + enable-switch header), a
+/// built-in enable switch wired to `set_enabled`, and the param sliders added
+/// by `add_params`. `description` is kept as the row tooltip so the info is
+/// not lost. `enabled` seeds the switch from the current params.
 fn module_expander(
     ctx: &PreviewCtx,
     title: &str,
-    subtitle: &str,
+    description: &str,
     enabled: bool,
     set_enabled: fn(&mut PreviewParams, bool),
     add_params: impl FnOnce(&adw::ExpanderRow, &PreviewCtx),
 ) -> adw::ExpanderRow {
+    // No subtitle property at all (not even an empty one): libadwaita only
+    // reserves the second line while a subtitle is set, so omitting it keeps
+    // the header to one line.
     let expander = adw::ExpanderRow::builder()
         .title(title)
-        .subtitle(subtitle)
         .show_enable_switch(true)
         .enable_expansion(enabled)
         .build();
+    expander.set_tooltip_text(Some(description));
+    expander.update_property(&[gtk4::accessible::Property::Description(description)]);
     let ctx_cl = ctx.clone();
     expander.connect_enable_expansion_notify(move |e| {
         set_enabled(&mut ctx_cl.params.borrow_mut(), e.enables_expansion());
@@ -3311,10 +3327,13 @@ fn highlights_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     let expander = adw::ExpanderRow::builder()
         .title("Highlight reconstruction")
-        .subtitle("recover clipped raw highlights (pre-demosaic)")
         .show_enable_switch(true)
         .enable_expansion(p0.hl_on)
         .build();
+    expander.set_tooltip_text(Some("recover clipped raw highlights (pre-demosaic)"));
+    expander.update_property(&[gtk4::accessible::Property::Description(
+        "recover clipped raw highlights (pre-demosaic)",
+    )]);
     if !crate::raw_preview::is_raw_path(&ctx.decode_path.borrow()) {
         expander.set_visible(false);
         return expander;
@@ -4091,6 +4110,57 @@ mod tests {
                  LIVE_MODULE_LABELS and the build_modules_panel match arms"
             );
         }
+    }
+
+    /// w3 header density: module headers are single-line (title only, the
+    /// description folded into the row tooltip). Pin by source scan that none
+    /// of the header builders sets a subtitle — headless, since instantiating
+    /// the rows needs a display. Non-header subtitles (styles rows, the
+    /// saturation-formula child row) are deliberately out of scope and still
+    /// allowed elsewhere in this file.
+    #[test]
+    fn module_headers_set_no_subtitle() {
+        let src = include_str!("mod.rs");
+        let mut current = "";
+        let mut offenders: Vec<String> = Vec::new();
+        for (i, l) in src.lines().enumerate() {
+            let t = l.trim();
+            let decl = t
+                .strip_prefix("fn ")
+                .or_else(|| t.strip_prefix("pub fn "))
+                .or_else(|| t.strip_prefix("pub(crate) fn "))
+                .or_else(|| t.strip_prefix("async fn "))
+                .or_else(|| t.strip_prefix("pub async fn "));
+            if let Some(rest) = decl {
+                current = rest.split('(').next().unwrap_or("");
+            }
+            let is_header_builder = matches!(
+                current,
+                "module_expander" | "inert_module_row" | "elsewhere_module_row" | "highlights_module_row"
+            );
+            if is_header_builder
+                && (t.contains(".subtitle(") || t.contains(".set_subtitle("))
+            {
+                offenders.push(format!("line {} in {current}", i + 1));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "single-line headers must not set a subtitle: {offenders:?}"
+        );
+    }
+
+    /// w3 tooltip preservation: the strings folded out of the subtitles into
+    /// tooltips are pinned here so the density change cannot silently drop
+    /// them (`elsewhere_hint` feeds `elsewhere_module_row`'s tooltip).
+    #[test]
+    fn elsewhere_hints_are_the_row_tooltips() {
+        assert_eq!(elsewhere_hint("Crop"), Some("use the Crop button above"));
+        assert_eq!(
+            elsewhere_hint("Rotate & perspective"),
+            Some("use the Straighten slider above")
+        );
+        assert_eq!(elsewhere_hint("Grain"), None);
     }
 
     /// The filter scope + search matcher behind the w2 module filter bar.
