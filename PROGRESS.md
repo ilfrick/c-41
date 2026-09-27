@@ -7253,7 +7253,9 @@ subtitle text gone, switches/expansion unchanged.
 tests, `c41-rs` link). All-targets Clippy: no new diagnostics in the changed
 ranges. Release suites: `c41-core` 1811, `c41-db` 97, `c41-ui` 503
 (501 + 2 new header tests), 0 failed. `git diff --check` clean.
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `e576d89a40` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c skipped, `CMake + Rust workspace`
+path-filtered out (Rust-only change). Both remotes verified at `e576d89a40`.
 
 ### UI parity closed (2026-09-26 UTC)
 
