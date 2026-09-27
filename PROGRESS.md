@@ -7149,4 +7149,8 @@ diagnostics in `slideshow.rs` post-fix. `git diff --check` clean; no
 `c41-db` 97 unchanged, `c41-ui` 495 passed (485 + 10 new), 0 failed.
 PARITY_AUDIT.md 3.4 noted in the same commit (fourth view; "Other" was
 only ever map/print/tethering).
-Remote CI confirmation follows commit/push per workflow.
+Remote CI on `db69b0e94d` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected.
+`CMake + Rust workspace` did not run — correctly path-filtered out (u8
+touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
+`db69b0e94d`.
