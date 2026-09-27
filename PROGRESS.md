@@ -7103,6 +7103,39 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `4c8c8aa664`.
 
+### u10 — deviation batch: WB-NONE, seam blending, antimeridian fit (2026-09-27 UTC)
+
+**What.** Three documented deviations closed: (1) Bayer WB-NONE mode
+(`variants.bayer.wb_norm: none` → {1,1,1} passthrough in normalize AND
+remosaic-inverse, daylight default preserved); (2) `ax·ay`-weighted seam
+accumulation for Bayer tiling (h/v strip ownership, corner routing,
+interior hard-write, clamped extents) replacing the valid-strip copy;
+(3) antimeridian map fit (lon span > 180° shifts to a +360 frame, centre
+wrapped back; =180 stays naive). Foveon stays refused (rawloader X3F
+unimplemented — upstream-blocked, verified in-vendored-source);
+darktablerc band override permanently out (no darktablerc in product).
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE** — all three closures faithful (WB key/values/default,
+strip ownership/weights/flush/rotate, fit math), no defects. Two
+load-bearing confirmations from the review: (1) the dev's u7e-bug claim
+VERIFIED real against HEAD — the old driver wrote one CFA pixel per
+packed pixel (always R sites), so 3/4 of shipped DNGs were raw source;
+fixed by the rewrite; (2) the C latent OOB VERIFIED real (unclamped
+extents/flushes) — the port's clamping preserves in-working weights
+bit-identically. NITs only (dead `BayerSource.wb` already documented,
+date-line heuristic limits noted, below-`T<4O` weights noted at clamp
+site). Untracked `install-debuntu.sh*` left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `raw.rs`/`neural.rs`/`tiles.rs` u10 ranges. `git diff
+--check` clean; no `/*`/`*/` in added lines. Release suites: `c41-core`
+1811 passed (1801 + 10 new), `c41-db` 97 unchanged, `c41-ui` 500 passed
+(498 + 2 new), 0 failed. PARITY_AUDIT.md 2.7 updated in the same commit
+(deviations closed; Foveon/darktablerc terminally out).
+Remote CI confirmation follows commit/push per workflow.
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the

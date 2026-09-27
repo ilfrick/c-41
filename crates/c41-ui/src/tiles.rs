@@ -314,9 +314,12 @@ pub fn visible_tile_range(
 /// zoom that still fits the box (with a marker margin kept clear), or
 /// `(0, 0)@2` when there is nothing to fit. A single fix (or duplicates)
 /// centres exactly on it at zoom 12, street-level-ish rather than a whole
-/// continent for one photo. The longitude box is naive (no antimeridian
-/// split): a set straddling the date line fits conservatively, showing ocean
-/// — correct, merely wide.
+/// continent for one photo. A set straddling the antimeridian (naive
+/// longitude span over 180) is boxed in a frame where negative longitudes
+/// shift by +360, and the centre wraps back — so Fiji plus Tonga fits the
+/// islands tight instead of fitting the whole ocean between the long way
+/// around. Markers themselves already take the short way in
+/// [`geo_to_screen`], so they land inside this fit.
 pub fn fit_view(points: &[(f64, f64)], vp_w: f64, vp_h: f64) -> (f64, f64, i32) {
     if points.is_empty() || vp_w.is_nan() || vp_h.is_nan() || vp_w <= 0.0 || vp_h <= 0.0 {
         return (0.0, 0.0, 2);
@@ -325,6 +328,8 @@ pub fn fit_view(points: &[(f64, f64)], vp_w: f64, vp_h: f64) -> (f64, f64, i32) 
     let mut lat_max = f64::NEG_INFINITY;
     let mut lon_min = f64::INFINITY;
     let mut lon_max = f64::NEG_INFINITY;
+    let mut shifted_min = f64::INFINITY;
+    let mut shifted_max = f64::NEG_INFINITY;
     for (lat, lon) in points {
         if !lat.is_finite() || !lon.is_finite() {
             continue;
@@ -335,13 +340,23 @@ pub fn fit_view(points: &[(f64, f64)], vp_w: f64, vp_h: f64) -> (f64, f64, i32) 
         lat_max = lat_max.max(lat);
         lon_min = lon_min.min(lon);
         lon_max = lon_max.max(lon);
+        let shifted = if lon < 0.0 { lon + 360.0 } else { lon };
+        shifted_min = shifted_min.min(shifted);
+        shifted_max = shifted_max.max(shifted);
     }
     if lat_min == f64::INFINITY {
         return (0.0, 0.0, 2);
     }
     let center_lat = (lat_min + lat_max) / 2.0;
-    let center_lon = wrap_lon((lon_min + lon_max) / 2.0);
-    let lon_span = (lon_max - lon_min).max(0.0);
+    // A naive span over 180 means the short way crosses the date line:
+    // box the shifted frame instead and wrap the centre back.
+    let (lon_lo, lon_hi) = if lon_max - lon_min > 180.0 {
+        (shifted_min, shifted_max)
+    } else {
+        (lon_min, lon_max)
+    };
+    let center_lon = wrap_lon((lon_lo + lon_hi) / 2.0);
+    let lon_span = (lon_hi - lon_lo).max(0.0);
     let lat_span_frac = (mercator_y_frac(lat_max) - mercator_y_frac(lat_min)).abs();
     if lon_span <= f64::EPSILON && lat_span_frac <= 1e-12 {
         return (center_lat, center_lon, 12);
@@ -929,6 +944,45 @@ mod tests {
         assert!((slat - 48.85).abs() < 1e-9 && (slon - 2.35).abs() < 1e-9 && sz == 12);
         let (dlat, dlon, dz) = fit_view(&[(48.85, 2.35), (48.85, 2.35)], 800.0, 600.0);
         assert!((dlat - slat).abs() < 1e-12 && (dlon - slon).abs() < 1e-12 && dz == sz);
+    }
+
+    #[test]
+    fn fit_view_splits_date_line_straddling_sets() {
+        // Suva, Fiji (178.44E) + Nuku'alofa, Tonga (175.22W): the naive
+        // span is ~354, but the short way is ~6.4 across the date line.
+        // The fit must box the shifted frame (negatives +360) and wrap
+        // the centre back, landing tight instead of fitting the ocean.
+        let pts = [(-18.1416, 178.4419), (-21.1359, -175.2167)];
+        let (clat, clon, z) = fit_view(&pts, 800.0, 600.0);
+        assert!((clat + 19.63875).abs() < 1e-6, "{clat}");
+        assert!((clon + 178.3874).abs() < 1e-4, "{clon}");
+        assert_eq!(z, 7, "tight on the islands, not the ocean");
+        // Both fixes land inside the viewport at the chosen zoom — via
+        // geo_to_screen, which renders markers the short way around the
+        // planet, so this also pins marker/fit agreement.
+        for (lat, lon) in pts {
+            let (px, py) = geo_to_screen(lat, lon, clat, clon, z, 800.0, 600.0);
+            assert!(
+                (0.0..=800.0).contains(&px) && (0.0..=600.0).contains(&py),
+                "{px},{py}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_view_leaves_non_straddling_sets_unchanged() {
+        // Span under 180 keeps the naive box: centre is the plain
+        // midpoint, strictly inside [-180, 180] with no wrap involved.
+        let (clat, clon, z) = fit_view(&[(0.0, 10.0), (0.0, 20.0)], 800.0, 600.0);
+        assert!((clat).abs() < 1e-12, "{clat}");
+        assert!((clon - 15.0).abs() < 1e-12, "{clon}");
+        assert_eq!(z, 6);
+        // A span of exactly 180 is NOT over 180: the naive branch still
+        // applies (centre 0, not the shifted frame's 180).
+        let (elat, elon, ez) = fit_view(&[(0.0, -90.0), (0.0, 90.0)], 800.0, 600.0);
+        assert!((elat).abs() < 1e-12, "{elat}");
+        assert!((elon).abs() < 1e-12, "{elon}");
+        assert_eq!(ez, 2);
     }
 
     #[test]

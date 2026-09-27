@@ -109,8 +109,12 @@ minimal CFA DNG writer (no-preview tag set, verified by rawloader decode
 roundtrip), RawDenoise panel task with NIND download-on-demand.
 **Linear raw variant landed 2026-09-26 (u7f):** X-Trans/non-Bayer sensors
 route to demosaiced linear camRGB inference (WB/matrix/boost/match_gain/
-inversion per `restore_raw_linear`) with LinearRaw DNG output. Item 2.7
-neural-restore leg CLOSED. | low priority; listed for completeness |
+inversion per `restore_raw_linear`) with LinearRaw DNG output.
+**Deviation batch landed 2026-09-27 (u10):** Bayer WB-NONE mode
+(`wb_norm: none` → passthrough), `ax·ay` seam-blended Bayer tiling,
+antimeridian map fit. Item 2.7 neural-restore leg CLOSED (Foveon stays
+refused — upstream rawloader X3F unimplemented; darktablerc override
+permanently out — no darktablerc in this product). | low priority; listed for completeness |
 
 ## Severity 3 — parity polish
 

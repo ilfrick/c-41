@@ -714,6 +714,14 @@ fn run_raw_denoise_worker(
         RawDenoiseSource::Bayer(src) => {
             let prepared = c41_core::ai::raw::prepare_rawdenoise_model(model_name)
                 .map_err(|e| format!("model prepare: {e}"))?;
+            // WB under the manifest `model_bayer.wb_norm` mode (daylight
+            // when the manifest is silent): the same wb_norm the C
+            // resolves in `_compute_bayer_prep` and inverts in remosaic.
+            let wb = c41_core::ai::raw::resolve_bayer_wb(
+                prepared.wb_mode,
+                src.xyz_to_cam,
+                src.wb_coeffs,
+            );
             let out_cfa = c41_core::ai::raw::rawdenoise_bayer(
                 &src.raw,
                 src.w,
@@ -721,7 +729,7 @@ fn run_raw_denoise_worker(
                 src.pattern,
                 src.black,
                 src.white,
-                src.wb,
+                wb,
                 &prepared.onnx_path,
                 prepared.tile_size,
                 progress,

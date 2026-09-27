@@ -51,18 +51,25 @@
 //! ## Deliberate deviations from the C batch path
 //!
 //! * Seam blending: the C accumulates `ax*ay`-weighted overlap seams
-//!   across tiles (`:598-736`). This port writes each tile's core valid
-//!   strip only (the u7b strip discipline) — no blending weights.
+//!   across tiles (`:598-736`, weights `restore_common.h:223-255`).
+//!   This port does the same since u10 ([`run_bayer_tiled`]): the
+//!   `2*sensor_O`-wide seam regions accumulate into the h/v strips with
+//!   `h_strip_top`/`bot` rotation and flush discipline mirroring the C,
+//!   pure interiors hard-write, and h-strips own the corners.
 //! * Visible region: the C crops to the metadata-reported visible region
 //!   and copies the margins from the source (`:358-373`). This port drives
 //!   full-frame only; the sub-working-region margins (at most one row/col
 //!   on odd-sized sensors) are copied from the source the same way.
 //! * Strength: the C blends `alpha * raw + (1-alpha) * cfa_in` (`:644-645`).
 //!   This port always takes the full model output (`alpha = 1`).
-//! * WB mode: the C keys daylight vs as-shot off `ctx->wb_mode` with a
-//!   fallback chain (`:139-152`). This port resolves daylight-first with
-//!   as-shot fallback (the C default) in [`resolve_wb`]; there is no NONE
-//!   mode and no per-model override.
+//! * WB mode: the C keys daylight vs as-shot vs none off `ctx->wb_mode`
+//!   with a fallback chain (`:139-152`), the mode itself selected by the
+//!   manifest `model_bayer.wb_norm` key (`restore.h:118-121`,
+//!   `restore.c:243,376`). This port resolves the same three modes in
+//!   [`resolve_bayer_wb`] from [`BayerWbMode`], read off the manifest by
+//!   [`bayer_wb_mode_from_manifest`] with the C default (daylight) on
+//!   missing/unknown keys. [`resolve_wb`] is the daylight-default alias
+//!   the source loaders use before the manifest is known.
 //! * Session: one session per call, no GPU/CPU fallback reload (`:515-526`
 //!   has none of that either — it is batch policy, not math).
 //!
@@ -305,18 +312,75 @@ pub fn as_shot_wb(wb_coeffs: [f32; 4]) -> Option<[f32; 3]> {
     Some([wb_coeffs[0] / g, 1.0, wb_coeffs[2] / g])
 }
 
+/// WB normalisation mode for the Bayer path (`model_bayer.wb_norm`,
+/// `restore.h:118-121`, parsed by `restore.c:110-120` `_parse_wb_mode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BayerWbMode {
+    /// `daylight` (the C default): daylight first, as-shot fallback.
+    Daylight,
+    /// `as_shot`: as-shot first, daylight fallback.
+    AsShot,
+    /// `none`: no normalisation, `{1, 1, 1}` — normalize multiplies by
+    /// one and [`remosaic_value`] divides by one, so the round-trip is a
+    /// passthrough up to black/range and quantisation.
+    Off,
+}
+
+/// Parse `model_bayer.wb_norm`, defaulting to
+/// [`BayerWbMode::Daylight`] on missing/unknown
+/// (`restore.c:110-120` `_parse_wb_mode` falls back to the caller default
+/// with a debug print — the Bayer caller default is daylight, `:372`).
+pub fn parse_bayer_wb_mode(s: Option<&str>) -> BayerWbMode {
+    match s {
+        Some("as_shot") => BayerWbMode::AsShot,
+        Some("none") => BayerWbMode::Off,
+        _ => BayerWbMode::Daylight,
+    }
+}
+
+/// Read the `model_bayer.wb_norm` knob from an unpacked manifest, with
+/// the C default (daylight) on a missing or unknown value.
+pub fn bayer_wb_mode_from_manifest(manifest: &package::PackageManifest) -> BayerWbMode {
+    parse_bayer_wb_mode(
+        package::variant_string(manifest, MODEL_BAYER_STEM, "wb_norm").as_deref(),
+    )
+}
+
+/// WB normalisation with an explicit mode: daylight-first with as-shot
+/// fallback, as-shot-first with daylight fallback, or unity
+/// (`restore_raw_bayer.c:139-152`, the three `DT_RESTORE_WB_*` branches;
+/// NONE leaves the `{1,1,1}` init untouched, `:152`). `{1, 1, 1}` when
+/// both resolutions are unavailable (the C keeps its init, `:139`).
+pub fn resolve_bayer_wb(
+    mode: BayerWbMode,
+    xyz_to_cam: [[f32; 3]; 4],
+    wb_coeffs: [f32; 4],
+) -> [f32; 3] {
+    match mode {
+        BayerWbMode::Off => [1.0, 1.0, 1.0],
+        BayerWbMode::Daylight => {
+            if let Some(wb) = daylight_wb(xyz_to_cam) {
+                return wb;
+            }
+            as_shot_wb(wb_coeffs).unwrap_or([1.0, 1.0, 1.0])
+        }
+        BayerWbMode::AsShot => {
+            if let Some(wb) = as_shot_wb(wb_coeffs) {
+                return wb;
+            }
+            daylight_wb(xyz_to_cam).unwrap_or([1.0, 1.0, 1.0])
+        }
+    }
+}
+
 /// WB normalisation with the C default policy: daylight first, as-shot as
 /// the fallback (`restore_raw_bayer.c:142-146`, `DT_RESTORE_WB_DAYLIGHT`
 /// branch). `{1, 1, 1}` when both are unavailable (the C keeps its
-/// `{1,1,1}` init, `:139`).
+/// `{1,1,1}` init, `:139`). Kept for the source loaders, which resolve
+/// before the manifest is known; the worker re-resolves with the
+/// manifest mode via [`resolve_bayer_wb`].
 pub fn resolve_wb(xyz_to_cam: [[f32; 3]; 4], wb_coeffs: [f32; 4]) -> [f32; 3] {
-    if let Some(wb) = daylight_wb(xyz_to_cam) {
-        return wb;
-    }
-    if let Some(wb) = as_shot_wb(wb_coeffs) {
-        return wb;
-    }
-    [1.0, 1.0, 1.0]
+    resolve_bayer_wb(BayerWbMode::Daylight, xyz_to_cam, wb_coeffs)
 }
 
 /// One site's model-input value: `(raw - black) / range * wb_norm[ch]`
@@ -444,11 +508,86 @@ pub fn remosaic_value(
     normalized * range[site] + black[site]
 }
 
+/// Seam ramp for one axis: `((d) + 0.5) / (2 * sensor_O)`
+/// (`restore_common.h:228-231` `_seam_ramp`). `d` counts from the seam
+/// region's far edge, `sensor_O` is `2 * O_PACKED` sensor pixels.
+#[inline]
+pub fn seam_ramp(d: i64, sensor_o: usize) -> f32 {
+    (d as f32 + 0.5) / (2 * sensor_o) as f32
+}
+
+/// Horizontal seam weight of one tile at sensor column `sc`:
+/// left ramp, right ramp, else `1.0` (pure interior)
+/// (`restore_common.h:233-243` `_seam_ax`). `px_base`/`px_end` are the
+/// tile's core-valid sensor columns (already origin-shifted).
+#[inline]
+pub fn seam_ax(
+    sc: i64,
+    px_base: i64,
+    px_end: i64,
+    sensor_o: usize,
+    has_left: bool,
+    has_right: bool,
+) -> f32 {
+    let so = sensor_o as i64;
+    if has_left && sc < px_base + so {
+        return seam_ramp(sc - (px_base - so), sensor_o);
+    }
+    if has_right && sc >= px_end - so {
+        return 1.0 - seam_ramp(sc - (px_end - so), sensor_o);
+    }
+    1.0
+}
+
+/// Vertical seam weight of one tile at sensor row `sr`
+/// (`restore_common.h:245-255` `_seam_ay`). Same shape as [`seam_ax`].
+#[inline]
+pub fn seam_ay(
+    sr: i64,
+    py_base: i64,
+    py_end: i64,
+    sensor_o: usize,
+    has_top: bool,
+    has_bot: bool,
+) -> f32 {
+    let so = sensor_o as i64;
+    if has_top && sr < py_base + so {
+        return seam_ramp(sr - (py_base - so), sensor_o);
+    }
+    if has_bot && sr >= py_end - so {
+        return 1.0 - seam_ramp(sr - (py_end - so), sensor_o);
+    }
+    1.0
+}
+
+/// Clip a blended float raw value to `[0, white]` and round half up to
+/// u16 (`restore_raw_bayer.c:676-679`, `:695-697`, `:727-729` — the same
+/// expression at the hard-write, v-flush and h-flush sites).
+#[inline]
+fn clip_round_u16(v: f32, clip_max: f32) -> u16 {
+    (v.clamp(0.0, clip_max) + 0.5) as u16
+}
+
 /// The tiled Bayer driver behind [`rawdenoise_bayer`]: pack each tile via
 /// [`pack_bayer_tile`], hand it to `run_tile` (which must return 3ch
 /// `2T x 2T` f32 — the `tile_out` of `dt_restore_run_patch_bayer`),
-/// [`match_gain_in_place`], then re-mosaic the tile's core valid strip
-/// into the CFA output. Injecting `run_tile` is the fake-session seam
+/// [`match_gain_in_place`], then re-mosaic into the CFA output with the
+/// C overlap blending (`restore_raw_bayer.c:430-736`): at each tile
+/// boundary the seam regions accumulate `ax*ay`-weighted contributions
+/// whose ramps sum to 1, pure interiors hard-write, and the h-strips own
+/// the corners. `h_strip_top`/`bot` rotate and flush per row, `v_strip`
+/// rotates and flushes per tile — the same ownership as the C.
+/// Strength blending stays at full model output (`alpha = 1`, see the
+/// module doc), so the accumulated value is the remosaiced model value.
+///
+/// Tile-size contract: the seam ramps of tiles two apart overlap unless
+/// the packed step covers `2*O` (`T >= 4*O_PACKED` = 128) — narrower
+/// tiles break the weights-sum-to-one in the C identically (three tiles
+/// accumulate the same pixel), so blending is exact only at or above
+/// that size. The driver accepts any `T > 2*O` like the C
+/// (`restore_raw_bayer.c:378`) and stays panic-free below it (all strip
+/// traffic is clamped to the working region), but the values there are
+/// the C's approximate ones, not exact blends.
 /// (same shape as the u7b driver): tests pass a pure function and never
 /// touch ONNX Runtime. `progress(tile, total)` fires after each completed
 /// tile, 1-based and monotonic.
@@ -501,6 +640,17 @@ pub fn run_bayer_tiled(
     // construction, and the region already lies inside the buffer).
     let (mir_y_lo, mir_y_hi) = (y0, y0 + 2 * hh);
     let (mir_x_lo, mir_x_hi) = (x0, x0 + 2 * ww);
+    // Working-region sensor bounds. The C accumulates and flushes strip
+    // traffic unclamped (`:604-736` has no working-region clamp on the
+    // extents or the v-strip flush — only the h-strip flush clamps its
+    // columns, `:724`), which runs past the buffer whenever a trailing
+    // packed core is narrower than the seam half-width (the strip then
+    // extends past the working end). This port clamps every strip read
+    // and write below to the working region: in-working pixels keep the
+    // exact C weights (every covering tile still contributes), and
+    // out-of-working pixels have no output pixel to blend toward.
+    let work_y1 = y0 + 2 * hh;
+    let work_x1 = x0 + 2 * ww;
     let step = t as i64 - 2 * o as i64;
     let cols = (ww + step - 1) / step;
     let rows = (hh + step - 1) / step;
@@ -514,13 +664,41 @@ pub fn run_bayer_tiled(
     // `+ 0.5` is a no-op on integers — same result as the C.
     let white_u16 = white as u16;
     let mut out: Vec<u16> = raw.iter().map(|&v| v.min(white_u16)).collect();
+    // Overlap blending (`:430-736`): seam half-width in sensor pixels,
+    // h-strip height, and the rotating accumulators. Only the
+    // `2*sensor_O`-wide seam regions accumulate; pure interiors
+    // hard-write; h-strips own the corners.
+    let sw = w as i64;
+    let sensor_o = 2 * o;
+    let hstrip_h = 2 * sensor_o;
     let mut done = 0u32;
+    // h_strip_top = seam between (ty-1) and ty with its sensor-row origin:
+    // built by ty-1 as bot, flushed by ty (`:437-439`).
+    let mut h_top: Option<(Vec<f32>, i64)> = None;
     for ty in 0..rows {
+        let has_top = ty > 0;
+        let has_bot = ty < rows - 1;
         let py_base = ty * step;
         let py_end = (py_base + step).min(hh);
+        let sensor_py_base = y0 + 2 * py_base;
+        let sensor_py_end = y0 + 2 * py_end;
+        // Cores run edge-to-edge in y, so one shared h_strip_bot origin
+        // per row, set at the first column (`:578-579`).
+        let mut h_bot: Option<(Vec<f32>, i64)> = if has_bot {
+            Some((vec![0f32; wt * hstrip_h], sensor_py_end - sensor_o as i64))
+        } else {
+            None
+        };
+        // v_strip_left = seam (tx-1) and tx with origin + height: rotated
+        // in from tx-1's right, flushed by tx (`:454-456`).
+        let mut v_left: Option<(Vec<f32>, i64, i64, usize)> = None;
         for tx in 0..cols {
+            let has_left = tx > 0;
+            let has_right = tx < cols - 1;
             let px_base = tx * step;
             let px_end = (px_base + step).min(ww);
+            let sensor_px_base = x0 + 2 * px_base;
+            let sensor_px_end = x0 + 2 * px_end;
             // Tile origin in sensor coords, shifted by (y0, x0) so packed
             // channel 0 always hits R (`:242-244`, `:478-483`: base
             // `2*(p_base - O)` plus the origin shift).
@@ -550,32 +728,145 @@ pub fn run_bayer_tiled(
                 )));
             }
             match_gain_in_place(&tile_in, &mut tile_out, t);
-            // Core valid strip only (no seam blending — see module doc):
-            // packed (py, px) owns sensor rows y0+2py..+2 and cols
-            // x0+2px..+2; the model sample is at 2*O + offset from the
-            // tile's core base (`:573-576`, `:606`, `:632`, `:637-641`).
-            let sensor_py_base = y0 + 2 * py_base;
-            let sensor_px_base = x0 + 2 * px_base;
-            let two_t = 2 * t;
-            for py in py_base..py_end {
-                let sr = y0 + 2 * py;
-                let my = 2 * o as i64 + (sr - sensor_py_base);
-                for px in px_base..px_end {
-                    let sc = x0 + 2 * px;
-                    let mx = 2 * o as i64 + (sc - sensor_px_base);
-                    let ch = pattern.fc(sr, sc);
-                    let model_val =
-                        tile_out[ch * out_plane + my as usize * two_t + mx as usize];
-                    let raw_val =
-                        remosaic_value(model_val, sr, sc, ch, wb_norm, black, range);
-                    let clipped = raw_val.clamp(0.0, clip_max);
-                    out[(sr * w as i64 + sc) as usize] = (clipped + 0.5) as u16;
+            // v-strip excludes top/bot corners (h-strips own them), so its
+            // y extent is the pure interior (`:581-596`).
+            let mut v_right: Option<(Vec<f32>, i64, i64, usize)> = None;
+            if has_right {
+                let sx0 = sensor_px_end - sensor_o as i64;
+                let sy0 = sensor_py_base + if has_top { sensor_o as i64 } else { 0 };
+                let y_end = sensor_py_end - if has_bot { sensor_o as i64 } else { 0 };
+                let vh = (y_end - sy0).max(0) as usize;
+                if vh > 0 {
+                    v_right = Some((vec![0f32; 2 * sensor_o * vh], sx0, sy0, vh));
                 }
             }
+            // Extended extent = core plus the seam where a neighbor exists;
+            // matches the model-output validity (`:598-602`).
+            let ext_y0 = if has_top { sensor_py_base - sensor_o as i64 } else { sensor_py_base };
+            let ext_y1 = if has_bot { sensor_py_end + sensor_o as i64 } else { sensor_py_end };
+            let ext_x0 = if has_left { sensor_px_base - sensor_o as i64 } else { sensor_px_base };
+            let ext_x1 = if has_right { sensor_px_end + sensor_o as i64 } else { sensor_px_end };
+            let two_t = 2 * t;
+            let two_o = 2 * o as i64;
+            for sr in ext_y0..ext_y1 {
+                // Clamp strip traffic to the working region (see above):
+                // out-of-working pixels have no output pixel, and skipping
+                // them keeps every strip index in bounds.
+                if sr < y0 || sr >= work_y1 {
+                    continue;
+                }
+                let my = two_o + (sr - sensor_py_base);
+                let ay = seam_ay(sr, sensor_py_base, sensor_py_end, sensor_o, has_top, has_bot);
+                let in_horiz_seam = ay < 1.0;
+                let mo_row = my as usize * two_t;
+                // Resolve the h-strip for this row once per row: top when
+                // in the upper seam half, bot when in the lower (`:614-626`).
+                let (mut h_buf, h_sy0) = if in_horiz_seam {
+                    if has_top && sr < sensor_py_base + sensor_o as i64 {
+                        match h_top.as_mut() {
+                            Some((b, sy0)) => (Some(b), *sy0),
+                            None => (None, 0),
+                        }
+                    } else if has_bot && sr >= sensor_py_end - sensor_o as i64 {
+                        match h_bot.as_mut() {
+                            Some((b, sy0)) => (Some(b), *sy0),
+                            None => (None, 0),
+                        }
+                    } else {
+                        (None, 0)
+                    }
+                } else {
+                    (None, 0)
+                };
+                let h_row_off = if h_buf.is_some() { (sr - h_sy0) as usize * wt } else { 0 };
+                for sc in ext_x0..ext_x1 {
+                    if sc < x0 || sc >= work_x1 {
+                        continue;
+                    }
+                    let mx = two_o + (sc - sensor_px_base);
+                    let ax = seam_ax(
+                        sc, sensor_px_base, sensor_px_end, sensor_o, has_left, has_right,
+                    );
+                    let in_vert_seam = ax < 1.0;
+                    let ch = pattern.fc(sr, sc);
+                    let model_val = tile_out[ch * out_plane + mo_row + mx as usize];
+                    let blended = remosaic_value(model_val, sr, sc, ch, wb_norm, black, range);
+                    let pidx = (sr * sw + sc) as usize;
+                    if in_horiz_seam {
+                        // h-strip owns corners too; weight ax*ay — the other
+                        // tiles complete the sum to 1 (`:647-652`).
+                        if let Some(buf) = h_buf.as_deref_mut() {
+                            buf[h_row_off + sc as usize] += ax * ay * blended;
+                        }
+                    } else if in_vert_seam {
+                        // Left half goes to the rotated-in strip, right half
+                        // to this tile's right strip (`:653-673`).
+                        let target = if has_left && sc < sensor_px_base + sensor_o as i64 {
+                            v_left.as_mut().map(|v| (v.0.as_mut_slice(), v.1, v.2))
+                        } else if has_right && sc >= sensor_px_end - sensor_o as i64 {
+                            v_right.as_mut().map(|v| (v.0.as_mut_slice(), v.1, v.2))
+                        } else {
+                            None
+                        };
+                        if let Some((buf, vsx0, vsy0)) = target {
+                            let dx = (sc - vsx0) as usize;
+                            let vidx = (sr - vsy0) as usize * (2 * sensor_o) + dx;
+                            buf[vidx] += ax * blended;
+                        }
+                    } else {
+                        out[pidx] = clip_round_u16(blended, clip_max);
+                    }
+                }
+            }
+            // The tx-1 + tx ramps now sum to 1: the strip holds the final
+            // value, so flush it and free (`:684-701`).
+            if let Some((buf, vsx0, vsy0, vh)) = v_left.take() {
+                for r in 0..vh {
+                    let sr = vsy0 + r as i64;
+                    if sr < y0 || sr >= work_y1 {
+                        continue;
+                    }
+                    let vrow = r * (2 * sensor_o);
+                    for dxs in 0..2 * sensor_o {
+                        let sc = vsx0 + dxs as i64;
+                        // Cells outside the working region were never
+                        // accumulated (see above) and must not overwrite
+                        // the margin copy with zeros.
+                        if sc < x0 || sc >= work_x1 {
+                            continue;
+                        }
+                        out[(sr * sw + sc) as usize] = clip_round_u16(buf[vrow + dxs], clip_max);
+                    }
+                }
+            }
+            v_left = v_right;
             done += 1;
             progress(done, total);
         }
+        // Defensive free on a mid-row break is a plain drop here; the
+        // whole call returns Err and `out` is discarded with it.
+        drop(v_left);
+        // Ramps sum to 1 — flush. Clamp sc to the working columns: cells
+        // outside were never written and would overwrite the margin copy
+        // (`:717-733`).
+        if let Some((buf, hsy0)) = h_top.take() {
+            for r in 0..hstrip_h {
+                let sr = hsy0 + r as i64;
+                if sr < y0 || sr >= work_y1 {
+                    continue;
+                }
+                let hrow = r * wt;
+                for sc in x0..x0 + 2 * ww {
+                    let v = buf[hrow + sc as usize];
+                    out[(sr * sw + sc) as usize] = clip_round_u16(v, clip_max);
+                }
+            }
+        }
+        h_top = h_bot;
     }
+    // Last row allocates no bottom strip, so `h_top` is None here; the
+    // drop is the defensive free (`:738-739`).
+    drop(h_top);
     Ok(out)
 }
 
@@ -765,6 +1056,10 @@ pub fn ensure_rawdenoise_model(
 pub struct PreparedRawModel {
     pub onnx_path: PathBuf,
     pub tile_size: u32,
+    /// The `model_bayer.wb_norm` knob (`restore.h:118-121`): daylight
+    /// when the manifest is silent or garbled, exactly like the C
+    /// `_parse_wb_mode` default (`restore.c:372-376`).
+    pub wb_mode: BayerWbMode,
 }
 
 /// Turn a downloaded raw-denoise archive into something the session can
@@ -781,7 +1076,7 @@ fn prepare_variant_model(
     stem: &str,
     onnx_file: &str,
     expected_kind: &str,
-) -> Result<PreparedRawModel, InferError> {
+) -> Result<(PathBuf, u32), InferError> {
     let Some(archive) = download::model_store_path(asset_name) else {
         return Err(InferError::Io("model store is unavailable".to_string()));
     };
@@ -837,7 +1132,26 @@ fn prepare_variant_model(
             "model {asset_name} declares no input_sizes"
         )));
     };
-    Ok(PreparedRawModel { onnx_path: payload, tile_size })
+    Ok((payload, tile_size))
+}
+
+/// Unpacked-manifest policy knob for one `prepare_variant_model` stem:
+/// reloads the already-unpacked manifest and reads the knob with `read`.
+/// Split out so the Bayer prepare can add its `wb_norm` knob without
+/// touching the shared stem resolution above.
+fn prepare_variant_knob<T>(
+    asset_name: &str,
+    read: impl FnOnce(&package::PackageManifest) -> T,
+) -> Result<T, InferError> {
+    let stem_dir = asset_name.strip_suffix(".dtmodel").unwrap_or(asset_name);
+    let Some(dir) = download::models_dir() else {
+        return Err(InferError::Io("model store is unavailable".to_string()));
+    };
+    let manifest = match package::load_manifest_from_dir(&dir.join(stem_dir)) {
+        Ok(m) => m,
+        Err(e) => return Err(InferError::Package(e.to_string())),
+    };
+    Ok(read(&manifest))
 }
 
 /// Turn a downloaded raw-denoise archive into something the session can
@@ -848,9 +1162,18 @@ fn prepare_variant_model(
 /// neither is refused. A declared `model_bayer.input_kind` that is not
 /// `bayer_v1` is a hard error — a declared-but-unknown input kind must
 /// never silently load (`restore.h:136-139`); a missing label keeps the
-/// back-compat `bayer_v1` reading.
+/// back-compat `bayer_v1` reading. Also reads the `model_bayer.wb_norm`
+/// knob ([`bayer_wb_mode_from_manifest`]): daylight when the manifest is
+/// silent or garbled, exactly like the C (`restore.c:372-376`).
 pub fn prepare_rawdenoise_model(asset_name: &str) -> Result<PreparedRawModel, InferError> {
-    prepare_variant_model(asset_name, MODEL_BAYER_STEM, MODEL_BAYER_ONNX_FILE, "bayer_v1")
+    let (onnx_path, tile_size) = prepare_variant_model(
+        asset_name,
+        MODEL_BAYER_STEM,
+        MODEL_BAYER_ONNX_FILE,
+        "bayer_v1",
+    )?;
+    let wb_mode = prepare_variant_knob(asset_name, bayer_wb_mode_from_manifest)?;
+    Ok(PreparedRawModel { onnx_path, tile_size, wb_mode })
 }
 
 // ── Source loading (raw file to mosaic + metadata) ───────────────────────────
@@ -866,7 +1189,14 @@ pub struct BayerSource {
     pub pattern: CfaPattern,
     pub black: [f32; 4],
     pub white: f32,
+    /// Daylight-first WB resolved at load (the C default — the worker
+    /// re-resolves with the manifest mode via [`resolve_bayer_wb`]).
     pub wb: [f32; 3],
+    /// `adobe_XYZ_to_CAM` analogue (rows 0..2 drive the daylight WB);
+    /// kept so the worker can re-resolve under the manifest mode.
+    pub xyz_to_cam: [[f32; 3]; 4],
+    /// File WB coefficients (RGBE order) for the as-shot WB; same reason.
+    pub wb_coeffs: [f32; 4],
     pub make: String,
     pub model: String,
     pub filename: String,
@@ -1017,6 +1347,8 @@ pub fn load_bayer_source(path: &Path) -> Result<BayerSource, InferError> {
         black,
         white,
         wb,
+        xyz_to_cam: raw.xyz_to_cam,
+        wb_coeffs: raw.wb_coeffs,
         make: raw.clean_make.clone(),
         model: raw.clean_model.clone(),
         filename,
@@ -2042,7 +2374,7 @@ pub struct PreparedLinearModel {
 pub fn prepare_rawdenoise_linear_model(
     asset_name: &str,
 ) -> Result<PreparedLinearModel, InferError> {
-    let base = prepare_variant_model(
+    let (onnx_path, tile_size) = prepare_variant_model(
         asset_name,
         MODEL_LINEAR_STEM,
         MODEL_LINEAR_ONNX_FILE,
@@ -2057,8 +2389,8 @@ pub fn prepare_rawdenoise_linear_model(
         Err(e) => return Err(InferError::Package(e.to_string())),
     };
     Ok(PreparedLinearModel {
-        onnx_path: base.onnx_path,
-        tile_size: base.tile_size,
+        onnx_path,
+        tile_size,
         knobs: linear_knobs_from_manifest(&manifest),
     })
 }
@@ -2349,6 +2681,8 @@ pub fn load_rawdenoise_source(path: &Path) -> Result<RawDenoiseSource, InferErro
                 black,
                 white,
                 wb: resolve_wb(raw.xyz_to_cam, raw.wb_coeffs),
+                xyz_to_cam: raw.xyz_to_cam,
+                wb_coeffs: raw.wb_coeffs,
                 make: raw.clean_make.clone(),
                 model: raw.clean_model.clone(),
                 filename,
@@ -2750,6 +3084,95 @@ mod tests {
         assert_eq!(resolve_wb([[0.0; 3]; 4], [0.0; 4]), [1.0, 1.0, 1.0]);
     }
 
+    #[test]
+    fn bayer_wb_mode_parses_with_daylight_default() {
+        // restore.c:110-120 _parse_wb_mode with the Bayer caller default
+        // daylight (restore.c:371-376): missing/unknown falls back.
+        assert_eq!(parse_bayer_wb_mode(None), BayerWbMode::Daylight);
+        assert_eq!(parse_bayer_wb_mode(Some("daylight")), BayerWbMode::Daylight);
+        assert_eq!(parse_bayer_wb_mode(Some("as_shot")), BayerWbMode::AsShot);
+        assert_eq!(parse_bayer_wb_mode(Some("none")), BayerWbMode::Off);
+        assert_eq!(parse_bayer_wb_mode(Some("fancy")), BayerWbMode::Daylight);
+        assert_eq!(parse_bayer_wb_mode(Some("")), BayerWbMode::Daylight);
+    }
+
+    #[test]
+    fn bayer_wb_mode_from_manifest_defaults_and_reads() {
+        let m = |text: &str| package::parse_manifest(text).expect("test manifest parses");
+        assert_eq!(
+            bayer_wb_mode_from_manifest(&m(r#"{"attributes": {}}"#)),
+            BayerWbMode::Daylight
+        );
+        assert_eq!(
+            bayer_wb_mode_from_manifest(
+                &m(r#"{"attributes": {"model_bayer": {"wb_norm": "none"}}}"#)
+            ),
+            BayerWbMode::Off
+        );
+        assert_eq!(
+            bayer_wb_mode_from_manifest(
+                &m(r#"{"attributes": {"model_bayer": {"wb_norm": "as_shot"}}}"#)
+            ),
+            BayerWbMode::AsShot
+        );
+        // Unknown values fall back to the C default, like the linear
+        // path's unknown-colorspace fallback (restore.c:105-108).
+        assert_eq!(
+            bayer_wb_mode_from_manifest(
+                &m(r#"{"attributes": {"model_bayer": {"wb_norm": "luminance"}}}"#)
+            ),
+            BayerWbMode::Daylight
+        );
+    }
+
+    #[test]
+    fn resolve_bayer_wb_modes_match_the_c_branches() {
+        // restore_raw_bayer.c:139-152: daylight-first, as-shot-first, and
+        // NONE leaving the {1,1,1} init untouched (:152).
+        let xyz = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0; 3]];
+        let coeffs = [2.0, 1.0, 4.0, 0.0];
+        let dl = resolve_bayer_wb(BayerWbMode::Daylight, xyz, coeffs);
+        assert!((dl[0] - 1.0 / 0.9504).abs() < EPS, "{dl:?}");
+        assert_eq!(resolve_bayer_wb(BayerWbMode::AsShot, xyz, coeffs), [2.0, 1.0, 4.0]);
+        // NONE is unity even when both resolutions would succeed.
+        assert_eq!(resolve_bayer_wb(BayerWbMode::Off, xyz, coeffs), [1.0, 1.0, 1.0]);
+        // Fallback chains mirror the C order per mode.
+        assert_eq!(
+            resolve_bayer_wb(BayerWbMode::Daylight, [[0.0; 3]; 4], coeffs),
+            [2.0, 1.0, 4.0]
+        );
+        let dl2 = resolve_bayer_wb(BayerWbMode::AsShot, xyz, [0.0; 4]);
+        assert!((dl2[0] - 1.0 / 0.9504).abs() < EPS, "{dl2:?}");
+        assert_eq!(
+            resolve_bayer_wb(BayerWbMode::AsShot, [[0.0; 3]; 4], [0.0; 4]),
+            [1.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn none_mode_normalize_remosaic_roundtrip_is_identity() {
+        // wb_norm {1,1,1}: normalize multiplies by one
+        // (restore_raw_bayer.c:318-321) and remosaic divides by one
+        // (:163-170), so the pair is a passthrough up to float dust.
+        let black = [12.0, 34.0, 56.0, 78.0];
+        let range = black_ranges(black, 4000.0);
+        let wb = resolve_bayer_wb(BayerWbMode::Off, [[9.0; 3]; 4], [9.0; 4]);
+        assert_eq!(wb, [1.0, 1.0, 1.0]);
+        for pat in [CfaPattern::Rggb, CfaPattern::Bggr, CfaPattern::Grbg, CfaPattern::Gbrg] {
+            for r in 0..4i64 {
+                for c in 0..4i64 {
+                    let ch = pat.fc(r, c);
+                    for raw in [100.0f32, 500.0, 1500.0, 3900.0] {
+                        let site = (((r & 1) << 1) | (c & 1)) as usize;
+                        let norm = normalize_site(raw, black[site], range[site], wb[ch]);
+                        let back = remosaic_value(norm, r, c, ch, wb, black, range);
+                        assert!((back - raw).abs() < 1e-4, "{pat:?} ({r},{c}) {raw}: {back}");
+                    }
+                }
+            }
+        }
+    }
+
     // ── Pack / gain / remosaic ──────────────────────────────────────────────
 
     #[test]
@@ -2896,12 +3319,16 @@ mod tests {
     fn constant_frame_roundtrips_through_tiles() {
         // Constant mosaic: every tile_in plane is constant, match_gain is
         // exactly 1, and remosaic inverts the pack — output == input.
+        // T=128 (step 64 = 2*O, the smallest tile the C seam math is
+        // exact for — see the driver docs): narrower tiles break the
+        // ramp sum-to-one in the C identically, so blending tests must
+        // not use them.
         for pat in [CfaPattern::Rggb, CfaPattern::Bggr, CfaPattern::Grbg, CfaPattern::Gbrg] {
             let (w, h) = (130u32, 74u32);
             let raw = vec![1000u16; w as usize * h as usize];
             let mut seen = Vec::new();
             let out = run_bayer_tiled(
-                &raw, w, h, pat, [0.0; 4], 65535.0, [1.0, 1.0, 1.0], 96,
+                &raw, w, h, pat, [0.0; 4], 65535.0, [1.0, 1.0, 1.0], 128,
                 broadcast_tile,
                 |d, t| seen.push((d, t)),
             )
@@ -2913,31 +3340,42 @@ mod tests {
             }
             let total = seen.last().unwrap().1;
             assert_eq!(seen.last().unwrap().0, total);
-            // Packed 65x37 (RGGB), T=96 O=32 step 32: 3 cols x 2 rows.
+            // Packed 65x37 (RGGB), T=128 O=32 step 64: 2 cols x 1 row.
             if pat == CfaPattern::Rggb {
-                assert_eq!(total, 6, "{seen:?}");
+                assert_eq!(total, 2, "{seen:?}");
             }
         }
     }
 
     #[test]
-    fn gradient_frame_roundtrips_within_u16_rounding() {
-        // Non-constant input exercises mirror padding + gain. Unity WB
-        // keeps the 4ch-input vs 3ch-output means equal up to float dust
-        // (gain ~= 1), so every pixel lands within u16 rounding of the
-        // source. (With non-unity WB the means structurally differ and
-        // match_gain rescales — correct per the C, pinned by the
-        // match_gain unit test instead.)
-        let (w, h) = (100u32, 60u32);
+    fn periodic_frame_roundtrips_within_u16_rounding() {
+        // Non-constant input exercises mirror padding + gain over every
+        // channel. The frame is 2x2-periodic (R=500, G=1000, B=1500), so
+        // the broadcast fake is exact on all four sites: R/B planes
+        // upsample to their own colour, and the G average sees two equal
+        // greens (any x-gradient would average two different rows — fake
+        // coarseness, not driver drift). Uniform planes also make
+        // match_gain exactly 1, isolating the tiling math: every pixel
+        // must land within u16 rounding of the source. (With non-unity WB
+        // the means structurally differ and match_gain rescales — correct
+        // per the C, pinned by the match_gain unit test instead.)
+        // Multi-tile at a seam-exact size (T=128, step 64 = 2*O — see the
+        // driver docs): T < 128 breaks the ramp sum-to-one in the C
+        // identically.
+        let (w, h) = (260u32, 140u32);
         let mut raw = vec![0u16; w as usize * h as usize];
         for y in 0..h as usize {
             for x in 0..w as usize {
-                raw[y * w as usize + x] = (500 + (x * 37 + y * 91) % 30000) as u16;
+                raw[y * w as usize + x] = match (y % 2, x % 2) {
+                    (0, 0) => 500,
+                    (1, 1) => 1500,
+                    _ => 1000,
+                };
             }
         }
         let out = run_bayer_tiled(
             &raw, w, h, CfaPattern::Rggb, [64.0, 64.0, 64.0, 64.0], 16000.0,
-            [1.0, 1.0, 1.0], 96, broadcast_tile, |_, _| {},
+            [1.0, 1.0, 1.0], 128, broadcast_tile, |_, _| {},
         )
         .unwrap();
         assert_eq!(out.len(), raw.len());
@@ -2956,6 +3394,159 @@ mod tests {
         let out = run_bayer_tiled(
             &raw, w, h, CfaPattern::Rggb, [0.0; 4], 65535.0, [1.0, 1.0, 1.0], 96,
             broadcast_tile, |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn seam_weights_match_the_c_ramps() {
+        // restore_common.h:228-231: ramp(d) = (d + 0.5) / (2 * sensor_O)
+        // with sensor_O = 2 * O_PACKED = 64 sensor pixels.
+        let so = 2 * O_PACKED as usize;
+        assert_eq!(so, 64);
+        assert!((seam_ramp(0, so) - 0.5 / 128.0).abs() < 1e-7, "{}", seam_ramp(0, so));
+        assert!((seam_ramp(63, so) - 63.5 / 128.0).abs() < 1e-7);
+        assert!((seam_ramp(127, so) - 127.5 / 128.0).abs() < 1e-7);
+        // Pure interior answers 1.0 on both axes (:242, :254) — probed on
+        // a wide core (a core narrower than 2*sensor_O has no interior:
+        // its left and right seam regions overlap everywhere).
+        assert_eq!(seam_ax(128, 0, 256, so, true, true), 1.0);
+        assert_eq!(seam_ay(128, 0, 256, so, true, true), 1.0);
+        // An edge tile with no neighbor on that side answers 1.0 even at
+        // the frame border — nothing accumulates there.
+        assert_eq!(seam_ax(0, 0, 256, so, false, true), 1.0);
+        assert_eq!(seam_ay(0, 0, 256, so, false, true), 1.0);
+        assert_eq!(seam_ax(255, 0, 256, so, true, false), 1.0);
+    }
+
+    #[test]
+    fn two_tile_seam_weights_sum_to_one_with_hand_values() {
+        // One row, two tiles with cores [0, 64) and [64, 128) sensor
+        // columns (sensor_O = 64): at sc = 64 the left tile sits on its
+        // right ramp and the right tile on its left ramp. The C recovers
+        // the blended value with no per-pixel division because the ramps
+        // sum to 1 (restore_common.h:223-227).
+        let so = 2 * O_PACKED as usize;
+        let sc = 64i64;
+        let w0 = seam_ax(sc, 0, 64, so, false, true);
+        let w1 = seam_ax(sc, 64, 128, so, true, false);
+        // Hand values: w1 = ramp(64) = 64.5/128, w0 = 1 - that.
+        assert!((w1 - 64.5 / 128.0).abs() < 1e-6, "{w1}");
+        assert!((w0 - 63.5 / 128.0).abs() < 1e-6, "{w0}");
+        assert!((w0 + w1 - 1.0).abs() < 1e-6);
+        // Blend of two remosaiced values at those weights, by hand:
+        // (63.5/128)*1000 + (64.5/128)*2000 = 1503.90625 (compared in
+        // f64 so the pin reads exactly).
+        let blend = w0 * 1000.0 + w1 * 2000.0;
+        assert!((blend as f64 - 1503.90625).abs() < 1e-3, "{blend}");
+        // The sum-to-one property holds across the whole seam, both axes.
+        for s in 0..128i64 {
+            let a = seam_ax(s, 0, 64, so, false, true);
+            let b = seam_ax(s, 64, 128, so, true, false);
+            assert!((a + b - 1.0).abs() < 1e-5, "sc {s}: {a} + {b}");
+            let c = seam_ay(s, 0, 64, so, false, true);
+            let d = seam_ay(s, 64, 128, so, true, false);
+            assert!((c + d - 1.0).abs() < 1e-5, "sr {s}: {c} + {d}");
+        }
+    }
+
+    /// A fake model whose tile outputs are `m + s_k * parity`, with
+    /// per-tile amplitudes `s_k` in call (row-major tile) order and a
+    /// checker parity balanced exactly per channel plane — so every
+    /// tile's mean is `m` up to float dust and match_gain is ~1 for all
+    /// tiles, leaving the seam weights as the only thing under test.
+    fn parity_tile(amplitudes: &[f32], m: f32) -> impl FnMut(&[f32], usize) -> Result<Vec<f32>, InferError> + '_ {
+        let mut call = 0usize;
+        move |_planar: &[f32], t: usize| {
+            let s = amplitudes[call % amplitudes.len()];
+            call += 1;
+            let two_t = 2 * t;
+            let mut out = vec![0f32; 3 * two_t * two_t];
+            for ch in 0..3 {
+                for y in 0..two_t {
+                    for x in 0..two_t {
+                        let p = if (x + y) % 2 == 0 { 1.0 } else { -1.0 };
+                        out[ch * two_t * two_t + y * two_t + x] = m + s * p;
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn blended_seam_matches_hand_computed_weights() {
+        // 256x128 RGGB, T=160 O=32: packed 128x64, step 96 -> 2 cols x 1
+        // row. Core boundary at sensor col 192, seam [128, 256); cols
+        // below 128 are pure interior (hard-written, gain ~1).
+        let (w, h) = (256u32, 128u32);
+        let raw = vec![1000u16; w as usize * h as usize];
+        let m = 1000.0f32 / 65535.0;
+        let out = run_bayer_tiled(
+            &raw, w, h, CfaPattern::Rggb, [0.0; 4], 65535.0, [1.0, 1.0, 1.0], 160,
+            parity_tile(&[0.002, -0.002], m), |_, _| {},
+        )
+        .unwrap();
+        let at = |sr: usize, sc: usize| out[sr * w as usize + sc];
+        // Interior of tile 0 (sr=64, sc=64): hard write of tile 0's own
+        // value. my = 64 + 64 = 128, mx = 128, parity even -> m + 0.002,
+        // remosaiced (m + 0.002) * 65535 = 1131.07 -> 1131.
+        assert_eq!(at(64, 64), 1131, "interior hard-writes, untouched by blending");
+        // Seam centre (sr=64, sc=192): tile 0 mx = 256 (even), tile 1 mx =
+        // 64 (even), both parity +1. w0 = 63.5/128, w1 = 64.5/128, so the
+        // blend is m + (w0 - w1) * 0.002 = m - 1.5625e-5 -> 998.976 -> 999.
+        // A core-only writer would have left tile 0's 1131 here.
+        assert_eq!(at(64, 192), 999, "seam blends with ax weights summing to 1");
+    }
+
+    #[test]
+    fn four_tile_corner_blends_once_with_corner_weights() {
+        // 256x256 RGGB, T=160: packed 128x128 -> 2x2 tiles; the four cores
+        // meet at sensor (192, 192), owned by the h-strip with ax*ay from
+        // each tile (restore_raw_bayer.c:647-652). Per-tile amplitudes
+        // [+0.002, -0.002, +0.0015, -0.0015] in row-major tile order.
+        let (w, h) = (256u32, 256u32);
+        let raw = vec![1000u16; w as usize * h as usize];
+        let m = 1000.0f32 / 65535.0;
+        let out = run_bayer_tiled(
+            &raw, w, h, CfaPattern::Rggb, [0.0; 4], 65535.0, [1.0, 1.0, 1.0], 160,
+            parity_tile(&[0.002, -0.002, 0.0015, -0.0015], m), |_, _| {},
+        )
+        .unwrap();
+        let at = |sr: usize, sc: usize| out[sr * w as usize + sc];
+        // Pure interior of tile (0,0), far from every seam: hard write,
+        // m + 0.002 at even parity -> 1131.
+        assert_eq!(at(64, 64), 1131, "interior untouched");
+        // Same tile, odd parity (my=128, mx=129): m - 0.002 -> 868.93 -> 869.
+        assert_eq!(at(64, 65), 869, "odd-parity interior level");
+        // Corner (192,192): a = 63.5/128, b = 64.5/128; all four tiles
+        // see even parity (+1). Blend = m + a*a*0.002 - a*b*0.002 +
+        // a*b*0.0015 - b*b*0.0015 = m - 1.3657e-5 -> 999.105 -> 999.
+        assert_eq!(at(192, 192), 999, "h-strip owns the corner exactly once");
+        // Corner-adjacent odd parity (sr=192, sc=193): the column ramps
+        // shift by one pixel — c0 = 62.5/128, c1 = 65.5/128 — while every
+        // tile still sees odd parity (-1). Blend = m + (c1-c0) *
+        // (0.002*r0 + 0.0015*r1) = m + 4.097e-5 -> 1002.685 -> 1003.
+        assert_eq!(at(192, 193), 1003, "corner blend follows parity");
+    }
+
+    #[test]
+    fn blended_tiles_with_per_tile_bias_leave_no_seam_step() {
+        // Constant-but-different per-tile model outputs are
+        // gain-harmonized to the same input mean, so the seam must equal
+        // the interior exactly: any weight sum other than 1 would leave a
+        // visible step at the boundary.
+        let (w, h) = (256u32, 128u32);
+        let raw = vec![1000u16; w as usize * h as usize];
+        let mut n = 0u32;
+        let out = run_bayer_tiled(
+            &raw, w, h, CfaPattern::Rggb, [0.0; 4], 65535.0, [1.0, 1.0, 1.0], 160,
+            |_planar: &[f32], t: usize| {
+                n += 1;
+                Ok(vec![if n == 1 { 4.0 } else { 8.0 }; 3 * 4 * t * t])
+            },
+            |_, _| {},
         )
         .unwrap();
         assert_eq!(out, raw);
@@ -3286,6 +3877,8 @@ mod tests {
         let prep = prepare_rawdenoise_model(RAWDENOISE_NIND_ASSET).unwrap();
         assert_eq!(prep.tile_size, 256);
         assert_eq!(prep.onnx_path.file_name().unwrap(), MODEL_BAYER_ONNX_FILE);
+        // Silent manifest = the C default (daylight, restore.c:372-376).
+        assert_eq!(prep.wb_mode, BayerWbMode::Daylight);
         // Second call reuses the unpacked payload (no re-unpack, same path).
         let prep2 = prepare_rawdenoise_model(RAWDENOISE_NIND_ASSET).unwrap();
         assert_eq!(prep2.onnx_path, prep.onnx_path);
@@ -3320,6 +3913,43 @@ mod tests {
         let r = prepare_rawdenoise_model("rawdenoise-nope.dtmodel").unwrap_err();
         assert!(matches!(r, InferError::MissingModel(_)), "{r}");
         std::env::remove_var("C41_MODELS_DIR");
+    }
+
+    #[test]
+    fn prepare_reads_bayer_wb_norm_knob() {
+        // `model_bayer.wb_norm` selects the resolve mode; unknown falls
+        // back to the C default (daylight). Fresh store dirs per case:
+        // prepare skips unpacking when the payload already exists, so a
+        // reused dir would read a stale manifest.
+        for (case, manifest, want) in [
+            (
+                "none",
+                r#"{"attributes": {"model_bayer": {"input_sizes": [256], "wb_norm": "none"}}}"#,
+                BayerWbMode::Off,
+            ),
+            (
+                "as_shot",
+                r#"{"attributes": {"model_bayer": {"input_sizes": [256], "wb_norm": "as_shot"}}}"#,
+                BayerWbMode::AsShot,
+            ),
+            (
+                "unknown",
+                r#"{"attributes": {"model_bayer": {"input_sizes": [256], "wb_norm": "luminance"}}}"#,
+                BayerWbMode::Daylight,
+            ),
+        ] {
+            let _env = ENV_LOCK.lock().unwrap();
+            let dir = TempDir::fresh(&format!("prepare_wb_{case}"));
+            std::env::set_var("C41_MODELS_DIR", &dir.path);
+            std::fs::write(
+                dir.path.join(RAWDENOISE_NIND_ASSET),
+                synthetic_bayer_dtmodel(manifest),
+            )
+            .unwrap();
+            let prep = prepare_rawdenoise_model(RAWDENOISE_NIND_ASSET).unwrap();
+            assert_eq!(prep.wb_mode, want, "case {case}");
+            std::env::remove_var("C41_MODELS_DIR");
+        }
     }
 
     #[test]
