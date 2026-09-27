@@ -25,6 +25,7 @@ pub mod persist;
 pub mod preview;
 pub mod print;
 pub mod raw_preview;
+pub mod slideshow;
 pub mod snapshots;
 pub mod stylemodules;
 pub mod tether;
@@ -97,6 +98,9 @@ pub fn run() -> Result<glib::ExitCode> {
     // Register app-level keyboard accelerators
     app.set_accels_for_action("win.import", &["<Control>i"]);
     app.set_accels_for_action("win.export-selected", &["<Control>e"]);
+    // win.slideshow — F11. Free: colour labels own F1–F5, F6/F12 are pinned
+    // unmapped, and no other action or keymap claims F11.
+    app.set_accels_for_action("win.slideshow", &["F11"]);
     app.connect_activate(build_main_window);
 
     // SIGTERM/SIGINT graceful shutdown. A GtkApplication installs no handler,
@@ -1898,6 +1902,37 @@ fn build_main_window(app: &Application) {
             tether_nav.push(&crate::tether::tether_page(tether_db.clone(), on_done));
         }));
         window.add_action(&tether_act);
+
+        // win.slideshow — pushes the slideshow page for the current
+        // collection, opening on the selected image (or the first when
+        // nothing real is selected). An empty collection is a no-op,
+        // matching print-selected's guard and the C `try_enter` refusing an
+        // empty collection. The tag is slash-free
+        // (`crate::slideshow::SLIDESHOW_PAGE_TAG`), so the `popped` cell
+        // re-sync above ignores it — the same contract as the print, map
+        // and tether pages. The collection is the culling base model when
+        // culling narrows the grid to a window (same base the select-all
+        // handler above spans), else the shown model; either way only real
+        // image rows (carrying `/`) become slides.
+        let slide_nav = nav.clone();
+        let slide_db = db_path.clone();
+        let slide_act = gtk4::gio::SimpleAction::new("slideshow", None);
+        slide_act.connect_activate(clone!(@weak lt_selection => move |_, _| {
+            let base = lighttable::cull_base_model(&lt_selection)
+                .or_else(|| lt_selection.model());
+            let paths: Vec<String> = base
+                .map(|m| lighttable::model_paths(&m))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p.contains('/'))
+                .collect();
+            let selected = lighttable::selected_path(&lt_selection);
+            let Some(start) = crate::slideshow::resolve_start(&paths, selected.as_deref()) else {
+                return;
+            };
+            slide_nav.push(&crate::slideshow::slideshow_page(paths, start, slide_db.clone()));
+        }));
+        window.add_action(&slide_act);
     }
 
     // ── Wire toast overlay + present ───────────────────────────────────────

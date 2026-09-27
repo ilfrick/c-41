@@ -7114,3 +7114,39 @@ marked CLOSED (plus a closure note on the 08-31 deferral itself);
 RUST_MIGRATION_PLAN.md item C marked DONE. No code in this commit beyond
 the audit/plan/log updates — verification is the green u7f CI already
 confirmed on both remotes.
+
+### u8 — slideshow view (2026-09-27 UTC)
+
+**What.** The one darktable view with zero coverage: a slideshow
+NavigationPage — new `crates/c41-ui/src/slideshow.rs` (pure delay model
++ page widget + 10 tests) + `win.slideshow` action with F11 accelerator
+in `lib.rs`. Fullscreen image via the FullPreview decode path (zero
+duplication; wheel-zoom/pan ride along), auto-advance 1–60 s persisted
+under `slideshow_delay` (default 5, C parity), play/pause, ←/→ step with
+end-clamp (no wrap, "End of images"), Up/Down/KP± delay adjust, two-stage
+Esc, back button via `navigation.pop`, click stops, chrome auto-hide,
+unmap stops the timer. Switcher/"Other" untouched.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**BLOCK** — two real defects, both fixed: (1) `Rc<Show>` dead on arrival
+(every closure held Weak, no strong owner — page inert after return);
+fixed with one strong capture in the page-owned unmap closure (DAG, no
+cycle); (2) `set_tooltip_text(bare &str)` doesn't compile — wrapped in
+`Some(..)`. Plus one MAJOR: documented back button didn't exist — added
+via `activate_action("navigation.pop")` (darkroom precedent). MINORs
+fixed: stale-selection fallback documented (index 0 vs C thumbtable
+offset), prefs-store wording corrected (same key, different store),
+KP/plus/minus keys added with verified polarity, empty counter "0 / 0",
+parse trim, spin-focus guard against double-handling. Post-fix gate
+caught what review couldn't: `&T as &Widget` upcast compile errors (→
+`upcast_ref`), one same-type cast lint. Untracked `install-debuntu.sh*`
+left unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). All-targets Clippy: zero
+diagnostics in `slideshow.rs` post-fix. `git diff --check` clean; no
+`/*`/`*/` in added lines. Release suites: `c41-core` 1801 unchanged,
+`c41-db` 97 unchanged, `c41-ui` 495 passed (485 + 10 new), 0 failed.
+PARITY_AUDIT.md 3.4 noted in the same commit (fourth view; "Other" was
+only ever map/print/tethering).
+Remote CI confirmation follows commit/push per workflow.
