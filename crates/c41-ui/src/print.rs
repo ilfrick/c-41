@@ -885,6 +885,15 @@ mod tests {
         );
         assert_eq!(default_pdf_name(&[]), "print.pdf");
         assert_eq!(default_pdf_name(&["noext".to_string()]), "noext.pdf");
+        // u11: a multi-image batch names the file after the first image's stem
+        // (sorted fan-out order) — one file per batch, so any single stem does.
+        assert_eq!(
+            default_pdf_name(&[
+                "/a/b/IMG_1234.CR2".to_string(),
+                "/a/b/IMG_1235.CR2".to_string()
+            ]),
+            "IMG_1234.pdf"
+        );
     }
 
     #[test]

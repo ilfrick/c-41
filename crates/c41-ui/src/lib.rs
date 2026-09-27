@@ -865,13 +865,15 @@ fn build_main_window(app: &Application) {
             .build();
         let toast_fn = make_toast.clone();
         let export_db = db_path.clone();
-        // `selected_path` resolves against the model the grid is showing, so this
-        // exports the image the user is looking at in every layout. Indexing the
-        // full collection with a window-relative `selected()` would export a
+        // `selected_path` resolves against the model the grid is showing, so the
+        // cursor is the image the user is looking at in every layout. Indexing the
+        // full collection with a window-relative `selected()` would resolve a
         // DIFFERENT FILE under culling, with nothing to signal it (m4-98c b).
+        // The containment rule is shared with the panel edits (u11): the set
+        // when it contains the cursor, else the cursor alone.
         btn.connect_clicked(clone!(@weak lt_selection, @weak window => move |_| {
-            let paths: Vec<String> =
-                lighttable::selected_path(&lt_selection).into_iter().collect();
+            let cursor = lighttable::selected_path(&lt_selection).unwrap_or_default();
+            let paths: Vec<String> = crate::panels::edit_target_paths(&cursor);
             dialogs::show_export_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 paths,
@@ -1828,10 +1830,11 @@ fn build_main_window(app: &Application) {
         let export_act  = gtk4::gio::SimpleAction::new("export-selected", None);
         let export_db2  = db_path.clone();
         // Same as the toolbar button: resolve through the shown model, or Ctrl+E
-        // exports the wrong file under culling.
+        // exports the wrong file under culling — then through the shared
+        // containment rule (u11), so the action and the button can never disagree.
         export_act.connect_activate(clone!(@weak lt_selection, @weak window => move |_, _| {
-            let paths: Vec<String> =
-                lighttable::selected_path(&lt_selection).into_iter().collect();
+            let cursor = lighttable::selected_path(&lt_selection).unwrap_or_default();
+            let paths: Vec<String> = crate::panels::edit_target_paths(&cursor);
             dialogs::show_export_dialog(
                 window.upcast_ref::<gtk4::Window>(),
                 paths,
@@ -1842,15 +1845,17 @@ fn build_main_window(app: &Application) {
         }));
         window.add_action(&export_act);
 
-        // win.print-selected — pushes the print composer for the selection.
+        // win.print-selected — pushes the print composer for the selection,
+        // resolved through the same containment rule as export (u11): the set
+        // when it contains the cursor, else the cursor alone.
         // Empty selection is a no-op, matching export-selected's guard (the
         // dialog/page constructors also tolerate it, but navigation must not
         // push a page for nothing).
         let print_nav = nav.clone();
         let print_act = gtk4::gio::SimpleAction::new("print-selected", None);
         print_act.connect_activate(clone!(@weak lt_selection => move |_, _| {
-            let paths: Vec<String> =
-                lighttable::selected_path(&lt_selection).into_iter().collect();
+            let cursor = lighttable::selected_path(&lt_selection).unwrap_or_default();
+            let paths: Vec<String> = crate::panels::edit_target_paths(&cursor);
             if paths.is_empty() {
                 return;
             }

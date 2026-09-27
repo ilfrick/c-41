@@ -7140,6 +7140,35 @@ Docker image` both `success`; matrix/full-c jobs skipped as expected.
 touches no C code). Both remotes (`origin` GitHub + Gitea) verified at
 `8faf63e9c4`.
 
+### u11 — Export/Print fan out over the multi-selection (2026-09-27 UTC)
+
+**What.** Last single-selection gap closed: `win.export-selected` (+ toolbar
+button) and `win.print-selected` resolve through the shared containment rule
+(`panels::edit_target_paths`, widened `fn` → `pub(crate) fn` — one rule, now
+three consumers; zero logic duplication). Set-contains-cursor → whole set;
+foreign set → cursor alone; empty → no-op as before (culling-safe:
+cursor still resolved through the shown model). Export batch and Print
+multipage already handled N>1 — verified by read, no fixes; first-stem
+default PDF name pinned by test. Explicitly single by design (verified,
+unchanged): copy/paste history, geotagging panel, neural Run,
+map/tether/slideshow pages, darkroom open. Rating/colour keys already
+fanned out (brief assumption corrected by code read).
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE** — cursor-first + containment + culling preservation verified at
+all three call sites, existing consumers unaffected (visibility-only
+change), Export N>1 quoted genuine, empty guards intact, `git diff --check`
+clean. Notes only, no fixes required. Untracked `install-debuntu.sh*` left
+unstaged.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree (check,
+clippy, release tests, `c41-rs` link). `git diff --check` clean; no
+`/*`/`*/` in added lines. Release suites: `c41-core` 1811 unchanged,
+`c41-db` 97 unchanged, `c41-ui` 500 passed (499 + 1 new pin), 0 failed.
+PARITY_AUDIT.md 2.2 updated in the same commit (fan-out closed; remaining
+singles documented as deliberate).
+Remote CI confirmation follows commit/push per workflow.
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the

@@ -1645,10 +1645,11 @@ type MetaTarget = std::rc::Rc<std::cell::RefCell<(Vec<String>, String, String)>>
 
 /// The images a panel edit made RIGHT NOW would land on: the whole
 /// multi-selection WHEN it contains the image on screen, else just that image
-/// alone. Shared by BOTH panel consumers so they can never disagree about what
-/// an edit targets: the metadata editor (snapshot at focus-enter / re-baseline)
-/// and the Styles section's Apply (read at click time — its intent IS the
-/// click).
+/// alone. Shared by every consumer that acts on "the selection" so they can
+/// never disagree about what it targets: the metadata editor (snapshot at
+/// focus-enter / re-baseline), the Styles section's Apply (read at click
+/// time — its intent IS the click), and — since u11 — the Export and Print
+/// actions (read from the grid cursor at activation time).
 ///
 /// Why the containment rule (m4-145 review MAJOR-2): the grid cursor can move
 /// without the selection following — native GridView keynav drives the
@@ -1659,7 +1660,7 @@ type MetaTarget = std::rc::Rc<std::cell::RefCell<(Vec<String>, String, String)>>
 /// others (upstream gets this for free: its `last_act_on` drives both display
 /// and write). Rating/colour keys deliberately keep the plain
 /// snapshot-else-cursor read — they act on grid focus, not on panel content.
-fn edit_target_paths(cursor_path: &str) -> Vec<String> {
+pub(crate) fn edit_target_paths(cursor_path: &str) -> Vec<String> {
     let mut targets = crate::lighttable::selection::paths_snapshot();
     if cursor_path.is_empty() || !targets.iter().any(|p| p == cursor_path) {
         targets.clear();
