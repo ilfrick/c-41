@@ -7342,7 +7342,10 @@ and none new in the touched files. Release suites: `c41-core` 1811, `c41-db`
 clean. Visually verified on a 1600x1900 Xvfb (the strip is below a 1080-tall
 screen, so the old :21 rig could not see it): two 82-px cells at the bottom
 band, the current one carrying a 2-px outline and the other none, zero GTK
-criticals. Remote CI confirmation follows commit/push per workflow.
+criticals. Remote CI on `3e212e0df5` is green: `check + test + clippy` and
+`Build & push Docker image` both `success`; matrix/full-c skipped, `CMake + Rust
+workspace` path-filtered out (Rust-only change). Both remotes verified at
+`3e212e0df5`.
 
 ### UI parity closed (2026-09-26 UTC)
 
