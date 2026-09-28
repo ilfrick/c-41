@@ -7419,19 +7419,29 @@ tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 100,
 `c41-ui` 518 (516 + 2 new), 0 failed. `git diff --check` clean. Confirmed the
 crash pre-fix and its absence is validated by the new all-layouts decode test;
 the rebuilt `c-41:latest` image no longer crash-loops (verified below at the
-image relaunch). Remote CI confirmation follows commit/push per workflow.
+image relaunch). Remote CI on `1f8b20c337` is green: `check + test + clippy`
+and `Build & push Docker image` both `success`; matrix/full-c skipped,
+`CMake + Rust workspace` path-filtered out (Rust-only change). Both remotes
+verified at `1f8b20c337`.
 
 ### Running image relaunched (2026-09-28 UTC)
 
 The live `c-41` container (KasmVNC web UI on :3000/:3001, config at
 `/home/nicola/darkroom/config/darkroom-docker`, photos at
 `/clamfs/Shared/Pictures`) had been up since before the whole w-series, so it
-showed none of w1–w7. Rebuilt `c-41:latest` from `docker/Dockerfile` with
-`CACHEBUST=db15200d30` (the image clones `origin` master and pins that commit),
-renamed the old container to `c-41-old`, and recreated `c-41` with the same
-env/ports/binds. The first launch exposed the w7 abort; the fix is then
-rebuilt into the image at the w7 commit and the container relaunched — outcome
-confirmed at the w7 CI-confirmation commit.
+showed none of w1–w7. Rebuilt `c-41:latest` from `docker/Dockerfile` pinned to
+the current master commit (the image clones `origin` master and checks that
+commit out), renamed the old container to `c-41-old`, and recreated `c-41` with
+the same env/ports/binds. The first launch, pinned at `db15200d30` (pre-w7),
+exposed the w7 abort; after w7 the image was rebuilt pinned at `1f8b20c337`
+and the container relaunched **clean** — `Up ... (healthy)`, `c41-rs` running,
+zero `panicked`/`Aborted`/`restarting`/`Failed to set text` lines. Captured
+from inside the running container on its KasmVNC display (`:1`) with the
+baseimage's `xwd`/`xwininfo`: the lighttable shows the user's real library with
+the new sectioned panels, and the darkroom (opened by double-clicking a
+thumbnail via `xdotool`) shows the w-series chrome end-to-end — left rail
+(histogram / picker / History / Snapshots), module tab bar + search, compact
+rows, Styles, and the bottom filmstrip with the current frame outlined.
 
 
 ### UI parity closed (2026-09-26 UTC)
