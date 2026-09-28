@@ -7380,8 +7380,10 @@ dynamic adw title/subtitle/description, confirming the darkroom scope.
 tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 100,
 `c41-ui` 516 (513 + 3 new), 0 failed. `git diff --check` clean. Reproduced the
 pre-fix GTK warning on the Xvfb rig, then confirmed zero
-`Failed to set text … markup` lines after the fix. Remote CI confirmation
-follows commit/push per workflow.
+`Failed to set text … markup` lines after the fix. Remote CI on `f91d517f88` is
+green: `check + test + clippy` and `Build & push Docker image` both `success`;
+matrix/full-c skipped, `CMake + Rust workspace` path-filtered out (Rust-only
+change). Both remotes verified at `f91d517f88`.
 
 ### UI parity closed (2026-09-26 UTC)
 
