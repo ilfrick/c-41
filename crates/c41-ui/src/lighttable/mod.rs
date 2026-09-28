@@ -654,9 +654,12 @@ pub(crate) const ASPECT_FILTER_PREF_KEY: &str = "aspect_filter";
 /// colour filter. Five buttons drawn with the SAME Pango dot glyphs as the grid
 /// cells ([`color_dot_markup`], one source of truth for hues), lit per the live
 /// [`current_colour_mask`]; clicking one toggles that colour's bit through
-/// [`set_colour_filter`]. The left panel's checks and this row are two mirrors of
-/// one state — [`add_filter_observer`] keeps them in step in both directions, and
+/// [`set_colour_filter`]. The top and bottom bar rows are two mirrors of one
+/// state — [`add_filter_observer`] keeps them in step in both directions, and
 /// persists the compact token (`db_path`) so the filter survives a restart.
+/// (Until w8 the left panel had a third mirror — independent checks plus an
+/// Any/All toggle; it was removed to match darktable's section set, so Any/All
+/// is now fixed at its persisted value.)
 ///
 /// Built twice (top bar + bottom bar); each instance registers its own
 /// display-refresh observer, so a change through any control repaints both rows.
@@ -1707,8 +1710,8 @@ thread_local! {
     /// The colour-label quick-filter bitmask (m4-126): bit `c` = colour `c`, 0 =
     /// no colour filter. Composes ON TOP of whatever collection is active (folder /
     /// tag / search / all), like [`MIN_RATING`] and [`YEAR_RANGE`] — it is no longer
-    /// a collection selector itself; the left panel's checks and both bars' circles
-    /// are three mirrors of this one state.
+    /// a collection selector itself; the top and bottom bars' circles are the two
+    /// mirrors of this one state (the left panel's checks were removed in w8).
     static COLOUR_MASK: Cell<u8> = const { Cell::new(0) };
     /// How [`COLOUR_MASK`] combines when several bits are set: `false` = any (OR),
     /// `true` = all (AND). Sticky across clears.

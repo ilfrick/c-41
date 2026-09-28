@@ -10,9 +10,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use crate::lighttable::{
     self, LighttableModel, lighttable_load_by_folder,
-    lighttable_load_by_tag_prefix, color_dot_markup,
+    lighttable_load_by_tag_prefix,
     rule_stack::{self, Combinator, PropertyKind, Rule, RuleCmp, RuleProperty},
-    COLOR_COUNT,
 };
 use c41_db;
 
@@ -21,7 +20,7 @@ use c41_db;
 /// The tag-section state a tag rename/delete popover needs, split out of
 /// `LeftPanel` (m4-27) so the per-row secondary-click gesture reconstructs
 /// exactly these fields on demand rather than a whole `LeftPanel` (which would
-/// otherwise drag along the folder filter and colour section the menu ignores).
+/// otherwise drag along the folder filter and image-info section the menu ignores).
 /// All fields are GObject ref-counts (plus a `String`), so it is `Clone` and cheap
 /// to hand to the deferred rename/delete closures. Owns every tag-mutation method
 /// (refresh / append-row / rename / delete); `LeftPanel` delegates to it.
@@ -40,6 +39,30 @@ struct TagPanel {
     on_tags_changed: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
 }
 
+/// The read-only "Image information" rows (darktable's lighttable module of the
+/// same name), moved here from the right panel's Metadata section in w8 so the
+/// left/right split matches darktable: read-only identity/EXIF facts on the
+/// left, writable metadata on the right.
+///
+/// Split out of `LeftPanel` like [`TagPanel`] so the eleven labels have a single
+/// owner and a single `update` entry point; `LeftPanel` delegates through
+/// [`LeftPanel::update_image_info`]. All fields are GObject ref-counts, so it is
+/// `Clone` and cheap.
+#[derive(Clone)]
+struct ImageInfo {
+    filename_lbl: gtk4::Label,
+    folder_lbl:   gtk4::Label,
+    dims_lbl:     gtk4::Label,
+    size_lbl:     gtk4::Label,
+    camera_lbl:   gtk4::Label,
+    lens_lbl:     gtk4::Label,
+    exposure_lbl: gtk4::Label,
+    aperture_lbl: gtk4::Label,
+    iso_lbl:      gtk4::Label,
+    focal_lbl:    gtk4::Label,
+    taken_lbl:    gtk4::Label,
+}
+
 /// The collections (left) panel: film rolls plus a live Tags section.
 ///
 /// Clicking a film roll reloads the lighttable to show only that folder; the
@@ -47,13 +70,13 @@ struct TagPanel {
 /// in place via [`LeftPanel::refresh_tags`] after a tag is attached elsewhere
 /// (e.g. from the metadata panel), so newly-created tags and changed counts
 /// appear without restarting the app. The tag list + all tag-mutation logic live
-/// in the [`TagPanel`] field; `LeftPanel` owns the folder filter and the colour /
-/// collection-filter sections' widgets, whose state lives in `lighttable`'s
-/// canonical quick-filters (m4-126/m4-128) rather than here.
+/// in the [`TagPanel`] field; `LeftPanel` owns the folder filter and the
+/// collection-filter / image-info sections' widgets, whose state lives in
+/// `lighttable`'s canonical quick-filters (m4-126/m4-128) rather than here.
 ///
-/// All fields are GObject ref-counts (plus the `TagPanel`, itself ref-counts), so
-/// `LeftPanel` is Clone and can be handed to the metadata panel's change callback
-/// cheaply.
+/// All fields are GObject ref-counts (plus the nested `TagPanel`/`ImageInfo`,
+/// themselves ref-counts), so `LeftPanel` is Clone and can be handed to the
+/// metadata panel's change callback cheaply.
 #[derive(Clone)]
 pub struct LeftPanel {
     pub widget:  gtk4::Box,
@@ -63,6 +86,10 @@ pub struct LeftPanel {
     /// Tag section (list + all tag-mutation methods), split out so its rename/
     /// delete popover doesn't reconstruct the whole panel — see [`TagPanel`].
     tags:        TagPanel,
+    /// Read-only identity/EXIF rows, moved out of `MetadataPanel` in w8 — see
+    /// [`ImageInfo`]. `LeftPanel` delegates refresh through
+    /// [`LeftPanel::update_image_info`].
+    image_info:  ImageInfo,
 }
 
 impl LeftPanel {
@@ -81,8 +108,10 @@ impl LeftPanel {
             .width_request(210)
             .build();
 
-        // Both the Collections and Tags sections scroll together inside one
-        // content box so neither steals the other's vertical space.
+        // Every left-panel section scrolls inside one content box; the sections
+        // are appended to it in `LEFT_SECTION_TITLES` order just before the
+        // scroller is built (w8), so the code can build them in whatever order
+        // the data-loading needs.
         let content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .spacing(0)
@@ -105,7 +134,7 @@ impl LeftPanel {
             .margin_start(10).margin_end(10).margin_top(4).margin_bottom(6)
             .build();
         import_btn.set_action_name(Some("win.import"));
-        content.append(&collapsible_section(
+        let import_section = collapsible_section(
             &import_header,
             &[import_sep.clone().upcast::<gtk4::Widget>(), import_btn.clone().upcast()]
                 .iter()
@@ -113,7 +142,7 @@ impl LeftPanel {
             true,
             db_path,
             IMPORT_SECTION_PREF_KEY,
-        ));
+        );
 
         // ── Collections (film rolls) ──────────────────────────────────────
         let collections_header = section_header("Collections");
@@ -145,32 +174,6 @@ impl LeftPanel {
             .build();
         tag_box.add_css_class("navigation-sidebar");
 
-        // Colour-label quick-filter box (m4-126 reconcile): a multi-select set of
-        // independent `CheckButton`s plus an Any/All mode toggle (m4-26), now ONE
-        // MIRROR of the canonical filter state that lives in
-        // `lighttable::set_colour_filter` alongside the rating/year filters — so it
-        // composes ON TOP of whatever collection is active (folder / tag / search /
-        // all) exactly like darktable's bar-mounted filters, and the top/bottom
-        // bars' circles (lib.rs) drive the same state through the observer bus.
-        // Collection switches therefore leave this filter alone (as they do the
-        // stars); there is no mutual-exclusion clearing any more, because the AND
-        // it implies really is running.
-        let color_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Vertical)
-            .build();
-        for idx in 0..COLOR_COUNT {
-            append_color_check(&color_box, idx);
-        }
-        let mode_toggle = gtk4::ToggleButton::builder()
-            .label("Match any")
-            .tooltip_text("Match images with ANY selected colour; toggle for ALL")
-            .halign(gtk4::Align::Start)
-            .margin_start(12)
-            .margin_end(8)
-            .margin_top(4)
-            .margin_bottom(4)
-            .build();
-
         // Activate: reload lighttable with folder filter, dropping any tag filter.
         // The colour quick-filter is NOT dropped: like the star filter, it composes
         // on top of whatever collection this click selects (m4-126).
@@ -194,7 +197,7 @@ impl LeftPanel {
         // darktable-style collapsible sections (parity 3.2): each panel section
         // folds away from its title row, which is what keeps a panel with this
         // many sections navigable without endless scrolling.
-        content.append(&collapsible_section(
+        let collections_section = collapsible_section(
             &collections_header,
             &[collections_sep.clone().upcast(), list_box.clone().upcast()]
                 .iter()
@@ -202,78 +205,17 @@ impl LeftPanel {
             true,
             db_path,
             COLLECTIONS_SECTION_PREF_KEY,
-        ));
+        );
 
-        // ── Colours (colour-label quick filter) ───────────────────────────
-        // The five colour labels as independent checks plus an Any/All combine
-        // toggle (m4-26), driving the CANONICAL compose-on-top filter state
-        // (`lighttable::set_colour_filter`, m4-126) rather than a collection of
-        // their own. Always present (the colour domain is fixed, not data-driven),
-        // so no refresh/visibility toggle is needed. The `color_box` + checks were
-        // built above.
-        let colours_header = section_header("Colours");
-        let colours_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-
-        // Seed the mirrors from the restored canonical state BEFORE connecting any
-        // handler — same ordering contract as the bottom bar's comparator seeding:
-        // a programmatic write with no handler connected fires nothing.
-        seed_colour_controls(&color_box, &mode_toggle);
-
-        // Each check pushes the box's full mask into the canonical state. An empty
-        // mask means "no colour restriction" there, so unchecking the last colour
-        // cleanly drops just this filter off the current view. Programmatic writes
-        // (the sync observer below) are skipped via the shared guard.
-        {
-            let color_box = color_box.clone();
-            let mut child = color_box.first_child();
-            while let Some(w) = child {
-                if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
-                    let color_box = color_box.clone();
-                    check.connect_toggled(move |_| {
-                        if lighttable::filter_sync_in_progress() { return; }
-                        lighttable::set_colour_filter(
-                            color_mask_from_box(&color_box),
-                            lighttable::current_colour_all(),
-                        );
-                    });
-                }
-                child = w.next_sibling();
-            }
-        }
-
-        // Any/All toggle flips the combine mode in the canonical state. Flipping
-        // with no colours selected changes nothing on screen (empty fragment), but
-        // writing it anyway keeps the state exactly what the controls show.
-        mode_toggle.connect_toggled(move |btn| {
-            if lighttable::filter_sync_in_progress() { return; }
-            lighttable::set_colour_filter(lighttable::current_colour_mask(), btn.is_active());
-        });
-
-        // Observer half: repaint these mirrors whenever ANY control changes the
-        // filter (this panel's own checks, either bar's circles). The bus invokes
-        // this inside its sync pass, so these programmatic writes are covered by
-        // the guard and the handlers above skip them — no guard consultation in
-        // here (the pass itself guarantees it), only in the handlers.
-        {
-            let color_box = color_box.clone();
-            let mode_toggle = mode_toggle.clone();
-            lighttable::add_filter_observer(move || {
-                sync_colour_controls_display(&color_box, &mode_toggle);
-            });
-        }
-        content.append(&collapsible_section(
-            &colours_header,
-            &[
-                colours_sep.clone().upcast::<gtk4::Widget>(),
-                mode_toggle.clone().upcast(),
-                color_box.clone().upcast(),
-            ]
-            .iter()
-            .collect::<Vec<_>>(),
-            true,
-            db_path,
-            COLOURS_SECTION_PREF_KEY,
-        ));
+        // The separate "Colours" section (m4-26/m4-126) was removed in w8. The
+        // canonical colour-filter state itself is untouched: the top/bottom bars'
+        // colour dots (`lighttable/mod.rs`, driven through the observer bus) still
+        // set the mask and the combine mode. Only this panel's mirror/driver UI is
+        // gone, so the combine mode is now fixed at whatever value was persisted
+        // (or last set by the bars) — the dots cannot change Any/All, and there is
+        // no in-panel control to flip it. That is the accepted trade-off for
+        // matching darktable's section set, where colour filtering lives on the
+        // top bar.
 
         // ── Collection filters (m4-128) ───────────────────────────────────
         // First slice of darktable's "collection filters" expander
@@ -281,7 +223,7 @@ impl LeftPanel {
         // collection is active. Its three stock aspect presets (square /
         // landscape / portrait) arrive as one dropdown driving the canonical
         // `lighttable::set_aspect_filter` state through the same observer bus as
-        // the colour checks above.
+        // the top bar's filters.
         let filters_header = section_header("Collection filters");
         let filters_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
         let labels: Vec<&str> = lighttable::AspectFilter::ALL.iter().map(|f| f.label()).collect();
@@ -743,7 +685,7 @@ impl LeftPanel {
             });
         }
 
-        content.append(&collapsible_section(
+        let filters_section = collapsible_section(
             &filters_header,
             &[
                 filters_sep.clone().upcast::<gtk4::Widget>(),
@@ -759,7 +701,63 @@ impl LeftPanel {
             true,
             db_path,
             FILTERS_SECTION_PREF_KEY,
-        ));
+        );
+
+        // ── Image information (w8) ────────────────────────────────────────
+        // darktable's left panel shows the read-only identity/EXIF facts here,
+        // between collection filters and tags. This grid was MOVED out of the
+        // right panel's Metadata section in w8 so the split matches darktable:
+        // read-only facts on the left, writable metadata on the right. The
+        // labels are owned by the [`ImageInfo`] field and refreshed through
+        // [`LeftPanel::update_image_info`].
+        let info_header = section_header("Image information");
+        let info_sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        let mk_info_key = |text: &str| {
+            let l = gtk4::Label::builder().label(text).halign(gtk4::Align::End).build();
+            l.add_css_class("dim-label");
+            l
+        };
+        let mk_info_val = || gtk4::Label::builder()
+            .halign(gtk4::Align::Start).hexpand(true)
+            .max_width_chars(20).ellipsize(gtk4::pango::EllipsizeMode::Middle)
+            .build();
+        let filename_lbl = mk_info_val();
+        let folder_lbl   = mk_info_val();
+        let dims_lbl     = mk_info_val();
+        let size_lbl     = mk_info_val();
+        let camera_lbl   = mk_info_val();
+        let lens_lbl     = mk_info_val();
+        let exposure_lbl = mk_info_val();
+        let aperture_lbl = mk_info_val();
+        let iso_lbl      = mk_info_val();
+        let focal_lbl    = mk_info_val();
+        let taken_lbl    = mk_info_val();
+        let info_grid = gtk4::Grid::builder()
+            .row_spacing(4).column_spacing(8)
+            .margin_start(12).margin_end(12).margin_top(10)
+            .build();
+        // Ordered as darktable's "image information": file identity first, then
+        // the capture facts (camera → lens → exposure triangle → date).
+        for (i, (key, val)) in [
+            ("File",     &filename_lbl), ("Folder",   &folder_lbl),
+            ("Size",     &dims_lbl),     ("Disk",     &size_lbl),
+            ("Camera",   &camera_lbl),   ("Lens",     &lens_lbl),
+            ("Exposure", &exposure_lbl), ("Aperture", &aperture_lbl),
+            ("ISO",      &iso_lbl),      ("Focal",    &focal_lbl),
+            ("Taken",    &taken_lbl),
+        ].iter().enumerate() {
+            info_grid.attach(&mk_info_key(key), 0, i as i32, 1, 1);
+            info_grid.attach(*val, 1, i as i32, 1, 1);
+        }
+        let image_info_section = collapsible_section(
+            &info_header,
+            &[info_sep.clone().upcast::<gtk4::Widget>(), info_grid.clone().upcast()]
+                .iter()
+                .collect::<Vec<_>>(),
+            true,
+            db_path,
+            IMAGE_INFO_SECTION_PREF_KEY,
+        );
 
         // ── Tags ──────────────────────────────────────────────────────────
         // The header/separator/box are always present; their visibility tracks
@@ -784,7 +782,7 @@ impl LeftPanel {
                 lighttable_load_by_tag_prefix(&lt_model, &db_tags, &prefix);
             }
         }));
-        content.append(&collapsible_section(
+        let tags_section_box = collapsible_section(
             &tags_header,
             &[tags_sep.clone().upcast::<gtk4::Widget>(), tag_box.clone().upcast()]
                 .iter()
@@ -792,7 +790,37 @@ impl LeftPanel {
             true,
             db_path,
             TAGS_SECTION_PREF_KEY,
-        ));
+        );
+
+        // w8: append every section in darktable's exact lighttable order. The
+        // order is driven by `LEFT_SECTION_TITLES` (not by the construction order
+        // above), so the product decision is one list, and the headless test pins
+        // it. An unknown title is a programming error, not a silent drop.
+        for title in LEFT_SECTION_TITLES {
+            let section: &gtk4::Box = match *title {
+                "Import" => &import_section,
+                "Collections" => &collections_section,
+                "Collection filters" => &filters_section,
+                "Image information" => &image_info_section,
+                "Tags" => &tags_section_box,
+                other => unreachable!("unknown left section: {other}"),
+            };
+            // Same construction-time invariant as the right panel: the collapsible
+            // section's title row is (arrow, header label), so a swapped arm is
+            // caught here rather than rendered under the wrong heading.
+            let shown = section
+                .first_child()
+                .and_then(|w| w.downcast::<gtk4::Box>().ok())
+                .and_then(|b| b.last_child())
+                .and_then(|w| w.downcast::<gtk4::Label>().ok())
+                .map(|l| l.label().to_string());
+            assert_eq!(
+                shown.as_deref(),
+                Some(*title),
+                "left section box for {title:?} does not start with its title label"
+            );
+            content.append(section);
+        }
 
         let scroll = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -809,10 +837,16 @@ impl LeftPanel {
             db_path: db_path.to_string(),
             on_tags_changed: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
+        let image_info = ImageInfo {
+            filename_lbl, folder_lbl, dims_lbl, size_lbl,
+            camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
+            focal_lbl, taken_lbl,
+        };
         let lp = Self {
             widget: panel,
             list_box,
             tags,
+            image_info,
         };
         lp.tags.refresh_tags();
         lp
@@ -825,8 +859,8 @@ impl LeftPanel {
     ///
     /// The colour quick-filter is deliberately NOT touched: since m4-126 it is a
     /// compose-on-top filter (like the bottom bar's stars), not a collection, so
-    /// it stays in force across these reloads and its mirrors keep telling the
-    /// truth.
+    /// it stays in force across these reloads — driven by the top/bottom-bar
+    /// colour circles (the left panel's own mirror was removed in w8).
     ///
     /// Invariant: call this exactly on the paths that *supersede* the active
     /// collection (i.e. null `active_tag`). Do NOT call it from a path that reloads
@@ -848,6 +882,53 @@ impl LeftPanel {
     /// to the [`TagPanel`]; see [`TagPanel::refresh_tags`].
     pub fn refresh_tags(&self) {
         self.tags.refresh_tags();
+    }
+
+    /// Refresh the read-only "Image information" rows for the image at
+    /// `full_path` against `db_path`. Delegates to the [`ImageInfo`] field; called
+    /// from lib.rs on selection change and on the initial paint, alongside
+    /// `MetadataPanel::update`. See [`ImageInfo::update`].
+    pub fn update_image_info(&self, full_path: &str, db_path: &str) {
+        self.image_info.update(full_path, db_path);
+    }
+}
+
+impl ImageInfo {
+    /// Repaint the eleven read-only rows for `full_path`. This is the label
+    /// population that used to live at the top of `MetadataPanel::update`,
+    /// moved here verbatim (w8) — same EXIF query, same formatting helpers, same
+    /// tooltip rule. The pure mapping is [`image_info_values`], so the
+    /// path/EXIF → text logic is unit-testable without a display.
+    fn update(&self, full_path: &str, db_path: &str) {
+        let exif = query_exif(full_path, db_path).unwrap_or_default();
+        let disk = std::fs::metadata(full_path).map(|m| m.len()).ok();
+        let v = image_info_values(full_path, &exif, disk);
+
+        self.filename_lbl.set_label(&v.filename);
+        self.folder_lbl.set_label(&v.folder);
+        self.dims_lbl.set_label(&v.dims);
+        self.size_lbl.set_label(&v.disk);
+        self.camera_lbl.set_label(&v.camera);
+        self.lens_lbl.set_label(&v.lens);
+        self.exposure_lbl.set_label(&v.exposure);
+        self.aperture_lbl.set_label(&v.aperture);
+        self.iso_lbl.set_label(&v.iso);
+        self.focal_lbl.set_label(&v.focal);
+        self.taken_lbl.set_label(&v.taken);
+
+        // Every label ellipsizes at 20 chars, so each value that can exceed that
+        // carries the full text in a tooltip — set from the formatted string, not
+        // read back off the widget. A placeholder gets no tooltip: hovering to be
+        // told "—" is noise. The folder label shows only the last path component
+        // but its tooltip carries the full path (`folder_tip`).
+        let tip = |l: &gtk4::Label, v: &str| {
+            l.set_tooltip_text(if v == NO_VALUE { None } else { Some(v) });
+        };
+        tip(&self.camera_lbl, &v.camera);
+        tip(&self.lens_lbl, &v.lens);
+        tip(&self.taken_lbl, &v.taken);
+        tip(&self.filename_lbl, &v.filename);
+        tip(&self.folder_lbl, &v.folder_tip);
     }
 }
 
@@ -1226,10 +1307,38 @@ impl TagPanel {
 /// side-panel collapse keys in `lib.rs`.
 const IMPORT_SECTION_PREF_KEY: &str = "left_section_import";
 const COLLECTIONS_SECTION_PREF_KEY: &str = "left_section_collections";
-const COLOURS_SECTION_PREF_KEY: &str = "left_section_colours";
 /// The m4-128 "Collection filters" section's fold state.
 const FILTERS_SECTION_PREF_KEY: &str = "left_section_filters";
+/// The w8 "Image information" section's fold state.
+const IMAGE_INFO_SECTION_PREF_KEY: &str = "left_section_image_info";
 const TAGS_SECTION_PREF_KEY: &str = "left_section_tags";
+
+/// The left panel's sections, top→bottom, matching darktable's lighttable
+/// (w8). The builder appends the section boxes in THIS order, so the product
+/// decision lives in one list; `section_order_matches_darktable_lighttable`
+/// pins it headlessly. `Tags` is a deliberate C-41 extra kept last: darktable's
+/// tagging lives on the right, but ours is a hierarchical tag *filter*.
+const LEFT_SECTION_TITLES: &[&str] = &[
+    "Import",
+    "Collections",
+    "Collection filters",
+    "Image information",
+    "Tags",
+];
+
+/// The right panel's sections, top→bottom, matching darktable's lighttable
+/// (w8): `history / styles / metadata / tags / geotagging / export`. We skip
+/// darktable's `select` / `actions` / `lua scripts installer` (no equivalents).
+/// The `Neural restore` (u7b) section is appended by lib.rs AFTER these, so it
+/// stays at the foot and is deliberately not part of this list.
+const RIGHT_SECTION_TITLES: &[&str] = &[
+    "History",
+    "Styles",
+    "Metadata",
+    "Tags",
+    "Geotagging",
+    "Export",
+];
 
 fn respliced_tag_path(full_name: &str, new_segment: &str) -> Option<String> {
     let new_segment = new_segment.trim();
@@ -1494,105 +1603,6 @@ fn append_roll_row(list_box: &gtk4::ListBox, label: &str, count: i64, folder: Op
     list_box.append(&row);
 }
 
-/// Human-readable names for the colour-label filter rows, indexed by colour
-/// (0 red … 4 purple) to match `c41_db::colorlabels` and the grid dots.
-const COLOR_NAMES: [&str; COLOR_COUNT as usize] =
-    ["Red", "Yellow", "Green", "Blue", "Purple"];
-
-/// Name for colour index `idx`, or `None` if out of range. Pure (no GTK) so the
-/// index↔name mapping has a unit-testable seam under the display-free discipline.
-fn color_filter_name(idx: u8) -> Option<&'static str> {
-    COLOR_NAMES.get(idx as usize).copied()
-}
-
-/// Append one colour-label filter check: a `CheckButton` whose child is a coloured
-/// dot plus its name. The colour index is stashed in the check's widget name so
-/// [`color_mask_from_box`] can read the mask back off the active checks. Independent
-/// (not a Single-selection row) so several colours can be combined (m4-26).
-fn append_color_check(color_box: &gtk4::Box, idx: u8) {
-    let check = gtk4::CheckButton::builder()
-        .margin_start(12).margin_end(8)
-        .margin_top(2).margin_bottom(2)
-        .build();
-    check.set_widget_name(&idx.to_string());
-
-    let hbox = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-
-    let dot = gtk4::Label::new(None);
-    dot.set_markup(&color_dot_markup(idx, true));
-    hbox.append(&dot);
-
-    let name_lbl = gtk4::Label::builder()
-        .label(color_filter_name(idx).unwrap_or(""))
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .build();
-    hbox.append(&name_lbl);
-
-    check.set_child(Some(&hbox));
-    color_box.append(&check);
-}
-
-/// Read the colour-label mask off `color_box`'s active checks: bit `c` set iff the
-/// check for colour `c` is ticked. The index is parsed from each check's widget
-/// name (stamped by [`append_color_check`]); an unparseable name is skipped (it
-/// can't occur from `append_color_check`, but we never want a stray child to panic
-/// the mask read).
-fn color_mask_from_box(color_box: &gtk4::Box) -> u8 {
-    let mut mask = 0u8;
-    let mut child = color_box.first_child();
-    while let Some(w) = child {
-        if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
-            if check.is_active() {
-                if let Ok(idx) = check.widget_name().parse::<u8>() {
-                    mask |= 1 << idx;
-                }
-            }
-        }
-        child = w.next_sibling();
-    }
-    mask
-}
-
-/// Repaint the colour section's mirrors (checks + Any/All toggle) from the
-/// canonical quick-filter state. The single display-write shared by the startup
-/// seed ([`seed_colour_controls`]) and the filter observer, so both stay in exact
-/// step with `lighttable::current_colour_mask/_all`. Runs under the observer bus's
-/// sync guard whenever the bus invokes it; called bare at startup only because no
-/// handler is connected yet at that point.
-///
-/// Colour indices come from each check's widget name (stamped by
-/// [`append_color_check`]), the same source [`color_mask_from_box`] reads — one
-/// indexing strategy over the children, so a stray non-check child could never
-/// silently misalign the two directions.
-fn sync_colour_controls_display(color_box: &gtk4::Box, mode_toggle: &gtk4::ToggleButton) {
-    let mask = lighttable::current_colour_mask();
-    let all = lighttable::current_colour_all();
-    let mut child = color_box.first_child();
-    while let Some(w) = child {
-        if let Some(check) = w.downcast_ref::<gtk4::CheckButton>() {
-            if let Ok(idx) = check.widget_name().parse::<u8>() {
-                check.set_active(mask & (1 << idx) != 0);
-            }
-        }
-        child = w.next_sibling();
-    }
-    mode_toggle.set_label(if all { "Match all" } else { "Match any" });
-    // Fires `toggled` only on change; the handlers skip it regardless when the bus
-    // is mid-pass.
-    mode_toggle.set_active(all);
-}
-
-/// Seed the colour mirrors from the restored canonical state BEFORE any handler is
-/// connected (the bottom-bar comparator's seeding contract: a programmatic write
-/// with nothing listening fires nothing).
-fn seed_colour_controls(color_box: &gtk4::Box, mode_toggle: &gtk4::ToggleButton) {
-    sync_colour_controls_display(color_box, mode_toggle);
-}
-
 fn load_film_rolls(db_path: &str) -> Vec<(String, i64)> {
     let conn = if db_path.is_empty() {
         match rusqlite::Connection::open_in_memory() {
@@ -1843,18 +1853,10 @@ pub struct MetadataPanel {
     /// The copied edit (params + undo-stack blob) awaiting Paste. Process-local,
     /// like darktable's own history clipboard — it dies with the app.
     history_clipboard: HistoryClipboardHandle,
-    filename_lbl: gtk4::Label,
-    folder_lbl:   gtk4::Label,
-    dims_lbl:     gtk4::Label,
-    size_lbl:     gtk4::Label,
-    // EXIF rows (m4-100), mirroring darktable's "image information" module.
-    camera_lbl:   gtk4::Label,
-    lens_lbl:     gtk4::Label,
-    exposure_lbl: gtk4::Label,
-    aperture_lbl: gtk4::Label,
-    iso_lbl:      gtk4::Label,
-    focal_lbl:    gtk4::Label,
-    taken_lbl:    gtk4::Label,
+    // NOTE (w8): the read-only EXIF/identity labels (File/Folder/Size/Disk/
+    // Camera/Lens/Exposure/Aperture/ISO/Focal/Taken) moved to the left panel's
+    // `ImageInfo` — darktable shows them on the left, not in this right-hand
+    // Metadata section.
     /// Geotagging section (u2, parity 2.7 leg): manual latitude/longitude/
     /// altitude entries plus the status line, refreshed in `update()` on
     /// every selection change like the metadata editor's entries.
@@ -1884,6 +1886,10 @@ pub struct MetadataPanel {
     /// Optional user-visible notifier, used to report a metadata save that could
     /// not land. Same shape as `on_tags_changed`; set via [`set_on_notify`].
     on_notify: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(String)>>>>,
+    /// "Select an image…" hint, shown only while no image is selected (hidden
+    /// by the first [`MetadataPanel::update`]). It is not a darktable section;
+    /// w8 kept it at the foot of the panel as the slack filler.
+    placeholder: gtk4::Label,
 }
 
 impl MetadataPanel {
@@ -2343,65 +2349,37 @@ impl MetadataPanel {
             .width_request(210)
             .build();
 
-        // ── Header ────────────────────────────────────────────────────────
-        let header = gtk4::Label::builder()
-            .label("Metadata")
-            .halign(gtk4::Align::Start)
-            .margin_top(12).margin_bottom(6)
-            .margin_start(12).margin_end(12)
-            .build();
-        header.add_css_class("heading");
-        panel.append(&header);
-        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        // w8: darktable's lighttable right panel is (top→bottom) History,
+        // Styles, Metadata, Tags, Geotagging, Export. The widgets below are still
+        // built in the order the code grew in — every local binding and closure
+        // stays valid — but each is appended to its own section box, and the
+        // boxes are appended to `panel` in `RIGHT_SECTION_TITLES` order at the
+        // end. This is a pure reparenting: no widget, callback, sensitivity or
+        // refresh path changes.
+        let history_section  = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let styles_section   = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let metadata_section = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let tags_section     = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let geo_section      = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let export_section   = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
-        // ── Info grid ─────────────────────────────────────────────────────
+        // ── Metadata (parity 2.3) ─────────────────────────────────────────
+        // The writable Dublin Core fields — darktable's metadata editor. The
+        // read-only EXIF "image information" grid that used to sit above these
+        // moved to the LEFT panel in w8, matching darktable's placement; the old
+        // separate "Metadata editor" header/separator is merged away, so the
+        // writable entries now sit under the single "Metadata" header. Written
+        // straight into darktable's own `main.meta_data` — see persist::MetaField.
+        metadata_section.append(&section_header("Metadata"));
+        metadata_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        // `mk_key` styles a dim end-aligned row label; shared by the metadata
+        // grid below and the geotagging grid.
         let mk_key = |text: &str| {
             let l = gtk4::Label::builder().label(text).halign(gtk4::Align::End).build();
             l.add_css_class("dim-label");
             l
         };
-        let mk_val = || gtk4::Label::builder()
-            .halign(gtk4::Align::Start).hexpand(true)
-            .max_width_chars(20).ellipsize(gtk4::pango::EllipsizeMode::Middle)
-            .build();
-
-        let filename_lbl = mk_val();
-        let folder_lbl   = mk_val();
-        let dims_lbl     = mk_val();
-        let size_lbl     = mk_val();
-        let camera_lbl   = mk_val();
-        let lens_lbl     = mk_val();
-        let exposure_lbl = mk_val();
-        let aperture_lbl = mk_val();
-        let iso_lbl      = mk_val();
-        let focal_lbl    = mk_val();
-        let taken_lbl    = mk_val();
-
-        let grid = gtk4::Grid::builder()
-            .row_spacing(4).column_spacing(8)
-            .margin_start(12).margin_end(12).margin_top(10)
-            .build();
-        // Ordered as darktable's "image information": file identity first, then the
-        // capture facts (camera → lens → exposure triangle → date).
-        for (i, (key, val)) in [
-            ("File",     &filename_lbl), ("Folder",   &folder_lbl),
-            ("Size",     &dims_lbl),     ("Disk",     &size_lbl),
-            ("Camera",   &camera_lbl),   ("Lens",     &lens_lbl),
-            ("Exposure", &exposure_lbl), ("Aperture", &aperture_lbl),
-            ("ISO",      &iso_lbl),      ("Focal",    &focal_lbl),
-            ("Taken",    &taken_lbl),
-        ].iter().enumerate() {
-            grid.attach(&mk_key(key), 0, i as i32, 1, 1);
-            grid.attach(*val, 1, i as i32, 1, 1);
-        }
-        panel.append(&grid);
-
-        // ── Metadata editor (parity 2.3) ──────────────────────────────────
-        // darktable's "metadata editor" module: the writable Dublin Core fields,
-        // as opposed to the read-only EXIF above. Written straight into
-        // darktable's own `main.meta_data` — see persist::MetaField.
-        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        panel.append(&section_header("Metadata editor"));
 
         let meta_grid = gtk4::Grid::builder()
             .row_spacing(4).column_spacing(8)
@@ -2418,7 +2396,7 @@ impl MetadataPanel {
             meta_grid.attach(&e, 1, i as i32, 1, 1);
             meta_entries.push(e);
         }
-        panel.append(&meta_grid);
+        metadata_section.append(&meta_grid);
 
         // Scope hint (m4-145): with a multi-selection active, commits land on
         // every selected image — darktable's behaviour, but silent fan-out is
@@ -2431,7 +2409,7 @@ impl MetadataPanel {
             .build();
         meta_scope_lbl.add_css_class("dim-label");
         meta_scope_lbl.set_visible(false);
-        panel.append(&meta_scope_lbl);
+        metadata_section.append(&meta_scope_lbl);
 
         // ── Geotagging (u2, parity 2.7 leg) ───────────────────────────────
         // darktable's geotagging/map module, foundation only: show the fix
@@ -2439,8 +2417,10 @@ impl MetadataPanel {
         // columns and allow manual entry for the selected image. No map
         // widget, no GPX import, no batch-apply — single selected image only,
         // like the metadata editor's target rule for one path.
-        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        panel.append(&section_header("Geotagging"));
+        // Section chrome is uniform across the right panel: header, then a
+        // separator rule, then the body (see `RIGHT_SECTION_TITLES`).
+        geo_section.append(&section_header("Geotagging"));
+        geo_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
         let geo_status_lbl = gtk4::Label::builder()
             .label("no coordinates")
@@ -2448,7 +2428,7 @@ impl MetadataPanel {
             .margin_start(12).margin_end(12).margin_top(2)
             .build();
         geo_status_lbl.add_css_class("dim-label");
-        panel.append(&geo_status_lbl);
+        geo_section.append(&geo_status_lbl);
 
         let geo_grid = gtk4::Grid::builder()
             .row_spacing(4).column_spacing(8)
@@ -2477,7 +2457,7 @@ impl MetadataPanel {
             geo_grid.attach(&mk_key(key), 0, i as i32, 1, 1);
             geo_grid.attach(*entry, 1, i as i32, 1, 1);
         }
-        panel.append(&geo_grid);
+        geo_section.append(&geo_grid);
 
         let geo_btns = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
@@ -2496,7 +2476,7 @@ impl MetadataPanel {
             .build();
         geo_btns.append(&geo_save_btn);
         geo_btns.append(&geo_clear_btn);
-        panel.append(&geo_btns);
+        geo_section.append(&geo_btns);
 
         // ── Tags section ──────────────────────────────────────────────────
         let tags_header = gtk4::Label::builder()
@@ -2506,7 +2486,8 @@ impl MetadataPanel {
             .margin_start(12).margin_end(12)
             .build();
         tags_header.add_css_class("heading");
-        panel.append(&tags_header);
+        tags_section.append(&tags_header);
+        tags_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
         let tags_flow = gtk4::FlowBox::builder()
             .selection_mode(gtk4::SelectionMode::None)
@@ -2514,23 +2495,26 @@ impl MetadataPanel {
             .max_children_per_line(10)
             .margin_start(10).margin_end(10).margin_bottom(6)
             .build();
-        panel.append(&tags_flow);
+        tags_section.append(&tags_flow);
 
         // Add-tag entry
         let tag_entry = gtk4::Entry::builder()
             .placeholder_text("Add tag…")
             .margin_start(10).margin_end(10).margin_bottom(8)
             .build();
-        panel.append(&tag_entry);
+        tags_section.append(&tag_entry);
 
         // ── Placeholder ───────────────────────────────────────────────────
+        // Not a section in darktable's layout; it trails the six section boxes
+        // (appended after them at the foot of `new`) so it still fills the
+        // panel's slack space. The neural-restore section is appended by lib.rs
+        // after ALL of this, so it remains the true last child.
         let placeholder = gtk4::Label::builder()
             .label("Select an image\nto view metadata")
             .halign(gtk4::Align::Center).valign(gtk4::Align::Center)
             .vexpand(true).justify(gtk4::Justification::Center)
             .build();
         placeholder.add_css_class("dim-label");
-        panel.append(&placeholder);
 
         let ctx = std::rc::Rc::new(std::cell::RefCell::new((String::new(), String::new())));
         let on_tags_changed: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>> =
@@ -2564,8 +2548,8 @@ impl MetadataPanel {
         // apply it to other images. Ours stores the whole PreviewParams blob
         // (see persist::STYLES_TABLE_DDL for why, and what that costs).
         let styles_header = section_header("Styles");
-        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        panel.append(&styles_header);
+        styles_section.append(&styles_header);
+        styles_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
         let styles_list = gtk4::ListBox::builder()
             .selection_mode(gtk4::SelectionMode::Single)
@@ -2580,7 +2564,7 @@ impl MetadataPanel {
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .child(&styles_list)
             .build();
-        panel.append(&styles_scroll);
+        styles_section.append(&styles_scroll);
 
         let styles_btns = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
@@ -2603,7 +2587,7 @@ impl MetadataPanel {
         styles_btns.append(&style_save_btn);
         styles_btns.append(&style_apply_btn);
         styles_btns.append(&style_delete_btn);
-        panel.append(&styles_btns);
+        styles_section.append(&styles_btns);
 
         // Toast channel shared with the metadata editor (declared here because
         // the history handlers below fire it too).
@@ -2618,8 +2602,8 @@ impl MetadataPanel {
         // darktable's paste replaces the stack; discard clears both in one
         // transaction and confirms first (deliberate deviation: darktable acts
         // immediately, but its action targets a whole multi-image selection).
-        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        panel.append(&section_header("History"));
+        history_section.append(&section_header("History"));
+        history_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
         let history_lbl = gtk4::Label::builder()
             .label("(no image selected)")
@@ -2627,7 +2611,7 @@ impl MetadataPanel {
             .margin_start(12).margin_end(12).margin_top(2)
             .build();
         history_lbl.add_css_class("dim-label");
-        panel.append(&history_lbl);
+        history_section.append(&history_lbl);
 
         let history_btns = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
@@ -2653,7 +2637,7 @@ impl MetadataPanel {
         history_btns.append(&history_copy_btn);
         history_btns.append(&history_paste_btn);
         history_btns.append(&history_discard_btn);
-        panel.append(&history_btns);
+        history_section.append(&history_btns);
 
         // The clipboard lives on the panel so `update()` can gate Paste's
         // sensitivity on it across selection changes.
@@ -2780,15 +2764,15 @@ impl MetadataPanel {
         // user looks for it. Pushed to the bottom so it does not displace the
         // metadata the panel exists to show.
         let export_header = section_header("Export");
-        panel.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        panel.append(&export_header);
+        export_section.append(&export_header);
+        export_section.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         let export_btn = gtk4::Button::builder()
             .label("Export selected…")
             .tooltip_text("Export the selected images (Ctrl+E)")
             .margin_start(10).margin_end(10).margin_top(2).margin_bottom(8)
             .build();
         export_btn.set_action_name(Some("win.export-selected"));
-        panel.append(&export_btn);
+        export_section.append(&export_btn);
 
         // Print composer entry point, beside Export: same one-action pattern
         // (the `win.print-selected` implementation lives with the other window
@@ -2799,7 +2783,7 @@ impl MetadataPanel {
             .margin_start(10).margin_end(10).margin_top(2).margin_bottom(8)
             .build();
         print_btn.set_action_name(Some("win.print-selected"));
-        panel.append(&print_btn);
+        export_section.append(&print_btn);
 
         // Map entry point, beside Export/Print: same one-action pattern
         // (the `win.open-map` implementation lives with the other window
@@ -2810,7 +2794,7 @@ impl MetadataPanel {
             .margin_start(10).margin_end(10).margin_top(2).margin_bottom(8)
             .build();
         map_btn.set_action_name(Some("win.open-map"));
-        panel.append(&map_btn);
+        export_section.append(&map_btn);
 
         // Tether entry point, beside Map: same one-action pattern (the
         // `win.open-tether` implementation lives with the other window
@@ -2822,7 +2806,7 @@ impl MetadataPanel {
             .margin_start(10).margin_end(10).margin_top(2).margin_bottom(8)
             .build();
         tether_btn.set_action_name(Some("win.open-tether"));
-        panel.append(&tether_btn);
+        export_section.append(&tether_btn);
 
         // Commit a metadata field on Enter or on losing focus.
         //
@@ -3060,6 +3044,40 @@ impl MetadataPanel {
             });
         }
 
+        // w8: append the section boxes in darktable's exact lighttable order.
+        // The order is driven by `RIGHT_SECTION_TITLES`, so the product decision
+        // is one list and `section_order_matches_darktable_lighttable` pins it
+        // headlessly. An unknown title is a programming error, not a silent drop.
+        for title in RIGHT_SECTION_TITLES {
+            let section: &gtk4::Box = match *title {
+                "History" => &history_section,
+                "Styles" => &styles_section,
+                "Metadata" => &metadata_section,
+                "Tags" => &tags_section,
+                "Geotagging" => &geo_section,
+                "Export" => &export_section,
+                other => unreachable!("unknown right section: {other}"),
+            };
+            // Construction-time invariant: each box's first child is its header
+            // label. A swapped arm above (title → wrong box) would otherwise
+            // render a section under the wrong heading, which only the eye would
+            // catch; this makes it a hard failure.
+            let shown = section
+                .first_child()
+                .and_then(|w| w.downcast::<gtk4::Label>().ok())
+                .map(|l| l.label().to_string());
+            assert_eq!(
+                shown.as_deref(),
+                Some(*title),
+                "right section box for {title:?} does not start with its title label"
+            );
+            panel.append(section);
+        }
+        // The "select an image" hint is not a section; it trails the six so it
+        // still fills the panel's slack space. lib.rs appends `Neural restore`
+        // after this call, so that stays the true last child.
+        panel.append(&placeholder);
+
         Self { widget: panel, styles_list, style_save_btn, style_apply_btn,
                style_delete_btn,
                history_copy_btn, history_paste_btn, history_discard_btn,
@@ -3067,10 +3085,7 @@ impl MetadataPanel {
                meta_entries, meta_targets, on_notify, meta_scope_lbl,
                geo_lat_entry, geo_lon_entry, geo_alt_entry, geo_status_lbl,
                styles_wired: std::rc::Rc::new(std::cell::Cell::new(false)),
-               filename_lbl, folder_lbl, dims_lbl, size_lbl,
-               camera_lbl, lens_lbl, exposure_lbl, aperture_lbl, iso_lbl,
-               focal_lbl, taken_lbl,
-               tags_flow, tag_entry, ctx, on_tags_changed }
+               tags_flow, tag_entry, ctx, on_tags_changed, placeholder }
     }
 
     /// Register a callback fired whenever a tag is attached from this panel.
@@ -3175,20 +3190,21 @@ impl MetadataPanel {
     /// selected image. Used as the left-panel's "tags mutated" callback so a
     /// rename/delete there updates chips shown here immediately.
     pub fn refresh_tags_display(&self) {
-        // Nothing selected yet → leave the placeholder; skip a pointless rebuild.
+        // Nothing selected yet → the hint stays up; skip a pointless rebuild.
         if self.ctx.borrow().0.is_empty() { return; }
         rebuild_tags_flow(&self.tags_flow, &self.ctx, &self.on_tags_changed);
     }
 
     /// Refresh the panel for the image at `full_path`.
     pub fn update(&self, full_path: &str, db_path: &str) {
-        use std::path::Path;
-        let p        = Path::new(full_path);
-        let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or(full_path);
-        let folder   = p.parent().and_then(|d| d.to_str()).unwrap_or("");
-
-        self.filename_lbl.set_label(filename);
-        self.folder_lbl.set_label(folder.rsplit('/').next().unwrap_or(folder));
+        // NOTE (w8): the read-only EXIF/identity rows were moved to the left
+        // panel's `ImageInfo`; selection-change and initial-paint callers pair
+        // this with `LeftPanel::update_image_info`. This method now owns the
+        // writable metadata entries, geotagging, history, styles and tag chips.
+        //
+        // An image is selected (this method is only called with one), so the
+        // "select an image" hint is no longer accurate — hide it.
+        self.placeholder.set_visible(false);
 
         // Metadata editor. Flush first, then repaint — the same order as
         // upstream's `gui_update` (`src/libs/metadata.c:239`, writing at `:269`),
@@ -3268,38 +3284,6 @@ impl MetadataPanel {
         // feature's whole workflow: pick a style, pick the target image, Apply.
         // Step two silently deselected step one. It also cost a Connection::open
         // per arrow-key press.
-
-        // One query for every catalog-sourced field (m4-100) — dimensions used to
-        // need their own connection; they now ride along with the EXIF row.
-        let exif = query_exif(full_path, db_path).unwrap_or_default();
-        let camera = format_camera(exif.maker.as_deref(), exif.model.as_deref());
-        let lens = format_opt(exif.lens.as_deref());
-        let taken = format_opt(exif.datetime.as_deref());
-        self.dims_lbl.set_label(&format_dims(exif.width, exif.height));
-        self.camera_lbl.set_label(&camera);
-        self.lens_lbl.set_label(&lens);
-        self.exposure_lbl.set_label(&format_exposure(exif.exposure));
-        self.aperture_lbl.set_label(&format_aperture(exif.aperture));
-        self.iso_lbl.set_label(&format_iso(exif.iso));
-        self.focal_lbl.set_label(&format_focal(exif.focal_length));
-        self.taken_lbl.set_label(&taken);
-        // Every label ellipsizes at 20 chars, so each value that can exceed that
-        // carries the full text in a tooltip — set from the formatted string, not
-        // read back off the widget. A placeholder gets no tooltip: hovering to be
-        // told "—" is noise.
-        let tip = |l: &gtk4::Label, v: &str| {
-            l.set_tooltip_text(if v == NO_VALUE { None } else { Some(v) });
-        };
-        tip(&self.camera_lbl, &camera);
-        tip(&self.lens_lbl, &lens);
-        tip(&self.taken_lbl, &taken);
-        tip(&self.filename_lbl, filename);
-        tip(&self.folder_lbl, folder);
-
-        let disk = std::fs::metadata(full_path)
-            .map(|m| format_bytes(m.len()))
-            .unwrap_or_else(|_| NO_VALUE.into());
-        self.size_lbl.set_label(&disk);
 
         // Store context for the tag-entry / detach handlers
         *self.ctx.borrow_mut() = (full_path.to_string(), db_path.to_string());
@@ -3828,6 +3812,54 @@ fn format_bytes(n: u64) -> String {
     else { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) }
 }
 
+/// The eleven strings the read-only "Image information" grid displays for one
+/// image, split out so the path/EXIF → text mapping is unit-testable without a
+/// display (`image_info_values`). `folder` is the last path component shown in
+/// the row; `folder_tip` is the full parent path carried in its tooltip.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct ImageInfoValues {
+    filename:   String,
+    folder:     String,
+    folder_tip: String,
+    dims:       String,
+    disk:       String,
+    camera:     String,
+    lens:       String,
+    exposure:   String,
+    aperture:   String,
+    iso:        String,
+    focal:      String,
+    taken:      String,
+}
+
+/// Pure mapping from a path + catalog EXIF row + on-disk size to the eleven
+/// Image-information strings. `disk_bytes` is `None` when the file could not be
+/// stat'd (the row then shows the em-dash placeholder). Same formatting helpers
+/// as before the w8 move, so the displayed text is byte-identical.
+fn image_info_values(
+    full_path: &str,
+    exif: &ExifInfo,
+    disk_bytes: Option<u64>,
+) -> ImageInfoValues {
+    let p = std::path::Path::new(full_path);
+    let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or(full_path);
+    let folder = p.parent().and_then(|d| d.to_str()).unwrap_or("");
+    ImageInfoValues {
+        filename: filename.to_string(),
+        folder: folder.rsplit('/').next().unwrap_or(folder).to_string(),
+        folder_tip: folder.to_string(),
+        dims: format_dims(exif.width, exif.height),
+        disk: disk_bytes.map(format_bytes).unwrap_or_else(|| NO_VALUE.into()),
+        camera: format_camera(exif.maker.as_deref(), exif.model.as_deref()),
+        lens: format_opt(exif.lens.as_deref()),
+        exposure: format_exposure(exif.exposure),
+        aperture: format_aperture(exif.aperture),
+        iso: format_iso(exif.iso),
+        focal: format_focal(exif.focal_length),
+        taken: format_opt(exif.datetime.as_deref()),
+    }
+}
+
 #[cfg(test)]
 mod geo_tests {
     use super::*;
@@ -4088,6 +4120,57 @@ mod exif_format_tests {
         assert_eq!(format_dims(e.width, e.height), "4640 × 3472");
         assert_eq!(e.datetime.as_deref(), Some("2018-07-28 22:07:53"));
     }
+
+    #[test]
+    fn image_info_values_map_a_known_record_to_every_row() {
+        // w8: the read-only grid moved to the left panel, but its text must stay
+        // byte-identical. Feed a real catalog row (same values as the end-to-end
+        // query test above) plus a known disk size through the pure mapping and
+        // pin all eleven rows.
+        let e = ExifInfo {
+            maker: Some("OLYMPUS CORPORATION".into()),
+            model: Some("E-M10 Mark III".into()),
+            lens: Some("Olympus M.Zuiko Digital 45mm F1.8".into()),
+            exposure: Some(0.0166666675359011),
+            aperture: Some(2.79999995231628),
+            iso: Some(640.0),
+            focal_length: Some(45.0),
+            width: Some(4640),
+            height: Some(3472),
+            datetime: Some("2018-07-28 22:07:53".into()),
+        };
+        let v = image_info_values("/photos/P1010153.ORF", &e, Some(12_582_912));
+        assert_eq!(v.filename, "P1010153.ORF");
+        assert_eq!(v.folder, "photos", "row shows the last path component");
+        assert_eq!(v.folder_tip, "/photos", "tooltip carries the full parent path");
+        assert_eq!(v.dims, "4640 × 3472");
+        assert_eq!(v.disk, "12.0 MB");
+        assert_eq!(v.camera, "OLYMPUS CORPORATION E-M10 Mark III");
+        assert_eq!(v.lens, "Olympus M.Zuiko Digital 45mm F1.8");
+        assert_eq!(v.exposure, "1/60 s");
+        assert_eq!(v.aperture, "f/2.8");
+        assert_eq!(v.iso, "640");
+        assert_eq!(v.focal, "45 mm");
+        assert_eq!(v.taken, "2018-07-28 22:07:53");
+    }
+
+    #[test]
+    fn image_info_values_placeholder_a_missing_record_and_unstattable_file() {
+        // No EXIF row + a failed stat: every catalog-sourced row is the em-dash
+        // placeholder, while the file identity still resolves from the path.
+        let v = image_info_values("/photos/unknown.ORF", &ExifInfo::default(), None);
+        assert_eq!(v.filename, "unknown.ORF");
+        assert_eq!(v.folder, "photos");
+        assert_eq!(v.dims, NO_VALUE);
+        assert_eq!(v.disk, NO_VALUE);
+        assert_eq!(v.camera, NO_VALUE);
+        assert_eq!(v.lens, NO_VALUE);
+        assert_eq!(v.exposure, NO_VALUE);
+        assert_eq!(v.aperture, NO_VALUE);
+        assert_eq!(v.iso, NO_VALUE);
+        assert_eq!(v.focal, NO_VALUE);
+        assert_eq!(v.taken, NO_VALUE);
+    }
 }
 
 #[cfg(test)]
@@ -4212,11 +4295,14 @@ mod tests {
 
     #[test]
     fn section_pref_keys_are_distinct_and_namespaced() {
-        // One key per section; a collision would make two sections share a fold
-        // state, and an un-namespaced key could clash with an unrelated pref.
+        // One key per left section; a collision would make two sections share a
+        // fold state, and an un-namespaced key could clash with an unrelated pref.
+        // The w8 "Colours" section was removed, its key with it.
         let keys = [
+            IMPORT_SECTION_PREF_KEY,
             COLLECTIONS_SECTION_PREF_KEY,
-            COLOURS_SECTION_PREF_KEY,
+            FILTERS_SECTION_PREF_KEY,
+            IMAGE_INFO_SECTION_PREF_KEY,
             TAGS_SECTION_PREF_KEY,
         ];
         let uniq: std::collections::BTreeSet<_> = keys.iter().collect();
@@ -4224,6 +4310,34 @@ mod tests {
         for k in keys {
             assert!(k.starts_with("left_section_"), "un-namespaced key: {k}");
         }
+    }
+
+    #[test]
+    fn section_order_matches_darktable_lighttable() {
+        // w8: the panel builders append their section boxes in these exact
+        // orders, so this list IS the UI order. Reordering the UI requires
+        // editing the const (and this test); editing a title without a matching
+        // builder arm panics on `unreachable!` at panel construction. Pins the
+        // agreed darktable mapping, including the C-41-only left-panel `Tags`
+        // (kept last) and the deliberate omission of darktable's `select` /
+        // `actions` / `lua scripts installer`.
+        let left_expected: &[&str] = &[
+            "Import",
+            "Collections",
+            "Collection filters",
+            "Image information",
+            "Tags",
+        ];
+        let right_expected: &[&str] = &[
+            "History",
+            "Styles",
+            "Metadata",
+            "Tags",
+            "Geotagging",
+            "Export",
+        ];
+        assert_eq!(LEFT_SECTION_TITLES, left_expected);
+        assert_eq!(RIGHT_SECTION_TITLES, right_expected);
     }
 
     #[test]
@@ -4301,24 +4415,6 @@ mod tests {
         assert_eq!(respliced_tag_path("places|Italy", "Italy|north"), None);
         assert_eq!(respliced_tag_path("places|Italy", "a|b"), None);
         assert_eq!(respliced_tag_path("landscape", "a|b"), None);
-    }
-
-    #[test]
-    fn color_filter_name_covers_every_label_in_range() {
-        // Every colour in the DAO's domain has a name; the array length tracks
-        // COLOR_COUNT so the two can't silently drift apart.
-        assert_eq!(COLOR_NAMES.len(), COLOR_COUNT as usize);
-        assert_eq!(color_filter_name(0), Some("Red"));
-        assert_eq!(color_filter_name(4), Some("Purple"));
-        for idx in 0..COLOR_COUNT {
-            assert!(color_filter_name(idx).is_some(), "idx {idx} unnamed");
-        }
-    }
-
-    #[test]
-    fn color_filter_name_is_none_out_of_range() {
-        assert_eq!(color_filter_name(COLOR_COUNT), None);
-        assert_eq!(color_filter_name(99), None);
     }
 
     #[test]

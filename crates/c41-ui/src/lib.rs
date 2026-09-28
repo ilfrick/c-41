@@ -601,6 +601,7 @@ fn build_main_window(app: &Application) {
     // Selection → metadata
     {
         let meta = right.clone();
+        let lp   = left.clone();
         let db   = db_path.clone();
         // Through `selected_path`, never through the full model: `selected()` is an
         // index into whatever the grid is *showing*, which culling narrows to a
@@ -609,6 +610,8 @@ fn build_main_window(app: &Application) {
         lt_selection.connect_selection_changed(move |sel, _, _| {
             if let Some(path) = lighttable::selected_path(sel) {
                 meta.update(&path, &db);
+                // w8: the read-only "image information" rows live on the left now.
+                lp.update_image_info(&path, &db);
             }
         });
     }
@@ -685,6 +688,8 @@ fn build_main_window(app: &Application) {
     // until the user clicks a *different* cell.
     if let Some(path) = lighttable::selected_path(&lt_selection) {
         right.update(&path, &db_path);
+        // w8: paint the moved Image-information rows for the auto-selected image.
+        left.update_image_info(&path, &db_path);
     }
 
     // Styles (parity 2.4). "Save current" needs whatever edit the selected

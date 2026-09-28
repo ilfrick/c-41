@@ -7444,6 +7444,60 @@ thumbnail via `xdotool`) shows the w-series chrome end-to-end — left rail
 rows, Styles, and the bottom filmstrip with the current frame outlined.
 
 
+### w8 — lighttable sections reordered to darktable's set (2026-09-28 UTC)
+
+**What.** The lighttable left/right panels now carry darktable's exact section
+set and order (mapping our C-41 extras, per an explicit product decision):
+
+- **Left:** `Import`, `Collections`, `Collection filters`, **`Image information`**
+  (new here — the read-only 11-row File/Folder/Size/Disk/Camera/Lens/Exposure/
+  Aperture/ISO/Focal/Taken grid was **moved** off the right panel, matching
+  darktable, which puts the read-only info on the left and the editable fields
+  on the right), `Tags` (kept last: ours is a hierarchical tag *filter*, a
+  C-41 extra — darktable's tagging is on the right).
+- **Right:** `History`, `Styles`, `Metadata` (the old separate `Metadata editor`
+  header/separator merged away — the writable Dublin Core entries now sit under
+  the single `Metadata` header), `Tags`, `Geotagging`, `Export`. `Neural restore`
+  stays last, unchanged.
+- The left **`Colours`** section was removed: the top and bottom bar colour
+  circles already drive the filter, so its five checks were a third mirror.
+  Accepted trade-off, documented in code: the Any/All combine mode is now fixed
+  at its persisted value (the bars cannot flip it). Canonical filter state and
+  `lighttable::set_colour_filter` are untouched.
+
+Order is one source of truth: `LEFT_SECTION_TITLES` / `RIGHT_SECTION_TITLES`
+are iterated by the builders, so the rendered order is the list. Widgets are
+built where they always were (every closure/binding stays valid) and reparented
+into per-section boxes; each box is asserted at construction to begin with its
+matching header label, so a swapped arm fails loudly instead of rendering a
+section under the wrong heading.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, no functional defect — image-info move verified
+byte-identical with a single DB read, both lib.rs call sites updated, canonical
+colour state untouched, no handler/observer lost, order genuinely const-driven,
+tests non-vacuous. MINORs addressed in-session: three comments that still
+described the removed left-panel colour mirrors (`lighttable/mod.rs:657`,
+`:1710`, `panels/mod.rs` `clear_filter_highlights`) updated; right-panel
+separators normalised to header-then-rule for all six sections. The reviewer's
+NITs (placeholder placement; the order test pinning only the const strings) also
+addressed: the construction-time header assert now catches a swapped
+title→box arm, and the always-on "Select an image" filler — which still showed
+over a selected image — now hides on the first `MetadataPanel::update`,
+removing the mid-panel gap above `Neural restore`. That header assert did in
+fact fire during visual verification (Styles and Export still had
+separator-before-header), which is how the separator normalisation above was
+confirmed rather than assumed.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 100,
+`c41-ui` 519 (516 + 3 new), 0 failed. `git diff --check` clean. Visually
+verified on the Xvfb rig: left = Import/Collections/Collection filters/Image
+information; right = History/Styles/Metadata/Tags/Geotagging/Export/Neural
+restore, compact with no placeholder gap, zero construction asserts. Remote CI
+confirmation follows commit/push per workflow.
+
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the
