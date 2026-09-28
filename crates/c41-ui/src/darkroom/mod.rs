@@ -11,6 +11,19 @@
 //! rebuilds the panel (ui-19); clicking the image samples the processed pixel
 //! into a colour-picker readout (ui-20). Remaining catalog modules stay as inert
 //! toggle rows. Navigation back to the lighttable is via the NavigationView pop.
+//!
+//! **Titles are plain text, not Pango markup.** libadwaita parses a row's title
+//! (and subtitle) as Pango markup by default — `AdwPreferencesRow:use-markup`
+//! defaults to `TRUE` — so a catalogue label carrying a raw `&` ("Rotate &
+//! perspective") fails to parse and GTK logs "Failed to set text … from
+//! markup". Every row built here from a catalogue label or other dynamic data
+//! therefore sets `.use_markup(false)` (drift-guarded by
+//! `dynamic_row_titles_are_markup_safe`, and by
+//! `curve_editor::tests::combo_row_titles_opt_out_of_markup` for that file),
+//! and `AdwPreferencesGroup` — which hardcodes `use-markup = True` on its title
+//! and description labels and exposes no property to change it — gets its
+//! strings through [`adw_markup_text`] instead. `AdwNavigationPage` is not a
+//! preference row and takes a plain-text title, so no escaping is needed there.
 
 use adw::prelude::*;
 use glib::clone;
@@ -28,6 +41,17 @@ mod filmstrip;
 
 /// Shared snapshot store over the cached-render payload (the frozen pixels).
 type SnapStore = Rc<RefCell<SnapshotStore<CachedRender>>>;
+
+/// Escape a string for an `adw::PreferencesGroup` title or description.
+///
+/// `AdwPreferencesGroup` hardcodes `use-markup = True` on both its title and
+/// description labels (`src/adw-preferences-group.ui`) and, unlike
+/// `AdwPreferencesRow`, exposes no `use-markup` property to turn it off — so
+/// user data (a saved style's name) has to arrive pre-escaped. Rows, which do
+/// have the property, use `.use_markup(false)` instead; see the module note.
+fn adw_markup_text(s: &str) -> String {
+    glib::markup_escape_text(s).to_string()
+}
 
 /// Placeholder shown in the colour-picker readout before/after a sample.
 const PICKER_PROMPT: &str = "Pick: click the image to sample a pixel";
@@ -2007,6 +2031,9 @@ pub fn darkroom_page(
     // Page-root scope: covers header + content, scoped to this page.
     toolbar_view.add_controller(shortcuts);
 
+    // `NavigationPage` has no `use_markup`: its title is plain text, so the
+    // file name needs no escaping here (unlike the row titles — see the
+    // module-level note on `AdwPreferencesRow:use-markup`).
     let page = adw::NavigationPage::builder()
         .title(&filename)
         .child(&toolbar_view)
@@ -2234,7 +2261,11 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
 
     let mut group_widgets: Vec<adw::PreferencesGroup> = Vec::new();
     for (gi, group) in crate::catalog::module_catalog().iter().enumerate() {
-        let pg = adw::PreferencesGroup::builder().title(group.name).build();
+        // `adw_markup_text`: a PreferencesGroup title label is always Pango
+        // markup (see `adw_markup_text`).
+        let pg = adw::PreferencesGroup::builder()
+            .title(adw_markup_text(group.name))
+            .build();
         // Live modules first: the catalogue is authored in darktable's
         // presentation order, which front-loads unported modules (Base opens
         // with three inert rows, Effect with nine), so a top-down scan hit
@@ -2381,6 +2412,7 @@ fn styles_module_group(
         // Same philosophy as inert_module_row: show state, not a dead control.
         let row = adw::ActionRow::builder()
             .title("No saved styles")
+            .use_markup(false)
             .subtitle(if ctx.db_path.is_empty() {
                 "no catalogue open"
             } else {
@@ -2400,6 +2432,7 @@ fn styles_module_group(
     apply_btn.set_valign(gtk4::Align::Center);
     let row = adw::ActionRow::builder()
         .title("Apply style")
+        .use_markup(false)
         .subtitle("whole styles replace the edit; partial ones merge their modules")
         .build();
     row.add_suffix(&dd);
@@ -2443,7 +2476,12 @@ fn styles_module_group(
         }
         render_preview(&ctx_cl);
         if let Some(g) = group_w.upgrade() {
-            g.set_description(Some(&format!("Applied \u{201c}{}\u{201d}", style.name)));
+            // The style name is user data and a group description is always
+            // Pango markup, so it must be escaped.
+            g.set_description(Some(&adw_markup_text(&format!(
+                "Applied \u{201c}{}\u{201d}",
+                style.name
+            ))));
         }
     });
     group
@@ -2463,7 +2501,10 @@ fn inert_module_row(label: &str, _default_on: bool) -> adw::ActionRow {
     // the row height. The description is set explicitly because AdwActionRow
     // statically binds `described-by` to its subtitle label, and an empty
     // subtitle would shadow the tooltip's accessible fallback.
-    let row = adw::ActionRow::builder().title(label).build();
+    let row = adw::ActionRow::builder()
+        .title(label)
+        .use_markup(false)
+        .build();
     row.add_css_class("dim-label");
     row.set_tooltip_text(Some("not yet wired"));
     row.update_property(&[gtk4::accessible::Property::Description("not yet wired")]);
@@ -2487,7 +2528,10 @@ fn elsewhere_module_row(label: &str, hint: &str) -> adw::ActionRow {
     // Single-line header (title only): the hint folds into the tooltip +
     // accessible description (empty subtitle would shadow the tooltip for
     // screen readers on AdwActionRow, which binds `described-by` to it).
-    let row = adw::ActionRow::builder().title(label).build();
+    let row = adw::ActionRow::builder()
+        .title(label)
+        .use_markup(false)
+        .build();
     row.set_tooltip_text(Some(hint));
     row.update_property(&[gtk4::accessible::Property::Description(hint)]);
     let marker = gtk4::Image::from_icon_name("go-up-symbolic");
@@ -2869,6 +2913,7 @@ fn module_expander(
     // the header to one line.
     let expander = adw::ExpanderRow::builder()
         .title(title)
+        .use_markup(false)
         .show_enable_switch(true)
         .enable_expansion(enabled)
         .build();
@@ -3646,6 +3691,7 @@ fn cbrgb_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             const FORMULA_LABELS: [&str; 2] = ["JzAzBz (2021)", "darktable UCS (2022)"];
             let formula_row = adw::ActionRow::builder()
                 .title("Saturation formula")
+                .use_markup(false)
                 .subtitle("uniform colour space used for saturation")
                 .build();
             let formula_dd = gtk4::DropDown::from_strings(&FORMULA_LABELS);
@@ -3708,6 +3754,7 @@ fn highlights_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     let expander = adw::ExpanderRow::builder()
         .title("Highlight reconstruction")
+        .use_markup(false)
         .show_enable_switch(true)
         .enable_expansion(p0.hl_on)
         .build();
@@ -4545,6 +4592,63 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "single-line headers must not set a subtitle: {offenders:?}"
+        );
+    }
+
+    /// w6: libadwaita parses a row's title as Pango markup by default
+    /// (`AdwPreferencesRow:use-markup` = TRUE), so every title built from
+    /// catalogue/user data must opt out. Enumerating the *dynamic* title
+    /// expressions — rather than scanning all `.title(` calls — is deliberate:
+    /// the static ones cannot break, and this way the scan cannot be satisfied
+    /// by an unrelated `use_markup(false)` elsewhere in the file. Headless, so
+    /// it is a source scan.
+    #[test]
+    fn dynamic_row_titles_are_markup_safe() {
+        let src = include_str!("mod.rs");
+        let dynamic = [
+            ".title(adw_markup_text(group.name))", // PreferencesGroup section header
+            ".title(label)", // inert / elsewhere module rows
+            ".title(title)", // every live module header
+        ];
+        let mut missing: Vec<String> = Vec::new();
+        for expr in dynamic {
+            let mut found = false;
+            for (i, l) in src.lines().enumerate() {
+                let t = l.trim();
+                if t != expr {
+                    continue;
+                }
+                found = true;
+                // The marker's own line, plus the rest of the builder chain.
+                let window: String = src.lines().skip(i).take(7).collect::<Vec<_>>().join("\n");
+                if !window.contains("use_markup(false)") && !window.contains("adw_markup_text(") {
+                    missing.push(format!("{expr} at line {}", i + 1));
+                }
+            }
+            assert!(found, "w6 expects {expr} to still exist in this file");
+        }
+        assert!(
+            missing.is_empty(),
+            "dynamic titles must opt out of Pango markup: {missing:?}"
+        );
+    }
+
+    /// The escape helper itself, plus the reason the guard above matters: the
+    /// catalogue really does contain labels a Pango parse rejects.
+    #[test]
+    fn adw_markup_text_escapes_and_the_catalogue_needs_it() {
+        assert_eq!(adw_markup_text("Rotate & perspective"), "Rotate &amp; perspective");
+        assert_eq!(adw_markup_text("B&W <mix>"), "B&amp;W &lt;mix&gt;");
+        assert_eq!(adw_markup_text("Exposure"), "Exposure");
+        let ampersand = crate::catalog::module_catalog()
+            .iter()
+            .flat_map(|g| g.modules.iter())
+            .filter(|m| m.label.contains('&'))
+            .count();
+        assert!(
+            ampersand > 0,
+            "the catalogue is expected to keep labels with a raw `&` — if this \
+             ever fails the markup guard is untested, not unnecessary"
         );
     }
 

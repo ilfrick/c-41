@@ -7347,6 +7347,42 @@ criticals. Remote CI on `3e212e0df5` is green: `check + test + clippy` and
 workspace` path-filtered out (Rust-only change). Both remotes verified at
 `3e212e0df5`.
 
+### w6 — row titles opt out of Pango markup (2026-09-27 UTC)
+
+**What.** Regression fix found while verifying w5: libadwaita parses a row's
+title (and subtitle) as Pango markup by default (`AdwPreferencesRow:use-markup`
+= TRUE), so the catalogue label `"Rotate & perspective"` failed to parse and
+GTK logged `Failed to set text '…' from markup …` on every darkroom open. All
+darkroom rows built from dynamic data now set `.use_markup(false)`
+(`inert_module_row`, `elsewhere_module_row`, `module_expander`,
+`highlights_module_row`, the two styles rows, the saturation-formula row, and
+the 7 `curve_editor` ComboRows); `AdwPreferencesGroup` exposes no such property
+(its title/description labels hardcode `use-markup = True`), so the group title
+and the user-supplied style-applied description go through a new
+`adw_markup_text` (`glib::markup_escape_text`) instead. `AdwNavigationPage`
+takes a plain-text title, so the file name needs no escaping. Module-level note
+records the rule.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE**, no BLOCKER/MAJOR. Diagnosis independently reproduced against
+upstream `gtklabel.c`/`gmarkup.c`, `adw-preferences-row.c`/`.ui`,
+`adw-preferences-group.ui` and `adw-navigation-view.c`; every
+title/subtitle/description in the two files enumerated and classified (no
+dynamic sink left unguarded); `markup_escape_text` signature and escaping set
+verified; static titles confirmed markup-free so `.use_markup(false)` is
+behaviour-preserving; both tests confirmed non-vacuous. The one MINOR (the
+source-scan guard covered only `mod.rs`, not `curve_editor.rs`) addressed
+in-session with a parallel `combo_row_titles_opt_out_of_markup` guard there;
+doc NIT reworded. Reviewer also swept the whole crate and found no other
+dynamic adw title/subtitle/description, confirming the darkroom scope.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 100,
+`c41-ui` 516 (513 + 3 new), 0 failed. `git diff --check` clean. Reproduced the
+pre-fix GTK warning on the Xvfb rig, then confirmed zero
+`Failed to set text … markup` lines after the fix. Remote CI confirmation
+follows commit/push per workflow.
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the

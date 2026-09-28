@@ -430,6 +430,7 @@ pub(crate) fn tonecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             let p0 = *ctx.params.borrow();
             let interp = adw::ComboRow::builder()
                 .title("Interpolator")
+                .use_markup(false)
                 .model(&gtk4::StringList::new(&labels))
                 .selected((p0.tc_type.round() as usize).min(labels.len() - 1) as u32)
                 .build();
@@ -487,6 +488,7 @@ pub(crate) fn rgbcurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             let labels = ["cubic spline", "Catmull-Rom", "monotone Hermite"];
             let interp = adw::ComboRow::builder()
                 .title("Interpolator")
+                .use_markup(false)
                 .model(&gtk4::StringList::new(&labels))
                 .selected((p0.rc_type_r.round() as usize).min(labels.len() - 1) as u32)
                 .build();
@@ -513,6 +515,7 @@ pub(crate) fn rgbcurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             let mode_labels = ["linked", "independent"];
             let mode = adw::ComboRow::builder()
                 .title("Channel mode")
+                .use_markup(false)
                 .model(&gtk4::StringList::new(&mode_labels))
                 .selected((p0.rc_autoscale.round() as usize).min(mode_labels.len() - 1) as u32)
                 .build();
@@ -523,6 +526,7 @@ pub(crate) fn rgbcurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 ["none", "luminance", "max", "average", "sum", "norm", "power"];
             let norm = adw::ComboRow::builder()
                 .title("Preserve colors")
+                .use_markup(false)
                 .model(&gtk4::StringList::new(&norm_labels))
                 .selected((p0.rc_preserve.round() as usize).min(norm_labels.len() - 1) as u32)
                 .sensitive(p0.rc_autoscale.round() as i32 == 0)
@@ -535,6 +539,7 @@ pub(crate) fn rgbcurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             let manual0 = p0.rc_autoscale.round() as i32 == 1;
             let chan = adw::ComboRow::builder()
                 .title("Channel")
+                .use_markup(false)
                 .model(&gtk4::StringList::new(&chan_labels))
                 .selected(0)
                 .sensitive(manual0)
@@ -634,6 +639,7 @@ pub(crate) fn basecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 ["none", "luminance", "max", "average", "sum", "norm", "power"];
             let norm = adw::ComboRow::builder()
                 .title("Preserve colors")
+                .use_markup(false)
                 .model(&gtk4::StringList::new(&norm_labels))
                 .selected((p0.bc_preserve.round() as usize).min(norm_labels.len() - 1) as u32)
                 .build();
@@ -650,6 +656,7 @@ pub(crate) fn basecurve_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             let fusion_labels = ["none", "two exposures", "three exposures"];
             let fusion = adw::ComboRow::builder()
                 .title("Exposure fusion")
+                .use_markup(false)
                 .model(&gtk4::StringList::new(&fusion_labels))
                 .selected((p0.bc_exposure_fusion.round() as usize).min(fusion_labels.len() - 1)
                     as u32)
@@ -941,5 +948,29 @@ mod tests {
         assert_eq!(seed_nodes(&p, 1).len(), MAX_ANCHORS);
         p.rc_nnodes_g = 0.0;
         assert_eq!(seed_nodes(&p, 1).len(), 2, "minimum two anchors");
+    }
+
+    /// w6 policy guard, mirroring `darkroom::tests::dynamic_row_titles_are_markup_safe`
+    /// for this file: a ComboRow title is Pango markup by default, so every one
+    /// here opts out. Catches a future `ComboRow` added without
+    /// `.use_markup(false)` (its title may come from a label oracle rather than
+    /// a literal).
+    #[test]
+    fn combo_row_titles_opt_out_of_markup() {
+        let src = include_str!("curve_editor.rs");
+        let mut missing: Vec<usize> = Vec::new();
+        for (i, l) in src.lines().enumerate() {
+            if !l.trim().starts_with(".title(") {
+                continue;
+            }
+            let window: String = src.lines().skip(i).take(6).collect::<Vec<_>>().join("\n");
+            if !window.contains("use_markup(false)") {
+                missing.push(i + 1);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "ComboRow titles must set .use_markup(false): lines {missing:?}"
+        );
     }
 }
