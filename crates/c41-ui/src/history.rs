@@ -197,7 +197,12 @@ impl HistoryStack {
             let pstart = p;
             // Peek at the params version byte to determine this entry's blob
             // length — older history stacks contain shorter (v13) blobs.
-            let params_len = crate::preview::encoded_len_for_version(bytes[pstart])?;
+            // `.get(..)?`, not `bytes[pstart]`: a label that runs exactly to the
+            // end of the buffer leaves `pstart == bytes.len()`, and decode is
+            // documented to return `None` (not abort) on ANY malformation —
+            // a panic here would unwind out of a GTK callback and kill the app.
+            let version = *bytes.get(pstart)?;
+            let params_len = crate::preview::encoded_len_for_version(version)?;
             take(&mut p, params_len)?;
             let params = PreviewParams::decode(&bytes[pstart..p])?;
             entries.push(HistoryEntry { label, params });
@@ -1151,6 +1156,22 @@ mod tests {
 
         // empty input
         assert!(HistoryStack::decode(&[]).is_none());
+    }
+
+    /// A label that runs exactly to the end of the buffer leaves the params
+    /// version peek with no byte to read. Decode must return `None` (it did
+    /// `bytes[pstart]` and panicked out of bounds before) — that panic unwinds
+    /// out of a GTK callback and aborts the process, so this is an app-death
+    /// regression, not a cosmetic one.
+    #[test]
+    fn decode_rejects_a_label_that_ends_exactly_at_the_buffer_edge() {
+        let mut blob = Vec::new();
+        blob.push(HISTORY_ENCODE_VERSION);
+        blob.extend_from_slice(&0u32.to_le_bytes()); // cursor = 0
+        blob.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        blob.extend_from_slice(&0u16.to_le_bytes()); // label_len = 0 → pstart == len
+        assert_eq!(blob.len(), 11);
+        assert!(HistoryStack::decode(&blob).is_none());
     }
 
     #[test]

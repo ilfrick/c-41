@@ -7385,6 +7385,55 @@ green: `check + test + clippy` and `Build & push Docker image` both `success`;
 matrix/full-c skipped, `CMake + Rust workspace` path-filtered out (Rust-only
 change). Both remotes verified at `f91d517f88`.
 
+### w7 — fix a v12-blob decode abort (2026-09-28 UTC)
+
+**What.** While rebuilding and relaunching the **running `c-41` container**, the
+new image crash-looped (SIGABRT, exit 134) with
+`panicked at crates/c41-ui/src/preview.rs:1566:25` — `bools[19]` in
+`PreviewParams::decode`. The `lowpass` module was appended in layout **v13**,
+but the oldest supported layout, **v12**, is `(12, 19, 129)`: 19 bools /
+129 f32. So decoding a v12 blob indexed past the end. The panic happens inside
+a GTK callback, so it cannot unwind and aborts the process. The user's real
+library contains a v12 entry, which is why the *rebuilt* image died while the
+older one had survived. The `lowpass` fields now use the same defensive
+`bools.get(19).map_or(d.lowpass_on, ..)` / `f.get(129).copied().unwrap_or(..)`
+pattern the shadhi/primaries fields below already used; the head hard indexes
+(`bools[0..=18]`, `f[0..=128]`) are exactly the v12 capacity and stay as-is.
+New test `every_known_layout_decodes_without_panicking` decodes a zeroed blob
+for every `PARAMS_LAYOUTS` row.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, and it found a **second, same-class** abort: the fix
+was correct and complete for `PreviewParams::decode` (every hard index
+re-checked against v12; the new test genuinely reproduces the panic and is
+non-vacuous), but `HistoryStack::decode` (`history.rs:200`) still read
+`bytes[pstart]` unguarded — a label running exactly to the buffer end leaves
+`pstart == len` and would abort the same way. Fixed in-session with
+`*bytes.get(pstart)?` plus
+`decode_rejects_a_label_that_ends_exactly_at_the_buffer_edge`. The reviewer
+also swept the other decoders (`Geometry::decode`, XMP, styles) and found no
+further instances.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 100,
+`c41-ui` 518 (516 + 2 new), 0 failed. `git diff --check` clean. Confirmed the
+crash pre-fix and its absence is validated by the new all-layouts decode test;
+the rebuilt `c-41:latest` image no longer crash-loops (verified below at the
+image relaunch). Remote CI confirmation follows commit/push per workflow.
+
+### Running image relaunched (2026-09-28 UTC)
+
+The live `c-41` container (KasmVNC web UI on :3000/:3001, config at
+`/home/nicola/darkroom/config/darkroom-docker`, photos at
+`/clamfs/Shared/Pictures`) had been up since before the whole w-series, so it
+showed none of w1–w7. Rebuilt `c-41:latest` from `docker/Dockerfile` with
+`CACHEBUST=db15200d30` (the image clones `origin` master and pins that commit),
+renamed the old container to `c-41-old`, and recreated `c-41` with the same
+env/ports/binds. The first launch exposed the w7 abort; the fix is then
+rebuilt into the image at the w7 commit and the container relaunched — outcome
+confirmed at the w7 CI-confirmation commit.
+
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the

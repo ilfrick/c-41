@@ -1563,9 +1563,16 @@ impl PreviewParams {
             basicadj_contrast: f[123], basicadj_preserve_colors: f[124],
             basicadj_middle_grey: f[125], basicadj_brightness: f[126],
             basicadj_saturation: f[127], basicadj_vibrance: f[128],
-            lowpass_on: bools[19] != 0,
-            lowpass_radius: f[129], lowpass_contrast: f[130],
-            lowpass_brightness: f[131], lowpass_saturation: f[132],
+            // lowpass is v13+; a v12 blob (n_bools 19, 129 f32) has neither
+            // bool 19 nor f[129..=132]. Same `.get` + Default fallback as the
+            // shadhi/primaries fields below — a hard index here was the crash
+            // (`bools[19]` on a v12 blob) that took the whole app down, because
+            // the panic happens inside a GTK callback and so cannot unwind.
+            lowpass_on: bools.get(19).map_or(d.lowpass_on, |&b| b != 0),
+            lowpass_radius: f.get(129).copied().unwrap_or(d.lowpass_radius),
+            lowpass_contrast: f.get(130).copied().unwrap_or(d.lowpass_contrast),
+            lowpass_brightness: f.get(131).copied().unwrap_or(d.lowpass_brightness),
+            lowpass_saturation: f.get(132).copied().unwrap_or(d.lowpass_saturation),
             shadhi_on: bools.get(20).map_or(d.shadhi_on, |&b| b != 0),
             primaries_on: bools.get(21).map_or(d.primaries_on, |&b| b != 0),
             shadhi_shadows: f.get(133).copied().unwrap_or(d.shadhi_shadows),
@@ -4146,6 +4153,34 @@ mod tests {
             b
         };
         assert_eq!(PreviewParams::decode(&v1), None);
+    }
+
+    /// Every layout in [`PARAMS_LAYOUTS`] must decode without panicking, not
+    /// just the versions that have a hand-written per-version test. When a new
+    /// module appends fields, it is added to the *newest* layout; the older
+    /// layouts keep their shorter length, so any hard index into the appended
+    /// region (rather than a `.get(..).map_or(default, ..)`) is an
+    /// out-of-bounds panic — and because decode runs inside a GTK callback, that
+    /// panic aborts the whole process instead of unwinding. This is the guard
+    /// for exactly the v12 `bools[19]` crash: the oldest layout has 19 bools /
+    /// 129 f32, which the lowpass (v13) fields must fall back from.
+    #[test]
+    fn every_known_layout_decodes_without_panicking() {
+        let def = PreviewParams::default();
+        for &(version, nb, nf) in PARAMS_LAYOUTS {
+            let mut blob = vec![0u8; 1 + nb + nf * 4];
+            blob[0] = version;
+            let decoded = PreviewParams::decode(&blob)
+                .unwrap_or_else(|| panic!("layout v{version} must decode"));
+            // The v12 layout predates lowpass; its fields must come from Default.
+            if version == 12 {
+                assert_eq!(decoded.lowpass_on, def.lowpass_on);
+                assert_eq!(decoded.lowpass_radius, def.lowpass_radius);
+                assert_eq!(decoded.lowpass_contrast, def.lowpass_contrast);
+                assert_eq!(decoded.lowpass_brightness, def.lowpass_brightness);
+                assert_eq!(decoded.lowpass_saturation, def.lowpass_saturation);
+            }
+        }
     }
 
     #[test]
