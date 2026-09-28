@@ -7286,6 +7286,64 @@ Remote CI on `7de4dc95b4` is green: `check + test + clippy` and `Build & push
 Docker image` both `success`; matrix/full-c skipped, `CMake + Rust workspace`
 path-filtered out (Rust-only change). Both remotes verified at `7de4dc95b4`.
 
+### w5 — darkroom filmstrip (2026-09-27 UTC)
+
+**What.** Final chrome leg: a bottom filmstrip under the darkroom's three
+panes, darktable's `src/libs/tools/filmstrip.c`. A horizontal
+`ListView` over the current image's film roll (`c41_db::film::film_image_paths`,
+filename order = the lighttable's default sort), current frame outlined with
+the grid's own `c41-cell-selected` frame, click switches image in place.
+`darkroom_page` gains one `on_open_image` callback; lib.rs implements it as
+`adw::NavigationView::replace(&[lighttable, new_page])`, which swaps the whole
+stack atomically so repeated clicks can never stack pages, and replays the
+m4-25 colour-dot/star refresh that `replace` does not trigger. No second image
+decoder: the strip reuses `lighttable::ensure_grid_thumb` / `apply_selection_frame`
+(widened to `pub(crate)`), so a thumb the grid already decoded is a cache hit
+and decoding stays off the UI thread. A 0/1-image roll hides the strip.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, no correctness defect — `NavigationView::replace`
+verified against the vendored bindings *and* the upstream C (stack shape,
+`replaced`-not-`popped`, tag handling, `remove_on_pop` sweep), all three
+`darkroom_page` call sites accounted for, every GTK/libadwaita API in the new
+module confirmed to exist. Two MAJORs found and fixed in-session:
+
+1. **Unbounded strip.** The dev version built one button per roll member and
+   eagerly armed `ensure_grid_thumb` for each, which behind
+   `thumbs::MAX_CONCURRENT_DECODES = 2` means one 150 ms retry timer per cell
+   (~3.3k wake-ups/s on a 500-image roll) plus 500 widgets realized on the UI
+   thread — the hazard `CULL_MAX_IMAGES` exists to bound in the grid. Replaced
+   with a virtualised `ListView` + `StringList` + `SignalListItemFactory`
+   (the grid's own factory protocol, including the unconditional widget-name
+   stamp that makes recycling safe); only realized cells decode. `NoSelection`
+   rather than `SingleSelection`, so GTK does not add its own "selected"
+   styling on top of the current-frame mark; `connect_map` scrolls the current
+   cell into view once.
+2. **False cycle-freedom claim.** `Rc::new_cyclic` only breaks the self
+   reference; the closure also held `nav` strongly while every page's strip
+   held a strong clone of the same `Rc` — a real (bounded) cycle. `nav` is now
+   a `glib::WeakRef` and the claim is stated accurately.
+
+MINORs also addressed: a NULL `filename` row (nullable in `schema.rs`) used to
+`||`-join to NULL and lose the *whole* roll — the join moved into Rust
+(`roll_file_path`, which also handles a NULL/root folder) and the row is
+skipped, so one bad cell costs one cell; clicking the frame you are already on
+no longer rebuilds the page (losing zoom, compare mode, crop overlay and undo
+stack for no visible change); the m4-25 refresh now runs *after* the swap so
+the outgoing page's `hidden` autosave flush has already happened; the strip
+height is 120 px with the arithmetic in the comment. NITs: the
+selection-frame pass-through wrapper is gone, and the 82-px display size's
+decoupling from the grid's 160-px decode bucket is now named in the comment.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). All-targets Clippy: zero diagnostics in `filmstrip.rs`
+and none new in the touched files. Release suites: `c41-core` 1811, `c41-db`
+100 (97 + 3 new), `c41-ui` 513 (508 + 5 new), 0 failed. `git diff --check`
+clean. Visually verified on a 1600x1900 Xvfb (the strip is below a 1080-tall
+screen, so the old :21 rig could not see it): two 82-px cells at the bottom
+band, the current one carrying a 2-px outline and the other none, zero GTK
+criticals. Remote CI confirmation follows commit/push per workflow.
+
 ### UI parity closed (2026-09-26 UTC)
 
 **What.** With u7f green on both remotes, every UI-parity leg from the

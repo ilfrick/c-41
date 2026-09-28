@@ -112,6 +112,45 @@ pub fn film_image_count(conn: &Connection, film_id: FilmId) -> rusqlite::Result<
     )
 }
 
+/// Join a film roll's folder and an image's file name into a full path.
+///
+/// `main.film_rolls.folder` and `main.images.filename` are both nullable
+/// (`crates/c41-db/src/schema.rs`), so the join is done here rather than in SQL:
+/// SQL's `||` would yield NULL for either side and the whole result set would
+/// fail to load. A root roll (`folder = '/'`, which `film_get_id` maps) has no
+/// directory to prepend, so the bare file name is the path.
+pub fn roll_file_path(folder: Option<&str>, filename: &str) -> String {
+    match folder {
+        Some(f) if !f.is_empty() && f != "/" => format!("{f}/{filename}"),
+        _ => filename.to_string(),
+    }
+}
+
+/// Full paths of every image in a film roll, ordered by file name. Within one
+/// film roll the folder is constant, so this is exactly the lighttable's
+/// default `SortOrder::Filename` order (`f.folder, i.filename`) with the
+/// constant term folded away — the filmstrip's display order.
+///
+/// Images with a NULL file name are skipped: they have no path to open, and one
+/// such row must not cost the caller the whole roll.
+pub fn film_image_paths(conn: &Connection, film_id: FilmId) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.folder, i.filename \
+         FROM main.images i \
+         JOIN main.film_rolls f ON f.id = i.film_id \
+         WHERE i.film_id = ?1 AND i.filename IS NOT NULL \
+         ORDER BY i.filename",
+    )?;
+    let rows = stmt
+        .query_map(params![film_id], |row| {
+            let folder: Option<String> = row.get(0)?;
+            let filename: String = row.get(1)?;
+            Ok(roll_file_path(folder.as_deref(), &filename))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -224,5 +263,61 @@ mod tests {
         db.execute("INSERT INTO main.images (id, film_id) VALUES (1, ?1)", params![id]).unwrap();
         db.execute("INSERT INTO main.images (id, film_id) VALUES (2, ?1)", params![id]).unwrap();
         assert_eq!(film_image_count(&db, id).unwrap(), 2);
+    }
+
+    #[test]
+    fn film_image_paths_returns_folder_joined_names_in_filename_order() {
+        // Dedicated schema: the shared fixture omits `filename`, and this query
+        // is precisely about the folder/filename join + order. The columns are
+        // declared nullable to match `schema.rs` — that is what this pins.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder VARCHAR);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename VARCHAR);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO film_rolls (id, folder) VALUES (7, '/photos/trip')", []).unwrap();
+        // Insert out of name order to prove the ORDER BY, not insertion order.
+        for (id, name) in [(1i32, "b.jpg"), (2, "a.jpg"), (3, "c.jpg")] {
+            conn.execute(
+                "INSERT INTO images (id, film_id, filename) VALUES (?1, 7, ?2)",
+                params![id, name],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            film_image_paths(&conn, 7).unwrap(),
+            vec!["/photos/trip/a.jpg", "/photos/trip/b.jpg", "/photos/trip/c.jpg"]
+        );
+        // An empty roll yields no rows, not an error.
+        conn.execute("INSERT INTO film_rolls (id, folder) VALUES (8, '/photos/empty')", []).unwrap();
+        assert!(film_image_paths(&conn, 8).unwrap().is_empty());
+    }
+
+    /// A NULL file name (a half-imported row) has no path to open, and it must
+    /// cost the caller that one cell — not the whole roll, which is what an
+    /// in-SQL `||` join plus `get::<_, String>` would do.
+    #[test]
+    fn film_image_paths_skips_null_filenames_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE film_rolls (id INTEGER PRIMARY KEY, folder VARCHAR);
+             CREATE TABLE images (id INTEGER PRIMARY KEY, film_id INTEGER, filename VARCHAR);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO film_rolls (id, folder) VALUES (1, '/r')", []).unwrap();
+        conn.execute("INSERT INTO images (id, film_id) VALUES (1, 1)", []).unwrap();
+        conn.execute("INSERT INTO images (id, film_id, filename) VALUES (2, 1, 'ok.jpg')", []).unwrap();
+        assert_eq!(film_image_paths(&conn, 1).unwrap(), vec!["/r/ok.jpg"]);
+    }
+
+    /// `folder` is nullable and a root roll is stored as `/`; neither may
+    /// produce a `//`-prefixed path that no image loader can open.
+    #[test]
+    fn roll_file_path_handles_null_and_root_folders() {
+        assert_eq!(roll_file_path(Some("/photos/trip"), "a.jpg"), "/photos/trip/a.jpg");
+        assert_eq!(roll_file_path(None, "a.jpg"), "a.jpg");
+        assert_eq!(roll_file_path(Some(""), "a.jpg"), "a.jpg");
+        assert_eq!(roll_file_path(Some("/"), "a.jpg"), "a.jpg");
     }
 }

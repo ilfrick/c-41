@@ -1489,6 +1489,74 @@ fn build_main_window(app: &Application) {
     let nav = adw::NavigationView::new();
     nav.push(&lt_page);
 
+    // In-place darkroom switch for the bottom filmstrip (w5). Each filmstrip
+    // thumbnail click rebuilds the target page and REPLACES the darkroom top
+    // page, keeping the lighttable root underneath so the back button still
+    // pops. `adw::NavigationView::replace` swaps the whole stack atomically
+    // (and, unlike `pop()` + `push()`, without animation), so repeated clicks
+    // can never stack darkroom pages — the last page is the only visible one.
+    //
+    // It is self-referential (every new darkroom page needs the same callback
+    // for its own strip), so `Rc::new_cyclic` hands the closure a Weak to
+    // itself. The `nav` handle is a `WeakRef` for the same reason: a strong
+    // `nav` here plus the strip holding a strong clone of this Rc would be a
+    // real reference cycle (nav → page → button → callback → nav), keeping both
+    // the NavigationView and every darkroom page alive for the process
+    // lifetime. Weak on both sides, so the last page going away frees the lot.
+    let switch_in_darkroom: std::rc::Rc<Box<dyn Fn(String)>> =
+        std::rc::Rc::new_cyclic(|weak: &std::rc::Weak<Box<dyn Fn(String)>>| {
+            let weak = weak.clone();
+            let nav: glib::WeakRef<adw::NavigationView> = nav.downgrade();
+            let db = db_path.clone();
+            let lt = lt_page.clone();
+            let grid = lt_grid.clone();
+            let db_for_refresh = db_path.clone();
+            Box::new(move |path: String| {
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                let Some(nav) = nav.upgrade() else {
+                    return;
+                };
+                // The darkroom page being left may have changed metadata (colour
+                // label / stars), and `replace` emits `replaced`, not `popped`,
+                // so the m4-25 refresh for its lighttable cell has to be
+                // replayed here rather than lost on the switch. The outgoing
+                // page's own tag is the image it was showing.
+                let leaving = nav
+                    .visible_page()
+                    .and_then(|p| p.tag())
+                    .map(|s| s.to_string())
+                    .filter(|p| p.contains('/'));
+                // Clicking the frame you are already on would tear the page
+                // down and rebuild it identically — losing zoom, compare mode,
+                // the crop overlay and the undo stack for no visible change.
+                if leaving.as_deref() == Some(path.as_str()) {
+                    return;
+                }
+                let cb = {
+                    let this = this.clone();
+                    move |next: String| this(next)
+                };
+                let page = darkroom::darkroom_page(&path, &db, cb);
+                page.set_tag(Some(&path));
+                // Replaces the whole stack with [lighttable, darkroom]: a
+                // deliberate narrowing, so an auxiliary page the user reached
+                // the darkroom through (the map, print, tether) is dropped and
+                // Back returns to the lighttable. darktable's own filmstrip
+                // does not retain such tool pages either, and preserving them
+                // would mean re-implementing a navigation stack here.
+                nav.replace(&[lt.clone(), page]);
+                // Replay AFTER the swap, so the outgoing page's `hidden`
+                // handler has already flushed its autosave — the same ordering
+                // window the m4-25 `popped` handler runs in.
+                if let Some(old) = leaving {
+                    lighttable::refresh_color_dots_for_path(&grid, &db_for_refresh, &old);
+                    lighttable::refresh_stars_for_path(&grid, &db_for_refresh, &old);
+                }
+            })
+        });
+
     // The open-the-editor body, shared verbatim by the grid's `activate`
     // signal, the zoomable canvas's double-click (m4-139), and the map list's
     // row activation (u3), so all entry points stay behaviourally identical by
@@ -1498,12 +1566,17 @@ fn build_main_window(app: &Application) {
         let nav = nav.clone();
         let db_path = db_path.clone();
         let preview_for_activate = preview.clone();
+        let switch = switch_in_darkroom.clone();
         std::rc::Rc::new(move |path| {
             // Leaving the lighttable closes the preview, or coming back from
             // the editor would land on a full-screen image of whatever was up
             // before — over a grid that has since moved on.
             preview_for_activate.close();
-            let page = darkroom::darkroom_page(&path, &db_path);
+            let cb = {
+                let switch = switch.clone();
+                move |next: String| switch(next)
+            };
+            let page = darkroom::darkroom_page(&path, &db_path, cb);
             // Tag the page with its image path so the pop handler below can
             // recover which cell to re-sync (m4-25), regardless of how the
             // page was dismissed (back button / Escape / swipe gesture).
@@ -1764,11 +1837,16 @@ fn build_main_window(app: &Application) {
         // selection (empty view / sentinel row) it snaps back to Lighttable.
         let preview_for_switch = preview.clone();
         dr_btn.connect_clicked(clone!(
-            @weak nav, @weak lt_selection, @weak lt_btn, @strong db_path => move |b| {
+            @weak nav, @weak lt_selection, @weak lt_btn, @strong db_path,
+            @strong switch_in_darkroom => move |b| {
             if !b.is_active() { return; }
             if let Some(path) = lighttable::selected_path(&lt_selection) {
                 preview_for_switch.close(); // same reason as the double-click path
-                let page = darkroom::darkroom_page(&path, &db_path);
+                let cb = {
+                    let switch = switch_in_darkroom.clone();
+                    move |next: String| switch(next)
+                };
+                let page = darkroom::darkroom_page(&path, &db_path, cb);
                 page.set_tag(Some(&path));
                 nav.push(&page);
             } else {

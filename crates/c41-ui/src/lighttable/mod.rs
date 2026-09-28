@@ -1096,7 +1096,7 @@ fn find_color_box_for_path(root: &gtk4::Widget, path: &str) -> Option<gtk4::Box>
 /// layout.
 const SEL_CSS_CLASS: &str = "c41-cell-selected";
 
-fn apply_selection_frame(thumb: &gtk4::Picture, selected: bool) {
+pub(crate) fn apply_selection_frame(thumb: &gtk4::Picture, selected: bool) {
     if selected {
         thumb.add_css_class(SEL_CSS_CLASS);
     } else {
@@ -1961,7 +1961,7 @@ pub(crate) fn paint_thumb(thumb: &gtk4::Picture, img: &thumbs::ThumbImage) {
 /// thumbnail decodes (review MAJOR, m4-140). Every entry re-checks the stamped
 /// widget name: cells recycle, so a retry landing on a rebound cell is a
 /// no-op — that cell's own bind runs a fresh chain.
-fn ensure_grid_thumb(thumb_w: glib::WeakRef<gtk4::Picture>, path: String) {
+pub(crate) fn ensure_grid_thumb(thumb_w: glib::WeakRef<gtk4::Picture>, path: String) {
     let Some(thumb) = thumb_w.upgrade() else { return };
     if thumb.widget_name() != path {
         return; // cell rebound mid-chain; its own bind owns the load now

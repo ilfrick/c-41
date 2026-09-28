@@ -24,6 +24,7 @@ use c41_core::rawimage::DemosaicMethod;
 use crate::snapshots::{SnapshotStore, SNAPSHOT_CAP};
 
 mod curve_editor;
+mod filmstrip;
 
 /// Shared snapshot store over the cached-render payload (the frozen pixels).
 type SnapStore = Rc<RefCell<SnapshotStore<CachedRender>>>;
@@ -1069,7 +1070,17 @@ fn spawn_decode(ctx: &PreviewCtx) {
 /// an `adw::NavigationView` and pops it to return to the lighttable. `db_path`
 /// is the catalogue database used to restore the image's saved preview params
 /// on open and persist them when the page is closed (empty string = no db).
-pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
+///
+/// `on_open_image` is called with the target path when the bottom filmstrip's
+/// thumbnail is clicked; the caller decides how to switch the darkroom (in
+/// lib.rs this replaces the current page in place, so repeated clicks never
+/// stack pages). The page itself deliberately holds no `NavigationView`.
+pub fn darkroom_page(
+    file_path: &str,
+    db_path: &str,
+    on_open_image: impl Fn(String) + 'static,
+) -> adw::NavigationPage {
+    let on_open_image: Rc<dyn Fn(String)> = Rc::new(on_open_image);
     let filename = std::path::Path::new(file_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -1973,8 +1984,25 @@ pub fn darkroom_page(file_path: &str, db_path: &str) -> adw::NavigationPage {
     crate::lighttable::wire_star_clicks(&stars_box, file_path.to_string(), db_path.to_string());
     header.pack_end(&stars_box);
 
+    // ── Bottom filmstrip (w5) ──────────────────────────────────────────────
+    // The current image's film-roll thumbnails; clicking one asks the caller to
+    // switch the darkroom in place. Hidden for a 0/1-image roll (see
+    // filmstrip::filmstrip_visible). Added as a ToolbarView bottom bar so it
+    // spans the full width below the three-pane content, exactly like the
+    // lighttable's timeline strip. `film_roll_paths` already returns filename
+    // order; `filmstrip_order` re-establishes the display rule explicitly, so
+    // it is unit-tested independently of the query.
+    let strip = filmstrip::filmstrip(
+        filmstrip::filmstrip_order(filmstrip::film_roll_paths(file_path, db_path)),
+        file_path,
+        on_open_image,
+    );
+
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
+    if let Some(strip) = &strip {
+        toolbar_view.add_bottom_bar(strip);
+    }
     toolbar_view.set_content(Some(&toast_overlay));
     // Page-root scope: covers header + content, scoped to this page.
     toolbar_view.add_controller(shortcuts);
