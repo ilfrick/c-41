@@ -7495,7 +7495,14 @@ tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 100,
 verified on the Xvfb rig: left = Import/Collections/Collection filters/Image
 information; right = History/Styles/Metadata/Tags/Geotagging/Export/Neural
 restore, compact with no placeholder gap, zero construction asserts. Remote CI
-confirmation follows commit/push per workflow.
+on `0eb1b253fc` is green: `check + test + clippy` and `Build & push Docker
+image` both `success`; matrix/full-c skipped, `CMake + Rust workspace`
+path-filtered out (Rust-only change). Both remotes verified at `0eb1b253fc`.
+The running `c-41` image was rebuilt pinned at `0eb1b253fc` and the container
+relaunched clean (`Up ... (healthy)`, zero panic/assert/markup lines); captured
+from its KasmVNC display, the live lighttable shows the new set with the user's
+real library (Image information populated from real EXIF, right panel starting
+at History, `Colours` gone).
 
 
 ### UI parity closed (2026-09-26 UTC)
