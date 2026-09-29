@@ -59,18 +59,25 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       # `cargo check` proves the whole workspace type-checks (including the
       # GTK4 c41-ui crate and the c41-rs binary).
+      #
+      # `--locked` on every cargo invocation in this file: `Cargo.lock` is
+      # tracked (it is the only record of which 266 dependency versions a
+      # "green" commit actually compiled), so a build may never silently
+      # re-resolve. A dependency bump is an explicit `cargo update` commit.
+      # Without it, `--locked` would have nothing to honour and cargo would
+      # write a fresh lockfile mid-job — the exact non-reproducibility x1 closed.
       - name: cargo check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
       # Full unit-test sweep. `--release` keeps the runtime within the
       # default 6h job budget on the larger crates.
       - name: cargo test
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --locked
 
       # Clippy at *default* strictness: catches actual bugs (incorrect
       # constant precision, dead unsafe, etc.) without enforcing the
@@ -78,7 +85,7 @@ jobs:
       # that would force a one-shot rewrite of every existing IOP.
       # Tighten this once the bulk of the migration lands.
       - name: cargo clippy
-        run: cargo clippy --workspace
+        run: cargo clippy --workspace --locked
 
       # Cargo-native build of the standalone GTK4 app binary (milestone 5 —
       # retire CMake): guarantees the real, shippable `c41-rs` links with
@@ -91,4 +98,4 @@ jobs:
       # dep rlibs `cargo test --release` already built (marginal cost ≈ the link,
       # not a full release codegen).
       - name: cargo-native app binary build
-        run: cargo build --release -p c41 --bin c41-rs
+        run: cargo build --release -p c41 --bin c41-rs --locked

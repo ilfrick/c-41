@@ -2004,11 +2004,16 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
      preview uses GdkPixbuf vs export's `image` crate (JPEG ±1-2 LSB); resize runs
      in gamma space (pre-existing, both paths). **Blocker to full cli removal:** a
      Rust HEIF/AVIF decoder (or dropping those formats) + broad raw decode coverage.
-   - *Build:* CMake drives a `cargo build` of `c41-core` as a static lib
-     linked into the C app, and builds the C `darktable`/`darktable-cli` the
-     runtime still needs. Once the export fallback is gone, the C build (and thus
-     CMake) can be dropped and the image becomes a pure-cargo build of
-     `c41-rs` + a GTK4 runtime.
+   - *Build:* ~~CMake drives a `cargo build` of `c41-core` as a static lib
+     linked into the C app~~ — **no longer true** (corrected by x1,
+     2026-09-30, while checking where `--locked` had to go: there is no `cargo`
+     reference anywhere in `CMakeLists.txt` or `cmake/*.cmake`, and
+     `ci-fork.yml` builds the C `darktable`/`darktable-cli` from `src/` alone).
+     The C app no longer consumes any Rust crate, so the C build is wholly
+     independent of the Rust workspace and of its lockfile. What remains is
+     that the C build still exists at all; once the export fallback is gone it
+     can be dropped and the image is a pure-cargo build of `c41-rs` + a GTK4
+     runtime.
    Ordered retirement path: reach export parity → drop the `darktable-cli`
    fallback in `dialogs::export_images_async` → strip the CMake C build from the
    Dockerfile (cargo-only) → retire `CMakeLists.txt` + `build.sh`.
@@ -2044,6 +2049,12 @@ print, slideshow, tethering), `src/libs/` (33 panels), `src/gui/` (16).
    reference (full C build available via `Dockerfile.full-c`). Remaining: live GUI
    eyeball (needs a display), the heic/heif/avif decision (drop vs keep full-c),
    and the deferred `--locked` (needs Cargo.lock committed — currently gitignored).
+   **`--locked` closed by x1 (2026-09-30):** `Cargo.lock` is now tracked (266
+   packages) and `--locked` is passed by `rust.yml`, `docker/Dockerfile`,
+   `docker/Dockerfile.full-c`, `docker/Dockerfile.rust-dev` and
+   `scripts/ci-local.sh`. Those are all the cargo invocations that touch the
+   workspace: the C/CMake path invokes cargo not at all (see the corrected
+   *Build* bullet above), so there is no unlocked hole left.
 
    **Before the Dockerfile-strip step, confirm each thing the C `install`
    currently provides to the runtime is Rust-side, not C-install-side** (checklist

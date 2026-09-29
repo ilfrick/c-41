@@ -44,4 +44,6 @@ RUN mkdir -p "$CARGO_TARGET_DIR"
 
 WORKDIR /src
 
-CMD ["cargo", "check", "--workspace"]
+# `--locked` (x1): the dev image resolves the same tracked `Cargo.lock` CI and
+# the release images do, so an incremental local build can't quietly diverge.
+CMD ["cargo", "check", "--workspace", "--locked"]

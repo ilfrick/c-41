@@ -10,12 +10,17 @@
 # never match — it reported success on a failing run. This script runs the real
 # commands and trusts their exit codes, which is the only reliable signal.
 #
-# Steps, matching rust.yml exactly:
-#   1. cargo check --workspace
-#   2. cargo clippy --workspace          (default strictness, as CI)
-#   3. cargo test --workspace --release  (CI uses --release; debug-only runs
-#                                         have missed release-profile breakage)
-#   4. cargo build --release -p c41 --bin c41-rs   (the real link)
+# Steps, mirroring rust.yml's four steps and their flags. Two deliberate
+# deltas from CI, both pre-existing and both widening coverage:
+#   * clippy adds --all-targets (rust.yml uses default target selection);
+#   * the toolchain/system deps come from the dev container, not apt in CI.
+# All four carry `--locked` (x1) so the gate resolves the same dependency set
+# CI and the container image do.
+#   1. cargo check --workspace --locked
+#   2. cargo clippy --workspace --all-targets --locked  (default strictness, as CI)
+#   3. cargo test --workspace --release --locked  (CI uses --release; debug-only
+#                                         runs have missed release-profile breakage)
+#   4. cargo build --release -p c41 --bin c41-rs --locked   (the real link)
 #
 # Exit code is non-zero if any step fails, so it works as a pre-push gate.
 
@@ -60,13 +65,17 @@ run_step() {
 }
 
 failed=()
-run_step "cargo check"   "cargo check --workspace"                             || failed+=("check")
+# `--locked` on every step (x1), matching .github/workflows/rust.yml: the gate
+# must exercise the same dependency set CI and the container image do, so a
+# local green means what CI green means. A stale lockfile fails here loudly
+# instead of being silently re-resolved.
+run_step "cargo check"   "cargo check --workspace --locked"                      || failed+=("check")
 # --all-targets: without it, #[cfg(test)] code is never linted — two
 # deny-by-default erasing_op errors sat in c41-core tests undetected until the
 # m4-131 session ran a stricter local clippy (review MINOR, fixed same day).
-run_step "cargo clippy"  "cargo clippy --workspace --all-targets"              || failed+=("clippy")
-run_step "cargo test"    "cargo test --workspace --release"                    || failed+=("test")
-run_step "release build" "cargo build --release -p c41 --bin c41-rs" || failed+=("build")
+run_step "cargo clippy"  "cargo clippy --workspace --all-targets --locked"        || failed+=("clippy")
+run_step "cargo test"    "cargo test --workspace --release --locked"              || failed+=("test")
+run_step "release build" "cargo build --release -p c41 --bin c41-rs --locked"     || failed+=("build")
 
 echo
 if [ ${#failed[@]} -ne 0 ]; then

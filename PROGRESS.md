@@ -7640,3 +7640,60 @@ Docker image` both `success` (the latter rebuilds the runtime with the new
 `libcups2t64` line); matrix/full-c jobs skipped as expected. `CMake + Rust
 workspace` did not run — correctly path-filtered out (u9 touches no C
 code). Both remotes (`origin` GitHub + Gitea) verified at `5819fcfe20`.
+
+### x-series — closing the project-goal gaps (from 2026-09-30)
+
+A status sweep against the two stated project goals (full Rust migration,
+feature parity) found the FFI-port chain and the UI-parity audit both formally
+closed, but four categories of real work untracked by any document:
+wiring parity (16 catalogue rows inert), colour management (the ICC engine is
+written and called by nobody), masks (absent entirely), and platform features
+with no implementation at all (Lua, OpenCL). The x-series works that list down
+in cost order. x1 is the build-reproducibility fix; a "Known gaps" section
+lands in `PARITY_AUDIT.md` alongside it so the rest stops being invisible.
+
+### x1 — track `Cargo.lock` and pass `--locked` everywhere (2026-09-30 UTC)
+
+**What.** `Cargo.lock` was gitignored — inherited from the darktable C fork,
+where a Rust lockfile was meaningless, and never revisited once the Rust
+workspace became the only shipped product. So every build silently re-resolved
+against crates.io: the same commit could produce different binaries on different
+days, and nothing in CI, the release images or the local gate would say so.
+`Cargo.lock` is now **tracked** (2524 lines, 266 packages) and `--locked` is
+passed by every cargo invocation that touches the workspace — the four steps in
+`.github/workflows/rust.yml` (check, test, clippy, release build), the release
+builds in `docker/Dockerfile` and `docker/Dockerfile.full-c`, the dev image's
+`CMD` in `docker/Dockerfile.rust-dev`, and all four steps of
+`scripts/ci-local.sh`. The `actions/cache` key now hashes `Cargo.lock` too, so
+a lockfile-only change busts the cache. Dependency bumps from here are explicit
+`cargo update` commits, reviewed like any other change. This closes the
+`--locked` item the migration plan had carried as "deferred (needs Cargo.lock
+committed)" — including the Dockerfile's own pre-existing TODO comment, which
+had named this exact follow-up.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, with committing the lockfile confirmed as correct for a
+shipped binary and no supply-chain red flags (no `git+`/`path`/credential
+entries; all registry sources). The review's headline MAJOR — "the CMake/cargo
+path has no `--locked`" — turned out to rest on a false premise inherited from
+the migration plan, and chasing it down found a real documentation bug: the
+plan claimed CMake drives a `cargo build` of `c41-core` as a static lib linked
+into the C app. There is **no `cargo` reference anywhere** in `CMakeLists.txt`
+or `cmake/*.cmake`, and `ci-fork.yml` builds the C `darktable` from `src/` alone
+— the C app consumes no Rust crate, so the C path cannot drift from the
+lockfile. Corrected in the plan, and in the `Dockerfile.full-c` comment that had
+repeated the same stale claim. Other fixes: `--locked` added to the dev image
+`CMD`; `ci-local.sh`'s "matching rust.yml exactly" claim softened to name its two
+real deltas (clippy `--all-targets`, deps from the dev container). NIT that the
+review could not check — lockfile v4 needs cargo ≥ 1.78 — is satisfied: all
+four paths install current `stable`, and `rust-toolchain.toml` pins `stable`.
+
+**Verified.** `cargo metadata --locked` exits 0, so the committed lockfile is
+consistent with the manifests (a stale one would have failed every `--locked`
+build in CI). Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link) with `--locked` on all four. Release suites: `c41-core`
+1811, `c41-db` 100, `c41-ui` 519, 0 failed. The lockfile is provably unchanged
+by the gated builds (`git diff -- Cargo.lock` empty after them), which is the
+direct evidence that `--locked` is being honoured rather than ignored.
+`git diff --check` clean; `bash -n scripts/ci-local.sh` clean. Remote CI
+confirmation follows commit/push per workflow.

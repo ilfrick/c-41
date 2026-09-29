@@ -81,11 +81,18 @@ RUN cmake -B build -G Ninja \
     && cmake --build build --parallel ${JOBS} \
     && cmake --install build
 
-# Build the Rust/GTK4 UI binary (c41-rs). CMake already invoked cargo to
-# build c41-core as a static lib for the C app, but the standalone GTK4
-# front-end is a separate workspace binary that must be built explicitly. It
-# lands at /src/target/release/c41-rs and is copied into the runtime stage.
-RUN cargo build --release -p c41 --bin c41-rs
+# Build the Rust/GTK4 UI binary (c41-rs). It lands at /src/target/release/c41-rs
+# and is copied into the runtime stage.
+#
+# `--locked` (x1) as in docker/Dockerfile: same tracked `Cargo.lock`, same
+# reason. Note this is the ONLY cargo invocation in the whole C path — the
+# CMake step above builds the C darktable purely from `src/` and never resolves
+# a Rust dependency (verified: no `cargo` reference anywhere in CMakeLists.txt or
+# cmake/*.cmake), so the C image cannot drift from the lockfile. An earlier
+# version of this comment claimed CMake invoked cargo for a c41-core static lib;
+# that stopped being true when the FFI shim was dropped, and the claim is
+# corrected here rather than left to mislead the next reader.
+RUN cargo build --release -p c41 --bin c41-rs --locked
 
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
 # KasmVNC provides browser-accessible GUI (same approach as linuxserver/darktable)

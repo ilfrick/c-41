@@ -1,7 +1,13 @@
 build*/
 obj*/
 /target/
-Cargo.lock
+# Cargo.lock is TRACKED (x1, 2026-09-30). It was inherited from the darktable
+# fork, where the C build made a Rust lockfile meaningless, and it was never
+# revisited once the Rust workspace became the only shipped product. A
+# gitignored lockfile means every build silently re-resolves against crates.io
+# and the "same commit" can produce different binaries; `--locked` is now passed
+# by CI, the container images and scripts/ci-local.sh. Dependency bumps are
+# explicit `cargo update` commits, reviewed like any other change.
 *~
 *.pot
 *.mo

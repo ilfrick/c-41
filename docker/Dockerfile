@@ -71,9 +71,12 @@ RUN git clone -b ${DARKROOM_BRANCH} ${DARKROOM_REPO} /src \
         || echo "CACHEBUST=${CACHEBUST} is not a commit; using ${DARKROOM_BRANCH} HEAD")
 
 WORKDIR /src
-# (Reproducibility follow-up: add `--locked` once Cargo.lock is committed — it's
-# currently gitignored, so --locked has no lockfile to honour and errors out.)
-RUN cargo build --release -p c41 --bin c41-rs
+# `--locked` (x1): `Cargo.lock` is tracked, and this stage git-clones the repo
+# at the pinned CACHEBUST commit, so the lockfile for those exact bits is
+# present. Honouring it is what makes "the image built from commit X" mean one
+# specific dependency set rather than whatever crates.io served that day — the
+# production image is the one artifact users actually run.
+RUN cargo build --release -p c41 --bin c41-rs --locked
 
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
 FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
