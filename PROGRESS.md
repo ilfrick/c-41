@@ -7695,5 +7695,14 @@ tests, `c41-rs` link) with `--locked` on all four. Release suites: `c41-core`
 1811, `c41-db` 100, `c41-ui` 519, 0 failed. The lockfile is provably unchanged
 by the gated builds (`git diff -- Cargo.lock` empty after them), which is the
 direct evidence that `--locked` is being honoured rather than ignored.
-`git diff --check` clean; `bash -n scripts/ci-local.sh` clean. Remote CI
-confirmation follows commit/push per workflow.
+`git diff --check` clean; `bash -n scripts/ci-local.sh` clean.
+
+Remote CI on `a699cb917c` is green: `check + test + clippy` and `Build & push
+Docker image` both `success`; matrix/full-c jobs skipped as expected. These two
+are the actual proof of x1 rather than a formality — `check + test + clippy`
+runs all four `--locked` invocations from a **fresh CI checkout** (so it proves
+the committed lockfile is complete and consistent with every manifest, not just
+with a warm local tree), and `Build & push Docker image` git-clones the pinned
+CACHEBUST commit and runs `cargo build --locked` against it, which is exactly the
+path that would have failed had the lockfile not been pushed. Both remotes
+verified at `a699cb917c`.
