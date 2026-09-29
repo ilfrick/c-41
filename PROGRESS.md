@@ -7504,6 +7504,43 @@ from its KasmVNC display, the live lighttable shows the new set with the user's
 real library (Image information populated from real EXIF, right panel starting
 at History, `Colours` gone).
 
+### w9 — darkroom right panel is one scroll column (2026-09-29 UTC)
+
+**What.** The live image is displayed on a **wide, short** KasmVNC viewport
+(1536×606 in the report), and the darkroom right panel was built as a plain
+vertical box: fixed `Demosaic` + `Geometry` sections, then a **nested**
+`ScrolledWindow` around only the module list, then fixed `Styles`. The fixed
+bands take their natural height first and the one elastic child — the nested
+module scroller — gets the remainder, which on a short window is a sliver
+(~35 px). That is the user's "tools in a very narrow horizontal window halfway
+through the page, scrollable but too little in view". Fix: `build_modules_panel`
+returns the module box **unwrapped**, and `darkroom_page` wraps the whole right
+column (demosaic + geometry + modules + styles) in a single `ScrolledWindow`
+(vexpand, 320 px, vscrollbar automatic). The scroll viewport is now the full
+panel height, so an over-tall panel scrolls instead of squeezing one band —
+darktable's single right-panel module column. The left rail was already a
+single scroll; the two are now the same shape.
+
+**Review.** Independent senior-reviewer agent (same model, fresh context):
+**APPROVE-WITH-FIXES**, no BLOCKER/MAJOR and explicitly **no aliasing or
+double-parent hazard** — the returned widget and `ctx.panel_box` are
+intentionally the same singly-parented box (one strong ref per site, weakref
+everywhere else), and every rebuild path (global Reset, `reset_module_and_rebuild`,
+style-apply) clears/refills only that box, leaving demosaic/geometry/styles
+untouched. `git diff --check` clean, no new deps, no dead import. Three
+doc-only MINOR/NITs (stale comments still saying the module list was a nested
+scroller / history "lives above") fixed in-session. The reviewer noted pinning
+the modulegroups filter bar above the scroll as a possible future darktable
+refinement, with the trade-off that it reintroduces a second sizing region —
+deliberately not done here.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 (check, clippy, release
+tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 100,
+`c41-ui` 519, 0 failed. `git diff --check` clean. Reproduced on a 1536×610
+Xvfb matching the reported viewport: the right panel now shows the full
+filter bar + `Modules` + the module rows filling the panel height, scrolling as
+one column. Remote CI confirmation follows commit/push per workflow.
+
 
 ### UI parity closed (2026-09-26 UTC)
 

@@ -1569,8 +1569,8 @@ pub fn darkroom_page(
 
     // Scrollable so short viewports clip nothing: the rail's children are all
     // fixed-minimum (hist 120 + history/snapshot scrolled windows), with no
-    // elastic child to absorb shrink the way the modules panel does on the
-    // right (same builder shape as that panel's scroller below).
+    // elastic child to absorb shrink. Both side panels are now single scroll
+    // columns (w9 did the same for the right panel; see `right_scroll` below).
     let left_scroll = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vexpand(true)
@@ -1579,10 +1579,13 @@ pub fn darkroom_page(
         .build();
 
     // Right column: demosaic/geometry/modules/styles (history + snapshots moved
-    // to the left rail above).
+    // to the left rail above). w9: these are the CHILDREN of one scroll column —
+    // `right_box` is wrapped in `right_scroll` below — so nothing is a fixed band
+    // squeezing the module list into a sliver on a short window. darktable keeps
+    // one scrolling right-panel module column (with the histogram/picker fixed in
+    // its own area); this matches that.
     let right_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
-        .width_request(320)
         .build();
 
     // Bayer demosaic-method selector — raw images only (JPEGs aren't
@@ -1763,6 +1766,17 @@ pub fn darkroom_page(
         &history_list.downgrade(),
     ));
 
+    // w9: one scroll column for the whole right panel (demosaic/geometry/
+    // modules/styles). The module list is no longer a tiny nested viewport; the
+    // panel's full height is the scroll viewport, so a short window just scrolls.
+    let right_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vexpand(true)
+        .width_request(320)
+        .child(&right_box)
+        .build();
+
     // ── Three-pane view: left rail | image | right modules ──────────────────
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
@@ -1771,7 +1785,7 @@ pub fn darkroom_page(
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     content.append(&image_area);
     content.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
-    content.append(&right_box);
+    content.append(&right_scroll);
 
     // Wrap the content so export (and future) status can surface as a toast —
     // the darkroom view previously logged export results only to stderr.
@@ -2079,7 +2093,8 @@ fn labeled_slider(label: &str, min: f64, max: f64, step: f64, value: f64) -> Lab
 /// IOP (Exposure, Velvia) render as expandable rows with a live enable switch
 /// and parameter sliders wired to the preview pipeline; the rest are inert
 /// enable-toggle rows. The navigable history panel is built separately in
-/// [`darkroom_page`] and lives above this (it survives the Reset/jump rebuilds).
+/// [`darkroom_page`] and lives in the left rail (w1); it survives the
+/// Reset/jump rebuilds.
 fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
     let panel = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -2095,14 +2110,12 @@ fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
     ctx.panel_box.set(Some(&panel));
     populate_modules(&panel, ctx);
 
-    // Scrollable so the (long) module list never blows out the window height.
-    let scrolled = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vexpand(true)
-        .width_request(320)
-        .child(&panel)
-        .build();
-    (scrolled.upcast(), panel)
+    // Returned UNWRAPPED: the right panel is one scroll column (see w9 in
+    // `darkroom_page`), so a nested scroller here would split the panel into a
+    // fixed chrome band + a small viewport — the exact "tiny window" the w9 fix
+    // removes. The module list shares the panel's single scroll with the
+    // demosaic/geometry/styles sections, darktable-style.
+    (panel.clone().upcast(), panel)
 }
 
 /// Module-list scope tab: which rows the filter bar keeps visible. `Group`
@@ -2382,8 +2395,9 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     apply();
 }
 
-/// Saved-style application inside the darkroom (m4-151), pinned below the
-/// scrollable module list. darktable keeps this lib module in the same
+/// Saved-style application inside the darkroom (m4-151), below the module list
+/// in the right panel's single scroll column (w9). darktable keeps this lib
+/// module in the same
 /// right-centre panel (`src/libs/styles.c`, container
 /// DT_UI_CONTAINER_PANEL_RIGHT_CENTER, position 599; views LIGHTTABLE|MULTI
 /// since 4.9 so it can be added to darkroom via the add-module menu) without
