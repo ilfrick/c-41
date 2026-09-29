@@ -7539,7 +7539,14 @@ tests, `c41-rs` link). Release suites: `c41-core` 1811, `c41-db` 100,
 `c41-ui` 519, 0 failed. `git diff --check` clean. Reproduced on a 1536×610
 Xvfb matching the reported viewport: the right panel now shows the full
 filter bar + `Modules` + the module rows filling the panel height, scrolling as
-one column. Remote CI confirmation follows commit/push per workflow.
+one column. Remote CI on `d6042baba0` is green: `check + test + clippy` and
+`Build & push Docker image` both `success`; matrix/full-c skipped,
+`CMake + Rust workspace` path-filtered out (Rust-only change). Both remotes
+verified at `d6042baba0`. The running `c-41` image was rebuilt pinned at
+`d6042baba0` and the container relaunched clean (`Up ... (healthy)`, zero
+panic/assert/markup lines); captured from its live KasmVNC display, the
+darkroom right panel is the single full-height scroll (Demosaic, Geometry,
+filter tabs, search, `Modules`, module rows — nothing squished into a sliver).
 
 
 ### UI parity closed (2026-09-26 UTC)
