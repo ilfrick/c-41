@@ -7774,3 +7774,15 @@ find more.
 `c41-db` 100, `c41-ui` 519, 0 failed — unchanged, as no code moved. Cold
 senior-review passes as listed above; the final one returned
 APPROVE-WITH-FIXES with only reflow/text nits, all applied.
+
+**Remote CI.** Committed as `c0b08ec921` and pushed to both remotes; `master`
+verified at that SHA on GitHub and gitea via `ls-remote`. GitHub CI is green:
+`Docker Build & Publish` → `success`, and the `full-c` on-demand job skipped as
+expected. The `Rust` workflow did **not** run, correctly — `rust.yml` is
+path-filtered to `crates/**`, `Cargo.toml`, `Cargo.lock` and
+`rust-toolchain.toml`, and x2 touches only Markdown. Per the user, **gitea has
+no CI available** (it is a push mirror): its Actions has no runner registered
+(`action_runner` is empty in its database, so every push since long before x2
+sits `Waiting to run`). "Confirm CI" in this log therefore means **GitHub CI
+green plus the commit present on both remotes**, which is what the x-series
+entries have always recorded.
