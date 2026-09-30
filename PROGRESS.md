@@ -7786,3 +7786,10 @@ no CI available** (it is a push mirror): its Actions has no runner registered
 sits `Waiting to run`). "Confirm CI" in this log therefore means **GitHub CI
 green plus the commit present on both remotes**, which is what the x-series
 entries have always recorded.
+
+**Running image.** Rebuilt `c-41:latest` from the current tree (image
+`22b8a1bad05f`, `--build-arg CACHEBUST=9cc7ad54c3`) and relaunched the long-lived
+`c-41` container on it, previous kept as `c-41-old`; container `healthy`,
+`/usr/local/bin/c41-rs` running, UI answers `HTTP 200` on `:3000`. x2 changed no
+code, so this is a freshness rebuild rather than a behavioural one, but the
+running container now tracks `master`.
