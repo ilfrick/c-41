@@ -1,8 +1,11 @@
 # C-41 vs darktable — parity audit
 
-**First written 2026-08-08. Last refreshed 2026-08-21** (severity 1 re-verified
-against the code; resolved items struck through rather than deleted, so the
-record of what was fixed survives).
+**First written 2026-08-08. Last refreshed 2026-09-30** (severity 1 re-verified
+against the code on 2026-08-11 and not re-walked since; resolved items struck
+through rather than deleted, so the record of what was fixed survives). The
+2026-09-30 refresh added the **"Known gaps"** section — every severity row was
+closed at that point, and the list had no way to describe what it had never
+looked at.
 
 > Keep this current. Between 08-08 and 08-11 it went stale enough to be
 > actively misleading — it still listed three severity-1 items that had shipped
@@ -31,6 +34,12 @@ target — see the note at the bottom.
 > geotagging (u2), print (u1), map list + slippy canvas (u3/u5), tethering
 > shell + watch + live capture (u4/u6), neural-restore infra + denoise +
 > detail/split + upscale + raw + linear (u7a–u7f). Items 2.7 and 3.4 closed.
+
+> **2026-09-30 — read this before trusting the strikethrough.** Every severity
+> row below is closed, and that is *not* a claim of parity: those rows audited
+> the product as it stood when the list was written. See **"Known gaps"** further
+> down for what they never covered. That section is itself a partial sweep, not
+> an exhaustive feature-set audit, and says so.
 
 > **2026-08-21 update:** shadows/highlights (shadhi) wired as the 21st live module,
 > joining basicadj (item 2.1) as a parity-2.1 increment — full pipeline Stage +
@@ -129,6 +138,306 @@ permanently out — no darktablerc in this product). | low priority; listed for 
 
 ---
 
+## Known gaps (2026-09-30) — outside the severity scale, because never audited
+
+Every item above is struck through, which reads as "parity closed". It is not.
+Those rows audited **the product as it stood when the list was written**; the
+items below are ones that list never covered. They surfaced on 2026-09-30 from
+a *goal-status* sweep (is the Rust migration done? is parity done?), not from a
+feature-by-feature comparison against darktable — which is the method this
+document's severity tables use, and the method that would be needed to claim the
+list below is complete. It is not claimed to be. Expect a real darktable
+feature-set audit to find more.
+
+One reconciliation with the rest of this file before reading G1: the header note
+and rows 2.1 / 2.4 say **33** live modules, and that was correct when written
+(m4-130 slice 3, 2026-08-25; row 2.4's "all 33 module groups" is a m4-149 figure
+from 2026-08-26 07:20 UTC). `Local contrast` landed four hours later the same
+day, as the 34th. `G1` counts today's 34 + the 2 elsewhere-driven rows = 36.
+Those historical figures are left as written and not retroactively edited.
+
+Three provenance classes, kept distinct below:
+
+- **G1–G3** — never audited. Not on any list, in any document, at any point.
+- **G4–G5** — named as *goals or decisions* in `RUST_MIGRATION_PLAN.md`, so they
+  were always visible as intentions; what was never done is auditing them as
+  gaps against the shipped product. They are unimplemented, not unrecorded.
+- **G6** — written down as open items and deliberately left open.
+
+Sizing is rough effort, not a schedule. Nothing here is a regression: each was
+never built (or, for G6, deliberately deferred), not lost.
+
+**House rule for this section.** Every count here was computed from source and
+carries what is needed to recompute it rather than trust it. Usually that is a
+`file:line`; where it is not, the section says so. Six counts are composed
+across the `geom_iop_stub!` macro and cannot be a single citation: 74, 22, 96,
+89, 76 and 90. For those, the anchor is the macro itself
+(`iop/geometry.rs:13-26`, invoked at `:30-35`, `:39-43`, `:46-56`) plus the rule
+that its own body at `:20` is excluded from the 74 — a naive
+`grep 'fn process_cl'` returns 76, not 96, because it also picks up the trait
+declaration at `iop/mod.rs:112` and the macro body, and a naive
+`grep '"not implemented"'` returns 110, not 76, because each stub says it in
+both `process` and `process_cl`. Most other numbers here are a plain grep or
+`wc -l`; a few are one-line arithmetic (36 = 34 + 2, 16 = 52 − 34 − 2).
+Extending this section means recomputing the numbers you add *and* re-checking
+the ones already here: earlier drafts carried counts that review disproved. A
+claim with no way to re-derive it does not go in.
+
+### G1 — 16 catalogue rows render inert, and wiring them is plumbing, not panels
+
+`catalog.rs` publishes 52 module rows across the five darktable groups
+(Base 11, Tone 11, Color 11, Correct 7, Effect 12). `LIVE_MODULE_LABELS` has
+34 entries (`darkroom/mod.rs:2592`); `ELSEWHERE_MODULE_LABELS` has 2 (`:2574` —
+`Crop`, `Rotate & perspective`, driven from controls outside the module list).
+The header counter is `is_live_module`-derived (`mod.rs:2268`, `:2565-2567`) and
+reads **"36 of 52 active"**.
+
+So 16 rows are in neither list, and **all 16 render through `inert_module_row`**
+(`mod.rs:2325-2331` dispatches on `elsewhere_hint`, which returns `Some` only
+for Crop and Rotate & perspective, and `inert_module_row` is the fall-through).
+Inert means dimmed, tooltip "not yet wired", a status icon, and deliberately not
+interactive — no switch at all, because the code comments that a disabled switch
+still suggests "turn me on", and an earlier version that shipped a *working*
+switch is exactly the "looks live, does nothing" bug the function was written to
+remove:
+
+`Raw black/white point` · `Demosaic` · `Orientation` · `Color calibration` ·
+`Input color profile` · `Output color profile` · `Hot pixels` ·
+`Chromatic aberrations` · `Defringe` · `Retouch` · `Liquify` · `Grain` ·
+`Soften` · `Highpass` · `Framing` · `Watermark`
+
+`Demosaic` is the one row that is inert *and* independently functional: the
+algorithm dropdown at the top of the right panel (`mod.rs:1607-1617`, handler at
+`:1624-1629`) is working software that the "36 of 52" counter does not count,
+since `is_live_module` only knows the two label lists. Two caveats, so the count
+is not oversold: the dropdown sits inside `if is_raw_path(file_path)`
+(`:1595`) and is hidden for X-Trans, so it only counts on a Bayer raw; and it is
+a free-standing section, not a control on the `Demosaic` row. By "reachable
+rather than listed": 37, not 36.
+
+`Orientation` deserves its own note because it looks covered and is not: the
+only other "Orientation" in `c41-ui` is the *print* page-orientation combo
+(`print.rs:516`). There is no image rotate/flip control — `Straighten` belongs to
+`Rotate & perspective`, a different darktable module. Raw files do get automatic
+EXIF orientation applied at decode (`rawimage.rs`), which is not a control and is
+raw-only. So `Orientation` is genuinely inert.
+
+**The maths is ported; the plumbing is not.** This is the part that is easy to
+get wrong, so it is worth being precise about *what* exists. The m4-129…m4-244
+chain ported darktable's per-pixel `DT_OMP_FOR` loops into `c41-core/src/iop/`
+and exposed them as `#[no_mangle] extern "C"` kernels for the **C** pixelpipe to
+call. All 16 rows have such kernels. Row by row — the label each darktable module
+returns, so the mapping is checkable against `src/iop/*.c` rather than asserted:
+
+| catalogue row | darktable module | Rust kernel | exports / tests |
+|---|---|---|---|
+| `Raw black/white point` | `rawprepare.c` | `iop/rawprepare.rs` | 6 / 6 |
+| `Demosaic` | `demosaic.c` | `iop/demosaic.rs` | 27 / 31 |
+| `Orientation` | `flip.c` | `iop/geometry.rs:111,142` | 2 / 9 |
+| `Color calibration` | `channelmixerrgb.c` | `iop/channelmixerrgb.rs` | 2 / 6 |
+| `Input color profile` | `colorin.c` | `iop/colorin.rs` | 5 / 15 |
+| `Output color profile` | `colorout.c` | `iop/colorout.rs` | 4 / 14 |
+| `Hot pixels` | `hotpixels.c` | `iop/hotpixels.rs` | 3 / 14 |
+| `Chromatic aberrations` | `cacorrectrgb.c` | `iop/cacorrectrgb.rs` | 7 / 11 |
+| `Defringe` | `defringe.c` | `iop/defringe.rs` | 1 / 4 |
+| `Retouch` | `retouch.c` | `iop/retouch.rs` | 7 / 12 |
+| `Liquify` | `liquify.c` | `iop/liquify.rs` | 6 / **0** |
+| `Grain` | `grain.c` | `iop/grain.rs` | 1 / 4 |
+| `Soften` | `soften.c` | `iop/soften.rs` | 1 / 4 |
+| `Highpass` | `highpass.c` | `iop/highpass.rs` | 2 / 2 |
+| `Framing` | `borders.c` | `borders.rs:330` + `iop/geometry.rs:65,87,182` | 4 / 21 |
+| `Watermark` | `watermark.c` | `iop/watermark.rs` | 1 / 3 |
+
+Two traps in that table, both of which cost a wrong claim in an earlier draft.
+`Chromatic aberrations` is `cacorrectrgb`, **not** `ashift` — `ashift.c:114` is
+*rotate and perspective*, one of the 2 elsewhere-driven rows that are otherwise
+live; *lens correction* is `lens.cc:252`. And `Orientation` is `flip.c`, whose
+own label is "orientation"; `rasterfile.c` is *external raster masks* and has
+nothing to do with it. `Liquify` is the one row whose ported kernel ships with no
+unit test at all. The last column is per-row, not additive: `Orientation` and
+`Framing` both draw on `iop/geometry.rs`, so its 9 tests are counted in each.
+
+But two further things follow, and both cut against reading "a module file
+exists" as "the Rust product can run this module":
+
+1. **`IopProcess::process` is a stub — on all 16 of these rows**, and on 89 of the
+   96 implementors crate-wide (74 explicit `impl` blocks plus 22 `geom_iop_stub!`
+   expansions; the two lists share 6 type *names* — `Ashift`, `Clipping`,
+   `Colorharmonizer`, `Denoiseprofile`, `Liquify`, `Retouch` — which are
+   distinct types in `iop/*.rs` and `iop/geometry.rs`, so counting by name gives
+   90). It returns `Err(Pipeline(…))` unconditionally; the literal
+   `"not implemented"` is on 76 of the 89; the other 13 all say "use C FFI path"
+   or "use the C FFI entry point", with a parenthetical where the params
+   hold LUTs that cannot be cast — `levels.rs:43`, `colisa.rs:41`,
+   `lowpass.rs:20`, `lowlight.rs:35`, `tonecurve.rs:154` are the LUT cases.
+   None of the 13 says anything else; the 15 "not yet ported" strings in
+   `src/iop/` are all `Error::OpenCl` from `process_cl`, not from `process`.
+   The driver was never ported, because C calls the kernels directly.
+   `watermark.rs` is the clearest case: 91 lines, a stub `process()` at
+   `:7-9`, and a fully written, unit-tested `darkroom_watermark_blend` at
+   `:22-42` beside it. `iop/geometry.rs:13-26` makes the pattern explicit with
+   its `geom_iop_stub!` macro.
+2. **Nothing in the Rust product constructs any of them.** `IopProcess` is
+   declared at `crates/c41-core/src/iop/mod.rs:101` and, outside `src/iop/`, its
+   only other mention in the tree is the module doc at
+   `crates/c41-core/src/lib.rs:3`.
+   The Rust product drives its *own* module set through the `Stage` enum in
+   `pipeline.rs`, whose import list (`pipeline.rs:31`) names 31 modules — none of
+   which is among these 16. Outside `src/iop/`, the only references to
+   `Watermark`, `Highpass`, `Retouch` or `Liquify` are label strings in
+   `catalog.rs:105,98,87,88`.
+
+So each of these rows needs a panel, its parameters, a `Stage` variant and a
+driver — the ported kernels remove the *maths* risk, not the *plumbing* work.
+That is a materially bigger job than the closed severity-2.1 rows, which attached
+panels to modules the Rust pipeline already ran.
+
+### G2 — colour management: engine built, called by C, absent from the Rust product
+
+`c41-core::icc` is built and unit-tested — parser (m4-89), cLUT N-D interpolation
+core (m4-90), LUT tag pipelines (m4-91/92), device↔PCS (m4-93a/b), PCS→device and
+assembly (m4-127), FFI boundary (m4-129 slice 1) — from the pure-Rust no-LCMS
+decision (`RUST_MIGRATION_PLAN.md:122`). It is **not** unused: the C darktable
+calls it at 15 `darkroom_icc*` sites (11 in `src/iop/colorin.c`, 4 in
+`src/iop/colorout.c`, wired in m4-129 slice 2). But **nothing in the Rust product
+calls it** — which is the part that matters for what users run.
+
+In `c41-rs` the working space is fixed, not chosen:
+`enum ColorSpace { Rec2020, LinearSrgb }` (`pipeline.rs:45-48`) has two variants
+and no picker. There is no preferences dialog in `c41-ui` at all, so no
+input-profile assignment, no output profile and no soft-proofing; `export.rs`
+contains no ICC reference whatsoever (638 lines, zero hits for `icc`/`profile`).
+Non-raw decode does not touch ICC either way. Export goes through the `image`
+crate — gated at `dialogs/mod.rs:408` (`RUST_IMAGE_EXTENSIONS` =
+jpg/jpeg/png/tif/tiff), decoded at `:472` (`image::ImageReader::open`), reached
+from the batch-export path at `:218`. The darkroom *preview* decodes non-raw
+through gdk-pixbuf instead (`darkroom/mod.rs:1059-1079`), which likewise ignores
+the embedded profile. So **a JPEG tagged with a non-sRGB profile is shown and
+written as if it were sRGB, and every export is untagged.** The two
+`Input/Output color profile` rows in G1 are inert for the same root cause.
+
+This is the largest gap here whose expensive half is already paid. The engine
+exists and is tested; what is missing is the product surface around it — and
+unlike G1's rows, the wiring is not a mechanical repeat of a proven pattern.
+
+### G3 — masks: kernels ported, product half missing
+
+Partly false to call this "absent". `crates/c41-core/src/masks/` is **5,192 lines
+across 9 shape modules** (brush, circle, detail, ellipse, gradient, group,
+object, path, points — 5,338 including `mod.rs`), carrying 33 `#[no_mangle]` FFI
+exports, ported from `src/develop/masks/` in m4-154…m4-160
+(`PROGRESS.md:3129`). The C darktable calls them — 45 `darkroom_masks_*`
+references across 8 of the 9 shape `.c` files — the same way it consumes the rest
+of the ported loops. `masks/mod.rs:1-13` is explicit that the loops interleaving
+with pixelpipe callbacks stay in C by design.
+
+What is missing is the Rust product's half, and it is the larger half:
+
+- no mask row in the catalogue — no draw, parametric or raster mask;
+- no mask UI in `c41-ui` at all. Do not try to confirm that with a `mask` grep:
+  148 lines in `crates/c41-ui/src` match it case-insensitively (125
+  case-sensitively), across at least five unrelated families — a `cb_mask_*`
+  module parameter, a colour-label bitmask, a **star**-rating bitmask
+  (`DT_VIEW_RATINGS_MASK`, `lighttable/mod.rs:445`), 10 lines carrying 13 X11
+  `ModifierType::*_MASK` sites across `lib.rs` and `lighttable/mod.rs`, and
+  prose collisions (`xmp.rs:361` `umask`, `preview.rs:74` "unsharp mask", and a
+  comment at `lib.rs:1755-1756` explaining that NumLock arrives as `MOD2_MASK`
+  and CapsLock as `LOCK_MASK`).
+  There is also one genuinely mask-*named* widget that is not part of darktable's
+  mask system at all: the "Mask middle-grey fulcrum" slider at
+  `darkroom/mod.rs:3691`, under the "masks & threshold" heading at `:3686`, which
+  drives colorbalancergb's own luminance-range mask (`cb_mask_grey_fulcrum`);
+- no per-instance module parameters, which is the structural part: darktable lets
+  one module exist many times over with independent params, and nothing in the
+  current module stack models that.
+
+So this is a UI + module-stack job sitting on top of finished kernels, not a
+ground-up port. It is still the biggest single item here, because instance
+plumbing touches every module.
+
+### G4 — Lua scripting: no implementation
+
+No `mlua` (or any Lua) dependency in the workspace — zero hits in `Cargo.toml`,
+the five member manifests, and `Cargo.lock` — and no Lua in `c41-ui`: two real
+hits, both prose in comments citing darktable's `lua scripts installer`
+(`panels/mod.rs:1331`, `:4323`), plus one grep false positive (the word
+"evaluated", `preview.rs:2512`). darktable's automation surface is Lua 5.4, and
+`RUST_MIGRATION_PLAN.md:2106` names "Keep existing Lua scripting API (via
+`mlua`)" as an end-state goal, so this is an unmet goal rather than a declined
+one. `data/lua/darktable/debug.lua` still ships, inherited from the fork — dead
+weight that reads as evidence the feature exists.
+
+### G5 — GPU: the Rust product is CPU-only; one image label over-promises
+
+No `opencl3` dependency (zero hits in `Cargo.lock`). The OpenCL surface in
+`c41-core` is a scaffold, not an implementation. `IopProcess::process_cl` has
+96 implementors crate-wide (74 explicit + the 22 `geom_iop_stub!` expansions, as
+in G1) and **every one of them is an unconditional `Err`** — not one contains
+an `Ok(` path — so none has a GPU implementation to call. 15 say
+`Error::OpenCl("… OpenCL path not yet ported")`, the rest `Error::Pipeline`.
+Alongside them sit `Error::OpenCl`, `has_opencl()` — whose only definition is a
+default returning a flat `false` (`iop/mod.rs:117-119`) — and a `ClBuffer` with
+a single private zero-sized field (`iop/mod.rs:96-98`). The product is CPU-only
+via `rayon`, consistent with the AI backend's own "is CPU only" note
+(`ai/mod.rs:34`).
+
+The GPU **compose profiles are not a bug**, contrary to what a first pass at this
+suggested. `docker/docker-compose.yml:82,109,126` defines `nvidia`, `amd` and
+`intel` profiles; all three build `x-full-build` → `docker/Dockerfile.full-c`,
+and that image builds *both* the C app and `c41-rs` and launches `c41-rs`
+(`kasmvnc-autostart.sh:48`). Choosing full-c for GPU is a recorded decision
+("the GPU profiles (OpenCL is a C-core feature) build full-c",
+`RUST_MIGRATION_PLAN.md:2044-2045`). What is left is one genuine overclaim: the
+`full-c` image **LABEL** advertises "Lightroom-competitive photo editor with GPU
+acceleration" (`docker/Dockerfile.full-c:103`) for a front-end that is CPU-only,
+because the OpenCL kernels live in the C app that image also installs but never
+launches.
+
+Also a real, separate doc bug found while checking this: `ROADMAP.md:255` and
+`:263-265` tell the reader the tree has a `gpu` and an `opencl` compose profile
+and to run `docker compose --profile gpu up` / `--profile opencl up` — but
+neither profile name exists. They are `nvidia` / `amd` / `intel`, as above. So
+the GPU quick-start in the roadmap cannot work as written.
+
+### G6 — recorded earlier, still unclosed
+
+These were already on the record; they are listed so the section is not read as
+"everything below is new", and so their status is explicit.
+
+- **HEIC/HEIF/AVIF**: the codec is C-only, so these degrade in the production
+  image. Precisely: `c41-core` *does* carry ported HEIF/AVIF kernels
+  (`heif.rs` — `heif_u16_to_float`, `heif_float_to_u8`, `heif_float_to_u16` from
+  m4-208; `avif.rs` — `avif_u16_to_float`, `avif_u8_to_float`,
+  `avif_float_to_u16`, `avif_float_to_u8` from m4-209/210/216) but those are only
+  the u16↔float normalize and pack loops; the container/codec decode is still
+  libheif/libavif in C, and neither library is in `docker/Dockerfile`
+  (`docker/Dockerfile:5` records that as deliberate — the only consumer was
+  `darktable-cli`, removed in m4-72). So the extensions are listed in
+  `RAW_EXTENSIONS` (`dialogs/mod.rs:527-531`) and pass the import filter
+  (`:604`), and `probe_dims` then returns `None`, so the catalogue's width and
+  height land as 0×0 (`:610`, `:698`, and the test comment at `:1053` notes the
+  0×0 insert is tolerated rather than invented). That is not a HEIF/AVIF-specific
+  defect: `probe_dims` (`:728-744`) is gdk-pixbuf-only, so *any* accepted format
+  without a registered loader in the shipped image registers 0×0 — the same
+  accepted limitation item 2.6 already records for aspect filtering. HEIC/AVIF
+  just have no decoder at all, so they stay that way permanently. Fix is a Rust
+  codec or removing the extensions; tracked as an open decision at
+  `RUST_MIGRATION_PLAN.md:2050` ("drop vs keep full-c"). Note the contrast:
+  `docker/Dockerfile.full-c:110-112` *does* ship `libheif1`/`libavif16`, so this
+  is a property of the production image, not of the codec being unportable.
+- **Foveon X3F**: refused; upstream `rawloader` has no X3F. A deliberate,
+  documented refusal — the severity-1 deviation-batch row above, and
+  `PROGRESS.md:7114-7115` inside the u10 section. Not an oversight.
+- **`darktablerc`**: never loaded. Deliberate, per the same row and
+  `PROGRESS.md:7116` ("no darktablerc in product"). It does mean upstream user
+  presets/config never apply, and `data/` still carries the fork's config
+  templates (`darktableconfig.xml.in`, `shortcutsrc`, `styles/`, `watermarks/`).
+- **Build reproducibility**: was open — `Cargo.lock` was gitignored, so no build
+  was pinned to a dependency set. **Closed by x1** (`a699cb917c`): lockfile
+  tracked, `--locked` passed everywhere the workspace is built.
+
+---
+
 ## Not on the table for 2026-08-20
 
 Full darktable parity. darktable is ~93 processing modules, 5 views, mask
@@ -137,3 +446,20 @@ the deadline is **a photo editor that is genuinely usable end to end** — impor
 cull, rate, edit with a real set of adjustments, export — with this document
 covering what remains. Anything claiming more than that would be a claim, not a
 plan.
+
+That judgement still holds for the *2026-08-20* deadline it was written about.
+Two things it could not have accounted for. First, "usable end to end" was
+reached while G1–G5 sat outside the audit entirely — so the sentence above, "with
+this document covering what remains", is no longer true, and is left in place
+only as the historical record. Second, "Known gaps" is not a complete statement
+of the distance to parity: it came from a goal-status sweep, and the
+feature-by-feature comparison this document's own severity rows were built on has
+not been redone as a *sweep* since 2026-08-11. (The 2026-09-26 closure note at the
+top closed the rows that sweep had found; it was not itself a fresh sweep, which
+is exactly why the next one turned up G1–G6.) Treat G1–G6 as the top of that
+list, not its extent. G2 (colour management) and G3 (masks) are the two largest.
+
+`ROADMAP.md`'s Phases 1–8 (smart previews, virtual copies, face detection and
+the People view, AI auto-tagging, batch AI queue, cloud sync, mobile companion,
+print templates) are a *different* and much larger tier, untouched; see that
+document's own ~44-week estimate.

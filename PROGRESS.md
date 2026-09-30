@@ -7645,12 +7645,31 @@ code). Both remotes (`origin` GitHub + Gitea) verified at `5819fcfe20`.
 
 A status sweep against the two stated project goals (full Rust migration,
 feature parity) found the FFI-port chain and the UI-parity audit both formally
-closed, but four categories of real work untracked by any document:
-wiring parity (16 catalogue rows inert), colour management (the ICC engine is
-written and called by nobody), masks (absent entirely), and platform features
-with no implementation at all (Lua, OpenCL). The x-series works that list down
-in cost order. x1 is the build-reproducibility fix; a "Known gaps" section
-lands in `PARITY_AUDIT.md` alongside it so the rest stops being invisible.
+closed, but four categories of real work the audit had never covered: wiring
+parity (16 catalogue rows inert), colour management, masks, and platform
+features with no implementation in the Rust product (Lua, OpenCL). The x-series
+works that list down in cost order. x1 is the build-reproducibility fix; a
+"Known gaps" section lands in `PARITY_AUDIT.md` alongside it so the rest stops
+being invisible.
+
+That first pass of the sweep was itself wrong in two places, and both corrections
+mattered enough to shape the work. It recorded the ICC engine as "written and
+called by nobody" and masks as "absent entirely" — in fact `c41-core::icc` is
+called at 15 sites in the C `colorin`/`colorout`, and `c41-core/src/masks/` is
+5,192 lines of ported shape kernels called at 45 sites from `src/develop/masks/`.
+The truth is narrower and worse in a different way: neither has any consumer in
+the Rust product, and outside C the only other *uses* of `masks` anywhere in
+the crate are twelve `use crate::masks::test_util::lcg_fill` lines in
+`#[cfg(test)]` modules, borrowing one deterministic-filler helper. Writing the
+"Known gaps" section took eight independent review passes, every one of which
+found something; the inventory was sound from the first draft, but the evidence
+layer beneath it was asserted rather than computed (a module list that was not
+diffed against the catalogue it claimed to cover; a "only hits are" claim that a
+ten-second grep refuted; a `file:line` pointing at a doc comment instead of the
+declaration, and then a second one pointing into a parameter list; a `grep` that
+returned 110 where the section said 76). Hence the section's house rule: compute
+from source, carry what is needed to recompute the claim, and re-check what is
+already written, not only what you add.
 
 ### x1 — track `Cargo.lock` and pass `--locked` everywhere (2026-09-30 UTC)
 
@@ -7706,3 +7725,52 @@ with a warm local tree), and `Build & push Docker image` git-clones the pinned
 CACHEBUST commit and runs `cargo build --locked` against it, which is exactly the
 path that would have failed had the lockfile not been pushed. Both remotes
 verified at `a699cb917c`.
+
+### x2 — "Known gaps" section in `PARITY_AUDIT.md` (2026-09-30 UTC)
+
+The audit had closed every severity row but had no way to say what it had never
+looked at. This adds a **`## Known gaps (2026-09-30)`** section — **G1**
+(wiring parity: 16 catalogue rows render inert), **G2** (colour management), G3
+(masks), G4 (Lua), G5 (GPU/OpenCL), G6 (HEIF/AVIF, Foveon, `darktablerc` /
+build-reproducibility) — with a three-way provenance split labelling each as
+never-audited (G1–G3), named-as-goal-or-decision-but-never-audited-as-a-gap
+(G4–G5), or written-down-and-left-open (G6). The header note, a reconciliation
+paragraph against the file's older "33 live" figures, and the closing
+paragraphs were adjusted so the section does not read as a complete statement
+of the distance to parity. No code changed.
+
+**The point of the section is that its numbers are true.** Writing it took
+**eight independent review passes**, and not one of them failed to find
+something. The inventory was right from the first draft; the *evidence layer*
+beneath it was asserted rather than computed and was progressively disproved:
+
+- a stated inert set that did not match the catalogue it claimed to cover — the
+  kernel list named `ashift` (which is *lens correction*, a **live** row) for
+  *chromatic aberrations* (really `cacorrectrgb`) and `rasterfile` for
+  *orientation* (really `flip.c`), and the row count itself was from memory;
+- a `file:line` pointing at a doc comment instead of a declaration, and later a
+  second pointing into a parameter list;
+- an "the only `mask` hits are…" claim refuted by its own 148-hit grep;
+- a stub-message characterisation that quoted "not yet ported" for 13 stubs that
+  do not say it (all 15 such strings are `Error::OpenCl` from `process_cl`);
+- a `masks::test_util` use-count of five against a real twelve;
+- a `process_cl` count of 74 against a real 96 — it is a required trait method,
+  so all 96 implementors supply one, not just the 74 with explicit bodies;
+- a date off by a day (`Local contrast` landed the *same* day as the m4-149
+  33-group figure, four hours later, not the next day);
+- and, last, a House rule that promised every count "carries its `file:line`" —
+  literally false for the six counts composed across a `macro_rules!` body, so
+  the rule now names them (74, 22, 96, 89, 76, 90), anchors them to the macro,
+  and publishes the two greps that mislead (`fn process_cl` → 76, not 96;
+  `"not implemented"` → 110, not 76).
+
+Every claim now recomputes from source. The section makes no claim of
+completeness, and it is explicit that the next feature-by-feature sweep will
+find more.
+
+**Verified.** `git diff --cached --check` clean; only `PARITY_AUDIT.md` and
+`PROGRESS.md` staged (`install-debuntu.sh*` left untracked). Docker
+`scripts/ci-local.sh` exit 0, all four steps, release suites `c41-core` 1811,
+`c41-db` 100, `c41-ui` 519, 0 failed — unchanged, as no code moved. Cold
+senior-review passes as listed above; the final one returned
+APPROVE-WITH-FIXES with only reflow/text nits, all applied.
