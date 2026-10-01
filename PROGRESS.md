@@ -7920,3 +7920,9 @@ docs-only x2 push, this increment touches `crates/**`, so `rust.yml` was not
 path-filtered out and the Rust workflow actually ran and passed. gitea remains a
 push mirror with no CI runner registered, so "confirm CI" here means **GitHub CI
 green plus the commit present on both remotes**.
+
+**Running image.** Rebuilt `c-41:latest` from the current tree (image
+`f160fe97d197`, `--build-arg CACHEBUST=f786bb8d7e`) and relaunched the long-lived
+`c-41` container on it, previous kept as `c-41-old`; container `healthy`, UI
+answers `HTTP 200` on `:3000`. Unlike the x2 rebuild this one is behavioural —
+the running image now contains the Grain module.
