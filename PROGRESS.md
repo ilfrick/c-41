@@ -7911,3 +7911,12 @@ suites: `c41-core` **1822**, `c41-db` **100**, `c41-ui` **522**, 0 failed (was
 --all-targets` clean, 9 warnings before and after (no new warnings); the only
 new lints (`too_many_arguments`, `identity_op` on the pre-existing kernel body)
 were either allowed per house style or pre-existing.
+
+**Remote CI.** Committed as `f786bb8d7e` and pushed to both remotes; `master`
+verified at that SHA on GitHub and gitea via `ls-remote`. GitHub CI is green:
+`check + test + clippy` → `success` and `Build & push Docker image` →
+`success` (the `full-c` on-demand job skipped, as expected). Unlike the
+docs-only x2 push, this increment touches `crates/**`, so `rust.yml` was not
+path-filtered out and the Rust workflow actually ran and passed. gitea remains a
+push mirror with no CI runner registered, so "confirm CI" here means **GitHub CI
+green plus the commit present on both remotes**.
