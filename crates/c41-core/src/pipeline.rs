@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basecurve, basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basecurve, basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, grain, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -556,6 +556,49 @@ pub enum Stage {
         lens: crate::iop::lens::ResolvedLens,
         params: crate::iop::lens::LensParams,
     },
+
+    /// Grain (grain.c) — display-referred creative module (iop_order.c v50 pos
+    /// 65, between monochrome 64 and soften 66). Adds 3-octave simplex noise to
+    /// **Lab L only**, shaped by a 128×128 photographic-paper-response LUT that
+    /// models how pronounced grain is in the midtones and how it falls off in
+    /// the shadows and highlights. a/b and alpha pass through.
+    ///
+    /// The stage holds the raw user params; everything the kernel needs is
+    /// derived per apply in [`grain::process`], exactly as `grain.c::process`
+    /// derives it before calling the migrated kernel.
+    ///
+    /// **Scope — the LIGHTNESS channel only.** darktable offers four grain
+    /// channels (`grain.c:57-60`: hue, saturation, lightness, RGB) and defaults
+    /// to lightness, which is the one the ported kernel implements. The other
+    /// three are *not* wired; see `PARITY_AUDIT.md` G1.
+    ///
+    /// Lab-domain, so it must agree with the other space-aware stages.
+    /// **NOT pixel-local**: the noise field is indexed by image *position*
+    /// (`(roi_x + i)/scale`), and the band-parallel path hands each band a
+    /// 1-row strip whose indices start at zero — so `process` falls back to the
+    /// serial whole-buffer path, same reason as Bloom/Sharpen/LensCorrection.
+    Grain {
+        /// Slider range 0.0938…30.02 (20/213.2 … 6400/213.2) — darktable's
+        /// `scale` after the `GRAIN_SCALE_FACTOR` division (`grain.c:45, 66-68`).
+        /// Sets the noise `zoom`: `zoom = (1 + 8·scale/100)/800`.
+        coarseness: f32,
+        /// 0..100, darktable default 25. `strength/100` scales the noise before
+        /// the LUT lookup.
+        strength: f32,
+        /// 0..100, darktable default 100. Selects the paper-response LUT.
+        midtones_bias: f32,
+        /// `_hash_string(filename)` (grain.c:201) — decorrelates grain between
+        /// images so a sequence doesn't repeat one pattern. Reduced by the ROI
+        /// width per apply, as the C does.
+        hash_seed: u32,
+        /// Buffer resolution relative to the full image (darktable's
+        /// `roi_out->scale`). **Every current c41 caller passes `1.0`**: c41
+        /// hands the stage a whole frame at the render resolution, so the
+        /// kernel's rank-1 downsampling branch (`filter = |scale-1| > 0.01`) is
+        /// unreachable in the product — see the `grain::process` docs.
+        scale: f32,
+        space: ColorSpace,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -620,6 +663,7 @@ impl Stage {
             Stage::FilmicRgb { .. } => "filmicrgb",
             Stage::DenoiseProfile { .. } => "denoiseprofile",
             Stage::LensCorrection { .. } => "lens",
+            Stage::Grain { .. } => "grain",
         }
     }
 
@@ -753,6 +797,15 @@ impl Stage {
             // its distorted source coordinate, so band-splitting would hand
             // the sampler the wrong rectangle. Serial whole-frame only.
             Stage::LensCorrection { .. } => false,
+            // Grain is NOT pixel-local: the simplex field is indexed by image
+            // *position* (`wx = (roi_x + i)/scale`, `wy = (roi_y + j)/scale`),
+            // and the band-parallel path hands each band a 1-row strip whose
+            // indices restart at zero — every band past the first would sample
+            // the noise field at the wrong place. No neighbour reads, but the
+            // position dependence alone disqualifies it; returning false forces
+            // the serial whole-frame path where (width, height) is the true
+            // rectangle, same reason as Bloom/LensCorrection.
+            Stage::Grain { .. } => false,
         }
     }
 
@@ -832,6 +885,10 @@ impl Stage {
             // fusion pyramid) run directly on the working lanes.
             Stage::Basecurve { .. } => None,
             Stage::GraduatedNd { .. } => None,
+            // Grain works on Lab L only (its kernel reads `in[base]/100` as
+            // lightness), so it converts RGB↔Lab and must agree with the other
+            // Lab-domain stages on the working space.
+            Stage::Grain { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -1763,6 +1820,49 @@ impl Stage {
             Stage::LensCorrection { lens: ref resolved, ref params } => {
                 crate::iop::lens::process(input, output, width, height, resolved, params);
             }
+            // ── Grain (grain.c) ─────────────────────────────────────────
+            // Simplex-noise grain on Lab L only, shaped by the paper-response
+            // LUT. Same RGB↔Lab sandwich as the other Lab-domain stages; the
+            // noise field is indexed by image position, so `process` guarantees
+            // (width, height) is the true frame here (see is_pixel_local).
+            // `grain::process` derives `strength`/`zoom`/`wd`/`hash`/`filter`/
+            // `filtermul` exactly as `grain.c::process` does and memoises the
+            // LUT per thread, so the whole-frame pass builds it once.
+            Stage::Grain { coarseness, strength, midtones_bias, hash_seed, scale, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                grain::process(
+                    &lab_in,
+                    &mut lab_out,
+                    width,
+                    height,
+                    scale,
+                    coarseness,
+                    strength,
+                    midtones_bias,
+                    hash_seed,
+                );
+                // The kernel passes a/b through unchanged, so only L needs the
+                // round-trip back — but converting the whole pixel is the
+                // pattern every other Lab stage uses and keeps alpha handling
+                // identical, so `input`'s alpha is restored on the way out.
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
         }
     }
 }
@@ -2210,6 +2310,21 @@ mod tests {
             }
             .is_pixel_local(),
             "vignette derives its weight from pixel POSITION ⇒ NOT pixel-local"
+        );
+        // Grain reads no neighbours, but its noise field is indexed by image
+        // POSITION — so the band-parallel path (which hands each band a 1-row
+        // strip starting at index 0) would resample the wrong part of the field.
+        assert!(
+            !Stage::Grain {
+                coarseness: 7.5047,
+                strength: 25.0,
+                midtones_bias: 100.0,
+                hash_seed: 5381,
+                scale: 1.0,
+                space: ColorSpace::LinearSrgb,
+            }
+            .is_pixel_local(),
+            "grain indexes its noise field by pixel POSITION ⇒ NOT pixel-local"
         );
         // Lowpass is NOT pixel-local: the Gaussian blur reads a spatial
         // neighbourhood, so band-splitting would produce wrong-edge artefacts.
@@ -2779,5 +2894,99 @@ mod tests {
             assert!(px[0] > px[1] && px[0] > px[2],
                 "red dominance lost: {:?}", &px[..3]);
         }
+    }
+
+    /// Grain must be a real per-position noise field, not a flat tint: on a
+    /// **uniform** mid-grey frame every output pixel must land on a *different*
+    /// Lab L. A stage that smeared one sampled value over the frame would pass
+    /// a "does it change the image at all?" test while looking like a wash, so
+    /// the assertion here is specifically about *variation*.
+    #[test]
+    fn grain_varies_across_a_flat_frame() {
+        let (w, h) = (48usize, 48usize);
+        // Mid-grey in linear sRGB ⇒ roughly L≈53, inside the paper response's
+        // steepest region (grain is most visible there).
+        let img: Vec<f32> = (0..w * h).flat_map(|_| [0.216f32, 0.216, 0.216, 1.0]).collect();
+        let p = Pipeline::with_stages(vec![Stage::Grain {
+            coarseness: 1600.0 / 213.2,
+            strength: 60.0,
+            midtones_bias: 100.0,
+            hash_seed: 5381,
+            scale: 1.0,
+            space: ColorSpace::LinearSrgb,
+        }]);
+        let out = p.process(&img, w, h);
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for px in out.chunks_exact(4) {
+            min = min.min(px[0]);
+            max = max.max(px[0]);
+        }
+        assert!(
+            max - min > 1e-3,
+            "grain produced a flat tint on a uniform frame (spread={}) — the \
+             noise field is not being indexed per pixel",
+            max - min
+        );
+    }
+
+    /// The whole point of `hash_seed`: two filenames must not share a grain
+    /// pattern, or a sequence of frames rendered from one edit would show one
+    /// repeating pattern. Compares the R channel, where the L-only perturbation
+    /// is visible for a neutral input.
+    ///
+    /// The frame is 256 px wide, not a token size, because the C reduces the
+    /// filename hash by `(int)fmax(width*0.3, 1)` before use (`grain.c:224`).
+    /// That modulus is the entire decorrelation budget: on a 32-px frame it is
+    /// 9 and two real sequence filenames land on the same offset, so a test
+    /// written at thumbnail size would be asserting that the C *doesn't*
+    /// decorrelate. [`grain_hash_budget_scales_with_the_frame`] pins that limit.
+    #[test]
+    fn grain_hash_seed_decorrelates_two_frames() {
+        let (w, h) = (256usize, 256usize);
+        let img: Vec<f32> = (0..w * h).flat_map(|_| [0.216f32, 0.216, 0.216, 1.0]).collect();
+        let mk = |seed| {
+            Pipeline::with_stages(vec![Stage::Grain {
+                coarseness: 1600.0 / 213.2,
+                strength: 60.0,
+                midtones_bias: 100.0,
+                hash_seed: seed,
+                scale: 1.0,
+                space: ColorSpace::LinearSrgb,
+            }])
+            .process(&img, w, h)
+        };
+        let a = mk(c41_core_grain_hash("/f/seq/img001.cr2"));
+        let b = mk(c41_core_grain_hash("/f/seq/img002.cr2"));
+        assert_ne!(a, b, "the hash seed must decorrelate grain between images");
+    }
+
+    /// The C's `% (int)fmax(width*0.3, 1)` also caps how *far apart* two
+    /// filenames can be pushed, and on a small buffer that budget is genuinely
+    /// tiny — nine distinct offsets on a 32-px frame, fewer than a tenth of the
+    /// frames in a typical sequence. Worth pinning rather than rediscovering as
+    /// "grain looks the same on thumbnails": the remedy (a wider modulus, or
+    /// dropping the reduction) would diverge from the C, so it has to be a
+    /// deliberate decision with the limit written down.
+    #[test]
+    fn grain_hash_budget_scales_with_the_frame() {
+        let budget = |w: usize| ((w as f32) * 0.3).max(1.0) as u32;
+        let a = || c41_core_grain_hash("/f/seq/img001.cr2");
+        let b = || c41_core_grain_hash("/f/seq/img002.cr2");
+        // The two filenames collide once the ROI shrinks to a thumbnail…
+        assert_eq!(
+            (a() % budget(32), b() % budget(32)),
+            (7, 7),
+            "a 32-px frame can only distinguish 9 offsets, and these two land on one"
+        );
+        // …and separate again as soon as the modulus outgrows the gap, which
+        // is why the decorrelation test above runs at 256.
+        assert_ne!(a() % budget(256), b() % budget(256));
+    }
+
+    /// Local helper so the test above reads as "the real filename hash", not a
+    /// magic constant.
+    fn c41_core_grain_hash(name: &str) -> u32 {
+        crate::iop::grain::hash_string(name)
     }
 }

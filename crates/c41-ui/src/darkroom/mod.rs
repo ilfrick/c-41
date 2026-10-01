@@ -100,14 +100,20 @@ impl BaseImage {
     /// Run the live pipeline and return the 8-bit sRGB image to display.
     /// `lens_gear` is the resolved lens-correction gear (see
     /// [`crate::preview::LensGear`]) — passed through so an enabled lens module
-    /// actually applies; `None` omits it.
-    fn render(&self, params: &PreviewParams, lens_gear: Option<&crate::preview::LensGear>) -> Rendered {
+    /// actually applies; `None` omits it. `grain_seed` is the grain module's
+    /// per-image noise seed (see `c41_core::pipeline::Stage::Grain`).
+    fn render(
+        &self,
+        params: &PreviewParams,
+        lens_gear: Option<&crate::preview::LensGear>,
+        grain_seed: u32,
+    ) -> Rendered {
         match self {
             BaseImage::Srgb8 { bytes, width, height, rowstride, nch } => {
                 let (w, h) = (*width as usize, *height as usize);
                 Rendered {
                     bytes: crate::preview::apply_pipeline_gear(
-                        bytes, w, h, *rowstride, *nch, params, lens_gear,
+                        bytes, w, h, *rowstride, *nch, params, lens_gear, grain_seed,
                     ),
                     width: *width,
                     height: *height,
@@ -117,7 +123,7 @@ impl BaseImage {
             }
             BaseImage::Linear { width, height, pixels } => Rendered {
                 bytes: crate::preview::render_linear_to_srgb8_gear(
-                    pixels, *width, *height, params, lens_gear,
+                    pixels, *width, *height, params, lens_gear, grain_seed,
                 ),
                 width: *width as i32,
                 height: *height as i32,
@@ -884,8 +890,12 @@ fn render_preview(ctx: &PreviewCtx) {
     // Snapshot the gear Arc (a refcount bump, no resolution work) so no borrow
     // is held across the render.
     let lens_gear = ctx.lens_gear.borrow().clone();
+    // Grain's per-image seed is `_hash_string(filename)` (grain.c:201) — the
+    // path is already in `ctx`, so hash it here rather than leaving every
+    // image with the same grain pattern.
+    let grain_seed = c41_core::iop::grain::hash_string(&ctx.decode_path.borrow());
     if let Some(b) = ctx.base.borrow().as_ref() {
-        let r = b.render(&params, lens_gear.as_deref());
+        let r = b.render(&params, lens_gear.as_deref(), grain_seed);
 
         *ctx.hist.borrow_mut() = crate::preview::compute_histogram(
             &r.bytes, r.width as usize, r.height as usize, r.rowstride, r.nch,
@@ -2307,6 +2317,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Denoise (profiled)" => denoise_module_row(ctx).upcast(),
                 "Lens correction" => lens_module_row(ctx).upcast(),
                 "Bloom" => bloom_module_row(ctx).upcast(),
+                "Grain" => grain_module_row(ctx).upcast(),
                 "Color zones" => colorzones_module_row(ctx).upcast(),
                 "Tone curve" => curve_editor::tonecurve_module_row(ctx).upcast(),
                 "RGB curve" => curve_editor::rgbcurve_module_row(ctx).upcast(),
@@ -2589,7 +2600,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2851,6 +2862,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             colorize_lightness,
             colorize_lightness_mix
         ),
+        "Grain" => set!(gr_on, gr_coarseness, gr_strength, gr_midtones_bias),
         _ => return false,
     }
     true
@@ -4360,6 +4372,36 @@ fn bloom_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         })
 }
 
+/// Grain (grain.c): display-referred grain on the **Lab L** channel, shaped by a
+/// photographic-paper-response LUT — iop_order.c v50 pos 65, a normal pipeline
+/// stage in the creative cluster, so [`module_expander`]'s plain re-render
+/// applies (no re-decode needed).
+///
+/// Slider ranges mirror the C introspection after `GRAIN_SCALE_FACTOR`
+/// (grain.c:45, 213.2): coarseness is stored and shown as the quotient
+/// (20/213.2 … 6400/213.2 ≈ 0.094…30.02, default 1600/213.2 ≈ 7.505), the
+/// other two straight off the annotations (strength 0..100 default 25,
+/// mid-tones bias 0..100 default 100).
+///
+/// **No channel control**, unlike darktable: only its default LIGHTNESS channel
+/// is implemented, so a dropdown could offer nothing else. See
+/// `c41_core::pipeline::Stage::Grain`.
+fn grain_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Grain", "film grain on lightness", p0.gr_on,
+        |p, on| p.gr_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Coarseness", 20.0 / 213.2, 6400.0 / 213.2, 0.01,
+                p0.gr_coarseness as f64,
+                |p, v| p.gr_coarseness = v);
+            add_param_slider(e, ctx, "Strength", 0.0, 100.0, 1.0, p0.gr_strength as f64,
+                |p, v| p.gr_strength = v);
+            add_param_slider(e, ctx, "Mid-tones bias", 0.0, 100.0, 1.0,
+                p0.gr_midtones_bias as f64,
+                |p, v| p.gr_midtones_bias = v);
+        })
+}
+
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     module_expander(ctx, "White balance", "channel multipliers", p0.temperature_on,
@@ -4501,7 +4543,7 @@ mod tests {
             height: 1,
             pixels: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         };
-        let r = b.render(&PreviewParams::default(), None);
+        let r = b.render(&PreviewParams::default(), None, 0);
         assert_eq!((r.width, r.height), (2, 1));
         assert_eq!(r.nch, 3);
         assert_eq!(r.rowstride, 2 * 3);
@@ -4549,9 +4591,14 @@ mod tests {
             "is_live_module disagrees with its own backing list"
         );
         // m4-121 ported bloom, so it must now read as live; pick another
-        // still-unported module as the negative case.
+        // still-unported module as the negative case. Grain was the negative
+        // case here until this increment wired it, which is why the positive
+        // case is Grain below — a live module silently dropping out of
+        // LIVE_MODULE_LABELS renders its panel but sorts and counts it as a
+        // placeholder, so both directions are pinned.
         assert!(is_live_module("Bloom"), "a ported module must read as live");
-        assert!(!is_live_module("Grain"), "an unported module must not read as live");
+        assert!(is_live_module("Grain"), "the wired grain module must read as live");
+        assert!(!is_live_module("Soften"), "an unported module must not read as live");
     }
 
     /// Every live-module label must still exist verbatim in the catalog, else
@@ -4688,9 +4735,11 @@ mod tests {
         // All shows everything, live or placeholder, on an empty query.
         assert!(module_filter_matches(ModuleFilter::All, 0, "Grain", ""));
         assert!(module_filter_matches(ModuleFilter::All, 2, "Exposure", ""));
-        // Active shows only live modules (Exposure is live, Grain is inert).
+        // Active shows only live modules (Exposure and Grain are live; Soften
+        // is still inert).
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Exposure", ""));
-        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Grain", ""));
+        assert!(module_filter_matches(ModuleFilter::Active, 4, "Grain", ""));
+        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
@@ -4705,7 +4754,7 @@ mod tests {
         assert!(!module_filter_matches(ModuleFilter::All, 0, "Exposure", "velvia"));
         // ... and it combines with the scope tab (Active + query still hides
         // inert rows even when the query matches their label).
-        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Grain", "gra"));
+        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Soften", "sof"));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Bloom", "loo"));
     }
 
@@ -5024,6 +5073,12 @@ mod tests {
             p.colorize_lightness = M;
             p.colorize_lightness_mix = M;
         }),
+        ("Grain", |p| {
+            p.gr_on = true;
+            p.gr_coarseness = M;
+            p.gr_strength = M;
+            p.gr_midtones_bias = M;
+        }),
     ];
 
     /// `reset_module` restores exactly the named module's fields, and only those
@@ -5287,6 +5342,10 @@ mod tests {
             lens_aperture: _,
             lens_distance: _,
             lens_target_geom: _,
+            gr_on: _,
+            gr_coarseness: _,
+            gr_strength: _,
+            gr_midtones_bias: _,
         } = PreviewParams::default();
     }
 
@@ -5344,7 +5403,7 @@ mod tests {
             ..Default::default()
         };
         let before = p;
-        assert!(!reset_module(&mut p, "Grain"));
+        assert!(!reset_module(&mut p, "Soften"));
         assert_eq!(p, before);
     }
 }

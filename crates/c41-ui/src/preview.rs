@@ -495,6 +495,32 @@ pub struct PreviewParams {
     /// Glow strength (`strength`), 0..100, darktable default 25. Scales the
     /// gathered light by exp2(min(100,strength+1)/100) before the blur.
     pub bl_strength: f32,
+    // ── Grain (grain.c) ─────────────────────────────────────────────────────
+    // Display-referred creative module (iop_order.c v50 pos 65, between
+    // monochrome 64 and soften 66): 3-octave simplex noise added to **Lab L
+    // only**, shaped by a 128×128 photographic-paper-response LUT.
+    //
+    // **Scope — the LIGHTNESS grain channel only.** darktable exposes four
+    // channels (`grain.c:57-60`: hue, saturation, lightness, RGB) and defaults
+    // to lightness, which is the one the ported kernel implements. There is
+    // deliberately no channel param: the other three are not wired, so a
+    // dropdown would only offer the choice darktable already defaults to.
+    /// Grain module enabled. Ships off, like darktable's default.
+    pub gr_on: bool,
+    /// Grain coarseness (`scale`), darktable default 1600/GRAIN_SCALE_FACTOR.
+    /// The C slider shows the *scaled* value (20..6400, ISO-like) via
+    /// `dt_bauhaus_slider_set_factor(g->scale, GRAIN_SCALE_FACTOR)`; we store
+    /// and show the divided value the kernel actually consumes,
+    /// 20/213.2 = 0.09381 … 6400/213.2 = 30.0188. Sets the noise `zoom`:
+    /// `zoom = (1 + 8·scale/100)/800`.
+    pub gr_coarseness: f32,
+    /// Grain strength, 0..100, darktable default 25. Divided by 100 before it
+    /// scales the noise.
+    pub gr_strength: f32,
+    /// Mid-tones bias, 0..100, darktable default 100. Selects the paper
+    /// response: the greater the bias, the more pronounced grain's falloff in
+    /// the shadows and highlights.
+    pub gr_midtones_bias: f32,
     // ── Tone curve (tonecurve.c) ────────────────────────────────────────────
     // Three-channel Lab LUT module (iop_order.c pos 48, between colisa 47 and
     // levels 49). First slice: the L channel editor only — a/b keep their C
@@ -874,6 +900,12 @@ impl Default for PreviewParams {
             bl_size: 20.0,      // bloom.h $DEFAULT
             bl_threshold: 90.0, // bloom.h $DEFAULT
             bl_strength: 25.0,  // bloom.h $DEFAULT
+            gr_on: false,
+            // 1600.0/GRAIN_SCALE_FACTOR (grain.c:45,68); the C slider shows the
+            // undivided 1600 through the factor, we show/store the quotient.
+            gr_coarseness: 1600.0 / 213.2,
+            gr_strength: 25.0,         // grain.h $DEFAULT
+            gr_midtones_bias: 100.0,   // grain.h $DEFAULT
             tc_on: false,
             tc_type: 2.0,        // MONOTONE_HERMITE ($DEFAULT annotation)
             tc_autoscale: 3.0,   // DT_S_SCALE_AUTOMATIC_RGB (C default)
@@ -1091,6 +1123,11 @@ impl PreviewParams {
         // runs flat toward g±σ outside, so no slider combination while
         // enabled is a pass-through (see the Stage::LocalContrast docs).
         let lc_identity = !self.lc_on;
+        // Grain gates on the enable flag alone, like Bloom/Colorize: the simplex
+        // field is non-zero for essentially every pixel, so no slider
+        // combination while enabled is a pass-through — and with strength 0 the
+        // C still runs the full Lab round-trip. The gate mirrors `to_pipeline`.
+        let gr_identity = !self.gr_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1109,6 +1146,7 @@ impl PreviewParams {
             && bc_identity
             && lens_identity
             && lc_identity
+            && gr_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -1309,7 +1347,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1474,6 +1512,11 @@ impl PreviewParams {
         // Local contrast (v27): the four LL-mode sliders, appended after the
         // lens block so the layout stays append-only.
         for s in [self.lc_midtone, self.lc_shadows, self.lc_highlights, self.lc_detail] {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        // Grain (v28): the three wired LIGHTNESS sliders, appended after the
+        // local-contrast block so the layout stays append-only.
+        for s in [self.gr_coarseness, self.gr_strength, self.gr_midtones_bias] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -1726,6 +1769,12 @@ impl PreviewParams {
             lc_shadows: f.get(445).copied().unwrap_or(d.lc_shadows),
             lc_highlights: f.get(446).copied().unwrap_or(d.lc_highlights),
             lc_detail: f.get(447).copied().unwrap_or(d.lc_detail),
+            // Grain (v28): bool 38, floats 448–450. v27-and-earlier blobs end
+            // before any of this — defaults hold.
+            gr_on: bools.get(38).map_or(d.gr_on, |&b| b != 0),
+            gr_coarseness: f.get(448).copied().unwrap_or(d.gr_coarseness),
+            gr_strength: f.get(449).copied().unwrap_or(d.gr_strength),
+            gr_midtones_bias: f.get(450).copied().unwrap_or(d.gr_midtones_bias),
         })
     }
 
@@ -1759,8 +1808,12 @@ impl PreviewParams {
     /// >1.0), velvia and splittoning still assume [0,1] display-referred input
     /// and clamp — sigmoid is off for already-display-referred JPEGs, where that
     /// assumption holds, and on for raws, where it is what saves the highlights.
+    /// [`Self::to_pipeline_with`] with the filename-derived grain seed. Only
+    /// useful where no image path is in scope; the darkroom and export funnels
+    /// pass `grain::hash_string(path)` so grain decorrelates per image exactly
+    /// as darktable's `_hash_string` does.
     pub fn to_pipeline(&self, space: ColorSpace, scale: f32) -> Pipeline {
-        self.to_pipeline_with(space, scale, None)
+        self.to_pipeline_with(space, scale, None, 0)
     }
 
     /// [`Self::to_pipeline`] with resolved lens-correction gear. The darkroom
@@ -1785,8 +1838,9 @@ impl PreviewParams {
             c41_core::iop::lens::ResolvedCamera,
             c41_core::iop::lens::ResolvedLens,
         )>,
+        grain_seed: u32,
     ) -> Pipeline {
-        self.to_pipeline_inner(space, scale, lens_gear, true)
+        self.to_pipeline_inner(space, scale, lens_gear, grain_seed, true)
     }
 
     /// [`Self::to_pipeline_with`] for buffers the lens warp has **already been
@@ -1803,12 +1857,15 @@ impl PreviewParams {
             c41_core::iop::lens::ResolvedCamera,
             c41_core::iop::lens::ResolvedLens,
         )>,
+        grain_seed: u32,
     ) -> Pipeline {
-        self.to_pipeline_inner(space, scale, lens_gear, false)
+        self.to_pipeline_inner(space, scale, lens_gear, grain_seed, false)
     }
 
     /// Shared builder; `lens_stage` selects whether the lens-correction stage
     /// is emitted (see the two public wrappers for which callers want which).
+    /// `grain_seed` is `grain::hash_string` of the source filename (0 when the
+    /// caller has no path) — see [`Stage::Grain`].
     fn to_pipeline_inner(
         &self,
         space: ColorSpace,
@@ -1817,6 +1874,7 @@ impl PreviewParams {
             c41_core::iop::lens::ResolvedCamera,
             c41_core::iop::lens::ResolvedLens,
         )>,
+        grain_seed: u32,
         lens_stage: bool,
     ) -> Pipeline {
         let mut p = Pipeline::new();
@@ -2451,6 +2509,30 @@ impl PreviewParams {
                 space,
             });
         }
+        // Grain (iop_order.c pos 65, between colorize 62 and splittoning 67) —
+        // display-referred creative module, so it sits after the tone map with
+        // the others: its kernel reads `in[0]/100` as **Lab L**, which only
+        // means lightness once the buffer is display-referred. Additive 3-octave
+        // simplex noise on L, shaped by the memoised paper-response LUT.
+        //
+        // `hash_seed` is `_hash_string(filename)` (grain.c:201) computed by the
+        // caller from the image being edited — darktable reduces it by the ROI
+        // width inside `process`, which is what keeps consecutive frames of a
+        // sequence from sharing one grain pattern. Callers with no path in
+        // scope (dialogs, tests) pass 0 as a documented placeholder — note that
+        // is NOT darktable's empty-filename hash (`_hash_string("") == 5381`),
+        // but those wrappers are only reached with grain at its off default, so
+        // no pattern is rendered.
+        if self.gr_on {
+            p.push(Stage::Grain {
+                coarseness: self.gr_coarseness,
+                strength: self.gr_strength,
+                midtones_bias: self.gr_midtones_bias,
+                hash_seed: grain_seed,
+                scale,
+                space,
+            });
+        }
         if self.split_on {
             p.push(Stage::Splittoning {
                 shadow_hue: self.split_shadow_hue,
@@ -2549,9 +2631,11 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v26 adds lens correction (2 bools + 6 f32; the camera/lens identity lives
 /// in `main.darkroom_lens_choice` — the blob carries no strings).
 /// v27 adds local contrast (1 bool + 4 f32, the LL-mode sliders).
-const ENCODE_VERSION: u8 = 27;
-/// 1 version byte + 38 bool bytes + 448 little-endian f32.
-const ENCODED_LEN: usize = 1 + 38 + 448 * 4;
+/// v28 adds grain (1 bool + 3 f32, the wired LIGHTNESS-channel sliders — the
+/// grain *channel* itself is not a param, see [`PreviewParams::gr_on`]).
+const ENCODE_VERSION: u8 = 28;
+/// 1 version byte + 39 bool bytes + 451 little-endian f32.
+const ENCODED_LEN: usize = 1 + 39 + 451 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2574,6 +2658,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (25, 35, 438), // v25: base curve added
     (26, 37, 444), // v26: lens correction added
     (27, 38, 448), // v27: local contrast added
+    (28, 39, 451), // v28: grain added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -2631,12 +2716,15 @@ pub fn apply_pipeline(
     nch: usize,
     params: &PreviewParams,
 ) -> Vec<u8> {
-    apply_pipeline_gear(base, width, height, rowstride, nch, params, None)
+    apply_pipeline_gear(base, width, height, rowstride, nch, params, None, 0)
 }
 
 /// [`Self::apply_pipeline`] with resolved lens-correction gear — the variant
 /// every caller that has gear cached must use, so an enabled lens module
 /// actually applies. See [`LensGear`].
+///
+/// `grain_seed` is [`c41_core::iop::grain::hash_string`] of the source
+/// filename, or `0` when the caller has no path (see [`Stage::Grain`]).
 pub fn apply_pipeline_gear(
     base: &[u8],
     width: usize,
@@ -2645,6 +2733,7 @@ pub fn apply_pipeline_gear(
     nch: usize,
     params: &PreviewParams,
     lens_gear: Option<&LensGear>,
+    grain_seed: u32,
 ) -> Vec<u8> {
     // Degenerate input: nothing to process (also guards `colour - 1` below
     // against underflow when nch == 0).
@@ -2658,7 +2747,7 @@ pub fn apply_pipeline_gear(
     }
     // No active stage ⇒ return the source untouched (byte-exact; also avoids a
     // pointless sRGB linearise/encode round-trip that could drift ±1 LSB).
-    let pipeline = params.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, lens_gear);
+    let pipeline = params.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, lens_gear, grain_seed);
     if pipeline.stages.is_empty() {
         return base.to_vec();
     }
@@ -2717,23 +2806,25 @@ pub fn apply_pipeline_rgb16(
     height: usize,
     params: &PreviewParams,
 ) -> Vec<u16> {
-    apply_pipeline_rgb16_gear(base, width, height, params, None)
+    apply_pipeline_rgb16_gear(base, width, height, params, None, 0)
 }
 
 /// [`Self::apply_pipeline_rgb16`] with resolved lens-correction gear. See
-/// [`LensGear`].
+/// [`LensGear`]. `grain_seed` is [`c41_core::iop::grain::hash_string`] of the
+/// source filename, or `0` when the caller has no path (see [`Stage::Grain`]).
 pub fn apply_pipeline_rgb16_gear(
     base: &[u16],
     width: usize,
     height: usize,
     params: &PreviewParams,
     lens_gear: Option<&LensGear>,
+    grain_seed: u32,
 ) -> Vec<u16> {
     let n = width.saturating_mul(height);
     if width == 0 || height == 0 || base.len() < n * 3 {
         return base.to_vec();
     }
-    let pipeline = params.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, lens_gear);
+    let pipeline = params.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, lens_gear, grain_seed);
     if pipeline.stages.is_empty() {
         return base.to_vec(); // no edit ⇒ lossless 16-bit passthrough
     }
@@ -2773,7 +2864,7 @@ pub fn render_linear_to_srgb8(
     height: usize,
     params: &PreviewParams,
 ) -> Vec<u8> {
-    render_linear_to_srgb8_gear(linear, width, height, params, None)
+    render_linear_to_srgb8_gear(linear, width, height, params, None, 0)
 }
 
 /// The lens-correction **pre-pass** (m4-131): warp + vignette `linear` on the
@@ -2817,18 +2908,22 @@ pub fn apply_lens_prepass(
 /// [`Self::render_linear_to_srgb8`] with resolved lens-correction gear — the
 /// variant the darkroom preview and the export path both use so a lens
 /// correction applies identically in both. See [`LensGear`].
+///
+/// `grain_seed` is [`c41_core::iop::grain::hash_string`] of the source
+/// filename, or `0` when the caller has no path (see [`Stage::Grain`]).
 pub fn render_linear_to_srgb8_gear(
     linear: &[f32],
     width: usize,
     height: usize,
     params: &PreviewParams,
     lens_gear: Option<&LensGear>,
+    grain_seed: u32,
 ) -> Vec<u8> {
     let n = width.saturating_mul(height);
     if linear.len() < n * 4 {
         return vec![0u8; n * 3];
     }
-    srgb_encode_rgb(linear, width, height, params, lens_gear)
+    srgb_encode_rgb(linear, width, height, params, lens_gear, grain_seed)
         .iter()
         .map(|&e| (e.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
         .collect()
@@ -2844,23 +2939,25 @@ pub fn render_linear_to_srgb16(
     height: usize,
     params: &PreviewParams,
 ) -> Vec<u16> {
-    render_linear_to_srgb16_gear(linear, width, height, params, None)
+    render_linear_to_srgb16_gear(linear, width, height, params, None, 0)
 }
 
 /// [`Self::render_linear_to_srgb16`] with resolved lens-correction gear. See
-/// [`LensGear`].
+/// [`LensGear`]. `grain_seed` is [`c41_core::iop::grain::hash_string`] of the
+/// source filename, or `0` when the caller has no path (see [`Stage::Grain`]).
 pub fn render_linear_to_srgb16_gear(
     linear: &[f32],
     width: usize,
     height: usize,
     params: &PreviewParams,
     lens_gear: Option<&LensGear>,
+    grain_seed: u32,
 ) -> Vec<u16> {
     let n = width.saturating_mul(height);
     if linear.len() < n * 4 {
         return vec![0u16; n * 3];
     }
-    srgb_encode_rgb(linear, width, height, params, lens_gear)
+    srgb_encode_rgb(linear, width, height, params, lens_gear, grain_seed)
         .iter()
         .map(|&e| (e.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16)
         .collect()
@@ -2877,13 +2974,15 @@ fn srgb_encode_rgb(
     height: usize,
     params: &PreviewParams,
     lens_gear: Option<&LensGear>,
+    grain_seed: u32,
 ) -> Vec<f32> {
     let n = width.saturating_mul(height);
     // The raw funnels feed an already-lens-warped buffer (the pre-pass ran on
     // the full frame before geometry), so the pipeline must NOT emit the lens
     // stage again — see [`PreviewParams::to_pipeline_lens_preapplied`].
-    let mut processed =
-        params.to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, lens_gear).process(&linear[..n * 4], width, height);
+    let mut processed = params
+        .to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
+        .process(&linear[..n * 4], width, height);
     // Working space (Rec.2020) → sRGB before the display OETF (m4-35).
     c41_core::rawimage::apply_color_matrix(
         &mut processed,
@@ -3303,6 +3402,14 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         lens_aperture: 5.6,
         lens_distance: 7.5,
         lens_target_geom: 3.0, // fisheye
+        // Grain: bool flipped, all three floats off-default and pairwise
+        // distinct, so a wrong index in the v28 trailing block shows up as a
+        // round-trip mismatch rather than silently colliding with a neighbour.
+        // No channel field — only the LIGHTNESS channel is wired.
+        gr_on: true,
+        gr_coarseness: 4.25,
+        gr_strength: 62.0,
+        gr_midtones_bias: 37.0,
     }
 }
 
@@ -3356,6 +3463,67 @@ mod tests {
         let base = vec![10u8, 20, 30, 0xAA, 0xBB, 40, 50, 60, 0xCC, 0xDD];
         let out = apply_pipeline(&base, 1, 2, 5, 3, &PreviewParams::default());
         assert_eq!(out, base); // identity, padding intact
+    }
+
+    /// End-to-end through the public funnel: enabling the grain module must
+    /// change the rendered bytes, and the change must *vary* across the frame.
+    /// A stage that ran but applied one flat offset (or a stage that was emitted
+    /// but never reached the pixels) would fail one half or the other.
+    #[test]
+    fn grain_module_perturbs_a_flat_frame_via_the_funnel() {
+        let (w, h) = (24usize, 24usize);
+        let base = vec![128u8; w * h * 3]; // uniform mid-grey
+        let mut p = PreviewParams::default();
+        p.gr_on = true;
+        p.gr_strength = 60.0;
+        let out = apply_pipeline_gear(&base, w, h, w * 3, 3, &p, None, 0);
+        assert_ne!(out, base, "grain must change the rendered image");
+        // Count distinct R values: a real noise field spreads them; a flat tint
+        // leaves exactly one.
+        let distinct: std::collections::BTreeSet<u8> = (0..w * h).map(|i| out[i * 3]).collect();
+        assert!(
+            distinct.len() > 4,
+            "grain produced only {} distinct red values — that is a flat tint, not a noise field",
+            distinct.len()
+        );
+    }
+
+    /// The per-file `grain_seed` must survive the whole funnel: a regression
+    /// that dropped it (or hard-coded `0`) would leave grain static across a
+    /// sequence of images. This pins it on both builders — the seed is a
+    /// property of the file, so it must reach `Stage::Grain` verbatim — and
+    /// then proves it changes the rendered bytes through the public funnel.
+    #[test]
+    fn grain_seed_reaches_both_builders_and_the_render() {
+        let a = c41_core::iop::grain::hash_string("/f/seq/img001.cr2");
+        let b = c41_core::iop::grain::hash_string("/f/seq/img002.cr2");
+        assert_ne!(a, b, "the two sample filenames must differ before the render");
+
+        let mut p = PreviewParams::default();
+        p.gr_on = true;
+        let seed_of = |pipe: &c41_core::pipeline::Pipeline| {
+            pipe.stages.iter().find_map(|s| match s {
+                c41_core::pipeline::Stage::Grain { hash_seed, .. } => Some(*hash_seed),
+                _ => None,
+            })
+        };
+        for seed in [a, b] {
+            let with = p.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, None, seed);
+            assert_eq!(seed_of(&with), Some(seed), "to_pipeline_with dropped the seed");
+            let pre =
+                p.to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, None, seed);
+            assert_eq!(seed_of(&pre), Some(seed), "lens_preapplied dropped the seed");
+        }
+
+        // And end to end: two seeds, two different renders of the same flat
+        // frame. A 64-px buffer keeps the C's ROI-width hash modulus (19) large
+        // enough that the two real filenames do not collide (see
+        // `grain_hash_budget_scales_with_the_frame`).
+        let (w, h) = (64usize, 64usize);
+        let base = vec![128u8; w * h * 3];
+        let ra = apply_pipeline_gear(&base, w, h, w * 3, 3, &p, None, a);
+        let rb = apply_pipeline_gear(&base, w, h, w * 3, 3, &p, None, b);
+        assert_ne!(ra, rb, "the per-file grain seed must change the rendered bytes");
     }
 
     #[test]
@@ -3650,6 +3818,18 @@ mod tests {
         let mut tc = PreviewParams::default();
         tc.tc_on = true;
         cfgs.push(tc);
+        // grain disabled ⇒ identity; enabled ⇒ non-identity even at strength 0,
+        // because the C still runs the kernel and the Lab round-trip. A gate
+        // that instead tested `gr_strength > 0` would disagree with to_pipeline
+        // (whose gate is the flag alone) — so pin the strength-0 case too.
+        cfgs.push(PreviewParams::default());
+        let mut gr0 = PreviewParams::default();
+        gr0.gr_on = true;
+        gr0.gr_strength = 0.0;
+        cfgs.push(gr0);
+        let mut gr = PreviewParams::default();
+        gr.gr_on = true;
+        cfgs.push(gr);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
@@ -3749,13 +3929,17 @@ mod tests {
         // placement), before colorcorrection 55. On by itself is enough to emit
         // the stage.
         p.lc_on = true;
+        // grain: pos 65 in v50_order — creative cluster, after colorize 62
+        // (and the relocatable monochrome 64) and before splittoning 67. On by
+        // itself is enough to emit the stage.
+        p.gr_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "lowpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "lowpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "splittoning"]
         );
         // Base curve is the scene→display conversion point (iop_order.c pos
         // 44.0): after rgbcurve/rgblevels, before sigmoid and filmicrgb.
@@ -3779,6 +3963,19 @@ mod tests {
             "bloom must run after velvia: {names:?}");
         assert!(bl_pos < names.iter().position(|n| *n == "colorize").unwrap(),
             "bloom must run before colorize: {names:?}");
+        // Grain is a display-referred creative module (iop_order.c pos 65) whose
+        // kernel reads `in[0]/100` as Lab L, so it must land after the tone map
+        // — before it, L would still be scene-linear luminance and the paper
+        // response would be sampled in the wrong domain entirely.
+        let gr_pos = names.iter().position(|n| *n == "grain").unwrap();
+        assert!(
+            gr_pos > names.iter().position(|n| *n == "sigmoid").unwrap(),
+            "grain must run after sigmoid: {names:?}"
+        );
+        assert!(gr_pos > names.iter().position(|n| *n == "colorize").unwrap(),
+            "grain (pos 65) must run after colorize (pos 62): {names:?}");
+        assert!(gr_pos < names.iter().position(|n| *n == "splittoning").unwrap(),
+            "grain (pos 65) must run before splittoning (pos 67): {names:?}");
         // Denoise is scene-referred and noise-thresholds against raw-domain
         // statistics: it must run BEFORE any tone mapping (exposure onwards).
         let dn_pos = names.iter().position(|n| *n == "denoiseprofile").unwrap();
@@ -3831,7 +4028,7 @@ mod tests {
         p.exposure_on = true;
         p.ev = 0.5; // off-default so exposure is emitted
         let names: Vec<&str> = p
-            .to_pipeline_with(ColorSpace::LinearSrgb, 1.0, Some(&gear))
+            .to_pipeline_with(ColorSpace::LinearSrgb, 1.0, Some(&gear), 0)
             .stages
             .iter()
             .map(|s| s.name())
@@ -3858,9 +4055,10 @@ mod tests {
         p.dn_on = true;
         p.exposure_on = true;
         p.ev = 0.5; // off-default so exposure is emitted
-        let with = p.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, Some(&gear));
+        let with = p.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, Some(&gear), 0);
         assert!(with.stages.iter().any(|s| s.name() == "lens"));
-        let without = p.to_pipeline_lens_preapplied(ColorSpace::LinearSrgb, 1.0, Some(&gear));
+        let without =
+            p.to_pipeline_lens_preapplied(ColorSpace::LinearSrgb, 1.0, Some(&gear), 0);
         assert!(!without.stages.iter().any(|s| s.name() == "lens"), "{:?}", without.stages.len());
         let kept: Vec<&str> = without.stages.iter().map(|s| s.name()).collect();
         let expected: Vec<&str> = with
@@ -3881,7 +4079,7 @@ mod tests {
         p.lens_on = true;
         assert!(!p.is_identity());
         assert!(p
-            .to_pipeline_with(ColorSpace::LinearSrgb, 1.0, None)
+            .to_pipeline_with(ColorSpace::LinearSrgb, 1.0, None, 0)
             .stages
             .is_empty());
     }
@@ -4181,6 +4379,31 @@ mod tests {
                 assert_eq!(decoded.lowpass_saturation, def.lowpass_saturation);
             }
         }
+    }
+
+    #[test]
+    fn decode_v27_blob_defaults_grain_fields() {
+        // A v27 blob (the last layout before grain — 38 bools / 448 f32s) must
+        // decode with the grain fields at their defaults, so an image edited
+        // before the grain module existed loads unchanged instead of having a
+        // random noise pattern switched on behind the user's back. Grain's
+        // enable flag is what matters here: a wrong `unwrap_or(true)` would
+        // silently alter every previously-saved edit.
+        let v27 = {
+            let mut b = vec![0u8; 1 + 38 + 448 * 4];
+            b[0] = 27;
+            b
+        };
+        let decoded = PreviewParams::decode(&v27).expect("v27 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.gr_on, def.gr_on);
+        assert_eq!(decoded.gr_coarseness, def.gr_coarseness);
+        assert_eq!(decoded.gr_strength, def.gr_strength);
+        assert_eq!(decoded.gr_midtones_bias, def.gr_midtones_bias);
+        // And it must still be an identity pipeline — the real consequence of
+        // the defaults being right.
+        assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
+            "a pre-grain edit must not gain a grain stage");
     }
 
     #[test]

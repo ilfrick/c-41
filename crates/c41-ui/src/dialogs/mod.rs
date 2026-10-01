@@ -269,6 +269,10 @@ fn render_raw_export(
     // above already fails before any file is touched, so a bad raw leaves nothing.
     atomic_write(&dest_ext, |out| {
         let lens_gear = edit.lens.as_deref();
+        // Grain's per-image noise seed (see `Stage::Grain`), so an export
+        // draws the same per-file grain pattern as the preview for this file
+        // (the C's ROI-width hash reduction still applies per render size).
+        let grain_seed = c41_core::iop::grain::hash_string(path);
         match settings.format {
             ExportFormat::Jpeg => {
                 let (w, h, rgb) = crate::export::render_export_rgb8_gear(
@@ -277,6 +281,7 @@ fn render_raw_export(
                     edit.geometry,
                     &edit.params,
                     lens_gear,
+                    grain_seed,
                 );
                 let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
                     .ok_or_else(|| anyhow::anyhow!("empty render"))?;
@@ -292,6 +297,7 @@ fn render_raw_export(
                     edit.geometry,
                     &edit.params,
                     lens_gear,
+                    grain_seed,
                 );
                 let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
                     .ok_or_else(|| anyhow::anyhow!("empty render"))?;
@@ -481,13 +487,16 @@ fn render_nonraw_export(
         .resize
         .as_ref()
         .map(|r| crate::export::fit_within(w as u32, h as u32, r));
+    // Grain's per-image noise seed (see `Stage::Grain`), so an export carries
+    // the same grain the preview showed for this file.
+    let grain_seed = c41_core::iop::grain::hash_string(path);
 
     match settings.format {
         // JPEG is an 8-bit container — decode + process at 8-bit.
         ExportFormat::Jpeg => {
             let rgb = composite_rgba8_over_white(&decoded.to_rgba8());
             let processed =
-                crate::preview::apply_pipeline_gear(&rgb, w, h, w * 3, 3, params, lens_gear);
+                crate::preview::apply_pipeline_gear(&rgb, w, h, w * 3, 3, params, lens_gear, grain_seed);
             atomic_write(&dest_ext, move |out| {
                 let mut buf: ImageBuffer<Rgb<u8>, _> =
                     ImageBuffer::from_raw(w as u32, h as u32, processed)
@@ -504,7 +513,7 @@ fn render_nonraw_export(
         ExportFormat::Png | ExportFormat::Tiff => {
             let rgb = composite_rgba16_over_white(&decoded.to_rgba16());
             let processed =
-                crate::preview::apply_pipeline_rgb16_gear(&rgb, w, h, params, lens_gear);
+                crate::preview::apply_pipeline_rgb16_gear(&rgb, w, h, params, lens_gear, grain_seed);
             let fmt = match settings.format {
                 ExportFormat::Png => image::ImageFormat::Png,
                 _ => image::ImageFormat::Tiff,

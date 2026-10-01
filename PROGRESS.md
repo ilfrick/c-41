@@ -7793,3 +7793,121 @@ entries have always recorded.
 `/usr/local/bin/c41-rs` running, UI answers `HTTP 200` on `:3000`. x2 changed no
 code, so this is a freshness rebuild rather than a behavioural one, but the
 running container now tracks `master`.
+
+---
+
+### g1a — Grain module wired (2026-10-01 UTC)
+
+**Commit** (GitHub + Gitea via `git push origin master`)
+
+**What.** First row of the G1 backlog — the catalogue modules whose kernels were
+ported in the m4-129…m4-244 chain but which still render inert because they have
+no panel, no `Stage` variant and no driver. `Grain` is now a live darkroom
+module.
+
+- `c41-core/src/iop/grain.rs`: new safe driver `process(input, output, width,
+  height, scale, coarseness, strength, midtones_bias, hash_seed)` deriving every
+  argument `darkroom_grain_process` needs exactly as `grain.c::process` does —
+  `hash = _hash_string(filename) % (int)fmax(width*0.3, 1)` (the ROI-width
+  reduction; f64 product, as the C's `int * double`), `wd = min(w,h)`,
+  `zoom = (1 + 8*scale/100) / 800` with the inner term in **f32** and only the
+  outer division in f64 (C promotes `8 * data->scale / 100` to float, not
+  double), `filter = |roi_out->scale - 1| > 0.01`, `filtermul =
+  iscale/(scale*wd)`. New `hash_string(&str) -> u32` ports `_hash_string`
+  (`grain.c:201`): djb2 seed 5381 folded **backwards** with the `char`
+  **sign-extended** (x86 `char` is signed), so a UTF-8 byte ≥ 0x80 folds all 32
+  bits. The 128×128 paper-response LUT is memoised in a thread-local `Rc` keyed
+  on `midtones_bias` (`toneequal::CORRECTION_LUT_CACHE` precedent) rather than
+  stored in the `Stage`, keeping the `Stage` cheap to `Clone`/`PartialEq`.
+  `process` is a safe `pub` fn, so it release-asserts input/output length and
+  `scale > 0` before the `unsafe` call (same trust boundary `Pipeline::process`
+  asserts).
+- `pipeline.rs`: `Stage::Grain { coarseness, strength, midtones_bias, hash_seed,
+  scale, space }`; `working_space = Some(space)`; `is_pixel_local = false` (the
+  noise field is indexed by position, so a band-parallel run would resample the
+  wrong field — routed serial); RGB↔Lab sandwich in `apply` per the
+  Bloom/Colorize precedent, so the kernel's `in[0]/100` really is Lab L. Placed
+  at iop_order v50 pos 65 (after colorize 62, before splittoning 67).
+- `c41-ui/src/preview.rs`: params `gr_on`/`gr_coarseness`/`gr_strength`/
+  `gr_midtones_bias`, defaults 7.5047 (= 1600/213.2) / 25 / 100; identity gate is
+  flag-only (`gr_identity = !gr_on`), matching `to_pipeline` exactly including
+  the strength-0 case; `ENCODE_VERSION` 27→28, bool index 38, floats 448–450,
+  `ENCODED_LEN = 1 + 39 + 451*4 = 1844`, `PARAMS_LAYOUTS += (28, 39, 451)`.
+  `hash_seed` is threaded as a `u32` through `to_pipeline*` and the render
+  funnels rather than stored on `PreviewParams` — it is a property of the *file*,
+  not the edit, and a field on `PreviewParams` would pollute the history
+  `PartialEq`/`describe_change` and force a path hash into the blob.
+- `darkroom/mod.rs` (`grain_module_row`, dispatch, `LIVE_MODULE_LABELS`,
+  `reset_module`, `MODULE_MUTATIONS`), `history.rs` (`describe_change`),
+  `stylemodules.rs` (`MODULE_GROUPS` + `copy_module_group`), `export.rs` and
+  `dialogs/mod.rs` (both export paths pass the real `hash_string(path)`; the
+  darkroom preview passes `hash_string(ctx.decode_path)`).
+
+**Documented deviations.**
+- **LIGHTNESS channel only** — the only channel the ported kernel implements
+  (it writes `out[0]` and passes 1/2/3 through), so no channel dropdown is
+  surfaced rather than shipping a control that does nothing.
+- **The rank-1 lattice branch is unreachable.** `dt_pipe_is_fast` has no c41
+  equivalent, and every c41 funnel passes `scale = 1.0`, so `filter` is 0 in the
+  product. The branch is kept (it belongs to the shared ported kernel) and is
+  covered only by a direct unit test at `scale = 0.5`.
+- `piece->iscale == roi_out->scale` for every whole-frame c41 buffer, so
+  `filtermul` collapses to `1/wd`; both terms are kept in the expression so a
+  future differently-scaled caller cannot inherit the assumption silently.
+- Coarseness is stored and shown as the **quotient** 20/213.2…6400/213.2
+  (0.0938…30.02, default 1600/213.2 ≈ 7.5047) — darktable's `GRAIN_SCALE_FACTOR`
+  applied at the widget boundary, as bloom/basicadj do. Known cosmetic
+  divergence: the slider step is 0.01 in quotient space (≈2.13 ISO) where
+  darktable's is 1 ISO.
+
+**Review.** Cold, independent senior review (fresh context, no prior knowledge)
+returned **REQUEST-CHANGES**: 1 BLOCKER, 5 MAJOR, 6 MINOR. All were addressed
+and a follow-up pass on the same reviewer verified each fix, returning
+**APPROVE-WITH-FIXES** with only cosmetic items, also corrected.
+
+- **BLOCKER** — the `PARITY_AUDIT.md` grain paragraph said the v28 blob grew
+  `1831→1851`; the arithmetic is `1831 + 1 + 12 = 1844`, which is what the code
+  and its pin actually assert. Fixed.
+- **MAJOR** — `process` (safe `pub`) forward-declared a length contract but only
+  `debug_assert`ed it, then handed caller slice pointers to `from_raw_parts`;
+  now release-asserted, with panic tests. The `filter` branch was documented as
+  running on downscaled previews when no c41 caller passes `scale != 1.0`; docs
+  corrected and the branch given a direct test. `zoom` was evaluated wholly in
+  f64 where the C's inner term is float; corrected, and `hash_modulus` moved to
+  the C's double product. The paper-response LUT had only a wide midpoint check;
+  added 15 golden vectors across `mb = 0/50/100` derived from the C with an
+  independent float32 model, plus antisymmetry and bias-damping checks. The
+  per-file seed had no funnel-level test; added one asserting the seed reaches
+  both builders *and* changes the rendered bytes.
+- **MINOR** — a false "seed 0 = darktable's empty filename" comment
+  (`_hash_string("")` is 5381, not 0); preview/export comments overstating
+  identical grain (the C's ROI-width reduction makes the *offset* render-size
+  dependent); stale `#[allow(dead_code)]` on the LUT constants and
+  paper-response helpers; audit test counts and one omitted live-module label;
+  the coarseness step divergence.
+
+**Mistakes kept.** The gate caught three rounds of my own errors, all wrong
+expectations rather than port bugs:
+1. `hash_string("\u{e9}")` — I expected a single `0xE9` byte, but Rust's
+   `"\u{e9}"` is the two UTF-8 bytes `0xC3 0xA9`, both of which sign-extend. The
+   implementation was right (5862479); the expectation was not.
+2. `grain_hash_seed_decorrelates_two_frames` at 32 px — the C reduces the hash
+   by `% (int)fmax(width*0.3, 1)`, a modulus of **9** there, and the two real
+   sequence filenames both land on 7. The C genuinely produces one pattern for
+   those two names at that size, so the test was asserting decorrelation the C
+   does not provide. Moved to 256 px and added a test pinning the collision and
+   the separation, so the C's decorrelation budget is written down.
+3. Four `c41-ui` failures the earlier compile errors had hidden: grain had no
+   `MODULE_GROUPS` entry (the style-partition invariant caught it);
+   `module_filter_matches_scope_and_search` and `reset_module_rejects_unknown_label`
+   used `"Grain"` as the inert/unknown negative case; and the
+   `previewparams_encode_len_is_pinned` pin still read 1831.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 — all four steps (`cargo check
+--workspace --locked`, `cargo clippy --workspace --all-targets --locked`,
+`cargo test --workspace --release --locked`, release `c41-rs` link). Release
+suites: `c41-core` **1822**, `c41-db` **100**, `c41-ui` **522**, 0 failed (was
+1811/100/519 — +11 core, +3 ui). `cargo check --locked -p c41-core
+--all-targets` clean, 9 warnings before and after (no new warnings); the only
+new lints (`too_many_arguments`, `identity_op` on the pre-existing kernel body)
+were either allowed per house style or pre-existing.

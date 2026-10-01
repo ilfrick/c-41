@@ -56,6 +56,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Highlight reconstruction",
     "Denoise (profiled)",
     "Bloom",
+    "Grain",
     "Tone curve",
     "RGB curve",
     "Base curve",
@@ -360,6 +361,13 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.bl_strength = src.bl_strength;
             true
         }
+        "Grain" => {
+            target.gr_on = src.gr_on;
+            target.gr_coarseness = src.gr_coarseness;
+            target.gr_strength = src.gr_strength;
+            target.gr_midtones_bias = src.gr_midtones_bias;
+            true
+        }
         "Tone curve" => {
             target.tc_on = src.tc_on;
             target.tc_type = src.tc_type;
@@ -453,7 +461,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 34);
+        assert_eq!(MODULE_GROUPS.len(), 35);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();

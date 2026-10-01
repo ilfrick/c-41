@@ -536,6 +536,18 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if bl {
         return "Bloom";
     }
+    // Grain: grouped immediately after Bloom, the other display-referred
+    // creative module working on Lab L, and the one iop_order.c places closest
+    // to it (bloom 61, grain 65). This list is not strictly chronological (it
+    // has grown by appending), so sitting next to its true neighbour is what
+    // keeps the "earliest group wins" tie-break honest here.
+    let grain = old.gr_on != new.gr_on
+        || old.gr_coarseness != new.gr_coarseness
+        || old.gr_strength != new.gr_strength
+        || old.gr_midtones_bias != new.gr_midtones_bias;
+    if grain {
+        return "Grain";
+    }
     // Tone curve (m4-122): the L anchors are compared pairwise (the array is a
     // plain [(f32, f32); 20], so `!=` does the right thing).
     let tc = old.tc_on != new.tc_on
@@ -776,6 +788,16 @@ mod tests {
             "Local contrast"
         );
         assert_eq!(
+            describe_change(&base, &PreviewParams { gr_strength: 40.0, ..d() }),
+            "Grain"
+        );
+        // The enable flag alone is a grain edit too — turning the module on or
+        // off changes the image just as much as a slider move.
+        assert_eq!(
+            describe_change(&base, &PreviewParams { gr_on: true, ..d() }),
+            "Grain"
+        );
+        assert_eq!(
             describe_change(&base, &PreviewParams { primaries_red_hue: 10.0, ..d() }),
             "Primaries"
         );
@@ -977,6 +999,10 @@ mod tests {
             lc_shadows: _,
             lc_highlights: _,
             lc_detail: _,
+            gr_on: _,
+            gr_coarseness: _,
+            gr_strength: _,
+            gr_midtones_bias: _,
             primaries_on: _,
             primaries_achromatic_tint_hue: _,
             primaries_achromatic_tint_purity: _,
@@ -1213,7 +1239,9 @@ mod tests {
         // camera/lens *identity* stays out of the blob (darkroom_lens_choice).
         // m4-152 (local contrast): 1814 → 1831 (1 + 38 bools + 448 f32 — the
         // four LL-mode sliders).
-        assert_eq!(PreviewParams::default().encode().len(), 1831);
+        // #2 (grain): 1831 → 1844 (1 + 39 bools + 451 f32 — enabled + the three
+        // coarseness/strength/mid-tones-bias sliders).
+        assert_eq!(PreviewParams::default().encode().len(), 1844);
     }
 
     #[test]

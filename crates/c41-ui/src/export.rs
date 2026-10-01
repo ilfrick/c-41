@@ -269,26 +269,42 @@ pub fn render_export_rgb8(
     method: c41_core::rawimage::DemosaicMethod,
     geometry: c41_core::geometry::Geometry,
     params: &crate::preview::PreviewParams,
+    grain_seed: u32,
 ) -> (usize, usize, Vec<u8>) {
-    render_export_rgb8_gear(img, method, geometry, params, None)
+    render_export_rgb8_gear(img, method, geometry, params, None, grain_seed)
 }
 
 /// [`Self::render_export_rgb8`] with resolved lens-correction gear — the form
 /// the export loop calls with the edit's cached gear so a corrected preview
 /// exports corrected. See [`crate::preview::LensGear`].
+///
+/// `grain_seed` is [`c41_core::iop::grain::hash_string`] of the **source** path,
+/// so an exported frame draws the same per-file grain pattern as the preview.
+/// (The C's `% (int)fmax(width*0.3, 1)` reduction still applies at each render,
+/// and preview and export buffer widths differ, so the *offset* — not the
+/// noise model or the per-file seed — is render-size dependent, as in
+/// darktable. See [`c41_core::pipeline::Stage::Grain`].)
 pub fn render_export_rgb8_gear(
     img: &c41_core::rawimage::RawImage,
     method: c41_core::rawimage::DemosaicMethod,
     geometry: c41_core::geometry::Geometry,
     params: &crate::preview::PreviewParams,
     lens_gear: Option<&crate::preview::LensGear>,
+    grain_seed: u32,
 ) -> (usize, usize, Vec<u8>) {
     let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
     // Lens pre-pass on the FULL frame, before crop/straighten — darktable runs
     // lens at iop_order 13, before the geometry modules (m4-131).
     let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
-    let rgb = crate::preview::render_linear_to_srgb8_gear(&geom_linear, gw, gh, params, lens_gear);
+    let rgb = crate::preview::render_linear_to_srgb8_gear(
+        &geom_linear,
+        gw,
+        gh,
+        params,
+        lens_gear,
+        grain_seed,
+    );
     (gw, gh, rgb)
 }
 
@@ -300,8 +316,9 @@ pub fn render_export_rgb16(
     method: c41_core::rawimage::DemosaicMethod,
     geometry: c41_core::geometry::Geometry,
     params: &crate::preview::PreviewParams,
+    grain_seed: u32,
 ) -> (usize, usize, Vec<u16>) {
-    render_export_rgb16_gear(img, method, geometry, params, None)
+    render_export_rgb16_gear(img, method, geometry, params, None, grain_seed)
 }
 
 /// 16-bit twin of [`render_export_rgb8_gear`]: identical pipeline (including
@@ -312,13 +329,21 @@ pub fn render_export_rgb16_gear(
     geometry: c41_core::geometry::Geometry,
     params: &crate::preview::PreviewParams,
     lens_gear: Option<&crate::preview::LensGear>,
+    grain_seed: u32,
 ) -> (usize, usize, Vec<u16>) {
     let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
     // Lens pre-pass on the FULL frame, before crop/straighten — darktable runs
     // lens at iop_order 13, before the geometry modules (m4-131).
     let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
-    let rgb = crate::preview::render_linear_to_srgb16_gear(&geom_linear, gw, gh, params, lens_gear);
+    let rgb = crate::preview::render_linear_to_srgb16_gear(
+        &geom_linear,
+        gw,
+        gh,
+        params,
+        lens_gear,
+        grain_seed,
+    );
     (gw, gh, rgb)
 }
 
@@ -356,6 +381,7 @@ mod tests {
             DemosaicMethod::Rcd,
             Geometry::default(),
             &crate::preview::PreviewParams::default(),
+            0,
         );
         assert_eq!((w, h), (40, 30));
         assert_eq!(rgb.len(), 40 * 30 * 3);
@@ -377,6 +403,7 @@ mod tests {
             DemosaicMethod::Rcd,
             geom,
             &crate::preview::PreviewParams::default(),
+            0,
         );
         assert_eq!((w, h), (20, 30));
         assert_eq!(rgb.len(), 20 * 30 * 3);
@@ -412,6 +439,7 @@ mod tests {
             Geometry::default(),
             &p,
             Some(&gear),
+            0,
         );
         let cropped = render_export_rgb16_gear(
             &img,
@@ -422,6 +450,7 @@ mod tests {
             },
             &p,
             Some(&gear),
+            0,
         );
         assert_eq!((cropped.0, cropped.1), (20, 30));
 
@@ -434,6 +463,7 @@ mod tests {
             Geometry::default(),
             &p,
             None,
+            0,
         );
         assert!(
             full.2.iter().zip(plain.2.iter()).any(|(a, b)| a != b),
@@ -462,13 +492,13 @@ mod tests {
         let img = synthetic_raw(40, 30);
         let params = crate::preview::PreviewParams::default();
         let (w, h, rgb16) =
-            render_export_rgb16(&img, DemosaicMethod::Rcd, Geometry::default(), &params);
+            render_export_rgb16(&img, DemosaicMethod::Rcd, Geometry::default(), &params, 0);
         assert_eq!((w, h), (40, 30));
         assert_eq!(rgb16.len(), 40 * 30 * 3);
         // The 16-bit encode is the same sRGB values at higher precision: the top
         // 8 bits of each u16 must equal the 8-bit render (within ±1 from rounding).
         let (_, _, rgb8) =
-            render_export_rgb8(&img, DemosaicMethod::Rcd, Geometry::default(), &params);
+            render_export_rgb8(&img, DemosaicMethod::Rcd, Geometry::default(), &params, 0);
         for (i, (&hi, &lo)) in rgb16.iter().zip(rgb8.iter()).enumerate() {
             // 65535 = 255·257, so the top byte of the 16-bit encode is ~0.4% above
             // the 8-bit one; with independent rounding they agree within ±2.
