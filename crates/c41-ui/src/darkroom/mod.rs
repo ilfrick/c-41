@@ -2318,6 +2318,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Lens correction" => lens_module_row(ctx).upcast(),
                 "Bloom" => bloom_module_row(ctx).upcast(),
                 "Grain" => grain_module_row(ctx).upcast(),
+                "Soften" => soften_module_row(ctx).upcast(),
                 "Color zones" => colorzones_module_row(ctx).upcast(),
                 "Tone curve" => curve_editor::tonecurve_module_row(ctx).upcast(),
                 "RGB curve" => curve_editor::rgbcurve_module_row(ctx).upcast(),
@@ -2600,7 +2601,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2863,6 +2864,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             colorize_lightness_mix
         ),
         "Grain" => set!(gr_on, gr_coarseness, gr_strength, gr_midtones_bias),
+        "Soften" => set!(soften_on, soften_size, soften_saturation, soften_brightness, soften_amount),
         _ => return false,
     }
     true
@@ -4402,6 +4404,34 @@ fn grain_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         })
 }
 
+/// Soften (soften.c): the Orton effect — overexpose in HSL, box-blur, blend the
+/// blurred buffer back over the original. iop_order.c v50 pos 66, a normal
+/// linear-RGB pipeline stage in the creative cluster, so [`module_expander`]'s
+/// plain re-render applies (no re-decode).
+///
+/// Ranges are the C introspection (soften.c:47-50): size 0..100 default 50,
+/// saturation 0..100 default 100, brightness −2..2 default 0.33, amount (mix)
+/// 0..100 default 50.
+fn soften_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Soften", "Orton effect (overexpose + blur)", p0.soften_on,
+        |p, on| p.soften_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Size", 0.0, 100.0, 1.0, p0.soften_size as f64,
+                |p, v| p.soften_size = v);
+            add_param_slider(e, ctx, "Saturation", 0.0, 100.0, 1.0,
+                p0.soften_saturation as f64, |p, v| p.soften_saturation = v);
+            add_param_slider(e, ctx, "Brightness", -2.0, 2.0, 0.01,
+                p0.soften_brightness as f64, |p, v| p.soften_brightness = v);
+            // Labelled "mix", not "Amount", because that is darktable's
+            // `$DESCRIPTION` for this param (soften.c:51) and c41 matches those
+            // strings verbatim where the C gives one — cf. Grain's "Coarseness"
+            // and "Mid-tones bias" (grain.c:69/71).
+            add_param_slider(e, ctx, "Mix", 0.0, 100.0, 1.0,
+                p0.soften_amount as f64, |p, v| p.soften_amount = v);
+        })
+}
+
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     module_expander(ctx, "White balance", "channel multipliers", p0.temperature_on,
@@ -4598,7 +4628,8 @@ mod tests {
         // placeholder, so both directions are pinned.
         assert!(is_live_module("Bloom"), "a ported module must read as live");
         assert!(is_live_module("Grain"), "the wired grain module must read as live");
-        assert!(!is_live_module("Soften"), "an unported module must not read as live");
+        assert!(is_live_module("Soften"), "the wired soften module must read as live");
+        assert!(!is_live_module("Highpass"), "an unported module must not read as live");
     }
 
     /// Every live-module label must still exist verbatim in the catalog, else
@@ -4739,7 +4770,8 @@ mod tests {
         // is still inert).
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Exposure", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Grain", ""));
-        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
+        assert!(module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
+        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Highpass", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
@@ -4754,7 +4786,7 @@ mod tests {
         assert!(!module_filter_matches(ModuleFilter::All, 0, "Exposure", "velvia"));
         // ... and it combines with the scope tab (Active + query still hides
         // inert rows even when the query matches their label).
-        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Soften", "sof"));
+        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Highpass", "hig"));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Bloom", "loo"));
     }
 
@@ -5079,6 +5111,13 @@ mod tests {
             p.gr_strength = M;
             p.gr_midtones_bias = M;
         }),
+        ("Soften", |p| {
+            p.soften_on = true;
+            p.soften_size = M;
+            p.soften_saturation = M;
+            p.soften_brightness = M;
+            p.soften_amount = M;
+        }),
     ];
 
     /// `reset_module` restores exactly the named module's fields, and only those
@@ -5346,6 +5385,11 @@ mod tests {
             gr_coarseness: _,
             gr_strength: _,
             gr_midtones_bias: _,
+            soften_on: _,
+            soften_size: _,
+            soften_saturation: _,
+            soften_brightness: _,
+            soften_amount: _,
         } = PreviewParams::default();
     }
 
@@ -5403,7 +5447,7 @@ mod tests {
             ..Default::default()
         };
         let before = p;
-        assert!(!reset_module(&mut p, "Soften"));
+        assert!(!reset_module(&mut p, "Highpass"));
         assert_eq!(p, before);
     }
 }

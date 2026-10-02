@@ -521,6 +521,24 @@ pub struct PreviewParams {
     /// response: the greater the bias, the more pronounced grain's falloff in
     /// the shadows and highlights.
     pub gr_midtones_bias: f32,
+    // ── Soften (soften.c) ───────────────────────────────────────────────────
+    // Orton effect (iop_order.c v50 pos 66, between grain 65 and splittoning
+    // 67): overexpose in HSL, box-blur, then blend the blurred buffer back over
+    // the original. Linear-RGB module (no Lab round-trip). The four sliders are
+    // straight off the C introspection (soften.c:47-50).
+    /// Soften module enabled. Ships off, like darktable's default.
+    pub soften_on: bool,
+    /// Blur radius as a fraction of the image diagonal, 0..100, default 50
+    /// (`size`). Drives the C radius derivation in `soften::process`.
+    pub soften_size: f32,
+    /// HSL saturation scale, 0..100, default 100; divided by 100 in the driver.
+    pub soften_saturation: f32,
+    /// HSL lightness scale, −2..2, default 0.33; the driver applies
+    /// `1/exp2(-brightness)`.
+    pub soften_brightness: f32,
+    /// Blurred/original blend weight ("mix"), 0..100, default 50; divided by
+    /// 100 in the driver.
+    pub soften_amount: f32,
     // ── Tone curve (tonecurve.c) ────────────────────────────────────────────
     // Three-channel Lab LUT module (iop_order.c pos 48, between colisa 47 and
     // levels 49). First slice: the L channel editor only — a/b keep their C
@@ -906,6 +924,11 @@ impl Default for PreviewParams {
             gr_coarseness: 1600.0 / 213.2,
             gr_strength: 25.0,         // grain.h $DEFAULT
             gr_midtones_bias: 100.0,   // grain.h $DEFAULT
+            soften_on: false,
+            soften_size: 50.0,        // soften.c $DEFAULT
+            soften_saturation: 100.0, // soften.c $DEFAULT
+            soften_brightness: 0.33,  // soften.c $DEFAULT
+            soften_amount: 50.0,      // soften.c $DEFAULT
             tc_on: false,
             tc_type: 2.0,        // MONOTONE_HERMITE ($DEFAULT annotation)
             tc_autoscale: 3.0,   // DT_S_SCALE_AUTOMATIC_RGB (C default)
@@ -1128,6 +1151,11 @@ impl PreviewParams {
         // combination while enabled is a pass-through — and with strength 0 the
         // C still runs the full Lab round-trip. The gate mirrors `to_pipeline`.
         let gr_identity = !self.gr_on;
+        // Soften gates on the enable flag alone, like Bloom/Grain: the box blur
+        // and HSL overexpose have no slider combination that is a pass-through
+        // while enabled (amount 0 does reproduce the input, but `to_pipeline`
+        // still emits the stage whenever enabled, so the gate mirrors it).
+        let soften_identity = !self.soften_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1147,6 +1175,7 @@ impl PreviewParams {
             && lens_identity
             && lc_identity
             && gr_identity
+            && soften_identity
     }
 
     /// Highlight-reconstruction options for the raw front end; `None` while the
@@ -1347,7 +1376,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1517,6 +1546,10 @@ impl PreviewParams {
         // Grain (v28): the three wired LIGHTNESS sliders, appended after the
         // local-contrast block so the layout stays append-only.
         for s in [self.gr_coarseness, self.gr_strength, self.gr_midtones_bias] {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        // Soften (v29): the four sliders, appended after the grain block.
+        for s in [self.soften_size, self.soften_saturation, self.soften_brightness, self.soften_amount] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -1775,6 +1808,13 @@ impl PreviewParams {
             gr_coarseness: f.get(448).copied().unwrap_or(d.gr_coarseness),
             gr_strength: f.get(449).copied().unwrap_or(d.gr_strength),
             gr_midtones_bias: f.get(450).copied().unwrap_or(d.gr_midtones_bias),
+            // Soften (v29): bool 39, floats 451–454. v28-and-earlier blobs end
+            // before any of this — defaults hold.
+            soften_on: bools.get(39).map_or(d.soften_on, |&b| b != 0),
+            soften_size: f.get(451).copied().unwrap_or(d.soften_size),
+            soften_saturation: f.get(452).copied().unwrap_or(d.soften_saturation),
+            soften_brightness: f.get(453).copied().unwrap_or(d.soften_brightness),
+            soften_amount: f.get(454).copied().unwrap_or(d.soften_amount),
         })
     }
 
@@ -2533,6 +2573,19 @@ impl PreviewParams {
                 space,
             });
         }
+        // Soften (iop_order.c pos 66, between grain 65 and splittoning 67) —
+        // the Orton effect: HSL overexpose, box-blur, blend back. Linear-RGB
+        // module (no Lab round-trip), so it takes no `space`; it also takes no
+        // `scale`, because the C's `roi_in->scale / piece->iscale` ratio is
+        // identically 1 when the whole frame is one buffer.
+        if self.soften_on {
+            p.push(Stage::Soften {
+                size: self.soften_size,
+                saturation: self.soften_saturation,
+                brightness: self.soften_brightness,
+                amount: self.soften_amount,
+            });
+        }
         if self.split_on {
             p.push(Stage::Splittoning {
                 shadow_hue: self.split_shadow_hue,
@@ -2633,9 +2686,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v27 adds local contrast (1 bool + 4 f32, the LL-mode sliders).
 /// v28 adds grain (1 bool + 3 f32, the wired LIGHTNESS-channel sliders — the
 /// grain *channel* itself is not a param, see [`PreviewParams::gr_on`]).
-const ENCODE_VERSION: u8 = 28;
-/// 1 version byte + 39 bool bytes + 451 little-endian f32.
-const ENCODED_LEN: usize = 1 + 39 + 451 * 4;
+/// v29 adds soften (1 bool + 4 f32: size, saturation, brightness, amount).
+const ENCODE_VERSION: u8 = 29;
+/// 1 version byte + 40 bool bytes + 455 little-endian f32.
+const ENCODED_LEN: usize = 1 + 40 + 455 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2659,6 +2713,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (26, 37, 444), // v26: lens correction added
     (27, 38, 448), // v27: local contrast added
     (28, 39, 451), // v28: grain added
+    (29, 40, 455), // v29: soften added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3410,6 +3465,13 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         gr_coarseness: 4.25,
         gr_strength: 62.0,
         gr_midtones_bias: 37.0,
+        // Soften: bool flipped, four floats off-default and pairwise distinct,
+        // for the same wrong-offset reason as the blocks above.
+        soften_on: true,
+        soften_size: 71.0,
+        soften_saturation: 38.0,
+        soften_brightness: -1.75,
+        soften_amount: 83.0,
     }
 }
 
@@ -3830,6 +3892,16 @@ mod tests {
         let mut gr = PreviewParams::default();
         gr.gr_on = true;
         cfgs.push(gr);
+        // soften disabled ⇒ identity; enabled ⇒ non-identity even at amount 0
+        // (the flag-only gate still emits the stage), matching to_pipeline's gate.
+        cfgs.push(PreviewParams::default());
+        let mut so0 = PreviewParams::default();
+        so0.soften_on = true;
+        so0.soften_amount = 0.0;
+        cfgs.push(so0);
+        let mut so = PreviewParams::default();
+        so.soften_on = true;
+        cfgs.push(so);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
@@ -3933,13 +4005,15 @@ mod tests {
         // (and the relocatable monochrome 64) and before splittoning 67. On by
         // itself is enough to emit the stage.
         p.gr_on = true;
+        // soften: pos 66 in v50_order — between grain 65 and splittoning 67.
+        p.soften_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "lowpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "lowpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning"]
         );
         // Base curve is the scene→display conversion point (iop_order.c pos
         // 44.0): after rgbcurve/rgblevels, before sigmoid and filmicrgb.
@@ -3976,6 +4050,12 @@ mod tests {
             "grain (pos 65) must run after colorize (pos 62): {names:?}");
         assert!(gr_pos < names.iter().position(|n| *n == "splittoning").unwrap(),
             "grain (pos 65) must run before splittoning (pos 67): {names:?}");
+        // Soften is the Orton effect at iop_order.c pos 66: after grain 65 and
+        // before splittoning 67.
+        let so_pos = names.iter().position(|n| *n == "soften").unwrap();
+        assert!(so_pos > gr_pos, "soften (pos 66) must run after grain (pos 65): {names:?}");
+        assert!(so_pos < names.iter().position(|n| *n == "splittoning").unwrap(),
+            "soften (pos 66) must run before splittoning (pos 67): {names:?}");
         // Denoise is scene-referred and noise-thresholds against raw-domain
         // statistics: it must run BEFORE any tone mapping (exposure onwards).
         let dn_pos = names.iter().position(|n| *n == "denoiseprofile").unwrap();
@@ -4404,6 +4484,29 @@ mod tests {
         // the defaults being right.
         assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
             "a pre-grain edit must not gain a grain stage");
+    }
+
+    #[test]
+    fn decode_v28_blob_defaults_soften_fields() {
+        // A v28 blob (the last layout before soften — 39 bools / 451 f32s) must
+        // decode with the soften fields at their defaults, so an edit saved
+        // before the soften module existed loads unchanged instead of gaining an
+        // Orton pass. As with grain, the enable flag is the load-bearing index:
+        // `unwrap_or(true)` would turn soften on for every saved edit.
+        let v28 = {
+            let mut b = vec![0u8; 1 + 39 + 451 * 4];
+            b[0] = 28;
+            b
+        };
+        let decoded = PreviewParams::decode(&v28).expect("v28 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.soften_on, def.soften_on);
+        assert_eq!(decoded.soften_size, def.soften_size);
+        assert_eq!(decoded.soften_saturation, def.soften_saturation);
+        assert_eq!(decoded.soften_brightness, def.soften_brightness);
+        assert_eq!(decoded.soften_amount, def.soften_amount);
+        assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
+            "a pre-soften edit must not gain a soften stage");
     }
 
     #[test]

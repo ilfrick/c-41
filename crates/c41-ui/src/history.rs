@@ -548,6 +548,16 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if grain {
         return "Grain";
     }
+    // Soften (pos 66 in iop_order.c, immediately after grain 65) — the Orton
+    // effect. Placed here so the group sits with its true neighbour.
+    let soften = old.soften_on != new.soften_on
+        || old.soften_size != new.soften_size
+        || old.soften_saturation != new.soften_saturation
+        || old.soften_brightness != new.soften_brightness
+        || old.soften_amount != new.soften_amount;
+    if soften {
+        return "Soften";
+    }
     // Tone curve (m4-122): the L anchors are compared pairwise (the array is a
     // plain [(f32, f32); 20], so `!=` does the right thing).
     let tc = old.tc_on != new.tc_on
@@ -798,6 +808,14 @@ mod tests {
             "Grain"
         );
         assert_eq!(
+            describe_change(&base, &PreviewParams { soften_amount: 20.0, ..d() }),
+            "Soften"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { soften_on: true, ..d() }),
+            "Soften"
+        );
+        assert_eq!(
             describe_change(&base, &PreviewParams { primaries_red_hue: 10.0, ..d() }),
             "Primaries"
         );
@@ -1003,6 +1021,11 @@ mod tests {
             gr_coarseness: _,
             gr_strength: _,
             gr_midtones_bias: _,
+            soften_on: _,
+            soften_size: _,
+            soften_saturation: _,
+            soften_brightness: _,
+            soften_amount: _,
             primaries_on: _,
             primaries_achromatic_tint_hue: _,
             primaries_achromatic_tint_purity: _,
@@ -1241,7 +1264,9 @@ mod tests {
         // four LL-mode sliders).
         // #2 (grain): 1831 → 1844 (1 + 39 bools + 451 f32 — enabled + the three
         // coarseness/strength/mid-tones-bias sliders).
-        assert_eq!(PreviewParams::default().encode().len(), 1844);
+        // #2 (soften): 1844 → 1861 (1 + 40 bools + 455 f32 — enabled + the four
+        // size/saturation/brightness/amount sliders).
+        assert_eq!(PreviewParams::default().encode().len(), 1861);
     }
 
     #[test]

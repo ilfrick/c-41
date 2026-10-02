@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basecurve, basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, grain, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basecurve, basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, grain, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, soften, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -599,6 +599,40 @@ pub enum Stage {
         scale: f32,
         space: ColorSpace,
     },
+    /// Soften (soften.c) — the Orton effect: overexpose (HSL lightness and
+    /// saturation lift), box-blur the result, then blend the blurred version
+    /// back over the original by `amount`. iop_order.c v50 pos 66, between grain
+    /// 65 and splittoning 67.
+    ///
+    /// Works directly in **linear RGB** (the C's `default_colorspace` is
+    /// `IOP_CS_RGB` — no Lab round-trip), so [`Self::working_space`] returns
+    /// `None`; the driver is `soften::process`.
+    ///
+    /// **NOT pixel-local** — the box mean reads a spatial neighbourhood, so the
+    /// band-parallel path would blur across band seams; `process` routes the
+    /// whole frame serial, same reason as Bloom/Lowpass/Sahdhi.
+    ///
+    /// No `scale` field: the C's radius is
+    /// `MIN(mrad, ceil(rad * roi_in->scale / piece->iscale))`, and that ratio is
+    /// identically 1 in c41 (a funnel hands the pipeline one whole frame, so the
+    /// ROI *is* the buffer and the two scales are equal). Note this leaves no
+    /// radius deviation either: the C's `iwidth * iscale` is that same buffer
+    /// width, so `radius_for`'s `hypot(width, height)` is the C's `mrad`, not a
+    /// substitute. See `soften::process`.
+    Soften {
+        /// `size` slider 0..100 (default 50) — blur radius as a fraction of the
+        /// image diagonal (`soften.c:134`).
+        size: f32,
+        /// `saturation` slider 0..100 (default 100) — divided by 100 in the
+        /// driver; scales the overexposed HSL saturation.
+        saturation: f32,
+        /// `brightness` slider −2..2 (default 0.33) — the driver applies
+        /// `1/exp2(-brightness)` to HSL lightness.
+        brightness: f32,
+        /// `amount` ("mix") slider 0..100 (default 50) — weight of the blurred
+        /// buffer in the final blend.
+        amount: f32,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -664,6 +698,7 @@ impl Stage {
             Stage::DenoiseProfile { .. } => "denoiseprofile",
             Stage::LensCorrection { .. } => "lens",
             Stage::Grain { .. } => "grain",
+            Stage::Soften { .. } => "soften",
         }
     }
 
@@ -806,6 +841,11 @@ impl Stage {
             // the serial whole-frame path where (width, height) is the true
             // rectangle, same reason as Bloom/LensCorrection.
             Stage::Grain { .. } => false,
+            // Soften is NOT pixel-local: the box mean reads a spatial
+            // neighbourhood, so band-splitting would blur across band seams.
+            // Returning false forces the whole pipeline serial whenever this
+            // stage is present — same reason as Bloom/Lowpass/Shadhi.
+            Stage::Soften { .. } => false,
         }
     }
 
@@ -889,6 +929,9 @@ impl Stage {
             // lightness), so it converts RGB↔Lab and must agree with the other
             // Lab-domain stages on the working space.
             Stage::Grain { space, .. } => Some(*space),
+            // Soften works directly on linear RGB (C default_colorspace is
+            // IOP_CS_RGB) — no Lab conversion, no working-space agreement.
+            Stage::Soften { .. } => None,
             _ => None,
         }
     }
@@ -1862,6 +1905,18 @@ impl Stage {
                     let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], input[i + 3]]);
                     output[i..i + 4].copy_from_slice(&rgb);
                 }
+            }
+            // ── Soften (soften.c) ───────────────────────────────────────
+            // Orton effect: overexpose in HSL, box-blur all four lanes, then
+            // blend the blurred buffer over the original by `amount`. Works
+            // directly in linear RGB (no Lab round-trip). NOT pixel-local (the
+            // box mean reads neighbours), so `process` guarantees (width,
+            // height) is the whole frame here.
+            Stage::Soften { size, saturation, brightness, amount } => {
+                soften::process(
+                    input, output, width, height,
+                    size, saturation, brightness, amount,
+                );
             }
         }
     }

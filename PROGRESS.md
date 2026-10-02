@@ -7926,3 +7926,174 @@ green plus the commit present on both remotes**.
 `c-41` container on it, previous kept as `c-41-old`; container `healthy`, UI
 answers `HTTP 200` on `:3000`. Unlike the x2 rebuild this one is behavioural —
 the running image now contains the Grain module.
+
+---
+
+### g1b — Soften module wired (2026-10-02 UTC)
+
+**What.** Second row of the G1 backlog: `Soften` (the Orton effect) is now a
+live darkroom module, wired end to end like g1a.
+
+- `c41-core/src/iop/box_filters.rs`: the verified 1-channel sliding-window core
+  is generalised to a **stride** (`blur_horizontal_strided` /
+  `blur_vertical_strided`, with thin `blur_horizontal`/`blur_vertical` wrappers
+  left for `box_mean_1ch` and its tests), and a new `box_mean_4ch` ports the C's
+  `ch == 4` dispatch. Channels never mix in the C, so this is the same per-lane
+  arithmetic as the already-verified `ch == 1` path, just strided — which avoids
+  deinterleaving into 4 planes and a second full-frame copy, and matches the C's
+  in-place `_box_mean<4>`.
+- `c41-core/src/iop/soften.rs`: the C's pixel loop (already ported as the FFI
+  kernel `darkroom_soften_process`) is extracted into a safe `overexpose` shared
+  by that entry point and the new safe `process` driver, which reproduces
+  `soften.c::process`'s three steps — overexpose, `dt_box_mean(…, 4, radius, 8)`,
+  `dt_iop_image_linear_blend(out, amt, in, …)`.
+- `pipeline.rs`: `Stage::Soften { size, saturation, brightness, amount }` at
+  iop_order v50 pos 66 (grain 65 → soften 66 → splittoning 67);
+  `working_space = None` (the module is linear-RGB, no Lab round-trip);
+  `is_pixel_local = false` (the box mean reads a neighbourhood, so
+  band-parallelism would blur across band seams) — routed serial whole-frame.
+- `c41-ui/src/preview.rs`: `soften_on`/`soften_size`/`soften_saturation`/
+  `soften_brightness`/`soften_amount`, defaults 50/100/0.33/50 (the C's
+  `$DEFAULT`s); identity gate flag-only, matching `to_pipeline` including the
+  amount-0 case; `ENCODE_VERSION` 28→29, bool index 39, floats 451–454,
+  `ENCODED_LEN = 1 + 40 + 455*4 = 1861`, `PARAMS_LAYOUTS += (29, 40, 455)`.
+- UI row in `darkroom/mod.rs` (dispatch, `LIVE_MODULE_LABELS`, `reset_module`,
+  `MODULE_MUTATIONS`), `history.rs` (`describe_change`), `stylemodules.rs`
+  (`MODULE_GROUPS` + `copy_module_group`). The fourth slider is labelled
+  **"Mix"**, which is darktable's `$DESCRIPTION` for that param (soften.c:51) —
+  c41 matches those strings verbatim where the C gives one, as Grain already
+  does with "Coarseness"/"Mid-tones bias".
+
+**Documented deviations.**
+- **No `scale` parameter.** The C's radius is
+  `MIN(mrad, ceil(rad * roi_in->scale / piece->iscale))`, and that ratio is
+  *identically* 1 for every c41 caller — a funnel hands the pipeline one whole
+  frame, so the ROI **is** the buffer and the two scales are equal. A parameter
+  that can only ever be 1.0 would be a lie in the signature, so it is folded
+  into `radius_for` and documented there. Note this leaves **no radius
+  deviation at all**: the C's `iwidth * iscale` is that same working-buffer
+  width, so `radius_for`'s `hypot(width, height)` is the C's own `mrad`, not a
+  substitute for it.
+- **The window factor is computed in f64.** `d->size + 1.0f` is a float add,
+  but C then promotes it to `double` for `fmin`/`/100.0` and for the `mrad * …`
+  product, so `((size + 1.0) as f64).min(100.0) / 100.0` is the faithful
+  spelling. In f32 this actually changes a truncation: at `size = 99` the C
+  gets `radius = 1` and an f32 evaluation gets `0`.
+- `MIN(mrad, …)` is retained to mirror soften.c:135 but is **provably
+  non-binding** (the factor is at most 1, so `rad ≤ mrad` always).
+- **Pre-existing, now written down:** `rgb2hsl`/`hsl2rgb` are float-only ports of
+  C code that evaluates `lv`/`hv`/`m2`/`m1` in **double**
+  (colorspaces.h:294-362, bare double literals). Measured worst case is 4 ulp
+  (5.96e-08) — invisible at working precision, but it is a real divergence and
+  is now documented on the functions and in the audit rather than left implicit.
+  Closing it means promoting five locals to `f64`, which belongs in its own
+  increment.
+- `box_mean_4ch` walks one lane per horizontal pass where the C's
+  `_blur_horizontal<4>` vectorises all four — same cache lines, ~2x the memory
+  traffic on that phase. Left alone deliberately: the strided core is what keeps
+  one verified implementation instead of two.
+
+**Review.** Cold, independent senior review (fresh context, adversarial) built
+its own reference harnesses rather than reading and agreeing: it transcribed
+`_box_mean<4>` and the whole soften chain into standalone C, diffed them against
+the real Rust sources, and mutation-tested its own numbers. It confirmed the two
+highest-risk items clean — the `linear_blend` argument direction (a swapped
+variant diverges by O(0.1) against our O(1e-5)) and that the Rust vertical
+enumeration covers exactly the C's `4*width` interleaved columns — and returned
+3 MAJOR, 3 MINOR, 6 NIT. All were addressed in-session.
+
+- **MAJOR 1 — a false precedent, which was the serious one.** The doc claimed
+  the buffer-diagonal `mrad` was "the deviation Bloom already carries". Bloom's
+  radius is a hard constant (`bloom.c:137`, `rad = 256.0f * fmin(100, size+1)/100`),
+  not a diagonal, so there was no precedent. Worse, chasing it down showed the
+  premise was wrong in the other direction too: under `roi_in->scale ==
+  piece->iscale` the Rust `mrad` is *bit-identical* to the C's, so there is no
+  deviation to document. The paragraph is gone from `soften.rs`, `pipeline.rs`
+  and the audit. A fabricated precedent would have buried a wrong claim as
+  pre-blessed, where nothing would ever re-examine it.
+- **MAJOR 2 — three false claims** in the `box_filters.rs` module header about
+  which C call sites use the un-ported `ch` dispatches. Replaced with a table of
+  the actual sites: `dt_box_mean` *is* called with `| BOXFILTER_KAHAN_SUM`
+  (`guided_filter.c:172`), `focus_peaking.h` never touches
+  `dt_box_mean_horizontal`/`_vertical`, and `fast_guided_filter` blurs *via*
+  `dt_box_mean` rather than an integral image. The honest reason those
+  dispatches are absent is simply that their C call sites are not ported.
+- **MAJOR 3 — `soften::process` had no C-verified pin.** The existing
+  `amount_full_blurs_a_noisy_frame` asserts only that variance drops, which
+  would pass with `radius = 1`, a reversed blend, `BOX_ITERATIONS = 4`, an
+  identity overexpose, or no alpha-zeroing at all — plausibility, not behaviour.
+  Three golden vectors transcribed from the C close it: a 4×4 radius-0 frame
+  fixing the `1/exp2f(-b)` scaling, the HSL round-trip, step order and — via a
+  golden alpha of `0.5·0 + 0.5·1` — the `linear_blend` direction; a 72×72
+  radius-1 frame sampled across the column and row boundaries where a separable
+  pass covering the wrong interleaved columns would show (all alphas 0.0); and a
+  100×100 `size = 99` frame sitting exactly on the C's `fmin(100.0, size+1.0f)`
+  clamp. They are read out of the C compiled *without* fast-math, never out of
+  our own Rust, so they are evidence about the C rather than a snapshot of our
+  output: bit-identical on 60 736 of 60 736 floats for the two blur sets, worst
+  case 5.96e-08 on the radius-0 set — exactly the documented float-only
+  `rgb2hsl` residue.
+- **MINOR** — the `MIN` justified as "for a future scaled caller" when the
+  function has no scale parameter (now stated plainly as non-binding); the inner
+  buffer assert was `==` while the public API accepts `>=` (relaxed); a
+  `pub(crate)` intra-doc link reachable from a `pub fn`; wrong citations
+  (`copy_pixel` for the alpha-zeroing, which is `hsl2rgb` setting `rgb[3] = 0`;
+  the `ch == 2` dispatch cited for `_box_mean<4>`); `BOX_ITERATIONS` hardcoded
+  without its `box_filters.h:25` source.
+- **NIT** — the fourth-slider label changed to "Mix"; the horizontal-phase
+  memory-traffic cost documented rather than silently left.
+
+**The new tests are mutation-verified, not assumed.** Four mutations of the
+driver were applied in Docker (restoring the file byte-identically each time)
+and the suite run: reversing the blend direction fails 3 tests, forcing
+`radius = 0` fails 3, keeping alpha instead of zeroing it fails 3, and
+dropping the `+1` from the window factor fails **exactly one** — the 100×100
+clamp vector. That last result is the point of it: the clamp golden is the only
+thing in the suite that pins that `+1`, and therefore the only thing that makes
+the f64 promotion matter. Baseline: 11 passed, 0 failed.
+
+**Reviewer's one MINOR was itself wrong, and was not applied.** It reported the
+audit's "74 explicit `impl` blocks + 22 `geom_iop_stub!` = 96 implementors" as
+stale, wanting 75/97. The 75th `impl IopProcess for` match in the tree is the
+`geom_iop_stub!` macro **template** at `geometry.rs:16` — the source of the 22
+expansions, not a 97th implementor. `74 + 22 = 96` is correct, and "fixing" it
+would have introduced the error.
+
+**Mistakes kept.**
+1. A dead `scale` parameter on `process` and on `Stage::Soften`, whose value
+   could not affect the result (`scale / iscale` where both are the same
+   variable). Caught in self-review before review; Bloom is the precedent for a
+   spatial stage without a scale field.
+2. Two wrong doc claims written *before* review, both caught by the reviewer:
+   that `fast_guided_filter`/`guided_filter` have no c41 caller (they do exist
+   as partial ports), and then that they blur with an integral image (they blur
+   via `dt_box_mean`).
+3. The false Bloom precedent (MAJOR 1) — the most consequential, because it was
+   a wrong claim dressed as an already-accepted one.
+4. `amount_full_blurs_a_noisy_frame` used a 32×32 frame, where the C's own
+   derivation gives `mrad = int(√2·32·0.01) = 0` and **no blur happens at all**;
+   moved to 256×256. Same class as g1a's wrong-expectation rounds.
+5. The reviewer's first two harness passes were wrong before they were right: its
+   `rgb2hsl` transcription omitted the `fmaxf(denom, 1.52587890625e-05f)` EPS
+   guard (producing `s = -17.8` instead of `23635` on out-of-gamut input, and a
+   spurious 30x error), and its all-float transcription missed that
+   `colorspaces.h` evaluates in double. A "verified against a reference" claim
+   is not self-validating; both had to be chased down before their output could
+   be used as a golden.
+6. Local-toolchain note for next time: `cargo test -p c41-core` **alone** in
+   Docker re-resolves `ort-sys` under a different unit hash than the gate's
+   `--workspace` and dies with `could not find native static library
+   onnxruntime`; use `--workspace` (with a test-name filter) so it hits the
+   cached build.
+
+**Verified.** Docker `scripts/ci-local.sh` exit 0 on the final tree — all four
+steps (`cargo check --workspace --locked`, `cargo clippy --workspace
+--all-targets --locked`, `cargo test --workspace --release --locked`, release
+`c41-rs` link). Release suites: `c41-core` **1831**, `c41-db` **100**,
+`c41-ui` **523**, 0 failed (was 1822/100/522 — +9 core, +1 ui).
+`cargo check --locked -p c41-core --all-targets` clean with the same 25 lib / 9
+lib-test pre-existing warnings and none added. `PARITY_AUDIT.md` recount
+updated in the same commit: 36 LIVE rows, "38 of 52 active", 14 inert, 33
+pipeline import names, the Soften row marked wired, and the Soften paragraph
+rewritten (the false divergence claim removed, the golden vectors and the
+float-only `rgb2hsl` residue recorded).
