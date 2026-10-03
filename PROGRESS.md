@@ -8107,3 +8107,15 @@ and the `full-c` on-demand job all skipped as expected. This increment touches
 actually ran and passed. gitea remains a push mirror with no CI runner
 registered, so "confirm CI" here means **GitHub CI green plus the commit
 present on both remotes**.
+
+**Running image.** Rebuilt `c-41:latest` from the current tree (image
+`c6c80304f5d1`, `--build-arg CACHEBUST=8f348a8be5`, binary written
+2026-10-02 20:01 local) and relaunched the long-lived `c-41` container on it,
+previous kept as `c-41-old`. Container `Up … (healthy)`, `c41-rs` running
+(PID 302), UI answers `HTTP 200` on `:3000`, and the log scan for
+`panicked`/`Aborted`/`restarting`/`Failed to set text`/`assertion` is **0
+lines**. Verified the increment is actually *in* the shipped binary rather than
+assuming the rebuild picked it up: `/usr/local/bin/c41-rs` contains both the
+Soften row subtitle `Orton effect (overexpose + blur)` and the new `Mix` slider
+label that only exists as of g1b. Unlike the x2 rebuild this one is behavioural
+— the running image now contains the Soften module alongside Grain.
