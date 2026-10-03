@@ -8097,3 +8097,13 @@ updated in the same commit: 36 LIVE rows, "38 of 52 active", 14 inert, 33
 pipeline import names, the Soften row marked wired, and the Soften paragraph
 rewritten (the false divergence claim removed, the golden vectors and the
 float-only `rgb2hsl` residue recorded).
+
+**Remote CI.** Committed as `8f348a8be5` and pushed to both remotes; `master`
+verified at that SHA on GitHub and gitea via `ls-remote`. GitHub CI is green:
+`Rust` (`check + test + clippy`) → `success` and `Docker Build & Publish`
+(`Build & push Docker image`) → `success`; `Mark stale issues`, `Nightly PKG`
+and the `full-c` on-demand job all skipped as expected. This increment touches
+`crates/**`, so `rust.yml` was not path-filtered out and the Rust workflow
+actually ran and passed. gitea remains a push mirror with no CI runner
+registered, so "confirm CI" here means **GitHub CI green plus the commit
+present on both remotes**.
