@@ -8411,3 +8411,39 @@ out-of-range `df_mode` cannot produce an out-of-range GTK selection.
 
 **Local gate:** `scripts/ci-local.sh` green on all four steps; full suite
 1857 (c41-core) + 525 (c41-ui) + 100 (c41-db) + 1 (lensfun), 0 failures.
+
+**Remote CI.** Committed as `7eea77171d` and pushed to both remotes; `master`
+verified at that SHA on GitHub and on gitea via `ls-remote`. GitHub CI is green:
+`Rust` → `success` and `Docker Build & Publish` → `success`; `Darkroom CI`
+skipped as expected. This increment touches `crates/**`, so `rust.yml` was not
+path-filtered out and the Rust workflow actually ran rather than being skipped —
+which matters here, because the bug that was fixed was one that **only manifests
+under `--release`**, and the Rust workflow is what proves the release-mode test
+suite is green. gitea remains a push mirror with no CI runner registered, so
+"confirm CI" here means **GitHub CI green plus the commit present on both
+remotes**.
+
+**Running image.** Rebuilt `c-41:latest` from the current tree (image
+`0b86d8c0d908`, `--build-arg CACHEBUST=7eea77171d`) and relaunched the long-lived
+`c-41` container on it, previous kept as `c-41-old`. Container `Up (healthy)`,
+0 restarts, `c41-rs` running, UI answers `HTTP 200` on `:3000`, and the log scan
+for `panicked`/`Aborted`/`restarting`/`Failed to set text`/`assertion` is **0
+lines**.
+
+Verified the increment is actually *in* the shipped binary rather than assuming
+the rebuild picked it up — `docker cp`'d `/usr/local/bin/c41-rs` out of the new
+image and grepped it. Present: the Defringe row subtitle `chroma aberration —
+upstream deprecated`, all three dropdown labels, and — deliberately — the two
+*fixes* from this review round, since those are the strings that could only
+exist if this exact commit was built: `defringe: Lab scratch buffers are n*4`
+(the unconditional-call panic message; if the `debug_assert!` were still there
+this string would be absent) and `defringe: input must be width*height*4` (the
+hardened length guard, which was a `debug_assert_eq!` and so absent from a
+release binary before this review). The g1a/g1b strings (`Orton effect
+(overexpose + blur)`, `Grain`) are still present.
+
+One caveat worth recording for future increments: the row subtitle contains an
+em-dash, so `strings` splits it — `strings | grep -cF "chroma aberration —
+upstream deprecated"` returns **0** on a binary that plainly contains it. Grep
+the UTF-8 bytes directly, or match an ASCII half. A false negative here would
+have been easy to misread as "the rebuild didn't pick up the change".
