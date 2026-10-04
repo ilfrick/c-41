@@ -58,6 +58,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Bloom",
     "Grain",
     "Soften",
+    "Defringe",
     "Tone curve",
     "RGB curve",
     "Base curve",
@@ -377,6 +378,13 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.soften_amount = src.soften_amount;
             true
         }
+        "Defringe" => {
+            target.df_on = src.df_on;
+            target.df_radius = src.df_radius;
+            target.df_thresh = src.df_thresh;
+            target.df_mode = src.df_mode;
+            true
+        }
         "Tone curve" => {
             target.tc_on = src.tc_on;
             target.tc_type = src.tc_type;
@@ -470,7 +478,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 36);
+        assert_eq!(MODULE_GROUPS.len(), 37);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();

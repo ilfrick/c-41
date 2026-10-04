@@ -539,6 +539,51 @@ pub struct PreviewParams {
     /// Blurred/original blend weight ("mix"), 0..100, default 50; divided by
     /// 100 in the driver.
     pub soften_amount: f32,
+    // ── Defringe (defringe.c) ────────────────────────────────────────────────
+    // Chromatic-aberration corrective: replaces the a/b of any pixel whose "edge
+    // chroma" (or any of its 8 neighbours') clears a threshold with an
+    // inverse-chroma-weighted average of a Fibonacci-lattice sample of the
+    // neighbourhood. Lab module (C `default_colorspace` is `IOP_CS_LAB`).
+    //
+    // **Placement is a documented deviation from `iop_order.c`, not a free
+    // choice.** v50 gives `defringe` position 31.0 (`iop_order.c:351`,
+    // commented "desaturate fringes in Lab, so needs properly calibrated
+    // colours in order for chromaticity to be meaningful"), between
+    // `colorchecker` 30.0 and `atrous` 32.0 — a scene-referred slot, well
+    // before the tone map at `basecurve` 44.0 / `sigmoid` 45.3. We run it
+    // immediately before `lowpass` (v50 33.0, only `atrous` between them, which
+    // c41 lacks), preserving their v50-relative order and inheriting the
+    // already-documented Lowpass deviation. See `Stage::Defringe` in
+    // `c41-core/src/pipeline.rs` for the full argument.
+    //
+    // `defringe` also carries `IOP_FLAGS_DEPRECATED` (defringe.c:98-101,
+    // redirecting to *chromatic aberrations*) with no rationale given upstream.
+    // Not a blocker: `vibrance` and `basicadj` are likewise deprecated and both
+    // are live here.
+    //
+    // **The module is deprecated upstream** (`defringe.c:98-101`, redirecting
+    // to *chromatic aberrations*) with no rationale given there. Note
+    // `defringe.c:180` hardcodes `order = 1`, and darktable's recursive Gaussian
+    // is only unity-gain at `order == 0` — so the filter is a high-pass, not a
+    // blur. It is reproduced exactly as the C has it; see
+    // `c41_core::iop::defringe` for the measurements (the edge map is a local
+    // chroma-*contrast* measure, sigma-dependent, not raw `a² + b²`).
+    /// Defringe module enabled. Ships off, like darktable's default.
+    pub df_on: bool,
+    /// "edge detection radius" (defringe.c:45), 0.5..20, default 4. Feeds both
+    /// the blur sigma (`fmax(0.1, |radius|)`) and the derived detection radius
+    /// `ceil(2.0 * ceilf(sigma))`. The C's slider range is quoted verbatim; the
+    /// floor of 0.1 inside the kernel is below the slider minimum and is only
+    /// reachable from a style or preset.
+    pub df_radius: f32,
+    /// "threshold" (defringe.c:46), 0.5..128, default 20 — higher values mean
+    /// less defringing. In the two averaging modes the effective threshold is
+    /// `max(0.1, 4 * thresh * avg_edge_chroma / 33)`.
+    pub df_thresh: f32,
+    /// Operation mode (defringe.c:37-42), stored as the C enum's ordinal:
+    /// 0 = global average (fast, the default), 1 = local average (slow),
+    /// 2 = static threshold (fast). See `c41_core::iop::defringe::DefringeMode`.
+    pub df_mode: f32,
     // ── Tone curve (tonecurve.c) ────────────────────────────────────────────
     // Three-channel Lab LUT module (iop_order.c pos 48, between colisa 47 and
     // levels 49). First slice: the L channel editor only — a/b keep their C
@@ -929,6 +974,10 @@ impl Default for PreviewParams {
             soften_saturation: 100.0, // soften.c $DEFAULT
             soften_brightness: 0.33,  // soften.c $DEFAULT
             soften_amount: 50.0,      // soften.c $DEFAULT
+            df_on: false,
+            df_radius: 4.0,   // defringe.c $DEFAULT
+            df_thresh: 20.0,  // defringe.c $DEFAULT
+            df_mode: 0.0,     // MODE_GLOBAL_AVERAGE (defringe.c $DEFAULT)
             tc_on: false,
             tc_type: 2.0,        // MONOTONE_HERMITE ($DEFAULT annotation)
             tc_autoscale: 3.0,   // DT_S_SCALE_AUTOMATIC_RGB (C default)
@@ -1376,7 +1425,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1550,6 +1599,11 @@ impl PreviewParams {
         }
         // Soften (v29): the four sliders, appended after the grain block.
         for s in [self.soften_size, self.soften_saturation, self.soften_brightness, self.soften_amount] {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        // Defringe (v30): the two sliders plus the mode dropdown's ordinal,
+        // appended after the soften block.
+        for s in [self.df_radius, self.df_thresh, self.df_mode] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -1815,6 +1869,33 @@ impl PreviewParams {
             soften_saturation: f.get(452).copied().unwrap_or(d.soften_saturation),
             soften_brightness: f.get(453).copied().unwrap_or(d.soften_brightness),
             soften_amount: f.get(454).copied().unwrap_or(d.soften_amount),
+            // Defringe (v30): bool 40, floats 455–457. v29-and-earlier blobs
+            // end before any of this — defaults hold.
+            df_on: bools.get(40).map_or(d.df_on, |&b| b != 0),
+            // Clamped to the C slider range (defringe.c:45-46) because a blob is
+            // not trusted input: it can be hand-edited or corrupt, and `radius`
+            // reaches the kernel through a `float -> int` cast (`detection_radius`),
+            // where a huge value saturates. The GUI slider already clamps on the
+            // way out, so this only ever fires for values the UI could not have
+            // produced — but the kernel should never be handed one, and clamping
+            // here is the layer that knows the range.
+            //
+            // `clamp` does **not** sanitise NaN (`f32::clamp` returns NaN: both
+            // `NaN < min` and `NaN > max` are false). That is fine rather than a
+            // gap, because the kernel is NaN-safe by construction — `sigma`
+            // uses `f32::max(0.1)`, which ignores NaN, and `detection_radius`
+            // turns the resulting NaN into `rad == 0` via a saturating `as i32`.
+            // `defringe_absurd_radius_cannot_overflow_the_early_exit` in
+            // `c41-core/src/pipeline.rs` pins that for both a huge radius and a
+            // NaN one.
+            df_radius: f.get(455).copied().unwrap_or(d.df_radius).clamp(0.5, 20.0),
+            df_thresh: f.get(456).copied().unwrap_or(d.df_thresh).clamp(0.5, 128.0),
+            // `df_mode` is deliberately NOT clamped here: it is a dropdown *index*,
+            // and `DefringeMode::from_ordinal` already maps anything out of range
+            // to the C's `$DEFAULT`, which is the behaviour a UI can present. The
+            // raw float is kept so the stored value stays a faithful record of
+            // what the blob said.
+            df_mode: f.get(457).copied().unwrap_or(d.df_mode),
         })
     }
 
@@ -2288,6 +2369,34 @@ impl PreviewParams {
                 space,
             });
         }
+        // Defringe — v50 `iop_order.c:351` gives it position 31.0 (scene-referred,
+        // "needs properly calibrated colours in order for chromaticity to be
+        // meaningful"). We run it immediately before Lowpass, which is v50 33.0:
+        // the two are adjacent upstream with only `atrous` (32.0, not implemented
+        // here) between them, so this preserves their relative order and inherits
+        // the already-documented Lowpass deviation. See `Stage::Defringe`.
+        //
+        // It still lands before grain/soften, so any chroma the module leaves
+        // behind is treated like any other image content rather than being baked
+        // in under a noise or Orton pass.
+        //
+        // The gate is flag-only, unlike Soften/Lowpass: there is no combination
+        // of sliders that makes defringe an identity. Even at the extremes a
+        // non-degenerate frame has some pixel over threshold, and the `else` arm
+        // that would make it a pure copy is unreachable once any pixel qualifies.
+        // (The kernel's own early exit — a frame smaller than `2*radius+1` in
+        // either axis — handles the "nothing to do" case internally.)
+        if self.df_on {
+            p.push(Stage::Defringe {
+                radius: self.df_radius,
+                thresh: self.df_thresh,
+                // `from_ordinal` is total and maps anything out of range to the
+                // C's `$DEFAULT` (global average) instead of panicking, so a
+                // hand-edited blob carrying e.g. 7.0 is safe.
+                mode: c41_core::iop::defringe::DefringeMode::from_ordinal(self.df_mode as i32),
+                space,
+            });
+        }
         // Lowpass (iop_order.c v50_order pos 33.0) — a Gaussian-blur-based local
         // contrast enhancement that runs in Lab: blur a copy, then apply the
         // contrast/brightness LUT pair + a/b saturation to the blurred pixels. It
@@ -2687,9 +2796,11 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v28 adds grain (1 bool + 3 f32, the wired LIGHTNESS-channel sliders — the
 /// grain *channel* itself is not a param, see [`PreviewParams::gr_on`]).
 /// v29 adds soften (1 bool + 4 f32: size, saturation, brightness, amount).
-const ENCODE_VERSION: u8 = 29;
-/// 1 version byte + 40 bool bytes + 455 little-endian f32.
-const ENCODED_LEN: usize = 1 + 40 + 455 * 4;
+/// v30 adds defringe (1 bool + 3 f32: radius, thresh, and the mode dropdown's
+/// enum ordinal stored as a float).
+const ENCODE_VERSION: u8 = 30;
+/// 1 version byte + 41 bool bytes + 458 little-endian f32.
+const ENCODED_LEN: usize = 1 + 41 + 458 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2714,6 +2825,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (27, 38, 448), // v27: local contrast added
     (28, 39, 451), // v28: grain added
     (29, 40, 455), // v29: soften added
+    (30, 41, 458), // v30: defringe added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3472,6 +3584,12 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         soften_saturation: 38.0,
         soften_brightness: -1.75,
         soften_amount: 83.0,
+        df_on: true,
+        df_radius: 7.5,
+        df_thresh: 62.0,
+        // 1 = MODE_LOCAL_AVERAGE, deliberately NOT the default 0, so the fixture
+        // catches an off-by-one in the ordinal round-trip.
+        df_mode: 1.0,
     }
 }
 
@@ -4007,13 +4125,18 @@ mod tests {
         p.gr_on = true;
         // soften: pos 66 in v50_order — between grain 65 and splittoning 67.
         p.soften_on = true;
+        // defringe: v50 iop_order.c gives it 31.0 (scene-referred). We run it
+        // immediately before lowpass (v50 33.0) — adjacent upstream too, with
+        // only `atrous` between — which preserves their relative order and
+        // inherits the documented Lowpass deviation. See `Stage::Defringe`.
+        p.df_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "lowpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning"]
         );
         // Base curve is the scene→display conversion point (iop_order.c pos
         // 44.0): after rgbcurve/rgblevels, before sigmoid and filmicrgb.
@@ -4056,6 +4179,21 @@ mod tests {
         assert!(so_pos > gr_pos, "soften (pos 66) must run after grain (pos 65): {names:?}");
         assert!(so_pos < names.iter().position(|n| *n == "splittoning").unwrap(),
             "soften (pos 66) must run before splittoning (pos 67): {names:?}");
+        // Defringe: v50 puts it at 31.0, before the tone map (basecurve 44.0 /
+        // sigmoid 45.3); the assertion that actually matters is that it stays
+        // before `sigmoid`, i.e. that it still sees scene-referred chroma rather
+        // than tone-mapped values. The `grain` assertion pins its position in the
+        // pre-creative cluster. See `Stage::Defringe`.
+        let df_pos = names.iter().position(|n| *n == "defringe").unwrap();
+        // v50 gives defringe 31.0 — a *scene-referred* slot, well before the tone
+        // map. That is the invariant worth pinning: if defringe ever drifts after
+        // `basecurve`/`sigmoid`, it would be thresholding chroma in
+        // tone-mapped values instead of scene-referred ones, which is a different
+        // algorithm from the one darktable ships.
+        let sig_pos_df = names.iter().position(|n| *n == "sigmoid").unwrap();
+        assert!(df_pos < sig_pos_df,
+            "defringe (v50 31.0) must run before the sigmoid tone map: {names:?}");
+        assert!(df_pos < gr_pos, "defringe must run before grain: {names:?}");
         // Denoise is scene-referred and noise-thresholds against raw-domain
         // statistics: it must run BEFORE any tone mapping (exposure onwards).
         let dn_pos = names.iter().position(|n| *n == "denoiseprofile").unwrap();
@@ -4507,6 +4645,56 @@ mod tests {
         assert_eq!(decoded.soften_amount, def.soften_amount);
         assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
             "a pre-soften edit must not gain a soften stage");
+    }
+
+    #[test]
+    fn decode_v29_blob_defaults_defringe_fields() {
+        // A v29 blob (the last layout before defringe — 40 bools / 455 f32s) must
+        // decode with the defringe fields at their defaults, so an edit saved
+        // before the defringe module existed loads unchanged instead of gaining a
+        // chroma pass. `df_on` is the load-bearing index: `unwrap_or(true)` would
+        // turn defringe on for every saved edit, and defringe is *not* neutral at
+        // its defaults (unlike soften, there is no slider combination that makes
+        // it an identity), so that would silently alter every old edit.
+        let v29 = {
+            let mut b = vec![0u8; 1 + 40 + 455 * 4];
+            b[0] = 29;
+            b
+        };
+        let decoded = PreviewParams::decode(&v29).expect("v29 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.df_on, def.df_on);
+        assert_eq!(decoded.df_radius, def.df_radius);
+        assert_eq!(decoded.df_thresh, def.df_thresh);
+        assert_eq!(decoded.df_mode, def.df_mode);
+        // And the defaults must be the *off* defaults the rest of this file
+        // assumes (the identity-pipeline assertions throughout depend on it).
+        assert!(!decoded.df_on, "defringe must ship off, like every other ported module");
+        assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
+            "a pre-defringe edit must not gain a defringe stage");
+    }
+
+    /// A blob carrying an out-of-range `df_mode` must not produce an out-of-range
+    /// GTK selection. `DefringeMode::from_ordinal` is total and maps anything
+    /// outside {0,1,2} to the C's `$DEFAULT` (global average, ordinal 0); the UI
+    /// row runs the selection through the same function, so the dropdown shows
+    /// "global average (fast)" rather than index 7. Pinned here because the
+    /// dropdown is built in GTK code that the unit tests cannot construct.
+    #[test]
+    fn out_of_range_defringe_mode_falls_back_to_the_default_ordinal() {
+        use c41_core::iop::defringe::DefringeMode;
+        for junk in [-1.0f32, 3.0, 7.0, 1e9, f32::NAN] {
+            let m = DefringeMode::from_ordinal(junk as i32);
+            assert_eq!(m.ordinal(), 0,
+                "df_mode {junk} must clamp to ordinal 0 (global average), got {}", m.ordinal());
+            // And the ordinal must be a valid GTK DropDown index in range.
+            assert!((m.ordinal() as u32)
+                < c41_core::iop::defringe::DEFRINGE_MODE_COUNT as u32);
+        }
+        // The in-range values round-trip untouched, in order.
+        assert_eq!(DefringeMode::from_ordinal(0).ordinal(), 0);
+        assert_eq!(DefringeMode::from_ordinal(1).ordinal(), 1);
+        assert_eq!(DefringeMode::from_ordinal(2).ordinal(), 2);
     }
 
     #[test]

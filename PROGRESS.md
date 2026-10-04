@@ -8119,3 +8119,295 @@ assuming the rebuild picked it up: `/usr/local/bin/c41-rs` contains both the
 Soften row subtitle `Orton effect (overexpose + blur)` and the new `Mix` slider
 label that only exists as of g1b. Unlike the x2 rebuild this one is behavioural
 — the running image now contains the Soften module alongside Grain.
+
+### g1c — Defringe module wired (2026-10-03 UTC)
+
+**What.** Third row of the G1 backlog: `Defringe` is now a live darkroom
+module, wired end to end like g1a/g1b. Unlike those two, the module's C process
+loop had never been ported at all — `defringe.rs` existed only as an
+`IopProcess` stub returning `Err` — so this increment is the port *and* the
+wiring.
+
+- `c41-core/src/iop/defringe.rs`: a complete port of `defringe.c::process`
+  (lines 168-384) as a safe `pub fn process(...)`. The pieces the C keeps in
+  scope are split out so they can be pinned without allocating a frame:
+  `detection_radius` (the nested `ceil(2.0 * ceilf(sigma))`),
+  `sample_index` (the Fibonacci-count ladder), `fib_latt` (the lattice offset),
+  `DefringeMode` with a total `from_ordinal`, and `MAGIC_THRESHOLD_COEFF`.
+  `darkroom_defringe_edge_chroma_pass` — the `#[no_mangle]` kernel c41's own
+  tree already called instead of upstream's inline loop — is kept and is what
+  `process` uses for step 2.
+- `pipeline.rs`: `Stage::Defringe { radius, thresh, mode, space }`;
+  `working_space = Some(*space)` (Lab, like the other 15 Lab stages) with the
+  RGB↔Lab sandwich done in the stage's `apply` arm; `is_pixel_local = false`
+  (the lattice average reaches up to `24 + 4*radius` pixels across) — routed
+  serial whole-frame.
+- `c41-ui/src/preview.rs`: `df_on`/`df_radius`/`df_thresh`/`df_mode`, defaults
+  4.0/20.0/`MODE_GLOBAL_AVERAGE`; identity gate flag-only; `ENCODE_VERSION`
+  29→30, bool index 40, floats 455–457, `ENCODED_LEN = 1 + 41 + 458*4 = 1874`,
+  `PARAMS_LAYOUTS += (30, 41, 458)`.
+- UI row in `darkroom/mod.rs` (dispatch, `LIVE_MODULE_LABELS` 36→37,
+  `reset_module`, `MODULE_MUTATIONS`), `history.rs` (`describe_change`),
+  `stylemodules.rs` (`MODULE_GROUPS` 36→37 + `copy_module_group`). Two sliders
+  plus a `DropDown` whose index *is* the C enum ordinal — the module's
+  `$DESCRIPTION` strings verbatim, in ordinal order, so no mapping table is
+  needed. This is the first enum/dropdown param in this series;
+  `gtk4::DropDown::from_strings` inside a module row was already the established
+  pattern (highlight reconstruction's method selector, lens correction's
+  corrections combo).
+
+**Placement: a documented deviation from `iop_order.c`, not a free choice.**
+darktable *does* place this module — v50 `iop_order.c:351` gives it **31.0**,
+commented *"desaturate fringes in Lab, so needs properly calibrated colours in
+order for chromaticity to be meaningful"*, between `colorchecker` (30.0) and
+`atrous` (32.0). c41 runs it immediately before `Lowpass`, which is *not* where
+v50 puts either (`lowpass` is 33.0). That is defensible on two counts: `defringe`
+(31.0) and `lowpass` (33.0) are **adjacent upstream** — the only module between
+them is `atrous` (32.0), which c41 does not implement — so c41 preserves their
+relative order; and both move together under the **already-documented Lowpass
+deviation** (Lowpass runs after `Shadhi` 50.0 "matching the legacy placement")
+rather than splitting a v50-adjacent pair.
+
+The load-bearing invariant that *is* preserved is that the stage runs **before the
+tone map** — v50's 31.0 is well before `basecurve` (44.0) / `sigmoid` (45.3),
+and so is c41's placement — so it thresholds scene-referred chroma, not
+tone-mapped values. That is what the pinned order test now asserts, rather than
+the bare "after shadhi" it asserted before this review.
+
+Separately, `defringe` carries `IOP_FLAGS_DEPRECATED` (defringe.c:98-101,
+redirecting to *chromatic aberrations*) with **no rationale given upstream**.
+That is not a blocker: `vibrance` and `basicadj` are likewise deprecated and both
+are live here. It still lands before grain/soften, so any chroma the module leaves
+behind is treated like any other image content rather than baked in under a noise
+or Orton pass.
+
+**The headline finding: `order = 1` makes the "blur" a high-pass.** `defringe.c:180`
+hardcodes `const int order = 1;`, and darktable's recursive Gaussian is only
+unity-gain at `order == 0`. On a **constant** Lab frame that annihilates DC
+(measured against the real C, `dt_gaussian_blur_4c`, sigma 4.0):
+
+```text
+order=0  sigma=4.0   50.0000153  12.0000038  -6.99999919   1.0
+order=1  sigma=4.0    0           0           -2.84e-14   3.6e-15
+```
+
+**That constant-frame result does not generalise, and reading it as a description
+of the filter is a trap this review caught.** `order = 1` is a *differentiating*
+recursive filter: it annihilates DC, but on any non-constant input it returns a
+finite, signal-dependent residual, not zero. Measured on LCG-noise Lab frames,
+comparing the a/b RMS of the input against the filter's output:
+
+```text
+24x24 sigma=0.5   RMS(a_in)=34.43  RMS(a_out)=57.37   mean edge/raw = 2.2211
+24x24 sigma=4.0   RMS(a_in)=34.43  RMS(a_out)=12.68   mean edge/raw = 1.0898
+24x24 sigma=20.0  RMS(a_in)=34.43  RMS(a_out)=36.31   mean edge/raw = 1.6188
+64x64 sigma=4.0   RMS(a_in)=34.78  RMS(a_out)=10.71   mean edge/raw = 1.0650
+```
+
+So `edge = (a - hp(a))² + (b - hp(b))²` is a genuine **local chroma-contrast**
+measure, not the frame's raw `a² + b²`. The ratio is never 1.0 — ~1.09 at sigma 4,
+1.62 at sigma 20, and **2.22 at sigma 0.5**, where the filter *amplifies* chroma
+rather than removing it. An earlier draft of this entry (and of the module docs)
+claimed the map "collapses to raw chroma magnitude squared" and thresholds on
+absolute chroma; that was an over-read of the constant-frame result and is
+withdrawn. Thresholding on local chroma contrast is, incidentally, a sensible
+thing to threshold on.
+
+The port reproduces the C's `order = 1` exactly, because the job here is to match
+the module and not to repair it. `GaussianOrder::One` is load-bearing: switching
+it to `GaussianOrder::Zero` changes the algorithm, and the goldens fail loudly.
+Upstream's own deprecation message gives no rationale, and none is invented here.
+
+This is also why the output **alpha comes back as the edge-chroma map rather
+than 1.0**: the C's `else` arm copies only channels 0..3, because alpha
+"contains info needed by neighboring pixels" (defringe.c:367). That is
+faithful, and consistent with Soften's FFI kernel also trampling alpha. The
+stage's `apply` arm therefore does *not* restore `input`'s alpha — the only
+Lab stage that doesn't — and says why.
+
+**Evidence: 13 C golden sets, bit-exact.** The reference is upstream darktable's
+`defringe.c` copied verbatim, with the gaussian **auto-extracted verbatim** from
+`src/common/gaussian.c` (not transcribed, so the reference cannot drift), c41's
+patch reverted, compiled **without** `-ffast-math`. Goldens are read out of the
+C, never out of our own Rust. **23 984 floats, worst |Rust − C| = 0.0 on every
+set**, including strict bit-exact output-checksum assertions. Each set asserts
+the harness's FNV-1a input checksum first, so an input mismatch is reported as
+such rather than surfacing as a mysterious output difference.
+
+The goldens found a real port bug before review: the lattice bounds clamps were
+first written backwards (`v_is.max(0) - 1` instead of `(v_is - 1).max(0)`, same
+for `t_is` → `lm`), which produced `-69` index panics. They also settled three
+of my own *test expectations* as wrong while the port was right.
+
+**Mutation-tested for non-vacuity — 19 kills, 3 proven-equivalent survivors.**
+Four goldens were the first attempt and the harness found real gaps:
+
+- *`Lab clamp widened* survived → the frames were all inside the Lab gamut, so
+  the gaussian's `Labmin`/`Labmax` clamp never bound. Fixed by adding the
+  out-of-gamut sets **J/K/L** (L up to 260, |a|,|b| up to 200, alpha > 1).
+- *`sigma floor 0.1 → 0.0* survived → no set had radius < 0.1. The floor **is**
+  observable (measured: a 6.1e-05 blur difference), it is just unreachable from
+  the GUI slider, whose minimum is 0.5. Added set **M** at radius 0.
+- *`detection_radius` nested ceil dropped* survived → every radius in the suite
+  gave the same answer either way. A sweep of the whole slider found the inner
+  ceil changes the detection radius for **48.7 %** of slider values; sets
+  **N/O** at radius 1.5 are where it bites on three axes at once (rad 4 vs 3,
+  `small_radius` 4 vs 3, ladder index 8 vs 7).
+
+Three mutations survive *by construction*, and the docs now say so rather than
+implying coverage:
+
+- The threshold's **f64-vs-f32 spelling**: a sweep of ~300 (chroma, threshold)
+  pairs across the module's whole slider range found **zero** pixel verdicts
+  that differ. Preserved for fidelity to the C, not because a golden pins it.
+- The **`10.0 * FLT_EPSILON`** guard on `avg_edge_chroma`: also zero verdict
+  flips; it could only matter if `4*thresh*avg/33` landed within one ulp of the
+  `0.1` floor, and the sweep never put it there.
+- **`sample_index`'s `> 89` rung**: unreachable, and that is a property of the C.
+  `samples_wish = radius²` and `radius = ceil(2*ceil(sigma))` is always *even*, so
+  `radius = 2k` and `samples_wish = 4k²` exactly. Rung 9's window is
+  `21 < samples_wish <= 34`; the only perfect square in that window is 25, and
+  `25 = 4k²` has no integer solution (`k² = 6.25`). Verified by sweeping every
+  radius in [0, 100]: rungs 7, 8, 10, 11 and 12 are all reachable, rung 9 never
+  is. **Rung 9 is dead code upstream**: darktable wrote a ladder over
+  `samples_wish` without noticing the parity of its own radius. The branch is
+  kept because it is in the C, and the ladder is pinned directly by a unit test
+  that feeds it unreachable values on purpose.
+
+  (An earlier draft justified this with "the multiples of 4 in that range are
+  none" — which is self-contradictory, since 24, 28 and 32 *are* multiples of 4
+  in `(21,34]`. The `4k²` argument is the real one.)
+
+**One behavioural difference, and it is a determinism improvement rather than a
+regression.** In `MODE_LOCAL_AVERAGE` the C computes `avg_edge_chroma` *inside* its
+`DT_OMP_PRAGMA(parallel for … schedule(dynamic,3))` loop (defringe.c:291-315), so
+the value used for a given pixel is whichever one that thread last wrote. An
+earlier draft of this entry called that a **data race**; it is not. The pragma is
+`default(firstprivate)`, so each thread gets a **private** copy seeded from the
+shared one — no unsynchronised access to shared state occurs. The real defect is
+that those private copies go stale independently once a thread stops taking the
+local branch, so the C's output depends on how the work happened to be partitioned
+(verified: the number of differing output floats grows monotonically with the
+thread count — 2, 4, 6, 8, 10, 12, 14 for 2…8 threads on a frame with 512
+local-branch pixels; modes 0 and 2 show zero flips at every thread count, as
+expected since neither takes the local branch). c41 runs the stage serially, so
+there is one copy and it settles deterministically on the last pixel that took the
+local branch.
+
+**Other documented deviations.** `roi_in->scale / piece->iscale` is folded away
+(identically 1 in c41 — a funnel hands the pipeline one whole frame, so the ROI
+*is* the buffer), same reasoning and same precedent as `soften::radius_for`.
+`atot / norm` stays an **f32** division: defringe.c:358-359 widens only the
+*result* to double, so promoting the operands would be a silent precision gain
+the C does not have. The *other* threshold line, defringe.c:279, has a precision
+split that is easy to state wrongly: `avg / (width * height)` is a **float**
+division (`width * height` is `int`, so the usual arithmetic conversions make it
+`float / float`, rounded to f32 *before* the `+ 10.0 * FLT_EPSILON` addend); only
+that addend is a double, and it is the addend that promotes the sum. The Rust
+spells the division in f64, which is not bit-identical in principle but is
+behaviourally equivalent here (a ~2.1e9-float sweep of `1/x` found zero
+double-rounding mismatches) — kept deliberately, since it is the spelling that
+cannot silently lose a bit if the divisor ever changes, and documented so nobody
+mistakes it for a transcription of the C's types. `radius / 2.0` in the lattice
+*is* a double division (2.0 is a double literal), so that `round()` rounds a
+double. The module ships **off**, like every other ported module in this series.
+
+**Tests.** 28 in `defringe.rs` — the 13 goldens plus 15 golden-independent ones
+written specifically to be things the goldens are *not*: the `fib_latt` lattice
+bounds and its round-half-away-from-zero rounding, the `detection_radius` and
+`sample_index` ladders, mode-ordinal round-tripping, exact passthrough on a
+too-small frame, `in == out` returning zero, L copied from the input in both
+arms, alpha carrying the chroma² map rather than 1.0, a uniform frame run
+through all three modes, and desaturation on a strong synthetic fringe. Plus
+canonical-position, v29-fallback, identity-gate and end-to-end coverage in
+`preview.rs`, live-label both directions and reset-field exhaustiveness in
+`darkroom/mod.rs`, and the `describe_change` label in `history.rs`.
+
+**Cold senior review — verdict FIX-FIRST, all findings addressed.** One blocker
+(one line of code, and it would have shipped), two majors (both false documented
+claims), five minors, five nits. Every finding was checked against the C before
+acting; none was taken on trust, and the reviewer's own numbers were re-derived
+independently where they contradicted something I had written.
+
+- **BLOCKER — `debug_assert!` was discarding the entire kernel call in release.**
+  The `Stage::Defringe` `apply` arm had
+  `debug_assert!(defringe::process(...).is_ok())`. `debug_assert!` is not
+  "check then run": with `debug_assertions` off — the default for
+  `[profile.release]`, which sets no `debug-assertions` key — the **whole
+  expression** is dropped, so `defringe::process` was never called,
+  `lab_out` stayed at the all-zero `vec![0.0; n*4]` it was allocated as, and the
+  following `lab_to_xyz`/`lab_to_srgb` mapped `[0,0,0,0]` to RGB 0. **Every
+  release build and every `cargo test --release` blacked the frame out.** All 28
+  kernel tests passed throughout, because every one of them calls
+  `defringe::process` *directly*; the only broken seam was `Stage::apply`, and
+  nothing tested it. Fixed to an unconditional call with `.expect(...)`, matching
+  the `soften::process` precedent directly below it in the same function, and
+  covered by two new pipeline-level tests: `defringe_stage_actually_runs_in_release`
+  (asserts non-black, finite, and that alpha came back holding the edge map —
+  which is only possible if the kernel ran) and
+  `defringe_absurd_radius_cannot_overflow_the_early_exit`. **Both were verified
+  to have teeth by reintroducing the bug and watching the first one fail.** The
+  whole tree was then swept for the same bug class (a side-effecting call inside
+  `debug_assert!`) — no other instance exists.
+- **MINOR (same review) — the release-UB guard.** `process` validated its buffer
+  lengths with `debug_assert_eq!` and then called the `unsafe` edge-chroma pass,
+  which builds a slice from `npixels * 4` with `npixels` taken from `width *
+  height`. In release the guards vanish, so a short buffer would be an
+  out-of-bounds slice rather than a panic. Now hard `assert_eq!`s, with a `# Safety`
+  section on the FFI entry point spelling out the four preconditions.
+- **MINOR (same review) — integer overflow defeated the early exit.** `radius`
+  reaches the kernel through a `float -> int` cast, so an absurd value (a
+  hand-edited params blob) saturates to `i32::MAX`; in `i32`, `2 * rad + 1` then
+  wraps *negative*, the "image too small" bail-out's `<` test becomes false, and
+  the stage proceeds with a nonsense radius — debug panic in debug builds, UB in
+  release. The bail-out is now computed in `i64`, the square is saturated, and
+  `df_radius`/`df_thresh` are clamped to the C slider ranges at decode time. The
+  C is undefined here too (`(int)ceil(...)` out of float range is UB), so this is
+  hardening, not a parity change: for every radius the GUI can produce (0.5..20)
+  the arithmetic is identical.
+- **NITs.** `# Safety` doc on the FFI symbol; `needless_range_loop` →
+  `copy_from_slice` for the three-channel copy; `match_single_binding` →
+  straight-line `.from_ordinal(...).ordinal()`; and the `const _: () = assert!`
+  tying `DEFRINGE_MODES` to `DEFRINGE_MODE_COUNT` — now labelled as *documentation,
+  not a check*, since the array's declared length already makes a mismatch a
+  compile error and the assertion can never fail.
+- **MINOR — `PARITY_AUDIT.md` numbers.** The g1c edit had bumped the label count
+  but not the derived figures, leaving the file self-contradictory (it said both
+  "13 untouched" and "14 rows", in adjacent sentences). Corrected to **39 of 52
+  active** and **13** inert rows, and four `darkroom/mod.rs:` line refs refreshed.
+
+Two claims I had written were simply wrong, and both are now withdrawn and
+corrected in place (`defringe.rs`, `preview.rs`, `history.rs`,
+`darkroom/mod.rs`, `pipeline.rs` and this entry):
+
+1. **"`order = 1` has no DC gain, so the edge map collapses to raw `a² + b²` and
+   thresholds on absolute chroma."** The premise is right; the inference is not.
+   A *constant* frame is the one input for which a high-pass returns zero — on any
+   non-constant input it returns a finite residual, and the measured edge/raw
+   ratio runs 1.07 → 2.22 across the slider range, never 1.0, and *exceeds* 1 at
+   small sigma where the filter amplifies chroma. Re-derived independently
+   (`verify_dc.c`), numbers above. It is a local chroma-*contrast* measure.
+   Upstream gives no rationale for its deprecation, and the old text had also
+   invented one.
+2. **"`defringe` has no `iop_order` position, so its placement is a judgement
+   call."** Flatly false: `iop_order.c` has **five** entries for it, including
+   v50 position 31.0 with a comment explaining the placement. I had checked
+   `src/libs/modulegroups.c` — which is the *styles*-group table, not the ordering
+   table — and misread its silence as an ordering fact. Corrected to a documented
+   deviation with the real argument (v50-adjacency to Lowpass + inheritance of the
+   existing Lowpass deviation), and the order test now pins the invariant that
+   actually matters (before the tone map) instead of the bare "after shadhi".
+
+The review also **confirmed sound** the load-bearing things I most expected to
+break, which is worth recording because it is the evidence for the kernel being
+safe to ship: `dfr_ref.c` genuinely restores upstream's verbatim inline
+edge-chroma loop (so the goldens are non-circular), `gauss_extract.c` is verbatim
+against `src/common/gaussian.c`, all 13 golden input+output checksums were rebuilt
+from source and match bit-exactly, the `Gaussian::new(min, max)` argument order is
+**not** swapped against C's `dt_gaussian_init(max, min)` (`LABMAX`/`LABMIN` are
+correctly wired), `GaussianOrder::One == DT_IOP_GAUSSIAN_ONE`, `roi_in->scale` is
+genuinely identically 1, the v30 blob layout is self-consistent, and an
+out-of-range `df_mode` cannot produce an out-of-range GTK selection.
+
+**Local gate:** `scripts/ci-local.sh` green on all four steps; full suite
+1857 (c41-core) + 525 (c41-ui) + 100 (c41-db) + 1 (lensfun), 0 failures.

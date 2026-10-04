@@ -558,6 +558,17 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if soften {
         return "Soften";
     }
+    // Defringe — v50 `iop_order.c` gives it position 31.0; see
+    // `Stage::Defringe` for why c41 runs it where it does. The label order here
+    // mirrors the field order in `PreviewParams`, which is what `reset_module`
+    // also mirrors.
+    let defringe = old.df_on != new.df_on
+        || old.df_radius != new.df_radius
+        || old.df_thresh != new.df_thresh
+        || old.df_mode != new.df_mode;
+    if defringe {
+        return "Defringe";
+    }
     // Tone curve (m4-122): the L anchors are compared pairwise (the array is a
     // plain [(f32, f32); 20], so `!=` does the right thing).
     let tc = old.tc_on != new.tc_on
@@ -816,6 +827,20 @@ mod tests {
             "Soften"
         );
         assert_eq!(
+            describe_change(&base, &PreviewParams { df_thresh: 4.0, ..d() }),
+            "Defringe"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { df_on: true, ..d() }),
+            "Defringe"
+        );
+        // df_mode is the dropdown's enum ordinal; 1 = local average, so this
+        // catches an off-by-one in the ordinal the widget stores.
+        assert_eq!(
+            describe_change(&base, &PreviewParams { df_mode: 1.0, ..d() }),
+            "Defringe"
+        );
+        assert_eq!(
             describe_change(&base, &PreviewParams { primaries_red_hue: 10.0, ..d() }),
             "Primaries"
         );
@@ -1026,6 +1051,10 @@ mod tests {
             soften_saturation: _,
             soften_brightness: _,
             soften_amount: _,
+            df_on: _,
+            df_radius: _,
+            df_thresh: _,
+            df_mode: _,
             primaries_on: _,
             primaries_achromatic_tint_hue: _,
             primaries_achromatic_tint_purity: _,
@@ -1266,7 +1295,9 @@ mod tests {
         // coarseness/strength/mid-tones-bias sliders).
         // #2 (soften): 1844 → 1861 (1 + 40 bools + 455 f32 — enabled + the four
         // size/saturation/brightness/amount sliders).
-        assert_eq!(PreviewParams::default().encode().len(), 1861);
+        // g1c (defringe): 1861 → 1874 (1 + 41 bools + 458 f32 — enabled + the
+        // radius/thresh sliders and the mode dropdown's enum ordinal as a float).
+        assert_eq!(PreviewParams::default().encode().len(), 1874);
     }
 
     #[test]

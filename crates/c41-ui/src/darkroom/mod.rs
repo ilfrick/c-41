@@ -2319,6 +2319,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Bloom" => bloom_module_row(ctx).upcast(),
                 "Grain" => grain_module_row(ctx).upcast(),
                 "Soften" => soften_module_row(ctx).upcast(),
+                "Defringe" => defringe_module_row(ctx).upcast(),
                 "Color zones" => colorzones_module_row(ctx).upcast(),
                 "Tone curve" => curve_editor::tonecurve_module_row(ctx).upcast(),
                 "RGB curve" => curve_editor::rgbcurve_module_row(ctx).upcast(),
@@ -2601,7 +2602,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2865,6 +2866,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
         ),
         "Grain" => set!(gr_on, gr_coarseness, gr_strength, gr_midtones_bias),
         "Soften" => set!(soften_on, soften_size, soften_saturation, soften_brightness, soften_amount),
+        "Defringe" => set!(df_on, df_radius, df_thresh, df_mode),
         _ => return false,
     }
     true
@@ -4432,6 +4434,76 @@ fn soften_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         })
 }
 
+/// Defringe — the C enum's `$DESCRIPTION` strings verbatim, in ordinal order
+/// (defringe.c:37-42). The dropdown index *is* the ordinal, so the round-trip
+/// through `df_mode` needs no lookup table; `DefringeMode::from_ordinal` maps
+/// anything out of range back to the `$DEFAULT`.
+const DEFRINGE_MODES: [&str; c41_core::iop::defringe::DEFRINGE_MODE_COUNT] = [
+    "global average (fast)",
+    "local average (slow)",
+    "static threshold (fast)",
+];
+
+/// The dropdown index <-> enum-ordinal identity, pinned rather than assumed.
+///
+/// **This assertion is documentation, not a check** — the array's declared length
+/// is already `DEFRINGE_MODE_COUNT`, so a mismatch is a compile error before this
+/// ever evaluates, and `const _: () = assert!(…)` on a value it cannot constrain
+/// would be a false sense of safety. What it *does* buy is a single named place
+/// saying the relationship is deliberate, and a second site that fails to compile
+/// if someone swaps one of the two constants for an unrelated one of the same
+/// value. The thing that could actually drift — the *order* of the labels — is
+/// pinned by `out_of_range_defringe_mode_falls_back_to_the_default_ordinal` and by
+/// the golden sets, not here.
+const _: () = assert!(
+    DEFRINGE_MODES.len() == c41_core::iop::defringe::DEFRINGE_MODE_COUNT
+);
+
+/// Defringe — Lab-space chromatic-aberration corrective: threshold on a/b and
+/// replace over-threshold chroma with an inverse-chroma-weighted average of a
+/// Fibonacci-lattice sample of the neighbourhood.
+///
+/// The two sliders and the dropdown are the C's three params verbatim
+/// (defringe.c:44-49): radius 0.5..20 default 4 ("edge detection radius"),
+/// thresh 0.5..128 default 20 ("threshold", higher means less defringing), and
+/// `op_mode`.
+///
+/// **Upstream this module is deprecated** (`IOP_FLAGS_DEPRECATED`,
+/// defringe.c:98-101, redirecting to *chromatic aberrations*) — with no
+/// rationale given there. It still has a real v50 position (31.0), and c41 runs
+/// it adjacent to Lowpass per that table; see `Stage::Defringe` in
+/// `c41-core/src/pipeline.rs`. It is offered here because the kernel is a
+/// faithful, goldens-pinned port.
+fn defringe_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Defringe", "chroma aberration — upstream deprecated", p0.df_on,
+        |p, on| p.df_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Radius", 0.5, 20.0, 0.1, p0.df_radius as f64,
+                |p, v| p.df_radius = v);
+            add_param_slider(e, ctx, "Threshold", 0.5, 128.0, 0.5, p0.df_thresh as f64,
+                |p, v| p.df_thresh = v);
+
+            // Mode selector: the DropDown index IS `df_mode` (the C enum ordinal),
+            // so no mapping table is needed. Same shape as the highlight
+            // reconstruction method dropdown.
+            let mode = gtk4::DropDown::from_strings(&DEFRINGE_MODES);
+            inset_dropdown(&mode);
+            mode.set_tooltip_text(Some("How the per-pixel threshold is chosen"));
+            // `from_ordinal`'s inverse clamp, so a blob carrying e.g. 7.0 shows a
+            // sane selection instead of an out-of-range index.
+            let sel = c41_core::iop::defringe::DefringeMode::from_ordinal(p0.df_mode as i32)
+                .ordinal();
+            mode.set_selected(sel as u32);
+            let m_ctx = ctx.clone();
+            mode.connect_selected_notify(move |dd| {
+                m_ctx.params.borrow_mut().df_mode = dd.selected() as f32;
+                render_preview(&m_ctx);
+            });
+            e.add_row(&mode);
+        })
+}
+
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     module_expander(ctx, "White balance", "channel multipliers", p0.temperature_on,
@@ -5118,6 +5190,16 @@ mod tests {
             p.soften_brightness = M;
             p.soften_amount = M;
         }),
+        // `df_mode` mutated to 2 (MODE_STATIC), not M: M is not a valid enum
+        // ordinal, and the point of this table is that every field differs from
+        // its default — an invalid ordinal would still differ, but pinning a real
+        // one also keeps the row honest about what the dropdown can hold.
+        ("Defringe", |p| {
+            p.df_on = true;
+            p.df_radius = M;
+            p.df_thresh = M;
+            p.df_mode = 2.0;
+        }),
     ];
 
     /// `reset_module` restores exactly the named module's fields, and only those
@@ -5390,6 +5472,10 @@ mod tests {
             soften_saturation: _,
             soften_brightness: _,
             soften_amount: _,
+            df_on: _,
+            df_radius: _,
+            df_thresh: _,
+            df_mode: _,
         } = PreviewParams::default();
     }
 

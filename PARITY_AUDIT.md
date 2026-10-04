@@ -184,18 +184,18 @@ claim with no way to re-derive it does not go in.
 
 ### G1 — 14 catalogue rows render inert, and wiring them is plumbing, not panels
 
-**Partially closed 2026-10-01** — `Grain` and `Soften` are wired (see item 2.1
-for the increments' scope notes); the remaining 14 are untouched. Numbers below
-are recomputed as of that commit.
+**Partially closed 2026-10-01** — `Grain`, `Soften` and `Defringe` are wired
+(see item 2.1 for the increments' scope notes); the remaining 13 are untouched.
+Numbers below are recomputed as of that commit.
 
 `catalog.rs` publishes 52 module rows across the five darktable groups
 (Base 11, Tone 11, Color 11, Correct 7, Effect 12). `LIVE_MODULE_LABELS` has
-36 entries (`darkroom/mod.rs:2604`); `ELSEWHERE_MODULE_LABELS` has 2 (`:2585` —
+37 entries (`darkroom/mod.rs:2605`); `ELSEWHERE_MODULE_LABELS` has 2 (`:2587` —
 `Crop`, `Rotate & perspective`, driven from controls outside the module list).
-The header counter is `is_live_module`-derived (`mod.rs:2277`, `:2576-2578`) and
-reads **"38 of 52 active"**.
+The header counter is `is_live_module`-derived (`mod.rs:2277`, `:2578`) and
+reads **"39 of 52 active"**.
 
-So 14 rows are in neither list, and **all 14 render through `inert_module_row`**
+So 13 rows are in neither list, and **all 13 render through `inert_module_row`**
 (`mod.rs:2336-2341` dispatches on `elsewhere_hint`, which returns `Some` only
 for Crop and Rotate & perspective, and `inert_module_row` is the fall-through).
 Inert means dimmed, tooltip "not yet wired", a status icon, and deliberately not
@@ -206,12 +206,12 @@ remove:
 
 `Raw black/white point` · `Demosaic` · `Orientation` · `Color calibration` ·
 `Input color profile` · `Output color profile` · `Hot pixels` ·
-`Chromatic aberrations` · `Defringe` · `Retouch` · `Liquify` ·
+`Chromatic aberrations` · `Retouch` · `Liquify` ·
 `Highpass` · `Framing` · `Watermark`
 
 `Demosaic` is the one row that is inert *and* independently functional: the
 algorithm dropdown at the top of the right panel (`mod.rs:1605-1640`, handler at
-`:1634-1639`) is working software that the "38 of 52" counter does not count,
+`:1634-1639`) is working software that the "39 of 52" counter does not count,
 since `is_live_module` only knows the two label lists. Two caveats, so the count
 is not oversold: the dropdown sits inside `if is_raw_path(file_path)`
 (`:1605`) and is hidden for X-Trans, so it only counts on a Bayer raw; and it is
@@ -229,8 +229,8 @@ raw-only. So `Orientation` is genuinely inert.
 get wrong, so it is worth being precise about *what* exists. The m4-129…m4-244
 chain ported darktable's per-pixel `DT_OMP_FOR` loops into `c41-core/src/iop/`
 and exposed them as `#[no_mangle] extern "C"` kernels for the **C** pixelpipe to
-call. All 14 remaining rows have such kernels (and so do `Grain` and `Soften`,
-now wired). Row by row — the label each darktable module
+call. All 13 remaining rows have such kernels (and so do the three now-wired
+`Grain`, `Soften` and `Defringe`). Row by row — the label each darktable module
 returns, so the mapping is checkable against `src/iop/*.c` rather than asserted:
 
 | catalogue row | darktable module | Rust kernel | exports / tests |
@@ -243,7 +243,7 @@ returns, so the mapping is checkable against `src/iop/*.c` rather than asserted:
 | `Output color profile` | `colorout.c` | `iop/colorout.rs` | 4 / 14 |
 | `Hot pixels` | `hotpixels.c` | `iop/hotpixels.rs` | 3 / 14 |
 | `Chromatic aberrations` | `cacorrectrgb.c` | `iop/cacorrectrgb.rs` | 7 / 11 |
-| `Defringe` | `defringe.c` | `iop/defringe.rs` | 1 / 4 |
+| ~~`Defringe`~~ | `defringe.c` | `iop/defringe.rs` | wired 2026-10-01 — see 2.1 |
 | `Retouch` | `retouch.c` | `iop/retouch.rs` | 7 / 12 |
 | `Liquify` | `liquify.c` | `iop/liquify.rs` | 6 / **0** |
 | ~~`Grain`~~ | `grain.c` | `iop/grain.rs` | wired 2026-10-01 — see 2.1 |

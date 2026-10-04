@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basecurve, basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, denoiseprofile, exposure, filmicrgb, grain, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, soften, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basecurve, basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, defringe, denoiseprofile, exposure, filmicrgb, grain, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, soften, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -633,6 +633,65 @@ pub enum Stage {
         /// buffer in the final blend.
         amount: f32,
     },
+    /// Defringe (defringe.c) — attenuate chromatic aberration by replacing the
+    /// a/b of any pixel whose "edge chroma" exceeds a threshold with an
+    /// inverse-chroma-weighted average of a Fibonacci-lattice sample of its
+    /// neighbourhood.
+    ///
+    /// Works in **Lab** (the C's `default_colorspace` is `IOP_CS_LAB`), so
+    /// [`Self::working_space`] returns `Some(*space)`; the driver is
+    /// `defringe::process`, which does its own RGB↔Lab-agnostic arithmetic on
+    /// Lab triples.
+    ///
+    /// **NOT pixel-local** — the lattice average reads a spatial neighbourhood
+    /// up to `24 + 4*radius` pixels across, so the band-parallel path would
+    /// average across band seams; `process` routes the whole frame serial, same
+    /// reason as Bloom/Lowpass/Shadhi/Soften.
+    ///
+    /// **Placement: a documented deviation from `iop_order.c`, following the
+    /// existing Lowpass deviation.** darktable *does* give this module a
+    /// position — v50 `iop_order.c:351` puts it at **31.0**, commented
+    /// *"desaturate fringes in Lab, so needs properly calibrated colours in
+    /// order for chromaticity to be meaningful"*, between `colorchecker` (30.0)
+    /// and `atrous` (32.0). It is a scene-referred position: 31.0 is well before
+    /// `basecurve` (44.0) / `sigmoid` (45.3).
+    ///
+    /// c41 places it immediately before [`Stage::Lowpass`], which is *not* where
+    /// v50 puts either of them (`lowpass` is 33.0). Two things make that
+    /// defensible rather than arbitrary:
+    ///
+    /// * **The relative order is preserved.** In v50 `defringe` (31.0) and
+    ///   `lowpass` (33.0) are adjacent — the only module between them is
+    ///   `atrous` (32.0), which c41 does not implement. c41 also runs them
+    ///   adjacently, in the same order.
+    /// * **It inherits Lowpass's already-documented deviation**, which moves
+    ///   `lowpass` from 33.0 to after `shadhi` (50.0) "matching the legacy
+    ///   placement" (see the pinned order test in `c41-ui/src/preview.rs`). Both
+    ///   modules move together rather than splitting a v50-adjacent pair.
+    ///
+    /// The load-bearing invariant that *is* preserved: like v50's 31.0, this
+    /// stage runs **before** the tone map, so it operates on scene-referred
+    /// chroma rather than on tone-mapped values.
+    ///
+    /// Separately, `defringe` carries `IOP_FLAGS_DEPRECATED` (defringe.c:98-101,
+    /// redirecting to *chromatic aberrations*) with **no rationale given
+    /// upstream**. That is not a blocker: `vibrance` and `basicadj` are likewise
+    /// deprecated and both are live in c41. See `PROGRESS.md` for the g1c entry.
+    Defringe {
+        /// `radius` slider 0.5..20 (default 4) — "edge detection radius"
+        /// (defringe.c:45). Feeds both the blur sigma
+        /// (`fmax(0.1, |radius|)`) and the derived detection radius
+        /// (`ceil(2.0 * ceilf(sigma))`).
+        radius: f32,
+        /// `thresh` slider 0.5..128 (default 20) — "threshold" (defringe.c:46);
+        /// higher values mean less defringing. In the two averaging modes the
+        /// effective threshold is `max(0.1, 4*thresh*avg_edge_chroma/33)`.
+        thresh: f32,
+        /// `op_mode` dropdown (defringe.c:37-42) — which threshold to use.
+        mode: defringe::DefringeMode,
+        /// The pipeline's working colour space; matches every other Lab stage.
+        space: ColorSpace,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -699,6 +758,7 @@ impl Stage {
             Stage::LensCorrection { .. } => "lens",
             Stage::Grain { .. } => "grain",
             Stage::Soften { .. } => "soften",
+            Stage::Defringe { .. } => "defringe",
         }
     }
 
@@ -846,6 +906,12 @@ impl Stage {
             // Returning false forces the whole pipeline serial whenever this
             // stage is present — same reason as Bloom/Lowpass/Shadhi.
             Stage::Soften { .. } => false,
+            // Defringe is NOT pixel-local: the Fibonacci-lattice average reads a
+            // neighbourhood up to `24 + 4*radius` pixels across, so band-splitting
+            // would average across band seams. Returning false forces the whole
+            // pipeline serial whenever this stage is present — same reason as
+            // Bloom/Lowpass/Shadhi/Soften.
+            Stage::Defringe { .. } => false,
         }
     }
 
@@ -932,6 +998,10 @@ impl Stage {
             // Soften works directly on linear RGB (C default_colorspace is
             // IOP_CS_RGB) — no Lab conversion, no working-space agreement.
             Stage::Soften { .. } => None,
+            // Defringe works entirely in Lab (C default_colorspace is
+            // IOP_CS_LAB) — every read and write in `defringe::process` is a Lab
+            // read and write, so it must agree with the other Lab stages.
+            Stage::Defringe { space, .. } => Some(*space),
             _ => None,
         }
     }
@@ -1918,6 +1988,68 @@ impl Stage {
                     size, saturation, brightness, amount,
                 );
             }
+            // ── Defringe (defringe.c) ───────────────────────────────────
+            // Replace the a/b of any pixel whose "edge chroma" (or any of its 8
+            // neighbours') clears a threshold with an inverse-chroma-weighted
+            // average of a Fibonacci-lattice sample of the neighbourhood.
+            // Same RGB↔Lab sandwich as the other Lab-domain stages; NOT
+            // pixel-local (the lattice reaches up to `24 + 4*radius` pixels
+            // across), so `process` guarantees (width, height) is the whole
+            // frame here.
+            Stage::Defringe { radius, thresh, mode, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) =
+                    match space {
+                        ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                        ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                    };
+                let n = width * height;
+                let mut lab_in = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    let lab = to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]);
+                    lab_in[i..i + 4].copy_from_slice(&lab);
+                }
+                let mut lab_out = vec![0.0f32; n * 4];
+                // **Called unconditionally — do not wrap this in `debug_assert!`.**
+                // `debug_assert!` does not merely drop the *check* when
+                // `debug_assertions` is off (the default for `[profile.release]`,
+                // which has no `debug-assertions` key in this workspace's
+                // Cargo.toml); it drops the **whole expression**, so the kernel
+                // would never run and `lab_out` would stay all-zero — which
+                // `lab_to_xyz`/`lab_to_srgb` then map to RGB 0. Every release
+                // build, and every `cargo test --release`, would black the frame
+                // out. Same reason `soften::process` below returns `()` and is
+                // simply called: the return value carries no information the
+                // caller can act on (`process` returns `Err` only on a length
+                // mismatch, and both scratch buffers are built at `n * 4` from the
+                // same `n` passed here), so the honest thing is to not have a
+                // `Result` to swallow in the first place.
+                defringe::process(
+                    &lab_in,
+                    &mut lab_out,
+                    width,
+                    height,
+                    radius,
+                    thresh,
+                    mode,
+                )
+                .expect("defringe: Lab scratch buffers are n*4 and process takes n*4");
+                // Unlike every other Lab stage here, alpha is *not* restored from
+                // the input: `defringe::process` writes the edge-chroma map into
+                // alpha and the C's `else` arm deliberately does not copy the
+                // original back ("we can't copy the alpha channel here because it
+                // contains info needed by neighboring pixels", defringe.c:367).
+                // Carrying `lab_out`'s alpha through is therefore the faithful
+                // round-trip — and the same reason Soften's FFI kernel trampling
+                // alpha was accepted rather than patched. `from_lab` passes
+                // channel 3 through untouched, so the map survives to the caller
+                // and whatever runs next in the pipeline sees it.
+                for p in 0..n {
+                    let i = p * 4;
+                    let rgb = from_lab([lab_out[i], lab_out[i + 1], lab_out[i + 2], lab_out[i + 3]]);
+                    output[i..i + 4].copy_from_slice(&rgb);
+                }
+            }
         }
     }
 }
@@ -2646,6 +2778,121 @@ mod tests {
     }
 
     #[test]
+    /// Regression test for a defect that shipped nowhere near the kernel: the
+    /// `Stage::Defringe` `apply` arm originally wrapped its `defringe::process`
+    /// call in `debug_assert!(... .is_ok())`. That is not "check then run" —
+    /// with `debug_assertions` off (the default for `[profile.release]`, which
+    /// sets no `debug-assertions` key) the **entire expression is discarded**.
+    /// Every release build and every `cargo test --release` therefore skipped the
+    /// kernel, left `lab_out` at all-zero, and ran `lab_to_xyz`/`lab_to_srgb` on
+    /// `[0,0,0,0]` — which maps to RGB 0. The frame came out **black**.
+    ///
+    /// Every test in `iop::defringe` calls the kernel *directly*, so all 28 of
+    /// them passed while the only integration seam was broken. This is that seam.
+    ///
+    /// It runs in `--release`, which is how CI invokes the suite, so the
+    /// regression cannot come back unnoticed.
+    #[test]
+    fn defringe_stage_actually_runs_in_release() {
+        let (w, h) = (24usize, 24usize);
+        let mut img = vec![0.0f32; w * h * 4];
+        // A strongly coloured, spatially varying frame so the threshold is
+        // actually crossed somewhere (an all-neutral frame is a no-op and would
+        // pass even with the kernel skipped).
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let t = (x + y) as f32 / (w + h) as f32;
+                img[i] = 0.2 + 0.6 * t;
+                img[i + 1] = 0.1 + 0.5 * (1.0 - t);
+                img[i + 2] = 0.4 + 0.3 * t;
+                img[i + 3] = 1.0;
+            }
+        }
+        let out = Pipeline::with_stages(vec![Stage::Defringe {
+            radius: 4.0,
+            thresh: 20.0,
+            mode: defringe::DefringeMode::GlobalAverage,
+            space: ColorSpace::LinearSrgb,
+        }])
+        .process(&img, w, h);
+
+        // 1. Not black. This is the assertion the bug needed.
+        let sum: f32 = out.iter().sum();
+        assert!(
+            sum.is_finite() && sum.abs() > 1e-3,
+            "defringe stage blacked the frame out (release build): \
+             sum {sum}, out[0..4] = {:?}",
+            &out[..4]
+        );
+        assert!(out.iter().all(|v| v.is_finite()), "defringe produced non-finite output");
+
+        // 2. It ran, rather than passing the input through untouched. The output
+        //    is *not* the input: alpha comes back holding the edge-chroma map
+        //    rather than 1.0, so alpha alone proves the kernel executed.
+        let input_alpha_unchanged = out.iter().skip(3).step_by(4).all(|&a| (a - 1.0).abs() < 1e-6);
+        assert!(
+            !input_alpha_unchanged,
+            "defringe left alpha at 1.0 everywhere — the kernel did not run"
+        );
+
+        // 3. And it is idempotent-ish in the sense that mattering: a second run
+        //    over its own output must still be finite and non-black, i.e. the
+        //    stage is safe in a chain rather than only on a fresh buffer.
+        let again = Pipeline::with_stages(vec![Stage::Defringe {
+            radius: 4.0,
+            thresh: 20.0,
+            mode: defringe::DefringeMode::GlobalAverage,
+            space: ColorSpace::LinearSrgb,
+        }])
+        .process(&out, w, h);
+        assert!(
+            again.iter().all(|v| v.is_finite()) && again.iter().sum::<f32>().abs() > 1e-3,
+            "defringe is not safe to run on its own output"
+        );
+    }
+
+    /// The overflow path that a hand-edited or corrupt params blob can reach:
+    /// `radius` reaches the kernel through a `float -> int` cast, so an absurd
+    /// value saturates to `i32::MAX`. In `i32` arithmetic `2 * rad + 1` wraps
+    /// *negative*, the "image too small" bail-out's `<` test is then false, and
+    /// the stage proceeds with a nonsense radius. (The C is undefined here too —
+    /// `(int)ceil(...)` out of float range is UB — so this is hardening, but it
+    /// must not be a *panic* in a release build.)
+    #[test]
+    fn defringe_absurd_radius_cannot_overflow_the_early_exit() {
+        let (w, h) = (16usize, 16usize);
+        let img = vec![0.25f32; w * h * 4];
+        for space in [ColorSpace::LinearSrgb, ColorSpace::Rec2020] {
+            for mode in [
+                defringe::DefringeMode::GlobalAverage,
+                defringe::DefringeMode::LocalAverage,
+                defringe::DefringeMode::Static,
+            ] {
+                let out = Pipeline::with_stages(vec![Stage::Defringe {
+                    radius: 1e30,
+                    thresh: 20.0,
+                    mode,
+                    space,
+                }])
+                .process(&img, w, h);
+                assert!(
+                    out.iter().all(|v| v.is_finite()),
+                    "radius 1e30 in {space:?}/{mode:?} produced non-finite output"
+                );
+            }
+        }
+        // NaN must be inert too rather than poisoning the lattice maths.
+        let out = Pipeline::with_stages(vec![Stage::Defringe {
+            radius: f32::NAN,
+            thresh: 20.0,
+            mode: defringe::DefringeMode::GlobalAverage,
+            space: ColorSpace::LinearSrgb,
+        }])
+        .process(&img, w, h);
+        assert!(out.iter().all(|v| v.is_finite()), "radius NaN produced non-finite output");
+    }
+
     fn sharpen_routes_conversion_by_working_space() {
         // A COLOURED edge: Y (hence Lab L) differs between Rec.2020 and sRGB
         // primaries, so the two working spaces must give different sharpening —
