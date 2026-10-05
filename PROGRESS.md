@@ -8581,3 +8581,49 @@ silently return a *different* profile) rather than the false "every flip errors"
 The reviewer *qualified* the `image` claim rather than disproving it; that the
 claim was actually false was found independently while checking it, which is why
 the docs were corrected on the strength of the measurement rather than the verdict.
+
+**Local gate.** `scripts/ci-local.sh` green on all four steps (fmt, check,
+clippy, release build + `cargo test --workspace`). Full suite 1857 (c41-core) +
+525 (c41-ui) + 100 (c41-db) + 1 (lensfun), 0 failures; the 23 new
+`icc::embed` tests included. **`icc/embed.rs` contributes zero warnings** — the
+lib-test count reads 11 against a baseline of 9, but grepping the gate log for
+warning sites resolves every one of them to other files, none to this increment.
+
+The gate also ran once more through the pre-push hook on the way to the
+remotes, so the pushed tree is not merely the tree that was tested.
+
+**Remote CI.** Committed as `17b5b5b88a` and pushed to both remotes; `master`
+verified at that SHA on GitHub and on gitea via `ls-remote` (two `pushurl`
+entries, so one `git push origin master` reaches both — the push output only
+prints the last URL, which is misleading). GitHub CI green: `Rust` → `success`
+and `Docker Build & Publish` → `success`; `Darkroom CI` skipped as expected.
+
+**Running image.** Rebuilt `c-41:latest` from this commit (image
+`d0e14a1ba464`, `--build-arg CACHEBUST=17b5b5b88a`) and relaunched the long-lived
+`c-41` container on it, previous image kept as `c-41-old`. Container
+`Up (healthy)`, 0 restarts, `c41-rs` running as pid 302, UI answers `HTTP 200`
+on `:3000`, and the log scan for `panicked`/`Aborted`/`restarting`/`Failed to
+start` is clean.
+
+Two verification notes, because this increment resists the check used for g1a–g1c:
+
+- The `org.opencontainers.image.revision` label on the image reads
+  `f92d0116eedaf…`, which is neither this commit nor the previous one. That is
+  expected and not a stale build: `docker/Dockerfile:84-86` deliberately does
+  **not** set that label because the KasmVNC base image sets its own and
+  overriding it "proved unreliable — a wrong value is worse than none". The
+  value is inherited from the base and is meaningless here. The real pin is
+  `git -C /src checkout ${CACHEBUST}` in the clone layer (`docker/Dockerfile:69-71`);
+  the build log shows that step emitting only `Cloning into '/src'...` with no
+  `CACHEBUST=… is not a commit` fallback, so the pin to `17b5b5b88a` took.
+  `/src` exists only in the builder stage, so it cannot be inspected at runtime.
+- Unlike g1a/g1b/g1c there is **no new string to grep for in the binary**, and
+  the honest reason is that this increment is inert at runtime by design: no
+  product code calls `extract`, so `extract<R: Read + Seek>` is never
+  monomorphised and link-time section GC can drop the whole module. Extracting
+  the two binaries and comparing confirms the shape — they differ (a rebuild did
+  happen), yet neither contains the `acsp` diagnostic that this module's error
+  text would introduce. A future reader seeing no trace of m4-245 in the shipped
+  binary should conclude "unused library code", not "the rebuild missed the
+  change". G2a2 is where the increment becomes observable, and that is the point
+  at which the g1a–g1c string check applies again.
