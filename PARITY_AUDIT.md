@@ -324,6 +324,31 @@ This is the largest gap here whose expensive half is already paid. The engine
 exists and is tested; what is missing is the product surface around it — and
 unlike G1's rows, the wiring is not a mechanical repeat of a proven pattern.
 
+**Progress (m4-245).** The *input-profiling* half now has a tested extractor:
+`c41-core/src/icc/embed.rs` lifts the embedded ICC out of JPEG, PNG and TIFF
+(`Present` / `Absent` / `UnsupportedFormat`, deliberately three states). Nothing
+calls it yet — m4-245 is deliberately pure — so **this section's user-visible
+claims above are still true**: a tagged JPEG is still shown and written as if it
+were sRGB. What changed is that the "can we even see the profile" half of the
+gap is closed and verified against lcms.
+
+Two corrections to the plan this audit previously implied, both found by checking
+rather than assuming:
+
+- The audit assumed no library could hand us the profile. **Half of that was
+  wrong.** `image` 0.25 *does* implement `ImageDecoder::icc_profile()` for
+  jpeg/png/tiff (plus avif/gif/webp) and `ImageEncoder::set_icc_profile()` for
+  jpeg/png/tiff/webp. It is still the wrong tool for extraction: the method
+  hangs off a constructed **pixel** decoder (the preview path has no
+  `ImageReader`), and its TIFF decoder rejects many real TIFFs outright
+  (`Photometric interpretation RGBPalette ... is unsupported` on palette TIFFs
+  ImageMagick writes). gdk-pixbuf, which *is* what the preview uses, genuinely
+  has no ICC surface at all.
+- Writing is therefore **cheaper** than "needs a vetted in-tree sRGB blob plus
+  container writers": export already encodes through `image`'s `ImageEncoder`
+  (`c41-ui/src/dialogs/mod.rs:369` and `save_with_format`), which carries
+  `set_icc_profile`. G2b does not need hand-rolled writers.
+
 ### G3 — masks: kernels ported, product half missing
 
 Partly false to call this "absent". `crates/c41-core/src/masks/` is **5,192 lines

@@ -8447,3 +8447,137 @@ em-dash, so `strings` splits it — `strings | grep -cF "chroma aberration —
 upstream deprecated"` returns **0** on a binary that plainly contains it. Grep
 the UTF-8 bytes directly, or match an ASCII half. A false negative here would
 have been easy to misread as "the rebuild didn't pick up the change".
+
+### m4-245 — G2a1: embedded ICC extraction from JPEG/PNG/TIFF (2026-10-05 UTC)
+
+First slice of **G2 (colour management)**, and deliberately the smallest useful
+one: given a JPEG, PNG or TIFF, find the ICC profile embedded in it. Nothing in
+the product calls this yet and no decode path changes behaviour — but the
+expensive half of G2 (turning profile bytes into a transform) already exists in
+`c41-core/src/icc/`, and the missing half was that *nothing could even see* a
+profile. Confirmed: no Rust product code calls `c41_core::icc` at all.
+
+**Why a container parser at all.** The preview decodes non-raw files through
+gdk-pixbuf (`c41-ui/src/darkroom/mod.rs`, `PixbufLoader`) and export through the
+`image` crate (`dialogs/mod.rs`, `ImageReader`). The first half of that
+investigation was right and is now verified rather than assumed: gdk-pixbuf
+0.20 exposes **no** ICC surface — zero ICC symbols in `gdk-pixbuf-0.20.10`'s
+source and zero in `gdk-pixbuf-2.0/gdk-pixbuf.h`. The second half was **wrong**
+and the module docs said so until this review round caught it: `image` 0.25 *does*
+implement `ImageDecoder::icc_profile()` for jpeg/png/tiff (plus avif/gif/webp)
+and `ImageEncoder::set_icc_profile()` for jpeg/png/tiff/webp. "No library exposes
+ICC" would have been a lie in the docs.
+
+It is still the wrong tool here, for two reasons that are now measured rather
+than argued:
+
+1. `icc_profile()` hangs off a constructed **pixel** decoder. The preview path
+   has no `ImageReader` to construct one from, so using it would mean two
+   different extraction paths for preview and export — the exact divergence a
+   single extractor avoids.
+2. Its TIFF decoder **rejects real TIFFs outright.** Run against a corpus built
+   by ImageMagick, `into_decoder()` fails on every palette TIFF with
+   `Photometric interpretation RGBPalette with bits per sample [8] is
+   unsupported`, and reports no profile. The extractor here reads those same
+   files' profiles correctly, because it walks the IFD and never asks what the
+   pixels are. Verified by three-way cross-check: for jpeg and png the extractor
+   and `image` agree byte-for-byte; for tiff, `image` cannot open the files at
+   all. A metadata-only extractor being *more* capable than the pixel decoder is
+   the whole point, not an accident.
+
+**Three states, not `Option`.** `Present(Vec<u8>)` / `Absent` /
+`UnsupportedFormat`. The product policy already decided for G2 (Q2 = (c): ask
+the user to choose an assumed profile) needs "we checked and there is none" to be
+distinguishable from "we cannot read this container", so the first two must not
+collapse.
+
+`Present` also deliberately does **not** mean "usable". A grayscale or CMYK photo
+carries a complete, valid profile that this module extracts happily, and the
+engine then refuses it, because every pipeline stage must be 3-channel
+(`transform.rs:115-124`) and a `GRAY` profile's is not. Collapsing that into
+`Absent` would tell a user "this file was never colour-managed" about a file
+whose profile is right there. `a_grayscale_profile_is_present_but_the_engine_refuses_it`
+asserts both halves, so the doc claim is checked rather than trusted.
+
+`EmbedError` (`Io` / `Truncated` / `Malformed`) is reserved for "I parse this but
+the file is broken". A blob of the right size that is not a profile (no `acsp`,
+or a size field disagreeing with the bytes extracted) is `Malformed`, not
+`Present`, so the diagnosis does not land on the engine and read as "your file's
+profile is unsupported". `acsp` is checked *and* the declared size, because a
+truncation after byte 40 leaves the signature intact.
+
+**Scope, deliberately excluded:** writing a profile into a container (G2b —
+cheaper than first assumed, see `PARITY_AUDIT.md`), raw-file camera profiles
+(separate and much larger, via `rawimage`), and decoding pixels at all.
+TIFF searches IFD0 plus the next-IFD chain (multi-page) but **not** SubIFDs: ICC
+there is non-standard and darktable's readers do not look, so following tag 330
+would be a behaviour change rather than a fix. `a_tiff_profile_in_a_subifd_is_deliberately_not_found`
+exists so a future reader who helpfully "fixes" it has to decide to change it.
+
+**Dependencies.** One new direct dep of `c41-core`: `flate2 = "1"`, needed only
+because a PNG `iCCP` chunk stores the profile zlib-compressed (jpeg and tiff
+store it raw). It was already in `Cargo.lock` transitively via `zip`, so the
+lockfile change is **one line** and no new crate is downloaded. Not pinned
+exactly, and the reasoning is deliberate: `rawloader` and `kamadak-exif` are
+pinned because their *output* decides how irreplaceable raws decode or what a
+collection rule matches. `flate2` only has to be a correct inflate — it cannot
+reinterpret bytes, so a minor bump cannot change which profile is extracted.
+
+**Verification.** Self-built fixtures share an author's assumptions with the
+parser, so the real evidence is an oracle sharing no code with it. ImageMagick's
+`convert FILE icc:OUT.icc` reads an embedded profile back byte-for-byte through
+**lcms**, the same library darktable uses. 28 files: real jpeg/png/tiff written
+by ImageMagick with real profiles from colord/ghostscript, including a **122 KB
+profile that exceeds a jpeg's 64 KB `APP2` segment limit and must be reassembled
+by sequence number**, plus untagged controls and non-ICC containers. All 28
+matched byte-for-byte, including five **big-endian** TIFFs produced by
+byte-swapping ImageMagick's output (it only ever writes `II`) and re-verifying
+through lcms, so the swapped files are real rather than merely plausible.
+
+The corpus is **generated, not committed** (`scripts/make-icc-corpus.sh`): the
+profiles are third-party (colord and ghostscript, each with its own licence) and
+this repo has no precedent for committed test fixtures, so vendoring them is not a
+call this increment should make unilaterally. Generating keeps the oracle
+reproducible anywhere with ImageMagick and puts nothing encumbered in-tree. The
+test skips unless `C41_ICC_CORPUS` is set, so CI stays hermetic.
+
+Also: a deterministic fixed-seed mutation sweep (4000 mutations plus systematic
+truncation at 64 offsets per seed, over synthetic fixtures and, when set, the
+corpus), and a **mutation-kill run** applying 16 realistic defects one at a time
+to confirm the suite can actually fail — 15 killed, 1 expected-hang, 0
+unexpected. The corpus test alone kills 6 mutations that unit tests miss. Three
+survivors in round 1 were real test gaps, not equivalent mutants, and the tests
+that close them were added: a right-sized non-profile blob, an absurd declared
+length refused *before* allocation (png chunk length and tiff tag count are each
+a u32, so an 8-byte header can demand 4 GB), and the three-state collapse.
+
+**Bugs this found, all before commit.** Three that mattered:
+
+- `extract` sniffed 8 bytes of magic and then dispatched readers that each
+  assumed they started at offset 0. PNG accidentally worked (its chunks begin at
+  offset 8); jpeg and tiff read mid-header and returned `Absent`. Fixed by
+  rewinding and having each reader consume its own signature.
+- `Tiff::u16(off)`/`u32(off)` **accepted an offset and ignored it** — every read
+  was sequential, correct only because IFD fields happened to be visited in
+  ascending order. An IFD walk skips entries whose tags we don't want, so this
+  was a trap rather than a style nit. They seek now.
+- The jpeg marker scan was pair-wise, so `FF FF E2` (legal, and emitted by
+  encoders that pad) desynchronised it into the payload. Also `0xD8` (SOI) was
+  missing from the standalone-marker set, so a length field was read from a
+  marker that has none. `a_jpeg_marker_preceded_by_fill_bytes_is_still_read` pins
+  the fix.
+
+**Review round.** Cold senior review: **SHIP**, 0 blockers, 0 majors, 2 minors,
+2 nits. Acted on: the gdk-pixbuf phrasing (now states what was verified rather
+than "no API at all"); the corpus-not-committed minor (addressed by committing
+the generator instead); the `tiff()` helper comment. The PNG-CRC minor was
+answered by measurement rather than argument: the CRC is skipped because zlib's
+Adler-32 covers every *decompressed* byte, and flipping every byte of the
+compressed data gives **419 of 420** rejections. The single survivor is a flip in
+the zlib header's `FLEVEL` bits, which are excluded from the header check by
+design and do not affect decoded output — so returning the same profile there is
+correct, not a miss. The test asserts the invariant that actually matters (never
+silently return a *different* profile) rather than the false "every flip errors".
+The reviewer *qualified* the `image` claim rather than disproving it; that the
+claim was actually false was found independently while checking it, which is why
+the docs were corrected on the strength of the measurement rather than the verdict.

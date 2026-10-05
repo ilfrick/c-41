@@ -30,14 +30,22 @@
 //!   ([`ffi`]) that colorin/colorout's LUT path calls in place of LCMS.
 //!   Replacing those C call sites is the follow-up (needs the full-app Docker
 //!   C build).
+//! - **m4-245 (this increment):** [`embed`] — lifting the ICC profile out of a
+//!   JPEG/PNG/TIFF container, the input-profile half of G2. Pure: nothing calls
+//!   it yet, and no decode path changes behaviour. It exists because neither
+//!   decoder we use (gdk-pixbuf for preview, the `image` crate for export)
+//!   exposes an ICC API, so the container has to be read for the profile
+//!   ourselves. Applying what it finds is the next increment.
 
 mod clut;
+mod embed;
 mod ffi;
 mod lut;
 mod parser;
 mod transform;
 
 pub use clut::Clut;
+pub use embed::{extract as extract_embedded, extract_file as extract_embedded_file, EmbedError, Embedded};
 pub use lut::{parse_lut_tag, parse_lut_v2, parse_lut_v4, Pipeline, Stage};
 pub use parser::{Curve, IccError, Profile, Xyz};
 pub use transform::Transform;

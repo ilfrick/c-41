@@ -26,3 +26,11 @@ rawloader    = "=0.37.1"
 # properties. Pinned for the same reason — parsed values land in the catalogue.
 # Published as `kamadak-exif`; its lib target is named `exif`.
 kamadak-exif = "=0.6.1"
+# Embedded-ICC extraction (m4-245): a PNG's `iCCP` chunk stores the profile
+# zlib-compressed, so reading it needs a decompressor. Not pinned exactly, and
+# the reasoning is deliberate: the two pins above guard crates whose *output*
+# decides how irreplaceable data decodes or what a collection rule matches.
+# flate2 only has to be a correct inflate — it cannot reinterpret bytes, so a
+# minor bump cannot change which profile we extract. It is already in
+# Cargo.lock as a transitive dependency of `zip`, so this adds no new crate.
+flate2 = "1"
