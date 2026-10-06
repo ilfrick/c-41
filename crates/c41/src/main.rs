@@ -10,6 +10,7 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    let _ = _icc_embed_force_link();
     // GTK4 boot. Returns glib::ExitCode which we forward as the process exit
     // status so docker-stop / s6 see a clean termination.
     match c41_ui::run() {
@@ -23,3 +24,10 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[inline(never)]
+fn _icc_embed_force_link() {
+    use std::io::Cursor;
+    let _ = c41_core::icc::extract_embedded(&mut Cursor::new(&[] as &[u8]));
+}
+
