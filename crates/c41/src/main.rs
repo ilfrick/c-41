@@ -28,6 +28,10 @@ fn main() -> ExitCode {
 #[inline(never)]
 fn _icc_embed_force_link() {
     use std::io::Cursor;
+    // Force top-level dispatch and ICC validation paths to be linked
     let _ = c41_core::icc::extract_embedded(&mut Cursor::new(&[] as &[u8]));
+    // Exercise an ICC validation error path to pull in its string literals
+    let fake = b"1234567890123456789012345678901234567890123456789012345"; // 55 bytes, no 'acsp' at 36
+    let _ = c41_core::icc::extract_embedded(&mut Cursor::new(&fake[..]));
 }
 
