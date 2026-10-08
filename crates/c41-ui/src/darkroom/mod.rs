@@ -1075,16 +1075,55 @@ fn spawn_decode(ctx: &PreviewCtx) {
         if ctx.decode_gen.get() != generation {
             return;
         }
+        // G2a2, input profiling: read the container's embedded ICC out of the
+        // bytes we already hold (the file on disk is opened once), and resolve
+        // the transform the decode applies — prompting BEFORE decoding when an
+        // untagged first-open has no remembered assumption, so the choice
+        // labels the same bytes it shapes. An *error* scanning means "no
+        // conclusion", not "no profile" — a truncated file gets the same sRGB
+        // assumption an untagged one does, and never takes a decode down with
+        // it.
+        let embedded = data
+            .as_deref()
+            .map(|d| {
+                c41_core::icc::extract_embedded(&mut std::io::Cursor::new(d))
+                    .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat)
+            })
+            .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat);
+        let transform = resolve_preview_transform(&ctx, &path, &embedded).await;
+        // The prompt can take a while: if a newer decode claimed the generation
+        // meanwhile, its result owns the screen (the choice, if any, is already
+        // persisted above — user input survives the stale race).
+        if ctx.decode_gen.get() != generation {
+            return;
+        }
         let base = data.and_then(|data| {
             let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
             let _ = loader.write(&data);
             let _ = loader.close();
-            loader.pixbuf().map(|pb| BaseImage::Srgb8 {
-                bytes: pb.read_pixel_bytes().to_vec(),
-                width: pb.width(),
-                height: pb.height(),
-                rowstride: pb.rowstride() as usize,
-                nch: pb.n_channels() as usize,
+            loader.pixbuf().map(|pb| {
+                let rowstride = pb.rowstride() as usize;
+                let nch = pb.n_channels() as usize;
+                let mut bytes = pb.read_pixel_bytes().to_vec();
+                // `transform` is `Some` only for a real matrix move: an embedded
+                // profile worth applying, or an untagged file remembered as
+                // Adobe RGB. `Missing`/`Srgb`/`Unusable`/`Unknown` — and an
+                // assumed sRGB — all leave the bytes exactly as decoded, which
+                // is what keeps an ordinary untagged or sRGB photograph on the
+                // byte-exact path it has always been on: no profile means no
+                // matrix round trip, not a pointless one.
+                if let Some(t) = &transform {
+                    // `width` rather than `rowstride / nch`: gdk-pixbuf rounds
+                    // rows to 4 bytes, and the padding is not a pixel.
+                    c41_core::icc::apply_rgb8(t, &mut bytes, pb.width() as usize, rowstride, nch);
+                }
+                BaseImage::Srgb8 {
+                    bytes,
+                    width: pb.width(),
+                    height: pb.height(),
+                    rowstride,
+                    nch,
+                }
             })
         });
         match base {
@@ -1096,6 +1135,90 @@ fn spawn_decode(ctx: &PreviewCtx) {
             None => eprintln!("darkroom preview: could not decode {path}"),
         }
     }));
+}
+
+/// The input transform the non-raw decode applies: the embedded profile when
+/// the container carries one (G2a2); otherwise the per-file *remembered*
+/// assumption, prompting the first time an untagged file is opened (G2a2, 1a).
+///
+/// `None` means "no matrix move": embedded or assumed sRGB, a profile that
+/// cannot be applied, or a container this module cannot scan — the byte-exact
+/// path. This is the preview's side of the decision; export resolves the
+/// remembered assumption on its own (it must not prompt mid-batch) so what is
+/// on screen and what lands on disk cannot drift apart.
+async fn resolve_preview_transform(
+    ctx: &PreviewCtx,
+    path: &str,
+    embedded: &c41_core::icc::Embedded,
+) -> Option<c41_core::icc::Transform> {
+    use c41_core::icc::{InputAssumption, InputProfile};
+    match c41_core::icc::input_profile(embedded) {
+        InputProfile::Transform(t) => Some(t),
+        InputProfile::Missing => match crate::persist::load_input_assumption(&ctx.db_path, path) {
+            // Remembered: apply the assumption exactly as though the file had
+            // been tagged with it (Srgb ⇒ `None` — the bytes are the space).
+            Some(a) => a.transform_for_missing(),
+            // Never decided for this file: ask. Dismissing is "sRGB, this
+            // session only", same as the no-db / uncatalogued fallback.
+            None => prompt_input_assumption(ctx, path)
+                .await
+                .and_then(|a| a.transform_for_missing()),
+        },
+        InputProfile::Srgb | InputProfile::Unusable | InputProfile::Unknown => None,
+    }
+}
+
+/// The per-image missing-profile prompt (G2a2, 1a): an untagged file's pixels
+/// carry no colour-space claim, so ask what space they are in — defaulting to
+/// sRGB, remembered per file (the checkbox is on by default). Returns the
+/// chosen assumption, or `None` when the prompt was dismissed: sRGB for this
+/// session, nothing persisted, and the next open asks again. An explicit
+/// choice — even the default sRGB — IS persisted when "remember" is checked,
+/// which is what stops the prompt from nagging on every open.
+async fn prompt_input_assumption(
+    ctx: &PreviewCtx,
+    path: &str,
+) -> Option<c41_core::icc::InputAssumption> {
+    let Some(parent) = ctx.picture.upgrade().map(|p| p.upcast::<gtk4::Widget>()) else {
+        // No widget to anchor to (mid-teardown): not worth a modal.
+        eprintln!("darkroom: no window for the profile prompt; assuming sRGB");
+        return None;
+    };
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned());
+    let dialog = adw::AlertDialog::builder()
+        .heading("No colour profile embedded")
+        .body(format!(
+            "{filename} carries no ICC colour profile, so its colours cannot be \
+             known from the file itself. Which colour space are these pixels in?"
+        ))
+        .build();
+    let remember = gtk4::CheckButton::with_label("Remember for this file");
+    remember.set_active(true);
+    dialog.set_extra_child(Some(&remember));
+    dialog.add_response("assume-srgb", "sRGB (default)");
+    dialog.add_response("assume-adobe", "Adobe RGB (1998)");
+    dialog.set_default_response(Some("assume-srgb"));
+    // Closing the dialog (Esc / window X) is its own response, so dismissing —
+    // "don't decide right now" — stays distinct from an explicit choice.
+    dialog.set_close_response("dismiss");
+    // `choose_future` resolves when the dialog closes, so every response closes
+    // it; `set_close_response` covers dismissal.
+    dialog.connect_response(None, |dialog, _| {
+        dialog.close();
+    });
+    let resp = dialog.choose_future(&parent).await;
+    let assumption = match resp.as_str() {
+        "assume-adobe" => c41_core::icc::InputAssumption::AdobeRgb1998,
+        "assume-srgb" => c41_core::icc::InputAssumption::Srgb,
+        _ => return None, // dismissed
+    };
+    if remember.is_active() {
+        crate::persist::save_input_assumption(&ctx.db_path, path, assumption);
+    }
+    Some(assumption)
 }
 
 /// Build a NavigationPage for editing a single image at `file_path`.
@@ -1995,7 +2118,12 @@ pub fn darkroom_page(
                 root.upcast_ref::<gtk4::Window>(),
                 vec![path_for_export.clone()],
                 Some(edit),
-                None, // fixed edit above; no per-image catalog lookup needed
+                // The catalogue is passed so an untagged file's export resolves
+                // the same remembered input assumption the preview prompts for
+                // (G2a2, 1a): on-screen and on-disk must not drift apart. The
+                // fixed `edit` above is unaffected — the per-image fallbacks
+                // only run when `edit` is `None`.
+                Some(ex_db.clone()),
                 move |msg| tf_overlay.add_toast(adw::Toast::new(&msg)),
             );
         }

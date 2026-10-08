@@ -215,7 +215,14 @@ async fn export_images_async(
                         (params, lens)
                     }
                 };
-                if let Err(e) = render_nonraw_export(path, &dest, &settings, &params, lens.as_deref()) {
+                if let Err(e) = render_nonraw_export(
+                    path,
+                    &dest,
+                    &settings,
+                    &params,
+                    lens.as_deref(),
+                    db_path.as_deref(),
+                ) {
                     eprintln!("darkroom export: Rust render failed for {path}: {e}");
                     failed += 1;
                 }
@@ -465,12 +472,18 @@ fn composite_rgba16_over_white(rgba: &image::ImageBuffer<image::Rgba<u16>, Vec<u
 /// agree), and the preview is 8-bit whereas PNG/TIFF export is 16-bit.
 ///
 /// Atomic + fsync-durable write via [`atomic_write`], like the raw path.
+///
+/// `db_path` (catalogue, `None` when absent) is how the per-file remembered
+/// input assumption is reached for untagged images — see the `Missing` arm of
+/// the match in the body. The preview prompts, this reads the answer: a batch
+/// export never prompts mid-run.
 fn render_nonraw_export(
     path: &str,
     dest: &str,
     settings: &crate::export::ExportSettings,
     params: &crate::preview::PreviewParams,
     lens_gear: Option<&crate::preview::LensGear>,
+    db_path: Option<&str>,
 ) -> Result<()> {
     use crate::export::ExportFormat;
     use image::{imageops::FilterType, ImageBuffer, Rgb};
@@ -491,10 +504,41 @@ fn render_nonraw_export(
     // the same grain the preview showed for this file.
     let grain_seed = c41_core::iop::grain::hash_string(path);
 
+    // G2a2, input profiling: reach the same decision the darkroom preview
+    // reached for this file, from the same container, so what is on screen and
+    // what lands on disk cannot drift apart. A scan *error* is "no conclusion"
+    // and falls back to the sRGB assumption, exactly as the preview does.
+    let embedded = c41_core::icc::extract_embedded_file(std::path::Path::new(path))
+        .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat);
+    let transform = match c41_core::icc::input_profile(&embedded) {
+        c41_core::icc::InputProfile::Transform(t) => Some(t),
+        // G2a2, 1a: an untagged file's transform comes from the same per-file
+        // remembered assumption the darkroom preview prompts for — so an image
+        // the user told the preview to treat as Adobe RGB exports as Adobe RGB,
+        // and what is on screen and what lands on disk cannot drift apart.
+        // This side never prompts (a batch export must not ask mid-run): an
+        // unremembered file is the default sRGB assumption, byte-exact.
+        c41_core::icc::InputProfile::Missing => db_path
+            .and_then(|db| crate::persist::load_input_assumption(db, path))
+            .unwrap_or_default()
+            .transform_for_missing(),
+        _ => None,
+    };
+
     match settings.format {
         // JPEG is an 8-bit container — decode + process at 8-bit.
         ExportFormat::Jpeg => {
-            let rgb = composite_rgba8_over_white(&decoded.to_rgba8());
+            let mut raw = decoded.to_rgba8().into_raw();
+            if let Some(t) = &transform {
+                // Before the white composite, never after: the backdrop's white
+                // *is* sRGB white, so compositing has to happen in sRGB, which
+                // means dealing with the device profile first. 4-sample stride —
+                // alpha is a channel apply_rgb8 steps over untouched.
+                c41_core::icc::apply_rgb8(t, &mut raw, w, w * 4, 4);
+            }
+            let rgba = ImageBuffer::from_raw(w as u32, h as u32, raw)
+                .ok_or_else(|| anyhow::anyhow!("empty decode of {path}"))?;
+            let rgb = composite_rgba8_over_white(&rgba);
             let processed =
                 crate::preview::apply_pipeline_gear(&rgb, w, h, w * 3, 3, params, lens_gear, grain_seed);
             atomic_write(&dest_ext, move |out| {
@@ -511,7 +555,17 @@ fn render_nonraw_export(
         // requantisation banding on an edited gradient (an unedited 16-bit source
         // is a lossless passthrough via apply_pipeline_rgb16).
         ExportFormat::Png | ExportFormat::Tiff => {
-            let rgb = composite_rgba16_over_white(&decoded.to_rgba16());
+            let mut raw = decoded.to_rgba16().into_raw();
+            if let Some(t) = &transform {
+                // The same rule as the JPEG leg — before the composite, never
+                // after, because the backdrop's white *is* sRGB white. Only the
+                // container differs: `apply_rgb16` normalizes by 65535, which
+                // is what a profile means by a device value at any depth.
+                c41_core::icc::apply_rgb16(t, &mut raw, w, w * 4, 4);
+            }
+            let rgba = ImageBuffer::from_raw(w as u32, h as u32, raw)
+                .ok_or_else(|| anyhow::anyhow!("empty decode of {path}"))?;
+            let rgb = composite_rgba16_over_white(&rgba);
             let processed =
                 crate::preview::apply_pipeline_rgb16_gear(&rgb, w, h, params, lens_gear, grain_seed);
             let fmt = match settings.format {
@@ -910,6 +964,7 @@ mod tests {
             &settings,
             &crate::preview::PreviewParams::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -953,6 +1008,7 @@ mod tests {
             dest.to_str().unwrap(),
             &settings,
             &params,
+            None,
             None,
         )
         .unwrap();
@@ -1011,6 +1067,7 @@ mod tests {
                 &settings,
                 &crate::preview::PreviewParams::default(),
                 None,
+                None,
             )
             .unwrap();
 
@@ -1023,6 +1080,105 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G2a2 end-to-end — and the only test here that compares us against
+    /// **LCMS** rather than against ourselves.
+    ///
+    /// Skips unless `C41_ICC_CORPUS` is set (see `scripts/make-icc-corpus.sh`),
+    /// keeping CI hermetic. Note what the fixture actually is: ImageMagick's
+    /// `-profile` *assigns* to an untagged image instead of converting it, so
+    /// `icc_AdobeRGB1998.png` carries base.png's own pixel values **declared**
+    /// to be Adobe RGB. That makes this a fair head-to-head — same input bytes,
+    /// two implementations of "read this profile, bring these pixels into sRGB".
+    ///
+    /// The goldens came from `magick icc_AdobeRGB1998.png -profile sRGB.icc`,
+    /// i.e. from lcms through ImageMagick. They are never derived from this
+    /// crate's own output, which is the only way this test means anything.
+    #[test]
+    fn input_profiling_matches_lcms_on_the_corpus() {
+        let Ok(dir) = std::env::var("C41_ICC_CORPUS") else {
+            eprintln!("skipping corpus check: C41_ICC_CORPUS not set");
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let name = "icc_AdobeRGB1998.png";
+
+        let src = image::ImageReader::open(dir.join(name))
+            .unwrap_or_else(|e| panic!("{name}: open: {e}"))
+            .with_guessed_format()
+            .unwrap_or_else(|e| panic!("{name}: probe: {e}"))
+            .decode()
+            .unwrap_or_else(|e| panic!("{name}: decode: {e}"));
+        let w = src.width() as usize;
+
+        let embedded = c41_core::icc::extract_embedded_file(&dir.join(name))
+            .unwrap_or_else(|e| panic!("{name}: scan: {e}"));
+        let c41_core::icc::InputProfile::Transform(t) = c41_core::icc::input_profile(&embedded)
+        else {
+            panic!("{name} is tagged Adobe RGB and must be transformed, not skipped");
+        };
+
+        let mut px = src.to_rgba8().into_raw();
+        assert!(c41_core::icc::apply_rgb8(&t, &mut px, w, w * 4, 4), "no pixels walked");
+
+        // (x, y) and lcms's sRGB answer for that pixel.
+        let golden = [
+            (60usize, 45usize, [222u8, 0, 63]),
+            (120, 90, [148, 0, 131]),
+            (180, 135, [70, 0, 197]),
+            (200, 30, [247, 0, 38]),
+        ];
+        for (x, y, want) in golden {
+            let i = (y * w + x) * 4;
+            let got = [px[i], px[i + 1], px[i + 2]];
+            for c in 0..3 {
+                // ±4 gives rounding and black-point handling room to disagree;
+                // a wrong profile, curve or matrix misses by tens of counts.
+                assert!(
+                    (got[c] as i32 - want[c] as i32).abs() <= 4,
+                    "pixel ({x},{y}): ours {got:?}, lcms {want:?}"
+                );
+            }
+        }
+
+        // The 16-bit export branch must land on the same colour — it is the
+        // same file and the same profile, only a wider container.
+        let mut px16 = src.to_rgba16().into_raw();
+        assert!(c41_core::icc::apply_rgb16(&t, &mut px16, w, w * 4, 4), "no pixels walked");
+        for (x, y, _) in golden {
+            let i = (y * w + x) * 4;
+            for c in 0..3 {
+                let down = (px16[i + c] as f32 / 65535.0 * 255.0).round() as u8;
+                assert!(
+                    (down as i32 - px[i + c] as i32).abs() <= 1,
+                    "pixel ({x},{y}) channel {c}: 8-bit gave {}, 16-bit gave {down}",
+                    px[i + c]
+                );
+            }
+        }
+
+        // The decision itself, across the four cases the corpus can settle.
+        // `icc_default_gray.png` is the useful one: a well-formed profile this
+        // engine simply cannot move, which has to mean "refuse and assume sRGB"
+        // rather than a mis-transform.
+        for (name, want) in [
+            ("icc_AdobeRGB1998.png", "transform"),
+            ("icc_sRGB.png", "srgb"),
+            ("none.png", "missing"),
+            ("icc_default_gray.png", "unusable"),
+        ] {
+            let emb = c41_core::icc::extract_embedded_file(&dir.join(name))
+                .unwrap_or_else(|e| panic!("{name}: scan: {e}"));
+            let got = match c41_core::icc::input_profile(&emb) {
+                c41_core::icc::InputProfile::Transform(_) => "transform",
+                c41_core::icc::InputProfile::Srgb => "srgb",
+                c41_core::icc::InputProfile::Missing => "missing",
+                c41_core::icc::InputProfile::Unusable => "unusable",
+                c41_core::icc::InputProfile::Unknown => "unknown",
+            };
+            assert_eq!(got, want, "{name}: wrong input-profiling decision");
+        }
     }
 
     #[test]

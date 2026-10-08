@@ -36,16 +36,31 @@
 //!   decoder we use (gdk-pixbuf for preview, the `image` crate for export)
 //!   exposes an ICC API, so the container has to be read for the profile
 //!   ourselves. Applying what it finds is the next increment.
+//! - **G2a2 (this increment):** [`standard`] — the sRGB destination profile and
+//!   the buffer loops, plus [`standard::input_profile`], the decision an
+//!   already-decoded image gets. This is the first module in `c41-core::icc`
+//!   the *product* calls: a file's embedded profile now reaches the screen and
+//!   the exported file instead of being ignored. Raw stays out (see
+//!   [`standard`]'s docs), and a profile that is missing or unusable is
+//!   assumed to be sRGB unless the user says otherwise: [`standard::
+//!   InputAssumption`] carries the per-file choice the darkroom preview prompts
+//!   for on the first open of an untagged container, and export resolves the
+//!   same remembered answer.
 
 mod clut;
 mod embed;
 mod ffi;
 mod lut;
 mod parser;
+mod standard;
 mod transform;
 
 pub use clut::Clut;
 pub use embed::{extract as extract_embedded, extract_file as extract_embedded_file, EmbedError, Embedded};
 pub use lut::{parse_lut_tag, parse_lut_v2, parse_lut_v4, Pipeline, Stage};
 pub use parser::{Curve, IccError, Profile, Xyz};
+pub use standard::{
+    apply_rgb8, apply_rgb16, adobe_rgb1998_profile, input_profile, srgb_profile, InputAssumption,
+    InputProfile, INPUT_INTENT,
+};
 pub use transform::Transform;

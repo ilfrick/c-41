@@ -46,6 +46,17 @@ const DEMOSAIC_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS main.darkroom_demosaic \
      (imgid INTEGER PRIMARY KEY, method INTEGER NOT NULL)";
 
+/// DDL for the per-image input-profile assumption table (same private-table
+/// rationale as the others). A separate table from `darkroom_preview`: the
+/// assumption is *decode-time* policy — what an untagged container is taken to
+/// be — stored as the stable code of [`InputAssumption`] so a later prompt
+/// answer updates one row in place. Absence of a row means "never decided",
+/// which the darkroom preview treats as prompt-worthy on the next untagged
+/// open.
+const INPUT_ASSUMPTION_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS main.darkroom_input_assumption \
+     (imgid INTEGER PRIMARY KEY, assumption INTEGER NOT NULL)";
+
 /// DDL for the per-image geometry (straighten + crop) table (same private-table
 /// rationale as the others). A separate table from the params blob: geometry is
 /// applied to the decoded buffer *before* the colour pipeline (it changes the
@@ -300,6 +311,76 @@ fn save_demosaic_conn(conn: &Connection, imgid: i32, method: DemosaicMethod) -> 
         "INSERT INTO main.darkroom_demosaic (imgid, method) VALUES (?1, ?2) \
          ON CONFLICT(imgid) DO UPDATE SET method = excluded.method",
         rusqlite::params![imgid, method.as_u8() as i64],
+    )?;
+    Ok(())
+}
+
+/// The remembered [`InputAssumption`] for the image at `full_path`, or `None` —
+/// meaning *never decided* (the darkroom preview prompts on the first open of
+/// an untagged file), which is distinct from an explicit default: an unknown
+/// stored code also yields `None`, so a corrupted row re-prompts instead of
+/// silently assuming. `None` too on no db / uncatalogued image / no row.
+pub fn load_input_assumption(
+    db_path: &str,
+    full_path: &str,
+) -> Option<c41_core::icc::InputAssumption> {
+    if db_path.is_empty() {
+        return None;
+    }
+    let Ok(conn) = open_catalog(db_path) else {
+        return None;
+    };
+    let imgid = imgid_for_path(&conn, full_path)?;
+    load_input_assumption_conn(&conn, imgid)
+}
+
+/// Persist the per-file [`InputAssumption`] for the image at `full_path`.
+/// Best-effort: silently no-ops with no db or an uncatalogued image.
+pub fn save_input_assumption(db_path: &str, full_path: &str, a: c41_core::icc::InputAssumption) {
+    if db_path.is_empty() {
+        return;
+    }
+    let Ok(conn) = open_catalog(db_path) else {
+        return;
+    };
+    if let Some(imgid) = imgid_for_path(&conn, full_path) {
+        let _ = save_input_assumption_conn(&conn, imgid, a);
+    }
+}
+
+/// Testable core of [`load_input_assumption`]: no row / no table / an unknown
+/// code all yield `None` (prompt-worthy), never an error path.
+fn load_input_assumption_conn(
+    conn: &Connection,
+    imgid: i32,
+) -> Option<c41_core::icc::InputAssumption> {
+    let code: rusqlite::Result<i64> = conn.query_row(
+        "SELECT assumption FROM main.darkroom_input_assumption WHERE imgid = ?1",
+        rusqlite::params![imgid],
+        |row| row.get(0),
+    );
+    match code {
+        Ok(v) => match c41_core::icc::InputAssumption::from_u8(v as u8).as_u8() == v as u8 {
+            // Round-trip guard: `from_u8` treats anything unknown as the
+            // default, which would *remember* sRGB for a row we cannot read.
+            true => Some(c41_core::icc::InputAssumption::from_u8(v as u8)),
+            false => None,
+        },
+        Err(_) => None,
+    }
+}
+
+/// Testable core of [`save_input_assumption`]: upsert the single choice row.
+fn save_input_assumption_conn(
+    conn: &Connection,
+    imgid: i32,
+    a: c41_core::icc::InputAssumption,
+) -> rusqlite::Result<()> {
+    conn.execute(INPUT_ASSUMPTION_TABLE_DDL, [])?;
+    conn.execute(
+        "INSERT INTO main.darkroom_input_assumption (imgid, assumption) VALUES (?1, ?2) \
+         ON CONFLICT(imgid) DO UPDATE SET assumption = excluded.assumption",
+        rusqlite::params![imgid, a.as_u8() as i64],
     )?;
     Ok(())
 }
@@ -661,6 +742,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_demosaic_conn(&db, 42), DemosaicMethod::default());
+    }
+
+    #[test]
+    fn input_assumption_save_then_load_roundtrips() {
+        use c41_core::icc::InputAssumption;
+        let db = open_db();
+        // no row yet → "never decided", prompt-worthy (NOT an implicit default)
+        assert_eq!(load_input_assumption_conn(&db, 42), None);
+        save_input_assumption_conn(&db, 42, InputAssumption::AdobeRgb1998).unwrap();
+        assert_eq!(
+            load_input_assumption_conn(&db, 42),
+            Some(InputAssumption::AdobeRgb1998)
+        );
+        // upsert: PK ⇒ one row holding the latest choice
+        save_input_assumption_conn(&db, 42, InputAssumption::Srgb).unwrap();
+        let n: i32 = db
+            .query_row(
+                "SELECT COUNT(*) FROM main.darkroom_input_assumption WHERE imgid = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            load_input_assumption_conn(&db, 42),
+            Some(InputAssumption::Srgb)
+        );
+    }
+
+    #[test]
+    fn input_assumption_unknown_stored_code_stays_prompt_worthy() {
+        use c41_core::icc::InputAssumption;
+        let db = open_db();
+        db.execute(INPUT_ASSUMPTION_TABLE_DDL, []).unwrap();
+        db.execute(
+            "INSERT INTO main.darkroom_input_assumption (imgid, assumption) VALUES (42, 77)",
+            [],
+        )
+        .unwrap();
+        // An unreadable row must NOT silently "remember" sRGB (which is what
+        // `from_u8`'s unknown-code fallback IS) — re-prompt instead.
+        assert_eq!(load_input_assumption_conn(&db, 42), None);
+        assert_ne!(load_input_assumption_conn(&db, 42), Some(InputAssumption::Srgb));
     }
 
     fn sample_geometry() -> Geometry {

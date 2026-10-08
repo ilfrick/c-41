@@ -174,6 +174,71 @@ mod tests {
         assert_eq!(out, rgba);
     }
 
+    /// Env-gated raw end-to-end (see `scripts/make-raw-corpus.sh`), CI-hermetic:
+    /// skips unless `C41_ICC_CORPUS` is set, exactly like the ICC corpus test in
+    /// dialogs — the raw fixture lives in that same generated corpus directory.
+    ///
+    /// Closes the G2a2 raw hole with a real file: before this there was no raw
+    /// anywhere the test suite could decode, and the raw branch's ICC **exclusion**
+    /// was asserted only by reading code, not by running it. The four claims:
+    /// routing, "nothing to lift", camera-matrix profiling, and a finite preview.
+    #[test]
+    fn synthetic_raw_corpus_decodes_without_the_icc_seam() {
+        let Ok(dir) = std::env::var("C41_ICC_CORPUS") else {
+            eprintln!("skipping raw corpus check: C41_ICC_CORPUS not set");
+            return;
+        };
+        let dng = std::path::Path::new(&dir).join("synthetic.dng");
+        let path = dng.display().to_string();
+
+        // 1. Routing: `spawn_decode` branches on `is_raw_path` BEFORE the ICC
+        // scan, so a raw never reaches `extract_embedded`/`input_profile`.
+        assert!(is_raw_path(&path), "the fixture must route as raw");
+
+        // 2. Even if it were scanned, the container carries no ICC to lift —
+        // a raw's input profile is the camera matrix, and the G2a2 seam has
+        // nothing to mislabel. (A DNG is TIFF-based, so this lands in `Absent`,
+        // not `UnsupportedFormat` — precisely the classification the routing
+        // exists to stay ahead of.)
+        let embedded = c41_core::icc::extract_embedded_file(&dng)
+            .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat);
+        assert!(
+            matches!(
+                embedded,
+                c41_core::icc::Embedded::Absent | c41_core::icc::Embedded::UnsupportedFormat
+            ),
+            "a raw must not expose an embedded ICC profile"
+        );
+
+        // 3. Core decode end-to-end from FILE bytes: dims, a finite RGGB
+        // mosaic, and a non-identity camera matrix — the raw's input profile,
+        // derived from the ColorMatrix tag the fixture carries.
+        let img = c41_core::rawimage::load(&dng).unwrap_or_else(|e| panic!("rawimage::load: {e:?}"));
+        assert_eq!((img.width, img.height), (24, 20), "fixture dims changed");
+        assert_eq!(img.cfa, [[0, 1], [1, 2]], "fixture must stay RGGB");
+        assert_eq!(img.wb[1], 1.0, "fixture white balance must be finite");
+        let identity = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(
+            img.cam_to_working != identity
+                && img.cam_to_working.iter().flatten().all(|v| v.is_finite()),
+            "raws must input-profile via the camera matrix, got {:?}",
+            img.cam_to_working
+        );
+        assert!(
+            img.mosaic.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            "mosaic must be normalized finite photosites"
+        );
+
+        // 4. The full preview path (demosaic + downscale) runs on the file.
+        let pv = decode_raw_preview_with(&path, 2048, Default::default(), None)
+            .unwrap_or_else(|| panic!("raw preview decode failed for {path}"));
+        assert!(pv.width <= 2048 && pv.height <= 2048);
+        assert!(
+            pv.pixels.iter().all(|v| v.is_finite()),
+            "raw preview produced non-finite pixels"
+        );
+    }
+
     #[test]
     fn downscale_drops_partial_edge_blocks() {
         // 3x3 at factor 2 ⇒ one full 2x2 block ⇒ 1x1; the partial right/bottom
