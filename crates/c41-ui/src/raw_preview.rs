@@ -197,17 +197,17 @@ mod tests {
 
         // 2. Even if it were scanned, the container carries no ICC to lift —
         // a raw's input profile is the camera matrix, and the G2a2 seam has
-        // nothing to mislabel. (A DNG is TIFF-based, so this lands in `Absent`,
-        // not `UnsupportedFormat` — precisely the classification the routing
-        // exists to stay ahead of.)
+        // nothing to mislabel. A TIFF-based DNG must classify as `Absent`
+        // (NOT `UnsupportedFormat`): tolerating that would mean a regression
+        // where the extractor refuses TIFF wholesale could pass unnoticed —
+        // which is exactly the classification the routing exists to stay
+        // ahead of.
         let embedded = c41_core::icc::extract_embedded_file(&dng)
             .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat);
         assert!(
-            matches!(
-                embedded,
-                c41_core::icc::Embedded::Absent | c41_core::icc::Embedded::UnsupportedFormat
-            ),
-            "a raw must not expose an embedded ICC profile"
+            matches!(embedded, c41_core::icc::Embedded::Absent),
+            "a DNG must lift nothing (Absent), got an {:?}",
+            embedded
         );
 
         // 3. Core decode end-to-end from FILE bytes: dims, a finite RGGB

@@ -75,7 +75,9 @@ pub(crate) const ADOBE_RGB1998: [[f32; 3]; 3] = [
 /// the same exponent the real profile's `para` type-0 curves carry.
 pub(crate) const ADOBE_RGB1998_GAMMA: f32 = 563.0 / 256.0;
 
-/// One `s15Fixed16` quantum in normalized units.
+/// One `s15Fixed16` quantum in normalized units. Tests compare against it; the
+/// production engine has no use for the constant itself.
+#[cfg(test)]
 const QUANTUM: f32 = 1.0 / 65536.0;
 
 /// Tolerance for the "already sRGB" gate, in normalized units: **one 16-bit

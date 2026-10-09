@@ -360,13 +360,13 @@ fn load_input_assumption_conn(
         |row| row.get(0),
     );
     match code {
-        Ok(v) => match c41_core::icc::InputAssumption::from_u8(v as u8).as_u8() == v as u8 {
-            // Round-trip guard: `from_u8` treats anything unknown as the
-            // default, which would *remember* sRGB for a row we cannot read.
-            true => Some(c41_core::icc::InputAssumption::from_u8(v as u8)),
-            false => None,
-        },
-        Err(_) => None,
+        // Only the two known codes are readable. Anything else — including a
+        // value that merely *truncates* to one of them, like 256 or 257 — must
+        // stay "never decided": `from_u8`'s fallback IS the default, and
+        // silently remembering the default for a row we cannot read would
+        // defeat the re-prompt the `None` contract exists for.
+        Ok(v) if v == 0 || v == 1 => Some(c41_core::icc::InputAssumption::from_u8(v as u8)),
+        _ => None,
     }
 }
 
@@ -748,7 +748,10 @@ mod tests {
     fn input_assumption_save_then_load_roundtrips() {
         use c41_core::icc::InputAssumption;
         let db = open_db();
-        // no row yet → "never decided", prompt-worthy (NOT an implicit default)
+        db.execute(INPUT_ASSUMPTION_TABLE_DDL, []).unwrap();
+        // table exists, no row yet → "never decided", prompt-worthy (NOT an
+        // implicit default) — meaningful only because the table is present,
+        // otherwise this would be satisfied by a missing table instead.
         assert_eq!(load_input_assumption_conn(&db, 42), None);
         save_input_assumption_conn(&db, 42, InputAssumption::AdobeRgb1998).unwrap();
         assert_eq!(
@@ -783,8 +786,26 @@ mod tests {
         .unwrap();
         // An unreadable row must NOT silently "remember" sRGB (which is what
         // `from_u8`'s unknown-code fallback IS) — re-prompt instead.
-        assert_eq!(load_input_assumption_conn(&db, 42), None);
-        assert_ne!(load_input_assumption_conn(&db, 42), Some(InputAssumption::Srgb));
+        // 256/257 pin the truncation trap: they cast to the *known* codes 0/1,
+        // so the old round-trip guard (compare `from_u8(v as u8).as_u8()`) let
+        // them through as remembered choices.
+        for code in [77i64, 256, 257, 4096 + 1] {
+            db.execute(
+                "UPDATE main.darkroom_input_assumption SET assumption = ?1 WHERE imgid = 42",
+                [code],
+            )
+            .unwrap();
+            assert_eq!(
+                load_input_assumption_conn(&db, 42),
+                None,
+                "stored code {code} must stay prompt-worthy"
+            );
+            assert_ne!(
+                load_input_assumption_conn(&db, 42),
+                Some(InputAssumption::Srgb),
+                "code {code} must not be silently remembered as sRGB"
+            );
+        }
     }
 
     fn sample_geometry() -> Geometry {

@@ -1151,7 +1151,7 @@ async fn resolve_preview_transform(
     path: &str,
     embedded: &c41_core::icc::Embedded,
 ) -> Option<c41_core::icc::Transform> {
-    use c41_core::icc::{InputAssumption, InputProfile};
+    use c41_core::icc::InputProfile;
     match c41_core::icc::input_profile(embedded) {
         InputProfile::Transform(t) => Some(t),
         InputProfile::Missing => match crate::persist::load_input_assumption(&ctx.db_path, path) {
@@ -1192,7 +1192,12 @@ async fn prompt_input_assumption(
         .heading("No colour profile embedded")
         .body(format!(
             "{filename} carries no ICC colour profile, so its colours cannot be \
-             known from the file itself. Which colour space are these pixels in?"
+             known from the file itself. Which colour space are these pixels \
+             in?\n\
+             \n\
+             Tick \"Remember for this file\" to apply the choice on every \
+             later open and on export. Unticked, it applies to this edit only \
+             \u{2014} an export of this file falls back to sRGB."
         ))
         .build();
     let remember = gtk4::CheckButton::with_label("Remember for this file");
