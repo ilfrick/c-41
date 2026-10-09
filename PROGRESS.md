@@ -8627,3 +8627,95 @@ Two verification notes, because this increment resists the check used for g1a–
   binary should conclude "unused library code", not "the rebuild missed the
   change". G2a2 is where the increment becomes observable, and that is the point
   at which the g1a–g1c string check applies again.
+## 2026-10-09 17:10 UTC — g2a2: device→sRGB input profiling wired through preview and export
+
+**Commits** `ef21bc4a40` + `34b5d5fff8` (review follow-up) — GitHub + Gitea
+
+**What.** First increment where the product calls c41-core::icc. G2a1 (m4-245)
+could lift a profile out of a JPEG/PNG/TIFF but nothing applied it; now a
+tagged image is actually shaped into the working space on the way to the
+screen and to the exported file.
+
+- `c41-core/src/icc/standard.rs`: the sRGB destination profile, the buffer
+  loops (`apply_rgb8`/`apply_rgb16`), and `input_profile()` — the decision an
+  already-decoded image gets, five outcomes (Missing / Srgb / Unusable /
+  Transform / Unknown). Only Transform moves pixels; Missing/Srgb/Unusable/
+  Unknown leave bytes untouched, so an ordinary untagged or sRGB photograph
+  stays byte-exact. `InputAssumption` (Srgb / AdobeRgb1998) + a cached
+  in-process Adobe RGB (1998) profile built from D50-consistent colourants, so
+  an assumed file is treated exactly like the same pixels tagged.
+- preview (`darkroom/mod.rs` `spawn_decode`): extracts the embedded ICC from
+  the bytes it already holds for the decode, resolves the transform BEFORE
+  PixbufLoader, applies it to the 8-bit base. Raw still routes before any ICC
+  scan by design.
+- export (`dialogs/mod.rs` `render_nonraw_export`): re-extracts the same
+  container and applies the same decision, at 8-bit (JPEG) and 16-bit
+  (PNG/TIFF), before the white composite — the backdrop's white IS sRGB white.
+  Preview/export parity is the increment's headline claim: what is on screen
+  and what lands on disk cannot drift apart.
+- prompt (user scope decision 1a): an untagged first-open asks the user once
+  instead of silently assuming sRGB. adw::AlertDialog via `choose_future`,
+  "sRGB (default)" highlighted, "Adobe RGB (1998)" second, "Remember for this
+  file" checked by default; dismissal = sRGB this session, nothing persisted.
+  Stored per file in a new `main.darkroom_input_assumption` table (persist,
+  same shape as `darkroom_demosaic`; row absent = never decided = prompt-worthy).
+  Export resolves the remembered answer silently (a batch export never prompts
+  mid-run): remembered row, or default sRGB. The dialog body states the
+  consequence of not remembering — an unremembered file exports as sRGB — so
+  the one remaining divergence (session-only choice vs export's row-only read)
+  is visible to the user, not silent.
+- raw fixture (user scope decision 2b): `scripts/make-raw-corpus.sh` generates
+  a minimal-but-real Adobe DNG (RGGB 24x20, uncompressed 16-bit, ColorMatrix1
+  + AsShotNeutral, WhiteLevel) into the same corpus dir as the ICC corpus;
+  env-gated test asserts routing, "nothing to lift" (`Absent` exactly), a
+  non-identity finite camera matrix, and a finite demosaiced preview.
+
+**Verified.** Full Docker gate (`scripts/ci-local.sh`) green on `ef21bc4a40`
+and again on `34b5d5fff8` (the review-fix tree), and once more through the
+pre-push hook on the way to the remotes. c41-core 1900 (1897 before this
+slice +3), c41-ui 529, c41-db 100, 0 failures. Clippy `--all-targets` adds no
+new warnings (the review caught two — `QUANTUM` and an unused import — and
+both are fixed). With `C41_ICC_CORPUS` set: the LCMS corpus test and the new
+raw end-to-end test both pass on generated files. The synthetic DNG was built
+incrementally: the first generator wrote TIFF element counts as byte counts,
+which made rawloader read inline values as out-of-line offsets and panic
+(`range start index 4095 out of range` for slice of length 1328); the fix
+(element counts) is why the generator asserts whole-element payloads.
+
+**Senior review** (`ef21bc4a40` → `34b5d5fff8`): APPROVE WITH NOTES, no
+blockers. The notes and their fixes: (1) `QUANTUM` is test-only, moved under
+`#[cfg(test)]`; (2) unused `InputAssumption` import dropped; (3) remember-off
+behaviour diverges between preview (applies this session) and export (row-only)
+— fixed by making the dialog body say so; (4) raw test's "nothing to lift"
+assertion tightened from `Absent|UnsupportedFormat` to `Absent` exactly;
+(5) persist round-trip test now creates the table before asserting None so the
+assertion is about a missing row; (6) `load_input_assumption_conn` range-checks
+the stored code to {0,1} before the u8 cast — codes that merely truncate to a
+known one (256, 257, 4097) now stay prompt-worthy instead of being silently
+remembered. The reviewer's empirical checks (generator layout byte-for-byte,
+prompt `choose_future` semantics, composite ordering, `is_srgb` neutrals) all
+confirmed sound.
+
+**Remote CI.** Pushed `34b5d5fff8` (both commits in one push) to both remotes;
+`master` verified at that SHA on GitHub and gitea via `ls-remote`. GitHub CI:
+`check + test + clippy` → success, `Build & push Docker image` → success;
+`Darkroom CI` → skipped as expected.
+
+**Running image.** Rebuilt `c-41:latest` from this commit (image
+`7c7614b2a2c9`, `--build-arg CACHEBUST=34b5d5fff8`) and relaunched the long-lived
+`c-41` container on it (id `3edd09482eec`), previous images kept as
+`c-41:previous`/`c-41-old`. Container `Up (healthy)`, 0 restarts, `c41-rs`
+running as pid 272, UI answers `HTTP 200` on `:3000`, and the log scan for
+`panicked`/`Aborted`/`restarting` is clean.
+
+**Notes.** The prompt is inherently untestable in the suite (UI), so its
+contract is pinned by construction: `choose_future` resolves only when the
+dialog closes, every response closes it, `set_close_response("dismiss")` maps
+Esc/X to "don't decide", and the answer (if any) is saved inside the prompt so
+it survives the generation-guard race that drops a stale decode's transform.
+The remaining preview/export divergence (an active-but-unremembered choice is
+not carried to export) is documented in the dialog body rather than engineered
+away; carrying session state into export would be a design change for a later
+increment.
+---
+
