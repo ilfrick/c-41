@@ -62,8 +62,8 @@ impl ExportPanel {
         // ── Output colour profile ─────────────────────────────────────────
         let color_group = adw::PreferencesGroup::builder()
             .title("Color")
-            .description("Space the file is encoded into and tagged with. \
-                          sRGB is a no-op; a wider space converts the rendered pixels.")
+            .description("Space the exported file is tagged with. sRGB leaves the \
+                          pipeline's own bytes unchanged; a wider space converts them into it.")
             .build();
         let profile_row = adw::ComboRow::builder().title("Output color profile").build();
         let profile_labels: Vec<&str> = OutputProfile::ALL.iter().map(|p| p.label()).collect();

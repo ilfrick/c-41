@@ -302,8 +302,7 @@ fn render_raw_export(
     // `atomic_write`): a mid-encode failure must never leave a truncated file
     // that looks like a valid export, and a failed re-export must not clobber a
     // prior good file. The decode above already fails before any file is touched.
-    let out_profile = settings.output_profile;
-    let profile = out_profile.profile_bytes();
+    let (profile, out_transform) = settings.output_profile.resolve();
     atomic_write(&dest_ext, |out| {
         let lens_gear = edit.lens.as_deref();
         // Grain's per-image noise seed (see `Stage::Grain`), so an export
@@ -320,7 +319,7 @@ fn render_raw_export(
                     lens_gear,
                     grain_seed,
                 );
-                if let Some(t) = out_profile.transform_from_srgb() {
+                if let Some(t) = out_transform {
                     // Tightly packed RGB, so rowstride == width·3.
                     c41_core::icc::apply_rgb8(t, &mut rgb, w, w * 3, 3);
                 }
@@ -340,7 +339,7 @@ fn render_raw_export(
                     lens_gear,
                     grain_seed,
                 );
-                if let Some(t) = out_profile.transform_from_srgb() {
+                if let Some(t) = out_transform {
                     c41_core::icc::apply_rgb16(t, &mut rgb, w, w * 3, 3);
                 }
                 let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
@@ -611,9 +610,10 @@ fn render_nonraw_export(
     // gears end in `linear_to_srgb`), then — when the chosen profile is not
     // sRGB — is converted into that space through the ICC engine and captioned
     // with the matching profile. An export that said nothing in G2a's day now
-    // states the space a colour-managed viewer must read it in.
-    let out_profile = settings.output_profile;
-    let profile = out_profile.profile_bytes();
+    // states the space a colour-managed viewer must read it in. `resolve` hands
+    // back the bytes and the transform together so the tag can never name a
+    // space the pixels were not converted into.
+    let (profile, out_transform) = settings.output_profile.resolve();
 
     match settings.format {
         // JPEG is an 8-bit container — decode + process at 8-bit.
@@ -632,7 +632,7 @@ fn render_nonraw_export(
             let mut processed =
                 crate::preview::apply_pipeline_gear(&rgb, w, h, w * 3, 3, params, lens_gear, grain_seed);
             // G2c: sRGB working space → the chosen output profile (no-op for sRGB).
-            if let Some(t) = out_profile.transform_from_srgb() {
+            if let Some(t) = out_transform {
                 c41_core::icc::apply_rgb8(t, &mut processed, w, w * 3, 3);
             }
             atomic_write(&dest_ext, move |out| {
@@ -662,7 +662,7 @@ fn render_nonraw_export(
             let rgb = composite_rgba16_over_white(&rgba);
             let mut processed =
                 crate::preview::apply_pipeline_rgb16_gear(&rgb, w, h, params, lens_gear, grain_seed);
-            if let Some(t) = out_profile.transform_from_srgb() {
+            if let Some(t) = out_transform {
                 c41_core::icc::apply_rgb16(t, &mut processed, w, w * 3, 3);
             }
             let fmt = match settings.format {
