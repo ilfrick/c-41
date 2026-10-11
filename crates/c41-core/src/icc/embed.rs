@@ -75,7 +75,8 @@
 //!   the three that needs a decompressor (`flate2`); JPEG and TIFF store ICC
 //!   uncompressed.
 //! * **TIFF** (both byte orders) — IFD entry tag `34675`
-//!   (`InterColorProfile`), type `UNDEFINED`, inline when it fits in four
+//!   (`InterColorProfile`), type `UNDEFINED` (or `BYTE`, which some encoders
+//!   write instead — see [`TIFF_TYPE_BYTE`]), inline when it fits in four
 //!   bytes and out-of-line otherwise. We search IFD0 and follow the IFD chain
 //!   (for multi-page TIFFs) but deliberately **not** SubIFDs: ICC in a SubIFD
 //!   is non-standard, and darktable's own readers do not look there.
@@ -101,8 +102,14 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 /// TIFF tag number for `InterColorProfile` — the embedded ICC profile.
 const TIFF_TAG_INTERCOLORPROFILE: u16 = 34675;
-/// TIFF field type `UNDEFINED` (7), the type ICC profiles are stored as.
+/// TIFF field type `UNDEFINED` (7), the type the spec says ICC profiles are
+/// stored as.
 const TIFF_TYPE_UNDEFINED: u16 = 7;
+/// TIFF field type `BYTE` (1). Not what the spec names, but the `tiff` crate
+/// behind `image`'s `TiffEncoder` writes the ICC tag as BYTE, and BYTE and
+/// UNDEFINED are both arrays of 1-byte elements — same length and inline
+/// semantics — so a reader that accepts one should accept both.
+const TIFF_TYPE_BYTE: u16 = 1;
 
 /// The 12-byte marker that opens an `APP2` payload carrying an ICC profile:
 /// `"ICC_PROFILE"` followed by a NUL. The next two bytes are then the chunk's
@@ -549,10 +556,13 @@ fn read_tiff<R: Read + Seek>(r: &mut R) -> Result<Embedded, EmbedError> {
             let ty = t.u16(entry + 2)?;
             let n = t.u32(entry + 4)? as usize;
             let value_raw = t.u32(entry + 8)?;
-            // ICCProfile in TIFF is specified as UNDEFINED; many encoders (including
-            // the `tiff` crate used by `image`) write it as BYTE. Accept both.
-            if ty != TIFF_TYPE_UNDEFINED && ty != 1 {
-                return Err(EmbedError::Malformed("tiff icc tag is not of type UNDEFINED"));
+            // ICCProfile in TIFF is specified as UNDEFINED; many encoders
+            // (including the `tiff` crate used by `image`) write it as BYTE.
+            // Both are 1-byte element arrays, so accept either.
+            if ty != TIFF_TYPE_UNDEFINED && ty != TIFF_TYPE_BYTE {
+                return Err(EmbedError::Malformed(
+                    "tiff icc tag is neither of type UNDEFINED nor BYTE",
+                ));
             }
             if n == 0 {
                 return Err(EmbedError::Malformed("tiff icc tag has zero length"));
@@ -872,6 +882,20 @@ mod tests {
         t.extend_from_slice(b"acsp"); // inline value
         t.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
         assert!(matches!(extract_bytes(&t), Err(EmbedError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_tiff_icc_tag_of_type_byte_is_accepted() {
+        // The `tiff` crate behind `image`'s `TiffEncoder` writes the ICC tag as
+        // BYTE, not the spec's UNDEFINED — so this is the shape the G2b export
+        // path actually produces. Both types are 1-byte element arrays, so the
+        // count and inline/out-of-line split are interpreted identically; the
+        // profile must come back unaltered.
+        let p = some_profile(9);
+        let mut t = tiff(&p, false);
+        let type_field = 8 + 2 + 2; // IFD0 offset + entry count (2) + tag (2)
+        t[type_field..type_field + 2].copy_from_slice(&TIFF_TYPE_BYTE.to_le_bytes());
+        assert_eq!(extract_bytes(&t).unwrap(), Embedded::Present(p));
     }
 
     #[test]

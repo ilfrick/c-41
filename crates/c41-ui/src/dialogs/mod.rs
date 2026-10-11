@@ -192,7 +192,9 @@ async fn export_images_async(
             // byte-identical to it (different decoder + 8-bit; see
             // render_nonraw_export). Bakes a single-image darkroom edit if present,
             // else the per-path persisted params seeded like the preview (sigmoid
-            // off). Only formats with no Rust decoder (heic/heif/avif) still use cli.
+            // off). Formats with no Rust decoder (heic/heif/avif) fall through to
+            // darkroom-cli below — that path emits the C tool's own output profile,
+            // which this crate neither owns nor tags (G2b tags only the Rust paths).
             if is_rust_image_path(path) {
                 let (params, lens) = match &edit {
                     Some(e) => (e.params, e.lens.clone()),
@@ -435,12 +437,18 @@ fn save_rgb16_buf(
 
 /// Write the neural-restore result as a TIFF beside the source: the exact
 /// export-path encode (16-bit RGB through [`save_rgb16_buf`] with
-/// `ImageFormat::Tiff`, the sRGB profile embedded — the denoise output is
-/// quantized sRGB, so the tag matches the pixels) behind the export path's
+/// `ImageFormat::Tiff`, the sRGB profile embedded) behind the export path's
 /// atomic+fsync write ([`atomic_write`]). `dest` is the exact destination path
 /// (already carrying the `.tif` extension — callers own uniqueness); `rgb` is
 /// packed RGB u16. Reusing the export writer — not a second TIFF encoder — is
 /// deliberate.
+///
+/// G2b: the neural path decodes every non-raw source *as sRGB* (inverse sRGB
+/// OETF — the "working profile, treated as sRGB" approximation `restore_rgb.c`
+/// makes; see [`crate::neural`]) and quantizes its result
+/// through the same sRGB OETF, so the embedded tag states the space the file
+/// was both read and written as, even though a non-sRGB-tagged source is
+/// deliberately collapsed rather than colour-managed on this path.
 pub(crate) fn write_rgb16_tiff_atomic(
     dest: &str,
     w: u32,
@@ -1136,6 +1144,12 @@ mod tests {
     /// [`c41_core::icc::srgb_profile`] — read back through the *extractor* the
     /// import path uses, pinning writer and reader together — and reopening the
     /// file must classify as sRGB, so an export round-trip never double-transforms.
+    ///
+    /// What this pins is writer↔reader agreement and the reclassification; that
+    /// the constant on both sides really *is* sRGB (colorants, TRC, illuminant)
+    /// is pinned by `c41_core::icc`'s conformance tests, since the same constant
+    /// can't prove its own colour space. The TIFF case also exercises the
+    /// BYTE-typed ICC tag the `image` encoder emits.
     #[test]
     fn exports_embed_the_srgb_profile_and_reopen_as_a_noop() {
         use image::{ImageBuffer, Rgb};
@@ -1205,21 +1219,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// G2b external oracle, env-gated like the ICC corpus tests so CI stays
-    /// hermetic: the exported profile is checked by **lcms** — the colour engine
-    /// darktable itself uses — through ImageMagick's `convert FILE icc:OUT`,
-    /// which reads the embedded profile back byte-for-byte. The fixtures are
-    /// written into `C41_ICC_CORPUS` so a run without ImageMagick on PATH still
-    /// leaves them behind for a host-side `convert`/`cmp` cross-check.
+    /// G2b external cross-check, env-gated like the ICC corpus tests so CI stays
+    /// hermetic. Two things a *third-party* tool — ImageMagick's reader, backed
+    /// by lcms — verifies about the bytes we ship:
+    ///
+    /// 1. It can **locate and extract** the payload from each container
+    ///    (`convert FILE icc:OUT`) and gets back exactly [`srgb_profile`], which
+    ///    exercises our framing (PNG iCCP deflate, TIFF tag 34675, JPEG APP2)
+    ///    against a reader that is not ours. A payload it cannot decompress or
+    ///    parse yields no output file, so the read below fails.
+    /// 2. It can **parse and use** the profile: translating to a known-good
+    ///    target (`-profile`) makes lcms read the embedded profile and build a
+    ///    transform, and it fails or prints an `invalid signature`/`not an ICC
+    ///    profile` diagnostic if the bytes are malformed. `-profile` is used
+    ///    rather than `-colorspace` because the latter leaves TIFF/JPEG profiles
+    ///    unvalidated on ImageMagick 7 (only PNG's libpng iCCP check trips).
+    ///    lcms is the engine darktable itself uses.
+    ///
+    /// What this does *not* prove is that the profile is numerically sRGB — that
+    /// is pinned by `c41_core::icc`'s own conformance tests (colorants, TRC
+    /// against the pipeline lineariser, the D50 PCS illuminant); here the same
+    /// constant sits on both sides of the comparison by design. Fixtures are left
+    /// in `C41_ICC_CORPUS` so a run without ImageMagick on PATH still leaves them
+    /// for a host-side `convert`/`cmp` cross-check.
     #[test]
-    fn embedded_profiles_match_via_lcms_imagemagick() {
+    fn imagemagick_extracts_and_parses_exported_profiles() {
         let Ok(dir) = std::env::var("C41_ICC_CORPUS") else {
-            eprintln!("skipping lcms oracle: C41_ICC_CORPUS not set");
+            eprintln!("skipping imagemagick oracle: C41_ICC_CORPUS not set");
             return;
         };
-        let convert = std::process::Command::new("convert").arg("--version").output().is_ok();
-        if !convert {
-            eprintln!("skipping lcms oracle: ImageMagick `convert` not on PATH");
+        if std::process::Command::new("convert").arg("--version").output().is_err() {
+            eprintln!("skipping imagemagick oracle: `convert` not on PATH");
+            return;
         }
 
         let scratch = std::env::temp_dir().join(format!(
@@ -1238,6 +1269,7 @@ mod tests {
 
         let want = c41_core::icc::srgb_profile();
         let corpus = std::path::Path::new(&dir);
+        std::fs::create_dir_all(corpus).unwrap();
         std::fs::write(corpus.join("g2b_srgb_profile.icc"), &want).unwrap();
         for format in [
             crate::export::ExportFormat::Jpeg,
@@ -1263,20 +1295,41 @@ mod tests {
 
             let done = corpus.join(format!("g2b_export.{ext}"));
             std::fs::copy(format!("{}.{ext}", dest.to_str().unwrap()), &done).unwrap();
-            if convert {
-                let icc = corpus.join(format!("g2b_export.{ext}.icc"));
-                let st = std::process::Command::new("convert")
-                    .arg(&done)
-                    .arg(format!("icc:{}", icc.display()))
-                    .status()
-                    .unwrap_or_else(|e| panic!("{ext}: convert: {e}"));
-                assert!(st.success(), "{ext}: convert exited {st}");
-                assert_eq!(
-                    std::fs::read(&icc).unwrap(),
-                    want,
-                    "{ext}: lcms did not reproduce our profile bytes"
-                );
-            }
+
+            // 1. Extract the payload with a third-party reader; it must round-trip
+            //    our bytes exactly (and must produce a file at all).
+            let icc = corpus.join(format!("g2b_export.{ext}.icc"));
+            let _ = std::fs::remove_file(&icc);
+            let st = std::process::Command::new("convert")
+                .arg(&done)
+                .arg(format!("icc:{}", icc.display()))
+                .status()
+                .unwrap_or_else(|e| panic!("{ext}: convert: {e}"));
+            assert!(st.success(), "{ext}: convert exited {st}");
+            assert_eq!(
+                std::fs::read(&icc).unwrap_or_else(|e| panic!("{ext}: reading extracted icc: {e}")),
+                want,
+                "{ext}: a third-party extractor did not recover our profile bytes"
+            );
+
+            // 2. Force lcms to parse + use the embedded profile by translating
+            //    to a known-good target; a malformed profile fails the transform
+            //    or draws a diagnostic even where `convert` may still exit zero,
+            //    so assert on the status *and* the stderr text.
+            let ref_profile = corpus.join("g2b_srgb_profile.icc");
+            let out = std::process::Command::new("convert")
+                .arg(&done)
+                .arg("-profile")
+                .arg(&ref_profile)
+                .arg("null:")
+                .output()
+                .unwrap_or_else(|e| panic!("{ext}: convert: {e}"));
+            assert!(out.status.success(), "{ext}: convert exited {}", out.status);
+            let err = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            assert!(
+                !err.contains("invalid signature") && !err.contains("not an icc profile"),
+                "{ext}: lcms rejected the embedded profile: {err}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&scratch);

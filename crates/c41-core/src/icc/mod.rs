@@ -48,11 +48,15 @@
 //!   same remembered answer.
 //! - **G2b (this increment):** the output side — [`standard::srgb_profile`]
 //!   now also carries the `desc`/`cprt`/`chad` tags a conformant display
-//!   profile needs, and the UI embeds those bytes in every exported
-//!   JPEG/PNG/TIFF (and the neural-restore TIFF), so what lands on disk is
-//!   tagged with the sRGB space its pixels were rendered in. Before this, an
-//!   export was untagged: colour-managed viewers guessed (usually wrong for
-//!   anything that had been transformed).
+//!   profile needs, and the profile header writes the mandatory D50 PCS
+//!   illuminant and a fixed creation date/time (`build_profile` had left both
+//!   zeroed), and the UI embeds those
+//!   bytes in every exported JPEG/PNG/TIFF (and the neural-restore TIFF), so
+//!   what lands on disk is tagged with the sRGB space its pixels were rendered
+//!   in. Before this, an export was untagged: colour-managed viewers guessed
+//!   (usually wrong for anything that had been transformed). [`embed`] also
+//!   accepts the `BYTE`-typed TIFF ICC tag the `image` encoder writes, alongside
+//!   the spec's `UNDEFINED`.
 
 mod clut;
 mod embed;

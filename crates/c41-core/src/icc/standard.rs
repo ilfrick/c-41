@@ -165,7 +165,23 @@ pub(crate) fn build_profile(
     b[12..16].copy_from_slice(class);
     b[16..20].copy_from_slice(data_space);
     b[20..24].copy_from_slice(pcs);
+    // Creation date/time — mandatory (ICC.1:2010 §7.2.4). A *fixed* stamp keeps
+    // `srgb_profile()` deterministic: the profile is a compile-time constant, so
+    // two builds — and two calls in one process — must produce identical bytes.
+    // Leaving it zero would encode an impossible year-0 date.
+    for (i, v) in [2026u16, 1, 1, 0, 0, 0].iter().enumerate() {
+        b[24 + i * 2..26 + i * 2].copy_from_slice(&v.to_be_bytes());
+    }
     b[36..40].copy_from_slice(b"acsp");
+    // PCS illuminant: ICC.1:2010 §7.2.16 mandates D50 in this field on every
+    // profile *regardless of the actual media white*, and the reference sRGB
+    // profile writes exactly these bytes. Strict third-party readers (libpng,
+    // ImageMagick) warn when it is zero, and every exported file now carries
+    // this header, so it has to be right.
+    for (i, v) in D50.iter().enumerate() {
+        let fixed = (v * 65536.0).round() as i32 as u32;
+        b[68 + i * 4..72 + i * 4].copy_from_slice(&fixed.to_be_bytes());
+    }
     // Default rendering intent = perceptual, matching [`INPUT_INTENT`] and the
     // reference profile. The caller passes its own intent to
     // [`Transform::new`], so this is a hint, not a control.
@@ -690,6 +706,24 @@ mod tests {
         assert_eq!(&p.data_space, b"RGB ");
         assert_eq!(&p.pcs, b"XYZ ");
 
+        // Creation date/time is mandatory (§7.2.4); pin the fixed stamp so the
+        // builder stays deterministic and never ships a year-0 date.
+        assert_eq!(
+            &bytes[24..36],
+            &[0x07, 0xea, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "creation date/time must be a real, fixed date"
+        );
+
+        // The PCS illuminant (spec §7.2.16) is mandatory and must be D50 on
+        // every profile; the reference sRGB profile writes exactly these bytes.
+        // Strict readers (libpng, ImageMagick) warn on an all-zero illuminant,
+        // and this header ships inside every exported file, so pin it.
+        assert_eq!(
+            &bytes[68..80],
+            &[0x00, 0x00, 0xf6, 0xd6, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xd3, 0x2d],
+            "PCS illuminant must be D50"
+        );
+
         // Every tag's data is 4-byte aligned and wholly inside the file.
         let n = u32::from_be_bytes(bytes[128..132].try_into().unwrap()) as usize;
         for i in 0..n {
@@ -712,13 +746,11 @@ mod tests {
         let doff = u32::from_be_bytes(desc[24..28].try_into().unwrap()) as usize;
         assert_eq!(doff, 28, "first record's text starts right after the record");
         let dlen = u32::from_be_bytes(desc[20..24].try_into().unwrap()) as usize;
-        let desc_text: String = String::from_utf16(
-            &desc[doff..doff + dlen]
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                .collect::<Vec<u16>>(),
-        )
-        .unwrap();
+        let words: Vec<u16> = (0..dlen)
+            .step_by(2)
+            .map(|i| u16::from_be_bytes([desc[doff + i], desc[doff + i + 1]]))
+            .collect();
+        let desc_text = String::from_utf16(&words).unwrap();
         assert!(desc_text.contains("sRGB"), "description must say what the profile is: {desc_text:?}");
 
         // cprt is an mluc with non-empty text.
@@ -730,9 +762,9 @@ mod tests {
         // chad: sf32 with the nine reference values, byte for byte.
         let chad = p.tag(b"chad").expect("a conformant mntr profile must carry chad");
         assert_eq!(&chad[0..4], b"sf32");
-        let vals: Vec<i32> = chad[8..]
-            .chunks_exact(4)
-            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        let vals: Vec<i32> = (0..chad.len() - 8)
+            .step_by(4)
+            .map(|i| i32::from_be_bytes(chad[8 + i..12 + i].try_into().unwrap()))
             .collect();
         assert_eq!(vals, CHAD.to_vec());
     }
