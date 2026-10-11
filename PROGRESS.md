@@ -8719,6 +8719,67 @@ away; carrying session state into export would be a design change for a later
 increment.
 ---
 
+## 2026-10-11 09:22 UTC — G2c: the export output colour profile is a choice
+
+**What.** The output half of G2a2: where G2b tagged every Rust export with the
+sRGB profile, G2c makes the destination a *choice*.
+
+- `c41-core::icc` gains `OutputProfile` (`Srgb` — the default and a byte-exact
+  no-op — or `AdobeRgb1998`) with `profile_bytes()` (the bytes to embed),
+  `transform_from_srgb()` (the sRGB→destination ICC transform, cached in a
+  `OnceLock`) and `resolve()`, which hands back the bytes and the transform
+  *together* so the tag can never name a space the pixels were not converted
+  into. `as_u8`/`from_u8` give the combo a stable code (0/1).
+- The export panel gains a "Color → Output color profile" combo populated from
+  `OutputProfile::ALL`; the choice is remembered app-wide as the ui-pref
+  `export.output_profile` (`main.darkroom_ui_prefs`), seeded on open and saved on
+  the Export response. `ExportSettings` carries the choice.
+- Both Rust export funnels — `render_raw_export` and `render_nonraw_export`, in
+  the 8-bit JPEG and 16-bit PNG/TIFF arms — convert the rendered **sRGB** buffer
+  through the engine (`apply_rgb8`/`apply_rgb16`, tightly packed RGB, stride
+  `w*3`) when the destination is not sRGB, then embed that profile's bytes. The
+  sRGB default skips the conversion, so every existing export stays
+  byte-identical and the G2b tests still hold.
+- **Fixes a bug the new tests exposed.** `adobe_rgb1998_profile()` read the
+  D50-adapted colorant table by *column* while the test fixture read it by
+  *row*, transposing the colorant matrix: the three primary vectors no longer
+  summed to the declared white, so device white reached the PCS off-white
+  (sRGB white → `[0.97, 1.0, 0.91]` Adobe) and every `InputAssumption::
+  AdobeRgb1998` transform — live since G2a2 — bent the hue. The builder now
+  reads rows; `adobe_rgb1998_profile_colorants_sum_to_d50` pins the invariant.
+- The Adobe profile also grows the three informational tags G2b gave sRGB
+  (`desc`/`cprt`/`chad`), because G2c now ships its bytes inside exported files
+  and a third-party reader must see a conformant `mntr` profile. `ExportFormat::
+  Jpeg`'s label drops the now-wrong "(sRGB)".
+
+**Scope, stated plainly.** The render seam is still sRGB (both gears end in
+`linear_to_srgb`), so a wider destination re-encodes the colours the seam
+produced rather than recovering gamut it clipped — the tag and the pixels always
+agree and a round trip is stable, which is what a reader needs. A true
+wide-gamut *render* is a later increment. Nothing changes for the
+`darkroom-cli` fallback (heic/heif/avif), which still emits the C tool's own
+untagged output.
+
+**Verified.** Docker gate (`scripts/ci-local.sh`, all four steps) green on the
+committed tree, clippy `--all-targets` adds no warnings. c41-core `icc` 95 pass,
+including the new `OutputProfile` codes/bytes/no-op/move/round-trip/colorant-sum
+and Adobe-conformance tests and the existing `srgb_round_trips_through_a_wider_
+profile`; c41-ui `dialogs` 14 pass, including a new end-to-end
+`exports_convert_and_tag_the_chosen_output_profile` (PNG: the Adobe export
+carries the Adobe profile, reopens as a transform not as sRGB, and lifting it
+back reproduces the sRGB export within ±1 LSB).
+
+**Senior review** (`9312407d92` → `4ca32c0d6e`): APPROVE WITH NOTES, no blockers
+or majors. (1) The Adobe profile lacked the mandatory informational tags, which
+was harmless while it was engine-internal but not once embedded — fixed.
+(2) Tag and conversion were fetched separately, so a degenerate parse could
+embed a profile whose pixels were unconverted — now one `resolve()` keeps them
+in lockstep. (3) Two new rustdoc links and a truncated test doc comment fixed;
+the export-panel sentence softened. The reviewer independently cross-checked
+sRGB→our Adobe profile against colord's `AdobeRGB1998.icc` via lcms:
+byte-identical, max 8-bit delta 0.
+---
+
 ## 2026-10-11 02:35 UTC — G2b: every Rust export carries the sRGB profile
 
 **What.** The output half of G2: exported files are now tagged with the profile

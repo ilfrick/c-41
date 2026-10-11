@@ -332,6 +332,23 @@ claims above are still true**: a tagged JPEG is still shown and written as if it
 were sRGB. What changed is that the "can we even see the profile" half of the
 gap is closed and verified against lcms.
 
+**Progress (G2a2 → G2c).** The user-visible claims above are now partly out of
+date. G2a2 wired input profiling into the darkroom preview and both export
+funnels: an embedded profile is lifted (`embed.rs`), classified (`InputProfile`)
+and applied device→sRGB through the engine, and an *untagged* file can be given
+an sRGB/Adobe-RGB assumption that the preview prompts for once per image and the
+export reproduces without prompting. G2b made `srgb_profile()` a conformant
+10-tag display profile and tagged every Rust export with it (JPEG APP2, PNG
+iCCP, TIFF 34675). G2c makes the destination a choice: an "Output color profile"
+row (sRGB default, byte-exact; or Adobe RGB (1998)) whose selection is a
+remembered ui-pref; each Rust export converts its rendered sRGB pixels into the
+chosen space through the engine and tags the file with that profile. Still
+outstanding: the G1 `Input color profile` / `Output color profile` rows are
+wired but only partly surfaced (the input side is a per-image prompt, not a
+preferences row), soft-proofing is absent, the render seam itself is still sRGB
+(so a wide-gamut *render* is a later increment), and the `darkroom-cli` fallback
+(heic/heif/avif) still emits the C tool's own untagged output.
+
 Two corrections to the plan this audit previously implied, both found by checking
 rather than assuming:
 
