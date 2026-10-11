@@ -240,7 +240,7 @@ struct PreviewCtx {
     decode_method: Rc<std::cell::Cell<DemosaicMethod>>,
     /// What the "Input color profile" row shows for the current image: the
     /// resolution of the embedded-profile decision (G2d). Seeded from the path
-    /// at page build (raw vs not) and refined by [`resolve_preview_transform`]
+    /// at page build (raw vs not) and refined by [`resolve_preview_transform_state`]
     /// when a non-raw decode completes; read by [`populate_modules`] so a panel
     /// rebuild re-seeds the row, and pushed live by [`refresh_input_row`].
     input_row_state: Rc<std::cell::Cell<InputRowState>>,
@@ -1109,13 +1109,18 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat)
             })
             .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat);
-        let transform = resolve_preview_transform(&ctx, &path, &embedded).await;
+        let transform_res = resolve_preview_transform_state(&ctx, &path, &embedded).await;
         // The prompt can take a while: if a newer decode claimed the generation
-        // meanwhile, its result owns the screen (the choice, if any, is already
-        // persisted above — user input survives the stale race).
+        // meanwhile, its result owns the screen.
         if ctx.decode_gen.get() != generation {
             return;
         }
+        let (transform, state) = transform_res;
+        if let InputRowState::Assumed(a) = state {
+            ctx.session_assumption.set(Some(a));
+        }
+        ctx.input_row_state.set(state);
+        refresh_input_row(&ctx);
         let base = data.and_then(|data| {
             let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
             let _ = loader.write(&data);
@@ -1168,17 +1173,22 @@ fn spawn_decode(ctx: &PreviewCtx) {
 /// path. This is the preview's side of the decision; export resolves the
 /// remembered assumption on its own (it must not prompt mid-batch) so what is
 /// on screen and what lands on disk cannot drift apart.
-async fn resolve_preview_transform(
+///
+/// Returns `(transform, state)` so the caller (inside the decode completion
+/// guarded by `decode_gen`) can apply the state/UI updates only to the current
+/// decode, avoiding mutating shared state from a superseded `await` (the modal
+/// prompt can race with a new decode).
+async fn resolve_preview_transform_state(
     ctx: &PreviewCtx,
     path: &str,
     embedded: &c41_core::icc::Embedded,
-) -> Option<c41_core::icc::Transform> {
+) -> (Option<c41_core::icc::Transform>, InputRowState) {
     use c41_core::icc::{InputAssumption, InputProfile};
-    let (state, transform) = match c41_core::icc::input_profile(embedded) {
-        InputProfile::Transform(t) => (InputRowState::Embedded, Some(t)),
-        InputProfile::Srgb => (InputRowState::Embedded, None),
-        InputProfile::Unusable => (InputRowState::Unusable, None),
-        InputProfile::Unknown => (InputRowState::Unknown, None),
+    match c41_core::icc::input_profile(embedded) {
+        InputProfile::Transform(t) => (Some(t), InputRowState::Embedded),
+        InputProfile::Srgb => (None, InputRowState::Embedded),
+        InputProfile::Unusable => (None, InputRowState::Unusable),
+        InputProfile::Unknown => (None, InputRowState::Unknown),
         InputProfile::Missing => {
             // Remembered for this file, else decided earlier this session, else
             // ask. Dismissing the prompt is "sRGB, this session only" — the same
@@ -1194,16 +1204,12 @@ async fn resolve_preview_transform(
                         .unwrap_or(InputAssumption::Srgb),
                 },
             };
-            ctx.session_assumption.set(Some(assumed));
             (
-                InputRowState::Assumed(assumed),
                 assumed.transform_for_missing(),
+                InputRowState::Assumed(assumed),
             )
         }
-    };
-    ctx.input_row_state.set(state);
-    refresh_input_row(ctx);
-    transform
+    }
 }
 
 /// The per-image missing-profile prompt (G2a2, 1a): an untagged file's pixels
