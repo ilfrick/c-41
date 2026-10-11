@@ -549,7 +549,9 @@ fn read_tiff<R: Read + Seek>(r: &mut R) -> Result<Embedded, EmbedError> {
             let ty = t.u16(entry + 2)?;
             let n = t.u32(entry + 4)? as usize;
             let value_raw = t.u32(entry + 8)?;
-            if ty != TIFF_TYPE_UNDEFINED {
+            // ICCProfile in TIFF is specified as UNDEFINED; many encoders (including
+            // the `tiff` crate used by `image`) write it as BYTE. Accept both.
+            if ty != TIFF_TYPE_UNDEFINED && ty != 1 {
                 return Err(EmbedError::Malformed("tiff icc tag is not of type UNDEFINED"));
             }
             if n == 0 {

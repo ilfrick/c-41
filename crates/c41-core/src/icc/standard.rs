@@ -1,6 +1,8 @@
-//! The sRGB **destination** profile, and the loops that carry a decoded image
-//! from its embedded device profile into the pipeline's working space (G2a2,
-//! input profiling).
+//! The sRGB profile that anchors the whole pipeline, and the loops that carry
+//! a decoded image from its embedded device profile into the pipeline's
+//! working space (G2a2, input profiling). G2b adds the same profile's **output**
+//! role: every exported file is tagged with it, because a decoded-and-rendered
+//! export is sRGB by construction.
 //!
 //! `c41-core::icc` has had a complete engine since m4-89…m4-129 and an
 //! extractor since m4-245, but until now **nothing in the product called it**:
@@ -58,6 +60,12 @@ const D50: [f32; 3] = [0.964203, 1.0, 0.824905];
 const RXYZ: [f32; 3] = [0.435852, 0.222382, 0.013916];
 const GXYZ: [f32; 3] = [0.385330, 0.717041, 0.097137];
 const BXYZ: [f32; 3] = [0.143021, 0.060593, 0.713837];
+
+/// The `chad` (chromatic adaptation) matrix the reference profile stores — the
+/// standard D65→D50 adaptation, kept as the raw `s15Fixed16` integers so the
+/// embedded bytes match colord's `sRGB.icc` exactly (G2b). The engine never
+/// reads this tag; it is data a conformant third-party reader may honour.
+const CHAD: [i32; 9] = [68682, 1507, -3286, 1947, 64903, -1118, -605, 984, 49300];
 
 /// Adobe RGB (1998) primaries as D50-adapted XYZ colorants — column `i` is the
 /// XYZ of device primary `i`, and the columns sum to [`D50`] (the trap the
@@ -124,13 +132,17 @@ const PROBES: [[f32; 3]; 13] = [
 // that move. `build_profile`/`xyz_tag` are `pub(crate)` so in-crate tests can
 // build deliberately *non*-sRGB profiles to exercise the transform.
 
-/// Assemble a minimal valid ICC profile: 128-byte header, tag table, then each
-/// tag's payload padded to the 4-byte boundary the spec requires.
+/// Assemble an ICC profile: 128-byte header, tag table, then each tag's
+/// payload padded to the 4-byte boundary the spec requires. The assembler
+/// writes exactly the tags it is given and nothing else.
 ///
-/// Deliberately small — no `desc`/`cprt`/`chad`. [`Profile::parse`] reads only
-/// the header, the tag table and the tags it is asked for, and the profiles
-/// built here are inputs to that parser, not files to hand to a third-party
-/// conformant reader.
+/// The callers deliberately pass minimal tag sets where a profile stays
+/// engine-internal — the Adobe assumption, the transform fixtures — because
+/// [`Profile::parse`] reads only the tags it is asked for, and those bytes
+/// never face a third-party reader. The one exception is [`srgb_profile`],
+/// which adds the informational tags the ICC spec requires on a display
+/// profile, because its bytes are shipped inside every exported file (G2b)
+/// to arbitrary readers on other machines.
 pub(crate) fn build_profile(
     class: &[u8; 4],
     data_space: &[u8; 4],
@@ -225,6 +237,40 @@ fn srgb_trc_tag() -> Vec<u8> {
     d
 }
 
+/// `multiLocalizedUnicodeType` carrying one `en-US` record of `text` (ASCII at
+/// both call sites, so UTF-16BE encoding is exact). The v4 way to write the
+/// `desc` and `cprt` tags the ICC spec makes mandatory on a display profile;
+/// layout mirrors the reference profile's: 16-byte header (`mluc`, reserved,
+/// record count, record length), a 12-byte record (`en`/`US`, string length in
+/// bytes, offset from the start of the tag), then the text at offset 28.
+fn mluc_tag(text: &str) -> Vec<u8> {
+    let mut chars = Vec::with_capacity(text.len() * 2);
+    for c in text.encode_utf16() {
+        chars.extend_from_slice(&c.to_be_bytes());
+    }
+    let mut d = vec![0u8; 28 + chars.len()];
+    d[0..4].copy_from_slice(b"mluc");
+    d[8..12].copy_from_slice(&1u32.to_be_bytes());
+    d[12..16].copy_from_slice(&12u32.to_be_bytes());
+    d[16..18].copy_from_slice(b"en");
+    d[18..20].copy_from_slice(b"US");
+    d[20..24].copy_from_slice(&(chars.len() as u32).to_be_bytes());
+    d[24..28].copy_from_slice(&28u32.to_be_bytes());
+    d[28..].copy_from_slice(&chars);
+    d
+}
+
+/// `s15Fixed16ArrayType` carrying [`CHAD`]: type, reserved, then nine
+/// `s15Fixed16` values in PCS order.
+fn chad_tag() -> Vec<u8> {
+    let mut d = vec![0u8; 8 + 4 * 9];
+    d[0..4].copy_from_slice(b"sf32");
+    for (i, v) in CHAD.iter().enumerate() {
+        d[8 + i * 4..12 + i * 4].copy_from_slice(&v.to_be_bytes());
+    }
+    d
+}
+
 /// The sRGB profile the input path transforms *into*: `mntr`/`RGB `/`XYZ `,
 /// the D50 white, D50-adapted sRGB colorants, and the exact sRGB EOTF on all
 /// three channels.
@@ -235,6 +281,17 @@ fn srgb_trc_tag() -> Vec<u8> {
 /// function. The three `*TRC` tags are emitted as three copies rather than the
 /// shared single offset a vendor profile would use; that costs 64 bytes and
 /// keeps [`build_profile`] a straight tag list.
+///
+/// G2b: the same bytes are embedded in every exported file. The pipeline
+/// renders every export into this working space, so an exported file's pixels
+/// really *are* sRGB and the tag must say so; and because a third-party reader
+/// — lcms, Windows, macOS, a browser — then sees the profile, it also carries
+/// the three informational tags the ICC spec requires on a `mntr` display
+/// profile: `desc` and `cprt` as [`mluc_tag`] records and the `chad`
+/// adaptation matrix as [`chad_tag`], pinned byte-for-byte by
+/// `srgb_profile_is_a_conformant_display_profile`. The colour-defining tags
+/// are untouched, so this did not move a single pixel (pinned by
+/// `added_informational_tags_leave_the_readers_alone`).
 pub fn srgb_profile() -> Vec<u8> {
     build_profile(
         b"mntr",
@@ -248,6 +305,12 @@ pub fn srgb_profile() -> Vec<u8> {
             (b"rTRC", srgb_trc_tag()),
             (b"gTRC", srgb_trc_tag()),
             (b"bTRC", srgb_trc_tag()),
+            (b"desc", mluc_tag("sRGB (IEC 61966-2-1)")),
+            (
+                b"cprt",
+                mluc_tag("Copyright (c) the c-41 project contributors. sRGB reference data per the public IEC 61966-2-1 specification."),
+            ),
+            (b"chad", chad_tag()),
         ],
     )
 }
@@ -608,6 +671,91 @@ mod tests {
         let [r, g, b] = p.rgb_trc().expect("missing a TRC tag");
         assert_eq!(r, g, "the three channels must carry the same curve");
         assert_eq!(g, b, "the three channels must carry the same curve");
+    }
+
+    /// G2b: the exported bytes are what a third-party reader on another machine
+    /// sees, so the profile has to be *conformant*, not just parseable by this
+    /// engine. Pins the informational tags the ICC spec requires on a `mntr`
+    /// display profile (`desc`/`cprt`/`chad`) and their exact on-disk layout.
+    #[test]
+    fn srgb_profile_is_a_conformant_display_profile() {
+        let bytes = srgb_profile();
+        let p = Profile::parse(&bytes).expect("our own sRGB profile must parse");
+
+        // The declared size in the header must match the buffer — the assembler
+        // writes it, so a padding bug would leave a short file on the wire.
+        let declared = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        assert_eq!(declared, bytes.len(), "declared profile size must match the buffer");
+        assert_eq!(p.device_class, *b"mntr");
+        assert_eq!(&p.data_space, b"RGB ");
+        assert_eq!(&p.pcs, b"XYZ ");
+
+        // Every tag's data is 4-byte aligned and wholly inside the file.
+        let n = u32::from_be_bytes(bytes[128..132].try_into().unwrap()) as usize;
+        for i in 0..n {
+            let base = 132 + i * 12;
+            let off = u32::from_be_bytes(bytes[base + 4..base + 8].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(bytes[base + 8..base + 12].try_into().unwrap()) as usize;
+            assert_eq!(off % 4, 0, "tag {i} data not 4-byte aligned");
+            assert!(off + len <= bytes.len(), "tag {i} data out of bounds");
+        }
+
+        // desc: a single en-US mluc record whose text names the profile. A
+        // broken record count, length or offset would make a reader fall back
+        // to a generic description — which is exactly what the tag exists to avoid.
+        let desc = p.tag(b"desc").expect("a conformant mntr profile must carry desc");
+        assert_eq!(&desc[0..4], b"mluc");
+        assert_eq!(u32::from_be_bytes(desc[8..12].try_into().unwrap()), 1, "one record");
+        assert_eq!(u32::from_be_bytes(desc[12..16].try_into().unwrap()), 12);
+        assert_eq!(&desc[16..18], b"en");
+        assert_eq!(&desc[18..20], b"US");
+        let doff = u32::from_be_bytes(desc[24..28].try_into().unwrap()) as usize;
+        assert_eq!(doff, 28, "first record's text starts right after the record");
+        let dlen = u32::from_be_bytes(desc[20..24].try_into().unwrap()) as usize;
+        let desc_text: String = String::from_utf16(
+            &desc[doff..doff + dlen]
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect::<Vec<u16>>(),
+        )
+        .unwrap();
+        assert!(desc_text.contains("sRGB"), "description must say what the profile is: {desc_text:?}");
+
+        // cprt is an mluc with non-empty text.
+        let cprt = p.tag(b"cprt").expect("a conformant mntr profile must carry cprt");
+        assert_eq!(&cprt[0..4], b"mluc");
+        let clen = u32::from_be_bytes(cprt[20..24].try_into().unwrap()) as usize;
+        assert!(clen > 0, "copyright text must not be empty");
+
+        // chad: sf32 with the nine reference values, byte for byte.
+        let chad = p.tag(b"chad").expect("a conformant mntr profile must carry chad");
+        assert_eq!(&chad[0..4], b"sf32");
+        let vals: Vec<i32> = chad[8..]
+            .chunks_exact(4)
+            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, CHAD.to_vec());
+    }
+
+    /// The G2b additions must be inert for the engine: the matrix-shaper tags
+    /// still parse to the same profile, and the sRGB gate still calls it sRGB —
+    /// the property that keeps a re-export of an export from double-transforming.
+    #[test]
+    fn added_informational_tags_leave_the_readers_alone() {
+        let p = Profile::parse(&srgb_profile()).unwrap();
+        for sig in [b"wtpt", b"rXYZ", b"gXYZ", b"bXYZ"] {
+            assert!(p.read_xyz(sig).is_ok(), "colour tag {sig:?} broke after G2b");
+        }
+        let [r, g, b] = p.rgb_trc().expect("TRC tags must survive the additions");
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        assert!(
+            matches!(
+                input_profile(&Embedded::Present(srgb_profile())),
+                InputProfile::Srgb
+            ),
+            "our own export profile must re-open as sRGB"
+        );
     }
 
     /// The whole reason the destination is built rather than approximated: the

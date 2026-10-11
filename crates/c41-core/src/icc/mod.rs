@@ -46,6 +46,13 @@
 //!   InputAssumption`] carries the per-file choice the darkroom preview prompts
 //!   for on the first open of an untagged container, and export resolves the
 //!   same remembered answer.
+//! - **G2b (this increment):** the output side — [`standard::srgb_profile`]
+//!   now also carries the `desc`/`cprt`/`chad` tags a conformant display
+//!   profile needs, and the UI embeds those bytes in every exported
+//!   JPEG/PNG/TIFF (and the neural-restore TIFF), so what lands on disk is
+//!   tagged with the sRGB space its pixels were rendered in. Before this, an
+//!   export was untagged: colour-managed viewers guessed (usually wrong for
+//!   anything that had been transformed).
 
 mod clut;
 mod embed;

@@ -274,6 +274,9 @@ fn render_raw_export(
     // that looks like a valid export, and a failed re-export must not clobber a
     // prior good file (File::create / the encoder truncate up front). The decode
     // above already fails before any file is touched, so a bad raw leaves nothing.
+    // G2b: the render lands in the sRGB working space, so the written file is
+    // captioned with the same profile, whatever the container.
+    let profile = c41_core::icc::srgb_profile();
     atomic_write(&dest_ext, |out| {
         let lens_gear = edit.lens.as_deref();
         // Grain's per-image noise seed (see `Stage::Grain`), so an export
@@ -295,7 +298,7 @@ fn render_raw_export(
                 if let Some((tw, th)) = target(w, h) {
                     buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
                 }
-                write_jpeg_rgb8(&buf, settings.quality, out)
+                write_jpeg_rgb8(&buf, settings.quality, out, &profile)
             }
             ExportFormat::Png | ExportFormat::Tiff => {
                 let (w, h, rgb) = crate::export::render_export_rgb16_gear(
@@ -318,7 +321,7 @@ fn render_raw_export(
                     ExportFormat::Png => image::ImageFormat::Png,
                     _ => image::ImageFormat::Tiff,
                 };
-                save_rgb16_buf(&buf, out, fmt)
+                save_rgb16_buf(&buf, out, fmt, &profile)
             }
         }
     })
@@ -362,44 +365,82 @@ fn atomic_write(dest: &str, write: impl FnOnce(&str) -> Result<()>) -> Result<()
     })
 }
 
-/// Encode an 8-bit RGB buffer as JPEG to `out`, flushing explicitly so a
-/// `BufWriter` drop can't swallow the final-chunk write error (durability of the
-/// bytes is `atomic_write`'s fsync). Shared by the raw and non-raw export paths.
+/// Encode an 8-bit RGB buffer as JPEG to `out`, embedding `profile` (the JPEG
+/// encoder writes it as APP2 segments) and flushing explicitly so a `BufWriter`
+/// drop can't swallow the final-chunk write error (durability of the bytes is
+/// `atomic_write`'s fsync). Shared by the raw and non-raw export paths; both
+/// render into the sRGB working space, so every caller passes
+/// [`c41_core::icc::srgb_profile`] — the caption that matches the pixels.
 fn write_jpeg_rgb8(
     buf: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
     quality: u32,
     out: &str,
+    profile: &[u8],
 ) -> Result<()> {
     use image::ImageEncoder;
     let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
     let q = quality.clamp(1, 100) as u8;
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, q)
-        .write_image(buf.as_raw(), buf.width(), buf.height(), image::ExtendedColorType::Rgb8)
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, q);
+    enc.set_icc_profile(profile.to_vec())
+        .map_err(|e| anyhow::anyhow!("embed jpeg profile: {e}"))?;
+    enc.write_image(buf.as_raw(), buf.width(), buf.height(), image::ExtendedColorType::Rgb8)
         .map_err(|e| anyhow::anyhow!("encode jpeg: {e}"))?;
     f.into_inner().map_err(|e| anyhow::anyhow!("flush jpeg: {e}"))?;
     Ok(())
 }
 
 /// The ONE 16-bit RGB encode primitive every TIFF/PNG write in the app goes
-/// through: `ImageBuffer::<Rgb<u16>>::save_with_format`. The export arms call
-/// it after their optional resize; the neural-restore panel's result TIFF
-/// calls it through [`write_rgb16_tiff_atomic`]. Keeping a single call site
-/// means the encoder choice (and any format quirk that ever needs handling)
-/// lives in one place instead of three copies.
+/// through. The export arms call it after their optional resize; the
+/// neural-restore panel's result TIFF calls it through [`write_rgb16_tiff_atomic`].
+/// Keeping a single call site means the encoder choice (and any format quirk
+/// that ever needs handling) lives in one place instead of three copies.
+///
+/// G2b: every caller renders into the sRGB working space, so each write
+/// embeds `profile` — always [`c41_core::icc::srgb_profile`] — through
+/// [`image::ImageEncoder::set_icc_profile`] (PNG iCCP, TIFF tag 34675). That
+/// is why the encoders are built explicitly rather than through
+/// `ImageBuffer::save_with_format`, which has no ICC surface; the u16 buffer
+/// is handed over via a `bytemuck` byte cast, the native-endian u16 rows the
+/// encoder reorders as the target format requires.
 fn save_rgb16_buf(
     buf: &image::ImageBuffer<image::Rgb<u16>, Vec<u16>>,
     out: &str,
     fmt: image::ImageFormat,
+    profile: &[u8],
 ) -> Result<()> {
-    buf.save_with_format(out, fmt).map_err(|e| anyhow::anyhow!("encode: {e}"))
+    use image::ImageEncoder;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
+    let w = buf.width();
+    let h = buf.height();
+    let rgb16 = bytemuck::cast_slice(buf.as_raw());
+    let result = match fmt {
+        image::ImageFormat::Png => {
+            let mut enc = image::codecs::png::PngEncoder::new(&mut f);
+            enc.set_icc_profile(profile.to_vec())
+                .map_err(|e| anyhow::anyhow!("embed png profile: {e}"))?;
+            enc.write_image(rgb16, w, h, image::ExtendedColorType::Rgb16)
+        }
+        image::ImageFormat::Tiff => {
+            let mut enc = image::codecs::tiff::TiffEncoder::new(&mut f);
+            enc.set_icc_profile(profile.to_vec())
+                .map_err(|e| anyhow::anyhow!("embed tiff profile: {e}"))?;
+            enc.write_image(rgb16, w, h, image::ExtendedColorType::Rgb16)
+        }
+        other => return Err(anyhow::anyhow!("encode: unsupported 16-bit format {other:?}")),
+    };
+    result.map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    f.into_inner().map_err(|e| anyhow::anyhow!("flush: {e}"))?;
+    Ok(())
 }
 
 /// Write the neural-restore result as a TIFF beside the source: the exact
 /// export-path encode (16-bit RGB through [`save_rgb16_buf`] with
-/// `ImageFormat::Tiff`) behind the export path's atomic+fsync write
-/// ([`atomic_write`]). `dest` is the exact destination path (already carrying
-/// the `.tif` extension — callers own uniqueness); `rgb` is packed RGB u16.
-/// Reusing the export writer — not a second TIFF encoder — is deliberate.
+/// `ImageFormat::Tiff`, the sRGB profile embedded — the denoise output is
+/// quantized sRGB, so the tag matches the pixels) behind the export path's
+/// atomic+fsync write ([`atomic_write`]). `dest` is the exact destination path
+/// (already carrying the `.tif` extension — callers own uniqueness); `rgb` is
+/// packed RGB u16. Reusing the export writer — not a second TIFF encoder — is
+/// deliberate.
 pub(crate) fn write_rgb16_tiff_atomic(
     dest: &str,
     w: u32,
@@ -407,11 +448,12 @@ pub(crate) fn write_rgb16_tiff_atomic(
     rgb: Vec<u16>,
 ) -> Result<()> {
     let path = dest.to_string();
+    let profile = c41_core::icc::srgb_profile();
     atomic_write(&path, move |out| {
         let buf: image::ImageBuffer<image::Rgb<u16>, _> =
             image::ImageBuffer::from_raw(w, h, rgb)
                 .ok_or_else(|| anyhow::anyhow!("empty render"))?;
-        save_rgb16_buf(&buf, out, image::ImageFormat::Tiff)
+        save_rgb16_buf(&buf, out, image::ImageFormat::Tiff, &profile)
     })
 }
 
@@ -525,6 +567,12 @@ fn render_nonraw_export(
         _ => None,
     };
 
+    // G2b: the rendered output is in the sRGB working space (both pipeline
+    // gears end in `linear_to_srgb`), so the written file is captioned with
+    // the same profile whatever the container — an export that said nothing
+    // becomes one that colour-managed viewers no longer have to guess at.
+    let profile = c41_core::icc::srgb_profile();
+
     match settings.format {
         // JPEG is an 8-bit container — decode + process at 8-bit.
         ExportFormat::Jpeg => {
@@ -548,7 +596,7 @@ fn render_nonraw_export(
                 if let Some((tw, th)) = target {
                     buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
                 }
-                write_jpeg_rgb8(&buf, settings.quality, out)
+                write_jpeg_rgb8(&buf, settings.quality, out, &profile)
             })
         }
         // PNG/TIFF at 16-bit: preserve a 16-bit source's precision and cut
@@ -579,7 +627,7 @@ fn render_nonraw_export(
                 if let Some((tw, th)) = target {
                     buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
                 }
-                save_rgb16_buf(&buf, out, fmt)
+                save_rgb16_buf(&buf, out, fmt, &profile)
             })
         }
     }
@@ -1080,6 +1128,158 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G2b headline: exported files carry the profile their pixels were encoded
+    /// in. The pipeline renders every export into the sRGB working space, so for
+    /// every container the embedded profile must be exactly
+    /// [`c41_core::icc::srgb_profile`] — read back through the *extractor* the
+    /// import path uses, pinning writer and reader together — and reopening the
+    /// file must classify as sRGB, so an export round-trip never double-transforms.
+    #[test]
+    fn exports_embed_the_srgb_profile_and_reopen_as_a_noop() {
+        use image::{ImageBuffer, Rgb};
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_g2b_profile_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.png");
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(4, 3, |x, y| {
+            Rgb([(x * 60) as u8, (y * 80) as u8, ((x + y) * 30) as u8])
+        });
+        img.save(&src).unwrap();
+
+        let want = c41_core::icc::srgb_profile();
+        for format in [
+            crate::export::ExportFormat::Jpeg,
+            crate::export::ExportFormat::Png,
+            crate::export::ExportFormat::Tiff,
+        ] {
+            let ext = format.out_ext();
+            let dest = dir.join(format!("out_{ext}"));
+            let settings = crate::export::ExportSettings {
+                format,
+                quality: 90,
+                resize: None,
+            };
+            render_nonraw_export(
+                src.to_str().unwrap(),
+                dest.to_str().unwrap(),
+                &settings,
+                &crate::preview::PreviewParams::default(),
+                None,
+                None,
+            )
+            .unwrap();
+
+            let out = format!("{}.{ext}", dest.to_str().unwrap());
+            let embedded = c41_core::icc::extract_embedded_file(std::path::Path::new(&out))
+                .unwrap_or_else(|e| panic!("{ext}: scan: {e}"));
+            match embedded {
+                c41_core::icc::Embedded::Present(bytes) => assert_eq!(
+                    bytes, want,
+                    "{ext} embedded a different profile than the pixels encode"
+                ),
+                other => panic!("{ext}: expected the sRGB profile embedded, got {other:?}"),
+            }
+
+            // Reopening the export must be the same no-op the input path gives a
+            // tagged-sRGB file (`Srgb`, not `Transform`): a second lift would
+            // cost a matrix round trip on every re-export of an export.
+            let again =
+                c41_core::icc::extract_embedded_file(std::path::Path::new(&out)).unwrap();
+            assert!(
+                matches!(
+                    c41_core::icc::input_profile(&again),
+                    c41_core::icc::InputProfile::Srgb
+                ),
+                "{ext}: an exported file must re-open as sRGB, not as needing a transform"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G2b external oracle, env-gated like the ICC corpus tests so CI stays
+    /// hermetic: the exported profile is checked by **lcms** — the colour engine
+    /// darktable itself uses — through ImageMagick's `convert FILE icc:OUT`,
+    /// which reads the embedded profile back byte-for-byte. The fixtures are
+    /// written into `C41_ICC_CORPUS` so a run without ImageMagick on PATH still
+    /// leaves them behind for a host-side `convert`/`cmp` cross-check.
+    #[test]
+    fn embedded_profiles_match_via_lcms_imagemagick() {
+        let Ok(dir) = std::env::var("C41_ICC_CORPUS") else {
+            eprintln!("skipping lcms oracle: C41_ICC_CORPUS not set");
+            return;
+        };
+        let convert = std::process::Command::new("convert").arg("--version").output().is_ok();
+        if !convert {
+            eprintln!("skipping lcms oracle: ImageMagick `convert` not on PATH");
+        }
+
+        let scratch = std::env::temp_dir().join(format!(
+            "darkroom_g2b_oracle_src_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let src = scratch.join("in.png");
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+            image::ImageBuffer::from_pixel(2, 2, image::Rgb([200, 100, 40]));
+        img.save(&src).unwrap();
+
+        let want = c41_core::icc::srgb_profile();
+        let corpus = std::path::Path::new(&dir);
+        std::fs::write(corpus.join("g2b_srgb_profile.icc"), &want).unwrap();
+        for format in [
+            crate::export::ExportFormat::Jpeg,
+            crate::export::ExportFormat::Png,
+            crate::export::ExportFormat::Tiff,
+        ] {
+            let ext = format.out_ext();
+            let dest = scratch.join(format!("out_{ext}"));
+            let settings = crate::export::ExportSettings {
+                format,
+                quality: 90,
+                resize: None,
+            };
+            render_nonraw_export(
+                src.to_str().unwrap(),
+                dest.to_str().unwrap(),
+                &settings,
+                &crate::preview::PreviewParams::default(),
+                None,
+                None,
+            )
+            .unwrap();
+
+            let done = corpus.join(format!("g2b_export.{ext}"));
+            std::fs::copy(format!("{}.{ext}", dest.to_str().unwrap()), &done).unwrap();
+            if convert {
+                let icc = corpus.join(format!("g2b_export.{ext}.icc"));
+                let st = std::process::Command::new("convert")
+                    .arg(&done)
+                    .arg(format!("icc:{}", icc.display()))
+                    .status()
+                    .unwrap_or_else(|e| panic!("{ext}: convert: {e}"));
+                assert!(st.success(), "{ext}: convert exited {st}");
+                assert_eq!(
+                    std::fs::read(&icc).unwrap(),
+                    want,
+                    "{ext}: lcms did not reproduce our profile bytes"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// G2a2 end-to-end — and the only test here that compares us against
