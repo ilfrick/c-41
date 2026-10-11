@@ -51,11 +51,12 @@ impl ExportFormat {
 
     /// Human label for the format combo row.
     pub fn label(self) -> &'static str {
+        // No colour-space or bit-depth claim: the output colour profile is now a
+        // separate control (G2c) that applies to every format, and the Rust path
+        // writes 8-bit for JPEG (inherent) but 16-bit for PNG/TIFF. Keep the
+        // label neutral in case the CLI path or a future path differs.
         match self {
-            ExportFormat::Jpeg => "JPEG (sRGB)",
-            // No bit-depth claim: the Rust export path writes 8-bit for JPEG
-            // (inherent) and 16-bit for PNG/TIFF (via the `image` crate); keep the
-            // label neutral in case the CLI path or a future path differs.
+            ExportFormat::Jpeg => "JPEG",
             ExportFormat::Tiff => "TIFF",
             ExportFormat::Png => "PNG",
         }
@@ -101,11 +102,21 @@ pub struct ExportSettings {
     pub quality: u32,
     /// `None` exports at original size; `Some` fits within the box.
     pub resize: Option<Resize>,
+    /// The colour space the export is encoded into and tagged with
+    /// ([`c41_core::icc::OutputProfile`]). sRGB — the pipeline's own output space
+    /// — is the default and a byte-exact no-op; a wider destination re-encodes
+    /// the rendered pixels and captions the file with its profile.
+    pub output_profile: c41_core::icc::OutputProfile,
 }
 
 impl Default for ExportSettings {
     fn default() -> Self {
-        Self { format: ExportFormat::Jpeg, quality: 95, resize: None }
+        Self {
+            format: ExportFormat::Jpeg,
+            quality: 95,
+            resize: None,
+            output_profile: c41_core::icc::OutputProfile::default(),
+        }
     }
 }
 
@@ -559,7 +570,8 @@ mod tests {
 
     #[test]
     fn cli_args_jpeg_sets_quality_via_core_conf() {
-        let s = ExportSettings { format: ExportFormat::Jpeg, quality: 90, resize: None };
+        let s = ExportSettings { format: ExportFormat::Jpeg, quality: 90, resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb };
         let a = cli_args("/in/a.raw", "/out", &s);
         assert_eq!(a[0], "/in/a.raw");
         assert_eq!(a[1], "/out");
@@ -579,7 +591,8 @@ mod tests {
 
     #[test]
     fn cli_args_tiff_sets_bpp_16_via_module_name() {
-        let s = ExportSettings { format: ExportFormat::Tiff, quality: 95, resize: None };
+        let s = ExportSettings { format: ExportFormat::Tiff, quality: 95, resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb };
         let a = cli_args("/in/a.raw", "/out", &s);
         assert!(a.windows(2).any(|w| w == ["--out-ext", "tif"]));
         // 16-bit label is truthful: bpp conf keyed on module name "tiff".
@@ -589,7 +602,8 @@ mod tests {
 
     #[test]
     fn cli_args_png_omits_quality_and_no_resize_omits_size() {
-        let s = ExportSettings { format: ExportFormat::Png, quality: 90, resize: None };
+        let s = ExportSettings { format: ExportFormat::Png, quality: 90, resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb };
         let a = cli_args("/in/a.raw", "/out", &s);
         assert!(a.windows(2).any(|w| w == ["--out-ext", "png"]));
         // PNG needs no core config → no --core/--conf appended.
@@ -603,6 +617,7 @@ mod tests {
             format: ExportFormat::Jpeg,
             quality: 100,
             resize: Some(Resize { max_w: 2048, max_h: 1536, allow_upscale: true }),
+            output_profile: c41_core::icc::OutputProfile::Srgb,
         };
         let a = cli_args("/in/a.raw", "/out", &s);
         assert!(a.windows(2).any(|w| w == ["--width", "2048"]));
@@ -661,7 +676,8 @@ mod tests {
 
     #[test]
     fn cli_args_clamps_out_of_range_quality() {
-        let s = ExportSettings { format: ExportFormat::Jpeg, quality: 999, resize: None };
+        let s = ExportSettings { format: ExportFormat::Jpeg, quality: 999, resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb };
         let a = cli_args("/in", "/out", &s);
         assert_eq!(a.last().unwrap(), "plugins/imageio/format/jpeg/quality=100");
     }

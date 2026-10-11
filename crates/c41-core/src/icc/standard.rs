@@ -1,8 +1,8 @@
 //! The sRGB profile that anchors the whole pipeline, and the loops that carry
 //! a decoded image from its embedded device profile into the pipeline's
-//! working space (G2a2, input profiling). G2b adds the same profile's **output**
-//! role: every exported file is tagged with it, because a decoded-and-rendered
-//! export is sRGB by construction.
+//! working space (G2a2, input profiling), plus the output side: every exported
+//! file is encoded into a destination profile and tagged with it (G2b made that
+//! destination sRGB; G2c makes it a choice — see [`OutputProfile`]).
 //!
 //! `c41-core::icc` has had a complete engine since m4-89…m4-129 and an
 //! extractor since m4-245, but until now **nothing in the product called it**:
@@ -11,16 +11,18 @@
 //! because the two decode paths (gdk-pixbuf for the preview, the `image` crate
 //! for export) disagree about everything else and share nothing but this.
 //!
-//! # Why the destination is sRGB and not a preference
+//! # Why the *working* space is sRGB and not a preference
 //!
 //! Non-raw decode ends in an 8-bit buffer that [`crate::preview::
 //! apply_pipeline_gear`] linearises with [`crate::color::srgb_to_linear`] and
-//! re-encodes with [`crate::color::linear_to_srgb`]. The destination profile
-//! therefore has to be IEC 61966-2-1 *exactly*: a gamma-2.2 stand-in would be a
-//! second, different opinion about how to linearise, and the two would disagree
-//! in the shadows on every frame. [`srgb_profile`] is built to the same curve
-//! the pipeline already uses, and `srgb_trc_matches_the_pipelines_lineariser`
-//! pins the two together.
+//! re-encodes with [`crate::color::linear_to_srgb`]. The pipeline's own working
+//! space therefore has to be IEC 61966-2-1 *exactly*: a gamma-2.2 stand-in would
+//! be a second, different opinion about how to linearise, and the two would
+//! disagree in the shadows on every frame. [`srgb_profile`] is built to the same
+//! curve the pipeline already uses, and `srgb_trc_matches_the_pipelines_lineariser`
+//! pins the two together. An *export* can then be re-encoded into a wider
+//! destination ([`OutputProfile`]) — a separate step that takes the rendered
+//! sRGB pixels as given — but the space the edits run in stays pinned.
 //!
 //! # What is deliberately not here
 //!
@@ -67,12 +69,15 @@ const BXYZ: [f32; 3] = [0.143021, 0.060593, 0.713837];
 /// reads this tag; it is data a conformant third-party reader may honour.
 const CHAD: [i32; 9] = [68682, 1507, -3286, 1947, 64903, -1118, -605, 984, 49300];
 
-/// Adobe RGB (1998) primaries as D50-adapted XYZ colorants — column `i` is the
-/// XYZ of device primary `i`, and the columns sum to [`D50`] (the trap the
-/// fixtures documented it to avoid: spec D65 constants must *not* be used
-/// here). This is the profile [`InputAssumption::AdobeRgb1998`] encodes for
-/// untagged containers, so assuming Adobe RGB treats a file exactly like the
-/// same pixels tagged with a real profile.
+/// Adobe RGB (1998) primaries as D50-adapted XYZ colorants — row `i` is the
+/// XYZ of device primary `i` (`[0]`=R, `[1]`=G, `[2]`=B), and the rows sum to
+/// [`D50`]. Note the *row* access: the D50-adapted spec values must *not* be
+/// used (that is the D65 trap the fixtures document), and they must not be read
+/// column-wise either — transposing makes white miss PCS white (see
+/// [`adobe_rgb1998_profile`]). This is the profile
+/// [`InputAssumption::AdobeRgb1998`] encodes for untagged containers, so
+/// assuming Adobe RGB treats a file exactly like the same pixels tagged with a
+/// real profile.
 pub(crate) const ADOBE_RGB1998: [[f32; 3]; 3] = [
     [0.609634, 0.311035, 0.019470],
     [0.205399, 0.625763, 0.060898],
@@ -356,18 +361,15 @@ pub fn adobe_rgb1998_profile() -> Vec<u8> {
         b"XYZ ",
         &[
             (b"wtpt", xyz_tag(D50[0], D50[1], D50[2])),
-            (
-                b"rXYZ",
-                xyz_tag(ADOBE_RGB1998[0][0], ADOBE_RGB1998[1][0], ADOBE_RGB1998[2][0]),
-            ),
-            (
-                b"gXYZ",
-                xyz_tag(ADOBE_RGB1998[0][1], ADOBE_RGB1998[1][1], ADOBE_RGB1998[2][1]),
-            ),
-            (
-                b"bXYZ",
-                xyz_tag(ADOBE_RGB1998[0][2], ADOBE_RGB1998[1][2], ADOBE_RGB1998[2][2]),
-            ),
+            // Row `i` is primary `i`'s XYZ — the same access the test fixture
+            // uses. Reading *columns* here transposes the colorant matrix: the
+            // three primary vectors then no longer sum to D50, device white
+            // lands off PCS white (sRGB white → [0.97, 1.0, 0.91] Adobe), and
+            // every `AdobeRgb1998` transform bends the hue. Caught by
+            // `output_profile_srgb_is_a_no_op_and_adobe_moves_pixels`.
+            (b"rXYZ", xyz_tag(ADOBE_RGB1998[0][0], ADOBE_RGB1998[0][1], ADOBE_RGB1998[0][2])),
+            (b"gXYZ", xyz_tag(ADOBE_RGB1998[1][0], ADOBE_RGB1998[1][1], ADOBE_RGB1998[1][2])),
+            (b"bXYZ", xyz_tag(ADOBE_RGB1998[2][0], ADOBE_RGB1998[2][1], ADOBE_RGB1998[2][2])),
             (b"rTRC", curv_gamma_tag(ADOBE_RGB1998_GAMMA)),
             (b"gTRC", curv_gamma_tag(ADOBE_RGB1998_GAMMA)),
             (b"bTRC", curv_gamma_tag(ADOBE_RGB1998_GAMMA)),
@@ -505,6 +507,105 @@ impl InputAssumption {
                 (Ok(dst), Ok(src)) => Transform::new(&src, dst, INPUT_INTENT).ok(),
                 _ => None,
             },
+        }
+    }
+}
+
+/// The destination colour space an **export** is encoded into and tagged with.
+///
+/// Where [`InputAssumption`] answers "what were these pixels *read* as", this
+/// answers "what is the file *written* as". Every render funnel in the product
+/// ends in the sRGB working space ([`srgb_profile`]), so [`Self::Srgb`] — the
+/// default — is a **byte-exact no-op**: the export is written exactly as it was
+/// before this choice existed. A wider destination re-encodes the rendered sRGB
+/// pixels into that space through the ICC engine and captions the file with its
+/// profile, so a colour-managed reader on another machine shows the colours the
+/// user edited.
+///
+/// # Scope
+///
+/// The *rendered* image arrives through the sRGB output seam the preview uses
+/// (`crate::preview::render_linear_to_srgb*`), so a wider destination re-encodes
+/// those colours rather than recovering gamut the seam already clipped. The tag
+/// and the pixels always agree — the conversion is the ICC transform, pinned by
+/// `output_profile_round_trips_through_adobe_rgb` — which is what a third-party
+/// reader needs; rendering the seam itself into the destination (true wide-gamut
+/// export) is a separate increment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputProfile {
+    /// sRGB (IEC 61966-2-1) — the pipeline's own output space. No conversion.
+    /// The default: choosing it writes the bytes the pipeline rendered.
+    #[default]
+    Srgb,
+    /// Adobe RGB (1998) — the wider space [`InputAssumption::AdobeRgb1998`] names
+    /// on the input side.
+    AdobeRgb1998,
+}
+
+impl OutputProfile {
+    /// Every destination, in the combo's display order. The index is
+    /// [`Self::as_u8`] — pinned by `output_profile_codes_round_trip_and_are_stable`
+    /// so the export panel's index↔value mapping can't drift.
+    pub const ALL: [OutputProfile; 2] = [OutputProfile::Srgb, OutputProfile::AdobeRgb1998];
+
+    /// Human label for the export panel's combo row.
+    pub fn label(self) -> &'static str {
+        match self {
+            OutputProfile::Srgb => "sRGB",
+            OutputProfile::AdobeRgb1998 => "Adobe RGB (1998)",
+        }
+    }
+
+    /// Stable integer code for [`crate::persist`] (a global ui-pref stores this,
+    /// so the numbering must not change once released) and the combo index.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            OutputProfile::Srgb => 0,
+            OutputProfile::AdobeRgb1998 => 1,
+        }
+    }
+
+    /// Inverse of [`Self::as_u8`]; unknown codes fall back to the default.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => OutputProfile::AdobeRgb1998,
+            _ => OutputProfile::Srgb,
+        }
+    }
+
+    /// True for [`Self::Srgb`] — the no-op destination.
+    pub fn is_srgb(self) -> bool {
+        matches!(self, OutputProfile::Srgb)
+    }
+
+    /// The ICC profile bytes to embed in the exported file.
+    pub fn profile_bytes(self) -> Vec<u8> {
+        match self {
+            OutputProfile::Srgb => srgb_profile(),
+            OutputProfile::AdobeRgb1998 => adobe_rgb1998_profile(),
+        }
+    }
+
+    /// The transform that converts the pipeline's rendered sRGB pixels into this
+    /// destination, or `None` for [`Self::Srgb`] — the bytes already *are* the
+    /// destination, and running a transform would only add rounding noise, the
+    /// same reason [`is_srgb`] gates the input side.
+    ///
+    /// Both profiles are built in-process and the pair is cached, so this is a
+    /// `&'static` borrow after the first call. A degenerate parse yields `None`
+    /// (no move), matching the fallback [`InputProfile::Unusable`] takes.
+    pub fn transform_from_srgb(self) -> Option<&'static Transform> {
+        match self {
+            OutputProfile::Srgb => None,
+            OutputProfile::AdobeRgb1998 => {
+                static CACHE: OnceLock<Option<Transform>> = OnceLock::new();
+                CACHE
+                    .get_or_init(|| match (srgb(), adobe_rgb1998()) {
+                        (Ok(src), Ok(dst)) => Transform::new(src, dst, INPUT_INTENT).ok(),
+                        _ => None,
+                    })
+                    .as_ref()
+            }
         }
     }
 }
@@ -1285,5 +1386,111 @@ mod tests {
         assert!(apply_rgb8(&t, &mut px, 2, 6, 3));
         assert_eq!(&px[0..3], &[255, 255, 255], "overshoot did not saturate");
         assert_eq!(&px[3..6], &[0, 0, 0], "the ceiling must not lift black");
+    }
+
+    // ── the output profile ────────────────────────────────────────────────
+
+    /// The choice is stored as a ui-pref code, so the numbering must be stable,
+    /// and the combo's index *is* that code — [`OutputProfile::ALL`] must stay in
+    /// code order or the panel would display one destination and export another.
+    #[test]
+    fn output_profile_codes_round_trip_and_are_stable() {
+        assert_eq!(OutputProfile::default(), OutputProfile::Srgb);
+        assert_eq!(OutputProfile::Srgb.as_u8(), 0);
+        assert_eq!(OutputProfile::AdobeRgb1998.as_u8(), 1);
+        for (i, p) in OutputProfile::ALL.iter().enumerate() {
+            assert_eq!(i, p.as_u8() as usize, "ALL is not in code order");
+            assert_eq!(OutputProfile::from_u8(p.as_u8()), *p);
+        }
+        assert_eq!(OutputProfile::from_u8(9), OutputProfile::Srgb);
+    }
+
+    /// The embedded bytes are the profile the pixels were converted into.
+    #[test]
+    fn output_profile_bytes_are_the_named_profiles() {
+        assert_eq!(OutputProfile::Srgb.profile_bytes(), srgb_profile());
+        assert_eq!(
+            OutputProfile::AdobeRgb1998.profile_bytes(),
+            adobe_rgb1998_profile()
+        );
+        assert!(OutputProfile::Srgb.is_srgb());
+        assert!(!OutputProfile::AdobeRgb1998.is_srgb());
+    }
+
+    /// Regression for a real, shipped bug: [`adobe_rgb1998_profile`] used to read
+    /// [`ADOBE_RGB1998`] by *column* while the test fixture read it by row, so
+    /// the built profile's colorant matrix was transposed — its three primary
+    /// vectors no longer summed to the declared white, device white arrived off
+    /// PCS white, and every `AdobeRgb1998` transform bent the hue. Asserting the
+    /// builder's own colorants sum to its `wtpt` is independent of any transform
+    /// and fails loudly on a re-transposition.
+    #[test]
+    fn adobe_rgb1998_profile_colorants_sum_to_d50() {
+        let p = Profile::parse(&adobe_rgb1998_profile()).expect("the built Adobe profile must parse");
+        let (r, g, b) = (
+            p.read_xyz(b"rXYZ").unwrap(),
+            p.read_xyz(b"gXYZ").unwrap(),
+            p.read_xyz(b"bXYZ").unwrap(),
+        );
+        // Summing the three colorant vectors (device white) must reach D50.
+        for (axis, want, got) in [
+            (0, D50[0], r.x + g.x + b.x),
+            (1, D50[1], r.y + g.y + b.y),
+            (2, D50[2], r.z + g.z + b.z),
+        ] {
+            assert!(
+                (want - got).abs() < 2.0 * QUANTUM,
+                "colorant axis {axis} sums to {got}, wtpt says {want}"
+            );
+        }
+    }
+    /// existing sRGB export byte-identical — while Adobe RGB moves a saturated
+    /// colour measurably and still maps white to white.
+    #[test]
+    fn output_profile_srgb_is_a_no_op_and_adobe_moves_pixels() {
+        assert!(
+            OutputProfile::Srgb.transform_from_srgb().is_none(),
+            "the sRGB destination must not add a matrix round trip"
+        );
+        let t = OutputProfile::AdobeRgb1998
+            .transform_from_srgb()
+            .expect("Adobe RGB must imply a transform");
+        let mut out = [0.0f32; 3];
+        let probe = [0.8f32, 0.1, 0.1];
+        t.eval_into(&probe, &mut out);
+        let moved = (0..3).map(|i| (out[i] - probe[i]).abs()).fold(0.0f32, f32::max);
+        assert!(moved > 0.02, "Adobe RGB did not move {probe:?}: {out:?}");
+        t.eval_into(&[1.0, 1.0, 1.0], &mut out);
+        for v in out {
+            assert!((v - 1.0).abs() < 1e-3, "white became {out:?}");
+        }
+    }
+
+    /// End to end: the transform the export applies (sRGB device → Adobe RGB
+    /// device) is exactly reversed by the input path's Adobe RGB → sRGB
+    /// transform, so exporting then re-importing closes. This is what makes the
+    /// tag and the pixels agree.
+    #[test]
+    fn output_profile_round_trips_through_adobe_rgb() {
+        let out_to_adobe = OutputProfile::AdobeRgb1998
+            .transform_from_srgb()
+            .expect("Adobe RGB must imply a transform");
+        let InputProfile::Transform(back_to_srgb) =
+            input_profile(&Embedded::Present(adobe_rgb1998_profile()))
+        else {
+            panic!("the Adobe RGB profile must classify as a transform into sRGB");
+        };
+        let mut mid = [0.0f32; 3];
+        let mut back = [0.0f32; 3];
+        for p in PROBES {
+            out_to_adobe.eval_into(&p, &mut mid);
+            back_to_srgb.eval_into(&mid, &mut back);
+            for i in 0..3 {
+                assert!(
+                    (back[i] - p[i]).abs() < 5e-3,
+                    "sRGB→Adobe→sRGB of {p:?} gave {back:?}"
+                );
+            }
+        }
     }
 }

@@ -6,6 +6,10 @@
 use adw::prelude::*;
 use anyhow::Result;
 
+/// Global ui-pref key for the remembered [`c41_core::icc::OutputProfile`]. Stored
+/// as its stable code (see `OutputProfile::as_u8`); absent ⇒ the default sRGB.
+const EXPORT_PROFILE_PREF: &str = "export.output_profile";
+
 /// Build the per-image [`ExportEdit`] for a lighttable batch export by loading
 /// the image's persisted c41-ui state. Returns `Some` **only** for a raw
 /// the user has actually edited — persisted colour params, a non-identity
@@ -89,6 +93,15 @@ pub fn show_export_dialog(
 
     // The reusable export panel collects format / quality / resize / template.
     let panel = crate::export_panel::ExportPanel::new();
+    // Seed the output-profile row from the remembered app-wide preference (the
+    // global ui-pref store): the choice persists across sessions and dialogs.
+    if let Some(db) = db_path.as_deref() {
+        if let Some(code) = crate::persist::load_ui_pref(db, EXPORT_PROFILE_PREF) {
+            if let Ok(v) = code.parse::<u8>() {
+                panel.set_output_profile(c41_core::icc::OutputProfile::from_u8(v));
+            }
+        }
+    }
     dialog.set_extra_child(Some(&panel.widget));
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("export", "Export");
@@ -98,6 +111,15 @@ pub fn show_export_dialog(
     dialog.connect_response(Some("export"), move |_, _| {
         let settings = panel.settings();
         let template = panel.template();
+        // Remember the output-profile choice for the next export. Best-effort,
+        // like every ui-pref write: a lost pref just re-defaults to sRGB.
+        if let Some(db) = db_path.as_deref() {
+            crate::persist::save_ui_pref(
+                db,
+                EXPORT_PROFILE_PREF,
+                &settings.output_profile.as_u8().to_string(),
+            );
+        }
         let out_paths = paths.clone();
         let n         = out_paths.len();
         let tf        = toast_fn.clone();
@@ -265,20 +287,23 @@ fn render_raw_export(
 
     // Target size for the optional resize box (None ⇒ keep source size).
     // `fit_within` already guarantees each dimension ≥ 1. The resize below runs
-    // in sRGB-encoded (gamma) space — technically inexact, but matches gdk-pixbuf
-    // and virtually every other tool; acceptable for export.
+    // in the *destination's* encoded (gamma) space — technically inexact, but
+    // matches gdk-pixbuf and virtually every other tool; acceptable for export.
     let target = |w: usize, h: usize| -> Option<(u32, u32)> {
         settings.resize.as_ref().map(|r| crate::export::fit_within(w as u32, h as u32, r))
     };
 
+    // G2c: the render lands in the sRGB working space, then — when the chosen
+    // output profile is not sRGB — is converted into that space through the ICC
+    // engine, and the file is captioned with the matching profile. sRGB (the
+    // default) skips the conversion, so its export is byte-identical to G2b's.
+    //
     // Encode to a temp file, then atomically rename onto `dest_ext` (see
     // `atomic_write`): a mid-encode failure must never leave a truncated file
     // that looks like a valid export, and a failed re-export must not clobber a
-    // prior good file (File::create / the encoder truncate up front). The decode
-    // above already fails before any file is touched, so a bad raw leaves nothing.
-    // G2b: the render lands in the sRGB working space, so the written file is
-    // captioned with the same profile, whatever the container.
-    let profile = c41_core::icc::srgb_profile();
+    // prior good file. The decode above already fails before any file is touched.
+    let out_profile = settings.output_profile;
+    let profile = out_profile.profile_bytes();
     atomic_write(&dest_ext, |out| {
         let lens_gear = edit.lens.as_deref();
         // Grain's per-image noise seed (see `Stage::Grain`), so an export
@@ -287,7 +312,7 @@ fn render_raw_export(
         let grain_seed = c41_core::iop::grain::hash_string(path);
         match settings.format {
             ExportFormat::Jpeg => {
-                let (w, h, rgb) = crate::export::render_export_rgb8_gear(
+                let (w, h, mut rgb) = crate::export::render_export_rgb8_gear(
                     &img,
                     edit.method,
                     edit.geometry,
@@ -295,6 +320,10 @@ fn render_raw_export(
                     lens_gear,
                     grain_seed,
                 );
+                if let Some(t) = out_profile.transform_from_srgb() {
+                    // Tightly packed RGB, so rowstride == width·3.
+                    c41_core::icc::apply_rgb8(t, &mut rgb, w, w * 3, 3);
+                }
                 let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
                     .ok_or_else(|| anyhow::anyhow!("empty render"))?;
                 if let Some((tw, th)) = target(w, h) {
@@ -303,7 +332,7 @@ fn render_raw_export(
                 write_jpeg_rgb8(&buf, settings.quality, out, &profile)
             }
             ExportFormat::Png | ExportFormat::Tiff => {
-                let (w, h, rgb) = crate::export::render_export_rgb16_gear(
+                let (w, h, mut rgb) = crate::export::render_export_rgb16_gear(
                     &img,
                     edit.method,
                     edit.geometry,
@@ -311,6 +340,9 @@ fn render_raw_export(
                     lens_gear,
                     grain_seed,
                 );
+                if let Some(t) = out_profile.transform_from_srgb() {
+                    c41_core::icc::apply_rgb16(t, &mut rgb, w, w * 3, 3);
+                }
                 let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
                     .ok_or_else(|| anyhow::anyhow!("empty render"))?;
                 if let Some((tw, th)) = target(w, h) {
@@ -371,8 +403,8 @@ fn atomic_write(dest: &str, write: impl FnOnce(&str) -> Result<()>) -> Result<()
 /// encoder writes it as APP2 segments) and flushing explicitly so a `BufWriter`
 /// drop can't swallow the final-chunk write error (durability of the bytes is
 /// `atomic_write`'s fsync). Shared by the raw and non-raw export paths; both
-/// render into the sRGB working space, so every caller passes
-/// [`c41_core::icc::srgb_profile`] — the caption that matches the pixels.
+/// render into sRGB and then convert to the chosen output profile (G2c), so the
+/// caller passes that profile's bytes — the caption that matches the pixels.
 fn write_jpeg_rgb8(
     buf: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
     quality: u32,
@@ -397,8 +429,8 @@ fn write_jpeg_rgb8(
 /// Keeping a single call site means the encoder choice (and any format quirk
 /// that ever needs handling) lives in one place instead of three copies.
 ///
-/// G2b: every caller renders into the sRGB working space, so each write
-/// embeds `profile` — always [`c41_core::icc::srgb_profile`] — through
+/// G2b/G2c: every caller renders into sRGB and then converts to the chosen
+/// output profile, so each write embeds that profile's bytes `profile` through
 /// [`image::ImageEncoder::set_icc_profile`] (PNG iCCP, TIFF tag 34675). That
 /// is why the encoders are built explicitly rather than through
 /// `ImageBuffer::save_with_format`, which has no ICC surface; the u16 buffer
@@ -575,11 +607,13 @@ fn render_nonraw_export(
         _ => None,
     };
 
-    // G2b: the rendered output is in the sRGB working space (both pipeline
-    // gears end in `linear_to_srgb`), so the written file is captioned with
-    // the same profile whatever the container — an export that said nothing
-    // becomes one that colour-managed viewers no longer have to guess at.
-    let profile = c41_core::icc::srgb_profile();
+    // G2c: the rendered output is in the sRGB working space (both pipeline
+    // gears end in `linear_to_srgb`), then — when the chosen profile is not
+    // sRGB — is converted into that space through the ICC engine and captioned
+    // with the matching profile. An export that said nothing in G2a's day now
+    // states the space a colour-managed viewer must read it in.
+    let out_profile = settings.output_profile;
+    let profile = out_profile.profile_bytes();
 
     match settings.format {
         // JPEG is an 8-bit container — decode + process at 8-bit.
@@ -595,8 +629,12 @@ fn render_nonraw_export(
             let rgba = ImageBuffer::from_raw(w as u32, h as u32, raw)
                 .ok_or_else(|| anyhow::anyhow!("empty decode of {path}"))?;
             let rgb = composite_rgba8_over_white(&rgba);
-            let processed =
+            let mut processed =
                 crate::preview::apply_pipeline_gear(&rgb, w, h, w * 3, 3, params, lens_gear, grain_seed);
+            // G2c: sRGB working space → the chosen output profile (no-op for sRGB).
+            if let Some(t) = out_profile.transform_from_srgb() {
+                c41_core::icc::apply_rgb8(t, &mut processed, w, w * 3, 3);
+            }
             atomic_write(&dest_ext, move |out| {
                 let mut buf: ImageBuffer<Rgb<u8>, _> =
                     ImageBuffer::from_raw(w as u32, h as u32, processed)
@@ -622,8 +660,11 @@ fn render_nonraw_export(
             let rgba = ImageBuffer::from_raw(w as u32, h as u32, raw)
                 .ok_or_else(|| anyhow::anyhow!("empty decode of {path}"))?;
             let rgb = composite_rgba16_over_white(&rgba);
-            let processed =
+            let mut processed =
                 crate::preview::apply_pipeline_rgb16_gear(&rgb, w, h, params, lens_gear, grain_seed);
+            if let Some(t) = out_profile.transform_from_srgb() {
+                c41_core::icc::apply_rgb16(t, &mut processed, w, w * 3, 3);
+            }
             let fmt = match settings.format {
                 ExportFormat::Png => image::ImageFormat::Png,
                 _ => image::ImageFormat::Tiff,
@@ -1011,6 +1052,7 @@ mod tests {
             format: crate::export::ExportFormat::Png,
             quality: 90,
             resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb,
         };
         // Default (identity) params ⇒ empty pipeline ⇒ byte-exact passthrough, so
         // a PNG (lossless) export must reproduce the source pixels exactly.
@@ -1058,6 +1100,7 @@ mod tests {
             format: crate::export::ExportFormat::Png,
             quality: 90,
             resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb,
         };
         render_nonraw_export(
             src.to_str().unwrap(),
@@ -1116,6 +1159,7 @@ mod tests {
                 format,
                 quality: 90,
                 resize: None,
+                output_profile: c41_core::icc::OutputProfile::Srgb,
             };
             render_nonraw_export(
                 src.to_str().unwrap(),
@@ -1180,6 +1224,7 @@ mod tests {
                 format,
                 quality: 90,
                 resize: None,
+                output_profile: c41_core::icc::OutputProfile::Srgb,
             };
             render_nonraw_export(
                 src.to_str().unwrap(),
@@ -1213,6 +1258,112 @@ mod tests {
                     c41_core::icc::InputProfile::Srgb
                 ),
                 "{ext}: an exported file must re-open as sRGB, not as needing a transform"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G2c headline: a non-sRGB output profile both **converts** the rendered
+    /// pixels into that space and **tags** the file with that profile, so the
+    /// bytes say what they are. The round trip is the proof the conversion is the
+    /// ICC one — lifting the Adobe RGB export back to sRGB reproduces the sRGB
+    /// export (±1 LSB at 8 bits) — while the sRGB default is left untouched.
+    #[test]
+    fn exports_convert_and_tag_the_chosen_output_profile() {
+        use image::{ImageBuffer, Rgb};
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_g2c_output_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.png");
+        // Saturated primaries: the Adobe RGB conversion moves these measurably,
+        // unlike a near-neutral grey that both spaces map almost identically.
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(3, 1, |x, _| {
+            Rgb(match x {
+                0 => [230, 20, 20],
+                1 => [20, 220, 30],
+                _ => [25, 40, 235],
+            })
+        });
+        img.save(&src).unwrap();
+
+        let render = |profile: c41_core::icc::OutputProfile, name: &str| -> String {
+            let dest = dir.join(name);
+            let settings = crate::export::ExportSettings {
+                format: crate::export::ExportFormat::Png,
+                quality: 90,
+                resize: None,
+                output_profile: profile,
+            };
+            render_nonraw_export(
+                src.to_str().unwrap(),
+                dest.to_str().unwrap(),
+                &settings,
+                &crate::preview::PreviewParams::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            format!("{}.png", dest.to_str().unwrap())
+        };
+
+        let srgb_out = render(c41_core::icc::OutputProfile::Srgb, "srgb");
+        let adobe_out = render(c41_core::icc::OutputProfile::AdobeRgb1998, "adobe");
+
+        // Tagging: each file carries its own profile and reclassifies accordingly.
+        let srgb_emb = c41_core::icc::extract_embedded_file(std::path::Path::new(&srgb_out)).unwrap();
+        assert_eq!(
+            srgb_emb,
+            c41_core::icc::Embedded::Present(c41_core::icc::srgb_profile()),
+            "the sRGB default must still embed the sRGB profile"
+        );
+        let adobe_emb =
+            c41_core::icc::extract_embedded_file(std::path::Path::new(&adobe_out)).unwrap();
+        assert_eq!(
+            adobe_emb,
+            c41_core::icc::Embedded::Present(c41_core::icc::adobe_rgb1998_profile()),
+            "an Adobe RGB export must embed the Adobe RGB profile"
+        );
+        assert!(
+            matches!(
+                c41_core::icc::input_profile(&adobe_emb),
+                c41_core::icc::InputProfile::Transform(_)
+            ),
+            "an Adobe RGB export must re-open as needing a transform, not as sRGB"
+        );
+
+        // Pixel maths: the conversion is the ICC transform, so Adobe → sRGB is
+        // its inverse. Compare 16-bit samples downscaled to 8 bits.
+        let srgb = image::ImageReader::open(&srgb_out)
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_rgb16()
+            .into_raw();
+        let mut adobe = image::ImageReader::open(&adobe_out)
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_rgb16()
+            .into_raw();
+        let c41_core::icc::InputProfile::Transform(back) =
+            c41_core::icc::input_profile(&adobe_emb)
+        else {
+            unreachable!("the Adobe path asserted as a transform above");
+        };
+        assert!(c41_core::icc::apply_rgb16(&back, &mut adobe, 3, 9, 3), "no pixels walked");
+        for i in 0..adobe.len() {
+            let a = (adobe[i] as f32 / 65535.0 * 255.0).round() as i32;
+            let b = (srgb[i] as f32 / 65535.0 * 255.0).round() as i32;
+            assert!(
+                (a - b).abs() <= 1,
+                "sample {i}: Adobe→sRGB {a} vs rendered sRGB {b} — the output transform is not the ICC one"
             );
         }
 
@@ -1282,6 +1433,7 @@ mod tests {
                 format,
                 quality: 90,
                 resize: None,
+                output_profile: c41_core::icc::OutputProfile::Srgb,
             };
             render_nonraw_export(
                 src.to_str().unwrap(),

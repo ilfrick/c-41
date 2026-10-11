@@ -1,12 +1,14 @@
 //! The persistent export panel (Phase 3 m4-7b): a reusable libadwaita widget that
-//! collects the export configuration — format, JPEG quality, resize box, and the
-//! output-path template — on top of the pure, headless-tested [`crate::export`]
-//! model. The widget is host-agnostic (currently mounted in the export dialog; it
-//! can be docked as a side panel later) and Clone (all fields are GObject
+//! collects the export configuration — format, JPEG quality, the output colour
+//! profile (G2c), resize box, and the output-path template — on top of the pure,
+//! headless-tested [`crate::export`] model. The widget is host-agnostic
+//! (currently mounted in the export dialog; it can be docked as a side panel
+//! later) and Clone (all fields are GObject
 //! ref-counts). All the testable logic (argv build, resize math, path templating)
 //! lives in [`crate::export`]; this module is just the GTK control surface.
 
 use adw::prelude::*;
+use c41_core::icc::OutputProfile;
 use crate::export::{ExportFormat, ExportSettings, Resize, DEFAULT_OUTPUT_TEMPLATE};
 
 /// Export configuration controls, grouped for embedding in a dialog or side dock.
@@ -16,6 +18,7 @@ pub struct ExportPanel {
     pub widget:    gtk4::Box,
     format_row:    adw::ComboRow,
     quality_row:   adw::SpinRow,
+    profile_row:   adw::ComboRow,
     resize_row:    adw::SwitchRow,
     width_row:     adw::SpinRow,
     height_row:    adw::SpinRow,
@@ -55,6 +58,18 @@ impl ExportPanel {
             sync(&format_row); // initial state
             format_row.connect_selected_notify(sync);
         }
+
+        // ── Output colour profile ─────────────────────────────────────────
+        let color_group = adw::PreferencesGroup::builder()
+            .title("Color")
+            .description("Space the file is encoded into and tagged with. \
+                          sRGB is a no-op; a wider space converts the rendered pixels.")
+            .build();
+        let profile_row = adw::ComboRow::builder().title("Output color profile").build();
+        let profile_labels: Vec<&str> = OutputProfile::ALL.iter().map(|p| p.label()).collect();
+        profile_row.set_model(Some(&gtk4::StringList::new(&profile_labels)));
+        color_group.add(&profile_row);
+        widget.append(&color_group);
 
         // ── Resize ────────────────────────────────────────────────────────
         let resize_group = adw::PreferencesGroup::builder().title("Resize").build();
@@ -107,7 +122,7 @@ impl ExportPanel {
         widget.append(&out_group);
 
         Self {
-            widget, format_row, quality_row,
+            widget, format_row, quality_row, profile_row,
             resize_row, width_row, height_row, upscale_row,
             template_row,
         }
@@ -128,7 +143,24 @@ impl ExportPanel {
             format: ExportFormat::from_index(self.format_row.selected()),
             quality: self.quality_row.value() as u32,
             resize,
+            output_profile: self.output_profile(),
         }
+    }
+
+    /// The chosen output profile from the combo row. The index is
+    /// [`OutputProfile::as_u8`] (the combo is built from [`OutputProfile::ALL`]
+    /// in that order); an out-of-range index falls back to the default.
+    pub fn output_profile(&self) -> OutputProfile {
+        OutputProfile::ALL
+            .get(self.profile_row.selected() as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Select the output profile shown in the combo — used to seed the dialog
+    /// from the remembered app-wide preference.
+    pub fn set_output_profile(&self, p: OutputProfile) {
+        self.profile_row.set_selected(p.as_u8() as u32);
     }
 
     /// The output-path template, falling back to the default when left blank.

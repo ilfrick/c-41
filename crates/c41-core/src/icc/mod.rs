@@ -57,6 +57,17 @@
 //!   (usually wrong for anything that had been transformed). [`embed`] also
 //!   accepts the `BYTE`-typed TIFF ICC tag the `image` encoder writes, alongside
 //!   the spec's `UNDEFINED`.
+//! - **G2c (this increment):** the destination becomes a *choice* —
+//!   [`standard::OutputProfile`] (sRGB, the default and a byte-exact no-op, or
+//!   Adobe RGB (1998)). The export panel gains an "Output color profile" row,
+//!   the choice is remembered app-wide, and each export converts its rendered
+//!   sRGB pixels into the chosen space through the ICC engine
+//!   ([`standard::OutputProfile::transform_from_srgb`]) before embedding that
+//!   profile's bytes. The render seam itself is still sRGB (a wide-gamut
+//!   *render* is a later increment), so the tag and the pixels agree rather
+//!   than the file gaining gamut the seam clipped. The same increment fixes a
+//!   pre-existing transposition in [`standard::adobe_rgb1998_profile`] (the
+//!   colorant table was read by column, so device white missed PCS white).
 
 mod clut;
 mod embed;
@@ -72,6 +83,6 @@ pub use lut::{parse_lut_tag, parse_lut_v2, parse_lut_v4, Pipeline, Stage};
 pub use parser::{Curve, IccError, Profile, Xyz};
 pub use standard::{
     apply_rgb8, apply_rgb16, adobe_rgb1998_profile, input_profile, srgb_profile, InputAssumption,
-    InputProfile, INPUT_INTENT,
+    InputProfile, OutputProfile, INPUT_INTENT,
 };
 pub use transform::Transform;
