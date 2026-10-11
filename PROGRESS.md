@@ -8719,3 +8719,63 @@ away; carrying session state into export would be a design change for a later
 increment.
 ---
 
+## 2026-10-11 02:35 UTC — G2b: every Rust export carries the sRGB profile
+
+**What.** The output half of G2: exported files are now tagged with the profile
+their pixels are actually encoded in, closing the audit's "every export is
+untagged" finding.
+
+- `c41-core::icc::srgb_profile()` grew from 7 to 10 tags with the three
+  informational tags the ICC spec requires on a `mntr` display profile —
+  `desc` ("sRGB (IEC 61966-2-1)") and `cprt` as `mluc` records, `chad` as an
+  `sf32` matrix matching colord's `sRGB.icc` byte-for-byte. The colour-defining
+  tags are untouched, so no pixel moves (`added_informational_tags_leave_the_
+  readers_alone`).
+- Every render primitive ends in `linear_to_srgb` (`apply_pipeline_gear`,
+  `apply_pipeline_rgb16_gear`, `render_*_gear`, the neural `quantize_srgb16`),
+  so the tag is always sRGB and never a guess. The export writers take an
+  explicit `profile: &[u8]` and pass it to `ImageEncoder::set_icc_profile`
+  (JPEG APP2, PNG iCCP, TIFF 34675); PNG/TIFF replaced `ImageBuffer::
+  save_with_format` with explicit `PngEncoder`/`TiffEncoder` (`write_image` is
+  not object-safe). `bytemuck` (`= 1.25.0`, already in the lock) supplies the
+  `&[u16]`→bytes cast. Neural-restore result TIFFs are tagged through the same
+  `save_rgb16_buf`.
+- The TIFF extractor now accepts `BYTE` as well as `UNDEFINED` for tag 34675:
+  the `tiff` crate behind `image`'s `TiffEncoder` writes BYTE, and both are
+  1-byte element arrays, so count and inline/out-of-line handling are identical
+  (`a_tiff_icc_tag_of_type_byte_is_accepted`).
+- `build_profile` now writes the two mandatory-but-previously-zero header
+  fields — the D50 PCS illuminant (spec §7.2.16) and a fixed creation date/time
+  (§7.2.4, fixed to keep the builder deterministic).
+
+**Verified.** `scripts/ci-local.sh` green (all four steps) on the follow-up
+tree and again through the pre-push hook. c41-core `icc` 89 pass (including the
+new BYTE-tag case and the illuminant/date assertions, which match
+`/usr/share/color/icc/colord/sRGB.icc` byte-for-byte); c41-ui `dialogs` 13
+pass. With `C41_ICC_CORPUS` set and ImageMagick 6.9.12 installed, the env-gated
+oracle extracts all three containers' payloads byte-exact and lcms parses the
+embedded profile with no diagnostic. Clippy `--all-targets` adds no new
+warnings — the conformance test's `chunks_exact(2/4)` loops tripped the new
+`clippy::chunks_exact_to_as_chunks` lint and were rewritten.
+
+**Senior review** (`3299966295` → `d7638f3634`): first pass REQUEST CHANGES
+with two MAJOR findings, both fixed. (1) The header's PCS illuminant was
+all-zero; strict readers warn and the profile ships in every export — now D50,
+pinned by test. (2) The designated "lcms oracle" was vacuous: `convert FILE
+icc:OUT` only copies the payload, so it validated nothing and would not have
+caught (1) — reworked into a real extraction check plus a `-profile` translate
+that forces lcms to parse the embedded profile (`-colorspace` leaves TIFF/JPEG
+unvalidated on ImageMagick 7). The remaining notes (skip-branch fall-through,
+unwrapped corpus dir, neural-path claim, magic `1`/stale doc, missing BYTE
+test, tautology note, CLI-scope overclaim) are all addressed; second pass
+APPROVE WITH NOTES, and the one residual note (the `-profile` mechanism) is the
+fix above.
+
+**Notes.** The `srgb_profile()` bytes are a compile-time constant by design —
+that is why the creation date is fixed rather than `now()`: two builds and two
+calls in one process must be identical. The `darktable-cli` fallback
+(heic/heif/avif, no Rust decoder) still emits the C tool's own output profile;
+tagging it is not this increment's and is recorded in the export-loop comment.
+
+---
+
