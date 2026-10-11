@@ -238,6 +238,25 @@ struct PreviewCtx {
     /// The active Bayer demosaic method (raw only), kept so a re-decode
     /// requested from anywhere re-uses the user's chosen algorithm.
     decode_method: Rc<std::cell::Cell<DemosaicMethod>>,
+    /// What the "Input color profile" row shows for the current image: the
+    /// resolution of the embedded-profile decision (G2d). Seeded from the path
+    /// at page build (raw vs not) and refined by [`resolve_preview_transform`]
+    /// when a non-raw decode completes; read by [`populate_modules`] so a panel
+    /// rebuild re-seeds the row, and pushed live by [`refresh_input_row`].
+    input_row_state: Rc<std::cell::Cell<InputRowState>>,
+    /// The input assumption decided this session, used when no per-file row was
+    /// persisted (no db / uncatalogued image) so a re-decode — including the one
+    /// the row itself requests — does not re-prompt.
+    session_assumption: Rc<std::cell::Cell<Option<c41_core::icc::InputAssumption>>>,
+    /// The "Input color profile" row's drop-down, updated in place when a decode
+    /// resolves the input state. A weak ref like [`PreviewCtx::demosaic_row`]:
+    /// the row lives inside the rebuilt module panel, so this must never keep a
+    /// detached widget alive (nor retain the `ctx` its handler captures).
+    input_row: glib::WeakRef<gtk4::DropDown>,
+    /// Re-entrancy guard for [`apply_input_row_view`]: a programmatic model +
+    /// selection update must not be mistaken for the user choosing an
+    /// assumption (the `lens_syncing` precedent).
+    input_row_syncing: Rc<std::cell::Cell<bool>>,
     /// Cleaned-up camera maker/model from the most recent raw decode (empty for
     /// JPEGs and pre-decode). Seeds the lens module's camera dropdown when the
     /// user hasn't picked one yet.
@@ -1137,9 +1156,12 @@ fn spawn_decode(ctx: &PreviewCtx) {
     }));
 }
 
-/// The input transform the non-raw decode applies: the embedded profile when
-/// the container carries one (G2a2); otherwise the per-file *remembered*
-/// assumption, prompting the first time an untagged file is opened (G2a2, 1a).
+/// The input transform the non-raw decode applies, and the input state it
+/// implies for the "Input color profile" row: the embedded profile when the
+/// container carries one (G2a2); otherwise the per-file *remembered* assumption,
+/// prompting the first time an untagged file is opened (G2a2, 1a). G2d records
+/// the outcome in [`PreviewCtx::input_row_state`] so the row can show it and let
+/// the user change it.
 ///
 /// `None` means "no matrix move": embedded or assumed sRGB, a profile that
 /// cannot be applied, or a container this module cannot scan — the byte-exact
@@ -1151,21 +1173,37 @@ async fn resolve_preview_transform(
     path: &str,
     embedded: &c41_core::icc::Embedded,
 ) -> Option<c41_core::icc::Transform> {
-    use c41_core::icc::InputProfile;
-    match c41_core::icc::input_profile(embedded) {
-        InputProfile::Transform(t) => Some(t),
-        InputProfile::Missing => match crate::persist::load_input_assumption(&ctx.db_path, path) {
-            // Remembered: apply the assumption exactly as though the file had
-            // been tagged with it (Srgb ⇒ `None` — the bytes are the space).
-            Some(a) => a.transform_for_missing(),
-            // Never decided for this file: ask. Dismissing is "sRGB, this
-            // session only", same as the no-db / uncatalogued fallback.
-            None => prompt_input_assumption(ctx, path)
-                .await
-                .and_then(|a| a.transform_for_missing()),
-        },
-        InputProfile::Srgb | InputProfile::Unusable | InputProfile::Unknown => None,
-    }
+    use c41_core::icc::{InputAssumption, InputProfile};
+    let (state, transform) = match c41_core::icc::input_profile(embedded) {
+        InputProfile::Transform(t) => (InputRowState::Embedded, Some(t)),
+        InputProfile::Srgb => (InputRowState::Embedded, None),
+        InputProfile::Unusable => (InputRowState::Unusable, None),
+        InputProfile::Unknown => (InputRowState::Unknown, None),
+        InputProfile::Missing => {
+            // Remembered for this file, else decided earlier this session, else
+            // ask. Dismissing the prompt is "sRGB, this session only" — the same
+            // fallback the no-db / uncatalogued case lands on. Caching the
+            // answer in `session_assumption` is what lets the row's own
+            // re-decode reuse it instead of prompting again.
+            let assumed = match crate::persist::load_input_assumption(&ctx.db_path, path) {
+                Some(a) => a,
+                None => match ctx.session_assumption.get() {
+                    Some(a) => a,
+                    None => prompt_input_assumption(ctx, path)
+                        .await
+                        .unwrap_or(InputAssumption::Srgb),
+                },
+            };
+            ctx.session_assumption.set(Some(assumed));
+            (
+                InputRowState::Assumed(assumed),
+                assumed.transform_for_missing(),
+            )
+        }
+    };
+    ctx.input_row_state.set(state);
+    refresh_input_row(ctx);
+    transform
 }
 
 /// The per-image missing-profile prompt (G2a2, 1a): an untagged file's pixels
@@ -1371,6 +1409,17 @@ pub fn darkroom_page(
     // Restore the saved per-image geometry (identity for JPEGs / no db) BEFORE
     // the first decode, so the initial render applies it.
     let geometry0 = crate::persist::load_geometry(db_path, file_path);
+    // Seed the "Input color profile" row before the first decode: a raw's input
+    // profile is its camera matrix (no choice), and a non-raw starts from its
+    // remembered assumption (the default sRGB when none) until a decode resolves
+    // the embedded-profile decision for real.
+    let input_state0 = if crate::raw_preview::is_raw_path(file_path) {
+        InputRowState::Raw
+    } else {
+        InputRowState::Assumed(
+            crate::persist::load_input_assumption(db_path, file_path).unwrap_or_default(),
+        )
+    };
     let ctx = PreviewCtx {
         picture: picture.downgrade(),
         hist_area: hist_area.downgrade(),
@@ -1394,6 +1443,10 @@ pub fn darkroom_page(
         decode_method: Rc::new(std::cell::Cell::new(
             crate::persist::load_demosaic(db_path, file_path),
         )),
+        input_row_state: Rc::new(std::cell::Cell::new(input_state0)),
+        session_assumption: Rc::new(std::cell::Cell::new(None)),
+        input_row: glib::WeakRef::new(),
+        input_row_syncing: Rc::new(std::cell::Cell::new(false)),
         cam_meta: Rc::new(RefCell::new((String::new(), String::new()))),
         lens_gear: Rc::new(RefCell::new(None)),
         lens_cam_dd: glib::WeakRef::new(),
@@ -2441,6 +2494,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Colorize" => colorize_module_row(ctx).upcast(),
                 "Color correction" => colorcorrection_module_row(ctx).upcast(),
                 "Color contrast" => colorcontrast_module_row(ctx).upcast(),
+                "Input color profile" => input_profile_module_row(ctx).upcast(),
                 "Primaries" => primaries_module_row(ctx).upcast(),
                 "Negadoctor" => negadoctor_module_row(ctx).upcast(),
                 "Tone equalizer" => toneequal_module_row(ctx).upcast(),
@@ -2735,7 +2789,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3131,6 +3185,135 @@ fn add_param_slider(
         render_preview(&ctx_cl);
     });
     expander.add_row(&row.row);
+}
+
+/// Tooltip / accessible description for the "Input color profile" row.
+const INPUT_PROFILE_ROW_TOOLTIP: &str =
+    "How this image's pixels are read into the working space. An embedded ICC \
+     profile is applied as-is; when the file carries none, the colour space you \
+     choose here is assumed for it, remembered per file and reproduced on export.";
+
+/// What the "Input color profile" row shows for the current image.
+///
+/// The [`c41_core::icc::InputProfile`] classification, collapsed to what the row
+/// needs to say. Kept in `ctx` (not only in the widget) so a panel rebuild
+/// re-seeds the row, and separate from the transform itself because the
+/// `Transform` is neither `Copy` nor `PartialEq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputRowState {
+    /// A raw file: the input profile is the camera matrix, not a choice.
+    Raw,
+    /// The container carries a profile, applied (or already sRGB).
+    Embedded,
+    /// The container carries a profile that will not parse; pixels left as-is.
+    Unusable,
+    /// The container could not be scanned; pixels left as-is.
+    Unknown,
+    /// No embedded profile: the per-image assumption applies, and this is it.
+    Assumed(c41_core::icc::InputAssumption),
+}
+
+impl Default for InputRowState {
+    fn default() -> Self {
+        InputRowState::Assumed(c41_core::icc::InputAssumption::Srgb)
+    }
+}
+
+/// The drop-down contents for `state`: items, selected index, and whether the
+/// user may change it. Only [`InputRowState::Assumed`] is a real choice — every
+/// other state names a profile the file already fixes, so the drop-down shows
+/// that name and is disabled rather than pretending to offer one. Pure, so the
+/// mapping is unit-tested without a display.
+fn input_row_view(state: InputRowState) -> (Vec<&'static str>, u32, bool) {
+    match state {
+        InputRowState::Raw => (vec!["Camera matrix (raw)"], 0, false),
+        InputRowState::Embedded => (vec!["Embedded profile"], 0, false),
+        InputRowState::Unusable => (vec!["Embedded profile (unreadable)"], 0, false),
+        InputRowState::Unknown => (vec!["Not inspected"], 0, false),
+        InputRowState::Assumed(a) => (
+            c41_core::icc::InputAssumption::ALL
+                .iter()
+                .map(|x| x.label())
+                .collect(),
+            a.as_u8() as u32,
+            true,
+        ),
+    }
+}
+
+/// Point a row's drop-down at `state`, guarded so the programmatic model +
+/// selection update (which fires `notify::selected`) is not mistaken for a user
+/// choice. Used only for the in-place refresh; the row is *built* seed-first.
+fn apply_input_row_view(dd: &gtk4::DropDown, ctx: &PreviewCtx, state: InputRowState) {
+    let (items, selected, sensitive) = input_row_view(state);
+    ctx.input_row_syncing.set(true);
+    dd.set_model(Some(&gtk4::StringList::new(&items)));
+    dd.set_selected(selected);
+    dd.set_sensitive(sensitive);
+    ctx.input_row_syncing.set(false);
+}
+
+/// Push the current [`InputRowState`] into the live row, if it is in the panel.
+/// A completed decode calls this; a panel rebuild re-seeds the row from `ctx`
+/// directly (so this is a no-op when no row exists yet).
+fn refresh_input_row(ctx: &PreviewCtx) {
+    if let Some(dd) = ctx.input_row.upgrade() {
+        apply_input_row_view(&dd, ctx, ctx.input_row_state.get());
+    }
+}
+
+/// The "Input color profile" module row (G2d): shows how the current image's
+/// pixels are interpreted, and for an untagged non-raw file lets the user change
+/// the per-image assumption without re-opening the first-open prompt. Not an
+/// expander: input profiling has no enable switch or parameters to expand, just
+/// this one choice.
+fn input_profile_module_row(ctx: &PreviewCtx) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Input color profile")
+        .use_markup(false)
+        .build();
+    row.set_tooltip_text(Some(INPUT_PROFILE_ROW_TOOLTIP));
+    row.update_property(&[gtk4::accessible::Property::Description(
+        INPUT_PROFILE_ROW_TOOLTIP,
+    )]);
+    // Seed the drop-down from the current state BEFORE connecting, so the build
+    // fires no handler (the demosaic selector's precedent).
+    let (items, selected, sensitive) = input_row_view(ctx.input_row_state.get());
+    let dd = gtk4::DropDown::new(
+        Some(gtk4::StringList::new(&items)),
+        None::<gtk4::Expression>,
+    );
+    dd.set_selected(selected);
+    dd.set_sensitive(sensitive);
+    dd.set_valign(gtk4::Align::Center);
+    dd.set_margin_start(12);
+    dd.set_margin_end(12);
+    let dd_ctx = ctx.clone();
+    dd.connect_selected_notify(move |dd| {
+        // Ignore the programmatic refreshes (see `apply_input_row_view`) and any
+        // state that is not a real choice — only `Assumed` renders a live combo.
+        if dd_ctx.input_row_syncing.get() {
+            return;
+        }
+        if !matches!(dd_ctx.input_row_state.get(), InputRowState::Assumed(_)) {
+            return;
+        }
+        let a = c41_core::icc::InputAssumption::from_u8(dd.selected() as u8);
+        dd_ctx.input_row_state.set(InputRowState::Assumed(a));
+        // Remember it for the session too: with no db (or an uncatalogued
+        // image) the re-decode below would otherwise prompt again for the answer
+        // the user just gave.
+        dd_ctx.session_assumption.set(Some(a));
+        crate::persist::save_input_assumption(
+            &dd_ctx.db_path,
+            dd_ctx.decode_path.borrow().as_str(),
+            a,
+        );
+        spawn_decode(&dd_ctx);
+    });
+    ctx.input_row.set(Some(&dd));
+    row.add_suffix(&dd);
+    row
 }
 
 /// Exposure module: enable switch gates `exposure_on`; EV / black-point sliders.
@@ -4785,6 +4968,44 @@ mod tests {
         assert_eq!(r.bytes.len(), 2 * 1 * 3);
     }
 
+    /// The "Input color profile" row's mapping from resolved state to drop-down
+    /// contents. The load-bearing invariant is the selected index: it indexes the
+    /// same `ALL`/`as_u8` numbering the handler reads back, so a mismatch would
+    /// silently save the wrong assumption when the row changes.
+    #[test]
+    fn input_row_view_maps_states_to_the_right_selector() {
+        use c41_core::icc::InputAssumption;
+        // Only an untagged file offers a choice, and the selection tracks the
+        // assumption's stable code.
+        let (items, selected, sensitive) =
+            input_row_view(InputRowState::Assumed(InputAssumption::Srgb));
+        assert_eq!(items, vec!["sRGB", "Adobe RGB (1998)"]);
+        assert_eq!(selected, InputAssumption::Srgb.as_u8() as u32);
+        assert!(sensitive);
+        let (_, adobe_selected, sensitive) =
+            input_row_view(InputRowState::Assumed(InputAssumption::AdobeRgb1998));
+        assert_eq!(adobe_selected, InputAssumption::AdobeRgb1998.as_u8() as u32);
+        assert!(sensitive);
+        // Every fixed state is a single, disabled entry naming what the file
+        // already is — never an editable combo that would do nothing.
+        for state in [
+            InputRowState::Raw,
+            InputRowState::Embedded,
+            InputRowState::Unusable,
+            InputRowState::Unknown,
+        ] {
+            let (items, selected, sensitive) = input_row_view(state);
+            assert_eq!(items.len(), 1, "{state:?} is not a choice");
+            assert_eq!(selected, 0);
+            assert!(!sensitive, "{state:?} must not offer a change");
+        }
+        // The default the row seeds from before a decode is an editable sRGB.
+        assert_eq!(
+            input_row_view(InputRowState::default()),
+            input_row_view(InputRowState::Assumed(InputAssumption::Srgb))
+        );
+    }
+
     /// `LIVE_MODULE_LABELS` now drives presentation (ordering + the "N of M
     /// active" count), not just this test, so a module present in the dispatch
     /// but missing from the list would render live yet be sorted and counted as
@@ -5635,12 +5856,31 @@ mod tests {
         }
     }
 
+    /// Live modules with no `PreviewParams` fields — nothing for `reset_module`
+    /// (or its mutation table) to act on. `Input color profile` (G2d) is driven
+    /// by the file's embedded profile and the per-file assumption in the DB, not
+    /// by the edit params, and its row has no enable switch or reset button.
+    const PARAMLESS_MODULES: &[&str] = &["Input color profile"];
+
     /// The mutation table and `reset_module` cover the same module set as the
-    /// live-module list, so a newly ported module can't silently get a reset
-    /// button that does nothing (or a test row with no reset arm).
+    /// live-module list — every live module *that has parameters*, so a newly
+    /// ported module can't silently get a reset button that does nothing (or a
+    /// test row with no reset arm). The parameterless live modules
+    /// (`PARAMLESS_MODULES`) are pinned to be absent from both instead.
     #[test]
     fn reset_module_covers_every_live_label() {
         for label in LIVE_MODULE_LABELS {
+            if PARAMLESS_MODULES.contains(label) {
+                assert!(
+                    MODULE_MUTATIONS.iter().all(|(l, _)| l != label),
+                    "parameterless module {label:?} must not have a mutation entry"
+                );
+                assert!(
+                    !reset_module(&mut PreviewParams::default(), label),
+                    "parameterless module {label:?} must not have a reset arm"
+                );
+                continue;
+            }
             assert!(
                 MODULE_MUTATIONS.iter().any(|(l, _)| l == label),
                 "no mutation-table entry for live module {label:?}"
@@ -5652,6 +5892,14 @@ mod tests {
             assert!(
                 LIVE_MODULE_LABELS.contains(label),
                 "mutation-table entry {label:?} is not a live module"
+            );
+        }
+        // The exception list must name real live modules, or it would silently
+        // stop exempting anything.
+        for label in PARAMLESS_MODULES {
+            assert!(
+                LIVE_MODULE_LABELS.contains(label),
+                "parameterless module {label:?} is not a live module"
             );
         }
     }

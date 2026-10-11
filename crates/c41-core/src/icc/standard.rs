@@ -486,6 +486,21 @@ impl Default for InputAssumption {
 }
 
 impl InputAssumption {
+    /// Every assumption, in the combo's display order. The index is
+    /// [`Self::as_u8`] — pinned by `assumption_codes_round_trip_and_are_stable`
+    /// so the darkroom row's index↔value mapping can't drift.
+    pub const ALL: [InputAssumption; 2] = [InputAssumption::Srgb, InputAssumption::AdobeRgb1998];
+
+    /// Human display name for the assumption — the input-profile row's combo
+    /// entries, and any other surface that needs to name the space rather than
+    /// its stable code.
+    pub fn label(self) -> &'static str {
+        match self {
+            InputAssumption::Srgb => "sRGB",
+            InputAssumption::AdobeRgb1998 => "Adobe RGB (1998)",
+        }
+    }
+
     /// Stable integer code for [`crate::persist`] (the DB stores this, so the
     /// numbering must not be renumbered once released).
     pub fn as_u8(self) -> u8 {
@@ -1051,6 +1066,18 @@ mod tests {
             assert_eq!(InputAssumption::from_u8(v).as_u8(), v);
         }
         assert_eq!(InputAssumption::from_u8(9), InputAssumption::Srgb);
+    }
+
+    /// `ALL` is the combo's order, and the row indexes it by `as_u8`, so the two
+    /// must agree — otherwise changing the row would save the wrong assumption.
+    /// The labels are shared display names and must name real spaces, not codes.
+    #[test]
+    fn assumption_all_matches_codes_and_labels() {
+        for (i, a) in InputAssumption::ALL.iter().enumerate() {
+            assert_eq!(i as u8, a.as_u8(), "ALL[{i}] must sit at code {}", a.as_u8());
+        }
+        assert_eq!(InputAssumption::ALL[0].label(), "sRGB");
+        assert_eq!(InputAssumption::ALL[1].label(), "Adobe RGB (1998)");
     }
 
     /// Assumed Adobe RGB is the SAME move a *tagged* AdobeRGB file gets: the
