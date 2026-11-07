@@ -8870,6 +8870,14 @@ tagging it is not this increment's and is recorded in the export-loop comment.
 
 **What.** `probe_dims` now first uses `image::ImageReader::into_dimensions()` for the enabled JPEG/PNG/TIFF formats, obtaining dimensions from decoder headers instead of doing a throwaway 1×1 GdkPixbuf decode followed by reading the entire file again. It retains GdkPixbuf as a fallback for formats available only through system loaders, and safely rejects dimensions that cannot fit the catalog's `i32` fields. Added coverage for a known-size PNG and invalid image input. The G6 audit now records that HEIC/AVIF remain unsupported while the common Rust-native import formats take the header fast path.
 
+---
+
+## 2026-11-07 15:17 UTC — import follow-up: cover image-format and fallback probes
+
+**What.** Expanded the `probe_dims` regression test to cover JPEG, PNG and TIFF header probes plus a minimal BMP that specifically exercises the GdkPixbuf fallback (BMP is not enabled in the `image` crate feature set). Invalid input is still asserted to return no dimensions.
+
+**Verified.** Senior review approved the fixture construction and fallback expectation. `scripts/ci-local.sh` passed all four Docker CI steps with 534 UI tests. The host-only cargo attempt documented in the preceding entry remains non-authoritative because this machine lacks GTK/GLib dev packages.
+
 **Verified.** Independent senior review approved. Initial host `cargo test` attempt failed because this host lacks GLib/GObject/GIO development packages; this is expected under the repo's Docker-only native-dependency policy. `scripts/ci-local.sh` then passed all four Docker CI steps, including release tests (534 UI tests), clippy, workspace check and binary link.
 
 **Notes.** GdkPixbuf fallback still reads the full contents for formats outside the Rust decoder set; this increment removes the repeated full decode/read for the common JPEG/PNG/TIFF path, not for every possible installed loader.

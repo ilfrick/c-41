@@ -949,11 +949,36 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let png = dir.join("known-size.png");
-        image::ImageBuffer::from_pixel(7, 5, image::Rgb([12_u8, 34, 56]))
-            .save(&png)
-            .unwrap();
-        assert_eq!(probe_dims(&png), Some((7, 5)));
+        let pixels = image::ImageBuffer::from_pixel(7, 5, image::Rgb([12_u8, 34, 56]));
+        for (extension, format) in [
+            ("png", image::ImageFormat::Png),
+            ("jpg", image::ImageFormat::Jpeg),
+            ("tiff", image::ImageFormat::Tiff),
+        ] {
+            let path = dir.join(format!("known-size.{extension}"));
+            pixels.save_with_format(&path, format).unwrap();
+            assert_eq!(probe_dims(&path), Some((7, 5)), "{extension} dimensions");
+        }
+
+        // A minimal 1x1 24-bit BMP exercises the GdkPixbuf fallback because
+        // BMP decoding is not enabled in c41-ui's image-crate feature set.
+        let mut bmp = Vec::with_capacity(58);
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&58_u32.to_le_bytes());
+        bmp.extend_from_slice(&[0; 4]);
+        bmp.extend_from_slice(&54_u32.to_le_bytes());
+        bmp.extend_from_slice(&40_u32.to_le_bytes());
+        bmp.extend_from_slice(&1_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_u16.to_le_bytes());
+        bmp.extend_from_slice(&24_u16.to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes());
+        bmp.extend_from_slice(&4_u32.to_le_bytes());
+        bmp.extend_from_slice(&[0; 16]);
+        bmp.extend_from_slice(&[0, 0, 0, 0]);
+        let bmp_path = dir.join("fallback.bmp");
+        std::fs::write(&bmp_path, bmp).unwrap();
+        assert_eq!(probe_dims(&bmp_path), Some((1, 1)));
 
         let invalid = dir.join("invalid.png");
         std::fs::write(&invalid, b"not an image").unwrap();
