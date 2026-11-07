@@ -20,18 +20,20 @@
 //! be a second, different opinion about how to linearise, and the two would
 //! disagree in the shadows on every frame. [`srgb_profile`] is built to the same
 //! curve the pipeline already uses, and `srgb_trc_matches_the_pipelines_lineariser`
-//! pins the two together. An *export* can then be re-encoded into a wider
-//! destination ([`OutputProfile`]) — a separate step that takes the rendered
-//! sRGB pixels as given — but the space the edits run in stays pinned.
+//! pins the two together. Non-raw exports can be re-encoded into a wider
+//! destination ([`OutputProfile`]) from their rendered sRGB pixels. Raw edits
+//! instead run in linear Rec.2020 and may be encoded directly into Adobe RGB;
+//! neither path changes the non-raw working space.
 //!
 //! # What is deliberately not here
 //!
-//! **Raw.** [`crate::rawimage`] already runs its own input profile — the camera
-//! → Rec.2020 matrix that darktable's `colorin` synthesises *as* an ICC profile
-//! for raw (`src/iop/colorin.c:1379-1385`, feeding the same engine through
-//! `_colorin_profile_bytes`). A sensor mosaic has no embedded ICC to lift out,
-//! and applying one on top of that matrix would colour-manage twice. See
-//! [`super::embed`]'s module docs, which scope raw out by design.
+//! **Raw input profiling.** [`crate::rawimage`] already runs its own camera
+//! → Rec.2020 matrix, equivalent to the ICC profile darktable's `colorin`
+//! synthesises for raw (`src/iop/colorin.c:1379-1385`). A sensor mosaic has no
+//! embedded ICC to lift out, and applying one on top of that matrix would
+//! colour-manage twice. Raw output conversion is handled separately by the
+//! linear Rec.2020 profile below; [`super::embed`]'s extractor still scopes raw
+//! out by design.
 
 use std::sync::OnceLock;
 
@@ -390,6 +392,60 @@ pub fn adobe_rgb1998_profile() -> Vec<u8> {
     )
 }
 
+/// Linear Rec.2020 input profile for raw pipeline output. Its channel colorants
+/// are the pipeline's Rec.2020 primaries, Bradford-adapted from D65 to the ICC
+/// D50 PCS; the unit TRCs mean input samples are already linear. This profile
+/// is internal to transforms and is never embedded in an exported file.
+fn linear_rec2020_profile() -> Vec<u8> {
+    let bradford = |xyz: [f32; 3]| -> [f32; 3] {
+        std::array::from_fn(|row| {
+            (0..3)
+                .map(|col| CHAD[row * 3 + col] as f32 / 65536.0 * xyz[col])
+                .sum()
+        })
+    };
+    // The Rec.2020 matrix and reference chad are each rounded independently.
+    // Normalize that sub-quantum white mismatch so the internal profile's
+    // colorants sum exactly to its declared D50 media white.
+    let white65 = crate::color::rec2020_to_xyz_d65([1.0, 1.0, 1.0, 0.0]);
+    let white50 = bradford([white65[0], white65[1], white65[2]]);
+    let scale = [D50[0] / white50[0], D50[1] / white50[1], D50[2] / white50[2]];
+    let adapt = |xyz: [f32; 3]| -> [f32; 3] {
+        let adapted = bradford(xyz);
+        [adapted[0] * scale[0], adapted[1] * scale[1], adapted[2] * scale[2]]
+    };
+    let primary = |rgb: [f32; 4]| {
+        let xyz65 = crate::color::rec2020_to_xyz_d65(rgb);
+        adapt([xyz65[0], xyz65[1], xyz65[2]])
+    };
+    let r = primary([1.0, 0.0, 0.0, 0.0]);
+    let g = primary([0.0, 1.0, 0.0, 0.0]);
+    let b = primary([0.0, 0.0, 1.0, 0.0]);
+    build_profile(
+        b"mntr",
+        b"RGB ",
+        b"XYZ ",
+        &[
+            (b"wtpt", xyz_tag(D50[0], D50[1], D50[2])),
+            (b"rXYZ", xyz_tag(r[0], r[1], r[2])),
+            (b"gXYZ", xyz_tag(g[0], g[1], g[2])),
+            (b"bXYZ", xyz_tag(b[0], b[1], b[2])),
+            (b"rTRC", curv_gamma_tag(1.0)),
+            (b"gTRC", curv_gamma_tag(1.0)),
+            (b"bTRC", curv_gamma_tag(1.0)),
+            (b"chad", chad_tag()),
+        ],
+    )
+}
+
+fn linear_rec2020() -> Result<&'static Profile, IccError> {
+    static CACHE: OnceLock<Result<Profile, ()>> = OnceLock::new();
+    match CACHE.get_or_init(|| Profile::parse(&linear_rec2020_profile()).map_err(|_| ())) {
+        Ok(p) => Ok(p),
+        Err(()) => Err(IccError::BadSignature),
+    }
+}
+
 /// [`adobe_rgb1998_profile`], parsed once — the same two reasons [`srgb`]
 /// caches its destination: cost per decoded image, and one canonical profile
 /// so every transform built in this process agrees.
@@ -543,22 +599,20 @@ impl InputAssumption {
 ///
 /// Where [`InputAssumption`] answers "what were these pixels *read* as", this
 /// answers "what is the file *written* as". Every render funnel in the product
-/// ends in the sRGB working space ([`srgb_profile`]), so [`Self::Srgb`] — the
-/// default — is a **byte-exact no-op**: the export is written exactly as it was
-/// before this choice existed. A wider destination re-encodes the rendered sRGB
-/// pixels into that space through the ICC engine and captions the file with its
-/// profile, so a colour-managed reader on another machine shows the colours the
-/// user edited.
+/// Non-raw renders end in the sRGB working space; raw renders retain linear
+/// Rec.2020 until output. [`Self::Srgb`] — the default — is a **byte-exact
+/// no-op** for both. Adobe RGB exports from non-raw sources re-encode rendered
+/// sRGB pixels through the ICC engine; raw exports convert directly from linear
+/// Rec.2020 so their Adobe-gamut colours are not clipped at an intermediate
+/// sRGB seam. Each file is tagged with the profile its pixels use.
 ///
 /// # Scope
 ///
-/// The *rendered* image arrives through the sRGB output seam the preview uses
-/// (`crate::preview::render_linear_to_srgb*`), so a wider destination re-encodes
-/// those colours rather than recovering gamut the seam already clipped. The tag
-/// and the pixels always agree — the conversion is the ICC transform, pinned by
-/// `output_profile_round_trips_through_adobe_rgb` — which is what a third-party
-/// reader needs; rendering the seam itself into the destination (true wide-gamut
-/// export) is a separate increment.
+/// Non-raw output still arrives through the sRGB seam and cannot recover gamut
+/// already clipped there. Raw exports use the separate
+/// [`Self::transform_from_linear_rec2020`] path to convert directly from the
+/// Rec.2020 working buffer. The on-screen preview remains sRGB; this does not
+/// add a wide-gamut display or soft-proof mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputProfile {
     /// sRGB (IEC 61966-2-1) — the pipeline's own output space. No conversion.
@@ -611,6 +665,26 @@ impl OutputProfile {
         match self {
             OutputProfile::Srgb => srgb_profile(),
             OutputProfile::AdobeRgb1998 => adobe_rgb1998_profile(),
+        }
+    }
+
+    /// Transform linear Rec.2020 raw-pipeline pixels directly into this output
+    /// profile. `None` for sRGB (the established raw render path is retained) or
+    /// if the in-process profiles cannot be parsed. This distinct seam avoids
+    /// clipping raw colors through the sRGB display encoding before an Adobe
+    /// RGB export.
+    pub fn transform_from_linear_rec2020(self) -> Option<&'static Transform> {
+        match self {
+            OutputProfile::Srgb => None,
+            OutputProfile::AdobeRgb1998 => {
+                static CACHE: OnceLock<Option<Transform>> = OnceLock::new();
+                CACHE
+                    .get_or_init(|| match (linear_rec2020(), adobe_rgb1998()) {
+                        (Ok(src), Ok(dst)) => Transform::new(src, dst, INPUT_INTENT).ok(),
+                        _ => None,
+                    })
+                    .as_ref()
+            }
         }
     }
 
@@ -1547,6 +1621,67 @@ mod tests {
         for v in out {
             assert!((v - 1.0).abs() < 1e-3, "white became {out:?}");
         }
+    }
+
+    #[test]
+    fn linear_rec2020_to_adobe_round_trips_adobe_primaries() {
+        let source = linear_rec2020().expect("the internal Rec.2020 profile must parse");
+        let colorants = [
+            source.read_xyz(b"rXYZ").unwrap(),
+            source.read_xyz(b"gXYZ").unwrap(),
+            source.read_xyz(b"bXYZ").unwrap(),
+        ];
+        for (axis, want, got) in [
+            (0, D50[0], colorants.iter().map(|x| x.x).sum::<f32>()),
+            (1, D50[1], colorants.iter().map(|x| x.y).sum::<f32>()),
+            (2, D50[2], colorants.iter().map(|x| x.z).sum::<f32>()),
+        ] {
+            assert!((got - want).abs() < 2.0 * QUANTUM, "Rec.2020 white axis {axis} = {got}, expected {want}");
+        }
+        for tag in [b"rTRC", b"gTRC", b"bTRC"] {
+            assert!(matches!(source.read_curve(tag).unwrap(), crate::icc::Curve::Gamma(g) if (g - 1.0).abs() < 1e-6));
+        }
+        let adobe = adobe_rgb1998().expect("the Adobe profile must parse");
+        let to_rec2020 = Transform::new(adobe, source, INPUT_INTENT)
+            .expect("Adobe RGB must convert to linear Rec.2020");
+        let to_adobe = OutputProfile::AdobeRgb1998
+            .transform_from_linear_rec2020()
+            .expect("Adobe RGB must provide a direct raw-output transform");
+        let to_srgb = Transform::new(source, srgb().unwrap(), INPUT_INTENT)
+            .expect("linear Rec.2020 must convert to sRGB");
+        let srgb_to_adobe = OutputProfile::AdobeRgb1998
+            .transform_from_srgb()
+            .expect("sRGB must convert to Adobe RGB");
+        let mut linear = [0.0f32; 3];
+        let mut encoded = [0.0f32; 3];
+        let mut old_srgb = [0.0f32; 3];
+        let mut old_adobe = [0.0f32; 3];
+        for primary in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+            to_rec2020.eval_into(&primary, &mut linear);
+            to_adobe.eval_into(&linear, &mut encoded);
+            for channel in 0..3 {
+                assert!(
+                    (encoded[channel] - primary[channel]).abs() < 2e-3,
+                    "Adobe primary {primary:?} round-tripped as {encoded:?}"
+                );
+            }
+        }
+        // Adobe green is inside Rec.2020 but outside sRGB. The old sRGB seam
+        // clips this color before the Adobe conversion; direct export retains
+        // the Adobe primary (within matrix-profile quantization tolerance).
+        to_rec2020.eval_into(&[0.0, 1.0, 0.0], &mut linear);
+        to_adobe.eval_into(&linear, &mut encoded);
+        to_srgb.eval_into(&linear, &mut old_srgb);
+        old_srgb.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+        srgb_to_adobe.eval_into(&old_srgb, &mut old_adobe);
+        assert!((encoded[1] - 1.0).abs() < 2e-3, "direct Adobe green: {encoded:?}");
+        let difference = (0..3)
+            .map(|channel| (old_adobe[channel] - encoded[channel]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            difference > 0.05,
+            "sRGB clipping failed to distinguish the paths: {old_adobe:?} vs {encoded:?}"
+        );
     }
 
     /// End to end: the transform the export applies (sRGB device → Adobe RGB

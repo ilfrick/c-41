@@ -8950,3 +8950,32 @@ Explicit perceptual intent is deliberate and matches Rust's
 export intent. Host-only Cargo tests remain unavailable because GTK/GLib
 headers are absent; Docker validation is authoritative. No deployment was
 modified.
+
+---
+
+## 2026-11-07 18:12 UTC — G2g: retain Rec.2020 gamut for raw Adobe exports
+
+**What.** Raw JPEG/PNG/TIFF exports selected as Adobe RGB now run the existing
+linear Rec.2020 raw pipeline directly through a cached ICC transform to Adobe
+RGB, instead of clipping through the sRGB display seam first. A deterministic
+internal linear Rec.2020 profile uses the pipeline's primary matrix, Bradford
+D65→D50 adaptation, normalized white, and unit TRCs. Default sRGB raw output
+remains byte-identical; non-raw exports and the sRGB display preview are
+unchanged. The resolved embedded ICC profile remains paired with the encoded
+pixels; direct-transform failures fall back through the existing sRGB path only
+when its output profile is available.
+
+**Verified.** Independent senior review found no blockers. `scripts/ci-local.sh`
+passed all four Docker CI steps after correction, including 539 `c41-ui` tests,
+clippy, workspace check, and the release binary link. Tests cover Adobe primary
+round trips and sRGB-seam clipping, exact sRGB raw passthrough, direct Adobe
+rendering, and JPEG/PNG/TIFF profile tags plus decoded pixel preservation for
+lossless formats. `git diff --check` passed.
+
+**Notes.** The first Docker test run failed only the new clipping assertion: it
+expected Adobe green's green channel itself to change, but the clipped and direct
+results retained `G=1` while red/blue differed substantially. The assertion now
+checks maximum per-channel distance; the rerun passed. A host-only `cargo test`
+was unavailable because the linker lacked Lensfun and gphoto2 native libraries;
+`cargo check -p c41-core` succeeded, and Docker CI is authoritative. No
+production service was changed.

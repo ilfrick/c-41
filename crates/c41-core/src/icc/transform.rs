@@ -161,11 +161,11 @@ impl Transform {
 
     /// Evaluate on one 3-channel vector writing into `out`, without allocating.
     /// Bit-exact to [`Self::eval`] — same order, same arithmetic, only the
-    /// plumbing differs. This is what the FFI apply path calls per pixel (hence
-    /// crate-scoped: `eval` is the public entry point); the allocation-free
-    /// property comes from [`Pipeline::eval_into3`]'s stack intermediates plus
-    /// these stack arrays.
-    pub(crate) fn eval_into(&self, input: &[f32; 3], out: &mut [f32; 3]) {
+    /// plumbing differs. This public low-level entry point lets large-buffer
+    /// callers avoid one heap allocation per pixel; the allocation-free property
+    /// comes from [`Pipeline::eval_into3`]'s stack intermediates plus these
+    /// stack arrays.
+    pub fn eval_into(&self, input: &[f32; 3], out: &mut [f32; 3]) {
         let mut v = [0.0f32; 3];
         self.head.eval_into3(input, &mut v);
         if self.to_xyz {

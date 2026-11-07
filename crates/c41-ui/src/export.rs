@@ -368,6 +368,54 @@ pub fn render_export_rgb16_gear(
     (gw, gh, rgb)
 }
 
+/// Raw export in the requested output profile. The sRGB variant reuses the
+/// established renderer byte-for-byte; Adobe RGB keeps the Rec.2020 render
+/// through the final ICC transform instead of clipping through sRGB first.
+pub(crate) fn render_export_rgb16_output_gear(
+    img: &c41_core::rawimage::RawImage,
+    method: c41_core::rawimage::DemosaicMethod,
+    geometry: c41_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
+    grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Option<(usize, usize, Vec<u16>)> {
+    if profile.is_srgb() {
+        return Some(render_export_rgb16_gear(img, method, geometry, params, lens_gear, grain_seed));
+    }
+    let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
+    let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
+    let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    let rgb = crate::preview::render_linear_to_output16_gear(
+        &geom_linear, gw, gh, params, lens_gear, grain_seed, profile,
+    )?;
+    Some((gw, gh, rgb))
+}
+
+/// 8-bit raw-export twin. The sRGB path remains the pre-existing 8-bit render;
+/// wider outputs render at 16-bit precision and quantize only after ICC encoding.
+pub(crate) fn render_export_rgb8_output_gear(
+    img: &c41_core::rawimage::RawImage,
+    method: c41_core::rawimage::DemosaicMethod,
+    geometry: c41_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
+    grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Option<(usize, usize, Vec<u8>)> {
+    if profile.is_srgb() {
+        return Some(render_export_rgb8_gear(img, method, geometry, params, lens_gear, grain_seed));
+    }
+    let (w, h, rgb16) = render_export_rgb16_output_gear(
+        img, method, geometry, params, lens_gear, grain_seed, profile,
+    )?;
+    let rgb8 = rgb16
+        .into_iter()
+        .map(|v| ((v as u32 + 128) / 257).min(255) as u8)
+        .collect();
+    Some((w, h, rgb8))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +438,40 @@ mod tests {
             clean_model: String::new(),
             mosaic,
         }
+    }
+
+    #[test]
+    fn output_profile_keeps_srgb_exact_and_renders_adobe_directly() {
+        use c41_core::geometry::Geometry;
+        use c41_core::icc::OutputProfile;
+        use c41_core::rawimage::DemosaicMethod;
+
+        let img = synthetic_raw(16, 12);
+        let params = crate::preview::PreviewParams::default();
+        let legacy = render_export_rgb16_gear(
+            &img, DemosaicMethod::Rcd, Geometry::default(), &params, None, 0,
+        );
+        let srgb = render_export_rgb16_output_gear(
+            &img, DemosaicMethod::Rcd, Geometry::default(), &params, None, 0,
+            OutputProfile::Srgb,
+        ).unwrap();
+        assert_eq!(srgb, legacy, "the default sRGB raw path must stay byte-exact");
+
+        let (w, h, adobe) = render_export_rgb16_output_gear(
+            &img, DemosaicMethod::Rcd, Geometry::default(), &params, None, 0,
+            OutputProfile::AdobeRgb1998,
+        ).unwrap();
+        assert_eq!((w, h), (16, 12));
+        assert_eq!(adobe.len(), w * h * 3);
+        assert!(adobe.iter().any(|&v| v != 0), "Adobe RGB output is blank");
+
+        let (w8, h8, adobe8) = render_export_rgb8_output_gear(
+            &img, DemosaicMethod::Rcd, Geometry::default(), &params, None, 0,
+            OutputProfile::AdobeRgb1998,
+        ).unwrap();
+        assert_eq!((w8, h8), (w, h));
+        assert_eq!(adobe8.len(), w * h * 3);
+        assert!(adobe8.iter().any(|&v| v != 0), "8-bit Adobe RGB output is blank");
     }
 
     #[test]

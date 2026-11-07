@@ -346,8 +346,10 @@ export reproduces without prompting. G2b made `srgb_profile()` a conformant
 10-tag display profile and tagged every Rust export with it (JPEG APP2, PNG
 iCCP, TIFF 34675). G2c makes the destination a choice: an "Output color profile"
 row (sRGB default, byte-exact; or Adobe RGB (1998)) whose selection is a
-remembered ui-pref; each Rust export converts its rendered sRGB pixels into the
-chosen space through the engine and tags the file with that profile. G2d makes
+remembered ui-pref; non-raw Rust exports convert their rendered sRGB pixels
+into the chosen space through the engine and tag the file with that profile.
+Raw exports can now encode directly from their linear Rec.2020 pipeline into
+Adobe RGB (G2g, below). G2d makes
 the input side a real row too: the darkroom's `Input color profile` row (no
 longer inert) shows the resolved input state — raw camera matrix, an embedded
 profile, or the assumed space — and, for an untagged file, edits the per-image
@@ -362,8 +364,13 @@ small resampling differences for nonlinear profiles. **G2f** also closes the
 untagged fallback export: `cli_args` now passes the selected sRGB/Adobe-RGB
 output-profile token and perceptual intent to `darkroom-cli`, which applies its
 own pixelpipe conversion and sends the same ICC choice to the format writer.
-Still outstanding: soft-proofing is absent and the render seam itself is sRGB
-(so a wide-gamut *render* is a later increment).
+**G2g** preserves the raw path's linear Rec.2020 values through Adobe RGB
+exports: raw JPEG/PNG/TIFF outputs transform directly from the pipeline to the
+selected Adobe profile, while sRGB raw output remains byte-identical and
+non-raw exports retain their existing sRGB working seam. The file's ICC tag
+continues to match the pixel encoding. This is not a wide-gamut display preview;
+that seam stays sRGB, as do non-raw Rust renders. Still outstanding:
+soft-proofing and the sRGB-only display/non-raw render seams.
 
 Two corrections to the plan this audit previously implied, both found by checking
 rather than assuming:

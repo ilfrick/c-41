@@ -293,16 +293,19 @@ fn render_raw_export(
         settings.resize.as_ref().map(|r| crate::export::fit_within(w as u32, h as u32, r))
     };
 
-    // G2c: the render lands in the sRGB working space, then — when the chosen
-    // output profile is not sRGB — is converted into that space through the ICC
-    // engine, and the file is captioned with the matching profile. sRGB (the
-    // default) skips the conversion, so its export is byte-identical to G2b's.
+    // G2c/G2g: sRGB outputs retain the byte-identical established path. Adobe
+    // output converts raw Rec.2020 renders directly to Adobe RGB; non-raw
+    // exports still convert their already-sRGB render through the usual ICC
+    // transform. The embedded profile always describes the encoded pixels.
     //
     // Encode to a temp file, then atomically rename onto `dest_ext` (see
     // `atomic_write`): a mid-encode failure must never leave a truncated file
     // that looks like a valid export, and a failed re-export must not clobber a
     // prior good file. The decode above already fails before any file is touched.
     let (profile, out_transform) = settings.output_profile.resolve();
+    let direct_rec2020 = settings.output_profile.transform_from_linear_rec2020().is_some()
+        && out_transform.is_some()
+        && profile == settings.output_profile.profile_bytes();
     atomic_write(&dest_ext, |out| {
         let lens_gear = edit.lens.as_deref();
         // Grain's per-image noise seed (see `Stage::Grain`), so an export
@@ -311,18 +314,26 @@ fn render_raw_export(
         let grain_seed = c41_core::iop::grain::hash_string(path);
         match settings.format {
             ExportFormat::Jpeg => {
-                let (w, h, mut rgb) = crate::export::render_export_rgb8_gear(
-                    &img,
-                    edit.method,
-                    edit.geometry,
-                    &edit.params,
-                    lens_gear,
-                    grain_seed,
-                );
-                if let Some(t) = out_transform {
-                    // Tightly packed RGB, so rowstride == width·3.
-                    c41_core::icc::apply_rgb8(t, &mut rgb, w, w * 3, 3);
-                }
+                let direct = if direct_rec2020 {
+                    crate::export::render_export_rgb8_output_gear(
+                        &img, edit.method, edit.geometry, &edit.params, lens_gear, grain_seed,
+                        settings.output_profile,
+                    )
+                } else {
+                    None
+                };
+                let (w, h, rgb) = if let Some(direct) = direct {
+                    direct
+                } else {
+                    let (w, h, mut rgb) = crate::export::render_export_rgb8_gear(
+                        &img, edit.method, edit.geometry, &edit.params, lens_gear, grain_seed,
+                    );
+                    if let Some(t) = out_transform {
+                        // Tightly packed RGB, so rowstride == width·3.
+                        c41_core::icc::apply_rgb8(t, &mut rgb, w, w * 3, 3);
+                    }
+                    (w, h, rgb)
+                };
                 let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
                     .ok_or_else(|| anyhow::anyhow!("empty render"))?;
                 if let Some((tw, th)) = target(w, h) {
@@ -331,17 +342,25 @@ fn render_raw_export(
                 write_jpeg_rgb8(&buf, settings.quality, out, &profile)
             }
             ExportFormat::Png | ExportFormat::Tiff => {
-                let (w, h, mut rgb) = crate::export::render_export_rgb16_gear(
-                    &img,
-                    edit.method,
-                    edit.geometry,
-                    &edit.params,
-                    lens_gear,
-                    grain_seed,
-                );
-                if let Some(t) = out_transform {
-                    c41_core::icc::apply_rgb16(t, &mut rgb, w, w * 3, 3);
-                }
+                let direct = if direct_rec2020 {
+                    crate::export::render_export_rgb16_output_gear(
+                        &img, edit.method, edit.geometry, &edit.params, lens_gear, grain_seed,
+                        settings.output_profile,
+                    )
+                } else {
+                    None
+                };
+                let (w, h, rgb) = if let Some(direct) = direct {
+                    direct
+                } else {
+                    let (w, h, mut rgb) = crate::export::render_export_rgb16_gear(
+                        &img, edit.method, edit.geometry, &edit.params, lens_gear, grain_seed,
+                    );
+                    if let Some(t) = out_transform {
+                        c41_core::icc::apply_rgb16(t, &mut rgb, w, w * 3, 3);
+                    }
+                    (w, h, rgb)
+                };
                 let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb)
                     .ok_or_else(|| anyhow::anyhow!("empty render"))?;
                 if let Some((tw, th)) = target(w, h) {
@@ -401,9 +420,9 @@ fn atomic_write(dest: &str, write: impl FnOnce(&str) -> Result<()>) -> Result<()
 /// Encode an 8-bit RGB buffer as JPEG to `out`, embedding `profile` (the JPEG
 /// encoder writes it as APP2 segments) and flushing explicitly so a `BufWriter`
 /// drop can't swallow the final-chunk write error (durability of the bytes is
-/// `atomic_write`'s fsync). Shared by the raw and non-raw export paths; both
-/// render into sRGB and then convert to the chosen output profile (G2c), so the
-/// caller passes that profile's bytes — the caption that matches the pixels.
+/// `atomic_write`'s fsync). Shared by the raw and non-raw export paths; the
+/// caller passes the bytes for the profile the buffer was encoded into (raw
+/// Adobe exports may have converted directly from Rec.2020).
 fn write_jpeg_rgb8(
     buf: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
     quality: u32,
@@ -428,8 +447,9 @@ fn write_jpeg_rgb8(
 /// Keeping a single call site means the encoder choice (and any format quirk
 /// that ever needs handling) lives in one place instead of three copies.
 ///
-/// G2b/G2c: every caller renders into sRGB and then converts to the chosen
-/// output profile, so each write embeds that profile's bytes `profile` through
+/// G2b/G2g: callers provide RGB values already encoded in `profile` (raw
+/// Adobe exports may convert directly from Rec.2020), so each write embeds the
+/// matching profile bytes through
 /// [`image::ImageEncoder::set_icc_profile`] (PNG iCCP, TIFF tag 34675). That
 /// is why the encoders are built explicitly rather than through
 /// `ImageBuffer::save_with_format`, which has no ICC surface; the u16 buffer
@@ -1178,6 +1198,96 @@ mod tests {
             out.get_pixel(0, 0)[0]
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_direct_adobe_export_encoders_tag_jpeg_png_and_tiff() {
+        use image::{ImageBuffer, Rgb};
+        let dir = std::env::temp_dir().join(format!(
+            "c41_raw_adobe_export_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = c41_core::rawimage::RawImage {
+            width: 8,
+            height: 6,
+            cfa: [[0, 1], [1, 2]],
+            xtrans: None,
+            wb: [1.0, 1.0, 1.0, 1.0],
+            orientation: (false, false, false),
+            cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            clean_make: String::new(),
+            clean_model: String::new(),
+            mosaic: (0..48).map(|i| (i % 8 + i / 8) as f32 / 14.0).collect(),
+        };
+        let params = crate::preview::PreviewParams::default();
+        let profile = c41_core::icc::OutputProfile::AdobeRgb1998.profile_bytes();
+        let (w, h, rgb8) = crate::export::render_export_rgb8_output_gear(
+            &img,
+            c41_core::rawimage::DemosaicMethod::Rcd,
+            c41_core::geometry::Geometry::default(),
+            &params,
+            None,
+            0,
+            c41_core::icc::OutputProfile::AdobeRgb1998,
+        )
+        .unwrap();
+        let expected8 = rgb8.clone();
+        let jpeg = dir.join("raw.jpg");
+        let buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb8).unwrap();
+        write_jpeg_rgb8(&buf, 90, jpeg.to_str().unwrap(), &profile).unwrap();
+
+        let (w, h, rgb16) = crate::export::render_export_rgb16_output_gear(
+            &img,
+            c41_core::rawimage::DemosaicMethod::Rcd,
+            c41_core::geometry::Geometry::default(),
+            &params,
+            None,
+            0,
+            c41_core::icc::OutputProfile::AdobeRgb1998,
+        )
+        .unwrap();
+        let expected16 = rgb16.clone();
+        let buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, rgb16).unwrap();
+        for (name, format) in [
+            ("raw.png", image::ImageFormat::Png),
+            ("raw.tiff", image::ImageFormat::Tiff),
+        ] {
+            let out = dir.join(name);
+            save_rgb16_buf(&buf, out.to_str().unwrap(), format, &profile).unwrap();
+        }
+
+        for name in ["raw.jpg", "raw.png", "raw.tiff"] {
+            let out = dir.join(name);
+            let embedded = c41_core::icc::extract_embedded_file(&out).unwrap();
+            assert_eq!(
+                embedded,
+                c41_core::icc::Embedded::Present(profile.clone()),
+                "{name} must describe the direct Adobe RGB pixels"
+            );
+            let decoded = image::ImageReader::open(&out).unwrap().decode().unwrap();
+            if name == "raw.jpg" {
+                let actual = decoded.to_rgb8().into_raw();
+                assert_eq!(actual.len(), expected8.len());
+                let close = actual
+                    .iter()
+                    .zip(&expected8)
+                    .filter(|(a, b)| a.abs_diff(**b) < 16)
+                    .count();
+                assert!(
+                    close * 10 >= expected8.len() * 8,
+                    "JPEG pixels diverged from the rendered Adobe data: {close}/{} close",
+                    expected8.len()
+                );
+            } else {
+                assert_eq!(decoded.to_rgb16().into_raw(), expected16, "{name} pixels changed");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

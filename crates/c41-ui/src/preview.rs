@@ -3130,6 +3130,47 @@ pub fn render_linear_to_srgb16_gear(
         .collect()
 }
 
+/// Run the raw Rec.2020 pipeline and encode to an explicitly selected output
+/// profile. sRGB delegates to the established display seam byte-for-byte;
+/// Adobe RGB transforms the linear Rec.2020 result directly, avoiding an
+/// intermediate sRGB gamut clip. The result is tightly packed RGB `u16`; a
+/// missing direct transform returns `None` so callers can use the resolved
+/// sRGB fallback without mis-tagging its pixels.
+pub fn render_linear_to_output16_gear(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+    grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Option<Vec<u16>> {
+    if profile.is_srgb() {
+        return Some(render_linear_to_srgb16_gear(
+            linear, width, height, params, lens_gear, grain_seed,
+        ));
+    }
+    let n = width.saturating_mul(height);
+    if linear.len() < n.saturating_mul(4) {
+        return Some(vec![0u16; n.saturating_mul(3)]);
+    }
+    let transform = profile.transform_from_linear_rec2020()?;
+    let processed = params
+        .to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
+        .process(&linear[..n * 4], width, height);
+    let mut out = vec![0u16; n * 3];
+    for i in 0..n {
+        let input = [processed[i * 4], processed[i * 4 + 1], processed[i * 4 + 2]];
+        let mut encoded = [0.0f32; 3];
+        transform.eval_into(&input, &mut encoded);
+        for c in 0..3 {
+            let value = if encoded[c].is_finite() { encoded[c].clamp(0.0, 1.0) } else { 0.0 };
+            out[i * 3 + c] = (value * 65535.0 + 0.5) as u16;
+        }
+    }
+    Some(out)
+}
+
 /// Shared render core: run the preview pipeline, map the Rec.2020 working space
 /// to sRGB, and apply the sRGB OETF, yielding tightly-packed **RGB** sRGB floats
 /// (`width*height*3`, pre-quantisation — values may fall outside `[0,1]` for
