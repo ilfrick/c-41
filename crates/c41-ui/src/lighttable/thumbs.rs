@@ -187,6 +187,12 @@ fn decode_uncapped(path: &str, max_dim: u32) -> Option<ThumbImage> {
         let _ = loader.write(&data);
         let _ = loader.close();
         let raw = loader.pixbuf()?;
+        let embedded = c41_core::icc::extract_embedded(&mut std::io::Cursor::new(&data))
+            .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat);
+        let transform = match c41_core::icc::input_profile(&embedded) {
+            c41_core::icc::InputProfile::Transform(transform) => Some(transform),
+            _ => None,
+        };
         let Some((fw, fh)) = fit_inside_box(raw.width(), raw.height(), max as i32) else {
             return None; // undecodable header reports 0×0
         };
@@ -201,7 +207,7 @@ fn decode_uncapped(path: &str, max_dim: u32) -> Option<ThumbImage> {
         Some(ThumbImage {
             width: pb.width(),
             height: pb.height(),
-            rgb: pixbuf_to_rgb8(&pb),
+            rgb: pixbuf_to_rgb8(&pb, transform.as_ref()),
         })
     }
 }
@@ -227,14 +233,22 @@ fn fit_inside_box(src_w: i32, src_h: i32, max: i32) -> Option<(i32, i32)> {
 /// (`rgb·a/255`), matching what the old `Texture::for_pixbuf` path showed over
 /// the dark cells — a transparent-background PNG keeps its background black
 /// instead of exposing whatever under-colour its stored RGB carries.
-fn pixbuf_to_rgb8(pb: &gtk4::gdk_pixbuf::Pixbuf) -> Vec<u8> {
+fn pixbuf_to_rgb8(
+    pb: &gtk4::gdk_pixbuf::Pixbuf,
+    transform: Option<&c41_core::icc::Transform>,
+) -> Vec<u8> {
     let (w, h) = (pb.width().max(0) as usize, pb.height().max(0) as usize);
     let nc = pb.n_channels() as usize;
     let rs = pb.rowstride() as usize;
     // `read_pixel_bytes` hands back an immutable snapshot; `Bytes` derefs to
     // `[u8]`, rowstride padding included.
     let src_bytes = pb.read_pixel_bytes();
-    let src: &[u8] = &src_bytes;
+    let mut src = src_bytes.to_vec();
+    // ICC transforms operate on straight RGB, including hidden RGB under
+    // transparent pixels; alpha is preserved and composited only afterward.
+    if let Some(transform) = transform {
+        c41_core::icc::apply_rgb8(transform, &mut src, w, rs, nc);
+    }
     let mut out = vec![0u8; w * h * 3];
     if nc < 3 {
         return out; // exotic monochrome pixbuf: stays black rather than panicking
@@ -759,6 +773,72 @@ mod tests {
         assert_eq!(mid_row(4), [255, 0, 0], "opaque red survives exactly");
         assert_eq!(mid_row(img.width as usize - 4), [0, 0, 0], "transparent → black");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn non_srgb_embedded_profile_transforms_thumbnail_to_srgb() {
+        use image::ImageEncoder;
+        let path = std::env::temp_dir().join(format!("c41_{}_icc.png", std::process::id()));
+        let pixels = image::RgbImage::from_pixel(1, 1, image::Rgb([128, 96, 64]));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = image::codecs::png::PngEncoder::new(file);
+        encoder
+            .set_icc_profile(c41_core::icc::adobe_rgb1998_profile())
+            .unwrap();
+        encoder
+            .write_image(pixels.as_raw(), 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let actual = decode_uncapped(path.to_str().unwrap(), 128).unwrap();
+        let embedded = c41_core::icc::Embedded::Present(c41_core::icc::adobe_rgb1998_profile());
+        let c41_core::icc::InputProfile::Transform(transform) =
+            c41_core::icc::input_profile(&embedded)
+        else {
+            panic!("Adobe RGB profile must select conversion to sRGB");
+        };
+        let mut expected = vec![128, 96, 64];
+        c41_core::icc::apply_rgb8(&transform, &mut expected, 1, 3, 3);
+        assert_eq!(
+            actual.rgb, expected,
+            "tagged RGB is converted before caching"
+        );
+        assert_ne!(actual.rgb, [128, 96, 64]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn untagged_image_remains_byte_exact_and_alpha_is_applied_after_profile_transform() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("c41_{}_untagged.png", std::process::id()));
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([128, 96, 64, 128]))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        let plain = decode_uncapped(path.to_str().unwrap(), 128).unwrap();
+        assert_eq!(
+            plain.rgb,
+            [64, 48, 32],
+            "untagged retains sRGB assumption and black composite"
+        );
+
+        let embedded = c41_core::icc::Embedded::Present(c41_core::icc::adobe_rgb1998_profile());
+        let c41_core::icc::InputProfile::Transform(transform) =
+            c41_core::icc::input_profile(&embedded)
+        else {
+            panic!("Adobe RGB profile must select conversion");
+        };
+        let pb = gtk4::gdk_pixbuf::Pixbuf::new(gtk4::gdk_pixbuf::Colorspace::Rgb, true, 8, 1, 1)
+            .unwrap();
+        pb.fill(0x80604080);
+        let out = pixbuf_to_rgb8(&pb, Some(&transform));
+        let mut expected = vec![128, 96, 64];
+        c41_core::icc::apply_rgb8(&transform, &mut expected, 1, 3, 3);
+        for c in &mut expected {
+            *c = ((*c as u16 * 128) / 255) as u8;
+        }
+        assert_eq!(
+            out, expected,
+            "transform straight RGB, then composite with original alpha"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

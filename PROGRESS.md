@@ -8881,3 +8881,36 @@ tagging it is not this increment's and is recorded in the export-loop comment.
 **Verified.** Independent senior review approved. Initial host `cargo test` attempt failed because this host lacks GLib/GObject/GIO development packages; this is expected under the repo's Docker-only native-dependency policy. `scripts/ci-local.sh` then passed all four Docker CI steps, including release tests (534 UI tests), clippy, workspace check and binary link.
 
 **Notes.** GdkPixbuf fallback still reads the full contents for formats outside the Rust decoder set; this increment removes the repeated full decode/read for the common JPEG/PNG/TIFF path, not for every possible installed loader.
+
+---
+
+## 2026-11-07 16:00 UTC — G2e: color-manage lighttable thumbnails
+
+**What.** The shared non-RAW thumbnail decoder now extracts an embedded ICC
+profile from the source bytes it already read and applies the existing Rust ICC
+transform to the bounded RGB pixels before caching. Tagged JPEG/PNG/TIFF
+thumbnails therefore render in sRGB like the darkroom preview and export paths;
+missing, unsupported, or unusable profiles keep the current sRGB assumption.
+Alpha remains untouched by the transform and is composited over black afterward.
+RAW thumbnails are unchanged. The parity audit records the bounded-decode
+trade-off: GdkPixbuf scales during decode, so the color transform follows that
+scaling to preserve memory and latency bounds, with possible small nonlinear
+resampling differences.
+
+**Verified.** `scripts/ci-local.sh` passed all four Docker CI steps, including
+release workspace tests (536 `c41-ui` tests), clippy, check, and binary link.
+The image built from commit `449bb16` was also run as an isolated KasmVNC
+smoke-test container with a fresh temporary config: health became `healthy`
+and HTTP returned 200; the container and temporary files were removed. The
+existing `c-41` deployment remained running and healthy and was not modified.
+`git diff --check` passed. An independent senior review approved after two
+review findings were fixed.
+
+**Review/test corrections.** Review caught a 1×1 expected buffer compared to an
+8×8 fixture; the fixture was reduced to 1×1. The first Docker CI attempt then
+found the GTK `Pixbuf::new` test call had one extra argument; that was corrected
+and the complete Docker CI loop passed on rerun. A host-only focused Cargo test
+was unavailable because this host lacks GLib/GObject development packages.
+`docker pull ghcr.io/ilfrick/c-41:latest` was denied (package access); an
+isolated local image was instead built from the pinned source commit for the
+smoke test. No production rollout was performed.

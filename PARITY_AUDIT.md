@@ -353,10 +353,16 @@ the input side a real row too: the darkroom's `Input color profile` row (no
 longer inert) shows the resolved input state — raw camera matrix, an embedded
 profile, or the assumed space — and, for an untagged file, edits the per-image
 assumption in place (persisting it and re-decoding), so the first-open prompt is
-no longer the only surface. Still outstanding: soft-proofing is absent, the
-render seam itself is still sRGB (so a wide-gamut *render* is a later increment),
-and the `darkroom-cli` fallback (heic/heif/avif) still emits the C tool's own
-untagged output.
+no longer the only surface. The non-RAW lighttable thumbnail path now also
+converts supported embedded ICC profiles to sRGB before caching, so catalog
+thumbnails agree with the darkroom's input-color treatment (raw thumbs already
+come through the Rust raw-preview pipeline). Because GdkPixbuf scales while
+decoding, ICC conversion is applied to the bounded thumbnail rather than the
+full-resolution source; this keeps the existing decode-memory/performance bound
+and may introduce small resampling differences for nonlinear profiles. Still
+outstanding: soft-proofing is absent, the render seam itself is still sRGB (so a
+wide-gamut *render* is a later increment), and the `darkroom-cli` fallback
+(heic/heif/avif) still emits the C tool's own untagged output.
 
 Two corrections to the plan this audit previously implied, both found by checking
 rather than assuming:
