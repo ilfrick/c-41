@@ -6,7 +6,7 @@ currently lacks, while keeping (and improving) Darktable's existing strengths.
 
 ---
 
-## Current State (Darktable v5.x baseline)
+## Upstream Current State (Darktable v5.x baseline — not the C-41 GTK4 application)
 
 Darktable already covers the core RAW-editing workflow at a level that rivals or
 exceeds Lightroom in several areas:
@@ -46,7 +46,7 @@ Prerequisite work; no user-visible features.
 
 - [x] **0.1** Fork darktable-org/darktable → ilfrick/c-41 on GitHub
 - [x] **0.2** Mirror to self-hosted Gitea (www.housefz.com/git/ilfrick/c-41)
-- [x] **0.3** Docker multi-stage build with KasmVNC (browser GUI) + GPU passthrough
+- [x] **0.3** Docker multi-stage build with KasmVNC (browser GUI) + optional GPU device passthrough (the launched C-41 GTK4 app remains CPU-only)
 - [ ] **0.4** Rename project string "darktable" → "Darkroom" in UI, about dialog,
        config paths (`~/.config/darkroom`, `~/.cache/darkroom`)
 - [ ] **0.5** CI pipeline: GitHub Actions build matrix (Linux/macOS/Windows) +
@@ -252,7 +252,7 @@ has multi-image grid layouts with fine typography.
 ```
 docker/
 ├── Dockerfile               # Multi-stage: builder (Ubuntu 24.04) + runtime (KasmVNC)
-├── docker-compose.yml       # Profiles: default (CPU), gpu (NVIDIA), opencl (AMD/Intel)
+├── docker-compose.yml       # Profiles: default (CPU), nvidia, amd, intel (device passthrough; c41-rs remains CPU-only)
 └── kasmvnc-autostart.sh     # Launches Darkroom inside the VNC desktop
 ```
 
@@ -260,9 +260,15 @@ docker/
 
 | GPU vendor | How to enable |
 |---|---|
-| NVIDIA | `docker compose --profile gpu up` (requires nvidia-container-toolkit) |
-| AMD | `docker compose --profile opencl up` (requires ROCm driver on host) |
-| Intel Arc / iGPU | `docker compose --profile opencl up` (requires intel-opencl-icd on host) |
+| NVIDIA | `docker compose -f docker/docker-compose.yml --profile nvidia up darkroom-nvidia` (requires nvidia-container-toolkit) |
+| AMD | `docker compose -f docker/docker-compose.yml --profile amd up darkroom-amd` (requires ROCm driver on host) |
+| Intel Arc / iGPU | `docker compose -f docker/docker-compose.yml --profile intel up darkroom-intel` (requires intel-opencl-icd on host) |
+
+These profiles pass GPU devices into the opt-in full-C image. The launched
+`c41-rs` GTK4 application is currently CPU-only; the OpenCL kernels in the C
+code are not used by that application. GPU acceleration is therefore not yet
+available in the C-41 product, despite the legacy C build being included in
+that image.
 
 ### Quick start
 
@@ -270,7 +276,7 @@ docker/
 # Build
 docker build -t darkroom -f docker/Dockerfile .
 
-# Run with NVIDIA GPU
+# Run with NVIDIA device passthrough (does not accelerate the C-41 GTK4 app yet)
 docker run --gpus all \
   -e PUID=$(id -u) -e PGID=$(id -g) \
   -p 3000:3000 \
@@ -312,7 +318,7 @@ docker run --gpus all \
 | PostgreSQL 16 (optional) | Cloud catalog backend | 6 |
 | Flutter 3.x | Mobile app | 7 |
 | KasmVNC | Browser-accessible desktop in Docker | Docker |
-| NVIDIA Container Toolkit | GPU passthrough | Docker |
+| NVIDIA Container Toolkit | Optional device passthrough (no C-41 GPU compute yet) | Docker |
 
 ---
 
@@ -328,7 +334,7 @@ docker run --gpus all \
 | Virtual Copies | ✅ | ✅ Phase 2 |
 | Cloud sync | ✅ (Adobe) | ✅ self-hosted Phase 6 |
 | Mobile app | ✅ | ✅ Phase 7 |
-| GPU acceleration | Limited | ✅ OpenCL (NVIDIA/AMD/Intel) |
+| GPU acceleration | Limited | Future target — not currently available in C-41; OpenCL (NVIDIA/AMD/Intel) |
 | Docker container | ❌ | ✅ Phase 0 |
 | Open source | ❌ | ✅ |
 | Cost | $9.99/month | Free |

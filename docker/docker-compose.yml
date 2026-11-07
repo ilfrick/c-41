@@ -2,15 +2,16 @@
 # Darkroom – docker-compose
 #
 # Default (recommended) — the cargo-only Rust image (no CMake, no GPU compute):
-#   docker compose build darkroom
-#   docker compose up darkroom
+#   docker compose -f docker/docker-compose.yml build darkroom
+#   docker compose -f docker/docker-compose.yml up darkroom
 #
-# GPU-accelerated profiles use the FULL C+Rust image (docker/Dockerfile.full-c):
-# OpenCL/CUDA acceleration + heic/heif/avif export live in the C darktable core,
-# which the cargo-only image doesn't ship. These build via CMake.
-#   docker compose --profile nvidia up darkroom-nvidia   # NVIDIA
-#   docker compose --profile amd    up darkroom-amd      # AMD (ROCm/OpenCL)
-#   docker compose --profile intel  up darkroom-intel    # Intel (NEO/OpenCL)
+# Device-passthrough profiles use the FULL C+Rust image (docker/Dockerfile.full-c).
+# The launched c41-rs GTK4 application is currently CPU-only; the C darktable
+# OpenCL kernels are not called by it. These profiles do not enable GPU compute
+# in the C-41 product.
+#   docker compose -f docker/docker-compose.yml --profile nvidia up darkroom-nvidia
+#   docker compose -f docker/docker-compose.yml --profile amd up darkroom-amd
+#   docker compose -f docker/docker-compose.yml --profile intel up darkroom-intel
 #
 # Environment variables (set in .env or inline):
 #   PUID        – host user ID for file ownership     (default: 1000)
@@ -42,9 +43,9 @@ x-common: &common
     - "3001:3001"   # KasmVNC HTTPS → open https://localhost:3001
   restart: unless-stopped
 
-# The full C+Rust build (CMake). Only the GPU profiles need it — GPU compute and
-# heic/heif/avif export are C-darktable-core features absent from the cargo-only
-# default image.
+# The full C+Rust build (CMake) is used by the device-passthrough profiles.
+# It includes C darktable/OpenCL binaries, but the container entrypoint launches
+# c41-rs, which currently performs image processing on CPU only.
 x-full-build: &full-build
   build:
     context: ..
@@ -68,7 +69,7 @@ services:
     container_name: darkroom
     image: darkroom:latest
 
-  # ── NVIDIA GPU (full C image) ─────────────────────────────────────────────
+  # ── NVIDIA device passthrough (full C image; c41-rs remains CPU-only) ───────
   # Prerequisites on host:
   #   1. NVIDIA driver installed
   #   2. nvidia-container-toolkit installed and configured
@@ -97,7 +98,7 @@ services:
               count: all
               capabilities: [gpu, compute, utility, video]
 
-  # ── AMD GPU (full C image, ROCm / OpenCL) ─────────────────────────────────
+  # ── AMD device passthrough (full C image; c41-rs remains CPU-only) ─────────
   # Prerequisites on host:
   #   1. ROCm installed: https://rocm.docs.amd.com/
   #   2. User in 'video' and 'render' groups: sudo usermod -aG video,render $USER
@@ -114,7 +115,7 @@ services:
       - video
       - render
 
-  # ── Intel GPU (full C image, OpenCL via Intel NEO) ────────────────────────
+  # ── Intel device passthrough (full C image; c41-rs remains CPU-only) ───────
   # Prerequisites on host:
   #   1. Intel OpenCL runtime: sudo apt install intel-opencl-icd
   #   2. User in 'video' and 'render' groups: sudo usermod -aG video,render $USER

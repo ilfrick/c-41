@@ -8853,3 +8853,13 @@ tagging it is not this increment's and is recorded in the export-loop comment.
 **Senior review** (`78e7a0a28e` → `2a61d81a45`): APPROVE WITH NOTES. The review noted a stale-decode UI write (applying state before the post-await generation check); the follow-up commit defers all UI/cache writes to after the generation check and caches the assumption only for the winning decode. Other notes (semantics of `InputProfile::Srgb` mapping, borrow/refcell safety, guard correctness) were already correct.
 
 **Notes.** The row does not introduce a history entry on assumption changes (re-decode-only), matching the demosaic selector. For no-db/uncatalogued images the session-cached assumption prevents re-prompting on the row's own re-decode while preserving "sRGB this session only" on prompt dismissal. PARITY_AUDIT's G2 progress paragraph and the G1 snapshot note were updated to reflect the row becoming live (40/52 active, 12 inert).
+
+---
+
+## 2026-11-07 15:05 UTC — docs: correct GPU capability and Compose instructions
+
+**What.** Corrected stale documentation that implied GPU acceleration in the C-41 GTK4 product. The full-C image label now identifies the launched `c41-rs` app as CPU-only; README, roadmap and Compose comments distinguish optional device passthrough from actual GPU compute. Fixed the Compose profile names (`nvidia`, `amd`, `intel`) and made examples repository-root runnable with `-f docker/docker-compose.yml`. Updated the G5 parity-audit status.
+
+**Verified.** `scripts/ci-local.sh` passed all four Docker CI steps. `docker compose config -q` passed for default and all three device profiles; `bash -n docker/kasmvnc-autostart.sh` and `git diff --check` passed. Independent senior review approved the final corrections.
+
+**Notes.** Review caught a missing compose-file path and further GPU wording in README/roadmap; both were corrected before final approval. No deployment image was rebuilt or rolled out: this increment changes only documentation and OCI metadata.

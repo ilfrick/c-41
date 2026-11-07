@@ -442,17 +442,14 @@ suggested. `docker/docker-compose.yml:82,109,126` defines `nvidia`, `amd` and
 and that image builds *both* the C app and `c41-rs` and launches `c41-rs`
 (`kasmvnc-autostart.sh:48`). Choosing full-c for GPU is a recorded decision
 ("the GPU profiles (OpenCL is a C-core feature) build full-c",
-`RUST_MIGRATION_PLAN.md:2044-2045`). What is left is one genuine overclaim: the
-`full-c` image **LABEL** advertises "Lightroom-competitive photo editor with GPU
-acceleration" (`docker/Dockerfile.full-c:103`) for a front-end that is CPU-only,
-because the OpenCL kernels live in the C app that image also installs but never
-launches.
+`RUST_MIGRATION_PLAN.md:2044-2045`). The `full-c` image label was a genuine overclaim: it described GPU
+acceleration for an image whose launched `c41-rs` front-end is CPU-only. This
+was corrected on 2026-11-07; the image description, README, roadmap and Compose
+comments now clearly distinguish device passthrough from available GPU compute.
 
-Also a real, separate doc bug found while checking this: `ROADMAP.md:255` and
-`:263-265` tell the reader the tree has a `gpu` and an `opencl` compose profile
-and to run `docker compose --profile gpu up` / `--profile opencl up` — but
-neither profile name exists. They are `nvidia` / `amd` / `intel`, as above. So
-the GPU quick-start in the roadmap cannot work as written.
+The roadmap's obsolete `gpu`/`opencl` Compose profile names and repository-root
+command paths were corrected on 2026-11-07; all three profile configurations
+pass `docker compose config`.
 
 ### G6 — recorded earlier, still unclosed
 

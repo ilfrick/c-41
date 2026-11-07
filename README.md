@@ -15,7 +15,7 @@ See [CHANGES.md](CHANGES.md) for the full changelog.
 | Smart Previews (offline editing) | ✅ | ❌ |
 | Virtual Copies | ✅ | ❌ |
 | Print Layout Templates | ✅ | ❌ |
-| GPU-accelerated Docker image | ✅ | ❌ |
+| GPU-accelerated C-41 application | ❌ (device passthrough only; app is CPU-only) | ✅ |
 
 ---
 
@@ -36,7 +36,7 @@ docker run -d \
 open http://localhost:3000
 ```
 
-For GPU acceleration and docker-compose usage see [docker/docker-compose.yml](docker/docker-compose.yml) and the [Docker section](#docker) below.
+Docker Compose includes optional NVIDIA/AMD/Intel device-passthrough profiles for the full C+Rust image, but the launched C-41 GTK4 application is currently CPU-only. See [docker/docker-compose.yml](docker/docker-compose.yml) and the [Docker section](#docker) below.
 
 ---
 
@@ -66,17 +66,17 @@ Build arguments:
 # CPU only
 docker compose -f docker/docker-compose.yml up darkroom
 
-# NVIDIA GPU (requires nvidia-container-toolkit)
+# NVIDIA device passthrough (no C-41 GPU compute yet; requires nvidia-container-toolkit)
 docker compose -f docker/docker-compose.yml --profile nvidia up darkroom-nvidia
 
-# AMD GPU (requires ROCm)
+# AMD device passthrough (no C-41 GPU compute yet; requires ROCm)
 docker compose -f docker/docker-compose.yml --profile amd up darkroom-amd
 
-# Intel GPU (requires intel-opencl-icd)
+# Intel device passthrough (no C-41 GPU compute yet; requires intel-opencl-icd)
 docker compose -f docker/docker-compose.yml --profile intel up darkroom-intel
 ```
 
-The browser UI is available at `http://localhost:3000`.
+The browser UI is available at `http://localhost:3000`. The launched GTK4 application currently processes images on CPU; the GPU profiles only pass devices into the full-C image and do not enable GPU acceleration in C-41.
 
 Volumes:
 
