@@ -188,6 +188,12 @@ claim with no way to re-derive it does not go in.
 (see item 2.1 for the increments' scope notes); the remaining 13 are untouched.
 Numbers below are recomputed as of that commit.
 
+**Further closed 2026-10-11 (G2d)** — `Input color profile` is now a live
+darkroom row (see the G2 section), so the inert count falls to 12 and the header
+reads "40 of 52 active". The enumeration and the per-kernel table below are the
+2026-10-01 snapshot and are otherwise unchanged: that row always had a ported
+kernel, and now it has a product surface.
+
 `catalog.rs` publishes 52 module rows across the five darktable groups
 (Base 11, Tone 11, Color 11, Correct 7, Effect 12). `LIVE_MODULE_LABELS` has
 37 entries (`darkroom/mod.rs:2605`); `ELSEWHERE_MODULE_LABELS` has 2 (`:2587` —
@@ -332,7 +338,7 @@ claims above are still true**: a tagged JPEG is still shown and written as if it
 were sRGB. What changed is that the "can we even see the profile" half of the
 gap is closed and verified against lcms.
 
-**Progress (G2a2 → G2c).** The user-visible claims above are now partly out of
+**Progress (G2a2 → G2d).** The user-visible claims above are now partly out of
 date. G2a2 wired input profiling into the darkroom preview and both export
 funnels: an embedded profile is lifted (`embed.rs`), classified (`InputProfile`)
 and applied device→sRGB through the engine, and an *untagged* file can be given
@@ -342,12 +348,15 @@ export reproduces without prompting. G2b made `srgb_profile()` a conformant
 iCCP, TIFF 34675). G2c makes the destination a choice: an "Output color profile"
 row (sRGB default, byte-exact; or Adobe RGB (1998)) whose selection is a
 remembered ui-pref; each Rust export converts its rendered sRGB pixels into the
-chosen space through the engine and tags the file with that profile. Still
-outstanding: the G1 `Input color profile` / `Output color profile` rows are
-wired but only partly surfaced (the input side is a per-image prompt, not a
-preferences row), soft-proofing is absent, the render seam itself is still sRGB
-(so a wide-gamut *render* is a later increment), and the `darkroom-cli` fallback
-(heic/heif/avif) still emits the C tool's own untagged output.
+chosen space through the engine and tags the file with that profile. G2d makes
+the input side a real row too: the darkroom's `Input color profile` row (no
+longer inert) shows the resolved input state — raw camera matrix, an embedded
+profile, or the assumed space — and, for an untagged file, edits the per-image
+assumption in place (persisting it and re-decoding), so the first-open prompt is
+no longer the only surface. Still outstanding: soft-proofing is absent, the
+render seam itself is still sRGB (so a wide-gamut *render* is a later increment),
+and the `darkroom-cli` fallback (heic/heif/avif) still emits the C tool's own
+untagged output.
 
 Two corrections to the plan this audit previously implied, both found by checking
 rather than assuming:

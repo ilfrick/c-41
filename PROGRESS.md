@@ -8840,3 +8840,16 @@ tagging it is not this increment's and is recorded in the export-loop comment.
 
 ---
 
+
+---
+## 2026-10-11 13:05 UTC — G2d: surface the input color profile as a live darkroom row
+
+**Commits** `78e7a0a28e` + follow-up `2a61d81a45` (GitHub + Gitea)
+
+**What.** Makes the G1 "Input color profile" catalogue row a live `adw::ActionRow` in the Color group. The suffix drop-down shows the resolved input state — "Camera matrix (raw)", "Embedded profile", "Embedded profile (unreadable)" or "Not inspected" — and, for an untagged non-raw file, edits the per-image sRGB/Adobe RGB (1998) assumption in place. Changing the assumption persists it (`save_input_assumption`) and re-decodes via the existing `spawn_decode` path; the row is tracked by a weak ref (`input_row`) and refreshed on decode resolution (mirroring the demosaic selector). Classification is computed in `resolve_preview_transform_state`, which returns `(transform, state)` so UI/state writes and the cached `session_assumption` are applied only after the decode's generation guard passes (avoiding stale-decode races with the modal prompt). `InputAssumption` gains `ALL` and `label()` so the combo index == stable code is pinned; the reset invariant test allows a parameterless live module.
+
+**Verified.** `cargo test --release --locked -p c41-ui --lib` (533 passed), `cargo test --release --locked -p c41-ui darkroom::` (31 passed, including `input_row_view_maps_states_to_the_right_selector`, `live_module_labels_match_the_dispatch_arms`, `reset_module_covers_every_live_label`), `cargo test --release --locked -p c41-core icc` (96 passed). Clippy on the workspace added zero new warnings vs baseline. `scripts/ci-local.sh` passed all four required Docker steps on the final tree; an independent senior review approved the implementation and audit updates with only a non-blocking GTK signal/integration-test coverage note. The GitHub `rust.yml` workflow for `2a61d81a45` completed successfully.
+
+**Senior review** (`78e7a0a28e` → `2a61d81a45`): APPROVE WITH NOTES. The review noted a stale-decode UI write (applying state before the post-await generation check); the follow-up commit defers all UI/cache writes to after the generation check and caches the assumption only for the winning decode. Other notes (semantics of `InputProfile::Srgb` mapping, borrow/refcell safety, guard correctness) were already correct.
+
+**Notes.** The row does not introduce a history entry on assumption changes (re-decode-only), matching the demosaic selector. For no-db/uncatalogued images the session-cached assumption prevents re-prompting on the row's own re-decode while preserving "sRGB this session only" on prompt dismissal. PARITY_AUDIT's G2 progress paragraph and the G1 snapshot note were updated to reflect the row becoming live (40/52 active, 12 inert).
