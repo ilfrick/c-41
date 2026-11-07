@@ -8899,10 +8899,11 @@ resampling differences.
 
 **Verified.** `scripts/ci-local.sh` passed all four Docker CI steps, including
 release workspace tests (536 `c41-ui` tests), clippy, check, and binary link.
-The image built from commit `449bb16` was also run as an isolated KasmVNC
-smoke-test container with a fresh temporary config: health became `healthy`
-and HTTP returned 200; the container and temporary files were removed. The
-existing `c-41` deployment remained running and healthy and was not modified.
+The image built from the previous commit and then again from the final commit
+`bfccd1ccbb` was run as an isolated KasmVNC smoke-test container with fresh
+temporary config: health became `healthy` and HTTP returned 200; both test
+containers and temporary files were removed. The existing `c-41` deployment
+remained running and healthy and was not modified.
 `git diff --check` passed. An independent senior review approved after two
 review findings were fixed.
 
@@ -8913,4 +8914,8 @@ and the complete Docker CI loop passed on rerun. A host-only focused Cargo test
 was unavailable because this host lacks GLib/GObject development packages.
 `docker pull ghcr.io/ilfrick/c-41:latest` was denied (package access); an
 isolated local image was instead built from the pinned source commit for the
-smoke test. No production rollout was performed.
+smoke test. No production rollout was performed. The first pre-push gate also
+hit a transient crates.io timeout downloading `ring`; a full `scripts/ci-local.sh`
+retry passed, after which the push hook reran all four checks successfully. Both
+GitHub and Gitea refs now point to `bfccd1ccbb`; GitHub's test/clippy and Docker
+image checks are green.
