@@ -466,14 +466,15 @@ These were already on the record; they are listed so the section is not read as
   (`docker/Dockerfile:5` records that as deliberate — the only consumer was
   `darktable-cli`, removed in m4-72). So the extensions are listed in
   `RAW_EXTENSIONS` (`dialogs/mod.rs:527-531`) and pass the import filter
-  (`:604`), and `probe_dims` then returns `None`, so the catalogue's width and
-  height land as 0×0 (`:610`, `:698`, and the test comment at `:1053` notes the
-  0×0 insert is tolerated rather than invented). That is not a HEIF/AVIF-specific
-  defect: `probe_dims` (`:728-744`) is gdk-pixbuf-only, so *any* accepted format
-  without a registered loader in the shipped image registers 0×0 — the same
-  accepted limitation item 2.6 already records for aspect filtering. HEIC/AVIF
-  just have no decoder at all, so they stay that way permanently. Fix is a Rust
-  codec or removing the extensions; tracked as an open decision at
+  (`:604`), and HEIC/AVIF still have no decoder in the cargo-only product, so
+  `probe_dims` returns `None` and their catalogue dimensions land as 0×0 (`:610`,
+  `:698`, and the test comment at `:1053` records that the insert is tolerated).
+  **Dimension-probe improvement (2026-11-07):** `probe_dims` now uses
+  `image::ImageReader::into_dimensions()` as a header-only fast path for the
+  enabled JPEG/PNG/TIFF formats, avoiding the prior throwaway scaled decode and
+  redundant full-file read for those imports; GdkPixbuf remains the fallback
+  for other system-loader formats. HEIC/AVIF remain unsupported until a Rust
+  codec is added or those extensions are removed; the open decision remains at
   `RUST_MIGRATION_PLAN.md:2050` ("drop vs keep full-c"). Note the contrast:
   `docker/Dockerfile.full-c:110-112` *does* ship `libheif1`/`libavif16`, so this
   is a property of the production image, not of the codec being unportable.

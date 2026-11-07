@@ -886,21 +886,26 @@ pub(crate) fn import_single_file_sync(dir: &str, filename: &str, db_path: &str) 
 
 /// Read image dimensions without fully decoding the file.
 fn probe_dims(path: &std::path::Path) -> Option<(i32, i32)> {
-    // Use gdk_pixbuf's file-info path (header-only probe, very fast)
-    // We're on a background thread so we use the sync API directly.
-    let pb = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, 1, 1, true).ok()?;
-    // Scale ratios let us recover original size from the 1px result
-    // — but actually we just want the original dimensions from the file.
-    // gdk_pixbuf doesn't expose original dims after scale; use file info instead.
-    drop(pb);
-    // Fall back: use the pixbuf loader to get the natural size hint
+    // The image crate can read dimensions from the supported export formats'
+    // headers (JPEG/PNG/TIFF), avoiding a pixel decode during library import.
+    if let Some((width, height)) = image::ImageReader::open(path)
+        .ok()
+        .and_then(|reader| reader.with_guessed_format().ok())
+        .and_then(|reader| reader.into_dimensions().ok())
+        .and_then(|(width, height)| Some((i32::try_from(width).ok()?, i32::try_from(height).ok()?)))
+    {
+        return Some((width, height));
+    }
+
+    // Keep GdkPixbuf as a fallback for formats handled by a system loader but
+    // not by this crate. Loading a PixbufLoader from the file contents avoids
+    // the previous throwaway scaled decode followed by a second full read.
     let data = std::fs::read(path).ok()?;
     let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
-    // Write a small chunk; loader fires "size-prepared" once it has the header
-    let _ = loader.write(&data[..data.len().min(65536)]);
-    let _ = loader.close();
-    let pb = loader.pixbuf()?;
-    Some((pb.width(), pb.height()))
+    loader.write(&data).ok()?;
+    loader.close().ok()?;
+    let pixbuf = loader.pixbuf()?;
+    Some((pixbuf.width(), pixbuf.height()))
 }
 
 #[cfg(test)]
@@ -930,6 +935,31 @@ mod tests {
         )
         .unwrap();
         (dir, dbs)
+    }
+
+    #[test]
+    fn probe_dims_reads_supported_image_headers_and_rejects_invalid_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "c41_probe_dims_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let png = dir.join("known-size.png");
+        image::ImageBuffer::from_pixel(7, 5, image::Rgb([12_u8, 34, 56]))
+            .save(&png)
+            .unwrap();
+        assert_eq!(probe_dims(&png), Some((7, 5)));
+
+        let invalid = dir.join("invalid.png");
+        std::fs::write(&invalid, b"not an image").unwrap();
+        assert_eq!(probe_dims(&invalid), None);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

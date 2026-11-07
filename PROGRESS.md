@@ -8863,3 +8863,13 @@ tagging it is not this increment's and is recorded in the export-loop comment.
 **Verified.** `scripts/ci-local.sh` passed all four Docker CI steps. `docker compose config -q` passed for default and all three device profiles; `bash -n docker/kasmvnc-autostart.sh` and `git diff --check` passed. Independent senior review approved the final corrections.
 
 **Notes.** Review caught a missing compose-file path and further GPU wording in README/roadmap; both were corrected before final approval. No deployment image was rebuilt or rolled out: this increment changes only documentation and OCI metadata.
+
+---
+
+## 2026-11-07 15:17 UTC — import: probe supported image dimensions from headers
+
+**What.** `probe_dims` now first uses `image::ImageReader::into_dimensions()` for the enabled JPEG/PNG/TIFF formats, obtaining dimensions from decoder headers instead of doing a throwaway 1×1 GdkPixbuf decode followed by reading the entire file again. It retains GdkPixbuf as a fallback for formats available only through system loaders, and safely rejects dimensions that cannot fit the catalog's `i32` fields. Added coverage for a known-size PNG and invalid image input. The G6 audit now records that HEIC/AVIF remain unsupported while the common Rust-native import formats take the header fast path.
+
+**Verified.** Independent senior review approved. Initial host `cargo test` attempt failed because this host lacks GLib/GObject/GIO development packages; this is expected under the repo's Docker-only native-dependency policy. `scripts/ci-local.sh` then passed all four Docker CI steps, including release tests (534 UI tests), clippy, workspace check and binary link.
+
+**Notes.** GdkPixbuf fallback still reads the full contents for formats outside the Rust decoder set; this increment removes the repeated full decode/read for the common JPEG/PNG/TIFF path, not for every possible installed loader.
