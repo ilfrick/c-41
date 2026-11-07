@@ -8919,3 +8919,34 @@ hit a transient crates.io timeout downloading `ring`; a full `scripts/ci-local.s
 retry passed, after which the push hook reran all four checks successfully. Both
 GitHub and Gitea refs now point to `bfccd1ccbb`; GitHub's test/clippy and Docker
 image checks are green.
+
+---
+
+## 2026-11-07 17:03 UTC — G2f: preserve output ICC on the darktable-cli fallback
+
+**What.** `ExportSettings.output_profile` now controls the output of the
+`darkroom-cli` path used when the Rust decoders cannot open a source. `cli_args`
+emits darktable's supported `--icc-type SRGB|ADOBERGB` and explicit
+`--icc-intent PERCEPTUAL` before `--core`. The CLI forwards these values to its
+pixelpipe (`dt_dev_pixelpipe_set_icc`) and to the output writer, so the C
+fallback converts its own pixels to and embeds the selected destination rather
+than inheriting the CLI default `NONE` (untagged). The audit now reflects that
+basic input/output ICC handling is present; soft-proofing and a wide-gamut
+render seam remain open.
+
+**Verified.** `scripts/ci-local.sh` passed all four Docker CI steps, including
+release tests (537 `c41-ui`), clippy, workspace check, and `c41-rs` link. The
+new argv test covers both profile tokens, perceptual intent, ordering before
+`--core`, and the trailing core config. `git diff --check` passed. Independent
+senior review approved after verifying the CLI-to-pixelpipe-to-writer source
+flow in `src/cli/main.c` and `src/imageio/imageio.c`.
+
+**Review notes.** The initial review raised a possible C/Rust pixel mismatch;
+source inspection showed the fallback does not pass Rust-rendered pixels at all:
+the C pixelpipe converts its own rendered output, and the selected ICC type is
+also passed to the writer. Pixel-identical C-vs-Rust renders are not claimed.
+Explicit perceptual intent is deliberate and matches Rust's
+`INPUT_INTENT = 0`; it changes the CLI's old `LAST` sentinel to match the Rust
+export intent. Host-only Cargo tests remain unavailable because GTK/GLib
+headers are absent; Docker validation is authoritative. No deployment was
+modified.

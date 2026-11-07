@@ -210,6 +210,16 @@ pub fn cli_args(input: &str, output_dest: &str, s: &ExportSettings) -> Vec<Strin
         "--apply-custom-presets".to_string(),
         "false".to_string(),
     ];
+    // Keep the fallback darktable renderer's pixel conversion and embedded tag
+    // aligned with the selected Rust export profile. These are CLI options (not
+    // core options), and symbolic names must match darktable's ICC parser.
+    a.push("--icc-type".to_string());
+    a.push(match s.output_profile {
+        c41_core::icc::OutputProfile::Srgb => "SRGB".to_string(),
+        c41_core::icc::OutputProfile::AdobeRgb1998 => "ADOBERGB".to_string(),
+    });
+    a.push("--icc-intent".to_string());
+    a.push("PERCEPTUAL".to_string());
     if let Some(r) = &s.resize {
         a.push("--width".to_string());
         a.push(r.max_w.to_string());
@@ -587,6 +597,28 @@ mod tests {
         assert_eq!(a[a.len() - 1], "plugins/imageio/format/jpeg/quality=90");
         // `--core` forwards the rest to the core parser, so it appears at most once.
         assert_eq!(a.iter().filter(|x| *x == "--core").count(), 1);
+    }
+
+    #[test]
+    fn cli_args_selects_icc_type_and_perceptual_intent_before_core() {
+        for (profile, token) in [
+            (c41_core::icc::OutputProfile::Srgb, "SRGB"),
+            (c41_core::icc::OutputProfile::AdobeRgb1998, "ADOBERGB"),
+        ] {
+            let s = ExportSettings {
+                format: ExportFormat::Jpeg,
+                quality: 90,
+                resize: None,
+                output_profile: profile,
+            };
+            let a = cli_args("/in/a.raw", "/out", &s);
+            assert!(a.windows(2).any(|w| w == ["--icc-type", token]));
+            assert!(a.windows(2).any(|w| w == ["--icc-intent", "PERCEPTUAL"]));
+            assert_eq!(a.last().unwrap(), "plugins/imageio/format/jpeg/quality=90");
+            let core_at = a.iter().position(|arg| arg == "--core").unwrap();
+            assert!(core_at > a.iter().position(|arg| arg == "--icc-intent").unwrap());
+            assert_eq!(a.iter().filter(|arg| *arg == "--core").count(), 1);
+        }
     }
 
     #[test]

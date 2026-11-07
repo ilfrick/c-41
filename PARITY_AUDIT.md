@@ -302,33 +302,32 @@ driver — the ported kernels remove the *maths* risk, not the *plumbing* work.
 That is a materially bigger job than the closed severity-2.1 rows, which attached
 panels to modules the Rust pipeline already ran.
 
-### G2 — colour management: engine built, called by C, absent from the Rust product
+### G2 — colour management: ICC conversion is wired; proofing and render-space controls remain
 
 `c41-core::icc` is built and unit-tested — parser (m4-89), cLUT N-D interpolation
 core (m4-90), LUT tag pipelines (m4-91/92), device↔PCS (m4-93a/b), PCS→device and
 assembly (m4-127), FFI boundary (m4-129 slice 1) — from the pure-Rust no-LCMS
-decision (`RUST_MIGRATION_PLAN.md:122`). It is **not** unused: the C darktable
-calls it at 15 `darkroom_icc*` sites (11 in `src/iop/colorin.c`, 4 in
-`src/iop/colorout.c`, wired in m4-129 slice 2). But **nothing in the Rust product
-calls it** — which is the part that matters for what users run.
+decision (`RUST_MIGRATION_PLAN.md:122`). The C darktable calls it at 15
+`darkroom_icc*` sites (11 in `src/iop/colorin.c`, 4 in `src/iop/colorout.c`,
+wired in m4-129 slice 2); the Rust product also now uses it for input-profile
+conversion, tagged Rust exports, output-profile conversion, and non-RAW
+lighttable thumbnails.
 
-In `c41-rs` the working space is fixed, not chosen:
-`enum ColorSpace { Rec2020, LinearSrgb }` (`pipeline.rs:45-48`) has two variants
-and no picker. There is no preferences dialog in `c41-ui` at all, so no
-input-profile assignment, no output profile and no soft-proofing; `export.rs`
-contains no ICC reference whatsoever (638 lines, zero hits for `icc`/`profile`).
-Non-raw decode does not touch ICC either way. Export goes through the `image`
-crate — gated at `dialogs/mod.rs:408` (`RUST_IMAGE_EXTENSIONS` =
-jpg/jpeg/png/tif/tiff), decoded at `:472` (`image::ImageReader::open`), reached
-from the batch-export path at `:218`. The darkroom *preview* decodes non-raw
-through gdk-pixbuf instead (`darkroom/mod.rs:1059-1079`), which likewise ignores
-the embedded profile. So **a JPEG tagged with a non-sRGB profile is shown and
-written as if it were sRGB, and every export is untagged.** The two
-`Input/Output color profile` rows in G1 are inert for the same root cause.
+The Rust render seam is still fixed to sRGB; `enum ColorSpace { Rec2020,
+LinearSrgb }` (`pipeline.rs:45-48`) describes internal spaces, not a user-selectable
+output/display space. There is no soft-proofing UI. The `Input color profile`
+row and first-open assumption flow and the remembered `Output color profile`
+choice (sRGB or Adobe RGB) are live, but destination selection currently applies
+to Rust-rendered exports and to the darktable-cli fallback only for inputs the
+Rust decoders cannot handle. That fallback now explicitly asks darktable-cli to
+convert and tag its own pixelpipe output as the selected profile. Rust-native
+JPEG/PNG/TIFF exports embed the profile matching the pixels. Thus the former
+claim that tagged JPEGs are always treated as sRGB and every export is untagged
+is no longer current.
 
-This is the largest gap here whose expensive half is already paid. The engine
-exists and is tested; what is missing is the product surface around it — and
-unlike G1's rows, the wiring is not a mechanical repeat of a proven pattern.
+The remaining colour-management product gap is the missing soft-proofing path
+and the fixed sRGB render seam (true wide-gamut render is a later increment),
+not the absence of basic input/output ICC handling.
 
 **Progress (m4-245).** The *input-profiling* half now has a tested extractor:
 `c41-core/src/icc/embed.rs` lifts the embedded ICC out of JPEG, PNG and TIFF
@@ -353,16 +352,18 @@ the input side a real row too: the darkroom's `Input color profile` row (no
 longer inert) shows the resolved input state — raw camera matrix, an embedded
 profile, or the assumed space — and, for an untagged file, edits the per-image
 assumption in place (persisting it and re-decoding), so the first-open prompt is
-no longer the only surface. The non-RAW lighttable thumbnail path now also
-converts supported embedded ICC profiles to sRGB before caching, so catalog
-thumbnails agree with the darkroom's input-color treatment (raw thumbs already
-come through the Rust raw-preview pipeline). Because GdkPixbuf scales while
-decoding, ICC conversion is applied to the bounded thumbnail rather than the
-full-resolution source; this keeps the existing decode-memory/performance bound
-and may introduce small resampling differences for nonlinear profiles. Still
-outstanding: soft-proofing is absent, the render seam itself is still sRGB (so a
-wide-gamut *render* is a later increment), and the `darkroom-cli` fallback
-(heic/heif/avif) still emits the C tool's own untagged output.
+no longer the only surface. The non-RAW lighttable thumbnail path also converts
+supported embedded ICC profiles to sRGB before caching, so catalog thumbnails
+agree with the darkroom's input-color treatment (raw thumbs already come through
+the Rust raw-preview pipeline). Because GdkPixbuf scales while decoding, ICC
+conversion is applied to the bounded thumbnail rather than the full-resolution
+source; this keeps the existing decode-memory/performance bound and may introduce
+small resampling differences for nonlinear profiles. **G2f** also closes the
+untagged fallback export: `cli_args` now passes the selected sRGB/Adobe-RGB
+output-profile token and perceptual intent to `darkroom-cli`, which applies its
+own pixelpipe conversion and sends the same ICC choice to the format writer.
+Still outstanding: soft-proofing is absent and the render seam itself is sRGB
+(so a wide-gamut *render* is a later increment).
 
 Two corrections to the plan this audit previously implied, both found by checking
 rather than assuming:
