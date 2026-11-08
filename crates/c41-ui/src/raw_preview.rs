@@ -117,11 +117,22 @@ pub fn decode_raw_preview_with(
     method: c41_core::rawimage::DemosaicMethod,
     hl: Option<c41_core::iop::highlights::HlOpts>,
 ) -> Option<RawPreview> {
+    decode_raw_preview_with_opts(path, max_dim, method, hl, None)
+}
+
+/// Raw preview with decode-stage hotpixel correction.
+pub fn decode_raw_preview_with_opts(
+    path: &str,
+    max_dim: usize,
+    method: c41_core::rawimage::DemosaicMethod,
+    hl: Option<c41_core::iop::highlights::HlOpts>,
+    hotpixels: Option<c41_core::iop::hotpixels::HotpixelsOpts>,
+) -> Option<RawPreview> {
     let img = c41_core::rawimage::load(path).ok()?;
     let is_xtrans = img.xtrans.is_some();
     let clean_make = img.clean_make.clone();
     let clean_model = img.clean_model.clone();
-    let (w, h, rgba) = img.to_linear_rgba_with(method, hl);
+    let (w, h, rgba) = img.to_linear_rgba_with_opts(method, hl, hotpixels);
     if w == 0 || h == 0 {
         return None;
     }

@@ -1316,25 +1316,96 @@ impl RawImage {
         method: DemosaicMethod,
         hl: Option<crate::iop::highlights::HlOpts>,
     ) -> (usize, usize, Vec<f32>) {
+        self.to_linear_rgba_with_opts(method, hl, None)
+    }
+
+    /// Decode with optional pre-demosaic hot-pixel correction, after clipping
+    /// or highlight reconstruction and before CFA interpolation.
+    pub fn to_linear_rgba_with_opts(
+        &self,
+        method: DemosaicMethod,
+        hl: Option<crate::iop::highlights::HlOpts>,
+        hotpixels: Option<crate::iop::hotpixels::HotpixelsOpts>,
+    ) -> (usize, usize, Vec<f32>) {
         let (w, h) = (self.width, self.height);
         let mut work = self.mosaic.clone();
-        match hl {
-            Some(opts) => {
-                apply_white_balance_mosaic(&mut work, w, |row, col| match &self.xtrans {
-                    Some(xt) => {
-                        crate::raw::fcol(row as i32, col as i32, 9, xt)
-                    }
-                    None => self.cfa[row % 2][col % 2],
-                }, self.wb);
-                crate::iop::highlights::reconstruct_mosaic(
-                    &mut work, w, h, self.cfa, self.xtrans.as_ref(), self.wb, opts,
-                );
+        if hl.is_some() {
+            apply_white_balance_mosaic(&mut work, w, |row, col| match &self.xtrans {
+                Some(xt) => crate::raw::fcol(row as i32, col as i32, 9, xt),
+                None => self.cfa[row % 2][col % 2],
+            }, self.wb);
+        }
+        if let Some(opts) = hl {
+            crate::iop::highlights::reconstruct_mosaic(
+                &mut work, w, h, self.cfa, self.xtrans.as_ref(), self.wb, opts,
+            );
+        }
+        // Darktable's hotpixels stage follows highlight reconstruction. The C
+        // pipeline sees a white-balanced mosaic; when highlight reconstruction
+        // is off, detect in that domain using a temporary copy, then convert only
+        // corrected photosites back to the decoder's pre-WB domain. This keeps
+        // enabling hot-pixel correction from moving white balance ahead of the
+        // existing demosaic path for every other photosite.
+        if let Some(opts) = hotpixels.map(|o| o.sanitized()).filter(|o| o.strength > 0.0) {
+            let mosaic_color = |row: usize, col: usize| match &self.xtrans {
+                Some(xt) => crate::raw::fcol(row as i32, col as i32, 9, xt),
+                None => self.cfa[row % 2][col % 2],
+            };
+            let pre_wb = hl.is_none();
+            let mut detector_input = work.clone();
+            if pre_wb {
+                apply_white_balance_mosaic(&mut detector_input, w, mosaic_color, self.wb);
             }
-            None => {
-                // Pre-m4-119 behaviour: hard-clip photosites at sensor white.
-                for v in work.iter_mut() {
-                    *v = v.min(1.0);
+            let mut corrected = detector_input.clone();
+            let min_neighbours = if opts.permissive { 3 } else { 4 };
+            unsafe {
+                if let Some(xt) = &self.xtrans {
+                    crate::iop::hotpixels::darkroom_hotpixels_xtrans(
+                        detector_input.as_ptr(), corrected.as_mut_ptr(), w, h,
+                        xt.as_ptr().cast(), opts.threshold, opts.strength / 2.0,
+                        min_neighbours, 0,
+                    );
+                } else if self.cfa.iter().flatten().all(|&c| c == self.cfa[0][0]) {
+                    // A uniform 2×2 CFA is the safely identifiable monochrome
+                    // mosaic case. The raw front end stores one float per site,
+                    // so use the monochrome kernel with a one-plane stride.
+                    crate::iop::hotpixels::darkroom_hotpixels_monochrome(
+                        detector_input.as_ptr(), corrected.as_mut_ptr(), w, h, 1,
+                        opts.threshold, opts.strength / 2.0, min_neighbours, 0,
+                    );
+                } else {
+                    crate::iop::hotpixels::darkroom_hotpixels_bayer(
+                        detector_input.as_ptr(), corrected.as_mut_ptr(), w, h,
+                        opts.threshold, opts.strength / 2.0, min_neighbours, 0,
+                    );
                 }
+            }
+            if pre_wb {
+                let green = self.wb[1];
+                for (i, (&before, &after)) in detector_input.iter().zip(&corrected).enumerate() {
+                    // If the correction selected the same numeric value, the
+                    // original raw sample is already the exact desired output;
+                    // keep it byte-identical rather than round-tripping it.
+                    if before != after {
+                        let color = mosaic_color(i / w, i % w);
+                        let gain = if green > 0.0 && green.is_finite() && self.wb[color].is_finite() {
+                            self.wb[color] / green
+                        } else {
+                            1.0
+                        };
+                        if gain != 0.0 && gain.is_finite() {
+                            work[i] = after / gain;
+                        }
+                    }
+                }
+            } else {
+                work = corrected;
+            }
+        }
+        if hl.is_none() {
+            // Pre-m4-119 behavior clips at sensor white before demosaicing.
+            for v in work.iter_mut() {
+                *v = v.min(1.0);
             }
         }
         let mut rgba = match &self.xtrans {
@@ -1627,6 +1698,90 @@ mod tests {
                 assert_eq!(px[3], 1.0, "alpha must be opaque");
             }
         }
+    }
+
+    #[test]
+    fn hotpixels_is_off_compatibly_and_corrects_bayer_and_xtrans_before_demosaic() {
+        let (w, h) = (48usize, 48usize);
+        let cfa = [[0usize, 1], [1, 2]];
+        let mut mosaic = vec![0.2f32; w * h];
+        let hot = 24 * w + 24;
+        mosaic[hot] = 8.0;
+        let bayer = RawImage {
+            width: w, height: h, cfa, xtrans: None,
+            wb: [1.0; 4], orientation: (false, false, false),
+            cam_to_working: IDENTITY3, clean_make: String::new(), clean_model: String::new(), mosaic,
+        };
+        let legacy = bayer.to_linear_rgba_with(DemosaicMethod::Rcd, None);
+        assert_eq!(legacy, bayer.to_linear_rgba_with_opts(DemosaicMethod::Rcd, None, None));
+        let corrected = bayer.to_linear_rgba_with_opts(DemosaicMethod::Rcd, None,
+            Some(crate::iop::hotpixels::HotpixelsOpts { strength: 0.25, threshold: 0.05, permissive: false }));
+        assert_ne!(legacy.2, corrected.2, "isolated Bayer hot photosite must be corrected");
+
+        let mut xtrans = vec![0.2f32; w * h];
+        xtrans[hot] = 8.0;
+        let xt = XTRANS;
+        let fuji = RawImage {
+            width: w, height: h, cfa, xtrans: Some(xt), wb: [1.0; 4],
+            orientation: (false, false, false), cam_to_working: IDENTITY3,
+            clean_make: String::new(), clean_model: String::new(), mosaic: xtrans,
+        };
+        let legacy_xt = fuji.to_linear_rgba_with(DemosaicMethod::Rcd, None);
+        assert_eq!(legacy_xt, fuji.to_linear_rgba_with_opts(DemosaicMethod::Rcd, None, None));
+        let fixed_xt = fuji.to_linear_rgba_with_opts(DemosaicMethod::Rcd, None,
+            Some(crate::iop::hotpixels::HotpixelsOpts { strength: 0.25, threshold: 0.05, permissive: false }));
+        assert_ne!(legacy_xt.2, fixed_xt.2, "isolated X-Trans hot photosite must be corrected");
+    }
+
+    #[test]
+    fn hotpixels_corrects_monochrome_mosaic_with_one_plane_stride() {
+        let (w, h) = (24usize, 24usize);
+        let cfa = [[0usize; 2]; 2];
+        let mut mosaic = vec![0.2f32; w * h];
+        mosaic[12 * w + 12] = 8.0;
+        let img = RawImage {
+            width: w, height: h, cfa, xtrans: None, wb: [1.0; 4],
+            orientation: (false, false, false), cam_to_working: IDENTITY3,
+            clean_make: String::new(), clean_model: String::new(), mosaic,
+        };
+        let legacy = img.to_linear_rgba_with(DemosaicMethod::Rcd, None);
+        let corrected = img.to_linear_rgba_with_opts(
+            DemosaicMethod::Rcd, None,
+            Some(crate::iop::hotpixels::HotpixelsOpts {
+                strength: 1.0, threshold: 0.05, permissive: false,
+            }),
+        );
+        assert_ne!(legacy.2, corrected.2, "monochrome hot photo-sites must be corrected");
+    }
+
+    #[test]
+    fn hotpixels_uses_white_balance_for_detection_without_shifting_other_pixels() {
+        let (w, h) = (48usize, 48usize);
+        let cfa = [[0usize, 1], [1, 2]];
+        let wb = [10.0, 1.0, 1.0, 1.0];
+        let mut mosaic = vec![0.0005f32; w * h];
+        let hot = 24 * w + 24; // red CFA site; its ±2 neighbours are red too.
+        mosaic[hot] = 0.006;
+        let make = |mosaic| RawImage {
+            width: w, height: h, cfa, xtrans: None, wb,
+            orientation: (false, false, false), cam_to_working: IDENTITY3,
+            clean_make: String::new(), clean_model: String::new(), mosaic,
+        };
+        let opts = Some(crate::iop::hotpixels::HotpixelsOpts {
+            strength: 1.0, threshold: 0.05, permissive: false,
+        });
+        // Unbalanced, the site is below threshold (0.006); after red WB it is
+        // 0.06, and the detector replaces it with the maximum same-colour
+        // neighbour. The adapter restores that correction to raw scale before
+        // demosaic, preserving the established post-demosaic WB behavior.
+        let mut expected_mosaic = mosaic.clone();
+        expected_mosaic[hot] = 0.0005;
+        let actual = make(mosaic.clone()).to_linear_rgba_with_opts(DemosaicMethod::Rcd, None, opts);
+        let expected = make(expected_mosaic).to_linear_rgba_with(DemosaicMethod::Rcd, None);
+        assert_eq!(actual, expected, "WB-scaled detection should correct only the hot photosite");
+
+        let legacy = make(mosaic.clone()).to_linear_rgba_with(DemosaicMethod::Rcd, None);
+        assert_eq!(make(mosaic).to_linear_rgba_with_opts(DemosaicMethod::Rcd, None, None), legacy);
     }
 
     #[test]
@@ -2165,6 +2320,12 @@ mod tests {
         let rggb = [[0usize, 1], [1, 2]];
         let got = classify_cfa(|r, c| rggb[r % 2][c % 2]).unwrap();
         assert_eq!(got, CfaKind::Bayer(rggb));
+    }
+
+    #[test]
+    fn classify_cfa_accepts_uniform_monochrome_bayer() {
+        let got = classify_cfa(|_, _| 0).unwrap();
+        assert_eq!(got, CfaKind::Bayer([[0; 2]; 2]));
     }
 
     #[test]

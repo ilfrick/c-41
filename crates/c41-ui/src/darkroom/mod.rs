@@ -1009,7 +1009,7 @@ fn apply_geometry_to_base(ctx: &PreviewCtx) {
 
 /// Decode + downscale the image off the main thread, then display it. Reads its
 /// inputs from `ctx`: [`PreviewCtx::decode_path`], [`PreviewCtx::decode_method`],
-/// and the live params' highlight-reconstruction options
+/// and the live params' highlight-reconstruction/hot-pixel options
 /// ([`PreviewParams::hl_opts`]). Camera raws go through the Rust decoder with
 /// that method (ignored for X-Trans sensors) and — when enabled — highlight
 /// reconstruction on the white-balanced mosaic BEFORE demosaicing (darktable's
@@ -1027,7 +1027,9 @@ fn spawn_decode(ctx: &PreviewCtx) {
     // async block never holds a params/path borrow across an await.
     let path = ctx.decode_path.borrow().clone();
     let method = ctx.decode_method.get();
-    let hl = ctx.params.borrow().hl_opts();
+    let params = *ctx.params.borrow();
+    let hl = params.hl_opts();
+    let hotpixels = params.hotpixels_opts();
     glib::spawn_future_local(clone!(@strong ctx => async move {
         if crate::raw_preview::is_raw_path(&path) {
             // Decode + reconstruct + demosaic off the main thread (it's heavy);
@@ -1035,11 +1037,12 @@ fn spawn_decode(ctx: &PreviewCtx) {
             // buffer.
             let p = path.clone();
             let decoded = gio::spawn_blocking(move || {
-                crate::raw_preview::decode_raw_preview_with(
+                crate::raw_preview::decode_raw_preview_with_opts(
                     &p,
                     crate::raw_preview::PREVIEW_MAX_DIM,
                     method,
                     hl,
+                    hotpixels,
                 )
                 .map(|rp| {
                     (
@@ -2507,6 +2510,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color balance RGB" => cbrgb_module_row(ctx).upcast(),
                 "Filmic RGB" => filmic_module_row(ctx).upcast(),
                 "Highlight reconstruction" => highlights_module_row(ctx).upcast(),
+                "Hot pixels" => hotpixels_module_row(ctx).upcast(),
                 "Denoise (profiled)" => denoise_module_row(ctx).upcast(),
                 "Lens correction" => lens_module_row(ctx).upcast(),
                 "Bloom" => bloom_module_row(ctx).upcast(),
@@ -2695,7 +2699,14 @@ fn styles_module_group(
             }
             populate_modules(&panel, &ctx_cl);
         }
-        render_preview(&ctx_cl);
+        // Raw hot-pixel settings are consumed during CFA decode, not by the
+        // post-decode render pipeline. Re-decode raw images after applying a
+        // style so the displayed pixels match the newly applied params.
+        if ctx_cl.pristine.borrow().is_some() {
+            spawn_decode(&ctx_cl);
+        } else {
+            render_preview(&ctx_cl);
+        }
         if let Some(g) = group_w.upgrade() {
             // The style name is user data and a group description is always
             // Pango markup, so it must be escaped.
@@ -2798,7 +2809,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3007,6 +3018,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             filmic_saturation
         ),
         "Highlight reconstruction" => set!(hl_on, hl_opposed, hl_clip),
+        "Hot pixels" => set!(hotpixels_on, hotpixels_threshold, hotpixels_strength, hotpixels_permissive),
         "Denoise (profiled)" => set!(dn_on, dn_mode_y0u0v0, dn_strength, dn_shadows, dn_bias),
         "Lens correction" => set!(
             lens_on,
@@ -3076,8 +3088,8 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
 /// (the same full-rebuild mechanism the global Reset uses), then re-render.
 ///
 /// `re_decode` selects the render path: `false` for a pipeline module
-/// ([`render_preview`]); `true` for Highlight reconstruction, whose params feed
-/// the pre-demosaic raw decode ([`spawn_decode`]).
+/// ([`render_preview`]); `true` for Highlight reconstruction and Hot pixels,
+/// whose params feed the pre-demosaic raw decode ([`spawn_decode`]).
 ///
 /// A no-op (no rebuild, no history entry) when the module is already at its
 /// defaults, so clicking reset on an untouched module does nothing.
@@ -4199,6 +4211,69 @@ fn highlights_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     });
     expander.add_suffix(&reset);
     expander
+}
+
+/// Raw-only hot-pixel correction for Bayer, X-Trans, and uniform-CFA
+/// monochrome mosaics, before demosaicing.
+fn hotpixels_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    let row = adw::ExpanderRow::builder()
+        .title("Hot pixels")
+        .use_markup(false)
+        .show_enable_switch(true)
+        .enable_expansion(p0.hotpixels_on)
+        .build();
+    row.set_tooltip_text(Some(
+        "Correct Bayer, X-Trans, or uniform-CFA monochrome hot pixels before demosaicing",
+    ));
+    if !crate::raw_preview::is_raw_path(&ctx.decode_path.borrow()) {
+        row.set_visible(false);
+        return row;
+    }
+    let on_ctx = ctx.clone();
+    row.connect_enable_expansion_notify(move |r| {
+        on_ctx.params.borrow_mut().hotpixels_on = r.enables_expansion();
+        spawn_decode(&on_ctx);
+    });
+    for (label, lo, hi, step, value, update) in [
+        ("Threshold", 0.0, 1.0, 0.0001, p0.hotpixels_threshold, 0usize),
+        ("Strength", 0.0, 1.0, 0.0001, p0.hotpixels_strength, 1usize),
+    ] {
+        let slider = labeled_slider(label, lo, hi, step, value as f64);
+        let slider_ctx = ctx.clone();
+        let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        slider.scale.connect_value_changed(move |s| {
+            let mut params = slider_ctx.params.borrow_mut();
+            if update == 0 { params.hotpixels_threshold = s as f32; }
+            else { params.hotpixels_strength = s as f32; }
+            drop(params);
+            if let Some(id) = debounce.borrow_mut().take() { id.remove(); }
+            let c = slider_ctx.clone();
+            let d = debounce.clone();
+            *debounce.borrow_mut() = Some(glib::timeout_add_local_once(
+                std::time::Duration::from_millis(160), move || {
+                    *d.borrow_mut() = None;
+                    spawn_decode(&c);
+                }));
+        });
+        row.add_row(&slider.row);
+    }
+    let permissive = gtk4::CheckButton::with_label("Detect with 3 neighbours");
+    permissive.set_active(p0.hotpixels_permissive);
+    let permissive_ctx = ctx.clone();
+    permissive.connect_toggled(move |b| {
+        permissive_ctx.params.borrow_mut().hotpixels_permissive = b.is_active();
+        spawn_decode(&permissive_ctx);
+    });
+    let pref = adw::ActionRow::builder().title("Detection").build();
+    pref.add_suffix(&permissive);
+    row.add_row(&pref);
+    let reset = gtk4::Button::builder().icon_name("edit-clear-symbolic")
+        .tooltip_text("Reset Hot pixels to defaults").has_frame(false).build();
+    let reset_ctx = ctx.clone();
+    reset.connect_clicked(move |_| reset_module_and_rebuild(&reset_ctx, "Hot pixels", true));
+    row.add_suffix(&reset);
+    row
 }
 
 // ── Lens correction (lens.c via the lensfun database) ──────────────────────
@@ -5489,6 +5564,12 @@ mod tests {
             p.hl_opposed = false;
             p.hl_clip = M;
         }),
+        ("Hot pixels", |p| {
+            p.hotpixels_on = true;
+            p.hotpixels_threshold = M;
+            p.hotpixels_strength = M;
+            p.hotpixels_permissive = true;
+        }),
         ("Denoise (profiled)", |p| {
             p.dn_on = true;
             p.dn_mode_y0u0v0 = false;
@@ -5866,6 +5947,10 @@ mod tests {
             highpass_on: _,
             highpass_sharpness: _,
             highpass_contrast: _,
+            hotpixels_on: _,
+            hotpixels_threshold: _,
+            hotpixels_strength: _,
+            hotpixels_permissive: _,
         } = PreviewParams::default();
     }
 

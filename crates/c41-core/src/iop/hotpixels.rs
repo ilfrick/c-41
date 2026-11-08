@@ -3,6 +3,53 @@ use super::{ClBuffer, IopProcess};
 
 pub struct Hotpixels;
 
+/// Raw mosaic correction controls. Defaults match darktable's strength,
+/// threshold, and strict four-neighbour detection defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HotpixelsOpts {
+    pub strength: f32,
+    pub threshold: f32,
+    pub permissive: bool,
+}
+
+impl Default for HotpixelsOpts {
+    fn default() -> Self {
+        Self { strength: 0.25, threshold: 0.05, permissive: false }
+    }
+}
+
+impl HotpixelsOpts {
+    /// Bound externally loaded or direct-call values to the UI's supported
+    /// range. Non-finite values fall back to the darktable defaults.
+    pub fn sanitized(self) -> Self {
+        let defaults = Self::default();
+        Self {
+            strength: if self.strength.is_finite() { self.strength.clamp(0.0, 1.0) } else { defaults.strength },
+            threshold: if self.threshold.is_finite() { self.threshold.clamp(0.0, 1.0) } else { defaults.threshold },
+            permissive: self.permissive,
+        }
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    #[test]
+    fn hotpixel_options_sanitize_ranges_and_non_finite_values() {
+        let bounded = HotpixelsOpts { strength: 2.0, threshold: -1.0, permissive: true }.sanitized();
+        assert_eq!(bounded, HotpixelsOpts { strength: 1.0, threshold: 0.0, permissive: true });
+
+        let defaults = HotpixelsOpts::default();
+        let recovered = HotpixelsOpts {
+            strength: f32::NAN,
+            threshold: f32::INFINITY,
+            permissive: false,
+        }.sanitized();
+        assert_eq!(recovered, defaults);
+    }
+}
+
 impl IopProcess for Hotpixels {
     fn process(&self, _input: &[f32], _output: &mut [f32], _params: &IopParams, _roi: &RoiIn) -> Result<()> {
         Err(crate::Error::Pipeline("not implemented".into()))

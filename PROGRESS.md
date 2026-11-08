@@ -9053,3 +9053,32 @@ Base (0).
 `git diff --check` passed, and `scripts/ci-local.sh` passed all four Docker
 steps (workspace check, clippy, release tests, release binary link). No
 production services or installer files were changed.
+
+## 2026-11-08 13:59 UTC — G1: Raw hot-pixel correction
+
+**What.** Added optional `HotpixelsOpts` to raw decode after highlight
+reconstruction (or, when that is off, before the legacy white clip) and before
+Bayer, X-Trans, or uniform-CFA monochrome demosaicing. Existing decode APIs
+remain compatibility wrappers, with correction off by default. PreviewParams
+v32 appends the enable/permissive bits and threshold/strength values; v31 and
+older blobs default Hot pixels off. Raw preview and all three raw export decode
+funnels use the same options. Added a raw-only darkroom row (enable, threshold,
+strength, permissive 3-neighbour switch), decode rebuild/debounce,
+history/reset, and partial-style support. `PARITY_AUDIT.md` records the scope and
+verified live/inert counts.
+
+**Verification.** The initial Docker gate passed workspace check/clippy and
+release linking but exposed one failing rawimage WB assertion (1,928 passed, 1
+failed). Review traced that to both an invalid pre-/post-demosaic exact oracle
+and an implementation that moved WB before demosaic for unaffected pixels. The
+fix detects on a temporary WB-scaled mosaic and restores only changed values;
+non-corrected samples remain byte-identical. A second gate run passed core tests
+but found the pinned PreviewParams length still at v31's 1883 bytes; updated it
+to v32's 1893 (two bools + two f32s). Independent reviews then found no remaining
+blockers/major findings; the raw UI/audit scope now explicitly includes Bayer,
+X-Trans, and uniform 2×2 monochrome CFA, and options clamp finite values to 0..1
+with non-finite values falling back to defaults. Final `scripts/ci-local.sh`
+passed all four Docker steps (workspace check, clippy, release tests: 1,932
+`c41-core` and 542 `c41-ui`, release binary link). `git diff --check` passed.
+No host cargo fallback, deployment/service changes, or installer edits. The two
+installer files remain untracked and untouched.

@@ -55,6 +55,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Color balance RGB",
     "Filmic RGB",
     "Highlight reconstruction",
+    "Hot pixels",
     "Denoise (profiled)",
     "Bloom",
     "Grain",
@@ -235,6 +236,13 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.highpass_on = src.highpass_on;
             target.highpass_sharpness = src.highpass_sharpness;
             target.highpass_contrast = src.highpass_contrast;
+            true
+        }
+        "Hot pixels" => {
+            target.hotpixels_on = src.hotpixels_on;
+            target.hotpixels_threshold = src.hotpixels_threshold;
+            target.hotpixels_strength = src.hotpixels_strength;
+            target.hotpixels_permissive = src.hotpixels_permissive;
             true
         }
         "Shadows/Highlights" => {
@@ -466,7 +474,7 @@ pub fn merge_modules(base: &PreviewParams, overlay: &PreviewParams, groups: &[&s
 /// its listed groups over what is already there. Unknown group names are
 /// skipped (see [`merge_modules`]).
 ///
-/// Note the whole-edit arm really is replace even though merging all 38 groups
+/// Note the whole-edit arm really is replace even though merging all 39 groups
 /// would compute the same value — [`MODULE_GROUPS`] partitions every field —
 /// because "replace" is the intent and the direct copy says so.
 pub fn apply_style(current: &PreviewParams, style: &crate::persist::Style) -> PreviewParams {
@@ -485,7 +493,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 38);
+        assert_eq!(MODULE_GROUPS.len(), 39);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
@@ -545,6 +553,24 @@ mod tests {
         let base = PreviewParams::default();
         let merged = merge_modules(&base, &populated, MODULE_GROUPS);
         assert_eq!(merged, populated, "every field must belong to exactly one listed group");
+    }
+
+    #[test]
+    fn hot_pixels_partial_style_copies_all_decode_controls() {
+        let overlay = PreviewParams {
+            hotpixels_on: true,
+            hotpixels_threshold: 0.12,
+            hotpixels_strength: 0.81,
+            hotpixels_permissive: true,
+            ..PreviewParams::default()
+        };
+        let mut target = PreviewParams::default();
+        assert!(copy_module_group(&mut target, &overlay, "Hot pixels"));
+        assert_eq!(target.hotpixels_on, overlay.hotpixels_on);
+        assert_eq!(target.hotpixels_threshold, overlay.hotpixels_threshold);
+        assert_eq!(target.hotpixels_strength, overlay.hotpixels_strength);
+        assert_eq!(target.hotpixels_permissive, overlay.hotpixels_permissive);
+        assert_eq!(target.ev, PreviewParams::default().ev);
     }
 
     #[test]

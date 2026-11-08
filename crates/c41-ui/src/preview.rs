@@ -702,6 +702,11 @@ pub struct PreviewParams {
     pub highpass_sharpness: f32,
     /// Contrast control, 0..100 (darktable default 50).
     pub highpass_contrast: f32,
+    /// Raw-only hot-pixel correction; changing these re-decodes the raw.
+    pub hotpixels_on: bool,
+    pub hotpixels_threshold: f32,
+    pub hotpixels_strength: f32,
+    pub hotpixels_permissive: bool,
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -983,6 +988,10 @@ impl Default for PreviewParams {
             highpass_on: false,
             highpass_sharpness: 50.0,
             highpass_contrast: 50.0,
+            hotpixels_on: false,
+            hotpixels_threshold: 0.05,
+            hotpixels_strength: 0.25,
+            hotpixels_permissive: false,
             df_on: false,
             df_radius: 4.0,   // defringe.c $DEFAULT
             df_thresh: 20.0,  // defringe.c $DEFAULT
@@ -1239,11 +1248,20 @@ impl PreviewParams {
             && soften_identity
     }
 
-    /// Highlight-reconstruction options for the raw front end; `None` while the
-    /// module is off (the legacy hard-clip-at-white decode). The single mapping
-    /// site shared by the darkroom preview decode and export, so they can never
-    /// disagree about what the controls mean. Non-raw inputs ignore it (no
-    /// float pre-demosaic domain there).
+    /// Hot-pixel options for raw decode; `None` while the module is off.
+    /// Strength and threshold are sanitized to darktable's 0..1 domain before
+    /// they reach the raw decoder; non-finite persisted values use defaults.
+    pub fn hotpixels_opts(&self) -> Option<c41_core::iop::hotpixels::HotpixelsOpts> {
+        self.hotpixels_on.then_some(c41_core::iop::hotpixels::HotpixelsOpts {
+            strength: self.hotpixels_strength,
+            threshold: self.hotpixels_threshold,
+            permissive: self.hotpixels_permissive,
+        }.sanitized())
+    }
+
+    /// Highlight-reconstruction options for the raw front end; `None` while
+    /// the module is off (the legacy hard-clip-at-white decode). Shared by
+    /// preview and export so the two paths cannot disagree.
     pub fn hl_opts(&self) -> Option<c41_core::iop::highlights::HlOpts> {
         if !self.hl_on {
             return None;
@@ -1437,7 +1455,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive] {
             v.push(b as u8);
         }
         for f in [
@@ -1618,8 +1636,9 @@ impl PreviewParams {
         for s in [self.df_radius, self.df_thresh, self.df_mode] {
             v.extend_from_slice(&s.to_le_bytes());
         }
-        // Highpass (v31): appended enable bit and two sliders.
-        for s in [self.highpass_sharpness, self.highpass_contrast] {
+        // Highpass (v31) followed append-only by hot-pixel controls (v32).
+        for s in [self.highpass_sharpness, self.highpass_contrast,
+                  self.hotpixels_threshold, self.hotpixels_strength] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -1915,6 +1934,10 @@ impl PreviewParams {
             highpass_on: bools.get(41).map_or(d.highpass_on, |&b| b != 0),
             highpass_sharpness: f.get(458).copied().unwrap_or(d.highpass_sharpness).clamp(0.0, 100.0),
             highpass_contrast: f.get(459).copied().unwrap_or(d.highpass_contrast).clamp(0.0, 100.0),
+            hotpixels_on: bools.get(42).map_or(d.hotpixels_on, |&b| b != 0),
+            hotpixels_permissive: bools.get(43).map_or(d.hotpixels_permissive, |&b| b != 0),
+            hotpixels_threshold: f.get(460).copied().unwrap_or(d.hotpixels_threshold),
+            hotpixels_strength: f.get(461).copied().unwrap_or(d.hotpixels_strength),
         })
     }
 
@@ -2829,9 +2852,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v30 adds defringe (1 bool + 3 f32: radius, thresh, and the mode dropdown's
 /// enum ordinal stored as a float).
 /// v31 adds highpass (1 bool + 2 f32).
-const ENCODE_VERSION: u8 = 31;
-/// 1 version byte + 42 bool bytes + 460 little-endian f32.
-const ENCODED_LEN: usize = 1 + 42 + 460 * 4;
+/// v32 adds raw-only hot pixels (2 bools + 2 f32).
+const ENCODE_VERSION: u8 = 32;
+/// 1 version byte + 44 bool bytes + 462 little-endian f32.
+const ENCODED_LEN: usize = 1 + 44 + 462 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2858,6 +2882,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (29, 40, 455), // v29: soften added
     (30, 41, 458), // v30: defringe added
     (31, 42, 460), // v31: highpass added
+    (32, 44, 462), // v32: raw hotpixels added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3568,6 +3593,7 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         // as a mismatch (slots 0/1 are the C-default identity endpoints —
         // slot 2 is the first one that differs from the default blob).
         highpass_on: true, highpass_sharpness: 67.0, highpass_contrast: 72.0,
+        hotpixels_on: true, hotpixels_threshold: 0.13, hotpixels_strength: 0.73, hotpixels_permissive: true,
         tc_on: true,
         tc_unbound: false,
         tc_type: 1.0,      // Catmull-Rom
@@ -4728,6 +4754,32 @@ mod tests {
         assert_eq!(decoded.soften_amount, def.soften_amount);
         assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
             "a pre-soften edit must not gain a soften stage");
+    }
+
+    #[test]
+    fn decode_v31_blob_defaults_raw_hotpixels() {
+        let mut blob = vec![0u8; 1 + 42 + 460 * 4];
+        blob[0] = 31;
+        let decoded = PreviewParams::decode(&blob).expect("v31 blob must decode");
+        let defaults = PreviewParams::default();
+        assert!(!decoded.hotpixels_on);
+        assert_eq!(decoded.hotpixels_threshold, defaults.hotpixels_threshold);
+        assert_eq!(decoded.hotpixels_strength, defaults.hotpixels_strength);
+        assert!(!decoded.hotpixels_permissive);
+        assert!(decoded.hotpixels_opts().is_none());
+    }
+
+    #[test]
+    fn hotpixels_opts_are_raw_decode_controls() {
+        let mut params = PreviewParams::default();
+        assert!(params.hotpixels_opts().is_none());
+        params.hotpixels_on = true;
+        params.hotpixels_threshold = 0.17;
+        params.hotpixels_strength = 0.62;
+        params.hotpixels_permissive = true;
+        assert_eq!(params.hotpixels_opts(), Some(c41_core::iop::hotpixels::HotpixelsOpts {
+            threshold: 0.17, strength: 0.62, permissive: true,
+        }));
     }
 
     #[test]

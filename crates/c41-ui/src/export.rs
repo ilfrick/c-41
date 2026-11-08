@@ -313,7 +313,7 @@ pub fn render_export_rgb8_gear(
     lens_gear: Option<&crate::preview::LensGear>,
     grain_seed: u32,
 ) -> (usize, usize, Vec<u8>) {
-    let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
+    let (w, h, linear) = img.to_linear_rgba_with_opts(method, params.hl_opts(), params.hotpixels_opts());
     // Lens pre-pass on the FULL frame, before crop/straighten — darktable runs
     // lens at iop_order 13, before the geometry modules (m4-131).
     let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
@@ -352,7 +352,7 @@ pub fn render_export_rgb16_gear(
     lens_gear: Option<&crate::preview::LensGear>,
     grain_seed: u32,
 ) -> (usize, usize, Vec<u16>) {
-    let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
+    let (w, h, linear) = img.to_linear_rgba_with_opts(method, params.hl_opts(), params.hotpixels_opts());
     // Lens pre-pass on the FULL frame, before crop/straighten — darktable runs
     // lens at iop_order 13, before the geometry modules (m4-131).
     let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
@@ -383,7 +383,7 @@ pub(crate) fn render_export_rgb16_output_gear(
     if profile.is_srgb() {
         return Some(render_export_rgb16_gear(img, method, geometry, params, lens_gear, grain_seed));
     }
-    let (w, h, linear) = img.to_linear_rgba_with(method, params.hl_opts());
+    let (w, h, linear) = img.to_linear_rgba_with_opts(method, params.hl_opts(), params.hotpixels_opts());
     let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
     let rgb = crate::preview::render_linear_to_output16_gear(

@@ -527,6 +527,13 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if hl {
         return "Highlight reconstruction";
     }
+    let hotpixels = old.hotpixels_on != new.hotpixels_on
+        || old.hotpixels_threshold != new.hotpixels_threshold
+        || old.hotpixels_strength != new.hotpixels_strength
+        || old.hotpixels_permissive != new.hotpixels_permissive;
+    if hotpixels {
+        return "Hot pixels";
+    }
     let dn = old.dn_on != new.dn_on
         || old.dn_mode_y0u0v0 != new.dn_mode_y0u0v0
         || old.dn_strength != new.dn_strength
@@ -930,6 +937,8 @@ mod tests {
             ),
             "Lens correction"
         );
+        assert_eq!(describe_change(&base, &PreviewParams { hotpixels_on: true, ..base }), "Hot pixels");
+        assert_eq!(describe_change(&base, &PreviewParams { hotpixels_threshold: 0.1, ..base }), "Hot pixels");
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -1193,6 +1202,10 @@ mod tests {
             lens_aperture: _,
             lens_distance: _,
             lens_target_geom: _,
+            hotpixels_on: _,
+            hotpixels_threshold: _,
+            hotpixels_strength: _,
+            hotpixels_permissive: _,
         } = PreviewParams::default();
     }
 
@@ -1312,7 +1325,8 @@ mod tests {
         // radius/thresh sliders and the mode dropdown's enum ordinal as a float).
         // #2 (Highpass): 1874 → 1883 (1 + 42 bools + 460 f32 — enabled and
         // sharpness/contrast).
-        assert_eq!(PreviewParams::default().encode().len(), 1883);
+        // G1 Hot pixels (v32): 1883 → 1893 (2 more bools + 2 f32 controls).
+        assert_eq!(PreviewParams::default().encode().len(), 1893);
     }
 
     #[test]
