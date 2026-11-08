@@ -183,7 +183,7 @@ that its own body at `:20` is excluded from the 74 — a naive
 declaration at `iop/mod.rs:112` and the macro body, and a naive
 `grep '"not implemented"'` returns 110, not 76, because each stub says it in
 both `process` and `process_cl`. Most other numbers here are a plain grep or
-`wc -l`; a few are one-line arithmetic (41 = 39 + 2, 11 = 52 − 39 − 2).
+`wc -l`; a few are one-line arithmetic (42 = 39 + 3, 10 = 52 − 39 − 3).
 Extending this section means recomputing the numbers you add *and* re-checking
 the ones already here: earlier drafts carried counts that review disproved. A
 claim with no way to re-derive it does not go in.
@@ -192,11 +192,13 @@ claim with no way to re-derive it does not go in.
 
 **Partially closed 2026-10-01** — `Grain`, `Soften` and `Defringe` were wired
 (see item 2.1 for the increments' scope notes). `Input color profile` followed
-on 2026-10-11 and Highpass on 2026-11-08; the current inert set is listed below.
+on 2026-10-11; Highpass and the Demosaic elsewhere-row were closed on
+2026-11-08. The current inert set is listed below.
 
 **Further closed 2026-10-11 (G2d)** — `Input color profile` is now a live
-darkroom row (see the G2 section). **Closed 2026-11-08 (Highpass)** — its Rust
-pipeline/UI wiring brings the current count to 41 of 52 active, with 11 inert.
+darkroom row (see the G2 section). **Closed 2026-11-08 (Highpass and Demosaic)** — Highpass's Rust pipeline/UI
+wiring and Demosaic's catalog status now bring the count to 42 of 52 active,
+with 10 inert.
 The kernel mapping below originates as the 2026-10-01 snapshot; current UI
 status and Liquify test count were refreshed on 2026-11-08. The input-profile row always had a
 ported kernel; it now has a product surface. Highpass is now a live UI,
@@ -204,33 +206,31 @@ preview, history and style module (item 2.1).
 
 `catalog.rs` publishes 52 module rows across the five darktable groups
 (Base 11, Tone 11, Color 11, Correct 7, Effect 12). `LIVE_MODULE_LABELS` has
-39 entries (`darkroom/mod.rs:2605`); `ELSEWHERE_MODULE_LABELS` has 2 (`:2587` —
-`Crop`, `Rotate & perspective`, driven from controls outside the module list).
+39 entries (`darkroom/mod.rs:2605`); `ELSEWHERE_MODULE_LABELS` has 3 (`:2587` —
+`Crop`, `Rotate & perspective` and `Demosaic`, driven from controls outside the module list).
 The header counter is `is_live_module`-derived (`mod.rs:2277`, `:2578`) and
-reads **"41 of 52 active"**.
+reads **"42 of 52 active"**.
 
-So 11 rows are in neither list, and **all 11 render through `inert_module_row`**
+So 10 rows are in neither list, and **all 10 render through `inert_module_row`**
 (`mod.rs:2336-2341` dispatches on `elsewhere_hint`, which returns `Some` only
-for Crop and Rotate & perspective, and `inert_module_row` is the fall-through).
+for Crop, Rotate & perspective and Demosaic, and `inert_module_row` is the fall-through).
 Inert means dimmed, tooltip "not yet wired", a status icon, and deliberately not
 interactive — no switch at all, because the code comments that a disabled switch
 still suggests "turn me on", and an earlier version that shipped a *working*
 switch is exactly the "looks live, does nothing" bug the function was written to
 remove:
 
-`Raw black/white point` · `Demosaic` · `Orientation` · `Color calibration` ·
+`Raw black/white point` · `Orientation` · `Color calibration` ·
 `Output color profile` · `Hot pixels` · `Chromatic aberrations` · `Retouch` ·
 `Liquify` · `Framing` · `Watermark`
 
-`Demosaic` is the one row that is inert *and* independently functional: the
-algorithm dropdown at the top of the right panel (`mod.rs:1605-1640`, handler at
-`:1634-1639`) is working software that the "41 of 52" counter does not count,
-since `is_live_module` only knows the two label lists. Two caveats, so the count
-is not oversold: the dropdown sits inside `if is_raw_path(file_path)`
-(`:1605`) and is hidden for X-Trans, so it only counts on a Bayer raw; and it is
-a free-standing section, not a control on the `Demosaic` row. This standalone
-Bayer-only control is additional to the 41 live catalog rows and is not included
-in the badge.
+`Demosaic` is now one of the three elsewhere-driven rows: its algorithm
+dropdown at the top of the right panel (`mod.rs:1605-1640`, handler at
+`:1634-1639`) is functional and the catalog row points to it rather than
+duplicating it. The selector is built only for raw files and is hidden for
+X-Trans, so it is usable only on Bayer raws; the catalog-wide active count
+reflects the capability even when the current image cannot use the selector.
+The row remains non-activatable.
 
 `Orientation` deserves its own note because it looks covered and is not: the
 only other "Orientation" in `c41-ui` is the *print* page-orientation combo
@@ -243,14 +243,14 @@ raw-only. So `Orientation` is genuinely inert.
 get wrong, so it is worth being precise about *what* exists. The m4-129…m4-244
 chain ported darktable's per-pixel `DT_OMP_FOR` loops into `c41-core/src/iop/`
 and exposed them as `#[no_mangle] extern "C"` kernels for the **C** pixelpipe to
-call. All 11 currently inert rows have such kernels; the wired `Grain`, `Soften`,
-`Defringe`, `Input color profile` and `Highpass` entries do as well. Row by row — the label each darktable module
+call. All 10 currently inert rows have such kernels; the wired `Grain`, `Soften`,
+`Defringe`, `Input color profile`, `Highpass` and `Demosaic` entries do as well. Row by row — the label each darktable module
 returns, so the mapping is checkable against `src/iop/*.c` rather than asserted:
 
 | catalogue row | darktable module | Rust kernel | exports / tests |
 |---|---|---|---|
 | `Raw black/white point` | `rawprepare.c` | `iop/rawprepare.rs` | 6 / 6 |
-| `Demosaic` | `demosaic.c` | `iop/demosaic.rs` | 27 / 31 |
+| ~~`Demosaic`~~ | `demosaic.c` | `iop/demosaic.rs` | 27 / 31 — selector wired elsewhere 2026-11-08 |
 | `Orientation` | `flip.c` | `iop/geometry.rs:111,142` | 2 / 9 |
 | `Color calibration` | `channelmixerrgb.c` | `iop/channelmixerrgb.rs` | 2 / 6 |
 | `Input color profile` | `colorin.c` | `iop/colorin.rs` | 5 / 15 |
@@ -282,7 +282,7 @@ last column is per-row, not additive: `Orientation` and `Framing` both draw on
 But two further things follow, and both cut against reading "a module file
 exists" as "the Rust product can run this module":
 
-1. **`IopProcess::process` is a stub — on all 11 currently inert rows**, and on 89 of the
+1. **`IopProcess::process` is a stub — on all 10 currently inert rows**, and on 89 of the
    96 implementors crate-wide (74 explicit `impl` blocks plus 22 `geom_iop_stub!`
    expansions; the two lists share 6 type *names* — `Ashift`, `Clipping`,
    `Colorharmonizer`, `Denoiseprofile`, `Liquify`, `Retouch` — which are
@@ -299,18 +299,18 @@ exists" as "the Rust product can run this module":
    `:7-9`, and a fully written, unit-tested `darkroom_watermark_blend` at
    `:22-42` beside it. `iop/geometry.rs:13-26` makes the pattern explicit with
    its `geom_iop_stub!` macro.
-2. **The Rust product still does not construct the 11 inert rows through `Stage`.** `IopProcess` is
+2. **The Rust product still does not construct the 10 inert rows through `Stage`.** `IopProcess` is
    declared at `crates/c41-core/src/iop/mod.rs:101` and, outside `src/iop/`, its
    only other mention in the tree is the module doc at
    `crates/c41-core/src/lib.rs:3`.
    The Rust product drives its *own* module set through the `Stage` enum in
    `pipeline.rs`, whose import list (`pipeline.rs:31`) names 33 modules — none of
-   which is among these 11 inert rows. Highpass is the exception to the old
+   which is among these 10 inert rows. Highpass is the exception to the old
    C-FFI-only pattern: its Rust pipeline stage calls the Lab driver directly.
    Outside `src/iop/`, the remaining references to `Watermark`, `Retouch` and
    `Liquify` are label strings in `catalog.rs:105,98,87,88`.
 
-So each of these still-inert rows needs live controls, parameters, a `Stage`
+So each of these 10 still-inert rows needs live controls, parameters, a `Stage`
 variant and a Rust driver — the ported kernels remove the *maths* risk, not the
 *plumbing* work.
 That is a materially bigger job than the closed severity-2.1 rows, which attached

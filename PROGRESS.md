@@ -9035,3 +9035,21 @@ the module-group count assertion (37→38). All corrections were made, and the
 final `scripts/ci-local.sh` passed all four Docker steps: workspace check,
 clippy, release tests, and release binary link. No production service was
 changed; `install-debuntu.sh` and its checksum remain untouched and untracked.
+
+## 2026-11-08 12:22 UTC — Demosaic: catalog row points to Bayer selector
+
+**What.** Classified the catalog's `Demosaic` row as implemented elsewhere rather
+than inert: its existing algorithm selector is above the module list, only for
+Bayer RAWs, and the catalog row now points there with that limitation stated.
+The selector remains the single control; no duplicate module widget was added.
+Active-module filtering/counting now includes Demosaic; `PARITY_AUDIT.md` updates
+the total to 42/52 and remaining inert rows to 10. Also corrected the stale
+Soften comment in the Active-filter test and pinned Demosaic's actual Base group
+index in that test.
+
+**Verified.** Independent senior reviews found no functional regression and
+caught a test assertion using the wrong catalog group index; it was fixed to
+Base (0).
+`git diff --check` passed, and `scripts/ci-local.sh` passed all four Docker
+steps (workspace check, clippy, release tests, release binary link). No
+production services or installer files were changed.

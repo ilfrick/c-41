@@ -2776,15 +2776,17 @@ pub(crate) fn is_live_module(label: &str) -> bool {
 /// Catalog labels whose functionality *is* implemented, but through dedicated
 /// controls elsewhere in the darkroom panel rather than a row in this list —
 /// Crop has its own mode toggle and overlay, Rotate & perspective the Straighten
-/// slider. Marking them "not yet wired" would be simply false, so they count as
-/// live and are labelled with where their controls actually are.
-const ELSEWHERE_MODULE_LABELS: &[&str] = &["Crop", "Rotate & perspective"];
+/// slider, and Demosaic has a Bayer-only selector above the module list. Marking
+/// them "not yet wired" would be simply false, so they count as live and are
+/// labelled with where their controls actually are.
+const ELSEWHERE_MODULE_LABELS: &[&str] = &["Crop", "Rotate & perspective", "Demosaic"];
 
 /// Where a module implemented outside this list keeps its controls.
 fn elsewhere_hint(label: &str) -> Option<&'static str> {
     match label {
         "Crop" => Some("use the Crop button above"),
         "Rotate & perspective" => Some("use the Straighten slider above"),
+        "Demosaic" => Some("use the Bayer demosaic selector above (Bayer RAW only)"),
         _ => None,
     }
 }
@@ -5202,6 +5204,10 @@ mod tests {
             elsewhere_hint("Rotate & perspective"),
             Some("use the Straighten slider above")
         );
+        assert_eq!(
+            elsewhere_hint("Demosaic"),
+            Some("use the Bayer demosaic selector above (Bayer RAW only)")
+        );
         assert_eq!(elsewhere_hint("Grain"), None);
     }
 
@@ -5214,12 +5220,12 @@ mod tests {
         // All shows everything, live or placeholder, on an empty query.
         assert!(module_filter_matches(ModuleFilter::All, 0, "Grain", ""));
         assert!(module_filter_matches(ModuleFilter::All, 2, "Exposure", ""));
-        // Active shows only live modules (Exposure and Grain are live; Soften
-        // is still inert).
+        // Active shows only live modules (Exposure, Grain and Soften are live).
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Exposure", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Grain", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Highpass", ""));
+        assert!(module_filter_matches(ModuleFilter::Active, 0, "Demosaic", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
