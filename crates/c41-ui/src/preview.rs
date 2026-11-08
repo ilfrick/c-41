@@ -696,6 +696,12 @@ pub struct PreviewParams {
     /// Target projection (`target_geom`, `lfLensType` value; C default 1 =
     /// rectilinear).
     pub lens_target_geom: f32,
+    /// Highpass module enabled.
+    pub highpass_on: bool,
+    /// Sharpness control, 0..100 (darktable default 50).
+    pub highpass_sharpness: f32,
+    /// Contrast control, 0..100 (darktable default 50).
+    pub highpass_contrast: f32,
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -974,6 +980,9 @@ impl Default for PreviewParams {
             soften_saturation: 100.0, // soften.c $DEFAULT
             soften_brightness: 0.33,  // soften.c $DEFAULT
             soften_amount: 50.0,      // soften.c $DEFAULT
+            highpass_on: false,
+            highpass_sharpness: 50.0,
+            highpass_contrast: 50.0,
             df_on: false,
             df_radius: 4.0,   // defringe.c $DEFAULT
             df_thresh: 20.0,  // defringe.c $DEFAULT
@@ -1200,6 +1209,8 @@ impl PreviewParams {
         // combination while enabled is a pass-through — and with strength 0 the
         // C still runs the full Lab round-trip. The gate mirrors `to_pipeline`.
         let gr_identity = !self.gr_on;
+        // Highpass has no identity setting while enabled; gate on the flag alone.
+        let highpass_identity = !self.highpass_on;
         // Soften gates on the enable flag alone, like Bloom/Grain: the box blur
         // and HSL overexpose have no slider combination that is a pass-through
         // while enabled (amount 0 does reproduce the input, but `to_pipeline`
@@ -1224,6 +1235,7 @@ impl PreviewParams {
             && lens_identity
             && lc_identity
             && gr_identity
+            && highpass_identity
             && soften_identity
     }
 
@@ -1425,7 +1437,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1604,6 +1616,10 @@ impl PreviewParams {
         // Defringe (v30): the two sliders plus the mode dropdown's ordinal,
         // appended after the soften block.
         for s in [self.df_radius, self.df_thresh, self.df_mode] {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        // Highpass (v31): appended enable bit and two sliders.
+        for s in [self.highpass_sharpness, self.highpass_contrast] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -1896,6 +1912,9 @@ impl PreviewParams {
             // raw float is kept so the stored value stays a faithful record of
             // what the blob said.
             df_mode: f.get(457).copied().unwrap_or(d.df_mode),
+            highpass_on: bools.get(41).map_or(d.highpass_on, |&b| b != 0),
+            highpass_sharpness: f.get(458).copied().unwrap_or(d.highpass_sharpness).clamp(0.0, 100.0),
+            highpass_contrast: f.get(459).copied().unwrap_or(d.highpass_contrast).clamp(0.0, 100.0),
         })
     }
 
@@ -2421,6 +2440,17 @@ impl PreviewParams {
                 space,
             });
         }
+        // Highpass (iop_order.c v50 pos 34): immediately after Lowpass pos 33.
+        // Its scale is the ROI scale / piece iscale ratio; current full-frame
+        // preview/export callers use unity. Preserve it for future non-unity paths.
+        if self.highpass_on {
+            p.push(Stage::Highpass {
+                sharpness: self.highpass_sharpness,
+                contrast: self.highpass_contrast,
+                scale,
+                space,
+            });
+        }
         // Local contrast (bilat.c local-laplacian mode, iop_order.c v50_order
         // pos 54 — "improve clarity/local contrast after all the bad things we
         // have done to it with tonemapping": after shadhi 50 / our lowpass
@@ -2798,9 +2828,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v29 adds soften (1 bool + 4 f32: size, saturation, brightness, amount).
 /// v30 adds defringe (1 bool + 3 f32: radius, thresh, and the mode dropdown's
 /// enum ordinal stored as a float).
-const ENCODE_VERSION: u8 = 30;
-/// 1 version byte + 41 bool bytes + 458 little-endian f32.
-const ENCODED_LEN: usize = 1 + 41 + 458 * 4;
+/// v31 adds highpass (1 bool + 2 f32).
+const ENCODE_VERSION: u8 = 31;
+/// 1 version byte + 42 bool bytes + 460 little-endian f32.
+const ENCODED_LEN: usize = 1 + 42 + 460 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2826,6 +2857,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (28, 39, 451), // v28: grain added
     (29, 40, 455), // v29: soften added
     (30, 41, 458), // v30: defringe added
+    (31, 42, 460), // v31: highpass added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3535,6 +3567,7 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         // moved so a wrong offset inside the 40-float anchor block shows
         // as a mismatch (slots 0/1 are the C-default identity endpoints —
         // slot 2 is the first one that differs from the default blob).
+        highpass_on: true, highpass_sharpness: 67.0, highpass_contrast: 72.0,
         tc_on: true,
         tc_unbound: false,
         tc_type: 1.0,      // Catmull-Rom
@@ -4061,6 +4094,11 @@ mod tests {
         let mut so = PreviewParams::default();
         so.soften_on = true;
         cfgs.push(so);
+        // Highpass is flag-gated even at the 50/50 parameter defaults.
+        cfgs.push(PreviewParams::default());
+        let mut hp = PreviewParams::default();
+        hp.highpass_on = true;
+        cfgs.push(hp);
         for c in cfgs {
             assert_eq!(
                 c.is_identity(),
@@ -4114,6 +4152,7 @@ mod tests {
         p.shadhi_shadows = 25.0; // off-default so the stage is emitted
         p.lowpass_on = true;
         p.lowpass_contrast = 0.6; // off-default (identity is contrast 1.0)
+        p.highpass_on = true;
         p.color_correction_on = true;
         p.color_correction_saturation = 1.5;
         p.colorize_on = true;
@@ -4177,7 +4216,7 @@ mod tests {
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning"]
+            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "highpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning"]
         );
         // Base curve is the scene→display conversion point (iop_order.c pos
         // 44.0): after rgbcurve/rgblevels, before sigmoid and filmicrgb.
@@ -4205,7 +4244,10 @@ mod tests {
         // kernel reads `in[0]/100` as Lab L, so it must land after the tone map
         // — before it, L would still be scene-linear luminance and the paper
         // response would be sampled in the wrong domain entirely.
+        let hp_pos = names.iter().position(|n| *n == "highpass").unwrap();
+        let lc_pos = names.iter().position(|n| *n == "bilat").unwrap();
         let gr_pos = names.iter().position(|n| *n == "grain").unwrap();
+        assert!(hp_pos < lc_pos && hp_pos < gr_pos, "highpass pos 34 follows lowpass and precedes local contrast: {names:?}");
         assert!(
             gr_pos > names.iter().position(|n| *n == "sigmoid").unwrap(),
             "grain must run after sigmoid: {names:?}"
@@ -4689,7 +4731,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_v29_blob_defaults_defringe_fields() {
+    fn decode_v29_blob_defaults_defringe_and_highpass_fields() {
         // A v29 blob (the last layout before defringe — 40 bools / 455 f32s) must
         // decode with the defringe fields at their defaults, so an edit saved
         // before the defringe module existed loads unchanged instead of gaining a
@@ -4708,6 +4750,9 @@ mod tests {
         assert_eq!(decoded.df_radius, def.df_radius);
         assert_eq!(decoded.df_thresh, def.df_thresh);
         assert_eq!(decoded.df_mode, def.df_mode);
+        assert!(!decoded.highpass_on);
+        assert_eq!(decoded.highpass_sharpness, 50.0);
+        assert_eq!(decoded.highpass_contrast, 50.0);
         // And the defaults must be the *off* defaults the rest of this file
         // assumes (the identity-pipeline assertions throughout depend on it).
         assert!(!decoded.df_on, "defringe must ship off, like every other ported module");

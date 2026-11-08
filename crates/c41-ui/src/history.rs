@@ -400,6 +400,12 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if lowpass {
         return "Lowpass";
     }
+    let highpass = old.highpass_on != new.highpass_on
+        || old.highpass_sharpness != new.highpass_sharpness
+        || old.highpass_contrast != new.highpass_contrast;
+    if highpass {
+        return "Highpass";
+    }
     let shadhi = old.shadhi_on != new.shadhi_on
         || old.shadhi_shadows != new.shadhi_shadows
         || old.shadhi_highlights != new.shadhi_highlights
@@ -801,6 +807,10 @@ mod tests {
             "Lowpass"
         );
         assert_eq!(
+            describe_change(&base, &PreviewParams { highpass_on: true, ..d() }),
+            "Highpass"
+        );
+        assert_eq!(
             describe_change(&base, &PreviewParams { shadhi_shadows: 25.0, ..d() }),
             "Shadows/Highlights"
         );
@@ -1052,6 +1062,9 @@ mod tests {
             soften_brightness: _,
             soften_amount: _,
             df_on: _,
+            highpass_on: _,
+            highpass_sharpness: _,
+            highpass_contrast: _,
             df_radius: _,
             df_thresh: _,
             df_mode: _,
@@ -1297,7 +1310,9 @@ mod tests {
         // size/saturation/brightness/amount sliders).
         // g1c (defringe): 1861 → 1874 (1 + 41 bools + 458 f32 — enabled + the
         // radius/thresh sliders and the mode dropdown's enum ordinal as a float).
-        assert_eq!(PreviewParams::default().encode().len(), 1874);
+        // #2 (Highpass): 1874 → 1883 (1 + 42 bools + 460 f32 — enabled and
+        // sharpness/contrast).
+        assert_eq!(PreviewParams::default().encode().len(), 1883);
     }
 
     #[test]

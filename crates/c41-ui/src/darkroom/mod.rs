@@ -2526,6 +2526,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Shadows/Highlights" => shadhi_module_row(ctx).upcast(),
                 "Local contrast" => localcontrast_module_row(ctx).upcast(),
                 "Lowpass" => lowpass_module_row(ctx).upcast(),
+                "Highpass" => highpass_module_row(ctx).upcast(),
                 "White balance" => whitebalance_module_row(ctx).upcast(),
                 "Invert" => invert_module_row(ctx).upcast(),
                 other => match elsewhere_hint(other) {
@@ -2795,7 +2796,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile"];
+const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -2907,6 +2908,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             shadhi_highlights_ccorrect
         ),
         "Local contrast" => set!(lc_on, lc_midtone, lc_shadows, lc_highlights, lc_detail),
+        "Highpass" => set!(highpass_on, highpass_sharpness, highpass_contrast),
         "Lowpass" => set!(
             lowpass_on,
             lowpass_radius,
@@ -3733,6 +3735,20 @@ fn localcontrast_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.lc_shadows = v);
             add_param_slider(e, ctx, "Midtone range", 0.001, 1.0, 0.001, p0.lc_midtone as f64,
                 |p, v| p.lc_midtone = v);
+        })
+}
+
+/// Highpass (highpass.c): isolate high frequencies in Lab L and produce the
+/// module's desaturated Lab output.
+fn highpass_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Highpass", "isolate high frequencies", p0.highpass_on,
+        |p, on| p.highpass_on = on,
+        |e, ctx| {
+            add_param_slider(e, ctx, "Sharpness", 0.0, 100.0, 1.0, p0.highpass_sharpness as f64,
+                |p, v| p.highpass_sharpness = v);
+            add_param_slider(e, ctx, "Contrast", 0.0, 100.0, 1.0, p0.highpass_contrast as f64,
+                |p, v| p.highpass_contrast = v);
         })
 }
 
@@ -5061,7 +5077,7 @@ mod tests {
         assert!(is_live_module("Bloom"), "a ported module must read as live");
         assert!(is_live_module("Grain"), "the wired grain module must read as live");
         assert!(is_live_module("Soften"), "the wired soften module must read as live");
-        assert!(!is_live_module("Highpass"), "an unported module must not read as live");
+        assert!(is_live_module("Highpass"), "ported module should be live");
     }
 
     /// Every live-module label must still exist verbatim in the catalog, else
@@ -5203,7 +5219,7 @@ mod tests {
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Exposure", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Grain", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
-        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Highpass", ""));
+        assert!(module_filter_matches(ModuleFilter::Active, 4, "Highpass", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
@@ -5218,7 +5234,7 @@ mod tests {
         assert!(!module_filter_matches(ModuleFilter::All, 0, "Exposure", "velvia"));
         // ... and it combines with the scope tab (Active + query still hides
         // inert rows even when the query matches their label).
-        assert!(!module_filter_matches(ModuleFilter::Active, 4, "Highpass", "hig"));
+        assert!(module_filter_matches(ModuleFilter::Active, 4, "Highpass", "hig"));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Bloom", "loo"));
     }
 
@@ -5368,6 +5384,11 @@ mod tests {
             p.lowpass_contrast = M;
             p.lowpass_brightness = M;
             p.lowpass_saturation = M;
+        }),
+        ("Highpass", |p| {
+            p.highpass_on = true;
+            p.highpass_sharpness = M;
+            p.highpass_contrast = M;
         }),
         ("Primaries", |p| {
             p.primaries_on = true;
@@ -5836,6 +5857,9 @@ mod tests {
             df_radius: _,
             df_thresh: _,
             df_mode: _,
+            highpass_on: _,
+            highpass_sharpness: _,
+            highpass_contrast: _,
         } = PreviewParams::default();
     }
 
@@ -5920,7 +5944,7 @@ mod tests {
             ..Default::default()
         };
         let before = p;
-        assert!(!reset_module(&mut p, "Highpass"));
+        assert!(!reset_module(&mut p, "Watermark"));
         assert_eq!(p, before);
     }
 }

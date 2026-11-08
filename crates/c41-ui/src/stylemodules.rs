@@ -46,6 +46,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Contrast brightness saturation",
     "Basic adjustments",
     "Lowpass",
+    "Highpass",
     "Shadows/Highlights",
     "Local contrast",
     "Primaries",
@@ -228,6 +229,12 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.lowpass_contrast = src.lowpass_contrast;
             target.lowpass_brightness = src.lowpass_brightness;
             target.lowpass_saturation = src.lowpass_saturation;
+            true
+        }
+        "Highpass" => {
+            target.highpass_on = src.highpass_on;
+            target.highpass_sharpness = src.highpass_sharpness;
+            target.highpass_contrast = src.highpass_contrast;
             true
         }
         "Shadows/Highlights" => {
@@ -459,7 +466,7 @@ pub fn merge_modules(base: &PreviewParams, overlay: &PreviewParams, groups: &[&s
 /// its listed groups over what is already there. Unknown group names are
 /// skipped (see [`merge_modules`]).
 ///
-/// Note the whole-edit arm really is replace even though merging all 33 groups
+/// Note the whole-edit arm really is replace even though merging all 38 groups
 /// would compute the same value — [`MODULE_GROUPS`] partitions every field —
 /// because "replace" is the intent and the direct copy says so.
 pub fn apply_style(current: &PreviewParams, style: &crate::persist::Style) -> PreviewParams {
@@ -478,7 +485,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 37);
+        assert_eq!(MODULE_GROUPS.len(), 38);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();

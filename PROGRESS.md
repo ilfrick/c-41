@@ -9008,3 +9008,30 @@ authoritative. After correcting the fixture, `scripts/ci-local.sh` passed all
 four Docker steps (workspace check, clippy, release tests: 1,921 `c41-core` and
 539 `c41-ui`, and release binary link). `git diff --check` passed. No C files,
 installer files, deployment services, or production containers were changed.
+
+## 2026-11-08 11:57 UTC — Highpass: preview pipeline and darkroom wiring
+
+**What.** Wired Highpass into the Rust pipeline and darkroom. The driver matches
+`highpass.c`: Lab-L inversion, eight iterations of the 1-channel box mean,
+sharpness-derived radius (including f32 `sharpness + 1` semantics), and C blend.
+The stage follows Lowpass at v50 position 34, and the RGBA adapter preserves
+input alpha even though the C blend treats Lab lane 3 as unused. Added the
+sharpness/contrast controls, append-only PreviewParams v31 persistence, older
+blob defaults, reset, history labels, and partial-style copying. `PARITY_AUDIT.md`
+now records Highpass as live and updates the active/inert module counts.
+
+Added a naive clipped-window scalar reference test with varied/chromatic Lab
+pixels, contrast endpoints and values immediately below/at the first radius
+boundary, plus an end-to-end pipeline test with distinct alpha values.
+
+**Verified.** Independent senior reviews found no remaining code blockers. One
+review found that carrying the C blend's zeroed Lab lane into RGB would erase
+pipeline alpha, so the adapter restores the original per-pixel alpha. The final
+documentation review's wording and claim-precision notes are reflected in this
+entry and `PARITY_AUDIT.md`. `git diff --check`
+passed. The first Docker test run exposed the expected +9-byte encoded-length
+pin and missing Highpass style group; after fixing those, a second run caught
+the module-group count assertion (37→38). All corrections were made, and the
+final `scripts/ci-local.sh` passed all four Docker steps: workspace check,
+clippy, release tests, and release binary link. No production service was
+changed; `install-debuntu.sh` and its checksum remain untouched and untracked.

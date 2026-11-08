@@ -327,6 +327,12 @@ pub enum Stage {
         saturation: f32,
         space: ColorSpace,
     },
+    /// Highpass filter (highpass.c): invert Lab L, apply eight iterations of the
+    /// one-channel sliding box mean, then blend into the C's desaturated Lab result.
+    /// `scale` represents roi_in->scale / piece->iscale; current whole-frame
+    /// preview/export callers use unity, with no scale divergence claimed.
+    /// Spatial, whole-frame stage.
+    Highpass { sharpness: f32, contrast: f32, scale: f32, space: ColorSpace },
     /// Low-pass local-contrast filter (lowpass.c). Blurs the image in Lab with a
     /// recursive Gaussian, then applies a contrast LUT + brightness LUT (each with
     /// exponential extrapolation above 1.0) to the blurred `L`, and scales a/b by
@@ -749,6 +755,7 @@ impl Stage {
             Stage::Basicadj { .. } => "basicadj",
             Stage::Shadhi { .. } => "shadhi",
             Stage::Lowpass { .. } => "lowpass",
+            Stage::Highpass { .. } => "highpass",
             Stage::Primaries { .. } => "primaries",
             Stage::Negadoctor { .. } => "negadoctor",
             Stage::ToneEqual { .. } => "toneequal",
@@ -837,6 +844,8 @@ impl Stage {
             // the whole pipeline serial whenever this stage is present, where
             // (width, height) is the true image rectangle.
             Stage::Lowpass { .. } => false,
+            // Highpass's eight-pass box mean reads neighbouring Lab L values.
+            Stage::Highpass { .. } => false,
             // Lowlight is pixel-local: a per-pixel scotopic/photopic blend
             // driven by that pixel's own luminance, no neighbour reads.
             Stage::Lowlight { .. } => true,
@@ -949,6 +958,7 @@ impl Stage {
             // Lowpass works in Lab (RGB-to-Lab blur then Lab-to-RGB), so it
             // must agree with the other Lab-domain stages on the working space.
             Stage::Lowpass { space, .. } => Some(*space),
+            Stage::Highpass { space, .. } => Some(*space),
             // Shadhi works in Lab (RGB→Lab blur then Lab→RGB process), so it
             // must agree with the other Lab-domain stages on the working space.
             // The C `default_colorspace` returns `IOP_CS_LAB` and the process
@@ -1712,6 +1722,35 @@ impl Stage {
                     output[i..i + 4].copy_from_slice(&rgb);
                 }
             }
+            Stage::Highpass { sharpness, contrast, scale, space } => {
+                let (to_lab, from_lab): (LabConv, LabConv) = match space {
+                    ColorSpace::Rec2020 => (crate::color::rec2020_to_lab, crate::color::lab_to_rec2020),
+                    ColorSpace::LinearSrgb => (crate::color::srgb_to_lab, crate::color::lab_to_srgb),
+                };
+                let n = width * height;
+                let mut lab = vec![0.0f32; n * 4];
+                for p in 0..n {
+                    let i = p * 4;
+                    lab[i..i + 4].copy_from_slice(&to_lab([input[i], input[i + 1], input[i + 2], input[i + 3]]));
+                }
+                let mut filtered = vec![0.0f32; n * 4];
+                // This is the full C process sequence: packed L inversion,
+                // scaled 1-channel box mean (8 iterations), and C blend.
+                if crate::iop::highpass::process_lab(
+                    &lab, &mut filtered, width, height, sharpness, contrast, scale,
+                ) {
+                    for p in 0..n {
+                        let i = p * 4;
+                        // The C blend treats Lab lane 3 as irrelevant and zeros
+                        // it; the RGBA pipeline contract instead preserves alpha.
+                        output[i..i + 4].copy_from_slice(&from_lab([
+                            filtered[i], filtered[i + 1], filtered[i + 2], input[i + 3],
+                        ]));
+                    }
+                } else {
+                    output.copy_from_slice(input);
+                }
+            }
             // ── Lowpass (lowpass.c) ──────────────────────────────────
             // Local-contrast reduction: blur in Lab, then apply contrast +
             // brightness LUTs to the blurred L and saturation-scale a/b. Same
@@ -2216,6 +2255,28 @@ mod tests {
     }
 
     #[test]
+    fn highpass_pipeline_integrates_lab_filter_and_returns_rgba() {
+        let input = vec![
+            0.05f32, 0.12, 0.03, 0.2,
+            0.20, 0.08, 0.35, 0.4,
+            0.70, 0.45, 0.10, 0.6,
+            0.95, 0.80, 0.60, 0.8,
+        ];
+        let stage = Stage::Highpass {
+            sharpness: 50.0, contrast: 50.0, scale: 1.0,
+            space: ColorSpace::LinearSrgb,
+        };
+        assert_eq!(stage.name(), "highpass");
+        assert_eq!(stage.working_space(), Some(ColorSpace::LinearSrgb));
+        assert!(!stage.is_pixel_local());
+        let out = Pipeline::with_stages(vec![stage]).process(&input, 2, 2);
+        assert_eq!(out.len(), input.len());
+        assert_ne!(out, input);
+        assert!(out.chunks_exact(4).zip(input.chunks_exact(4)).all(|(out, input)| out[3] == input[3]));
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn stages_apply_in_order() {
         // exposure ×2 then ×3 ⇒ ×6
         let px = vec![0.1f32, 0.1, 0.1, 1.0];
@@ -2522,6 +2583,10 @@ mod tests {
             }
                 .is_pixel_local(),
             "lowpass blurs a spatial neighbourhood ⇒ NOT pixel-local"
+        );
+        assert!(
+            !Stage::Highpass { sharpness: 50.0, contrast: 50.0, scale: 1.0, space: ColorSpace::LinearSrgb }.is_pixel_local(),
+            "highpass box mean reads spatial neighbours"
         );
         // Shadhi is NOT pixel-local: the Gaussian blur reads a spatial
         // neighbourhood, so band-splitting would produce wrong-edge artefacts.
