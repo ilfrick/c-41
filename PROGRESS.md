@@ -8979,3 +8979,32 @@ checks maximum per-channel distance; the rerun passed. A host-only `cargo test`
 was unavailable because the linker lacked Lensfun and gphoto2 native libraries;
 `cargo check -p c41-core` succeeded, and Docker CI is authoritative. No
 production service was changed.
+
+## 2026-11-08 10:28 UTC — Liquify kernel safety and regression coverage
+
+**What.** Fixed an off-by-one in `darkroom_liquify_fill_gaps`: its right-side
+column was `width - x`, which crossed into the next row and read past the final
+row; it now uses `width - x - 1`. Empty dimensions are no-ops. Hardened all six
+Liquify FFI kernels with checked buffer-size/`isize` bounds before constructing
+slices or using raw map offsets, checked signed offset arithmetic, and explicit
+pointer/aliasing contracts. `apply_map` now computes ROI intersections with
+signed `i64` coordinates, preserving negative origins without `usize` underflow.
+Empty/non-finite bounding-box inputs return documented sentinels.
+
+Added 10 tests across the six exports: both stamp modes and all quadrants,
+shifted single-channel sampling, negative-origin ROI and distortion, inversion,
+odd/even and multi-row gap fill, bounding-box outputs, and oversized-input guards.
+`PARITY_AUDIT.md` now records the kernel fix and updates Liquify from 0 to 10
+tests; the module remains inert in the UI and `IopProcess::process` remains the
+C-FFI-only stub.
+
+**Verified.** Independent senior review approved with no blockers. The first
+`ci-local` test run found a fixture issue: the inversion test's zero-displacement
+target overwrote the inverse value under test; the target now points to the
+border and is correctly excluded. The standalone targeted Docker command was
+also tried without `--locked` and stopped while rebuilding `ort-sys` because
+that image lacked the static ONNX Runtime library; the locked project gate is
+authoritative. After correcting the fixture, `scripts/ci-local.sh` passed all
+four Docker steps (workspace check, clippy, release tests: 1,921 `c41-core` and
+539 `c41-ui`, and release binary link). `git diff --check` passed. No C files,
+installer files, deployment services, or production containers were changed.

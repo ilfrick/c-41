@@ -190,9 +190,10 @@ Numbers below are recomputed as of that commit.
 
 **Further closed 2026-10-11 (G2d)** — `Input color profile` is now a live
 darkroom row (see the G2 section), so the inert count falls to 12 and the header
-reads "40 of 52 active". The enumeration and the per-kernel table below are the
-2026-10-01 snapshot and are otherwise unchanged: that row always had a ported
-kernel, and now it has a product surface.
+reads "40 of 52 active". The enumeration and the per-kernel table below
+originate as the 2026-10-01 snapshot; the Liquify test count was updated
+2026-11-08, and other rows are unchanged. The input-profile row always had a
+ported kernel; it now has a product surface.
 
 `catalog.rs` publishes 52 module rows across the five darktable groups
 (Base 11, Tone 11, Color 11, Correct 7, Effect 12). `LIVE_MODULE_LABELS` has
@@ -251,7 +252,7 @@ returns, so the mapping is checkable against `src/iop/*.c` rather than asserted:
 | `Chromatic aberrations` | `cacorrectrgb.c` | `iop/cacorrectrgb.rs` | 7 / 11 |
 | ~~`Defringe`~~ | `defringe.c` | `iop/defringe.rs` | wired 2026-10-01 — see 2.1 |
 | `Retouch` | `retouch.c` | `iop/retouch.rs` | 7 / 12 |
-| `Liquify` | `liquify.c` | `iop/liquify.rs` | 6 / **0** |
+| `Liquify` | `liquify.c` | `iop/liquify.rs` | 6 / **10** |
 | ~~`Grain`~~ | `grain.c` | `iop/grain.rs` | wired 2026-10-01 — see 2.1 |
 | ~~`Soften`~~ | `soften.c` | `iop/soften.rs` | wired 2026-10-01 — see 2.1 |
 | `Highpass` | `highpass.c` | `iop/highpass.rs` | 2 / 2 |
@@ -263,9 +264,13 @@ Two traps in that table, both of which cost a wrong claim in an earlier draft.
 *rotate and perspective*, one of the 2 elsewhere-driven rows that are otherwise
 live; *lens correction* is `lens.cc:252`. And `Orientation` is `flip.c`, whose
 own label is "orientation"; `rasterfile.c` is *external raster masks* and has
-nothing to do with it. `Liquify` is the one row whose ported kernel ships with no
-unit test at all. The last column is per-row, not additive: `Orientation` and
-`Framing` both draw on `iop/geometry.rs`, so its 9 tests are counted in each.
+nothing to do with it. **Liquify's kernel gap/test update (2026-11-08):** the
+old right-edge index in `fill_gaps` addressed column `width` rather than
+`width - 1`, reading into the next row and past the final row. The fix adds
+per-row regression coverage and a suite of 10 unit tests across all six exports;
+Liquify remains an inert UI row and `IopProcess::process` remains a stub. The
+last column is per-row, not additive: `Orientation` and `Framing` both draw on
+`iop/geometry.rs`, so its 9 tests are counted in each.
 
 But two further things follow, and both cut against reading "a module file
 exists" as "the Rust product can run this module":
