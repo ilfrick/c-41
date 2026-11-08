@@ -9082,3 +9082,16 @@ passed all four Docker steps (workspace check, clippy, release tests: 1,932
 `c41-core` and 542 `c41-ui`, release binary link). `git diff --check` passed.
 No host cargo fallback, deployment/service changes, or installer edits. The two
 installer files remain untracked and untouched.
+
+## 2026-11-08 14:24 UTC — G1: Output profile catalog cross-link
+
+**What.** Classified `Output color profile` as implemented elsewhere in the
+catalog because the global sRGB/Adobe RGB choice is available in the Export
+dialog. The row tooltip says where to find it; this is explicitly not a per-image
+edit or full `colorout` module parity. `PARITY_AUDIT.md` updates the arithmetic
+to 44/52 active (40 live labels + 4 elsewhere links), 8 inert.
+
+**Verified.** Independent review caught wording that could imply full per-image
+parity; the source comment and audit now scope the row to the global export
+choice. `scripts/ci-local.sh` passed all four Docker steps; `git diff --check`
+passed. No production services or installer files changed.

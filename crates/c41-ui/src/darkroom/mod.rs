@@ -2753,9 +2753,8 @@ fn inert_module_row(label: &str, _default_on: bool) -> adw::ActionRow {
     row
 }
 
-/// A row for a module that works but is driven from a control elsewhere in the
-/// panel. Not dimmed — it is functional — but non-activatable, since its switch
-/// would have nothing to gate.
+/// A catalog row whose capability is handled by a control outside the module
+/// list. Not dimmed, but non-activatable because it has no per-row switch state.
 fn elsewhere_module_row(label: &str, hint: &str) -> adw::ActionRow {
     // Single-line header (title only): the hint folds into the tooltip +
     // accessible description (empty subtitle would shadow the tooltip for
@@ -2784,13 +2783,17 @@ pub(crate) fn is_live_module(label: &str) -> bool {
     LIVE_MODULE_LABELS.contains(&label) || ELSEWHERE_MODULE_LABELS.contains(&label)
 }
 
-/// Catalog labels whose functionality *is* implemented, but through dedicated
-/// controls elsewhere in the darkroom panel rather than a row in this list —
-/// Crop has its own mode toggle and overlay, Rotate & perspective the Straighten
-/// slider, and Demosaic has a Bayer-only selector above the module list. Marking
-/// them "not yet wired" would be simply false, so they count as live and are
-/// labelled with where their controls actually are.
-const ELSEWHERE_MODULE_LABELS: &[&str] = &["Crop", "Rotate & perspective", "Demosaic"];
+/// Catalog labels represented by controls outside the module list: Crop has
+/// its own toggle/overlay; Rotate & perspective uses the Straighten slider;
+/// Demosaic has a Bayer-only selector above the list; Output color profile
+/// links to a global Export-dialog choice, not per-image module parity. These
+/// product capabilities count as active and are labeled with their controls.
+const ELSEWHERE_MODULE_LABELS: &[&str] = &[
+    "Crop",
+    "Rotate & perspective",
+    "Demosaic",
+    "Output color profile",
+];
 
 /// Where a module implemented outside this list keeps its controls.
 fn elsewhere_hint(label: &str) -> Option<&'static str> {
@@ -2798,6 +2801,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
         "Crop" => Some("use the Crop button above"),
         "Rotate & perspective" => Some("use the Straighten slider above"),
         "Demosaic" => Some("use the Bayer demosaic selector above (Bayer RAW only)"),
+        "Output color profile" => Some("choose the global export profile in the Export dialog"),
         _ => None,
     }
 }
@@ -5283,6 +5287,10 @@ mod tests {
             elsewhere_hint("Demosaic"),
             Some("use the Bayer demosaic selector above (Bayer RAW only)")
         );
+        assert_eq!(
+            elsewhere_hint("Output color profile"),
+            Some("choose the global export profile in the Export dialog")
+        );
         assert_eq!(elsewhere_hint("Grain"), None);
     }
 
@@ -5301,6 +5309,7 @@ mod tests {
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Highpass", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Demosaic", ""));
+        assert!(module_filter_matches(ModuleFilter::Active, 2, "Output color profile", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
