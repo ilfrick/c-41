@@ -2752,6 +2752,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Bloom" => bloom_module_row(ctx).upcast(),
                 "Grain" => grain_module_row(ctx).upcast(),
                 "Soften" => soften_module_row(ctx).upcast(),
+                "Chromatic aberrations" => chromatic_aberrations_module_row(ctx).upcast(),
                 "Defringe" => defringe_module_row(ctx).upcast(),
                 "Color zones" => colorzones_module_row(ctx).upcast(),
                 "Tone curve" => curve_editor::tonecurve_module_row(ctx).upcast(),
@@ -3057,7 +3058,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile", "Framing"];
+const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Defringe", "Invert", "White balance", "Input color profile", "Framing"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3276,6 +3277,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
         ),
         "Hot pixels" => set!(hotpixels_on, hotpixels_threshold, hotpixels_strength, hotpixels_permissive),
         "Denoise (profiled)" => set!(dn_on, dn_mode_y0u0v0, dn_strength, dn_shadows, dn_bias),
+        "Chromatic aberrations" => set!(cac_on, cac_guide, cac_radius, cac_strength, cac_mode, cac_refine),
         "Lens correction" => set!(
             lens_on,
             lens_inverse,
@@ -5445,6 +5447,110 @@ fn defringe_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         })
 }
 
+/// Guide-channel choices for [`chromatic_aberrations_module_row`] — the C's
+/// `dt_iop_cacorrectrgb_guide_channel_t` `$DESCRIPTION` labels in enum order,
+/// so the dropdown index IS the ordinal (same shape as `DEFRINGE_MODES`).
+const CAC_GUIDE_CHANNELS: [&str; 3] = ["red", "green", "blue"];
+
+/// Correction-mode choices for [`chromatic_aberrations_module_row`] — the C's
+/// `dt_iop_cacorrectrgb_mode_t` `$DESCRIPTION` labels in enum order (index ==
+/// ordinal).
+const CAC_MODES: [&str; 3] = ["standard", "darken only", "brighten only"];
+
+/// The dropdown labels' declared length pins against the enum arity at compile
+/// time (`DropDown::from_strings` needs the slice), just like
+/// `DEFRINGE_MODES`; the assert is documentation of the index==ordinal invari-
+/// ant, not a runtime check.
+const _: () = assert!(CAC_GUIDE_CHANNELS.len() == 3 && CAC_MODES.len() == 3);
+
+/// Chromatic aberrations (cacorrectrgb.c): manifold-based estimation of the
+/// correction ratios between the guide channel and the other two, applied per
+/// pixel by a weighted geometric mean. iop_order.c v50 pos 13.5 — right after
+/// lens, before exposure — a normal pipeline stage, so `module_expander`'s
+/// plain re-render applies (no re-decode).
+///
+/// Controls mirror darktable's: the guide-channel combobox (red/green/blue
+/// `$DESCRIPTION`s), radius and strength sliders, and under "advanced" the
+/// correction-mode combobox and the "very large chromatic aberration" toggle
+/// (`refine_manifolds`).
+///
+/// **Radius range: the C's soft 1..20, not the hard 1..500** (same precedent
+/// as the denoise strength slider, which also exposes the soft range).
+/// `reload_defaults` sets `dt_bauhaus_slider_set_soft_range(radius, 1, 20)`
+/// over the introspection hard 1..500; c41 sliders have no soft/hard split,
+/// so the drag range is the soft one. Values 20..500 remain valid — the blob
+/// decode clamps to the hard range and `to_pipeline` maps them straight
+/// through — but the UI cannot reach them (darktable only can via text entry;
+/// documented limitation).
+fn chromatic_aberrations_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Chromatic aberrations", "correct chromatic aberration fringes", p0.cac_on,
+        |p, on| p.cac_on = on,
+        |e, ctx| {
+            // Guide channel: the DropDown index IS the enum ordinal (0 = R,
+            // 1 = G, 2 = B — darktable's default is G). Same shape as the
+            // defringe mode dropdown; the seed clamps so a blob carrying an
+            // out-of-range ordinal still shows a sane selection.
+            let guide = gtk4::DropDown::from_strings(&CAC_GUIDE_CHANNELS);
+            inset_dropdown(&guide);
+            guide.set_tooltip_text(Some(
+                "channel used as a reference to correct the other channels",
+            ));
+            guide.set_selected((p0.cac_guide as u32).min(2));
+            let g_ctx = ctx.clone();
+            guide.connect_selected_notify(move |dd| {
+                g_ctx.params.borrow_mut().cac_guide = dd.selected() as f32;
+                render_preview(&g_ctx);
+            });
+            e.add_row(&guide);
+
+            // Radius: soft 1..20 on the C's hard 1..500 (see the row doc).
+            add_param_slider(e, ctx, "Radius", 1.0, 20.0, 0.1, p0.cac_radius as f64,
+                |p, v| p.cac_radius = v);
+            // Strength: C introspection 0..4, default 0.5.
+            add_param_slider(e, ctx, "Strength", 0.0, 4.0, 0.01, p0.cac_strength as f64,
+                |p, v| p.cac_strength = v);
+
+            // Correction mode: dropdown index == enum ordinal (standard /
+            // darken only / brighten only). darktable keeps these under an
+            // "advanced parameters" section label; the expander rows have no
+            // section concept, so it sits directly below the sliders.
+            let mode = gtk4::DropDown::from_strings(&CAC_MODES);
+            inset_dropdown(&mode);
+            mode.set_tooltip_text(Some(
+                "correction mode; darken only is particularly efficient to \
+                 correct blue chromatic aberration",
+            ));
+            mode.set_selected((p0.cac_mode as u32).min(2));
+            let m_ctx = ctx.clone();
+            mode.connect_selected_notify(move |dd| {
+                m_ctx.params.borrow_mut().cac_mode = dd.selected() as f32;
+                render_preview(&m_ctx);
+            });
+            e.add_row(&mode);
+
+            // "Very large chromatic aberration" toggle (refine_manifolds) —
+            // the same CheckButton-in-ActionRow shape as the Hot pixels
+            // "Detection" row.
+            let refine = gtk4::CheckButton::with_label("Very large aberration");
+            refine.set_active(p0.cac_refine);
+            let r_ctx = ctx.clone();
+            refine.connect_toggled(move |b| {
+                r_ctx.params.borrow_mut().cac_refine = b.is_active();
+                render_preview(&r_ctx);
+            });
+            let pref = adw::ActionRow::builder()
+                .title("Refine manifolds")
+                .tooltip_text(
+                    "runs an iterative approach with several radii; improves \
+                     result on images with very large chromatic aberrations",
+                )
+                .build();
+            pref.add_suffix(&refine);
+            e.add_row(&pref);
+        })
+}
+
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     module_expander(ctx, "White balance", "channel multipliers", p0.temperature_on,
@@ -5682,6 +5788,10 @@ mod tests {
         assert!(is_live_module("Soften"), "the wired soften module must read as live");
         assert!(is_live_module("Highpass"), "ported module should be live");
         assert!(
+            is_live_module("Chromatic aberrations"),
+            "the wired cacorrectrgb module must read as live"
+        );
+        assert!(
             is_live_module("Raw black/white point"),
             "the wired rawprepare module must read as live"
         );
@@ -5898,6 +6008,17 @@ mod tests {
         // other display-referred creative modules) — pins the right group so
         // the Active filter counts it where darktable shows it.
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Framing", ""));
+        // Chromatic aberrations sits in the catalog's Correct group (index 3,
+        // between Hot pixels and Defringe, mirroring darktable's presentation)
+        // and is live. Pin the group slot by scanning the catalog directly
+        // (`module_filter_matches(Group(gi))` only compares group indices and
+        // is agnostic to which label sits there).
+        assert!(is_live_module("Chromatic aberrations"));
+        let cac_group = crate::catalog::module_catalog()
+            .iter()
+            .position(|g| g.modules.iter().any(|m| m.label == "Chromatic aberrations"));
+        assert_eq!(cac_group, Some(3));
+        assert!(module_filter_matches(ModuleFilter::Active, 3, "Chromatic aberrations", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
@@ -6264,6 +6385,14 @@ mod tests {
             p.brd_frame_color_g = M;
             p.brd_frame_color_b = M;
         }),
+        ("Chromatic aberrations", |p| {
+            p.cac_on = true;
+            p.cac_guide = M;
+            p.cac_radius = M;
+            p.cac_strength = M;
+            p.cac_mode = M;
+            p.cac_refine = true;
+        }),
         ("Grain", |p| {
             p.gr_on = true;
             p.gr_coarseness = M;
@@ -6576,6 +6705,12 @@ mod tests {
             rwp_black2: _,
             rwp_black3: _,
             rwp_white: _,
+            cac_on: _,
+            cac_guide: _,
+            cac_radius: _,
+            cac_strength: _,
+            cac_mode: _,
+            cac_refine: _,
             brd_on: _,
             brd_size: _,
             brd_pos_h: _,

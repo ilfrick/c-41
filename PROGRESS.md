@@ -9231,3 +9231,83 @@ a no-op to avoid the i64 overflow a debug build panics on. Focused re-review:
 no blockers. Final `scripts/ci-local.sh` all four steps green (1 950
 `c41-core` / 556 `c41-ui`); `git diff --check` passed. No deployment changed;
 installers untracked and untouched.
+
+## 2026-11-10 17:55 UTC — S2: Chromatic aberrations (cacorrectrgb) LIVE
+
+Sprint S2 of the parity plan: the catalogue row `Chromatic aberrations`
+(darktable `cacorrectrgb`) is now a live darkroom module. Catalogue 47/52 →
+48/52 active (43 live + 5 elsewhere-driven), 4 inert left
+(`Color calibration` · `Retouch` · `Liquify` · `Watermark`).
+
+WHAT
+- `crates/c41-core/src/iop/cacorrectrgb.rs`: new pure-Rust `CacorrectrgbParams`
+  (`guide: u8` 0=R/1=G/2=B, `radius`, `strength`, `mode: u8`, `refine: bool`)
+  + `process(pixels, w, h, params) -> Vec<f32>` replicating the C
+  `reduce_chromatic_aberrations` exactly at whole-frame scale 1:
+  sigma=max(radius,1), sigma2=max(radius²,1), downsize=min(3,sigma),
+  safety=20^(1-strength); 4ch bilinear downsample (the existing
+  `fast_guided_filter::interpolate_bilinear` port) → `get_manifolds`
+  (Gaussian `blur_4c` ×5 + the 7 unchanged FFI kernels:
+  normalize/build/refine/pack_manifolds, with the refine pass re-blurring at
+  `sigma` not `sigma2` per the C) → 6ch bilinear upsample → `apply_correction`
+  → `reduce_artifacts` (pack_inout + blend_artifacts with safety).
+  `guide`/`mode` clamped `.min(2)` (the C can never see 0..2-FROM ITS OWN UI;
+  blob-only hardening — the kernels guard-return on bad ordinals). Float and
+  argument order verified against the C/FFI wrappers in review.
+- `crates/c41-core/src/pipeline.rs`: `Stage::ChromaticAberrations {
+  guide, radius, strength, mode, refine }`, v50 pos 13.5 = immediately after
+  the lens block in the non-raw funnel and after `denoise` in the raw funnel
+  (lens pre-applied full-frame there), before exposure/sigmoid — pinned by the
+  ordering tests. `is_pixel_local=false` (whole-frame serial like Bloom),
+  `working_space=None` (IOP_CS_RGB), `name()="cacorrectrgb"`.
+  **Placement deviation documented**: raw pipeline runs post-geometry (c41
+  crops/orients before the pipeline) whereas v50 puts 13.5 before crop/flip —
+  same class as Defringe/lens.
+- `crates/c41-ui/src/preview.rs`: PreviewParams **v35** (append-only):
+  +1 bool `cac_on` (46), +1 bool `cac_refine` (47), +4 f32 `cac_guide/radius/
+  strength/mode` (478–481); ENCODE_VERSION 35, ENCODED_LEN 1977,
+  layout (35,48,482); v34 blobs decode cac all-off/defaults (version+exact
+  length dispatch). Flag-only `is_identity` gate (an enabled-at-defaults run is
+  genuinely NOT a pass-through: even strength 0 runs apply_correction + blend —
+  validated against the C). to_pipeline maps params → stage. describe_change →,
+  fully_populated_params arm.
+- `crates/c41-ui/src/darkroom/mod.rs`: `chromatic_aberrations_module_row` in
+  the catalog's Correct group (index 3): guide DropDown (R/G/B), Radius slider
+  soft 1..20 / hard 1..500 (denoise precedent — sliders expose the soft range;
+  decode clamps hard), Strength 0..4, mode DropDown (standard/darken/brighten),
+  refine toggle. dispatch, reset arm, LIVE_MODULE_LABELS (42→43),
+  MODULE_MUTATIONS, filter/live-label tests.
+- `crates/c41-ui/src/history.rs`: describe_change "Chromatic aberrations",
+  blob-length pin 1959→1977.
+- `crates/c41-ui/src/stylemodules.rs`: MODULE_GROUPS 41→42 + copy_module_group
+  arm.
+
+VERIFY
+- `scripts/ci-local.sh` all four steps green (cargo check / clippy /
+  test --release with **1 960 c41-core / 560 c41-ui** / c41-rs release link);
+  `git diff --check` clean.
+- Review (independent senior, sw-vv-engineer): **APPROVE**, zero blockers —
+  float/arg-order parity is by construction (same FFI kernels + same
+  interpolate_bilinear/Gaussian the C path uses), append-only invariant sound.
+- Review M1 hardening applied: `cac_strength` NaN from a hand-corrupt blob is
+  now folded to the default at decode (f32::clamp leaves NaN untouched, and
+  strength feeds `safety` directly with no `.max(1.0)` NaN fold).
+
+NOTES / FAILURES
+- First CI run: two test failures from the developing code, both fixed.
+  1. `driver_out_of_range_ordinals_are_clamped_not_ub` asserted a clamped
+     run equals the *default* run — but clamp maps guide/mode 9→2 (highest legal
+     ordinal), not → default (1/0), so last-ulp differences tripped it. Rewrote
+     to compare the 9/9 run bit-identically against an explicit 2/2 run.
+  2. `module_filter_matches_scope_and_search` asserted cac was NOT live in the
+     Effect group. Two mistakes: (a) I first "fixed" it to `Group(4)`-negative,
+     but `module_filter_matches(Group(gi))` only compares group indices and is
+     agnostic to the label's real slot — trivially true; replaced with a direct
+     `module_catalog()` position scan asserting Some(3) + a plain Active/liveness
+     assert. (b) Earlier I lazily injected statements into an EDIT batch whose
+     sed read the file concurrently and showed stale text — the edit did land;
+     keep edits+reads in separate batches.
+- Driver limitations (documented in review M2): tiny frames where
+  width/downsize==0 produce deterministic degenerate output where the C reads
+  uninitialised malloc; radius 20..500 not reachable from the slider (soft range
+  only); non-pixel-local forces the serial whole-frame path like Bloom.

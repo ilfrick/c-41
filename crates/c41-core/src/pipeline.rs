@@ -639,6 +639,64 @@ pub enum Stage {
         /// buffer in the final blend.
         amount: f32,
     },
+    /// Chromatic aberrations (cacorrectrgb.c) — manifold-based estimation of
+    /// the correction ratios between the guide channel and the two others,
+    /// applied per pixel by weighted geometric mean. iop_order.c v50 pos
+    /// **13.5**, immediately after lens (13.0) and before exposure (21.0):
+    /// the C comment there says it must run after lensfun so the lens
+    /// correction does not reintroduce chromatic aberrations while trying to
+    /// correct them.
+    ///
+    /// The stage holds the raw user params (the C's `dt_iop_cacorrectrgb_params_t`
+    /// as enums + floats); everything else — sigma/sigma2/safety, the
+    /// 4ch downsample, the manifold passes, the 6ch upsample and the artifact
+    /// reduction — is derived inside the driver [`cacorrectrgb::process`]
+    /// exactly as `cacorrectrgb.c::process` derives it before calling
+    /// `reduce_chromatic_aberrations`. `default_colorspace()` is `IOP_CS_RGB`,
+    /// so the stage works directly on the linear RGB lanes: `working_space()`
+    /// returns `None`, no Lab sandwich.
+    ///
+    /// **NOT pixel-local**: every stage of the driver (bilinear resampling,
+    /// recursive Gaussian on the manifolds, the artifact blur) reads spatial
+    /// neighbourhoods, so band-splitting would blur across band seams;
+    /// `process` routes the whole frame serial, same reason as
+    /// Bloom/LensCorrection/Soften.
+    ///
+    /// **Identity gate: flag-only, like Bloom.** There is no slider combination
+    /// that is a pass-through while enabled: at the darktable defaults
+    /// (G, radius 5, strength 0.5, standard, no refine) the C runs the full
+    /// manifold pipeline and a `safety = 20^(1-0.5) ≈ 4.47` artifact blend —
+    /// a real edit, not a no-op — so `to_pipeline` emits the stage whenever
+    /// `cac_on` is set and `is_identity` mirrors it. (`strength 0` is *not*
+    /// gated: it makes `safety = 20` and the blend conservative, but
+    /// `apply_correction` still runs — match the C, don't special-case it.)
+    ///
+    /// **Placement deviation, documented like Defringe/Lowpass:** v50 runs
+    /// 13.5 before flip (16) and crop (17); c41's raw funnels crop and orient
+    /// the base *before* the pipeline runs (the lens pre-pass is the only
+    /// 13.x predecessor that is hoisted above geometry, m4-131), so this stage
+    /// corrects the post-geometry frame. The pipeline-visible invariant that
+    /// IS preserved — and pinned by the ordering test — is the v50 adjacency
+    /// to lens: in the non-raw funnels the two stages run adjacent
+    /// (`lens` then `cacorrectrgb`, both before exposure); in the raw funnels
+    /// the lens pre-pass has already run on the full frame, so
+    /// `cacorrectrgb` sits directly after denoise, exactly where lens would
+    /// have been. See `Stage::Defringe` for the precedent for this class of
+    /// deviation.
+    ChromaticAberrations {
+        /// Guide channel enum ordinal (0 = R, 1 = G, 2 = B — darktable
+        /// default G). Filtered to 0..=2 by the driver.
+        guide: u8,
+        /// `radius` slider, 1..500 (darktable default 5). `sigma = max(radius, 1)`.
+        radius: f32,
+        /// `strength` slider, 0..4 (darktable default 0.5). `safety = 20^(1-strength)`.
+        strength: f32,
+        /// Correction mode enum ordinal (0 = STANDARD, 1 = DARKEN, 2 = BRIGHTEN).
+        mode: u8,
+        /// "Very large chromatic aberration" toggle: runs the sigma2-first
+        /// manifold pass plus a refinement pass. Darktable default off.
+        refine: bool,
+    },
     /// Defringe (defringe.c) — attenuate chromatic aberration by replacing the
     /// a/b of any pixel whose "edge chroma" exceeds a threshold with an
     /// inverse-chroma-weighted average of a Fibonacci-lattice sample of its
@@ -763,6 +821,7 @@ impl Stage {
             Stage::FilmicRgb { .. } => "filmicrgb",
             Stage::DenoiseProfile { .. } => "denoiseprofile",
             Stage::LensCorrection { .. } => "lens",
+            Stage::ChromaticAberrations { .. } => "cacorrectrgb",
             Stage::Grain { .. } => "grain",
             Stage::Soften { .. } => "soften",
             Stage::Defringe { .. } => "defringe",
@@ -921,6 +980,12 @@ impl Stage {
             // pipeline serial whenever this stage is present — same reason as
             // Bloom/Lowpass/Shadhi/Soften.
             Stage::Defringe { .. } => false,
+            // ChromaticAberrations is NOT pixel-local: the bilinear downsample/
+            // upsample, the manifold Gaussian passes and the artifact-reduction
+            // blur all read spatial neighbourhoods, so band-splitting would hand
+            // each band a (band_pixels, 1) strip whose neighbourhoods cross band
+            // seams. Serial whole-frame only, like Bloom/Soften/Defringe.
+            Stage::ChromaticAberrations { .. } => false,
         }
     }
 
@@ -1012,6 +1077,11 @@ impl Stage {
             // IOP_CS_LAB) — every read and write in `defringe::process` is a Lab
             // read and write, so it must agree with the other Lab stages.
             Stage::Defringe { space, .. } => Some(*space),
+            // ChromaticAberrations works directly on the linear RGB lanes
+            // (cacorrectrgb.c default_colorspace is IOP_CS_RGB) — the manifold
+            // ratios are per-channel RGB ratios, no Lab conversion, so no
+            // working-space agreement is needed.
+            Stage::ChromaticAberrations { .. } => None,
             _ => None,
         }
     }
@@ -1972,6 +2042,25 @@ impl Stage {
             Stage::LensCorrection { lens: ref resolved, ref params } => {
                 crate::iop::lens::process(input, output, width, height, resolved, params);
             }
+            // ── Chromatic aberrations (cacorrectrgb.c) ──────────────────
+            // Manifold-based chroma correction. Works directly in linear RGB
+            // and is NOT pixel-local (bilinear resampling + manifold Gaussian
+            // passes + artifact blur), so `process` guarantees (width, height)
+            // is the whole frame here — same serial-path contract as
+            // LensCorrection/Soften/Defringe. The driver replicates the C's
+            // `reduce_chromatic_aberrations` exactly at the scale-1 contract;
+            // the stage carries the raw user params.
+            Stage::ChromaticAberrations { guide, radius, strength, mode, refine } => {
+                let corrected = crate::iop::cacorrectrgb::process(
+                    input,
+                    width,
+                    height,
+                    crate::iop::cacorrectrgb::CacorrectrgbParams {
+                        guide, radius, strength, mode, refine,
+                    },
+                );
+                output.copy_from_slice(&corrected);
+            }
             // ── Grain (grain.c) ─────────────────────────────────────────
             // Simplex-noise grain on Lab L only, shaped by the paper-response
             // LUT. Same RGB↔Lab sandwich as the other Lab-domain stages; the
@@ -2635,6 +2724,51 @@ mod tests {
             .is_pixel_local(),
             "lens correction warps coordinates ⇒ NOT pixel-local"
         );
+        // ChromaticAberrations is NOT pixel-local: the bilinear resampling, the
+        // manifold Gaussian passes and the artifact blur all read spatial
+        // neighbourhoods — band-splitting would seam at band boundaries.
+        assert!(
+            !Stage::ChromaticAberrations {
+                guide: 1, radius: 5.0, strength: 0.5, mode: 0, refine: false,
+            }
+            .is_pixel_local(),
+            "chromatic aberrations resamples + blurs neighbourhoods ⇒ NOT pixel-local"
+        );
+    }
+
+    #[test]
+    fn chromatic_aberrations_stage_changes_and_is_deterministic() {
+        // Stage-level smoke: the apply arm must run the driver over the whole
+        // frame (serial path) and deterministically rewrite a CA-fringe frame
+        // while leaving a flat frame within tolerance of unchanged — the same
+        // contract the driver tests pin, through the Stage boundary.
+        let w = 40usize;
+        let h = 24usize;
+        let flat = vec![0.25f32; w * h * 4];
+        let stage = Stage::ChromaticAberrations {
+            guide: 1, radius: 5.0, strength: 0.5, mode: 0, refine: false,
+        };
+        assert_eq!(stage.name(), "cacorrectrgb");
+        let flat_out = Pipeline::with_stages(vec![stage.clone()]).process(&flat, w, h);
+        for (o, i) in flat_out.iter().zip(&flat) {
+            assert!((o - i).abs() < 1e-3, "flat stays flat-ish under the stage: {o} vs {i}");
+        }
+        // A lateral-fringe frame (R/B bar shifted off the G guide bar).
+        let mut fringe = flat.clone();
+        for j in 0..h {
+            for i in 0..w {
+                let b = (j * w + i) * 4;
+                if i >= w / 2 - 1 && i <= w / 2 { fringe[b + 1] = 0.9; }
+                if i > w / 2 - 1 && i < w / 2 + 1 { fringe[b + 2] = 0.9; }
+                if i >= w / 2 - 2 && i <= w / 2 - 1 { fringe[b] = 0.9; }
+            }
+        }
+        let a = Pipeline::with_stages(vec![stage.clone()]).process(&fringe, w, h);
+        let b = Pipeline::with_stages(vec![stage]).process(&fringe, w, h);
+        assert_eq!(a, b, "stage output must be deterministic");
+        assert_ne!(a, fringe, "enabled-at-defaults is a real edit on fringes");
+        // No NaN/Inf can survive the round-trip.
+        assert!(a.iter().all(|v| v.is_finite()));
     }
 
     #[test]

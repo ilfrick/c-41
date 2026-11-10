@@ -762,6 +762,31 @@ pub struct PreviewParams {
     pub brd_frame_color_r: f32,
     pub brd_frame_color_g: f32,
     pub brd_frame_color_b: f32,
+    // ── Chromatic aberrations (cacorrectrgb.c, iop_order.c v50 pos 13.5) ────
+    // A normal pipeline stage right after lens (13.0), before exposure
+    // (21.0): manifold-based estimation of the correction ratios between the
+    // guide channel and the two others. Runs on linear RGB (`IOP_CS_RGB`),
+    // whole-frame serial (bilinear resampling + manifold Gaussian passes;
+    // see `Stage::ChromaticAberrations`). Ships off, like darktable's
+    // default.
+    /// Chromatic aberrations module enabled.
+    pub cac_on: bool,
+    /// Guide channel enum ordinal, 0..2 (0 = R, 1 = G, 2 = B), stored as f32
+    /// like the other dropdown ordinals. Default 1 = G (darktable
+    /// `DT_CACORRECT_RGB_G`).
+    pub cac_guide: f32,
+    /// `radius` slider, 1..500, darktable default 5. sigma = max(radius, 1)
+    /// at the scale-1 c41 contract.
+    pub cac_radius: f32,
+    /// `strength` slider, 0..4, darktable default 0.5. safety = 20^(1−strength).
+    pub cac_strength: f32,
+    /// Correction mode enum ordinal, 0..2 (0 = STANDARD, 1 = DARKEN,
+    /// 2 = BRIGHTEN), default 0.
+    pub cac_mode: f32,
+    /// "Very large chromatic aberration" toggle (darktable
+    /// `refine_manifolds`), default off: runs the sigma2-first manifold pass
+    /// plus a refinement pass.
+    pub cac_refine: bool,
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -1075,6 +1100,17 @@ impl Default for PreviewParams {
             brd_frame_color_r: 0.0,
             brd_frame_color_g: 0.0,
             brd_frame_color_b: 0.0,
+            // Chromatic aberrations: off, with the darktable
+            // `reload_defaults` values (cacorrectrgb.c:401-409) for the
+            // wired controls — guide G, radius 5, strength 0.5, mode
+            // STANDARD, no refinement. Inert exactly because `cac_on` gates
+            // the pipeline stage (see `to_pipeline_inner`).
+            cac_on: false,
+            cac_guide: 1.0,   // DT_CACORRECT_RGB_G (1)
+            cac_radius: 5.0,  // $DEFAULT
+            cac_strength: 0.5, // $DEFAULT
+            cac_mode: 0.0,    // DT_CACORRECT_MODE_STANDARD (0)
+            cac_refine: false,
             df_on: false,
             df_radius: 4.0,   // defringe.c $DEFAULT
             df_thresh: 20.0,  // defringe.c $DEFAULT
@@ -1316,6 +1352,15 @@ impl PreviewParams {
         // while enabled (amount 0 does reproduce the input, but `to_pipeline`
         // still emits the stage whenever enabled, so the gate mirrors it).
         let soften_identity = !self.soften_on;
+        // Chromatic aberrations gates on the enable flag alone (Bloom policy):
+        // there is no slider combination that is a pass-through while enabled.
+        // At the darktable defaults (guide G, radius 5, strength 0.5, standard)
+        // the C runs the full manifold pipeline with safety = 20^(1−0.5) ≈ 4.47
+        // and a real artifact blend — and `strength 0` still runs
+        // `apply_correction` (safety = 20 makes the blend conservative, not
+        // identity), so even the "neutral" strength 0 is not gated. The gate
+        // mirrors `to_pipeline`, which emits the stage whenever `cac_on`.
+        let cac_identity = !self.cac_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1337,6 +1382,7 @@ impl PreviewParams {
             && gr_identity
             && highpass_identity
             && soften_identity
+            && cac_identity
     }
 
     /// Hot-pixel options for raw decode; `None` while the module is off.
@@ -1593,7 +1639,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on, self.brd_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on, self.brd_on, self.cac_on, self.cac_refine] {
             v.push(b as u8);
         }
         for f in [
@@ -1786,7 +1832,11 @@ impl PreviewParams {
                   self.brd_size, self.brd_pos_h, self.brd_pos_v,
                   self.brd_color_r, self.brd_color_g, self.brd_color_b,
                   self.brd_frame_size, self.brd_frame_offset,
-                  self.brd_frame_color_r, self.brd_frame_color_g, self.brd_frame_color_b] {
+                  self.brd_frame_color_r, self.brd_frame_color_g, self.brd_frame_color_b,
+                  // Chromatic aberrations (v35): the guide/mode dropdown
+                  // ordinals plus radius and strength, appended after the
+                  // Framing block so the layout stays append-only.
+                  self.cac_guide, self.cac_radius, self.cac_strength, self.cac_mode] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -2115,6 +2165,28 @@ impl PreviewParams {
             brd_frame_color_r: f.get(475).copied().unwrap_or(d.brd_frame_color_r),
             brd_frame_color_g: f.get(476).copied().unwrap_or(d.brd_frame_color_g),
             brd_frame_color_b: f.get(477).copied().unwrap_or(d.brd_frame_color_b),
+            // Chromatic aberrations (v35): bools 46–47, floats 478–481.
+            // v34-and-earlier blobs end before any of this — every `.get`
+            // misses and each slot keeps its default (cac off ⇒ no stage,
+            // exactly like reading a fresh edit). The ordinals are stored raw
+            // like `df_mode` (a faithful record; the stage clamps to 0..=2
+            // and the UI dropdowns clamp on the way out), while radius and
+            // strength are bounded to the C hard ranges like `df_radius`.
+            cac_on: bools.get(46).map_or(d.cac_on, |&b| b != 0),
+            cac_guide: f.get(478).copied().unwrap_or(d.cac_guide),
+            cac_radius: f.get(479).copied().unwrap_or(d.cac_radius).clamp(1.0, 500.0),
+            // `cac_strength` feeds `safety = 20f32.powf(1 - strength)` directly
+            // in the core driver (no `.max(1.0)` NaN fold like sigma), so a
+            // non-finite blob value must be folded to the default: `f32::clamp`
+            // leaves NaN untouched and would otherwise propagate NaN colour
+            // through `blend_artifacts`. Radius is NaN-safe downstream
+            // (`f32::max(1.0, NaN)` yields 1.0).
+            cac_strength: {
+                let v = f.get(480).copied().unwrap_or(d.cac_strength);
+                if !v.is_finite() { d.cac_strength } else { v.clamp(0.0, 4.0) }
+            },
+            cac_mode: f.get(481).copied().unwrap_or(d.cac_mode),
+            cac_refine: bools.get(47).map_or(d.cac_refine, |&b| b != 0),
         })
     }
 
@@ -2271,6 +2343,28 @@ impl PreviewParams {
                     params: self.lens_params(cam, lens),
                 });
             }
+        }
+        // Chromatic aberrations (cacorrectrgb.c, iop_order.c v50_order pos
+        // 13.5 — immediately after lens 13.0, before exposure 21.0; the C
+        // comment there says it must run after lensfun so the lens correction
+        // does not reintroduce CA). The stage is emitted on the enable flag
+        // alone (is_identity mirrors this): there is no neutral slider
+        // combination while enabled — even at strength 0 the C still runs
+        // apply_correction. In the non-raw funnels (`to_pipeline_with`) it
+        // lands right after the in-pipeline lens stage, preserving the v50
+        // adjacency; in the raw funnels the lens pre-pass already ran on the
+        // full frame before geometry, so `cacorrectrgb` sits directly after
+        // denoise — exactly where lens would have been (see
+        // `Stage::ChromaticAberrations` for the documented post-geometry
+        // placement deviation).
+        if self.cac_on {
+            p.push(Stage::ChromaticAberrations {
+                guide: self.cac_guide as u8,
+                radius: self.cac_radius,
+                strength: self.cac_strength,
+                mode: self.cac_mode as u8,
+                refine: self.cac_refine,
+            });
         }
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
@@ -3035,9 +3129,12 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v34 adds Framing (1 bool + 11 f32: size, pos_h/v, border RGB,
 /// frame size/offset, frame RGB) — a GEOMETRY-family compose (base-image
 /// enlarge like crop), so it joins the blob but not is_identity/pipeline.
-const ENCODE_VERSION: u8 = 34;
-/// 1 version byte + 46 bool bytes + 478 little-endian f32.
-const ENCODED_LEN: usize = 1 + 46 + 478 * 4;
+/// v35 adds Chromatic aberrations (2 bools + 4 f32: the guide/mode dropdown
+/// ordinals, radius, strength) — a normal pipeline stage (v50 pos 13.5),
+/// so it joins is_identity and to_pipeline.
+const ENCODE_VERSION: u8 = 35;
+/// 1 version byte + 48 bool bytes + 482 little-endian f32.
+const ENCODED_LEN: usize = 1 + 48 + 482 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -3067,6 +3164,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (32, 44, 462), // v32: raw hotpixels added
     (33, 45, 467), // v33: raw black/white point added
     (34, 46, 478), // v34: Framing (borders) geometry compose added
+    (35, 48, 482), // v35: Chromatic aberrations (cacorrectrgb) added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3892,6 +3990,16 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         brd_frame_color_r: 0.91,
         brd_frame_color_g: 0.02,
         brd_frame_color_b: 0.67,
+        // Chromatic aberrations (v35): both bools flipped from their defaults,
+        // every float off-default and pairwise distinct so a wrong offset in
+        // the trailing block shows as a mismatch. guide = 2 (B) and
+        // mode = 1 (DARKEN) deliberately diverge from the G/STANDARD defaults.
+        cac_on: true,
+        cac_guide: 2.0,      // B — non-default guide
+        cac_radius: 43.0,    // off the soft-range default 5
+        cac_strength: 1.75,
+        cac_mode: 1.0,       // DARKEN — non-default mode
+        cac_refine: true,
         df_on: true,
         df_radius: 7.5,
         df_thresh: 62.0,
@@ -3923,6 +4031,58 @@ mod tests {
         let base = vec![10u8, 20, 30, 200, 100, 50];
         let out = apply_pipeline(&base, 2, 1, 6, 3, &p);
         assert_eq!(out, base);
+    }
+
+    #[test]
+    fn chromatic_aberrations_default_off_stays_byte_identical() {
+        // The v35 constraint: a default edit (cac off) must round-trip the
+        // 8-bit preview byte-for-byte, exactly as if the module did not exist.
+        let base = vec![
+            12u8, 34, 56, 200,  // pixel 0 RGBA
+            78, 90, 123, 111,   // pixel 1
+            45, 67, 89, 255,    // pixel 2
+        ];
+        let d = PreviewParams::default();
+        assert!(!d.cac_on, "cac must ship off");
+        assert!(d.is_identity());
+        let out = apply_pipeline(&base, 3, 1, 4, 4, &d);
+        assert_eq!(out, base, "default-off must be byte-identical");
+    }
+
+    #[test]
+    fn chromatic_aberrations_enabled_changes_preview_and_export_deterministically() {
+        // A synthetic lateral-fringe linear frame (R/B bars shifted off the G
+        // guide bar — case (1) in cacorrectrgb.c's module comment): enabling
+        // the module at a non-default strength must change both the 8-bit
+        // preview and the 16-bit export encoding vs the disabled run, and two
+        // enabled runs must agree bit-for-bit (a deterministic pipeline).
+        let (w, h) = (64usize, 48usize);
+        let mut lin = vec![0.25f32; w * h * 4];
+        for j in 0..h {
+            for i in 0..w {
+                let b = (j * w + i) * 4;
+                lin[b + 3] = 1.0;
+                if i >= w / 2 - 1 && i <= w / 2 { lin[b + 1] = 0.9; }   // G guide bar
+                if i > w / 2 - 1 && i < w / 2 + 1 { lin[b + 2] = 0.9; } // B shifted right
+                if i >= w / 2 - 2 && i <= w / 2 - 1 { lin[b] = 0.9; }   // R shifted left
+            }
+        }
+        let off = render_linear_to_srgb8(&lin, w, h, &PreviewParams::default());
+        let mut on = PreviewParams::default();
+        on.cac_on = true;
+        on.cac_strength = 2.0;
+        on.cac_radius = 3.0;
+        let a = render_linear_to_srgb8(&lin, w, h, &on);
+        let b = render_linear_to_srgb8(&lin, w, h, &on);
+        assert_eq!(a, b, "enabled preview must be deterministic");
+        assert_ne!(a, off, "correcting fringes must change the preview");
+        // 16-bit exports share the same to_pipeline builder — the pipeline
+        // stage must show up there identically.
+        let off16 = render_linear_to_srgb16(&lin, w, h, &PreviewParams::default());
+        let a16 = render_linear_to_srgb16(&lin, w, h, &on);
+        assert_ne!(off16, a16, "export must change like the preview");
+        let b16 = render_linear_to_srgb16(&lin, w, h, &on);
+        assert_eq!(a16, b16, "enabled export must be deterministic");
     }
 
     #[test]
@@ -4415,6 +4575,11 @@ mod tests {
         // denoise profiled: pos 9/10 in v50_order — immediately after demosaic
         // 8, before exposure. On by itself is enough to emit the stage.
         p.dn_on = true;
+        // chromatic aberrations: pos 13.5 in v50_order — right after lens 13,
+        // before exposure 21 (the C comment: after lensfun so it does not
+        // reintroduce CA). On by itself is enough to emit the stage (flag-only
+        // gate, like Bloom).
+        p.cac_on = true;
         // bloom: pos 61 in v50_order — creative cluster, after velvia 57,
         // before colorize 62. On by itself is enough to emit the stage.
         p.bl_on = true;
@@ -4450,8 +4615,20 @@ mod tests {
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "highpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning"]
+            ["denoiseprofile", "cacorrectrgb", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "highpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning"]
         );
+        // Chromatic aberrations is scene-referred at v50 pos 13.5: between the
+        // denoise block (9/10) and exposure (21), on the raw linear frame. It
+        // must run BEFORE the sigmoid tone map — the manifolds estimate linear
+        // channel ratios, and the artifact blend compares linear local
+        // averages.
+        let cac_pos = names.iter().position(|n| *n == "cacorrectrgb").unwrap();
+        assert!(cac_pos < names.iter().position(|n| *n == "exposure").unwrap(),
+            "cacorrectrgb must run before exposure: {names:?}");
+        assert!(cac_pos > names.iter().position(|n| *n == "denoiseprofile").unwrap(),
+            "cacorrectrgb must run after denoiseprofile: {names:?}");
+        assert!(cac_pos < names.iter().position(|n| *n == "sigmoid").unwrap(),
+            "cacorrectrgb (v50 13.5) must run before the sigmoid tone map: {names:?}");
         // Base curve is the scene→display conversion point (iop_order.c pos
         // 44.0): after rgbcurve/rgblevels, before sigmoid and filmicrgb.
         let bc_pos = names.iter().position(|n| *n == "basecurve").unwrap();
@@ -4569,6 +4746,52 @@ mod tests {
             .map(|s| s.name())
             .collect();
         assert_eq!(names, ["denoiseprofile", "lens", "exposure"], "{names:?}");
+    }
+
+    #[test]
+    fn to_pipeline_orders_cacorrectrgb_adjacent_to_lens() {
+        // cacorrectrgb is v50 pos 13.5, immediately AFTER lens (13.0) — the
+        // C comment in iop_order.c says so that lensfun's own correction does
+        // not reintroduce chromatic aberrations. With both enabled the two
+        // stages must stay adjacent in that order inside the scene-referred
+        // pre-exposure cluster. (Needs real gear for the lens stage, so it
+        // skips where the lensfun database is absent, like
+        // to_pipeline_orders_lens_between_denoise_and_exposure.)
+        let Some(gear) = c41_core::iop::lens::resolve(
+            "Canon",
+            "Canon EOS 5D Mark II",
+            "Canon",
+            "Canon EF 50mm f/1.4 USM",
+        ) else {
+            eprintln!("skip: lensfun database unavailable");
+            return;
+        };
+        let mut p = PreviewParams::default();
+        p.dn_on = true;
+        p.lens_on = true;
+        p.cac_on = true;
+        p.exposure_on = true;
+        p.ev = 0.5; // off-default so exposure is emitted
+        let names: Vec<&str> = p
+            .to_pipeline_with(ColorSpace::LinearSrgb, 1.0, Some(&gear), 0)
+            .stages
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(
+            names,
+            ["denoiseprofile", "lens", "cacorrectrgb", "exposure"],
+            "lens 13.0 then cacorrectrgb 13.5, both before exposure 21: {names:?}"
+        );
+        // The raw builder (lens pre-applied) drops only the lens stage: cac
+        // stays directly after denoise, in the position lens would have had.
+        let pre: Vec<&str> = p
+            .to_pipeline_lens_preapplied(ColorSpace::LinearSrgb, 1.0, Some(&gear), 0)
+            .stages
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(pre, ["denoiseprofile", "cacorrectrgb", "exposure"], "{pre:?}");
     }
 
     #[test]
@@ -5064,6 +5287,34 @@ mod tests {
         assert_eq!((decoded.brd_frame_color_r, decoded.brd_frame_color_g, decoded.brd_frame_color_b),
                    (def.brd_frame_color_r, def.brd_frame_color_g, def.brd_frame_color_b));
         assert!(decoded.borders_params().is_none(), "a pre-framing edit must not compose a border");
+    }
+
+    #[test]
+    fn decode_v34_blob_defaults_chromatic_aberrations() {
+        // A v34 blob (the last layout before Chromatic aberrations — 46 bools
+        // / 478 f32s) must decode with cac OFF and its controls at the
+        // darktable defaults, so an image edited before the module existed
+        // loads unchanged instead of gaining a manifold correction behind the
+        // user's back. `cac_on` is the load-bearing flag: `unwrap_or(true)`
+        // would correct every saved edit.
+        let v34 = {
+            let mut b = vec![0u8; 1 + 46 + 478 * 4];
+            b[0] = 34;
+            b
+        };
+        let decoded = PreviewParams::decode(&v34).expect("v34 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert!(!decoded.cac_on);
+        assert!(!decoded.cac_refine);
+        assert_eq!(decoded.cac_guide, def.cac_guide);
+        assert_eq!(decoded.cac_radius, def.cac_radius);
+        assert_eq!(decoded.cac_strength, def.cac_strength);
+        assert_eq!(decoded.cac_mode, def.cac_mode);
+        // And it must still be an identity pipeline — the real consequence of
+        // the defaults being right.
+        assert!(decoded.is_identity());
+        assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
+            "a pre-cac edit must not gain a chromatic-aberrations stage");
     }
 
     #[test]

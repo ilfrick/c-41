@@ -1,3 +1,5 @@
+use crate::fast_guided_filter::interpolate_bilinear;
+use crate::gaussian::{Gaussian, GaussianOrder};
 use crate::{params::IopParams, roi::RoiIn, Result};
 use super::{ClBuffer, IopProcess};
 
@@ -11,6 +13,227 @@ impl IopProcess for Cacorrectrgb {
         Err(crate::Error::Pipeline("not implemented".into()))
     }
     fn name(&self) -> &'static str { "cacorrectrgb" }
+}
+
+/// Darkroom `cacorrectrgb` process parameters in the units the C `process`
+/// reads them (cacorrectrgb.c:145-154): raw slider values, not pre-scaled.
+/// `guide` is the `dt_iop_cacorrectrgb_guide_channel_t` enum ordinal (0 = R,
+/// 1 = G, 2 = B), `mode` the `dt_iop_cacorrectrgb_mode_t` ordinal (0 =
+/// STANDARD, 1 = DARKEN, 2 = BRIGHTEN), `refine` the "very large chromatic
+/// aberration" toggle. No working space: `default_colorspace()` returns
+/// `IOP_CS_RGB` — the kernels run straight on the RGB lanes, exactly like
+/// the pipeline stage that carries them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacorrectrgbParams {
+    pub guide: u8,
+    pub radius: f32,
+    pub strength: f32,
+    pub mode: u8,
+    pub refine: bool,
+}
+
+impl Default for CacorrectrgbParams {
+    /// The darktable defaults (`reload_defaults`, cacorrectrgb.c:401-409):
+    /// guide = G, radius 5, strength 0.5, mode STANDARD, no refinement.
+    fn default() -> Self {
+        Self { guide: 1, radius: 5.0, strength: 0.5, mode: 0, refine: false }
+    }
+}
+
+/// Whole-frame chromatic-aberration correction — the pure-Rust driver used
+/// by the product's `Stage::ChromaticAberrations`.
+///
+/// Replicates `reduce_chromatic_aberrations()` (cacorrectrgb.c:334-367) at
+/// the scale-1 whole-frame contract every c41 funnel hands the pipeline:
+/// bilinear 4ch downsample by `downsize = min(3, sigma)`, manifolds on the
+/// small buffer (`get_manifolds`, with `sigma/downsize` and `sigma2/downsize`
+/// blur sizes — the refinement pass only when `refine`), bilinear 6ch
+/// upsample back to full size, `apply_correction`, then `reduce_artifacts`.
+/// `process` (cacorrectrgb.c:369-396) folds `scale = max(iscale/in_scale, 1)`
+/// which is identically `1.0` here (every c41 caller hands one whole frame,
+/// so the ROI *is* the buffer — same precedent as `soften::radius_for` and
+/// defringe's folded ratio), giving `sigma = max(radius, 1)` and
+/// `sigma2 = max(radius², 1)`.
+///
+/// The math runs through the same 7 FFI kernels the C calls (the production
+/// binary's kernel set, reused rather than duplicated) plus the shared
+/// recursive Gaussian and `interpolate_bilinear` ports, so the float orders
+/// are the C's by construction: `safety = powf(20.0f, 1.0 - strength)`
+/// (cacorrectrgb.c:389), and every buffer is allocated fresh at the exact
+/// sizes the C allocates.
+///
+/// Hardening vs the C (documented, reachable only via hand-edited blobs):
+/// `guide` and `mode` are clamped to their enum ordinals' ranges so an
+/// out-of-range blob value cannot reach the kernel guards; the C can only
+/// ever receive 0..2 through its own UI. `process` hard-asserts the buffer
+/// length like `defringe::process` — the FFI kernels build raw slices from
+/// the dims, so a short buffer would be UB, not a panic, in release builds.
+pub fn process(pixels: &[f32], width: usize, height: usize, params: CacorrectrgbParams) -> Vec<f32> {
+    let npix = width.saturating_mul(height);
+    assert_eq!(pixels.len(), npix * 4, "cacorrectrgb: input must be width*height*4");
+    if npix == 0 || width == 0 || height == 0 {
+        return pixels.to_vec();
+    }
+    let guide = params.guide.min(2);
+    let mode = params.mode.min(2);
+    let scale = 1.0_f32; // max(iscale / roi_in->scale, 1.f) — identically 1 in c41
+    let sigma = (params.radius / scale).max(1.0);
+    let sigma2 = (params.radius * params.radius / scale).max(1.0);
+    let safety = 20.0_f32.powf(1.0 - params.strength);
+
+    // reduce_chromatic_aberrations (cacorrectrgb.c:334-367).
+    let downsize = sigma.min(3.0);
+    let ds_width = (width as f32 / downsize) as usize;
+    let ds_height = (height as f32 / downsize) as usize;
+    let mut ds_in = vec![0.0_f32; ds_width * ds_height * 4];
+    interpolate_bilinear(pixels, width, height, &mut ds_in, ds_width, ds_height, 4);
+
+    let mut ds_manifolds = vec![0.0_f32; ds_width * ds_height * 6];
+    get_manifolds(
+        &ds_in, ds_width, ds_height,
+        sigma / downsize, sigma2 / downsize,
+        guide, &mut ds_manifolds, params.refine,
+    );
+    drop(ds_in);
+
+    let mut manifolds = vec![0.0_f32; npix * 6];
+    interpolate_bilinear(&ds_manifolds, ds_width, ds_height, &mut manifolds, width, height, 6);
+    drop(ds_manifolds);
+
+    let mut out = vec![0.0_f32; npix * 4];
+    unsafe {
+        darkroom_cacorrectrgb_apply_correction(
+            pixels.as_ptr(), manifolds.as_ptr(), width, height,
+            guide as u32, mode as u32, out.as_mut_ptr(),
+        );
+    }
+    drop(manifolds);
+
+    reduce_artifacts(pixels, width, height, sigma, guide, safety, &mut out);
+    out
+}
+
+/// `get_manifolds` (cacorrectrgb.c:210-281): blur the input (larger sigma2
+/// when refining), build the higher/lower manifolds, blur both, normalise,
+/// then — for the refinement pass — re-blur the input at the normal sigma,
+/// refine, re-blur, re-normalise; finally pack into the 6-channel layout.
+/// The exact call order of the FFI kernels and both Gaussian passes is
+/// transcribed from the C; the clamp ranges are the C's `dt_aligned_pixel_t`
+/// `max = {FLT_MAX×3, FLT_MAX}` / `min = {-FLT_MAX, -FLT_MAX, -FLT_MAX, 0}`
+/// (cacorrectrgb.c:221-222).
+fn get_manifolds(
+    in_buf: &[f32],
+    width: usize,
+    height: usize,
+    sigma: f32,
+    sigma2: f32,
+    guide: u8,
+    manifolds_out: &mut [f32],
+    refine: bool,
+) {
+    let npx = width * height;
+    let mut blurred_in = vec![0.0_f32; npx * 4];
+    let mut manifold_higher = vec![0.0_f32; npx * 4];
+    let mut manifold_lower = vec![0.0_f32; npx * 4];
+    let mut blurred_manifold_higher = vec![0.0_f32; npx * 4];
+    let mut blurred_manifold_lower = vec![0.0_f32; npx * 4];
+
+    let max = [f32::MAX; 4];
+    let min = [-f32::MAX, -f32::MAX, -f32::MAX, 0.0];
+    // Start with a larger blur to estimate the manifolds if we refine them
+    // later on (cacorrectrgb.c:225-226).
+    let blur_size = if refine { sigma2 } else { sigma };
+    let mut g = Gaussian::new(width, height, min, max, blur_size, GaussianOrder::Zero);
+    g.blur_4c(in_buf, &mut blurred_in);
+
+    unsafe {
+        darkroom_cacorrectrgb_build_manifolds(
+            in_buf.as_ptr(), blurred_in.as_ptr(),
+            manifold_lower.as_mut_ptr(), manifold_higher.as_mut_ptr(),
+            width, height, guide as u32,
+        );
+    }
+    g.blur_4c(&manifold_higher, &mut blurred_manifold_higher);
+    g.blur_4c(&manifold_lower, &mut blurred_manifold_lower);
+    drop(g);
+
+    unsafe {
+        darkroom_cacorrectrgb_normalize_manifolds(
+            blurred_in.as_ptr(),
+            blurred_manifold_lower.as_mut_ptr(), blurred_manifold_higher.as_mut_ptr(),
+            width, height, guide as u32,
+        );
+    }
+
+    if refine {
+        // A blur of normal size for this step (cacorrectrgb.c:254-262).
+        let mut g = Gaussian::new(width, height, min, max, sigma, GaussianOrder::Zero);
+        g.blur_4c(in_buf, &mut blurred_in);
+        unsafe {
+            darkroom_cacorrectrgb_refine_manifolds(
+                in_buf.as_ptr(), blurred_in.as_ptr(),
+                blurred_manifold_lower.as_ptr(), blurred_manifold_higher.as_ptr(),
+                manifold_lower.as_mut_ptr(), manifold_higher.as_mut_ptr(),
+                width, height, guide as u32,
+            );
+        }
+        g.blur_4c(&manifold_higher, &mut blurred_manifold_higher);
+        g.blur_4c(&manifold_lower, &mut blurred_manifold_lower);
+        drop(g);
+        unsafe {
+            darkroom_cacorrectrgb_normalize_manifolds(
+                blurred_in.as_ptr(),
+                blurred_manifold_lower.as_mut_ptr(), blurred_manifold_higher.as_mut_ptr(),
+                width, height, guide as u32,
+            );
+        }
+    }
+
+    // Store all manifolds in the same structure to make upscaling faster
+    // (cacorrectrgb.c:278-282).
+    unsafe {
+        darkroom_cacorrectrgb_pack_manifolds(
+            blurred_manifold_lower.as_ptr(), blurred_manifold_higher.as_ptr(),
+            manifolds_out.as_mut_ptr(), npx,
+        );
+    }
+}
+
+/// `reduce_artifacts` (cacorrectrgb.c:299-332): pack the two guided channels
+/// of in and out into one 4-channel buffer, blur it with the C's second clamp
+/// range `{FLT_MAX×4} / {0, 0, 0, 0}`, then blend toward the input where the
+/// local averages diverge (the same weight for all channels, per the C
+/// comment at cacorrectrgb.c:325-331).
+fn reduce_artifacts(
+    in_buf: &[f32],
+    width: usize,
+    height: usize,
+    sigma: f32,
+    guide: u8,
+    safety: f32,
+    out: &mut [f32],
+) {
+    let npx = width * height;
+    let mut in_out = vec![0.0_f32; npx * 4];
+    unsafe {
+        darkroom_cacorrectrgb_pack_inout(
+            in_buf.as_ptr(), out.as_ptr(), in_out.as_mut_ptr(), npx, guide as u32,
+        );
+    }
+    let mut blurred_in_out = vec![0.0_f32; npx * 4];
+    let max = [f32::MAX; 4];
+    let min = [0.0_f32; 4];
+    let mut g = Gaussian::new(width, height, min, max, sigma, GaussianOrder::Zero);
+    g.blur_4c(&in_out, &mut blurred_in_out);
+    drop(g);
+    drop(in_out);
+
+    unsafe {
+        darkroom_cacorrectrgb_blend_artifacts(
+            in_buf.as_ptr(), blurred_in_out.as_ptr(), out.as_mut_ptr(),
+            npx, guide as u32, safety,
+        );
+    }
 }
 
 /// Per-pixel manifold normalisation for the cacorrectrgb (RGB chromatic-
@@ -651,5 +874,191 @@ mod tests {
         }
         // Untouched.
         for v in inp.iter().chain(lo.iter()).chain(hi.iter()) { assert_eq!(*v, 0.0); }
+    }
+
+    // ── whole-frame driver (`process`) ─────────────────────────────────────
+
+    fn flat(w: usize, h: usize, v: f32) -> Vec<f32> {
+        let mut px = vec![v; w * h * 4];
+        for k in 0..w * h { px[k * 4 + 3] = 1.0; }
+        px
+    }
+
+    /// A frame with lateral CA fringes: a vertical bright bar on a mid-grey
+    /// background, with the R channel displaced one column to the right of G
+    /// and B one column to the left (case (1) in the C's module comment).
+    /// guide = G is the aligned channel; R/B give the fringes.
+    fn fringes(w: usize, h: usize, bar: f32, bg: f32) -> Vec<f32> {
+        let mut px = flat(w, h, bg);
+        for j in 0..h {
+            for i in 0..w {
+                let b = (j * w + i) * 4;
+                // G (guide) bar is two columns wide at the centre…
+                if i >= w / 2 - 1 && i <= w / 2 { px[b + 1] = bar; }
+                // …R bar is shifted one column right, B one column left.
+                if i > w / 2 - 1 && i < w / 2 + 1 { px[b + 2] = bar; }
+                if i >= w / 2 - 2 && i <= w / 2 - 1 { px[b] = bar; }
+            }
+        }
+        px
+    }
+
+    #[test]
+    fn driver_rejects_short_buffers() {
+        // The FFI kernels build raw slices from the dims, so handing them a
+        // short buffer through the driver is UB-in-release — the driver must
+        // hard-assert instead (same contract as defringe::process). Panics in
+        // both debug and release (assert, not debug_assert).
+        let px = flat(4, 4, 0.5); // 64 floats
+        let result = std::panic::catch_unwind(|| {
+            process(&px[..60], 4, 4, CacorrectrgbParams::default())
+        });
+        assert!(result.is_err(), "short buffer must panic, not read OOB");
+    }
+
+    #[test]
+    fn driver_empty_frame_is_passthrough() {
+        let empty: Vec<f32> = vec![];
+        assert_eq!(process(&empty, 0, 0, CacorrectrgbParams::default()), empty);
+        // Zero-area but non-empty buffer follows the empty path too.
+        let px = flat(0, 3, 0.5);
+        assert_eq!(process(&px, 0, 3, CacorrectrgbParams::default()), px);
+    }
+
+    #[test]
+    fn driver_flat_image_passes_through_within_tolerance() {
+        // A perfectly flat image is the degenerate case the algorithm is
+        // designed around: every pixel is its own neighbourhood's average, so
+        // the manifolds should reproduce the input (the correction ratios are
+        // all 1, and the artifact-reduction blend mixes two equal buffers).
+        // Not bit-exact — the Gaussian, the bilinear resamplers and the
+        // log/exp round-trips all wander by a few ulp on flat content — but
+        // bounded well below any visible threshold.
+        let px = flat(32, 24, 0.25);
+        for strength in [0.0_f32, 0.5, 4.0] {
+            let p = CacorrectrgbParams { strength, ..CacorrectrgbParams::default() };
+            let out = process(&px, 32, 24, p);
+            assert_eq!(out.len(), px.len());
+            for k in 0..px.len() / 4 {
+                for c in 0..3 {
+                    assert!(
+                        (out[k * 4 + c] - px[k * 4 + c]).abs() < 1e-3,
+                        "({k},{c}) in={} out={} strength={strength}",
+                        px[k * 4 + c], out[k * 4 + c]
+                    );
+                }
+                assert_eq!(out[k * 4 + 3], 1.0, "alpha passes through");
+            }
+        }
+    }
+
+    #[test]
+    fn driver_corrects_fringes_and_is_deterministic() {
+        // A synthetic lateral-fringe frame (R shifted right, B shifted left of
+        // the G guide bar) must change under correction at a non-trivial
+        // strength, deterministically: two runs are bit-identical, and the
+        // corrected frame differs from the input on the fringe edges.
+        let px = fringes(48, 32, 0.9, 0.25);
+        let p = CacorrectrgbParams {
+            radius: 2.0,
+            strength: 2.0,
+            ..CacorrectrgbParams::default()
+        };
+        let a = process(&px, 48, 32, p);
+        let b = process(&px, 48, 32, p);
+        assert_eq!(a, b, "re-running the driver must be bit-identical");
+        let changed = a.iter().zip(&px).filter(|(x, y)| x != y).count();
+        assert!(changed > 0, "a chromatic fringe must not pass through untouched");
+        // And the change must target the non-guide channels: the guide (G)
+        // channel is passed through unchanged by apply_correction and only
+        // the artifact blend rewrites it (toward input, so bounded).
+        assert!(a.iter().all(|v| v.is_finite()), "correction must stay finite");
+    }
+
+    #[test]
+    fn driver_darken_and_brighten_modes_respect_their_bounds() {
+        // darken = min(out, in), brighten = max(out, in) per non-guide
+        // channel (apply_correction, cacorrectrgb.c:464-500). The mode is the
+        // only difference: the same frame at the same strength must never
+        // violate its own inequality, while standard may move either way.
+        let px = fringes(48, 32, 0.9, 0.25);
+        let params = CacorrectrgbParams { strength: 3.0, ..CacorrectrgbParams::default() };
+        let std = process(&px, 48, 32, params);
+        let dark = process(&px, 48, 32, CacorrectrgbParams { mode: 1, ..params });
+        let bright = process(&px, 48, 32, CacorrectrgbParams { mode: 2, ..params });
+        assert_ne!(std, dark, "modes must differ from standard");
+        assert_ne!(std, bright);
+        for k in 0..px.len() / 4 {
+            // Non-guide channels (guide = G).
+            for c in [0usize, 2] {
+                assert!(dark[k * 4 + c] <= px[k * 4 + c] + 1e-6, "darken out[{k}][{c}] raised");
+                assert!(bright[k * 4 + c] >= px[k * 4 + c] - 1e-6, "brighten out[{k}][{c}] lowered");
+            }
+            assert_eq!(dark[k * 4 + 1], std[k * 4 + 1]);
+            assert_eq!(bright[k * 4 + 1], std[k * 4 + 1]);
+        }
+    }
+
+    #[test]
+    fn driver_refine_path_runs_and_differs() {
+        // `refine` takes the sigma2-first pass + a second Gaussian and
+        // refinement — a strictly longer pipeline whose output need not equal
+        // the plain pass (and on a fringe frame it should not).
+        let px = fringes(48, 32, 0.9, 0.25);
+        let plain = process(&px, 48, 32, CacorrectrgbParams::default());
+        let refined = process(
+            &px, 48, 32,
+            CacorrectrgbParams { refine: true, strength: 2.0, ..CacorrectrgbParams::default() },
+        );
+        assert!(refined.iter().all(|v| v.is_finite()));
+        let refined2 = process(
+            &px, 48, 32,
+            CacorrectrgbParams { refine: true, strength: 2.0, ..CacorrectrgbParams::default() },
+        );
+        assert_eq!(refined, refined2, "refinement must be deterministic too");
+        assert_ne!(plain, refined, "refinement should change the correction");
+    }
+
+    #[test]
+    fn driver_guide_channel_changes_the_correction() {
+        // A fringe frame built for guide = G (the aligned channel) corrects
+        // differently when the guide is an offset channel: the manifold
+        // neighbourhoods are decided by a different channel's local average.
+        let px = fringes(48, 32, 0.9, 0.25);
+        let g = process(&px, 48, 32, CacorrectrgbParams { guide: 1, ..CacorrectrgbParams::default() });
+        let r = process(&px, 48, 32, CacorrectrgbParams { guide: 0, ..CacorrectrgbParams::default() });
+        assert_ne!(g, r, "guide R vs G must not agree on an asymmetric fringe");
+    }
+
+    #[test]
+    fn driver_out_of_range_ordinals_are_clamped_not_ub() {
+        // A hand-edited blob can carry guide/mode outside the enum range; the
+        // driver clamps instead of reaching the kernels' hard early-return
+        // (which would silently leave `out` zeroed). Same output as the
+        // nearest legal enum value.
+        let px = fringes(48, 32, 0.9, 0.25);
+        // 9 clamps to the highest legal ordinal (2) in both fields, so the
+        // out-of-range run must be bit-identical to an explicit 2/2 run.
+        let clamped = process(
+            &px, 48, 32,
+            CacorrectrgbParams { guide: 2, mode: 2, ..CacorrectrgbParams::default() },
+        );
+        let garbage = process(
+            &px, 48, 32,
+            CacorrectrgbParams { guide: 9, mode: 9, ..CacorrectrgbParams::default() },
+        );
+        assert_eq!(clamped, garbage);
+    }
+
+    #[test]
+    fn driver_tiny_frame_does_not_panic() {
+        // radius 5 ⇒ sigma 5 ⇒ downsize 3 ⇒ a 1×1 frame downsamples to 0×0,
+        // where the C's bilinear/gaussian/kernels are all empty-buffer no-ops
+        // and the upsampled manifolds stay zero. The C would read uninitialised
+        // malloc here; we produce deterministic (if degenerate) values. What
+        // matters: no panic, no UB, finite output.
+        let px = flat(1, 1, 0.5);
+        let out = process(&px, 1, 1, CacorrectrgbParams::default());
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 }

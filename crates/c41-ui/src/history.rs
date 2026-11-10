@@ -556,6 +556,20 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if dn {
         return "Denoise (profiled)";
     }
+    // Chromatic aberrations (cacorrectrgb.c, iop_order.c v50 pos 13.5) — the
+    // Correct-group neighbour of Denoise (profiled) in the catalog and the
+    // other scene-referred pre-exposure module with actual live params.
+    // Grouped immediately after dn, the same position it holds in the
+    // catalogue's Correct group and in MODULE_GROUPS.
+    let cac = old.cac_on != new.cac_on
+        || old.cac_guide != new.cac_guide
+        || old.cac_radius != new.cac_radius
+        || old.cac_strength != new.cac_strength
+        || old.cac_mode != new.cac_mode
+        || old.cac_refine != new.cac_refine;
+    if cac {
+        return "Chromatic aberrations";
+    }
     let bl = old.bl_on != new.bl_on
         || old.bl_size != new.bl_size
         || old.bl_threshold != new.bl_threshold
@@ -987,6 +1001,23 @@ mod tests {
         );
         assert_eq!(describe_change(&base, &PreviewParams { hotpixels_on: true, ..base }), "Hot pixels");
         assert_eq!(describe_change(&base, &PreviewParams { hotpixels_threshold: 0.1, ..base }), "Hot pixels");
+        // Chromatic aberrations labels the enable flag and each control.
+        assert_eq!(
+            describe_change(&base, &PreviewParams { cac_on: true, ..base }),
+            "Chromatic aberrations"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { cac_radius: 9.0, ..base }),
+            "Chromatic aberrations"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { cac_guide: 2.0, ..base }),
+            "Chromatic aberrations"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { cac_refine: true, ..base }),
+            "Chromatic aberrations"
+        );
         // Framing labels both the enable flag and the sliders (geometry-family
         // compose; the fields live in the blob like any other module).
         assert_eq!(
@@ -1274,6 +1305,12 @@ mod tests {
             rwp_black2: _,
             rwp_black3: _,
             rwp_white: _,
+            cac_on: _,
+            cac_guide: _,
+            cac_radius: _,
+            cac_strength: _,
+            cac_mode: _,
+            cac_refine: _,
             brd_on: _,
             brd_size: _,
             brd_pos_h: _,
@@ -1410,7 +1447,9 @@ mod tests {
         // four per-colour black levels + the white point).
         // S1 Framing (v34): 1914 → 1959 (1 more bool + 11 f32 controls — size,
         // pos_h/v, border RGB, frame size/offset, frame RGB).
-        assert_eq!(PreviewParams::default().encode().len(), 1959);
+        // S2 Chromatic aberrations (v35): 1959 → 1977 (2 more bools — on,
+        // refine — + 4 f32 controls — guide/mode ordinals, radius, strength).
+        assert_eq!(PreviewParams::default().encode().len(), 1977);
     }
 
     #[test]

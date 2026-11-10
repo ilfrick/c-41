@@ -12,11 +12,10 @@
 
 ## 1. Current state (2026-11-10)
 
-- Catalogue: **47 of 52 module rows active** (42 live + 5 elsewhere-driven).
-  **5 inert rows:** `Color calibration` · `Chromatic aberrations` · `Retouch` ·
-  `Liquify` · `Watermark`.
-- Tests: 1 940 `c41-core` / 550 `c41-ui` (Docker release). PreviewParams blob
-  v33 (1914 B); geometry blob v2.
+- Catalogue: **48 of 52 module rows active** (43 live + 5 elsewhere-driven).
+  **4 inert rows:** `Color calibration` · `Retouch` · `Liquify` · `Watermark`.
+- Tests: 1 960 `c41-core` / 560 `c41-ui` (Docker release). PreviewParams blob
+  v35 (1977 B); geometry blob v2.
 - G2 colour: input profiling (embedded + per-image assumption) live; output
   profile choice (sRGB/Adobe RGB) live for all Rust exports; raw Adobe exports
   transform directly from linear Rec.2020. **Still open: soft-proofing and the
@@ -133,7 +132,7 @@ RAW prepare combined, "XL" splits into two.
 | Sprint | Backlog item | Deliverable (DoD) | Risk |
 |---|---|---|---|
 | ✅ **S1 2026-11-10** | `Framing` (G1 M) | **SHIPPED** +1 live (46→47/52) — constant-border compose + frame line, geometry-family, raw+non-raw preview & all export funnels, v34 blob, 3 review passes, no blockers | geometry interaction (crop/framing order) — verified |
-| S2 | `Chromatic aberrations` (G1 M) | +1 live; RGBA stage, 3 sliders, preview/export parity | none expected (per-pixel) |
+| ✅ **S2 2026-11-10** | `Chromatic aberrations` (G1 M) | **SHIPPED** +1 live (47→48/52) — full manifold pipeline over the 7 pre-ported FFI kernels (downsample→get_manifolds→upsample→apply_correction→reduce_artifacts); Stage at v50 13.5 after lens in both funnels; v35 blob (bools 46/47, floats 478–481); 5-control Correct-group row; preview/export parity; NaN-strength hardening; review APPROVE | stage serial (non-pixel-local) — expected |
 | S3 | `Watermark` (G1 M) | +1 live; asset picker + compositing row + seeds | asset resolution/persistence |
 | S4 | `Color calibration` (G1 L) | +1 live; 12-coeff/auto-WB row on matrix-stage precedent | parity-of-coefficients claim ≠ C (document) |
 | S5 | `Liquify` (G1 L) | +1 live; lattice/point-deform UI slice 1 | gesture plumbing heavy |
@@ -146,9 +145,9 @@ RAW prepare combined, "XL" splits into two.
 | S12 | G6 decision batch | each G6 row: ship/withdraw/refuse recorded; cosmetic + clippy pass | — |
 | S13 | Closure | 52/52 counters, audit "Not on the table" rewrite, final CI + deploy | — |
 
-> Sprint ledger: **S1 ✅ 2026-11-10** (Framing shipped). Remaining G1 rows for
-> S2–S7: `Chromatic aberrations` → `Watermark` → `Color calibration` →
-> `Liquify` → `Retouch` ×2.
+> Sprint ledger: **S1 ✅ 2026-11-10** (Framing shipped). **S2 ✅ 2026-11-10**
+> (Chromatic aberrations shipped). Remaining G1 rows for S3–S7: `Watermark` →
+> `Color calibration` → `Liquify` → `Retouch` ×2.
 | S12 | G6 decision batch | each G6 row: ship/withdraw/refuse recorded; cosmetic + clippy pass | — |
 | S13 | Closure | 52/52 counters, audit "Not on the table" rewrite, final CI + deploy | — |
 

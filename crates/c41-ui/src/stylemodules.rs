@@ -60,6 +60,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Highlight reconstruction",
     "Hot pixels",
     "Denoise (profiled)",
+    "Chromatic aberrations",
     "Bloom",
     "Grain",
     "Soften",
@@ -384,6 +385,17 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.dn_bias = src.dn_bias;
             true
         }
+        // Chromatic aberrations (cacorrectrgb.c): a normal pipeline stage
+        // whose six fields all live in the blob, so a style carries them.
+        "Chromatic aberrations" => {
+            target.cac_on = src.cac_on;
+            target.cac_guide = src.cac_guide;
+            target.cac_radius = src.cac_radius;
+            target.cac_strength = src.cac_strength;
+            target.cac_mode = src.cac_mode;
+            target.cac_refine = src.cac_refine;
+            true
+        }
         "Bloom" => {
             target.bl_on = src.bl_on;
             target.bl_size = src.bl_size;
@@ -523,7 +535,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 41);
+        assert_eq!(MODULE_GROUPS.len(), 42);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
