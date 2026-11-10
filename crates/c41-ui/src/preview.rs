@@ -787,6 +787,32 @@ pub struct PreviewParams {
     /// `refine_manifolds`), default off: runs the sigma2-first manifold pass
     /// plus a refinement pass.
     pub cac_refine: bool,
+    // ── Watermark (watermark.c, iop_order.c v50 pos 69) ──────────────────
+    // Composites a marker bitmap over the finished display-referred frame —
+    // the LAST in-pipeline stage (after borders 68/vignette, before gamma 71).
+    // The maths is a normal pipeline [`Stage`](c41_core::pipeline::Stage): see
+    // `Stage::Watermark` / `c41_core::watermark`. Ships off, like darktable's
+    // default (its `darktable.svg` logo is not shipped here; see the G6
+    // `watermarks/` note in `c41_core::watermark`).
+    /// Watermark module enabled.
+    pub wm_on: bool,
+    /// Built-in asset index (slice 1: 0 = the embedded emblem — the only
+    /// entry; preserved as a float like the other dropdown ordinals so a
+    /// future user-`watermarks/` PNG picker appends without a blob rebuild).
+    pub wm_asset: f32,
+    /// `opacity` slider 0..100 (darktable `$DEFAULT` 100).
+    pub wm_opacity: f32,
+    /// `scale` slider 1..500 % (darktable `$DEFAULT` 100; soft max 100).
+    pub wm_scale: f32,
+    /// `xoffset` −1..1, fraction of the image width (`$DEFAULT` 0).
+    pub wm_xoffset: f32,
+    /// `yoffset` −1..1, fraction of the image height (`$DEFAULT` 0).
+    pub wm_yoffset: f32,
+    /// `alignment` ordinal 0..8 row-major on the 3×3 grid (`$DEFAULT` 4 =
+    /// centred).
+    pub wm_alignment: f32,
+    /// `rotate` degrees −180..180 (`$DEFAULT` 0).
+    pub wm_rotate: f32,
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -1111,6 +1137,17 @@ impl Default for PreviewParams {
             cac_strength: 0.5, // $DEFAULT
             cac_mode: 0.0,    // DT_CACORRECT_MODE_STANDARD (0)
             cac_refine: false,
+            // Watermark: off, at the darktable `reload_defaults` values for
+            // the wired controls (opacity 100, scale 100, offsets 0, alignment
+            // 4 = centre, no rotation). The embedded asset index defaults to 0.
+            wm_on: false,
+            wm_asset: 0.0,
+            wm_opacity: 100.0,
+            wm_scale: 100.0,
+            wm_xoffset: 0.0,
+            wm_yoffset: 0.0,
+            wm_alignment: 4.0, // DT_SCALE_MAINMENU_IMAGE centre
+            wm_rotate: 0.0,
             df_on: false,
             df_radius: 4.0,   // defringe.c $DEFAULT
             df_thresh: 20.0,  // defringe.c $DEFAULT
@@ -1360,7 +1397,16 @@ impl PreviewParams {
         // `apply_correction` (safety = 20 makes the blend conservative, not
         // identity), so even the "neutral" strength 0 is not gated. The gate
         // mirrors `to_pipeline`, which emits the stage whenever `cac_on`.
+        // Watermark gates on the enable flag alone (Bloom policy): at the
+        // darktable defaults (centred, 100 % opacity, 100 % scale) the C
+        // paints the marker at full strength over every frame — a real edit,
+        // never a no-op while enabled. (`opacity 0` is not gated: the C
+        // still renders the surface and blends with zero alpha; the result is
+        // byte-identical only after rounding, not by construction, so it is
+        // not treated as identity — mirror `to_pipeline`, which emits the
+        // stage whenever `wm_on`.)
         let cac_identity = !self.cac_on;
+        let wm_identity = !self.wm_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1383,6 +1429,7 @@ impl PreviewParams {
             && highpass_identity
             && soften_identity
             && cac_identity
+            && wm_identity
     }
 
     /// Hot-pixel options for raw decode; `None` while the module is off.
@@ -1639,7 +1686,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on, self.brd_on, self.cac_on, self.cac_refine] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on, self.brd_on, self.cac_on, self.cac_refine, self.wm_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1836,7 +1883,13 @@ impl PreviewParams {
                   // Chromatic aberrations (v35): the guide/mode dropdown
                   // ordinals plus radius and strength, appended after the
                   // Framing block so the layout stays append-only.
-                  self.cac_guide, self.cac_radius, self.cac_strength, self.cac_mode] {
+                  self.cac_guide, self.cac_radius, self.cac_strength, self.cac_mode,
+                  // Watermark (v36): the asset index, opacity %, scale %,
+                  // x/y offsets, alignment ordinal and rotation — appended
+                  // after the cac block so the layout stays append-only.
+                  self.wm_asset, self.wm_opacity, self.wm_scale,
+                  self.wm_xoffset, self.wm_yoffset,
+                  self.wm_alignment, self.wm_rotate] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -2187,6 +2240,49 @@ impl PreviewParams {
             },
             cac_mode: f.get(481).copied().unwrap_or(d.cac_mode),
             cac_refine: bools.get(47).map_or(d.cac_refine, |&b| b != 0),
+            // Watermark (v36): bool 48, floats 482–488. v35-and-earlier blobs
+            // end before any of this — every `.get` misses and each slot keeps
+            // its default (wm off ⇒ no stage, exactly like reading a fresh
+            // edit). The alignment/asset ordinals are stored raw like `df_mode`
+            // (a faithful record; the driver clamps to 0..=8 and the UI
+            // dropdown clamps on the way out), while opacity/scale/offsets/
+            // rotate are bounded to the C hard ranges. Non-finite values fold
+            // to the defaults so a hand-edited NaN never poisons the layout or
+            // the blend (the `f32::clamp` path alone would leave NaN intact).
+            wm_on: bools.get(48).map_or(d.wm_on, |&b| b != 0),
+            wm_asset: {
+                let v = f.get(482).copied().unwrap_or(d.wm_asset);
+                if v.is_finite() { v } else { d.wm_asset }
+            },
+            wm_opacity: {
+                let v = f.get(483).copied().unwrap_or(d.wm_opacity);
+                if v.is_finite() { v.clamp(0.0, 100.0) } else { d.wm_opacity }
+            },
+            wm_scale: {
+                let v = f.get(484).copied().unwrap_or(d.wm_scale);
+                if v.is_finite() { v.clamp(1.0, 500.0) } else { d.wm_scale }
+            },
+            wm_xoffset: {
+                let v = f.get(485).copied().unwrap_or(d.wm_xoffset);
+                if v.is_finite() { v.clamp(-1.0, 1.0) } else { d.wm_xoffset }
+            },
+            wm_yoffset: {
+                let v = f.get(486).copied().unwrap_or(d.wm_yoffset);
+                if v.is_finite() { v.clamp(-1.0, 1.0) } else { d.wm_yoffset }
+            },
+            wm_alignment: {
+                let v = f.get(487).copied().unwrap_or(d.wm_alignment);
+                // Fold NaN like the siblings: a non-finite ordinal would
+                // saturate to 0 (top-left) in the stage's `as i32` cast and
+                // paint the marker off its UI-grid position; the default 4
+                // (centre) is the deterministic fallback. Finite out-of-range
+                // values stay raw (faithful record; the driver clamps to 0..=8).
+                if v.is_finite() { v } else { d.wm_alignment }
+            },
+            wm_rotate: {
+                let v = f.get(488).copied().unwrap_or(d.wm_rotate);
+                if v.is_finite() { v.clamp(-180.0, 180.0) } else { d.wm_rotate }
+            },
         })
     }
 
@@ -3073,6 +3169,36 @@ impl PreviewParams {
                 unbound: false,
             });
         }
+        // Watermark (watermark.c, iop_order.c v50_order pos 69.0 — after
+        // borders 68.0 [a geometry-family compose, outside the pipeline] and
+        // before gamma 71.0): the LAST in-pipeline stage, compositing the
+        // marker over the finished display-referred frame. The stage is
+        // emitted on the enable flag alone (is_identity mirrors this): at the
+        // darktable defaults — centred, 100 % opacity, 100 % scale — the C
+        // paints the marker at full strength over every frame, so there is no
+        // neutral slider combination while enabled, and `opacity 0` still
+        // renders + blends with a zero alpha in the C (byte-identical only
+        // after rounding, not by construction — same Bloom-policy reasoning
+        // that keeps `strength 0` un-gated in cacorrectrgb).
+        //
+        // The ordinals/strings that can't join the blob (none in slice 1 —
+        // the asset index is an f32) are carried via `c41_core::watermark::
+        // WatermarkParams`; the driver handles unknown asset ordinals by
+        // falling back to the built-in.
+        if self.wm_on {
+            p.push(Stage::Watermark {
+                params: c41_core::watermark::WatermarkParams {
+                    opacity: self.wm_opacity,
+                    scale: self.wm_scale,
+                    xoffset: self.wm_xoffset,
+                    yoffset: self.wm_yoffset,
+                    alignment: self.wm_alignment as i32,
+                    rotate: self.wm_rotate,
+                    asset: self.wm_asset as u8,
+                },
+                scale,
+            });
+        }
         p
     }
 }
@@ -3132,9 +3258,12 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v35 adds Chromatic aberrations (2 bools + 4 f32: the guide/mode dropdown
 /// ordinals, radius, strength) — a normal pipeline stage (v50 pos 13.5),
 /// so it joins is_identity and to_pipeline.
-const ENCODE_VERSION: u8 = 35;
-/// 1 version byte + 48 bool bytes + 482 little-endian f32.
-const ENCODED_LEN: usize = 1 + 48 + 482 * 4;
+/// v36 adds Watermark (1 bool + 7 f32: asset index, opacity %, scale %,
+/// x/y offsets, alignment ordinal, rotation) — a normal pipeline stage
+/// (v50 pos 69, the last), so it joins is_identity and to_pipeline.
+const ENCODE_VERSION: u8 = 36;
+/// 1 version byte + 49 bool bytes + 489 little-endian f32.
+const ENCODED_LEN: usize = 1 + 49 + 489 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -3165,6 +3294,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (33, 45, 467), // v33: raw black/white point added
     (34, 46, 478), // v34: Framing (borders) geometry compose added
     (35, 48, 482), // v35: Chromatic aberrations (cacorrectrgb) added
+    (36, 49, 489), // v36: Watermark (watermark.c) added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -4000,6 +4130,18 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         cac_strength: 1.75,
         cac_mode: 1.0,       // DARKEN — non-default mode
         cac_refine: true,
+        // Watermark (v36): on, asset 0 (only entry), every float off-default
+        // and pairwise distinct so a wrong offset in the trailing block shows
+        // as a mismatch (opacity/scale at deliberately awkward values, offsets
+        // of opposite signs, alignment at a corner, a non-zero rotation).
+        wm_on: true,
+        wm_asset: 0.0,
+        wm_opacity: 37.0,
+        wm_scale: 226.0,
+        wm_xoffset: 0.33,
+        wm_yoffset: -0.27,
+        wm_alignment: 6.0,   // bottom-left — non-default
+        wm_rotate: 31.5,
         df_on: true,
         df_radius: 7.5,
         df_thresh: 62.0,
@@ -4083,6 +4225,68 @@ mod tests {
         assert_ne!(off16, a16, "export must change like the preview");
         let b16 = render_linear_to_srgb16(&lin, w, h, &on);
         assert_eq!(a16, b16, "enabled export must be deterministic");
+    }
+
+    #[test]
+    fn watermark_default_off_stays_byte_identical() {
+        // The v36 constraint: a default edit (wm off) must round-trip the
+        // 8-bit preview byte-for-byte, exactly as if the module did not exist.
+        let base = vec![
+            12u8, 34, 56, 200,  // pixel 0 RGBA
+            78, 90, 123, 111,   // pixel 1
+            45, 67, 89, 255,    // pixel 2
+        ];
+        let d = PreviewParams::default();
+        assert!(!d.wm_on, "wm must ship off");
+        assert!(d.is_identity());
+        let out = apply_pipeline(&base, 3, 1, 4, 4, &d);
+        assert_eq!(out, base, "default-off must be byte-identical");
+    }
+
+    #[test]
+    fn watermark_enabled_changes_preview_and_export_deterministically() {
+        // A flat mid-grey linear frame: enabling the watermark at the defaults
+        // must lift the centre toward white in BOTH the 8-bit preview and the
+        // 16-bit export encoding (a centred 100 %-opacity white emblem), and
+        // two enabled runs must agree bit-for-bit (a deterministic pipeline).
+        let (w, h) = (64usize, 48usize);
+        let lin = vec![0.25f32; w * h * 4];
+        let off = render_linear_to_srgb8(&lin, w, h, &PreviewParams::default());
+        let mut on = PreviewParams::default();
+        on.wm_on = true;
+        let a = render_linear_to_srgb8(&lin, w, h, &on);
+        let b = render_linear_to_srgb8(&lin, w, h, &on);
+        assert_eq!(a, b, "enabled preview must be deterministic");
+        assert_ne!(a, off, "a centred opaque watermark must change the preview");
+        // The centre pixel of the preview must whiten towards the asset white.
+        let mid = (h / 2 * w + w / 2) * 3;
+        assert!(a[mid] > 240, "preview centre should be near-white, got {}", a[mid]);
+        // 16-bit exports share the same to_pipeline builder — the pipeline
+        // stage must show up there identically.
+        let off16 = render_linear_to_srgb16(&lin, w, h, &PreviewParams::default());
+        let a16 = render_linear_to_srgb16(&lin, w, h, &on);
+        assert_ne!(off16, a16, "export must change like the preview");
+        let b16 = render_linear_to_srgb16(&lin, w, h, &on);
+        assert_eq!(a16, b16, "enabled export must be deterministic");
+    }
+
+    #[test]
+    fn watermark_opacity_zero_still_emits_the_stage_but_renders_identically() {
+        // The identity gate is flag-only: `wm_on` alone decides whether the
+        // stage is emitted, even at opacity 0 (Bloom policy — the C renders
+        // and blends a zero-alpha surface, byte-identical only through
+        // rounding). Pin BOTH halves so is_identity and to_pipeline cannot
+        // drift: the params read non-identity (pipeline present) yet the
+        // rendered bytes are a pass-through.
+        let mut p = PreviewParams::default();
+        p.wm_on = true;
+        p.wm_opacity = 0.0;
+        assert!(!p.is_identity(), "wm_on must gate is_identity on the flag alone");
+        assert_eq!(p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.len(), 1);
+        let lin = vec![0.4f32; 8 * 8 * 4];
+        let out = render_linear_to_srgb8(&lin, 8, 8, &p);
+        let off = render_linear_to_srgb8(&lin, 8, 8, &PreviewParams::default());
+        assert_eq!(out, off, "opacity 0 must render byte-identical");
     }
 
     #[test]
@@ -4609,14 +4813,35 @@ mod tests {
         // only `atrous` between — which preserves their relative order and
         // inherits the documented Lowpass deviation. See `Stage::Defringe`.
         p.df_on = true;
+        // watermark: v50 pos 69.0 — the LAST in-pipeline stage, after borders
+        // 68 (a geometry-family compose, outside the pipeline) and before
+        // gamma 71 (not implemented here). On by itself is enough to emit the
+        // stage (flag-only gate, like Bloom).
+        p.wm_on = true;
         let names: Vec<&str> = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().map(|s| s.name()).collect();
         // Pinned to v50_order, *except* Lowpass — v50 puts it at pos 33 (before
         // basicadj 40), but we run it after (after shadhi 50), matching the legacy
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "cacorrectrgb", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "highpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning"]
+            ["denoiseprofile", "cacorrectrgb", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "highpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning", "watermark"]
         );
+        // Watermark is the final stage (v50 pos 69.0): it must run after the
+        // whole display-referred cluster — never before the tone map, because
+        // the C blends the marker against display-referred values.
+        assert_eq!(
+            names.last(),
+            Some(&"watermark"),
+            "watermark must close the pipeline (v50 pos 69): {names:?}"
+        );
+        // ... and it must come after every display-referred creative module it
+        // follows in v50 (grain 65, soften 66, splittoning 67).
+        let wm_pos = names.len() - 1;
+        for before in ["grain", "soften", "splittoning", "vignette"] {
+            if let Some(p) = names.iter().position(|n| *n == before) {
+                assert!(p < wm_pos, "{before} must run before watermark: {names:?}");
+            }
+        }
         // Chromatic aberrations is scene-referred at v50 pos 13.5: between the
         // denoise block (9/10) and exposure (21), on the raw linear frame. It
         // must run BEFORE the sigmoid tone map — the manifolds estimate linear
@@ -5315,6 +5540,88 @@ mod tests {
         assert!(decoded.is_identity());
         assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
             "a pre-cac edit must not gain a chromatic-aberrations stage");
+    }
+
+    #[test]
+    fn decode_v35_blob_defaults_watermark() {
+        // A v35 blob (the last layout before Watermark — 48 bools / 482 f32s)
+        // must decode with wm OFF and its controls at the darktable defaults,
+        // so an image edited before the module existed loads unchanged
+        // instead of gaining a marker composite behind the user's back.
+        // `wm_on` is the load-bearing flag: `unwrap_or(true)` would stamp
+        // every saved edit.
+        let v35 = {
+            let mut b = vec![0u8; 1 + 48 + 482 * 4];
+            b[0] = 35;
+            b
+        };
+        let decoded = PreviewParams::decode(&v35).expect("v35 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert!(!decoded.wm_on);
+        assert_eq!(decoded.wm_asset, def.wm_asset);
+        assert_eq!(decoded.wm_opacity, def.wm_opacity);
+        assert_eq!(decoded.wm_scale, def.wm_scale);
+        assert_eq!(decoded.wm_xoffset, def.wm_xoffset);
+        assert_eq!(decoded.wm_yoffset, def.wm_yoffset);
+        assert_eq!(decoded.wm_alignment, def.wm_alignment);
+        assert_eq!(decoded.wm_rotate, def.wm_rotate);
+        // And it must still be an identity pipeline — the real consequence of
+        // the defaults being right.
+        assert!(decoded.is_identity());
+        assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
+            "a pre-watermark edit must not gain a watermark stage");
+    }
+
+    #[test]
+    fn watermark_params_decode_clamps_and_folds_blob_garbage() {
+        // The decode layer is the last trusted-input gate before the stage:
+        // NaN/Inf blob values must fold to the defaults (never reach the
+        // driver as NaN), and finite-but-out-of-range values clamp to the C
+        // hard ranges so a hand-edited blob cannot stretch the marker off
+        // into +infinity scale or -infinity offset.
+        let mut b = vec![0u8; 1 + 49 + 489 * 4];
+        b[0] = 36;
+        let neg = f32::NAN.to_le_bytes();
+        for &(idx, bytes) in &[
+            (482, neg), // wm_asset
+            (483, neg), // wm_opacity
+            (484, neg), // wm_scale
+            (485, neg), // wm_xoffset
+            (486, neg), // wm_yoffset
+            (487, neg), // wm_alignment
+            (488, neg), // wm_rotate
+        ] {
+            let base = 1 + 49 + idx as usize * 4;
+            b[base..base + 4].copy_from_slice(&bytes);
+        }
+        let decoded = PreviewParams::decode(&b).expect("v36 blob must decode");
+        let def = PreviewParams::default();
+        assert_eq!(decoded.wm_asset, def.wm_asset);
+        assert_eq!(decoded.wm_opacity, def.wm_opacity);
+        assert_eq!(decoded.wm_scale, def.wm_scale);
+        assert_eq!(decoded.wm_xoffset, def.wm_xoffset);
+        assert_eq!(decoded.wm_yoffset, def.wm_yoffset);
+        assert_eq!(decoded.wm_alignment, def.wm_alignment);
+        assert_eq!(decoded.wm_rotate, def.wm_rotate);
+
+        // Finite out-of-range: scale beyond the hard max clamps (a huge blob
+        // scale would otherwise blow the overlay up to absurd cost), offsets
+        // clamp to ±1, rotation to ±180.
+        let mut b2 = vec![0u8; 1 + 49 + 489 * 4];
+        b2[0] = 36;
+        let mut put = |idx: usize, v: f32| {
+            let base = 1 + 49 + idx * 4;
+            b2[base..base + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        put(484, 1e30);
+        put(485, 42.0);
+        put(486, -42.0);
+        put(488, 999.0);
+        let decoded2 = PreviewParams::decode(&b2).unwrap();
+        assert_eq!(decoded2.wm_scale, 500.0);
+        assert_eq!(decoded2.wm_xoffset, 1.0);
+        assert_eq!(decoded2.wm_yoffset, -1.0);
+        assert_eq!(decoded2.wm_rotate, 180.0);
     }
 
     #[test]

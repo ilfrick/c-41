@@ -30,13 +30,29 @@ pub unsafe extern "C" fn darkroom_watermark_blend(
     let input = std::slice::from_raw_parts(in_buf, npixels * 4);
     let output = std::slice::from_raw_parts_mut(out_buf, npixels * 4);
     let wm = std::slice::from_raw_parts(watermark, npixels * 4);
+    blend(input, output, wm, opacity);
+}
+
+/// Safe compositing entry used by the Rust [`crate::watermark`] driver: blends
+/// the Cairo-premultiplied `BGRA8` `watermark` overlay over the float RGBA
+/// `input` into `output`. Identical pixel loop to the FFI kernel above (which
+/// delegates here), so C-side callers and the Rust pipeline bit-match.
+///
+/// The watermark buffer is **premultiplied** `ARGB32` (`BGRA` in memory) as
+/// Cairo produces it — the `o[c] = opacity*wm[c]/255` colour weight is then
+/// exactly source-over (see `crate::watermark` module docs). `output` may be
+/// `input` (blend in place); the overlay must be `npixels*4` bytes.
+pub fn blend(input: &[f32], output: &mut [f32], watermark: &[u8], opacity: f32) {
+    let npixels = input.len() / 4;
+    debug_assert_eq!(output.len(), npixels * 4, "mesh mismatch");
+    debug_assert_eq!(watermark.len(), npixels * 4, "overlay/input mesh mismatch");
     for j in 0..npixels {
-        let alpha = (wm[j * 4 + 3] as f32 / 255.0) * opacity;
+        let alpha = (watermark[j * 4 + 3] as f32 / 255.0) * opacity;
         let one_minus = 1.0 - alpha;
         // Cairo BGRA: byte 0=B, 1=G, 2=R, 3=A — maps to RGB as [2,1,0]
-        output[j * 4]     = one_minus * input[j * 4]     + opacity * (wm[j * 4 + 2] as f32 / 255.0);
-        output[j * 4 + 1] = one_minus * input[j * 4 + 1] + opacity * (wm[j * 4 + 1] as f32 / 255.0);
-        output[j * 4 + 2] = one_minus * input[j * 4 + 2] + opacity * (wm[j * 4]     as f32 / 255.0);
+        output[j * 4]     = one_minus * input[j * 4]     + opacity * (watermark[j * 4 + 2] as f32 / 255.0);
+        output[j * 4 + 1] = one_minus * input[j * 4 + 1] + opacity * (watermark[j * 4 + 1] as f32 / 255.0);
+        output[j * 4 + 2] = one_minus * input[j * 4 + 2] + opacity * (watermark[j * 4]     as f32 / 255.0);
         output[j * 4 + 3] = input[j * 4 + 3];
     }
 }

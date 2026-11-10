@@ -9311,3 +9311,72 @@ NOTES / FAILURES
   width/downsize==0 produce deterministic degenerate output where the C reads
   uninitialised malloc; radius 20..500 not reachable from the slider (soft range
   only); non-pixel-local forces the serial whole-frame path like Bloom.
+
+## 2026-11-10 19:10 UTC — S3: Watermark (watermark.c) LIVE
+
+Sprint S3 of the parity plan: the catalogue row `Watermark` is now a live
+darkroom module (Effect group). Catalogue 48/52 → 49/52 active (44 live + 5
+elsewhere-driven), 3 inert left (`Color calibration` · `Retouch` · `Liquify`).
+
+WHAT
+- `crates/c41-core/src/watermark.rs` (new): hand-written PNG decoder
+  (`decode_png_rgba8`: colour types 2/6, non-interlaced, CRC-checked, all 5
+  row filters, MAX_PIXELS=1<<28 allocation cap — no `image` crate added, no
+  new native deps) + `WatermarkParams` (opacity/scale/xoffset/yoffset/
+  alignment/rotate + asset ordinal; sanitized() folds NaN → C defaults) +
+  `Watermark::apply` — the `watermark.c::process` PNG branch ported by
+  inverse-mapped pixel-centre (x+0.5) sampling: IMAGE scale mode
+  (`scale = longer-dim/asset-longer-side · uscale`, svg_width/height from
+  `svg_calc_base`), rotation bbox (bX/bY), 3×3 alignment + `offset·(iw|ih)`
+  translation, the `T(t)·T(c)·R(−rotate)·T(−c)·S(scale)` chain, EXTEND_NONE
+  edge cover — rendering premultiplied-BGRA into the full-frame overlay and
+  mixing via the existing `darkroom_watermark_blend` kernel (unchanged FFI;
+  safe `blend()` twin added). Deviations documented: pixel/filter arithmetic
+  approximates Cairo/pixman (bilinear upscale exact-int cases pinned by a
+  crisp-texel test; a C-render golden is a recorded follow-up — do NOT claim
+  bit-exact C parity), only IMAGE scale_base, built-in asset only.
+- Asset: `crates/c41-core/assets/watermark_c41.png` (160×160, deterministic
+  generator `gen_watermark_c41.py`, md5-stable), embedded via include_bytes!
+  (no configdir/datadir file plumbing in the funnels — the G6 `watermarks/`
+  picker decision stays on the backlog).
+- `crates/c41-core/src/pipeline.rs`: `Stage::Watermark` at iop_order **v50
+  pos 69.0** (last in-pipeline stage), `is_pixel_local=false` (serial
+  whole-frame), `working_space=None`, flag-only identity gate (Bloom policy —
+  opacity 0 still renders-blends-zero-alpha exactly like the C).
+- `crates/c41-ui/src/preview.rs`: PreviewParams **v36** (append-only): +1 bool
+  `wm_on` (48) + 7 f32 (482–488: asset/opacity/scale/xoffset/yoffset/
+  alignment/rotate); ENCODE_VERSION 36, ENCODED_LEN 2006 (1+49+489·4),
+  layout (36,49,489); v35 blobs decode wm off; decode clamps + NaN folds +
+  fully_populated_params; to_pipeline emission after vignetting.
+- `crates/c41-ui/src/darkroom/mod.rs`: module row — marker DropDown (1 builtin
+  asset), Opacity 0..100, Scale 1..500, X/Y offset ±1, Rotation ±180 (C's −1
+  sign convention), exclusive 3×3 alignment toggle grid (re-click re-arms, per
+  review minor); LIVE_MODULE_LABELS 43→44, reset arm, history label + blob pin
+  2006, MODULE_GROUPS 43 (Watermark before Framing) + style copy arm.
+- Nits applied from review: alignment grid re-click must re-arm (never desync);
+  stale "colour type 3 → RGB" comment corrected to type 2.
+
+VERIFY
+- `scripts/ci-local.sh` all four steps green (cargo check / clippy /
+  test --release with **1 973 c41-core / 565 c41-ui** / c41-rs release link);
+  `git diff --check` clean.
+- Independent senior review (sw-vv-engineer): **APPROVE**, zero blockers —
+  inverse-map chain algebraically identical to the Cairo CTM at the c41
+  invariants (roi x/y = 0, scale = 1); blob v36 arithmetic re-verified
+  (2006 = 1+49+489·4); PNG decoder hostile-checked (no release panic/UB);
+  the FFI kernel IS the C implementation (single source of truth).
+
+NOTES / FAILURES
+- First CI run: 1 core test failure — `tiny_and_degenerate_frames` asserted
+  NaN params fold to opacity 0 (pass-through); the driver folds to the C
+  DEFAULT 100 (the same convention as the S2 `cac_strength` fold), so on a
+  1×1 fully-covered frame the default watermark renders. Fixed the TEST to
+  pin the implemented contract: NaN run == explicit default-params run, finite
+  output. (Also caught my briefing error: watermark is v50 pos 69, not 77 —
+  the code comments were right.)
+- Review note (evidence gap, accepted): no C/Cairo golden render comparison
+  yet for non-identity transforms — recorded follow-up; the crisp-texel + grid
+  tests are first-principles coverage until then.
+- G6 items landed in the backlog: `watermarks/` template picker (filename
+  string table in the blob) + SVG/text watermark types + Cairo-faithful
+  rendering in the future.

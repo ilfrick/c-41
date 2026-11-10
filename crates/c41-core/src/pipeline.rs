@@ -756,6 +756,51 @@ pub enum Stage {
         /// The pipeline's working colour space; matches every other Lab stage.
         space: ColorSpace,
     },
+    /// Watermark (watermark.c) — composits a marker bitmap over the finished
+    /// frame: image position (3×3 alignment + x/y offsets), scale, rotation
+    /// and opacity. iop_order.c v50 pos **69.0** — the last in-pipeline
+    /// stage, immediately after borders (68.0) and before gamma (71.0). The
+    /// C's `default_colorspace()` is `IOP_CS_RGB` (display-referred
+    /// values), so `working_space()` returns `None` and the stage runs
+    /// directly on the buffer lanes.
+    ///
+    /// Holds the raw user params (the c41 wiring subset of
+    /// `dt_iop_watermark_params_t` — see [`crate::watermark::WatermarkParams`]);
+    /// [`crate::watermark::Watermark::apply`] derives the layout exactly as
+    /// `watermark.c::process` does for the PNG branch in IMAGE scale mode,
+    /// paints the full-frame BGRA overlay, and composites it through the
+    /// ported [`crate::iop::watermark::blend`] kernel.
+    ///
+    /// Slice 1 documents deviations (see the [`crate::watermark`] module
+    /// docs): only the embedded PNG asset (no SVG/text/font rendering),
+    /// `scale_base` locked to darktable's IMAGE mode (no larger/smaller
+    /// border / height / advanced), and the blend is not colour-managed,
+    /// exactly like the C (sRGB-encoded asset bytes pasted into the
+    /// display-referred linear buffer — white survives, mid-tones shift
+    /// after the final OETF).
+    ///
+    /// **NOT pixel-local**: the layout needs the whole frame (alignment/axis
+    /// sizing use `width`/`height`), and the overlay paint is position-
+    /// dependent per band — band-splitting would hand every band the same
+    /// (band_pixels, 1) rectangle. Serial whole-frame only, like
+    /// Vignette/Soften.
+    ///
+    /// **Identity gate: flag-only, like Bloom.** At the darktable defaults
+    /// (centred, 100 % opacity, 100 % scale) the C paints the marker at full
+    /// strength — a real edit on any frame — so `to_pipeline` emits the
+    /// stage whenever the module is enabled and `is_identity` mirrors it.
+    /// (`opacity 0` is not gated: the C still renders the surface and runs
+    /// the blend with a zero alpha — the result is byte-identical to input
+    /// only after the rounding, not by construction.)
+    Watermark {
+        /// The c41 wiring subset of the C params (opacity %, scale %, offsets,
+        /// alignment ordinal 0..8, rotation degrees, asset index).
+        params: crate::watermark::WatermarkParams,
+        /// The pipeline's ROI scale (darktable's `roi_out->scale`; the C
+        /// multiplies translation and scale by it). Every c41 funnel passes
+        /// 1.0 today; kept so a future downscaled preview stays faithful.
+        scale: f32,
+    },
 }
 
 /// Faithful port of sharpen.c `init_gaussian_kernel`: a normalised Gaussian of
@@ -825,6 +870,7 @@ impl Stage {
             Stage::Grain { .. } => "grain",
             Stage::Soften { .. } => "soften",
             Stage::Defringe { .. } => "defringe",
+            Stage::Watermark { .. } => "watermark",
         }
     }
 
@@ -986,6 +1032,13 @@ impl Stage {
             // each band a (band_pixels, 1) strip whose neighbourhoods cross band
             // seams. Serial whole-frame only, like Bloom/Soften/Defringe.
             Stage::ChromaticAberrations { .. } => false,
+            // Watermark is NOT pixel-local: the layout maths size the marker
+            // against the whole frame (alignment uses width/height, IMAGE-mode
+            // scaling picks the dominant axis), and the overlay paint maps each
+            // output pixel through a position-dependent inverse transform — a
+            // band's (band_pixels, 1) rectangle would hand the transform the
+            // wrong coordinates. Serial whole-frame only, like Vignette/Soften.
+            Stage::Watermark { .. } => false,
         }
     }
 
@@ -1082,6 +1135,11 @@ impl Stage {
             // ratios are per-channel RGB ratios, no Lab conversion, so no
             // working-space agreement is needed.
             Stage::ChromaticAberrations { .. } => None,
+            // Watermark works directly on the linear RGB lanes
+            // (watermark.c default_colorspace is IOP_CS_RGB) — the marker is
+            // painted and blended in place, no Lab conversion, so no
+            // working-space agreement is needed.
+            Stage::Watermark { .. } => None,
             _ => None,
         }
     }
@@ -2110,6 +2168,14 @@ impl Stage {
             // directly in linear RGB (no Lab round-trip). NOT pixel-local (the
             // box mean reads neighbours), so `process` guarantees (width,
             // height) is the whole frame here.
+            Stage::Watermark { ref params, scale } => {
+                // Composite the marker over the finished frame (v50 pos 69,
+                // the last in-pipeline stage). The driver paints the
+                // full-frame BGRA overlay and blends it in place via the
+                // ported watermark kernel; see
+                // `crate::watermark::Watermark::apply` for the layout port.
+                crate::watermark::Watermark::apply(input, output, width, height, params, scale);
+            }
             Stage::Soften { size, saturation, brightness, amount } => {
                 soften::process(
                     input, output, width, height,
@@ -2807,6 +2873,59 @@ mod tests {
         let left = out[(row * w) * 4];
         let mid = out[(row * w + w / 2) * 4];
         assert!(left < mid, "falloff must vary along x: left {left} !< mid {mid}");
+    }
+
+    #[test]
+    fn watermark_stage_changes_whitens_and_is_deterministic() {
+        // Stage-level smoke through the serial path: the apply arm must
+        // composite the built-in marker over a flat frame (a visible white
+        // lift at the centre), stay deterministic on re-runs, and never
+        // disturb the alpha lane. Also pins the v50 pos-69 identity gate:
+        // enabling at the defaults is a real edit.
+        let (w, h) = (48usize, 36usize);
+        let flat = vec![0.4f32; w * h * 4];
+        let stage = Stage::Watermark {
+            params: crate::watermark::WatermarkParams::default(),
+            scale: 1.0,
+        };
+        assert_eq!(stage.name(), "watermark");
+        let out = Pipeline::with_stages(vec![stage.clone()]).process(&flat, w, h);
+        assert_eq!(out, Pipeline::with_stages(vec![stage]).process(&flat, w, h),
+            "watermark output must be deterministic");
+        assert_ne!(out, flat, "a centred opaque watermark must change the frame");
+        // Alpha lane untouched (the kernel passes channel 4 through), and the
+        // centre brightens toward the asset's white.
+        assert!(out.chunks_exact(4).all(|px| px[3] == 0.4));
+        let mid = (h / 2 * w + w / 2) * 4;
+        assert!(out[mid] > 0.99, "centre pixel should be near-white: {}", out[mid]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn watermark_stage_translation_and_alignment_reach_the_driver() {
+        // The full params set reaches the driver through the stage: two
+        // composites differing only in alignment/offsets must render
+        // differently (non-degenerate translation) — same contract the
+        // driver-level tests pin, through the Stage boundary.
+        let (w, h) = (32usize, 32usize);
+        let flat = vec![0.5f32; w * h * 4];
+        let tl = Stage::Watermark {
+            params: crate::watermark::WatermarkParams {
+                alignment: 0, xoffset: 0.3, yoffset: 0.3, ..Default::default()
+            },
+            scale: 1.0,
+        };
+        let br = Stage::Watermark {
+            params: crate::watermark::WatermarkParams {
+                alignment: 8, xoffset: -0.3, yoffset: -0.3, ..Default::default()
+            },
+            scale: 1.0,
+        };
+        let a = Pipeline::with_stages(vec![tl]).process(&flat, w, h);
+        let b = Pipeline::with_stages(vec![br]).process(&flat, w, h);
+        assert_ne!(a, b, "opposite placement must paint differently");
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(b.iter().all(|v| v.is_finite()));
     }
 
     #[test]

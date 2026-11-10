@@ -12,10 +12,10 @@
 
 ## 1. Current state (2026-11-10)
 
-- Catalogue: **48 of 52 module rows active** (43 live + 5 elsewhere-driven).
-  **4 inert rows:** `Color calibration` · `Retouch` · `Liquify` · `Watermark`.
-- Tests: 1 960 `c41-core` / 560 `c41-ui` (Docker release). PreviewParams blob
-  v35 (1977 B); geometry blob v2.
+- Catalogue: **49 of 52 module rows active** (44 live + 5 elsewhere-driven).
+  **3 inert rows:** `Color calibration` · `Retouch` · `Liquify`.
+- Tests: 1 973 `c41-core` / 565 `c41-ui` (Docker release). PreviewParams blob
+  v36 (2006 B); geometry blob v2.
 - G2 colour: input profiling (embedded + per-image assumption) live; output
   profile choice (sRGB/Adobe RGB) live for all Rust exports; raw Adobe exports
   transform directly from linear Rec.2020. **Still open: soft-proofing and the
@@ -133,7 +133,7 @@ RAW prepare combined, "XL" splits into two.
 |---|---|---|---|
 | ✅ **S1 2026-11-10** | `Framing` (G1 M) | **SHIPPED** +1 live (46→47/52) — constant-border compose + frame line, geometry-family, raw+non-raw preview & all export funnels, v34 blob, 3 review passes, no blockers | geometry interaction (crop/framing order) — verified |
 | ✅ **S2 2026-11-10** | `Chromatic aberrations` (G1 M) | **SHIPPED** +1 live (47→48/52) — full manifold pipeline over the 7 pre-ported FFI kernels (downsample→get_manifolds→upsample→apply_correction→reduce_artifacts); Stage at v50 13.5 after lens in both funnels; v35 blob (bools 46/47, floats 478–481); 5-control Correct-group row; preview/export parity; NaN-strength hardening; review APPROVE | stage serial (non-pixel-local) — expected |
-| S3 | `Watermark` (G1 M) | +1 live; asset picker + compositing row + seeds | asset resolution/persistence |
+| ✅ **S3 2026-11-10** | `Watermark` (G1 M) | **SHIPPED** +1 live (48→49/52) — full `watermark.c` PNG-branch compositor (scale/bbox/alignment/rot/opacity), embedded deterministic 160×160 asset, Stage at v50 pos 69 (last), v36 blob (2006 B), 3×3 grid row; slice 1: built-in PNG only (no picker/SVG/text) — see G6 notes | asset persistence deferred to serialized string table; C-render golden recorded follow-up |
 | S4 | `Color calibration` (G1 L) | +1 live; 12-coeff/auto-WB row on matrix-stage precedent | parity-of-coefficients claim ≠ C (document) |
 | S5 | `Liquify` (G1 L) | +1 live; lattice/point-deform UI slice 1 | gesture plumbing heavy |
 | S6 | `Retouch` slice 1 (G1 XL₁) | +1 live; brush stamp, radius/opacity, painting on preview | paint-canvas + blend wiring |
@@ -146,8 +146,8 @@ RAW prepare combined, "XL" splits into two.
 | S13 | Closure | 52/52 counters, audit "Not on the table" rewrite, final CI + deploy | — |
 
 > Sprint ledger: **S1 ✅ 2026-11-10** (Framing shipped). **S2 ✅ 2026-11-10**
-> (Chromatic aberrations shipped). Remaining G1 rows for S3–S7: `Watermark` →
-> `Color calibration` → `Liquify` → `Retouch` ×2.
+> (Chromatic aberrations shipped). **S3 ✅ 2026-11-10** (Watermark shipped).
+> Remaining G1 rows for S4–S7: `Color calibration` → `Liquify` → `Retouch` ×2.
 | S12 | G6 decision batch | each G6 row: ship/withdraw/refuse recorded; cosmetic + clippy pass | — |
 | S13 | Closure | 52/52 counters, audit "Not on the table" rewrite, final CI + deploy | — |
 

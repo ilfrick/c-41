@@ -69,6 +69,10 @@ pub const MODULE_GROUPS: &[&str] = &[
     "RGB curve",
     "Base curve",
     "Lens correction",
+    // Watermark closes the pipeline stages (v50 pos 69, the last); the
+    // geometry-family Framing compose still closes the whole list (it has no
+    // pipeline position — it runs on the base image).
+    "Watermark",
     "Framing",
 ];
 
@@ -472,6 +476,19 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.lens_target_geom = src.lens_target_geom;
             true
         }
+        // Watermark (watermark.c): a normal pipeline stage whose eight fields
+        // all live in the blob, so a style carries them like any other module.
+        "Watermark" => {
+            target.wm_on = src.wm_on;
+            target.wm_asset = src.wm_asset;
+            target.wm_opacity = src.wm_opacity;
+            target.wm_scale = src.wm_scale;
+            target.wm_xoffset = src.wm_xoffset;
+            target.wm_yoffset = src.wm_yoffset;
+            target.wm_alignment = src.wm_alignment;
+            target.wm_rotate = src.wm_rotate;
+            true
+        }
         // Framing (borders): geometry-family compose, but its params live in
         // the blob like any other module, so a style carries them.
         "Framing" => {
@@ -535,16 +552,17 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 42);
+        assert_eq!(MODULE_GROUPS.len(), 43);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
         sorted.dedup();
         assert_eq!(sorted.len(), n, "duplicate group name");
         // Base group row 0 (rawprepare) leads; exposure follows the catalog
-        // order after the decode-level controls. The geometry-family Framing
-        // group closes the list (it has no pipeline position — the compose
-        // runs on the base image, before the pipeline).
+        // order after the decode-level controls. Pipeline modules end with
+        // Watermark (v50 pos 69, the last in-pipeline stage); the
+        // geometry-family Framing group closes the list (it has no pipeline
+        // position — the compose runs on the base image, before the pipeline).
         assert_eq!(MODULE_GROUPS[0], "Raw black/white point", "pipeline order starts at rawprepare");
         assert_eq!(
             MODULE_GROUPS[MODULE_GROUPS.len() - 1],
@@ -553,8 +571,13 @@ mod tests {
         );
         assert_eq!(
             MODULE_GROUPS[MODULE_GROUPS.len() - 2],
+            "Watermark",
+            "pipeline order ends at watermark (v50 pos 69)"
+        );
+        assert_eq!(
+            MODULE_GROUPS[MODULE_GROUPS.len() - 3],
             "Lens correction",
-            "pipeline order ends at lens correction"
+            "lens correction sits before watermark"
         );
     }
 

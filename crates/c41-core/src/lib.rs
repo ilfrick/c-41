@@ -51,6 +51,7 @@ pub mod roi;
 pub mod splines;
 pub mod thumbnail;
 pub mod tiff;
+pub mod watermark;
 pub mod webp;
 pub mod xcf;
 

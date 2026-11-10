@@ -2770,6 +2770,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Highpass" => highpass_module_row(ctx).upcast(),
                 "White balance" => whitebalance_module_row(ctx).upcast(),
                 "Framing" => framing_module_row(ctx).upcast(),
+                "Watermark" => watermark_module_row(ctx).upcast(),
                 "Invert" => invert_module_row(ctx).upcast(),
                 other => match elsewhere_hint(other) {
                     // Implemented, but driven from its own control — point at it
@@ -3058,7 +3059,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Defringe", "Invert", "White balance", "Input color profile", "Framing"];
+const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Defringe", "Invert", "White balance", "Input color profile", "Framing", "Watermark"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3278,6 +3279,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
         "Hot pixels" => set!(hotpixels_on, hotpixels_threshold, hotpixels_strength, hotpixels_permissive),
         "Denoise (profiled)" => set!(dn_on, dn_mode_y0u0v0, dn_strength, dn_shadows, dn_bias),
         "Chromatic aberrations" => set!(cac_on, cac_guide, cac_radius, cac_strength, cac_mode, cac_refine),
+        "Watermark" => set!(wm_on, wm_asset, wm_opacity, wm_scale, wm_xoffset, wm_yoffset, wm_alignment, wm_rotate),
         "Lens correction" => set!(
             lens_on,
             lens_inverse,
@@ -5319,6 +5321,147 @@ fn framing_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     expander
 }
 
+/// The marker choices for [`watermark_module_row`] — slice 1 ships exactly one
+/// entry (the embedded emblem), mirroring the c41-core asset list. The dropdown
+/// index IS the [`PreviewParams::wm_asset`] ordinal, so a future built-in or
+/// user-`watermarks/` PNG extends this array and the blob keeps its shape
+/// (the driver falls back to the built-in for unknown ordinals).
+const WTM_ASSETS: [&str; 1] = ["c41 emblem"];
+const _: () = assert!(!WTM_ASSETS.is_empty());
+
+/// Watermark (watermark.c): composites a marker bitmap over the finished
+/// display-referred frame — iop_order.c v50 pos 69, the LAST in-pipeline
+/// stage, so it is a normal pipeline [`Stage`](c41_core::pipeline::Stage)
+/// and [`module_expander`]'s plain re-render applies (no re-decode, no
+/// geometry recompose). The compositor lives in `c41_core::watermark`.
+///
+/// Controls mirror darktable's watermarked surface: the marker dropdown
+/// (slice 1: one embedded asset; darktable's `watermarks/` template directory
+/// is a documented later slice — the G6 decision is recorded in the
+/// `c41_core::watermark` module docs), the placement cluster (3×3 alignment
+/// grid + x/y offsets), scale, rotation and opacity. `scale_base` is locked to
+/// darktable's default IMAGE mode; the advanced larger/smaller-border/height
+/// modes and the SVG text/font/colour machinery are not implemented (documented
+/// deviations in `Stage::Watermark` / `c41_core::watermark`).
+///
+/// **Rotation sign mirrors darktable's inverted slider factor**
+/// (`watermark.c`: `dt_bauhaus_slider_set_factor(g->rotate, -1.f)` stores the
+/// NEGATIVE of what the slider shows, and `process` negates again), so the
+/// blob keeps the C-equivalent param while the slider shows the render angle:
+/// dragging to +90° stores −90 and rotates the marker 90° CCW, exactly like
+/// C darktable.
+///
+/// **Scale range: the C's soft max 100, not the introspection hard 500**
+/// (same precedent as the cacorrectrg radius / denoise strength sliders, which
+/// also expose the soft range). Values 100..500 remain valid — the blob decode
+/// clamps to the hard range and the driver maps them straight through — but the
+/// drag cannot reach them.
+fn watermark_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Watermark", "overlay a marker like a signature or logo", p0.wm_on,
+        |p, on| p.wm_on = on,
+        |e, ctx| {
+            // Marker dropdown: the index IS the asset ordinal (only entry in
+            // slice 1); the seed clamps on the way out, like the other
+            // dropdown rows.
+            let marker = gtk4::DropDown::from_strings(&WTM_ASSETS);
+            inset_dropdown(&marker);
+            marker.set_tooltip_text(Some(
+                "marker to overlay; darktable's watermarks/ template directory \
+                 is a later slice — slice 1 ships one built-in emblem",
+            ));
+            marker.set_selected((p0.wm_asset as u32).min(WTM_ASSETS.len() as u32 - 1));
+            let m_ctx = ctx.clone();
+            marker.connect_selected_notify(move |dd| {
+                m_ctx.params.borrow_mut().wm_asset = dd.selected() as f32;
+                render_preview(&m_ctx);
+            });
+            e.add_row(&marker);
+
+            // Opacity: C introspection 0..100 %, default 100.
+            add_param_slider(e, ctx, "Opacity", 0.0, 100.0, 1.0, p0.wm_opacity as f64,
+                |p, v| p.wm_opacity = v);
+            // Scale: the C soft max 100 (hard range 1..500 is not reachable
+            // from the drag — see the row doc).
+            add_param_slider(e, ctx, "Scale", 1.0, 100.0, 1.0, p0.wm_scale as f64,
+                |p, v| p.wm_scale = v);
+            // Rotation: slider shows the render angle, blob stores the C
+            // param (= −display, the C's factor −1 slider) — see the row doc.
+            add_param_slider(e, ctx, "Rotation", -180.0, 180.0, 1.0, -p0.wm_rotate as f64,
+                |p, v| p.wm_rotate = -v);
+            // X/Y offsets: fractions of the image width/height, like the C's
+            // xoffset/yoffset ($MIN −1 $MAX 1).
+            add_param_slider(e, ctx, "X offset", -1.0, 1.0, 0.01, p0.wm_xoffset as f64,
+                |p, v| p.wm_xoffset = v);
+            add_param_slider(e, ctx, "Y offset", -1.0, 1.0, 0.01, p0.wm_yoffset as f64,
+                |p, v| p.wm_yoffset = v);
+
+            // 3×3 alignment grid: the C's dtgtk toggle table (watermark.c
+            // `_alignment_callback`), row-major ordinal 0..8, default 4 =
+            // centre. A plain grid of ToggleButtons with the C's layout; the
+            // selection is exclusive — a newly-armed button deactivates the
+            // others, exactly like the C's block-handlers-then-set loop. The
+            // deactivation blips fire their own toggled handlers, which take
+            // the `!is_active` no-op branch, so only the armed button writes
+            // and re-renders (once). Buttons are seeded before connecting, so
+            // the build itself never fires a handler.
+            let labels = ["TL", "T", "TR", "L", "C", "R", "BL", "B", "BR"];
+            let grid = gtk4::Grid::builder()
+                .column_homogeneous(true)
+                .row_homogeneous(true)
+                .column_spacing(3)
+                .row_spacing(3)
+                .margin_start(8)
+                .margin_end(8)
+                .build();
+            let buttons: Vec<gtk4::ToggleButton> = labels
+                .iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    let b = gtk4::ToggleButton::with_label(label);
+                    b.set_active((p0.wm_alignment as i32) == i as i32);
+                    b
+                })
+                .collect();
+            for (i, b) in buttons.iter().enumerate() {
+                let b_ctx = ctx.clone();
+                let wi = i as f32;
+                let others: Vec<gtk4::ToggleButton> = buttons
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, o)| o.clone())
+                    .collect();
+                b.connect_toggled(move |tb| {
+                    if tb.is_active() {
+                        // (re)armed: clear the siblings and commit the slot. A
+                        // deliberate re-click on the already-armed button would
+                        // otherwise toggle it OFF and desync the grid (the C's
+                        // radio-group behaviour never allows no selection).
+                        for o in &others {
+                            o.set_active(false);
+                        }
+                        b_ctx.params.borrow_mut().wm_alignment = wi;
+                        render_preview(&b_ctx);
+                    } else {
+                        // A toggled-off transition is either a sibling being
+                        // armed (whose own handler clears us) or a user re-click
+                        // on the armed button — the latter must re-arm, never
+                        // leave the grid with no selection.
+                        tb.set_active(true);
+                    }
+                });
+                grid.attach(b, (i % 3) as i32, (i / 3) as i32, 1, 1);
+            }
+            let align_row = adw::ActionRow::builder()
+                .title("Alignment")
+                .tooltip_text("marker position on a 3×3 grid")
+                .build();
+            align_row.add_suffix(&grid);
+            e.add_row(&align_row);
+        })
+}
+
 /// Grain (grain.c): display-referred grain on the **Lab L** channel, shaped by a
 /// photographic-paper-response LUT — iop_order.c v50 pos 65, a normal pipeline
 /// stage in the creative cluster, so [`module_expander`]'s plain re-render
@@ -5792,6 +5935,10 @@ mod tests {
             "the wired cacorrectrgb module must read as live"
         );
         assert!(
+            is_live_module("Watermark"),
+            "the wired watermark module must read as live"
+        );
+        assert!(
             is_live_module("Raw black/white point"),
             "the wired rawprepare module must read as live"
         );
@@ -6019,6 +6166,15 @@ mod tests {
             .position(|g| g.modules.iter().any(|m| m.label == "Chromatic aberrations"));
         assert_eq!(cac_group, Some(3));
         assert!(module_filter_matches(ModuleFilter::Active, 3, "Chromatic aberrations", ""));
+        // Watermark sits in the catalog's Effect group (index 4 — darktable's
+        // own module group for it, next to Framing) and is live, so the
+        // Active filter counts it there.
+        assert!(is_live_module("Watermark"));
+        let wm_group = crate::catalog::module_catalog()
+            .iter()
+            .position(|g| g.modules.iter().any(|m| m.label == "Watermark"));
+        assert_eq!(wm_group, Some(4));
+        assert!(module_filter_matches(ModuleFilter::Active, 4, "Watermark", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
@@ -6393,6 +6549,16 @@ mod tests {
             p.cac_mode = M;
             p.cac_refine = true;
         }),
+        ("Watermark", |p| {
+            p.wm_on = true;
+            p.wm_asset = M;
+            p.wm_opacity = M;
+            p.wm_scale = M;
+            p.wm_xoffset = M;
+            p.wm_yoffset = M;
+            p.wm_alignment = M;
+            p.wm_rotate = M;
+        }),
         ("Grain", |p| {
             p.gr_on = true;
             p.gr_coarseness = M;
@@ -6711,6 +6877,14 @@ mod tests {
             cac_strength: _,
             cac_mode: _,
             cac_refine: _,
+            wm_on: _,
+            wm_asset: _,
+            wm_opacity: _,
+            wm_scale: _,
+            wm_xoffset: _,
+            wm_yoffset: _,
+            wm_alignment: _,
+            wm_rotate: _,
             brd_on: _,
             brd_size: _,
             brd_pos_h: _,
@@ -6877,7 +7051,9 @@ mod tests {
             ..Default::default()
         };
         let before = p;
-        assert!(!reset_module(&mut p, "Watermark"));
+        // "Not a module" is not in the reset map (Watermark IS now — it became
+        // a live row in S3, so it can no longer double as the unknown label).
+        assert!(!reset_module(&mut p, "Not a module"));
         assert_eq!(p, before);
     }
 }

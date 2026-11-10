@@ -692,6 +692,22 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if framing {
         return "Framing";
     }
+    // Watermark (watermark.c, iop_order.c v50 pos 69): a normal pipeline
+    // stage (the last one) whose eight fields all live in the blob, so an
+    // edit to them must be labelled or it would silently fall through to
+    // "Edit". Grouped after Framing, in v50 order (pos 69 follows the
+    // geometry-family borders compose at 68).
+    let wm = old.wm_on != new.wm_on
+        || old.wm_asset != new.wm_asset
+        || old.wm_opacity != new.wm_opacity
+        || old.wm_scale != new.wm_scale
+        || old.wm_xoffset != new.wm_xoffset
+        || old.wm_yoffset != new.wm_yoffset
+        || old.wm_alignment != new.wm_alignment
+        || old.wm_rotate != new.wm_rotate;
+    if wm {
+        return "Watermark";
+    }
     "Edit"
 }
 
@@ -1018,6 +1034,19 @@ mod tests {
             describe_change(&base, &PreviewParams { cac_refine: true, ..base }),
             "Chromatic aberrations"
         );
+        // Watermark labels the enable flag and each control.
+        assert_eq!(
+            describe_change(&base, &PreviewParams { wm_on: true, ..base }),
+            "Watermark"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { wm_opacity: 71.0, ..base }),
+            "Watermark"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { wm_alignment: 2.0, ..base }),
+            "Watermark"
+        );
         // Framing labels both the enable flag and the sliders (geometry-family
         // compose; the fields live in the blob like any other module).
         assert_eq!(
@@ -1311,6 +1340,14 @@ mod tests {
             cac_strength: _,
             cac_mode: _,
             cac_refine: _,
+            wm_on: _,
+            wm_asset: _,
+            wm_opacity: _,
+            wm_scale: _,
+            wm_xoffset: _,
+            wm_yoffset: _,
+            wm_alignment: _,
+            wm_rotate: _,
             brd_on: _,
             brd_size: _,
             brd_pos_h: _,
@@ -1449,7 +1486,10 @@ mod tests {
         // pos_h/v, border RGB, frame size/offset, frame RGB).
         // S2 Chromatic aberrations (v35): 1959 → 1977 (2 more bools — on,
         // refine — + 4 f32 controls — guide/mode ordinals, radius, strength).
-        assert_eq!(PreviewParams::default().encode().len(), 1977);
+        // S3 Watermark (v36): 1977 → 2006 (1 more bool + 7 f32 controls —
+        // asset index, opacity %, scale %, x/y offsets, alignment ordinal,
+        // rotation).
+        assert_eq!(PreviewParams::default().encode().len(), 2006);
     }
 
     #[test]
