@@ -276,6 +276,24 @@ pub struct ExportEdit {
     pub lens: Option<std::sync::Arc<crate::preview::LensGear>>,
 }
 
+/// Add the Framing (borders) compose to a linear RGBA buffer already cropped/
+/// straightened by the geometry pass — the raw twin of the darkroom preview's
+/// `apply_geometry_to_base`. Identity (module off) returns the buffer
+/// untouched, so the default edit stays byte-identical to the pre-Framing
+/// render. Shared by every raw export funnel so preview and export can never
+/// drift apart.
+fn apply_framing_linear(
+    params: &crate::preview::PreviewParams,
+    gw: usize,
+    gh: usize,
+    pixels: Vec<f32>,
+) -> (usize, usize, Vec<f32>) {
+    match params.borders_params() {
+        Some(bp) => c41_core::borders::Borders::apply(&pixels, gw, gh, bp),
+        None => (gw, gh, pixels),
+    }
+}
+
 /// Render a decoded [`RawImage`] to a packed 8-bit **sRGB RGB** buffer
 /// (`width*height*3`) through the c41-ui pipeline — the full-resolution
 /// twin of the darkroom preview, so a Rust-native export matches what the user
@@ -318,6 +336,9 @@ pub fn render_export_rgb8_gear(
     // lens at iop_order 13, before the geometry modules (m4-131).
     let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    // Framing (borders) composes the canvas AFTER geometry, exactly like the
+    // raw preview: the pipeline then runs on the bordered frame.
+    let (gw, gh, geom_linear) = apply_framing_linear(params, gw, gh, geom_linear);
     let rgb = crate::preview::render_linear_to_srgb8_gear(
         &geom_linear,
         gw,
@@ -357,6 +378,9 @@ pub fn render_export_rgb16_gear(
     // lens at iop_order 13, before the geometry modules (m4-131).
     let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    // Framing (borders) composes the canvas AFTER geometry, exactly like the
+    // 8-bit twin and the raw preview: the pipeline then runs on the bordered frame.
+    let (gw, gh, geom_linear) = apply_framing_linear(params, gw, gh, geom_linear);
     let rgb = crate::preview::render_linear_to_srgb16_gear(
         &geom_linear,
         gw,
@@ -386,6 +410,9 @@ pub(crate) fn render_export_rgb16_output_gear(
     let (w, h, linear) = img.to_linear_rgba_with_opts(method, params.hl_opts(), params.hotpixels_opts());
     let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
     let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    // Framing (borders) composes the canvas AFTER geometry, exactly like the
+    // other raw funnels: the pipeline then runs on the bordered frame.
+    let (gw, gh, geom_linear) = apply_framing_linear(params, gw, gh, geom_linear);
     let rgb = crate::preview::render_linear_to_output16_gear(
         &geom_linear, gw, gh, params, lens_gear, grain_seed, profile,
     )?;
@@ -604,6 +631,57 @@ mod tests {
         );
         assert_eq!((w, h), (20, 30));
         assert_eq!(rgb.len(), 20 * 30 * 3);
+    }
+
+    #[test]
+    fn render_export_rgb8_applies_framing_borders() {
+        use c41_core::geometry::Geometry;
+        use c41_core::rawimage::DemosaicMethod;
+        let img = synthetic_raw(20, 12);
+        // size 0.1 on a landscape 20x12: basis = width (20 > 12),
+        // roundf(20/0.9) = 22 → 22x14 (height = 12 + 22 − 20). Centred pos
+        // 0.5 on a 2x2 border split: trunc(2·0.5) = 1 top/left, 1 bottom/right.
+        let params = crate::preview::PreviewParams {
+            brd_on: true,
+            brd_size: 0.1,
+            brd_color_r: 1.0,
+            brd_color_g: 0.0,
+            brd_color_b: 0.0,
+            ..crate::preview::PreviewParams::default()
+        };
+        let (w, h, rgb) = render_export_rgb8(
+            &img,
+            DemosaicMethod::Rcd,
+            Geometry::default(),
+            &params,
+            0,
+        );
+        // Bordered dims (22x14) — NOT the source 20x12.
+        assert_eq!((w, h), (22, 14));
+        assert_eq!(rgb.len(), 22 * 14 * 3);
+        // Top-left corner must be the border colour (red 255,0,0).
+        assert_eq!(&rgb[0..3], &[255, 0, 0]);
+        // The border extends exactly 1 row/col on each side (pos 0.5 on 2px).
+        assert_eq!(&rgb[1 * 3..2 * 3], &[255, 0, 0]); // row 0, col 1
+        // An interior image pixel differs from the border colour (the synthetic
+        // gradient is never pure red), so the copied region survived.
+        let interior = (7 * w + 11) * 3; // framed output (7,11)
+        assert_ne!(&rgb[interior..interior + 3], &[255, 0, 0]);
+        // Off borders must stay byte-identical: dims and pixels untouched.
+        let (w0, h0, rgb0) = render_export_rgb8(
+            &img,
+            DemosaicMethod::Rcd,
+            Geometry::default(),
+            &crate::preview::PreviewParams::default(),
+            0,
+        );
+        assert_eq!((w0, h0), (20, 12));
+        // The framed export must contain the unframed image region: the demosaic
+        // is deterministic, so the framed pixel at (7,11) — source (6,10), the
+        // 1-px border offset — must equal the unframed source (6,10).
+        let src_px = ((7 - 1) * 20 + (11 - 1)) * 3;
+        assert_eq!(&rgb0[src_px..src_px + 3], &rgb[interior..interior + 3],
+                   "interior image region must be preserved by borders");
     }
 
     #[test]

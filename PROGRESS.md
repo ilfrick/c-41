@@ -9190,3 +9190,44 @@ re-decode (shared decode-level gap with Hot pixels/HL). Host `cargo test -p
 c41-core` cannot link (no lensfun/gphoto2 — known; docker authoritative). No
 deployment/container/installer/service changed; `install-debuntu.sh` +
 checksum remain untracked and untouched.
+
+## 2026-11-10 — S1 (parity sprint plan): Framing (borders)
+
+**What.** First sprint of `PARITY_SPRINT_PLAN.md`: made darktable's `Framing`
+(`borders.c`, v50 pos 76) a LIVE module. New `c41_core::borders::{BordersParams,
+Borders}` ports the C's constant-border path bit-exactly for whole-frame scale-1:
+`modify_roi_out` (basis AUTO→LONGER→larger side, `roundf(basis/(1-size))`,
+`other + basis_out − basis_in`, `CLAMP(1, 3·max)`), `dt_iop_setup_binfo` port
+(pos splits, frame-line branch with `border_min_size`, `floor(in + 2·offset)`
+widths, stick conditions) writing all `border_size_t/b/l/r` fields, and the
+compose reuses the already-ported `copy_image_with_border_kernel` plus new
+8-bit/16-bit twins (`apply_srgb8/16` with `classify_pixel` matching the kernel's
+band lattice). It runs in the **geometry family** — a base-image compose after
+orientation/straighten/crop and before the pipeline — wired into the darkroom
+compose (raw + non-raw), all three raw export funnels, and both non-raw export
+legs; `borders_params()` (v34 blob, +1 bool +11 f32, 1914→1959) is the single
+construction site shared by every path. UI: `framing_module_row` (enable + size
++ position H/V + border RGB + frame size/offset + frame RGB, 11 sliders),
+history label, style group (MODULE_GROUPS 41), reset wired through the
+recompose paths. Header count 47/52 active, 5 inert. Deviations: aspect/basis
+selection not surfaced (constant border only); borders fill colours run through
+the full pipeline (linear base compose) whereas darktable composes them
+post-pipeline display-referred — documented, self-consistent preview≡export;
+per-module slider recompose is un-debounced (bounded cost on the downscaled
+base).
+
+**Problems found en route.** First CI run: the ported `setup_binfo` computed the
+four `border_size_*` locals but never assigned them to the struct (border_size
+fields stayed 0 — the C writes them); fixed. Three golden tests had wrong
+hand-arithmetic (15×10 vs the actual 11; a corner that is really an image
+pixel; a false "frame collapse" invariant — `frame_tl_*` stay default/0 when
+no frame runs, matching the C's uninitialized stack fields); fixed. The senior
+review found two real blockers of the same stale-base class I had already fixed
+for Reset but missed on the other edit-reverting flows: `apply_history_params`
+(undo/redo/jump) and the non-raw style-apply branch still bare-`render_preview`
+so a Framing change left the old border painted — both now recompose. L1 fix:
+`modify_roi_out` treats `size >= 1.0` (blob-corruption-only; UI caps at 0.5) as
+a no-op to avoid the i64 overflow a debug build panics on. Focused re-review:
+no blockers. Final `scripts/ci-local.sh` all four steps green (1 950
+`c41-core` / 556 `c41-ui`); `git diff --check` passed. No deployment changed;
+installers untracked and untouched.

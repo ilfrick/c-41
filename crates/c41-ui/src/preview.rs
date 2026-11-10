@@ -730,6 +730,38 @@ pub struct PreviewParams {
     /// White point, sensor units, broadcast to every colour (the rawprepare
     /// `div[i] = white - sub[i]` contract).
     pub rwp_white: f32,
+    // ── Framing (borders.c, iop_order.c v50 pos 70) ───────────────────────────
+    // Adds a solid border (and optional frame line) around the picture,
+    // enlarging the canvas. Runs in the GEOMETRY family — it is a base-image
+    // compose like crop, applied to the decoded buffer BEFORE the pipeline
+    // (see `apply_geometry_to_base` in the darkroom view and the export
+    // funnels), so it is deliberately NOT a pipeline [`Stage`](c41_core::
+    // pipeline::Stage) and deliberately stays out of [`Self::is_identity`] /
+    // [`Self::to_pipeline`] exactly like the `Geometry`/`Orientation` controls.
+    // The constant-border subset is ported in `c41_core::borders::Borders`.
+    /// Framing module enabled (darktable's border/frame toggle). Ships off.
+    pub brd_on: bool,
+    /// Border width relative to the chosen basis, 0..0.5, default 0.1
+    /// (darktable `size` `$DEFAULT`).
+    pub brd_size: f32,
+    /// Picture horizontal position ratio into the final frame, 0..1, default
+    /// 0.5 (centred).
+    pub brd_pos_h: f32,
+    /// Picture vertical position ratio into the final frame, 0..1, default 0.5.
+    pub brd_pos_v: f32,
+    /// Border colour RGB in `[0,1]`, default white (darktable `color`).
+    pub brd_color_r: f32,
+    pub brd_color_g: f32,
+    pub brd_color_b: f32,
+    /// Frame-line width relative to the border width, 0..1, default 0.0 =
+    /// no frame line.
+    pub brd_frame_size: f32,
+    /// Frame-line position relative to the picture edge, 0..1, default 0.5.
+    pub brd_frame_offset: f32,
+    /// Frame-line colour RGB in `[0,1]`, default black (darktable `frame_color`).
+    pub brd_frame_color_r: f32,
+    pub brd_frame_color_g: f32,
+    pub brd_frame_color_b: f32,
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -1026,6 +1058,23 @@ impl Default for PreviewParams {
             rwp_black2: 0.0,
             rwp_black3: 0.0,
             rwp_white: 65535.0,
+            // Framing (borders): off, with the darktable `$DEFAULT`s for the
+            // wired sliders — size 0.1, centred position, white border
+            // colour, no frame line (0.0), frame offset 0.5, black frame
+            // colour. Inert exactly because `brd_on` gates the compose
+            // (see [`Self::borders_params`]).
+            brd_on: false,
+            brd_size: 0.1,
+            brd_pos_h: 0.5,
+            brd_pos_v: 0.5,
+            brd_color_r: 1.0,
+            brd_color_g: 1.0,
+            brd_color_b: 1.0,
+            brd_frame_size: 0.0,
+            brd_frame_offset: 0.5,
+            brd_frame_color_r: 0.0,
+            brd_frame_color_g: 0.0,
+            brd_frame_color_b: 0.0,
             df_on: false,
             df_radius: 4.0,   // defringe.c $DEFAULT
             df_thresh: 20.0,  // defringe.c $DEFAULT
@@ -1100,6 +1149,14 @@ impl PreviewParams {
     /// True when the pipeline would leave the image unchanged, so the caller
     /// can skip re-processing/uploading. Exposure is a no-op at ev 0 & black 0;
     /// velvia is a no-op when off or at strength 0.
+    ///
+    /// **Framing is deliberately not consulted here**, exactly like
+    /// `Geometry`/`Orientation` (which live outside [`PreviewParams`]): a
+    /// borders pass is a base-image compose that runs before the pipeline in
+    /// the geometry family (crop-style, changing the buffer dims), so the
+    /// pipeline's identity is independent of it. Callers that need to know
+    /// whether the whole render is a no-op must check `borders_params()`
+    /// separately.
     pub fn is_identity(&self) -> bool {
         // Exact `== 0.0` is intentional: ev/black come straight from GTK slider
         // positions (cast of an f64 that is exactly 0.0 at the default), never
@@ -1338,6 +1395,25 @@ impl PreviewParams {
         })
     }
 
+    /// The Framing (borders) params for the geometry pass — the single
+    /// construction site shared by the darkroom compose, the export funnels
+    /// and the 8-bit non-raw compose, so preview and export cannot disagree
+    /// about what the sliders mean. `None` while the module is off (or never
+    /// persisted), which is exactly the identity signal — like `rwp_opts`,
+    /// an enabled flag is the only gate (the slider values are always carried
+    /// in the blob, so a later enable needs no migration).
+    pub fn borders_params(&self) -> Option<c41_core::borders::BordersParams> {
+        self.brd_on.then_some(c41_core::borders::BordersParams {
+            color: [self.brd_color_r, self.brd_color_g, self.brd_color_b],
+            size: self.brd_size,
+            pos_h: self.brd_pos_h,
+            pos_v: self.brd_pos_v,
+            frame_size: self.brd_frame_size,
+            frame_offset: self.brd_frame_offset,
+            frame_color: [self.brd_frame_color_r, self.brd_frame_color_g, self.brd_frame_color_b],
+        })
+    }
+
     /// The UI fields + resolved gear mapped onto the core's `LensParams` —
     /// the single construction site shared by `to_pipeline_with` and the lens
     /// module's autoscale button, so they can never disagree about what the
@@ -1517,7 +1593,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on, self.brd_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1699,11 +1775,18 @@ impl PreviewParams {
             v.extend_from_slice(&s.to_le_bytes());
         }
         // Highpass (v31), then hot-pixel controls (v32), then raw black/white
-        // point (v33) — each block appended so the layout stays append-only.
+        // point (v33), then Framing (v34) — each block appended so the layout
+        // stays append-only.
         for s in [self.highpass_sharpness, self.highpass_contrast,
                   self.hotpixels_threshold, self.hotpixels_strength,
                   self.rwp_black0, self.rwp_black1, self.rwp_black2, self.rwp_black3,
-                  self.rwp_white] {
+                  self.rwp_white,
+                  // Framing (v34): the geometry-family compose params — size,
+                  // position, border colour, frame line width / offset / colour.
+                  self.brd_size, self.brd_pos_h, self.brd_pos_v,
+                  self.brd_color_r, self.brd_color_g, self.brd_color_b,
+                  self.brd_frame_size, self.brd_frame_offset,
+                  self.brd_frame_color_r, self.brd_frame_color_g, self.brd_frame_color_b] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -2013,6 +2096,25 @@ impl PreviewParams {
             rwp_black2: f.get(464).copied().unwrap_or(d.rwp_black2),
             rwp_black3: f.get(465).copied().unwrap_or(d.rwp_black3),
             rwp_white: f.get(466).copied().unwrap_or(d.rwp_white),
+            // Framing (v34): bool 45, floats 467–477. v33-and-earlier blobs
+            // end before any of this — every `.get` misses and each slot keeps
+            // its default (brd off ⇒ nothing composes, exactly like reading a
+            // fresh edit). Ranges: size 0..0.5, positions 0..1, colours 0..1,
+            // frame size 0..1, frame offset 0..1. Kept unclamped on decode so
+            // the stored blob stays a faithful record (the compose guards
+            // non-finite values and the UI sliders clamp on the way out).
+            brd_on: bools.get(45).map_or(d.brd_on, |&b| b != 0),
+            brd_size: f.get(467).copied().unwrap_or(d.brd_size),
+            brd_pos_h: f.get(468).copied().unwrap_or(d.brd_pos_h),
+            brd_pos_v: f.get(469).copied().unwrap_or(d.brd_pos_v),
+            brd_color_r: f.get(470).copied().unwrap_or(d.brd_color_r),
+            brd_color_g: f.get(471).copied().unwrap_or(d.brd_color_g),
+            brd_color_b: f.get(472).copied().unwrap_or(d.brd_color_b),
+            brd_frame_size: f.get(473).copied().unwrap_or(d.brd_frame_size),
+            brd_frame_offset: f.get(474).copied().unwrap_or(d.brd_frame_offset),
+            brd_frame_color_r: f.get(475).copied().unwrap_or(d.brd_frame_color_r),
+            brd_frame_color_g: f.get(476).copied().unwrap_or(d.brd_frame_color_g),
+            brd_frame_color_b: f.get(477).copied().unwrap_or(d.brd_frame_color_b),
         })
     }
 
@@ -2930,9 +3032,12 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v32 adds raw-only hot pixels (2 bools + 2 f32).
 /// v33 adds raw black/white point (1 bool + 5 f32) — decode-level, like
 /// hot pixels, so the params remain pipeline-identity-neutral.
-const ENCODE_VERSION: u8 = 33;
-/// 1 version byte + 45 bool bytes + 467 little-endian f32.
-const ENCODED_LEN: usize = 1 + 45 + 467 * 4;
+/// v34 adds Framing (1 bool + 11 f32: size, pos_h/v, border RGB,
+/// frame size/offset, frame RGB) — a GEOMETRY-family compose (base-image
+/// enlarge like crop), so it joins the blob but not is_identity/pipeline.
+const ENCODE_VERSION: u8 = 34;
+/// 1 version byte + 46 bool bytes + 478 little-endian f32.
+const ENCODED_LEN: usize = 1 + 46 + 478 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2961,6 +3066,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (31, 42, 460), // v31: highpass added
     (32, 44, 462), // v32: raw hotpixels added
     (33, 45, 467), // v33: raw black/white point added
+    (34, 46, 478), // v34: Framing (borders) geometry compose added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3771,6 +3877,21 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         rwp_black2: 333.0,
         rwp_black3: 444.0,
         rwp_white: 5000.0,
+        // Framing (v34): enabled with every slider off-default and pairwise
+        // distinct so a wrong offset inside the appended block shows up as a
+        // round-trip mismatch.
+        brd_on: true,
+        brd_size: 0.37,
+        brd_pos_h: 0.21,
+        brd_pos_v: 0.63,
+        brd_color_r: 0.11,
+        brd_color_g: 0.83,
+        brd_color_b: 0.47,
+        brd_frame_size: 0.55,
+        brd_frame_offset: 0.29,
+        brd_frame_color_r: 0.91,
+        brd_frame_color_g: 0.02,
+        brd_frame_color_b: 0.67,
         df_on: true,
         df_radius: 7.5,
         df_thresh: 62.0,
@@ -4915,6 +5036,76 @@ mod tests {
         let round = PreviewParams::decode(&params.encode()).expect("v33 blob must decode");
         assert_eq!(round, params);
         assert_eq!(round.rawprepare_opts(), params.rawprepare_opts());
+    }
+
+    #[test]
+    fn decode_v33_blob_defaults_framing_fields() {
+        // A v33 blob (the last layout before Framing — 45 bools / 467 f32s)
+        // must decode with framing OFF and its sliders at the darktable
+        // defaults, so an image edited before the module existed loads
+        // unchanged instead of growing a border behind the user's back.
+        // `brd_on` is the load-bearing index: `unwrap_or(true)` would border
+        // every saved edit.
+        let v33 = {
+            let mut b = vec![0u8; 1 + 45 + 467 * 4];
+            b[0] = 33;
+            b
+        };
+        let decoded = PreviewParams::decode(&v33).expect("v33 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert!(!decoded.brd_on);
+        assert_eq!(decoded.brd_size, def.brd_size);
+        assert_eq!(decoded.brd_pos_h, def.brd_pos_h);
+        assert_eq!(decoded.brd_pos_v, def.brd_pos_v);
+        assert_eq!((decoded.brd_color_r, decoded.brd_color_g, decoded.brd_color_b),
+                   (def.brd_color_r, def.brd_color_g, def.brd_color_b));
+        assert_eq!(decoded.brd_frame_size, def.brd_frame_size);
+        assert_eq!(decoded.brd_frame_offset, def.brd_frame_offset);
+        assert_eq!((decoded.brd_frame_color_r, decoded.brd_frame_color_g, decoded.brd_frame_color_b),
+                   (def.brd_frame_color_r, def.brd_frame_color_g, def.brd_frame_color_b));
+        assert!(decoded.borders_params().is_none(), "a pre-framing edit must not compose a border");
+    }
+
+    #[test]
+    fn borders_params_are_geometry_compose_controls() {
+        // `borders_params` is gated on the enable flag alone; the sliders are
+        // always carried so an enable after loading needs no migration.
+        let mut params = PreviewParams::default();
+        assert!(params.borders_params().is_none());
+        params.brd_on = true;
+        params.brd_size = 0.25;
+        params.brd_pos_h = 0.3;
+        params.brd_pos_v = 0.7;
+        params.brd_color_r = 0.9;
+        params.brd_color_g = 0.1;
+        params.brd_color_b = 0.5;
+        params.brd_frame_size = 0.5;
+        params.brd_frame_offset = 0.25;
+        params.brd_frame_color_r = 0.1;
+        params.brd_frame_color_g = 0.8;
+        params.brd_frame_color_b = 0.2;
+        assert_eq!(
+            params.borders_params(),
+            Some(c41_core::borders::BordersParams {
+                color: [0.9, 0.1, 0.5],
+                size: 0.25,
+                pos_h: 0.3,
+                pos_v: 0.7,
+                frame_size: 0.5,
+                frame_offset: 0.25,
+                frame_color: [0.1, 0.8, 0.2],
+            })
+        );
+        let round = PreviewParams::decode(&params.encode()).expect("v34 blob must decode");
+        assert_eq!(round, params);
+        assert_eq!(round.borders_params(), params.borders_params());
+        // A borders edit must NOT drag the *pipeline* out of identity (it
+        // composes the base image in the geometry family, before the pipeline).
+        assert!(round.is_identity());
+        assert!(
+            round.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
+            "Framing is a base-image compose, never a pipeline stage"
+        );
     }
 
     #[test]

@@ -677,6 +677,14 @@ fn render_nonraw_export(
             // export's geometry pass; crop/straighten stay raw-only.
             let (ow, oh, rgb) =
                 c41_core::geometry::apply_orientation(&rgb, w, h, 3, geometry.orientation);
+            // Framing (borders) — the same geometry-family compose the raw
+            // export funnels apply after geometry, on the 8-bit non-raw path.
+            // Identity when the module is off (default renders byte-identical).
+            let (ow, oh, rgb) = match params.borders_params() {
+                Some(bp) => c41_core::borders::Borders::apply_srgb8(&rgb, ow, oh, 3, ow * 3, bp)
+                    .ok_or_else(|| anyhow::anyhow!("borders compose: bad decoded buffer"))?,
+                None => (ow, oh, rgb),
+            };
             let mut processed = crate::preview::apply_pipeline_gear(
                 &rgb, ow, oh, ow * 3, 3, params, lens_gear, grain_seed,
             );
@@ -715,6 +723,15 @@ fn render_nonraw_export(
             let rgb = composite_rgba16_over_white(&rgba);
             let (ow, oh, rgb) =
                 c41_core::geometry::apply_orientation(&rgb, w, h, 3, geometry.orientation);
+            // Framing — same symmetric point as the 8-bit leg, via the lossless
+            // 16-bit twin so a bordered 16-bit source keeps its depth (an 8-bit
+            // compose here would requantise the whole image; the geometry-only
+            // orientation slice above is what 'same care' demands).
+            let (ow, oh, rgb) = match params.borders_params() {
+                Some(bp) => c41_core::borders::Borders::apply_srgb16(&rgb, ow, oh, 3, ow * 3, bp)
+                    .ok_or_else(|| anyhow::anyhow!("borders compose: bad decoded buffer"))?,
+                None => (ow, oh, rgb),
+            };
             let mut processed = crate::preview::apply_pipeline_rgb16_gear(
                 &rgb, ow, oh, params, lens_gear, grain_seed,
             );
@@ -1277,6 +1294,75 @@ mod tests {
             &expected,
             "non-raw export must rotate the decoded pixels exactly"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_nonraw_export_applies_framing_borders() {
+        use image::{ImageBuffer, Rgb};
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_nonraw_framing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 6×4 with a distinct value per pixel (lossless PNG keeps them exact).
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(6, 4, |x, y| Rgb([(x + 6 * y) as u8, 200, 60]));
+        let src = dir.join("in.png");
+        img.save(&src).unwrap();
+
+        // size 0.34 on 6×4: basis = width (6 > 4), roundf(6/0.66) = 9 → 9×7
+        // (height = 4 + 9 − 6); border totals 3×3, pos 0.5 → t/l 1, b/r 2.
+        let params = crate::preview::PreviewParams {
+            brd_on: true,
+            brd_size: 0.34,
+            brd_color_r: 1.0,
+            brd_color_g: 0.0,
+            brd_color_b: 0.0,
+            ..crate::preview::PreviewParams::default()
+        };
+        let dest = dir.join("out");
+        let settings = crate::export::ExportSettings {
+            format: crate::export::ExportFormat::Png,
+            quality: 90,
+            resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb,
+        };
+        render_nonraw_export(
+            src.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            &settings,
+            &params,
+            None,
+            &c41_core::geometry::Geometry::default(),
+            None,
+        )
+        .unwrap();
+
+        let out = image::ImageReader::open(format!("{}.png", dest.to_str().unwrap()))
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_rgb8();
+        // Bordered dims — the canvas grew by 1 px on top/left and 2 on
+        // bottom/right.
+        assert_eq!((out.width(), out.height()), (9, 7));
+        // Top-left corner is the border colour.
+        assert_eq!(out.get_pixel(0, 0)[0], 255);
+        assert_eq!(out.get_pixel(0, 1)[0], 255); // top border row
+        assert_eq!(out.get_pixel(1, 0)[0], 255); // left border column
+        // The image region is preserved: output (2,2) == source (1,1) — the
+        // 16-bit leg's lossless compose + lossless PNG round-trip.
+        let src_px = img.get_pixel(1, 1);
+        let out_px = out.get_pixel(2, 2);
+        assert_eq!(out_px, src_px, "image region must survive the bordered 16-bit export");
+        // Bottom-right image pixel maps to source (4,2) (image at offset 1,1).
+        assert_eq!(out.get_pixel(5, 3), img.get_pixel(4, 2));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

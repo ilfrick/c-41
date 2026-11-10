@@ -39,7 +39,7 @@
 // multiple of 16. `repr(C, align(16))` reproduces that exactly: 32 bytes of
 // color plus 30 ints (120 bytes) plus 8 bytes of tail padding = 160 bytes.
 #[repr(C, align(16))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct BorderPositions {
     pub bcolor: [f32; 4],
     pub flcolor: [f32; 4],
@@ -358,6 +358,538 @@ pub unsafe extern "C" fn darkroom_borders_copy_with_border(
     let out_slice = std::slice::from_raw_parts_mut(out, out_n);
     let in_slice = std::slice::from_raw_parts(inp, in_n);
     copy_image_with_border_kernel(out_slice, in_slice, b);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure-Rust `Framing` module (darktable `borders`, iop_order.c v50 pos 76).
+//
+// This is a *whole-frame, scale-1* port of the module's constant-border path
+// — the product's only case (the UI drives no aspect-ratio or basis sliders,
+// so `aspect` is locked to the C's `DT_IOP_BORDERS_ASPECT_CONSTANT_VALUE`
+// (`-1.0`) and `basis` to `DT_IOP_BORDERS_BASIS_AUTO`, the C default). The
+// boundary geometry (`modify_roi_out`, whole-frame `dt_iop_setup_binfo`) is
+// ported exactly; the row-loop compose reuses [`copy_image_with_border_kernel`].
+//
+// Framing runs in the **geometry family**: like crop it is a base-image
+// compose that changes the buffer dimensions *before* the per-pixel pipeline
+// runs. See `c41-ui`'s `apply_geometry_to_base` / export funnels for where
+// each render path invokes [`Borders::apply`] / [`Borders::apply_srgb8`].
+
+/// The c41 wiring subset of `dt_iop_borders_params_t` (v4). Fields mirror the
+/// C struct's names, ranges and `$DEFAULT`s for the constant-border path:
+/// `color` (border colour, 1.0 = white), `size` (border width as a fraction
+/// of the chosen basis, 0..0.5, 0.1), `pos_h`/`pos_v` (picture position ratio
+/// into the final frame, 0..1, 0.5 — i.e. centred), `frame_size` (frame-line
+/// width relative to the border width, 0..1, 0.0 = no frame), `frame_offset`
+/// (frame position relative to the picture edge, 0..1, 0.5) and
+/// `frame_color` (frame-line colour, 0.0 = black).
+///
+/// Omitted by design: `aspect`/`aspect_text`/`aspect_orient` (locked to the
+/// constant border), `basis` (locked to AUTO → LONGER for constant borders),
+/// `max_border_size` (TRUE is the only surviving behaviour) and the text
+/// sentinels. The UI stores exactly these fields in `PreviewParams` and
+/// round-trips them through `c41_core::borders::BordersParams`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BordersParams {
+    /// Border colour (RGB, 0..1, darktable default 1.0 = white).
+    pub color: [f32; 3],
+    /// Border width relative to the chosen basis (0..0.5, default 0.1).
+    pub size: f32,
+    /// Picture horizontal position ratio into the final frame (0..1, 0.5).
+    pub pos_h: f32,
+    /// Picture vertical position ratio into the final frame (0..1, 0.5).
+    pub pos_v: f32,
+    /// Frame-line width relative to the border width (0..1, 0.0 = no frame).
+    pub frame_size: f32,
+    /// Frame-line position relative to the picture edge (0..1, 0.5).
+    pub frame_offset: f32,
+    /// Frame-line colour (RGB, 0..1, default 0.0 = black).
+    pub frame_color: [f32; 3],
+}
+
+impl Default for BordersParams {
+    fn default() -> Self {
+        // Mirrors dt_iop_borders_params_t's `$DEFAULT`s for the fields we
+        // wire (`color 1.0`, `size 0.1`, `pos_* 0.5`, `frame_size 0.0`,
+        // `frame_offset 0.5`, `frame_color 0.0`; `default_v3` in borders.c
+        // also seeds these exact values).
+        Self {
+            color: [1.0, 1.0, 1.0],
+            size: 0.1,
+            pos_h: 0.5,
+            pos_v: 0.5,
+            frame_size: 0.0,
+            frame_offset: 0.5,
+            frame_color: [0.0, 0.0, 0.0],
+        }
+    }
+}
+
+impl BordersParams {
+    /// True when every field is a finite number. A corrupt blob with a NaN/Inf
+    /// parameter is treated as a no-op by the compose (like
+    /// [`crate::geometry::apply_rotate`]) rather than being allowed to poison
+    /// the geometry arithmetic.
+    fn is_finite(&self) -> bool {
+        self.size.is_finite()
+            && self.pos_h.is_finite()
+            && self.pos_v.is_finite()
+            && self.frame_size.is_finite()
+            && self.frame_offset.is_finite()
+            && self.color.iter().all(|c| c.is_finite())
+            && self.frame_color.iter().all(|c| c.is_finite())
+    }
+}
+
+/// The `Framing`/`borders` compose. See the module docs for the port scope.
+///
+/// `apply` is the linear-RGBA (4-float) form used by the raw preview and raw
+/// export funnels; `apply_srgb8` is the 8-bit form used by the non-raw paths.
+pub struct Borders;
+
+impl Borders {
+    /// Port of `modify_roi_out`'s **constant-border** path
+    /// (`src/iop/borders.c`, `is_constant_border` arm). For a constant border
+    /// the C's `DTO_IOP_BORDERS_BASIS_AUTO` resolves via `LONGER` to whichever
+    /// of width/height is the larger side; that side is scaled by
+    /// `roundf(basis_in / (1 - size))` and the other by
+    /// `other_in + basis_out - basis_in`, then both are `CLAMP`ed to
+    /// `[1, 3 * max(w, h)]`. `basis` is not a parameter here — it is locked to
+    /// AUTO exactly as described.
+    fn modify_roi_out(w: usize, h: usize, size: f32) -> (usize, usize) {
+        // Mirrors the C's `const float size = fabsf(d->size);` — the UI slider
+        // is 0..0.5, but a persisted blob is untrusted input and the C path
+        // takes the magnitude before any ratio.
+        let size = size.abs();
+        // `size >= 1.0` makes `basis/(1-size)` non-finite (and the subsequent
+        // `oh = hi + ow - wi` i64 arithmetic overflow in a debug build). The C
+        // is UB here; treat anything at/above the cap as a no-op — "geometry
+        // never fails a render". Not reachable from the UI (slider max 0.5).
+        if !(size < 1.0) {
+            return (w, h);
+        }
+        let (wi, hi) = (w as i64, h as i64);
+        let max_dim = wi.max(hi);
+        let (mut ow, mut oh) = (wi, hi);
+        // basis AUTO → LONGER → WIDTH when `width > height`, else HEIGHT.
+        if wi > hi {
+            let basis_out = ((w as f32) / (1.0 - size)).round();
+            ow = basis_out as i64;
+            oh = hi + ow - wi;
+        } else {
+            let basis_out = ((h as f32) / (1.0 - size)).round();
+            oh = basis_out as i64;
+            ow = wi + oh - hi;
+        }
+        ow = ow.clamp(1, 3 * max_dim);
+        oh = oh.clamp(1, 3 * max_dim);
+        (ow as usize, oh as usize)
+    }
+
+    /// Port of the **whole-frame, scale-1, `roi_out.x/y` = 0** geometry of
+    /// `dt_iop_setup_binfo` (`src/develop/borders_helper.c`). Generates a
+    /// [`BorderPositions`] for an `in_w × in_h` input placed in an
+    /// `out_w × out_h` frame at `pos_v`/`pos_h`, with the border/frame colours
+    /// and the frame-line branch (`frame_size`/`frame_offset`, capped by the
+    /// `border_min_size` logic). Integer rounding, `CLAMP`/`MAX` and the
+    /// bit-exact ordering match the C; `pos_v`/`pos_h` are genuine parameters.
+    fn setup_binfo(
+        in_w: i32,
+        in_h: i32,
+        out_w: i32,
+        out_h: i32,
+        pos_v: f32,
+        pos_h: f32,
+        bcolor: &[f32; 3],
+        fcolor: &[f32; 3],
+        f_size: f32,
+        f_offset: f32,
+    ) -> BorderPositions {
+        let has_left = pos_h > 0.0;
+        let has_right = pos_h < 1.0;
+        let has_top = pos_v > 0.0;
+        let has_bottom = pos_v < 1.0;
+
+        // `ceilf((buf_out.width - buf_in.width) * roi_in->scale)` with scale 1:
+        // ceil of an integer difference is itself, so this is exact. `i32`
+        // matches the C's `int` fields; the intermediate products explicitly
+        // widen to f32 exactly where the C's int×float promotions happen.
+        let border_tot_width = out_w - in_w;
+        let border_tot_height = out_h - in_h;
+
+        let border_size_t = if has_top { (border_tot_height as f32 * pos_v) as i32 } else { 0 };
+        let border_size_b = if has_bottom { border_tot_height - border_size_t } else { 0 };
+        let border_size_l = if has_left { (border_tot_width as f32 * pos_h) as i32 } else { 0 };
+        let border_size_r = if has_right { border_tot_width - border_size_l } else { 0 };
+
+        let (image_right, border_in_x) = if has_right {
+            let bx = border_size_l.clamp(0, out_w);
+            (bx + in_w, bx)
+        } else {
+            (out_w, border_tot_width.clamp(0, out_w))
+        };
+        let (image_bottom, border_in_y) = if has_bottom {
+            let by = border_size_t.clamp(0, out_h);
+            (by + in_h, by)
+        } else {
+            (out_h, border_tot_height.clamp(0, out_h))
+        };
+
+        let mut b = BorderPositions::default();
+        for c in 0..3 {
+            b.bcolor[c] = bcolor[c];
+            b.flcolor[c] = fcolor[c];
+        }
+        b.bcolor[3] = 1.0;
+        b.flcolor[3] = 1.0;
+
+        b.border_top = border_in_y;
+        b.fl_top = border_in_y;
+        b.image_top = border_in_y;
+        b.border_left = border_in_x;
+        b.fl_left = border_in_x;
+        b.image_left = border_in_x;
+        b.image_right = image_right;
+        b.fl_right = out_w;
+        b.border_right = out_w;
+        b.width = out_w;
+        b.image_bot = image_bottom;
+        b.fl_bot = out_h;
+        b.border_bot = out_h;
+        b.height = out_h;
+        b.stride = in_w;
+        b.border_in_x = border_in_x;
+        b.border_in_y = border_in_y;
+        // The per-side border sizes, exactly as the C writes them into
+        // `binfo` ahead of the frame branch (`dt_iop_setup_binfo` assigns
+        // `binfo->border_size_{t,b,l,r}` before the sub-rectangle geometry).
+        b.border_size_t = border_size_t;
+        b.border_size_b = border_size_b;
+        b.border_size_l = border_size_l;
+        b.border_size_r = border_size_r;
+
+        // Frame-line branch.
+        let border_min_size = border_size_t
+            .min(border_size_b)
+            .min(border_size_l.min(border_size_r));
+        b.frame_size = (border_min_size as f32 * f_size) as i32;
+
+        if b.frame_size > 0 {
+            let image_lx = border_size_l; // - roi_out.x (0)
+            let image_ty = border_size_t; // - roi_out.y (0)
+            let frame_space = border_min_size - b.frame_size;
+            let frame_offset = (frame_space as f32 * f_offset) as i32;
+
+            b.frame_tl_in_x = (border_in_x - frame_offset).max(0);
+            b.frame_tl_out_x = (b.frame_tl_in_x - b.frame_size).max(0);
+            b.frame_tl_in_y = (border_in_y - frame_offset).max(0);
+            b.frame_tl_out_y = (b.frame_tl_in_y - b.frame_size).max(0);
+            b.border_top = b.frame_tl_out_y;
+            b.fl_top = b.frame_tl_in_y;
+            b.border_left = b.frame_tl_out_x.clamp(0, out_w);
+            b.fl_left = b.frame_tl_in_x.clamp(0, out_w);
+            let frame_in_width = ((in_w as f32) + frame_offset as f32 * 2.0).floor() as i32;
+            let frame_in_height = ((in_h as f32) + frame_offset as f32 * 2.0).floor() as i32;
+            let frame_out_width = frame_in_width + b.frame_size * 2;
+            let frame_out_height = frame_in_height + b.frame_size * 2;
+
+            b.frame_br_in_x =
+                (image_lx - frame_offset + frame_in_width - 1).clamp(0, out_w - 1);
+            b.frame_br_in_y =
+                (image_ty - frame_offset + frame_in_height - 1).clamp(0, out_h - 1);
+
+            // If 100% frame_offset we ensure the frame line sticks to the
+            // outer border (mirrors the C's two conditional assignments).
+            b.frame_br_out_x = if f_offset == 1.0
+                && (border_size_l.min(border_size_r) - border_min_size < 2)
+            {
+                out_w
+            } else {
+                (image_lx - frame_offset - b.frame_size + frame_out_width - 1).clamp(0, out_w - 1)
+            };
+            b.frame_br_out_y = if f_offset == 1.0
+                && (border_size_t.min(border_size_b) - border_min_size < 2)
+            {
+                out_h
+            } else {
+                (image_ty - frame_offset - b.frame_size + frame_out_height - 1).clamp(0, out_h - 1)
+            };
+
+            // Need end+1 for these coordinates.
+            b.fl_right = b.frame_br_in_x;
+            b.border_right = b.frame_br_out_x;
+            b.fl_bot = b.frame_br_in_y;
+            b.border_bot = b.frame_br_out_y;
+        }
+        b
+    }
+
+    /// Compose a packed linear RGBA `f32` buffer (`pixels`, `w × h`) with the
+    /// `Framing` params: `modify_roi_out` → `setup_binfo` →
+    /// [`copy_image_with_border_kernel`], returning `(ow, oh, pixels)` on the
+    /// enlarged canvas. The pipeline never needs the re-routed `modify_roi_in`
+    /// (whole-frame scale-1 input), so it is not ported.
+    ///
+    /// Identity (border `size == 0` — the C's constant-border no-op, which
+    /// also zeroes `frame_size` since a zero border cannot host a frame) or a
+    /// degenerate/malformed buffer returns the source dimensions and a
+    /// verbatim copy, as does any non-finite parameter — geometry never fails
+    /// a render.
+    pub fn apply(
+        pixels: &[f32],
+        w: usize,
+        h: usize,
+        params: BordersParams,
+    ) -> (usize, usize, Vec<f32>) {
+        if w == 0
+            || h == 0
+            || pixels.len() < w.saturating_mul(h).saturating_mul(4)
+            || params.size == 0.0
+            || !params.is_finite()
+        {
+            return (w, h, pixels.to_vec());
+        }
+        let (ow, oh) = Self::modify_roi_out(w, h, params.size);
+        let binfo = Self::setup_binfo(
+            w as i32,
+            h as i32,
+            ow as i32,
+            oh as i32,
+            params.pos_v,
+            params.pos_h,
+            &params.color,
+            &params.frame_color,
+            params.frame_size,
+            params.frame_offset,
+        );
+        let n = ow.saturating_mul(oh).saturating_mul(4);
+        let mut out = vec![0.0f32; n];
+        copy_image_with_border_kernel(&mut out, pixels, &binfo);
+        (ow, oh, out)
+    }
+
+    /// Compose an **8-bit** interleaved image (`bytes`, `w × h`, `nch`
+    /// channels, `rowstride` bytes per row) with the `Framing` params, for the
+    /// non-raw preview / non-raw export paths that never see a linear float
+    /// buffer. The output is tightly packed (`ow * nch` bytes per row); filled
+    /// border pixels get the colour bytes and, for 4-channel buffers, alpha
+    /// 255 (the C compose's `bcolor`/`flcolor` alpha = 1.0); image pixels are
+    /// copied verbatim (alpha preserved). Returns `None` when the borders are
+    /// off/empty or the buffer is malformed — the caller then keeps the
+    /// original as-is.
+    pub fn apply_srgb8(
+        bytes: &[u8],
+        w: usize,
+        h: usize,
+        nch: usize,
+        rowstride: usize,
+        params: BordersParams,
+    ) -> Option<(usize, usize, Vec<u8>)> {
+        if nch == 0 || w == 0 || h == 0 || params.size == 0.0 || !params.is_finite() {
+            return None;
+        }
+        let packed_row = w.checked_mul(nch)?;
+        let required = rowstride.checked_mul(h)?;
+        if rowstride < packed_row || bytes.len() < required {
+            return None;
+        }
+        let (ow, oh) = Self::modify_roi_out(w, h, params.size);
+        let binfo = Self::setup_binfo(
+            w as i32,
+            h as i32,
+            ow as i32,
+            oh as i32,
+            params.pos_v,
+            params.pos_h,
+            &params.color,
+            &params.frame_color,
+            params.frame_size,
+            params.frame_offset,
+        );
+        let out_row = ow.checked_mul(nch)?;
+        let total = oh.checked_mul(out_row)?;
+        let mut out = vec![0u8; total];
+        for row in 0..oh {
+            let r = row as i64;
+            let src_row = r - binfo.image_top as i64;
+            for col in 0..ow {
+                let c = col as i64;
+                let o = row * out_row + col * nch;
+                match classify_pixel(&binfo, r, c, &params.color, &params.frame_color) {
+                    PixelClass::Fill(fill) => {
+                        let n = nch.min(3);
+                        let b = to_byte(&fill);
+                        out[o..o + n].copy_from_slice(&b[..n]);
+                        if nch == 4 {
+                            out[o + 3] = 255;
+                        }
+                    }
+                    PixelClass::Image => {
+                        let sc = (c - binfo.image_left as i64) as usize;
+                        let sr = src_row.max(0) as usize;
+                        let src = sr * rowstride + sc * nch;
+                        if src + nch <= bytes.len() {
+                            out[o..o + nch].copy_from_slice(&bytes[src..src + nch]);
+                        }
+                    }
+                }
+            }
+        }
+        Some((ow, oh, out))
+    }
+
+    /// Compose an **16-bit** interleaved image (`samples: &[u16]`, `w × h`,
+    /// `nch` channels, `rowstride` samples per row) with the `Framing` params —
+    /// the lossless twin of [`Self::apply_srgb8`] for the PNG/TIFF export leg
+    /// (a 16-bit source round-trips without an 8-bit detour, exactly like the
+    /// orientation slice it sits next to in `render_nonraw_export`). Filled
+    /// border pixels get `round(color · 65535)` and, for 4-channel buffers,
+    /// alpha 65535; image pixels are copied verbatim. Returns `None` when the
+    /// borders are off/empty or the buffer is malformed.
+    pub fn apply_srgb16(
+        samples: &[u16],
+        w: usize,
+        h: usize,
+        nch: usize,
+        rowstride: usize,
+        params: BordersParams,
+    ) -> Option<(usize, usize, Vec<u16>)> {
+        if nch == 0 || w == 0 || h == 0 || params.size == 0.0 || !params.is_finite() {
+            return None;
+        }
+        let packed_row = w.checked_mul(nch)?;
+        let required = rowstride.checked_mul(h)?;
+        if rowstride < packed_row || samples.len() < required {
+            return None;
+        }
+        let (ow, oh) = Self::modify_roi_out(w, h, params.size);
+        let binfo = Self::setup_binfo(
+            w as i32,
+            h as i32,
+            ow as i32,
+            oh as i32,
+            params.pos_v,
+            params.pos_h,
+            &params.color,
+            &params.frame_color,
+            params.frame_size,
+            params.frame_offset,
+        );
+        let out_row = ow.checked_mul(nch)?;
+        let total = oh.checked_mul(out_row)?;
+        let mut out = vec![0u16; total];
+        for row in 0..oh {
+            let r = row as i64;
+            let src_row = r - binfo.image_top as i64;
+            for col in 0..ow {
+                let c = col as i64;
+                let o = row * out_row + col * nch;
+                match classify_pixel(&binfo, r, c, &params.color, &params.frame_color) {
+                    PixelClass::Fill(fill) => {
+                        let n = nch.min(3);
+                        let v = to_u16(&fill);
+                        out[o..o + n].copy_from_slice(&v[..n]);
+                        if nch == 4 {
+                            out[o + 3] = 65535;
+                        }
+                    }
+                    PixelClass::Image => {
+                        let sc = (c - binfo.image_left as i64) as usize;
+                        let sr = src_row.max(0) as usize;
+                        let src = sr * rowstride + sc * nch;
+                        if src + nch <= samples.len() {
+                            out[o..o + nch].copy_from_slice(&samples[src..src + nch]);
+                        }
+                    }
+                }
+            }
+        }
+        Some((ow, oh, out))
+    }
+}
+
+/// Why a border-space output pixel is drawn the way it is.
+#[derive(Clone, Copy)]
+enum PixelClass {
+    Fill([f32; 3]),
+    Image,
+}
+
+/// Classify one output pixel against [`BorderPositions`] using the same
+/// four-band, five-run layout as [`copy_image_with_border_kernel`]; `Fill`
+/// carries the original float colour so both the 8-bit and 16-bit composes
+/// can scale it once at fill time, `Image` means copy the source pixel. The
+/// band precedence and run boundaries reproduce the kernel exactly, so all
+/// the integer composes agree pixel-for-pixel for the same geometry.
+fn classify_pixel(
+    b: &BorderPositions,
+    row: i64,
+    col: i64,
+    bcolour: &[f32; 3],
+    flcolour: &[f32; 3],
+) -> PixelClass {
+    // The kernel derives its i64 bands by casting the i32 struct fields; do
+    // the same here so the composes share one comparison lattice.
+    let (border_top, fl_top, image_top) =
+        (b.border_top as i64, b.fl_top as i64, b.image_top as i64);
+    let (image_bot, fl_bot, border_bot) =
+        (b.image_bot as i64, b.fl_bot as i64, b.border_bot as i64);
+    let (border_left, fl_left, image_left) =
+        (b.border_left as i64, b.fl_left as i64, b.image_left as i64);
+    let (image_right, fl_right, border_right, width) =
+        (b.image_right as i64, b.fl_right as i64, b.border_right as i64, b.width as i64);
+    let bg = |c: &[f32; 3]| PixelClass::Fill(*c);
+    if row < border_top || row >= border_bot {
+        bg(bcolour)
+    } else if row < fl_top || row >= fl_bot {
+        bg(if col < border_left || col >= border_right { bcolour } else { flcolour })
+    } else if row < image_top || row >= image_bot {
+        bg(if col < border_left {
+            bcolour
+        } else if col < fl_left {
+            flcolour
+        } else if col < fl_right {
+            bcolour
+        } else if col < border_right {
+            flcolour
+        } else {
+            bcolour
+        })
+    } else if col < border_left {
+        bg(bcolour)
+    } else if image_left > border_left && col >= border_left && col < fl_left {
+        bg(flcolour)
+    } else if image_left > border_left && col >= fl_left && col < image_left {
+        bg(bcolour)
+    } else if col >= image_left && col < image_right {
+        PixelClass::Image
+    } else if col < fl_right {
+        bg(bcolour)
+    } else if width > fl_right && col < border_right {
+        bg(flcolour)
+    } else {
+        bg(bcolour)
+    }
+}
+
+/// Scale a `[f32; 3]` colour in `[0, 1]` to `u8` bytes (clamped, with
+/// half-away-from-zero rounding).
+fn to_byte(color: &[f32; 3]) -> [u8; 3] {
+    [
+        (color[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (color[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (color[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+/// Scale a `[f32; 3]` colour in `[0, 1]` to `u16` samples (clamped, with
+/// half-away-from-zero rounding), for the 16-bit compose.
+fn to_u16(color: &[f32; 3]) -> [u16; 3] {
+    [
+        (color[0] * 65535.0).round().clamp(0.0, 65535.0) as u16,
+        (color[1] * 65535.0).round().clamp(0.0, 65535.0) as u16,
+        (color[2] * 65535.0).round().clamp(0.0, 65535.0) as u16,
+    ]
 }
 
 #[cfg(test)]
@@ -754,5 +1286,360 @@ mod tests {
             darkroom_borders_copy_with_border(out.as_mut_ptr(), inp.as_ptr(), &bad);
         }
         assert_eq!(out, vec![2.0; 8 * 8 * 4]);
+    }
+
+    // ── Framing (Borders module) geometry ────────────────────────────────────
+
+    /// Hand-checks `modify_roi_out`'s constant-border math against the C
+    /// formulas. `basis` is AUTO → LONGER → width when `width > height`, else
+    /// height; `basis_out = roundf(basis_in / (1 - size))`, the other side gets
+    /// `other_in + basis_out - basis_in`; both CLAMP to [1, 3·max].
+    #[test]
+    fn borders_modify_roi_out_constant_path_golden() {
+        // Square 100×100, size 0.1: base = height (100 not > 100),
+        // roundf(100/0.9) = 111 both ways → 111×111.
+        assert_eq!(Borders::modify_roi_out(100, 100, 0.1), (111, 111));
+        // Landscape 100×50, size 0.1: base = width, roundf(100/0.9) = 111;
+        // height = 50 + 111 − 100 = 61 → 111×61.
+        assert_eq!(Borders::modify_roi_out(100, 50, 0.1), (111, 61));
+        // Portrait 50×100: base = height, roundf(100/0.9) = 111;
+        // width = 50 + 111 − 100 = 61 → 61×111.
+        assert_eq!(Borders::modify_roi_out(50, 100, 0.1), (61, 111));
+        // size 0 (identity) → exactly the input dims.
+        assert_eq!(Borders::modify_roi_out(80, 60, 0.0), (80, 60));
+        // Large size (0.5 cap) on 200×100: base = width, roundf(200/0.5)=400,
+        // height = 100 + 400 − 200 = 300 → 400×300.
+        assert_eq!(Borders::modify_roi_out(200, 100, 0.5), (400, 300));
+        // Clamp: size 0.9 on 4×4 → base = roundf(4/0.1)=40, other=4+40−4=40,
+        // both well under 3·max=12 after CLAMP → 12×12.
+        assert_eq!(Borders::modify_roi_out(4, 4, 0.9), (12, 12));
+    }
+
+    /// Whole-frame centered `setup_binfo` on a square 100×100 → 111×111,
+    /// pos 0.5: borders split t/l = trunc(11·0.5)=5, b/r = 6; image rect at
+    /// (5,5) sized 100×100. No frame (frame_size 0).
+    #[test]
+    fn borders_setup_binfo_centered_golden() {
+        let b = Borders::setup_binfo(
+            100, 100, 111, 111, 0.5, 0.5, &[1.0, 1.0, 1.0], &[0.0, 0.0, 0.0], 0.0, 0.5,
+        );
+        assert_eq!(b.width, 111);
+        assert_eq!(b.height, 111);
+        assert_eq!(b.stride, 100);
+        assert_eq!(b.border_size_t, 5);
+        assert_eq!(b.border_size_b, 6);
+        assert_eq!(b.border_size_l, 5);
+        assert_eq!(b.border_size_r, 6);
+        // Image placed at (5,5), 100×100.
+        assert_eq!((b.border_in_x, b.border_in_y), (5, 5));
+        assert_eq!((b.image_left, b.image_top), (5, 5));
+        assert_eq!((b.image_right, b.image_bot), (105, 105));
+        // No frame: frame_size stays 0 and the frame sub-rectangle fields
+        // remain the struct defaults (the C only writes them inside its
+        // `frame_size > 0` branch; the compose reads the `border_/fl_/image_`
+        // bands, whose values above are the frame-agnostic ones).
+        assert_eq!(b.frame_size, 0);
+        assert_eq!(b.frame_tl_out_y, 0);
+        assert_eq!(b.frame_tl_out_x, 0);
+        // Colours with opaque alpha.
+        assert_eq!(b.bcolor, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(b.flcolor, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// The frame-line branch: on a 100×100 → 125×125 canvas with pos 0.5,
+    /// size 0.2, border 12/12/13/13, border_min = 12, frame_size = 12·0.5 = 6
+    /// → the top/left frame-line inner/outer bands at 9 and 3.
+    #[test]
+    fn borders_setup_binfo_frame_branch_golden() {
+        // roundf(100/0.8) = 125 → 125×125.
+        assert_eq!(Borders::modify_roi_out(100, 100, 0.2), (125, 125));
+        let b = Borders::setup_binfo(
+            100, 100, 125, 125, 0.5, 0.5, &[1.0, 1.0, 1.0], &[0.0, 0.0, 0.0], 0.5, 0.5,
+        );
+        // border_size_t = trunc(25·0.5) = 12; sized 12/13.
+        assert_eq!((b.border_size_t, b.border_size_b), (12, 13));
+        assert_eq!((b.border_size_l, b.border_size_r), (12, 13));
+        // border_min_size = 12 → frame_size = 6.
+        assert_eq!(b.frame_size, 6);
+        // frame_space = 12 − 6 = 6, frame_offset = trunc(6·0.5) = 3.
+        // frame_tl_in_x = max(border_in_x=12 − 3, 0) = 9;
+        // frame_tl_out_x = max(9 − 6, 0) = 3.
+        assert_eq!(b.border_in_x, 12);
+        assert_eq!(b.frame_tl_in_x, 9);
+        assert_eq!(b.frame_tl_out_x, 3);
+        // frame_in_width = floor(100 + 3·2) = 106;
+        // frame_out_width = 106 + 12 = 118.
+        // frame_br_in_x = clamp(12 − 3 + 106 − 1, 0, 124) = 114.
+        assert_eq!(b.frame_br_in_x, 114);
+    }
+
+    /// pos extremes push the image to the frame edges: pos (0,0) leaves the
+    /// image at the top-left with all border on the right/bottom.
+    #[test]
+    fn borders_setup_binfo_pos_extremes() {
+        let b = Borders::setup_binfo(
+            100, 100, 111, 111, 0.0, 0.0, &[1.0, 1.0, 1.0], &[0.0, 0.0, 0.0], 0.0, 0.5,
+        );
+        assert_eq!(b.border_size_t, 0);
+        assert_eq!(b.border_size_b, 11);
+        assert_eq!(b.border_size_l, 0);
+        assert_eq!(b.border_size_r, 11);
+        // Image at the top-left corner.
+        assert_eq!((b.border_in_x, b.border_in_y), (0, 0));
+        assert_eq!((b.image_left, b.image_top), (0, 0));
+        assert_eq!((b.image_right, b.image_bot), (100, 100));
+
+        // pos (1,1): image at bottom-right, all border on top/left.
+        let c = Borders::setup_binfo(
+            100, 100, 111, 111, 1.0, 1.0, &[1.0, 1.0, 1.0], &[0.0, 0.0, 0.0], 0.0, 0.5,
+        );
+        assert_eq!(c.border_size_t, 11);
+        assert_eq!(c.border_size_b, 0);
+        assert_eq!(c.border_size_l, 11);
+        assert_eq!(c.border_size_r, 0);
+        assert_eq!((c.border_in_x, c.border_in_y), (11, 11));
+        assert_eq!((c.image_left, c.image_top), (11, 11));
+    }
+
+    /// `Borders::apply` on a uniform f32 RGBA field: the enlarged canvas has
+    /// border-colour corners, the copied image region holds the source pixels
+    /// at the exact source offsets (via a per-pixel reference), and the dims
+    /// equal `modify_roi_out`.
+    #[test]
+    fn borders_apply_composes_field_with_border_corners() {
+        let (w, h) = (12usize, 8usize);
+        let mut px = vec![0.0f32; w * h * 4];
+        for i in 0..h {
+            for j in 0..w {
+                let o = (i * w + j) * 4;
+                px[o] = j as f32;
+                px[o + 1] = i as f32;
+                px[o + 2] = 0.25;
+                px[o + 3] = 1.0;
+            }
+        }
+        // size 0.2 on 12×8: basis = width (12 > 8), roundf(12/0.8) = 15 →
+        // 15×11 (height = 8 + 15 − 12 = 11); border totals 3×3, pos 0.5 gives
+        // l/t = 1, r = 2, b = 2.
+        let params = BordersParams { color: [0.2, 0.3, 0.4], size: 0.2, ..Default::default() };
+        let (ow, oh, out) = Borders::apply(&px, w, h, params);
+        assert_eq!((ow, oh), Borders::modify_roi_out(w, h, 0.2));
+        assert_eq!((ow, oh), (15, 11));
+        // Build the reference with the same geometry.
+        let binfo = Borders::setup_binfo(
+            w as i32,
+            h as i32,
+            ow as i32,
+            oh as i32,
+            params.pos_v,
+            params.pos_h,
+            &params.color,
+            &params.frame_color,
+            params.frame_size,
+            params.frame_offset,
+        );
+        let mut reference = vec![0.0f32; ow * oh * 4];
+        ref_copy_image_with_border(&mut reference, &px, &binfo);
+        assert_eq!(to_bits(&out), to_bits(&reference), "compose must match the per-pixel reference");
+        // Top-left corner is border colour, opaque.
+        let co = 0usize;
+        assert_eq!(to_bits(&out[co..co + 4]), to_bits(&[0.2, 0.3, 0.4, 1.0]));
+        // Centre pixel is a copied source pixel (image band, well inside).
+        // With the 1-px border (image at (1,1)): output (cx,cy) ← source
+        // (cx−1, cy−1).
+        let (cx, cy) = (ow / 2, oh / 2);
+        let cio = (cy * ow + cx) * 4;
+        let si = ((cy - 1) * w + (cx - 1)) * 4;
+        assert_eq!(
+            to_bits(&out[cio..cio + 4]),
+            to_bits(&px[si..si + 4]),
+            "bordered pixel must equal the source pixel at its offset"
+        );
+        // A known image pixel: with 1-px border, output (5,4) ← source (4,3).
+        let di = (4 * ow + 5) * 4;
+        let si = (3 * w + 4) * 4;
+        assert_eq!(to_bits(&out[di..di + 4]), to_bits(&px[si..si + 4]),
+                   "bordered pixel must equal the source pixel at its offset");
+    }
+
+    /// Identity (size 0), malformed and non-finite inputs return a verbatim
+    /// copy (or `None` for the 8-bit form) and never panic.
+    #[test]
+    fn borders_apply_identity_and_degenerate_inputs() {
+        let px = vec![1.0f32; 8 * 8 * 4];
+        // size 0 → verbatim, same dims.
+        let identity = BordersParams { size: 0.0, ..Default::default() };
+        let (w, h, out) = Borders::apply(&px, 8, 8, identity);
+        assert_eq!((w, h), (8, 8));
+        assert_eq!(out, px);
+        // Non-finite size → verbatim (geometry no-op, like rotate).
+        let nan = BordersParams { size: f32::NAN, ..Default::default() };
+        let (w2, h2, out2) = Borders::apply(&px, 8, 8, nan);
+        assert_eq!((w2, h2), (8, 8));
+        assert_eq!(out2, px);
+        // Short buffer claims 8x8 but only holds 3 pixels → verbatim copy.
+        let short = vec![0.0f32; 12];
+        let (w3, h3, out3) = Borders::apply(&short, 8, 8, Default::default());
+        assert_eq!((w3, h3), (8, 8));
+        assert_eq!(out3, short);
+    }
+
+    #[test]
+    fn borders_apply_srgb8_identity_and_compose() {
+        // Identity: size 0 → None (caller keeps the source; no copy needed).
+        let identity = BordersParams { size: 0.0, ..Default::default() };
+        let src = vec![0u8; 3 * 3 * 3];
+        let o = Borders::apply_srgb8(&src, 3, 3, 3, 9, identity);
+        assert!(o.is_none());
+        // Malformed (short buffer) → None.
+        assert!(Borders::apply_srgb8(&vec![0u8; 4], 3, 3, 3, 9, Default::default()).is_none());
+        // Compose a uniform 3-colour 2x2 → 3x3 8-bit buffer; border pixels get
+        // the colour bytes, image pixels are copied verbatim.
+        let params = BordersParams { color: [1.0, 0.0, 0.0], size: 0.5, ..Default::default() };
+        let (ow, oh) = Borders::modify_roi_out(2, 2, 0.5);
+        // roundf(2/0.5) = 4 → 4×4.
+        assert_eq!((ow, oh), (4, 4));
+        let mut img = vec![0u8; 2 * 2 * 3];
+        // Left half red-ish, right half green-ish, so copied region is
+        // distinguishable.
+        img[0..3].copy_from_slice(&[100, 200, 50]); // (0,0)
+        img[3..6].copy_from_slice(&[110, 210, 60]); // (1,0)
+        img[6..9].copy_from_slice(&[120, 220, 70]); // (0,1)
+        img[9..12].copy_from_slice(&[130, 230, 80]); // (1,1)
+        let (zw, zh, out) = Borders::apply_srgb8(&img, 2, 2, 3, 6, params).expect("compose");
+        assert_eq!((zw, zh), (4, 4));
+        assert_eq!(out.len(), 4 * 4 * 3);
+        // pos 0.5 on 2x2 → 4x4: border_size each = trunc(2*0.5)=1. Image at
+        // (1,1), 2x2 in a 4x4 out (border t/l 1, b/r 1).
+        // Top-left corner = red border bytes.
+        assert_eq!(&out[0..3], &[255, 0, 0]);
+        // A copied image pixel at (2,2) maps to source (1,1) = [130,230,80].
+        let di = (2 * 4 + 2) * 3;
+        assert_eq!(&out[di..di + 3], &[130, 230, 80]);
+    }
+
+    #[test]
+    fn borders_apply_srgb16_is_the_lossless_twin() {
+        // Identity and malformed inputs → None, same contract as the 8-bit form.
+        assert!(Borders::apply_srgb16(&vec![0u16; 4], 3, 3, 3, 9, Default::default()).is_none());
+        let params = BordersParams {
+            color: [1.0, 0.0, 0.0],
+            size: 0.5,
+            ..Default::default()
+        };
+        let mut img = vec![0u16; 2 * 2 * 3];
+        for (i, v) in [100u16, 30000, 5000, 200, 30001, 6000, 300, 30002, 7000, 400, 30003, 8000]
+            .into_iter()
+            .enumerate()
+        {
+            img[i] = v;
+        }
+        let (ow, oh, out) = Borders::apply_srgb16(&img, 2, 2, 3, 6, params).expect("compose");
+        // Same geometry as the 8-bit test: 2x2 → 4x4, image at (1,1).
+        assert_eq!((ow, oh), (4, 4));
+        // Corner = full-scale red (65535, 0, 0), not a quantized 8-bit value.
+        assert_eq!(&out[0..3], &[65535, 0, 0]);
+        // Copied image pixel (2,2) → source (1,1) verbatim at 16-bit.
+        let di = (2 * 4 + 2) * 3;
+        assert_eq!(&out[di..di + 3], &[400, 30003, 8000]);
+        // Interior copy is bit-exact (16→16 needs no requantisation).
+        assert_eq!(out, {
+            let mut expect = vec![0u16; 4 * 4 * 3];
+            for row in 1..3 {
+                for col in 1..3 {
+                    let s = ((row - 1) * 2 + (col - 1)) * 3;
+                    let d = (row * 4 + col) * 3;
+                    expect[d..d + 3].copy_from_slice(&img[s..s + 3]);
+                }
+            }
+            for row in 0..4 {
+                for col in 0..4 {
+                    if row == 0 || row == 3 || col == 0 || col == 3 {
+                        let d = (row * 4 + col) * 3;
+                        expect[d..d + 3].copy_from_slice(&[65535, 0, 0]);
+                    }
+                }
+            }
+            expect
+        });
+    }
+
+    /// `Borders::apply` on an RGBA buffer must agree bit-exactly with the
+    /// manual `copy_image_with_border_kernel` reference for the same geometry,
+    /// across a couple of param sets (with and without a frame).
+    #[test]
+    fn borders_apply_matches_the_kernel_reference() {
+        let (w, h) = (10usize, 6usize);
+        let mut px = vec![0.0f32; w * h * 4];
+        lcg_fill(&mut px, 0x5A17);
+        for params in [
+            BordersParams { color: [0.2, 0.3, 0.4], size: 0.25, pos_h: 0.4, pos_v: 0.6, ..Default::default() },
+            BordersParams {
+                color: [0.9, 0.1, 0.5],
+                size: 0.2,
+                frame_size: 0.5,
+                frame_offset: 0.5,
+                frame_color: [0.0, 1.0, 0.25],
+                ..Default::default()
+            },
+        ] {
+            let (ow, oh, direct) = Borders::apply(&px, w, h, params);
+            let binfo = Borders::setup_binfo(
+                w as i32,
+                h as i32,
+                ow as i32,
+                oh as i32,
+                params.pos_v,
+                params.pos_h,
+                &params.color,
+                &params.frame_color,
+                params.frame_size,
+                params.frame_offset,
+            );
+            let mut reference = vec![0.0f32; ow * oh * 4];
+            ref_copy_image_with_border(&mut reference, &px, &binfo);
+            assert_eq!(to_bits(&direct), to_bits(&reference));
+        }
+    }
+
+    /// The composed canvas keeps the border colour on the border runs, the
+    /// source pixels intact inside the image band, and — when the frame-line
+    /// branch fires — the frame colour in its ring, on a hand-computed
+    /// geometry (10×10, size 0.2 → 13×13; border t/b/l/r = 1/2/1/2,
+    /// border_min = 1, frame_size = 1, frame_offset = 0 — frame ring at the
+    /// very top/left edge, row 0 lights the frame colour everywhere).
+    #[test]
+    fn borders_apply_frame_line_golden() {
+        let (w, h) = (10usize, 10usize);
+        let mut px = vec![0.0f32; w * h * 4];
+        for i in 0..h {
+            for j in 0..w {
+                let o = (i * w + j) * 4;
+                px[o] = 0.5;
+                px[o + 1] = 0.5;
+                px[o + 2] = 0.5;
+                px[o + 3] = 1.0;
+            }
+        }
+        let params = BordersParams {
+            color: [0.0, 0.0, 0.0], // black border
+            size: 0.2,
+            frame_size: 1.0,       // frame line occupies the whole border
+            frame_color: [1.0, 1.0, 1.0], // white frame line
+            ..Default::default()
+        };
+        let (ow, oh, out) = Borders::apply(&px, w, h, params);
+        assert_eq!((ow, oh), (13, 13));
+        // Row 0 is the frameline band (frame_tl_out = 0): fully white.
+        assert_eq!(to_bits(&out[0..4]), to_bits(&[1.0, 1.0, 1.0, 1.0]));
+        // (1,1) is an image pixel copy (grey).
+        let p = (1 * ow + 1) * 4;
+        assert_eq!(to_bits(&out[p..p + 4]), to_bits(&[0.5, 0.5, 0.5, 1.0]));
+        // Bottom-right corner (12,12): outer border band → black.
+        let p = (12 * ow + 12) * 4;
+        assert_eq!(to_bits(&out[p..p + 4]), to_bits(&[0.0, 0.0, 0.0, 1.0]));
+        // And the last pure-border row (12, 0): black border again.
+        let p = (12 * ow + 0) * 4;
+        assert_eq!(to_bits(&out[p..p + 4]), to_bits(&[0.0, 0.0, 0.0, 1.0]));
     }
 }

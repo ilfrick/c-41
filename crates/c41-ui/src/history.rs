@@ -658,6 +658,26 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if lens {
         return "Lens correction";
     }
+    // Framing (borders): a geometry-family compose (base-image enlarge like
+    // crop) rather than a pipeline stage — see the v34 note in PreviewParams —
+    // but its params still live in the blob, so an edit to them must be
+    // labelled, or it would silently fall through to "Edit". Grouped after the
+    // pipeline modules, like the other base-image families that predate it.
+    let framing = old.brd_on != new.brd_on
+        || old.brd_size != new.brd_size
+        || old.brd_pos_h != new.brd_pos_h
+        || old.brd_pos_v != new.brd_pos_v
+        || old.brd_color_r != new.brd_color_r
+        || old.brd_color_g != new.brd_color_g
+        || old.brd_color_b != new.brd_color_b
+        || old.brd_frame_size != new.brd_frame_size
+        || old.brd_frame_offset != new.brd_frame_offset
+        || old.brd_frame_color_r != new.brd_frame_color_r
+        || old.brd_frame_color_g != new.brd_frame_color_g
+        || old.brd_frame_color_b != new.brd_frame_color_b;
+    if framing {
+        return "Framing";
+    }
     "Edit"
 }
 
@@ -967,6 +987,20 @@ mod tests {
         );
         assert_eq!(describe_change(&base, &PreviewParams { hotpixels_on: true, ..base }), "Hot pixels");
         assert_eq!(describe_change(&base, &PreviewParams { hotpixels_threshold: 0.1, ..base }), "Hot pixels");
+        // Framing labels both the enable flag and the sliders (geometry-family
+        // compose; the fields live in the blob like any other module).
+        assert_eq!(
+            describe_change(&base, &PreviewParams { brd_on: true, ..base }),
+            "Framing"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { brd_size: 0.2, ..base }),
+            "Framing"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { brd_frame_color_b: 0.9, ..base }),
+            "Framing"
+        );
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -1240,6 +1274,18 @@ mod tests {
             rwp_black2: _,
             rwp_black3: _,
             rwp_white: _,
+            brd_on: _,
+            brd_size: _,
+            brd_pos_h: _,
+            brd_pos_v: _,
+            brd_color_r: _,
+            brd_color_g: _,
+            brd_color_b: _,
+            brd_frame_size: _,
+            brd_frame_offset: _,
+            brd_frame_color_r: _,
+            brd_frame_color_g: _,
+            brd_frame_color_b: _,
         } = PreviewParams::default();
     }
 
@@ -1362,7 +1408,9 @@ mod tests {
         // G1 Hot pixels (v32): 1883 → 1893 (2 more bools + 2 f32 controls).
         // G1 rawprepare (v33): 1893 → 1914 (1 more bool + 5 f32 controls — the
         // four per-colour black levels + the white point).
-        assert_eq!(PreviewParams::default().encode().len(), 1914);
+        // S1 Framing (v34): 1914 → 1959 (1 more bool + 11 f32 controls — size,
+        // pos_h/v, border RGB, frame size/offset, frame RGB).
+        assert_eq!(PreviewParams::default().encode().len(), 1959);
     }
 
     #[test]

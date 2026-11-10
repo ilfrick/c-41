@@ -412,7 +412,11 @@ fn apply_history_params(
         }
         populate_modules(&panel, ctx);
     }
-    render_preview(ctx);
+    // Recompose the base, not a bare render: the restored `p` may have turned
+    // Framing on/off, and a border lives in the base-image compose — a plain
+    // re-render over the old `ctx.base` would keep painting the stale
+    // bordered/unbordered frame (same root cause as the Reset recompose).
+    apply_geometry_to_base(ctx);
     // Keep the list highlight on the cursor (Undo/Redo move it without a click).
     if let Some(list) = list.upgrade() {
         let cursor = ctx.history.borrow().cursor();
@@ -1033,24 +1037,74 @@ fn reorient_srgb8(
     })
 }
 
+/// Compose the Framing (borders) params onto an 8-bit [`BaseImage::Srgb8`]
+/// base — the non-raw twin of the f32 compose that runs inside
+/// [`apply_geometry_to_base`]'s raw closure. Filled border pixels get the
+/// colour bytes (alpha 255 for RGBA), image rows are copied verbatim honouring
+/// the row stride; the output is tightly packed. Identity passthrough when
+/// `params` is `None` (module off) or the base isn't an Srgb8, preserving the
+/// original buffer/layout exactly — so the default render stays byte-identical
+/// to the pre-Framing path. `None` on a malformed buffer.
+fn borders_srgb8(
+    base: &BaseImage,
+    params: Option<c41_core::borders::BordersParams>,
+) -> Option<BaseImage> {
+    let BaseImage::Srgb8 { bytes, width, height, rowstride, nch } = base else {
+        return Some(base.clone());
+    };
+    if *width <= 0 || *height <= 0 || *nch == 0 {
+        return None;
+    }
+    let Some(bp) = params else {
+        return Some(base.clone());
+    };
+    let (w, h) = (*width as usize, *height as usize);
+    let (ow, oh, pixels) =
+        c41_core::borders::Borders::apply_srgb8(bytes, w, h, *nch, *rowstride, bp)?;
+    let output_stride = ow.checked_mul(*nch)?;
+    Some(BaseImage::Srgb8 {
+        bytes: pixels,
+        width: i32::try_from(ow).ok()?,
+        height: i32::try_from(oh).ok()?,
+        rowstride: output_stride,
+        nch: *nch,
+    })
+}
+
 /// Apply the current [`PreviewCtx::geometry`] to the cached decoded source to
 /// produce the displayed `base`, then re-render. RAW frames use their linear
 /// pristine buffer (or its post-lens-warp form); non-RAW frames support the
 /// lossless discrete orientation without enabling JPEG crop/straighten. Cheap
 /// enough to re-run on every geometry change, unlike a full re-decode.
+///
+/// **Framing (borders) composes here too, after geometry** — it is a
+/// base-image enlarge like crop, so the displayed `base` carries the border
+/// and the pipeline runs on the bordered frame (see [`crate::preview::
+/// PreviewParams::borders_params`]). When it is off the compose is a no-op and
+/// every byte below matches the pre-Framing render.
 fn apply_geometry_to_base(ctx: &PreviewCtx) {
     let geom = ctx.geometry.get();
     let editing = ctx.crop_editing.get();
+    // Borders join the geometry pass: read them from the shared edit once so
+    // both the raw (Linear) and non-raw (Srgb8) compose paths agree. Bypass
+    // never touches them — like crop, a border persists under the before/after
+    // toggle, which only strips pipeline stages.
+    let borders = ctx.params.borrow().borders_params();
     let compose = |pixels: &[f32], w: usize, h: usize| -> BaseImage {
         let (gw, gh, gpixels) = if editing {
             geom.apply_without_crop(pixels, w, h)
         } else {
             geom.apply(pixels, w, h)
         };
-        BaseImage::Linear { width: gw, height: gh, pixels: gpixels }
+        let (bw, bh, bpixels) = match borders {
+            Some(bp) => c41_core::borders::Borders::apply(&gpixels, gw, gh, bp),
+            None => (gw, gh, gpixels),
+        };
+        BaseImage::Linear { width: bw, height: bh, pixels: bpixels }
     };
     // JPEG geometry deliberately supports only the discrete manual orientation;
-    // crop and straighten remain raw-only as before.
+    // crop and straighten remain raw-only as before. Framing is not raw-only:
+    // the 8-bit path gets the same border via borders_srgb8.
     if ctx.pristine.borrow().is_none() {
         let source = ctx.pristine_srgb.borrow().clone();
         if let Some(BaseImage::Srgb8 { bytes, width, height, rowstride, nch }) = source {
@@ -1063,6 +1117,13 @@ fn apply_geometry_to_base(ctx: &PreviewCtx) {
                 geom.orientation,
             ) else {
                 eprintln!("darkroom preview: invalid decoded pixel layout during orientation");
+                return;
+            };
+            let Some(base) = borders_srgb8(
+                &base,
+                borders,
+            ) else {
+                eprintln!("darkroom preview: invalid decoded pixel layout during borders");
                 return;
             };
             *ctx.base.borrow_mut() = Some(base);
@@ -2321,7 +2382,10 @@ pub fn darkroom_page(
             }
             populate_modules(&panel, &reset_ctx);
         }
-        render_preview(&reset_ctx);
+        // Recompose the base: the reset may have turned Framing off, and a
+        // border lives in the compose, not the pipeline — a bare render would
+        // keep painting the stale bordered frame.
+        apply_geometry_to_base(&reset_ctx);
     });
     header.pack_start(&reset_btn);
 
@@ -2704,6 +2768,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Lowpass" => lowpass_module_row(ctx).upcast(),
                 "Highpass" => highpass_module_row(ctx).upcast(),
                 "White balance" => whitebalance_module_row(ctx).upcast(),
+                "Framing" => framing_module_row(ctx).upcast(),
                 "Invert" => invert_module_row(ctx).upcast(),
                 other => match elsewhere_hint(other) {
                     // Implemented, but driven from its own control — point at it
@@ -2873,11 +2938,13 @@ fn styles_module_group(
         }
         // Raw hot-pixel settings are consumed during CFA decode, not by the
         // post-decode render pipeline. Re-decode raw images after applying a
-        // style so the displayed pixels match the newly applied params.
+        // style so the displayed pixels match the newly applied params. In the
+        // non-raw branch, recompose the base rather than bare-render: a style
+        // can change Framing, which lives in the base compose.
         if ctx_cl.pristine.borrow().is_some() {
             spawn_decode(&ctx_cl);
         } else {
-            render_preview(&ctx_cl);
+            apply_geometry_to_base(&ctx_cl);
         }
         if let Some(g) = group_w.upgrade() {
             // The style name is user data and a group description is always
@@ -2990,7 +3057,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile"];
+const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile", "Framing"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3254,6 +3321,20 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             bc_nodes
         ),
         "White balance" => set!(temperature_on, temperature_r, temperature_g, temperature_b),
+        "Framing" => set!(
+            brd_on,
+            brd_size,
+            brd_pos_h,
+            brd_pos_v,
+            brd_color_r,
+            brd_color_g,
+            brd_color_b,
+            brd_frame_size,
+            brd_frame_offset,
+            brd_frame_color_r,
+            brd_frame_color_g,
+            brd_frame_color_b
+        ),
         "Invert" => set!(invert_on, invert_r, invert_g, invert_b),
         "Colorize" => set!(
             colorize_on,
@@ -3318,6 +3399,12 @@ fn reset_module_and_rebuild(ctx: &PreviewCtx, which: &str, re_decode: bool) {
     }
     if re_decode {
         spawn_decode(ctx);
+    } else if which == "Framing" {
+        // Framing lives in the base-image compose (geometry family), not the
+        // pipeline: a bare re-render would keep painting the stale bordered
+        // frame. Recomposing runs the border compose with the reset params and
+        // re-renders.
+        apply_geometry_to_base(ctx);
     } else {
         render_preview(ctx);
     }
@@ -5134,6 +5221,102 @@ fn bloom_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         })
 }
 
+/// Framing (borders.c): adds a solid border (and optional frame line) around
+/// the image, enlarging the canvas. Runs in the **geometry family** — a
+/// base-image compose like crop, applied by [`apply_geometry_to_base`] AFTER
+/// orientation/straighten/crop and BEFORE the pipeline — so every control here
+/// re-composes the base and re-renders, never a bare [`render_preview`] (which
+/// would repaint the stale bordered/unbordered frame) and never a re-decode.
+///
+/// Slider ranges mirror the C introspection: size 0..0.5 (default 0.1),
+/// positions 0..1 (default 0.5 = centred), frame size 0..1 (default 0.0 — no
+/// frame line), frame offset 0..1 (default 0.5), border/frame colours 0..1
+/// (defaults white border, black frame). darktable's own row exposes exactly
+/// these controls (plus colour pickers, which the plain sliders here stand in
+/// for — a bounded S1 slice).
+fn framing_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    let expander = adw::ExpanderRow::builder()
+        .title("Framing")
+        .use_markup(false)
+        .show_enable_switch(true)
+        .enable_expansion(p0.brd_on)
+        .build();
+    expander.set_tooltip_text(Some(
+        "add a solid border or frame line around the image",
+    ));
+    let ctx_cl = ctx.clone();
+    expander.connect_enable_expansion_notify(move |e| {
+        ctx_cl.params.borrow_mut().brd_on = e.enables_expansion();
+        apply_geometry_to_base(&ctx_cl);
+    });
+    // Per-module reset (w4), mirroring module_expander's suffix button; the
+    // rebuild + recompose happens inside reset_module_and_rebuild (Framing
+    // takes the apply_geometry_to_base branch there).
+    let reset = gtk4::Button::builder()
+        .icon_name("edit-clear-symbolic")
+        .tooltip_text("Reset Framing to defaults")
+        .has_frame(false)
+        .valign(gtk4::Align::Center)
+        .build();
+    reset.update_property(&[gtk4::accessible::Property::Label("Reset Framing")]);
+    let reset_ctx = ctx.clone();
+    reset.connect_clicked(move |_| {
+        reset_module_and_rebuild(&reset_ctx, "Framing", false);
+    });
+    expander.add_suffix(&reset);
+    // Slider twin of add_param_slider that recomposes the base instead of a
+    // bare pipeline re-render (for the same geometry-family reason as the
+    // toggle above).
+    let add = |e: &adw::ExpanderRow,
+               label: &str,
+               min: f64,
+               max: f64,
+               step: f64,
+               init: f64,
+               set: fn(&mut PreviewParams, f32)| {
+        let row = labeled_slider(label, min, max, step, init);
+        let ctx_cl = ctx.clone();
+        row.scale.connect_value_changed(move |v| {
+            set(&mut ctx_cl.params.borrow_mut(), v as f32);
+            apply_geometry_to_base(&ctx_cl);
+        });
+        e.add_row(&row.row);
+    };
+    add(&expander, "Size", 0.0, 0.5, 0.01, p0.brd_size as f64, |p, v| p.brd_size = v);
+    add(&expander, "Position H", 0.0, 1.0, 0.01, p0.brd_pos_h as f64, |p, v| {
+        p.brd_pos_h = v
+    });
+    add(&expander, "Position V", 0.0, 1.0, 0.01, p0.brd_pos_v as f64, |p, v| {
+        p.brd_pos_v = v
+    });
+    add(&expander, "Frame size", 0.0, 1.0, 0.01, p0.brd_frame_size as f64, |p, v| {
+        p.brd_frame_size = v
+    });
+    add(&expander, "Frame offset", 0.0, 1.0, 0.01, p0.brd_frame_offset as f64, |p, v| {
+        p.brd_frame_offset = v
+    });
+    add(&expander, "Border R", 0.0, 1.0, 0.01, p0.brd_color_r as f64, |p, v| {
+        p.brd_color_r = v
+    });
+    add(&expander, "Border G", 0.0, 1.0, 0.01, p0.brd_color_g as f64, |p, v| {
+        p.brd_color_g = v
+    });
+    add(&expander, "Border B", 0.0, 1.0, 0.01, p0.brd_color_b as f64, |p, v| {
+        p.brd_color_b = v
+    });
+    add(&expander, "Frame R", 0.0, 1.0, 0.01, p0.brd_frame_color_r as f64, |p, v| {
+        p.brd_frame_color_r = v
+    });
+    add(&expander, "Frame G", 0.0, 1.0, 0.01, p0.brd_frame_color_g as f64, |p, v| {
+        p.brd_frame_color_g = v
+    });
+    add(&expander, "Frame B", 0.0, 1.0, 0.01, p0.brd_frame_color_b as f64, |p, v| {
+        p.brd_frame_color_b = v
+    });
+    expander
+}
+
 /// Grain (grain.c): display-referred grain on the **Lab L** channel, shaped by a
 /// photographic-paper-response LUT — iop_order.c v50 pos 65, a normal pipeline
 /// stage in the creative cluster, so [`module_expander`]'s plain re-render
@@ -5711,6 +5894,10 @@ mod tests {
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Demosaic", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Orientation", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 2, "Output color profile", ""));
+        // Framing sits in the catalog's Effect group (index 4, next to the
+        // other display-referred creative modules) — pins the right group so
+        // the Active filter counts it where darktable shows it.
+        assert!(module_filter_matches(ModuleFilter::Active, 4, "Framing", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
@@ -6063,6 +6250,20 @@ mod tests {
             p.colorize_lightness = M;
             p.colorize_lightness_mix = M;
         }),
+        ("Framing", |p| {
+            p.brd_on = true;
+            p.brd_size = M;
+            p.brd_pos_h = M;
+            p.brd_pos_v = M;
+            p.brd_color_r = M;
+            p.brd_color_g = M;
+            p.brd_color_b = M;
+            p.brd_frame_size = M;
+            p.brd_frame_offset = M;
+            p.brd_frame_color_r = M;
+            p.brd_frame_color_g = M;
+            p.brd_frame_color_b = M;
+        }),
         ("Grain", |p| {
             p.gr_on = true;
             p.gr_coarseness = M;
@@ -6375,6 +6576,18 @@ mod tests {
             rwp_black2: _,
             rwp_black3: _,
             rwp_white: _,
+            brd_on: _,
+            brd_size: _,
+            brd_pos_h: _,
+            brd_pos_v: _,
+            brd_color_r: _,
+            brd_color_g: _,
+            brd_color_b: _,
+            brd_frame_size: _,
+            brd_frame_offset: _,
+            brd_frame_color_r: _,
+            brd_frame_color_g: _,
+            brd_frame_color_b: _,
         } = PreviewParams::default();
     }
 
@@ -6447,6 +6660,76 @@ mod tests {
                 "parameterless module {label:?} is not a live module"
             );
         }
+    }
+
+    /// The preview's raw compose chain (the `apply_geometry_to_base` closure:
+    /// decode → lens pre-pass → geometry → Framing → pipeline) must produce
+    /// byte-identical output to the export funnel for the same params on the
+    /// same raw — the two paths share [`c41_core::borders::Borders::apply`]
+    /// and [`crate::preview::render_linear_to_srgb8_gear`], and this pins that
+    /// the wiring really does route them together (any double-apply or wrong
+    /// ordering shows up as a mismatch).
+    #[test]
+    fn preview_framing_compose_matches_export_funnel() {
+        use c41_core::geometry::Geometry;
+        use c41_core::rawimage::DemosaicMethod;
+        // A tiny synthetic Bayer mosaic (same generator as export.rs).
+        let (w, h) = (16usize, 12usize);
+        let mosaic: Vec<f32> = (0..w * h)
+            .map(|i| ((i % w + i / w) as f32) / ((w + h) as f32))
+            .collect();
+        let img = c41_core::rawimage::RawImage {
+            width: w,
+            height: h,
+            cfa: [[0, 1], [1, 2]],
+            xtrans: None,
+            wb: [1.0; 4],
+            orientation: (false, false, false),
+            cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            clean_make: String::new(),
+            clean_model: String::new(),
+            blacklevels: [0.0; 4],
+            whitelevels: [65535.0; 4],
+            mosaic,
+        };
+        let params = crate::preview::PreviewParams {
+            brd_on: true,
+            brd_size: 0.1,
+            brd_color_r: 0.2,
+            brd_color_g: 0.4,
+            brd_color_b: 0.6,
+            brd_frame_size: 0.5,
+            brd_frame_color_r: 1.0,
+            brd_frame_color_g: 1.0,
+            brd_frame_color_b: 1.0,
+            ..crate::preview::PreviewParams::default()
+        };
+        // The export funnel (full chain).
+        let (ew, eh, exported) = crate::export::render_export_rgb8(
+            &img,
+            DemosaicMethod::Rcd,
+            Geometry::default(),
+            &params,
+            0,
+        );
+        // The preview compose chain, rebuilt by hand exactly as the raw
+        // `apply_geometry_to_base` closure runs it.
+        let (dw, dh, linear) = img.to_linear_rgba_with_opts(
+            DemosaicMethod::Rcd,
+            params.hl_opts(),
+            params.hotpixels_opts(),
+        );
+        let linear = crate::preview::apply_lens_prepass(&linear, dw, dh, &params, None);
+        let (gw, gh, geom) = Geometry::default().apply(&linear, dw, dh);
+        let bp = params.borders_params().unwrap();
+        let (bw, bh, bordered) = c41_core::borders::Borders::apply(&geom, gw, gh, bp);
+        let rendered = crate::preview::render_linear_to_srgb8_gear(
+            &bordered, bw, bh, &params, None, 0,
+        );
+        assert_eq!((ew, eh), (bw, bh));
+        assert_eq!(exported, rendered, "preview borders compose must equal the export funnel");
+        // And the bordered frame really is larger than the source.
+        assert!(bw > w && bh > h, "canvas must grow: {bw}x{bh} vs {w}x{h}");
     }
 
     /// An unknown label is rejected and leaves the params untouched, so a

@@ -12,9 +12,9 @@
 
 ## 1. Current state (2026-11-10)
 
-- Catalogue: **46 of 52 module rows active** (41 live + 5 elsewhere-driven).
-  **6 inert rows:** `Color calibration` · `Chromatic aberrations` · `Retouch` ·
-  `Liquify` · `Framing` · `Watermark`.
+- Catalogue: **47 of 52 module rows active** (42 live + 5 elsewhere-driven).
+  **5 inert rows:** `Color calibration` · `Chromatic aberrations` · `Retouch` ·
+  `Liquify` · `Watermark`.
 - Tests: 1 940 `c41-core` / 550 `c41-ui` (Docker release). PreviewParams blob
   v33 (1914 B); geometry blob v2.
 - G2 colour: input profiling (embedded + per-image assumption) live; output
@@ -132,7 +132,7 @@ RAW prepare combined, "XL" splits into two.
 
 | Sprint | Backlog item | Deliverable (DoD) | Risk |
 |---|---|---|---|
-| S1 | `Framing` (G1 M) | +1 live (46→47/52); border stage + row + tests, preview + export parity | geometry interaction (crop/framing order) |
+| ✅ **S1 2026-11-10** | `Framing` (G1 M) | **SHIPPED** +1 live (46→47/52) — constant-border compose + frame line, geometry-family, raw+non-raw preview & all export funnels, v34 blob, 3 review passes, no blockers | geometry interaction (crop/framing order) — verified |
 | S2 | `Chromatic aberrations` (G1 M) | +1 live; RGBA stage, 3 sliders, preview/export parity | none expected (per-pixel) |
 | S3 | `Watermark` (G1 M) | +1 live; asset picker + compositing row + seeds | asset resolution/persistence |
 | S4 | `Color calibration` (G1 L) | +1 live; 12-coeff/auto-WB row on matrix-stage precedent | parity-of-coefficients claim ≠ C (document) |
@@ -143,6 +143,12 @@ RAW prepare combined, "XL" splits into two.
 | S9 | G2 S-A soft-proofing | proof toggle + proof profile + gamut check; docs | proof-of-sRGB-only display limits |
 | S10 | G3 S-D per-instance module stack | duplicate/remove instances end-to-end | touches every module's state |
 | S11 | G3 S-E masks v1 | draw/parametric mask editor on ≥ 4 modules | biggest; splits further if needed |
+| S12 | G6 decision batch | each G6 row: ship/withdraw/refuse recorded; cosmetic + clippy pass | — |
+| S13 | Closure | 52/52 counters, audit "Not on the table" rewrite, final CI + deploy | — |
+
+> Sprint ledger: **S1 ✅ 2026-11-10** (Framing shipped). Remaining G1 rows for
+> S2–S7: `Chromatic aberrations` → `Watermark` → `Color calibration` →
+> `Liquify` → `Retouch` ×2.
 | S12 | G6 decision batch | each G6 row: ship/withdraw/refuse recorded; cosmetic + clippy pass | — |
 | S13 | Closure | 52/52 counters, audit "Not on the table" rewrite, final CI + deploy | — |
 

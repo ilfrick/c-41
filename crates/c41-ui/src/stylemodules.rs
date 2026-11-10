@@ -68,6 +68,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "RGB curve",
     "Base curve",
     "Lens correction",
+    "Framing",
 ];
 
 /// Copy every parameter of one module group from `src` into `target`,
@@ -459,6 +460,23 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.lens_target_geom = src.lens_target_geom;
             true
         }
+        // Framing (borders): geometry-family compose, but its params live in
+        // the blob like any other module, so a style carries them.
+        "Framing" => {
+            target.brd_on = src.brd_on;
+            target.brd_size = src.brd_size;
+            target.brd_pos_h = src.brd_pos_h;
+            target.brd_pos_v = src.brd_pos_v;
+            target.brd_color_r = src.brd_color_r;
+            target.brd_color_g = src.brd_color_g;
+            target.brd_color_b = src.brd_color_b;
+            target.brd_frame_size = src.brd_frame_size;
+            target.brd_frame_offset = src.brd_frame_offset;
+            target.brd_frame_color_r = src.brd_frame_color_r;
+            target.brd_frame_color_g = src.brd_frame_color_g;
+            target.brd_frame_color_b = src.brd_frame_color_b;
+            true
+        }
         _ => false,
     }
 }
@@ -505,17 +523,24 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 40);
+        assert_eq!(MODULE_GROUPS.len(), 41);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
         sorted.dedup();
         assert_eq!(sorted.len(), n, "duplicate group name");
         // Base group row 0 (rawprepare) leads; exposure follows the catalog
-        // order after the decode-level controls.
+        // order after the decode-level controls. The geometry-family Framing
+        // group closes the list (it has no pipeline position — the compose
+        // runs on the base image, before the pipeline).
         assert_eq!(MODULE_GROUPS[0], "Raw black/white point", "pipeline order starts at rawprepare");
         assert_eq!(
             MODULE_GROUPS[MODULE_GROUPS.len() - 1],
+            "Framing",
+            "geometry-family Framing closes the group list"
+        );
+        assert_eq!(
+            MODULE_GROUPS[MODULE_GROUPS.len() - 2],
             "Lens correction",
             "pipeline order ends at lens correction"
         );
@@ -567,6 +592,42 @@ mod tests {
         let base = PreviewParams::default();
         let merged = merge_modules(&base, &populated, MODULE_GROUPS);
         assert_eq!(merged, populated, "every field must belong to exactly one listed group");
+    }
+
+    #[test]
+    fn framing_partial_style_copies_all_geometry_compose_fields() {
+        let overlay = PreviewParams {
+            brd_on: true,
+            brd_size: 0.3,
+            brd_pos_h: 0.25,
+            brd_pos_v: 0.75,
+            brd_color_r: 0.9,
+            brd_color_g: 0.4,
+            brd_color_b: 0.1,
+            brd_frame_size: 0.6,
+            brd_frame_offset: 0.2,
+            brd_frame_color_r: 0.1,
+            brd_frame_color_g: 0.7,
+            brd_frame_color_b: 0.5,
+            ..PreviewParams::default()
+        };
+        let mut target = PreviewParams::default();
+        assert!(copy_module_group(&mut target, &overlay, "Framing"));
+        assert_eq!(target.brd_on, overlay.brd_on);
+        assert_eq!(target.brd_size, overlay.brd_size);
+        assert_eq!(target.brd_pos_h, overlay.brd_pos_h);
+        assert_eq!(target.brd_pos_v, overlay.brd_pos_v);
+        assert_eq!(target.brd_color_r, overlay.brd_color_r);
+        assert_eq!(target.brd_color_g, overlay.brd_color_g);
+        assert_eq!(target.brd_color_b, overlay.brd_color_b);
+        assert_eq!(target.brd_frame_size, overlay.brd_frame_size);
+        assert_eq!(target.brd_frame_offset, overlay.brd_frame_offset);
+        assert_eq!(target.brd_frame_color_r, overlay.brd_frame_color_r);
+        assert_eq!(target.brd_frame_color_g, overlay.brd_frame_color_g);
+        assert_eq!(target.brd_frame_color_b, overlay.brd_frame_color_b);
+        // Another group's fields must not move.
+        assert_eq!(target.ev, PreviewParams::default().ev);
+        assert_eq!(target.df_on, PreviewParams::default().df_on);
     }
 
     #[test]
