@@ -38,6 +38,14 @@ pub struct RawPreview {
     /// The UI uses this to hide the Bayer demosaic-method selector, which is a
     /// no-op for X-Trans files.
     pub is_xtrans: bool,
+    /// The source file's own per-colour black levels in sensor units (RGBE
+    /// order), BEFORE any rawprepare override — the raw black/white row's
+    /// slider seed. Mirrors [`c41_core::rawimage::RawImage::blacklevels`].
+    pub blacklevels: [f32; 4],
+    /// The source file's own per-colour white levels in sensor units (all four
+    /// equal in rawloader; the white *scalar* override plays the same
+    /// broadcast role). Mirrors [`c41_core::rawimage::RawImage::whitelevels`].
+    pub whitelevels: [f32; 4],
     /// Cleaned-up camera maker/model from the decoder's table — seeds the
     /// lens-correction module's camera dropdown. Empty when unknown.
     pub clean_make: String,
@@ -117,19 +125,25 @@ pub fn decode_raw_preview_with(
     method: c41_core::rawimage::DemosaicMethod,
     hl: Option<c41_core::iop::highlights::HlOpts>,
 ) -> Option<RawPreview> {
-    decode_raw_preview_with_opts(path, max_dim, method, hl, None)
+    decode_raw_preview_with_opts(path, max_dim, method, hl, None, None)
 }
 
-/// Raw preview with decode-stage hotpixel correction.
+/// Raw preview with decode-stage hotpixel correction and an optional raw
+/// black/white override (darktable's rawprepare, applied at CFA decode time
+/// via [`c41_core::rawimage::load_with`]; `None` = the file's own levels,
+/// byte-identical to the pre-module decode).
 pub fn decode_raw_preview_with_opts(
     path: &str,
     max_dim: usize,
     method: c41_core::rawimage::DemosaicMethod,
     hl: Option<c41_core::iop::highlights::HlOpts>,
     hotpixels: Option<c41_core::iop::hotpixels::HotpixelsOpts>,
+    rawprepare: Option<c41_core::RawPrepareOpts>,
 ) -> Option<RawPreview> {
-    let img = c41_core::rawimage::load(path).ok()?;
+    let img = c41_core::rawimage::load_with(path, rawprepare).ok()?;
     let is_xtrans = img.xtrans.is_some();
+    let blacklevels = img.blacklevels;
+    let whitelevels = img.whitelevels;
     let clean_make = img.clean_make.clone();
     let clean_model = img.clean_model.clone();
     let (w, h, rgba) = img.to_linear_rgba_with_opts(method, hl, hotpixels);
@@ -144,6 +158,8 @@ pub fn decode_raw_preview_with_opts(
         height: h2,
         pixels: small,
         is_xtrans,
+        blacklevels,
+        whitelevels,
         clean_make,
         clean_model,
     })

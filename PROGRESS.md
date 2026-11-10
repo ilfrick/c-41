@@ -9145,3 +9145,48 @@ orientation/v1-decode tests; 545 `c41-ui` — +1 non-raw export orientation test
 Host `cargo test -p c41-core` cannot link (no lensfun/gphoto2 libs — known);
 docker is authoritative. No deployment/container/installer/service changed;
 `install-debuntu.sh` + checksum remain untracked and untouched.
+
+## 2026-11-10 10:05 UTC — G1: Raw black/white point (rawprepare)
+
+**What.** Wired darktable's `Raw black/white point` as a live decode-level module
+(Hot-pixels precedent, NOT a pipeline `Stage`): the user can override the four
+per-colour sensor black levels (RGBE order) and the scalar white point that the
+raw CFA normalisation uses. New `c41_core::RawPrepareOpts` +
+`RawImage::load_with(path, opts)` substitute exactly the `commit_params` pair
+(`sub[i]=black[i]`, `div[i]=white-sub[i]`, white broadcast `[o.white;4]`) into
+`normalize_cfa`/`normalize_xtrans`; `None` keeps the file's metadata values,
+byte-identical to the pre-module decode (`load` = `load_with(None)`, pinned by
+test + a synthetic-DNG writer with a per-colour BlackLevel tag). PreviewParams v33 append-only (+1 bool `rwp_on`, +5 f32 levels at float
+462–466; blob 1893 → 1914; v32 blobs decode off/inert). UI: raw-only hand-rolled
+row with 4 black + 1 white sliders (0..65535), debounced `spawn_decode`
+re-decodes, history label, reset, partial-style group (MODULE_GROUPS 40, first
+row). The sliders seed from the FILE's levels once the first decode lands (new
+`PreviewCtx::rawprepare_levels`); until then the row is insensitive, so an
+enable can never normalise from unknown sentinels. Export parity: single-image
+and catalog-resolved edits load with `params.rawprepare_opts()` in
+`render_raw_export` (the renderers need no plumbing — the override is baked
+into the mosaic). Header count now 46/52 active (41 live + 5 elsewhere), 6
+inert.
+
+**Review + fixes.** Three independent review passes. Initial pass found the
+synthetic-DNG tests' recomposition inverted with the wrong (file) pair and wb
+NaN-compared (test logic, fixed), plus no code defect. The independent senior
+review then found two behavioral defects in the row semantics: (A) enabling
+before the first decode seeded a sentinel white causing a near-black decode —
+fixed by keeping the row insensitive until the file's levels land; (B)
+disable→enable unconditionally reseeded from file levels, clobbering the
+user's edited values — fixed by seeding only from the pristine sentinel state
+(0,0,0,0,65535), so an off→on toggle preserves the user's edit like
+darktable. Also applied the reviewer's hardening: `rawprepare_opts()` now
+sanitises levels to 0..65535 with non-finite fallbacks (corrupt-blob posture
+like hotpixels). Focused re-review: no blockers, two accepted LOW edge cases of
+the sentinel heuristic. CI green on the final tree: `scripts/ci-local.sh`
+all four steps (workspace check, clippy, release tests 1 940 `c41-core` / 550
+`c41-ui`, release link); `git diff --check` passed. Documented deviations in
+PARITY_AUDIT: gain-map/flat-field + raw-crop not surfaced; degenerate
+`white<=black` pairs guarded (never negative-div); rawloader black-source
+limits (pre-existing); history jump/undo/redo restores decode params without a
+re-decode (shared decode-level gap with Hot pixels/HL). Host `cargo test -p
+c41-core` cannot link (no lensfun/gphoto2 — known; docker authoritative). No
+deployment/container/installer/service changed; `install-debuntu.sh` +
+checksum remain untracked and untouched.

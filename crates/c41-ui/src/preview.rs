@@ -707,6 +707,29 @@ pub struct PreviewParams {
     pub hotpixels_threshold: f32,
     pub hotpixels_strength: f32,
     pub hotpixels_permissive: bool,
+    /// Raw-only black/white-point override (darktable's rawprepare): when on,
+    /// the per-colour black levels (RGBE order) and the white point override
+    /// the file's own levels at CFA decode time; off = the decode uses the
+    /// file's metadata values, byte-identical to a pre-module decode. UI units
+    /// are sensor levels 0..65535, stored as `f32` so they are exact.
+    ///
+    /// Like Hot pixels this is a **decode-level** control, consumed by
+    /// [`Self::rawprepare_opts`] during the raw decode — NOT a pipeline
+    /// [`Stage`](c41_core::pipeline::Stage) — so it deliberately stays out of
+    /// [`Self::is_identity`] (decode inputs change the base image, never the
+    /// post-decode pipeline) and every change re-decodes the raw.
+    pub rwp_on: bool,
+    /// Black level for CFA colour 0 (R), sensor units.
+    pub rwp_black0: f32,
+    /// Black level for CFA colour 1 (G), sensor units.
+    pub rwp_black1: f32,
+    /// Black level for CFA colour 2 (B), sensor units.
+    pub rwp_black2: f32,
+    /// Black level for CFA colour 3 (E), sensor units.
+    pub rwp_black3: f32,
+    /// White point, sensor units, broadcast to every colour (the rawprepare
+    /// `div[i] = white - sub[i]` contract).
+    pub rwp_white: f32,
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -992,6 +1015,17 @@ impl Default for PreviewParams {
             hotpixels_threshold: 0.05,
             hotpixels_strength: 0.25,
             hotpixels_permissive: false,
+            // Raw black/white point: off, with inert file-default sentinels
+            // (black 0 / white 65535 — the rawloader default level pair for an
+            // un-tagged file). They are inert exactly because `rwp_on` is the
+            // only gate: `rawprepare_opts()` returns None while off, so the
+            // decode keeps the file's own values regardless of these.
+            rwp_on: false,
+            rwp_black0: 0.0,
+            rwp_black1: 0.0,
+            rwp_black2: 0.0,
+            rwp_black3: 0.0,
+            rwp_white: 65535.0,
             df_on: false,
             df_radius: 4.0,   // defringe.c $DEFAULT
             df_thresh: 20.0,  // defringe.c $DEFAULT
@@ -1259,6 +1293,34 @@ impl PreviewParams {
         }.sanitized())
     }
 
+    /// A sensor black/white level owned by the UI: finite and inside
+    /// `0..=65535` (the strict sensor range). A corrupt/edited blob can carry
+    /// NaN or out-of-range values (the same untrusted-input posture as the
+    /// sibling decode options), which would otherwise poison the whole mosaic
+    /// normalisation; non-finite/out-of-range values fall back to `fallback`.
+    fn sanitize_level(v: f32, fallback: f32) -> f32 {
+        if v.is_finite() { v.clamp(0.0, 65535.0) } else { fallback }
+    }
+
+    /// Raw black/white overrides for the raw decode; `None` while the module
+    /// is off, so the decode uses the file's own metadata values (byte-
+    /// identical to a pre-module decode). The sensor-level UI units map 1:1
+    /// onto the core's `RawPrepareOpts` (per-colour black + scalar white), the
+    /// exact substitute arrays `rawprepare.c`'s commit_params builds. Levels
+    /// are sanitised to the sensor range with a sRGB-white fallback for
+    /// non-finite values.
+    pub fn rawprepare_opts(&self) -> Option<c41_core::RawPrepareOpts> {
+        self.rwp_on.then_some(c41_core::RawPrepareOpts {
+            black: [
+                Self::sanitize_level(self.rwp_black0, 0.0),
+                Self::sanitize_level(self.rwp_black1, 0.0),
+                Self::sanitize_level(self.rwp_black2, 0.0),
+                Self::sanitize_level(self.rwp_black3, 0.0),
+            ],
+            white: Self::sanitize_level(self.rwp_white, 65535.0),
+        })
+    }
+
     /// Highlight-reconstruction options for the raw front end; `None` while
     /// the module is off (the legacy hard-clip-at-white decode). Shared by
     /// preview and export so the two paths cannot disagree.
@@ -1455,7 +1517,7 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on] {
             v.push(b as u8);
         }
         for f in [
@@ -1636,9 +1698,12 @@ impl PreviewParams {
         for s in [self.df_radius, self.df_thresh, self.df_mode] {
             v.extend_from_slice(&s.to_le_bytes());
         }
-        // Highpass (v31) followed append-only by hot-pixel controls (v32).
+        // Highpass (v31), then hot-pixel controls (v32), then raw black/white
+        // point (v33) — each block appended so the layout stays append-only.
         for s in [self.highpass_sharpness, self.highpass_contrast,
-                  self.hotpixels_threshold, self.hotpixels_strength] {
+                  self.hotpixels_threshold, self.hotpixels_strength,
+                  self.rwp_black0, self.rwp_black1, self.rwp_black2, self.rwp_black3,
+                  self.rwp_white] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -1938,6 +2003,16 @@ impl PreviewParams {
             hotpixels_permissive: bools.get(43).map_or(d.hotpixels_permissive, |&b| b != 0),
             hotpixels_threshold: f.get(460).copied().unwrap_or(d.hotpixels_threshold),
             hotpixels_strength: f.get(461).copied().unwrap_or(d.hotpixels_strength),
+            // Raw black/white point (v33): bool 44, floats 462–466. v32-and-
+            // earlier blobs end before any of this — every `.get` misses and
+            // each slot keeps its inert sentinel default (rwp off ⇒ the decode
+            // uses the file's own levels regardless).
+            rwp_on: bools.get(44).map_or(d.rwp_on, |&b| b != 0),
+            rwp_black0: f.get(462).copied().unwrap_or(d.rwp_black0),
+            rwp_black1: f.get(463).copied().unwrap_or(d.rwp_black1),
+            rwp_black2: f.get(464).copied().unwrap_or(d.rwp_black2),
+            rwp_black3: f.get(465).copied().unwrap_or(d.rwp_black3),
+            rwp_white: f.get(466).copied().unwrap_or(d.rwp_white),
         })
     }
 
@@ -2853,9 +2928,11 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// enum ordinal stored as a float).
 /// v31 adds highpass (1 bool + 2 f32).
 /// v32 adds raw-only hot pixels (2 bools + 2 f32).
-const ENCODE_VERSION: u8 = 32;
-/// 1 version byte + 44 bool bytes + 462 little-endian f32.
-const ENCODED_LEN: usize = 1 + 44 + 462 * 4;
+/// v33 adds raw black/white point (1 bool + 5 f32) — decode-level, like
+/// hot pixels, so the params remain pipeline-identity-neutral.
+const ENCODE_VERSION: u8 = 33;
+/// 1 version byte + 45 bool bytes + 467 little-endian f32.
+const ENCODED_LEN: usize = 1 + 45 + 467 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -2883,6 +2960,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (30, 41, 458), // v30: defringe added
     (31, 42, 460), // v31: highpass added
     (32, 44, 462), // v32: raw hotpixels added
+    (33, 45, 467), // v33: raw black/white point added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3684,6 +3762,15 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         soften_saturation: 38.0,
         soften_brightness: -1.75,
         soften_amount: 83.0,
+        // Raw black/white point (v33): enabled with every slider off-default
+        // and pairwise distinct so a wrong offset inside the trailing block
+        // shows up as a round-trip mismatch.
+        rwp_on: true,
+        rwp_black0: 111.0,
+        rwp_black1: 222.0,
+        rwp_black2: 333.0,
+        rwp_black3: 444.0,
+        rwp_white: 5000.0,
         df_on: true,
         df_radius: 7.5,
         df_thresh: 62.0,
@@ -4780,6 +4867,54 @@ mod tests {
         assert_eq!(params.hotpixels_opts(), Some(c41_core::iop::hotpixels::HotpixelsOpts {
             threshold: 0.17, strength: 0.62, permissive: true,
         }));
+    }
+
+    #[test]
+    fn decode_v32_blob_defaults_raw_black_white_point() {
+        // A v32 blob (the last layout before rawprepare — 44 bools / 462 f32s)
+        // must decode with rwp OFF and the inert sentinels, so an image edited
+        // before the module existed loads unchanged — and critically the raw
+        // decode keeps using the file's own levels (`rwp_on` is the gate: a
+        // wrong `unwrap_or(true)` here would re-normalise every saved raw edit
+        // with a made-up black/white pair).
+        let mut blob = vec![0u8; 1 + 44 + 462 * 4];
+        blob[0] = 32;
+        let decoded = PreviewParams::decode(&blob).expect("v32 blob must decode");
+        let defaults = PreviewParams::default();
+        assert!(!decoded.rwp_on);
+        assert_eq!(decoded.rwp_black0, defaults.rwp_black0);
+        assert_eq!(decoded.rwp_black1, defaults.rwp_black1);
+        assert_eq!(decoded.rwp_black2, defaults.rwp_black2);
+        assert_eq!(decoded.rwp_black3, defaults.rwp_black3);
+        assert_eq!(decoded.rwp_white, defaults.rwp_white);
+        assert!(decoded.rawprepare_opts().is_none());
+        // A decode-level control must not drag the pipeline out of identity.
+        assert!(decoded.is_identity());
+        assert!(
+            decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
+            "rawprepare is a decode input, never a pipeline stage"
+        );
+    }
+
+    #[test]
+    fn rawprepare_opts_are_raw_decode_controls() {
+        let mut params = PreviewParams::default();
+        assert!(params.rawprepare_opts().is_none(), "off = use the file's values");
+        params.rwp_on = true;
+        params.rwp_black0 = 64.0;
+        params.rwp_black1 = 32.0;
+        params.rwp_black2 = 48.0;
+        params.rwp_black3 = 16.0;
+        params.rwp_white = 4000.0;
+        assert_eq!(
+            params.rawprepare_opts(),
+            Some(c41_core::RawPrepareOpts { black: [64.0, 32.0, 48.0, 16.0], white: 4000.0 })
+        );
+        // Encode/decode round-trips the new fields exactly (the layout grow is
+        // covered by params_encode_decode_roundtrips; this pins the semantics).
+        let round = PreviewParams::decode(&params.encode()).expect("v33 blob must decode");
+        assert_eq!(round, params);
+        assert_eq!(round.rawprepare_opts(), params.rawprepare_opts());
     }
 
     #[test]

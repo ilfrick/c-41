@@ -295,7 +295,14 @@ fn render_raw_export(
     use crate::export::ExportFormat;
     use image::{imageops::FilterType, ImageBuffer, Rgb};
 
-    let img = c41_core::rawimage::load(path).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    // Bake the edit's raw black/white override into the decode itself
+    // (`load_with`), exactly like the preview's `spawn_decode` — the override
+    // lives in the CFA normalisation, so an export must load under it or it
+    // silently diverges from the on-screen preview. `None` (module off) keeps
+    // the file's own levels byte-for-byte. The renderers below receive the
+    // already-overridden mosaic and need no rwp plumbing.
+    let img = c41_core::rawimage::load_with(path, edit.params.rawprepare_opts())
+        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
     let dest_ext = format!("{dest}.{}", settings.format.out_ext());
 
     // Target size for the optional resize box (None ⇒ keep source size).
@@ -1066,6 +1073,36 @@ mod tests {
     }
 
     #[test]
+    fn raw_black_white_edit_reaches_the_export_edit() {
+        // The rawprepare override must ride the catalog-resolved export edit
+        // (and be absent from the unedited seed) so `render_raw_export`'s
+        // `load_with(path, edit.params.rawprepare_opts())` bakes what the
+        // preview showed. `params.rawprepare_opts()` is the shared construction
+        // site, so asserting it here pins the whole preview→export seam.
+        let (dir, db) = seeded_db();
+        let mut params = crate::preview::PreviewParams::default();
+        params.rwp_on = true;
+        params.rwp_black0 = 64.0;
+        params.rwp_black1 = 32.0;
+        params.rwp_black2 = 48.0;
+        params.rwp_black3 = 16.0;
+        params.rwp_white = 4000.0;
+        crate::persist::save_params(&db, "/p/a.dng", &params);
+        let edit = load_export_edit(&db, "/p/a.dng").expect("edited raw exports via Rust");
+        assert_eq!(
+            edit.params.rawprepare_opts(),
+            params.rawprepare_opts(),
+            "the export edit must carry the override the preview shows"
+        );
+        assert_eq!(
+            default_raw_export_edit().params.rawprepare_opts(),
+            None,
+            "an unedited raw exports under the file's own levels"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn unedited_raw_export_default_matches_preview_seed() {
         // Milestone 5: an unedited raw exports through the Rust pipeline using the
         // SAME seed the darkroom preview shows for a freshly-opened raw (no cli
@@ -1318,6 +1355,8 @@ mod tests {
             cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             clean_make: String::new(),
             clean_model: String::new(),
+            blacklevels: [0.0; 4],
+            whitelevels: [65535.0; 4],
             mosaic: (0..48).map(|i| (i % 8 + i / 8) as f32 / 14.0).collect(),
         };
         let params = crate::preview::PreviewParams::default();

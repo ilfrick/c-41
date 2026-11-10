@@ -240,6 +240,20 @@ fn read_u16(bytes: &[u8], p: &mut usize) -> Option<u16> {
 /// `"Edit"` if nothing recognised differs. Pure, so it's unit-testable without a
 /// live widget — the darkroom page calls it when recording a settled edit.
 pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str {
+    // Raw black/white point is Base group row 0 (the catalogue's first module)
+    // and a decode-level control like Hot pixels / Highlight reconstruction —
+    // it edits the raw decode inputs, so it gets a history label of its own.
+    // Checked first: `rwp_on` may flip alone (an enable with untouched sliders
+    // still normalises identically but is a real module edit).
+    let rawprepare = old.rwp_on != new.rwp_on
+        || old.rwp_black0 != new.rwp_black0
+        || old.rwp_black1 != new.rwp_black1
+        || old.rwp_black2 != new.rwp_black2
+        || old.rwp_black3 != new.rwp_black3
+        || old.rwp_white != new.rwp_white;
+    if rawprepare {
+        return "Raw black/white point";
+    }
     let exposure = old.exposure_on != new.exposure_on
         || old.black != new.black
         || old.ev != new.ev;
@@ -937,6 +951,20 @@ mod tests {
             ),
             "Lens correction"
         );
+        // Raw black/white point labels both the enable flag and the sliders.
+        assert_eq!(
+            describe_change(&base, &PreviewParams { rwp_on: true, ..base }),
+            "Raw black/white point"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { rwp_white: 4000.0, ..base }),
+            "Raw black/white point"
+        );
+        // A lone slider move without the enable flag is still the group's edit.
+        assert_eq!(
+            describe_change(&base, &PreviewParams { rwp_black0: 512.0, ..base }),
+            "Raw black/white point"
+        );
         assert_eq!(describe_change(&base, &PreviewParams { hotpixels_on: true, ..base }), "Hot pixels");
         assert_eq!(describe_change(&base, &PreviewParams { hotpixels_threshold: 0.1, ..base }), "Hot pixels");
         // No recognised difference ⇒ the generic fallback.
@@ -1206,6 +1234,12 @@ mod tests {
             hotpixels_threshold: _,
             hotpixels_strength: _,
             hotpixels_permissive: _,
+            rwp_on: _,
+            rwp_black0: _,
+            rwp_black1: _,
+            rwp_black2: _,
+            rwp_black3: _,
+            rwp_white: _,
         } = PreviewParams::default();
     }
 
@@ -1326,7 +1360,9 @@ mod tests {
         // #2 (Highpass): 1874 → 1883 (1 + 42 bools + 460 f32 — enabled and
         // sharpness/contrast).
         // G1 Hot pixels (v32): 1883 → 1893 (2 more bools + 2 f32 controls).
-        assert_eq!(PreviewParams::default().encode().len(), 1893);
+        // G1 rawprepare (v33): 1893 → 1914 (1 more bool + 5 f32 controls — the
+        // four per-colour black levels + the white point).
+        assert_eq!(PreviewParams::default().encode().len(), 1914);
     }
 
     #[test]

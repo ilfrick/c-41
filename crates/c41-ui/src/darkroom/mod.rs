@@ -236,6 +236,13 @@ struct PreviewCtx {
     /// once a decode reveals the sensor is X-Trans (where the method is a no-op).
     /// Empty until the raw-only selector is built below.
     demosaic_row: glib::WeakRef<gtk4::Box>,
+    /// The most recent raw decode's FILE black/white levels (sensor units:
+    /// per-colour RGBE black + the scalar white) — seeds the raw black/white
+    /// sliders once the first decode completes. `None` = no raw decode has
+    /// landed yet; the row then shows inert sentinel values. The params own
+    /// the values only once the user edits (`rwp_on`), where they override
+    /// these — see [`crate::preview::PreviewParams::rawprepare_opts`].
+    rawprepare_levels: Rc<RefCell<Option<([f32; 4], f32)>>>,
     /// Path of the image being edited. [`spawn_decode`] reads it from here so
     /// any module row (whose closures only capture `ctx`) can request a full
     /// re-decode — needed by highlight reconstruction, whose options live in
@@ -1082,16 +1089,20 @@ fn apply_geometry_to_base(ctx: &PreviewCtx) {
 
 /// Decode + downscale the image off the main thread, then display it. Reads its
 /// inputs from `ctx`: [`PreviewCtx::decode_path`], [`PreviewCtx::decode_method`],
-/// and the live params' highlight-reconstruction/hot-pixel options
-/// ([`PreviewParams::hl_opts`]). Camera raws go through the Rust decoder with
-/// that method (ignored for X-Trans sensors) and — when enabled — highlight
-/// reconstruction on the white-balanced mosaic BEFORE demosaicing (darktable's
-/// temperature → highlights → demosaic order); the result is stored as the
+/// and the live params' decode-stage options — highlight reconstruction, hot
+/// pixels and the raw black/white override ([`PreviewParams::rawprepare_opts`]).
+/// Camera raws go through the Rust decoder with that method (ignored for X-Trans
+/// sensors) and — when enabled — highlight reconstruction on the
+/// white-balanced mosaic BEFORE demosaicing (darktable's temperature →
+/// highlights → demosaic order); the result is stored as the
 /// un-geometried [`PreviewCtx::pristine`] buffer and gets the current
-/// [`Geometry`] applied to produce `base`. Everything else goes through
-/// gdk-pixbuf straight to `base` (no geometry, no reconstruction). Re-run after
-/// changing any decode input — this re-decodes the full raw, unlike the
-/// geometry/pipeline changes which reuse the already-downscaled buffer.
+/// [`Geometry`] applied to produce `base`. The first completed decode also
+/// captures the FILE's own black/white levels into
+/// [`PreviewCtx::rawprepare_levels`] (the raw black/white sliders' seed).
+/// Everything else goes through gdk-pixbuf straight to `base` (no geometry, no
+/// reconstruction). Re-run after changing any decode input — this re-decodes
+/// the full raw, unlike the geometry/pipeline changes which reuse the
+/// already-downscaled buffer.
 fn spawn_decode(ctx: &PreviewCtx) {
     // Claim the newest generation; a stale (superseded) decode discards below.
     let generation = ctx.decode_gen.get().wrapping_add(1);
@@ -1103,11 +1114,13 @@ fn spawn_decode(ctx: &PreviewCtx) {
     let params = *ctx.params.borrow();
     let hl = params.hl_opts();
     let hotpixels = params.hotpixels_opts();
+    let rawprepare = params.rawprepare_opts();
     glib::spawn_future_local(clone!(@strong ctx => async move {
         if crate::raw_preview::is_raw_path(&path) {
             // Decode + reconstruct + demosaic off the main thread (it's heavy);
             // downscale to a responsive preview size. Keep the un-geometried
-            // buffer.
+            // buffer. The rawprepare override is baked into the loader (as in
+            // export), so preview and export cannot disagree about black/white.
             let p = path.clone();
             let decoded = gio::spawn_blocking(move || {
                 crate::raw_preview::decode_raw_preview_with_opts(
@@ -1116,6 +1129,7 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     method,
                     hl,
                     hotpixels,
+                    rawprepare,
                 )
                 .map(|rp| {
                     (
@@ -1123,6 +1137,8 @@ fn spawn_decode(ctx: &PreviewCtx) {
                         rp.height,
                         rp.pixels,
                         rp.is_xtrans,
+                        rp.blacklevels,
+                        rp.whitelevels,
                         rp.clean_make,
                         rp.clean_model,
                     )
@@ -1137,7 +1153,22 @@ fn spawn_decode(ctx: &PreviewCtx) {
                 return;
             }
             match decoded {
-                Some((w, h, px, is_xtrans, clean_make, clean_model)) => {
+                Some((w, h, px, is_xtrans, blacklevels, whitelevels, clean_make, clean_model)) => {
+                    // The first completed decode seeds the raw black/white row
+                    // with the FILE's own levels (sensor units; before that the
+                    // row shows inert sentinels). Only the None→Some transition
+                    // rebuilds the module panel — a re-decode that already has
+                    // levels (hot-pixel slider drags, demosaic switches) must
+                    // not churn the whole panel per change.
+                    if ctx.rawprepare_levels.borrow().is_none() {
+                        *ctx.rawprepare_levels.borrow_mut() = Some((blacklevels, whitelevels[0]));
+                        if let Some(panel) = ctx.panel_box.upgrade() {
+                            while let Some(child) = panel.first_child() {
+                                panel.remove(&child);
+                            }
+                            populate_modules(&panel, &ctx);
+                        }
+                    }
                     // The Bayer demosaic selector is a no-op for X-Trans
                     // (Markesteijn is fixed) — hide the section for those files.
                     // Runs on every decode, including Bayer method-change
@@ -1535,6 +1566,7 @@ pub fn darkroom_page(
         history,
         history_rec,
         demosaic_row: glib::WeakRef::new(),
+        rawprepare_levels: Rc::new(RefCell::new(None)),
         decode_path: Rc::new(RefCell::new(file_path.to_string())),
         decode_method: Rc::new(std::cell::Cell::new(
             crate::persist::load_demosaic(db_path, file_path),
@@ -2643,6 +2675,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Color correction" => colorcorrection_module_row(ctx).upcast(),
                 "Color contrast" => colorcontrast_module_row(ctx).upcast(),
                 "Input color profile" => input_profile_module_row(ctx).upcast(),
+                "Raw black/white point" => rawprepare_module_row(ctx).upcast(),
                 "Primaries" => primaries_module_row(ctx).upcast(),
                 "Negadoctor" => negadoctor_module_row(ctx).upcast(),
                 "Tone equalizer" => toneequal_module_row(ctx).upcast(),
@@ -2957,7 +2990,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile"];
+const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Defringe", "Invert", "White balance", "Input color profile"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3166,6 +3199,14 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             filmic_saturation
         ),
         "Highlight reconstruction" => set!(hl_on, hl_opposed, hl_clip),
+        "Raw black/white point" => set!(
+            rwp_on,
+            rwp_black0,
+            rwp_black1,
+            rwp_black2,
+            rwp_black3,
+            rwp_white
+        ),
         "Hot pixels" => set!(hotpixels_on, hotpixels_threshold, hotpixels_strength, hotpixels_permissive),
         "Denoise (profiled)" => set!(dn_on, dn_mode_y0u0v0, dn_strength, dn_shadows, dn_bias),
         "Lens correction" => set!(
@@ -4424,6 +4465,160 @@ fn hotpixels_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     row
 }
 
+/// Raw-only black/white point override (darktable's rawprepare): the four
+/// per-colour black sliders + the white slider in sensor units, applied at CFA
+/// decode time. Hand-rolled like the Hot pixels row — a decode-level control,
+/// NOT a pipeline [`Stage`](c41_core::pipeline::Stage) — so every change
+/// re-decodes ([`spawn_decode`]), never `render_preview`. Hidden for non-raw
+/// files (JPEGs carry no CFA level pair).
+///
+/// Slider semantics: while the module is off the sliders show the FILE's own
+/// levels once the first decode lands ([`PreviewCtx::rawprepare_levels`]), inert
+/// sentinels before that, matching the params defaults; turning the module on
+/// (or dragging any slider) materialises those shown values into `params`, so
+/// an enable with untouched sliders keeps the decode identical to off, and a
+/// first drag starts from what the row displays, not from the sentinels.
+fn rawprepare_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    /// One slider of the raw black/white row. `which` selects the target
+    /// field (0..3 = rwp_black0..3, anything else = rwp_white); `baseline` is
+    /// the (file-level or sentinel) display baseline a first interaction
+    /// materialises wholesale before the dragged channel is overwritten.
+    fn add_rwp_slider(
+        row: &adw::ExpanderRow,
+        ctx: &PreviewCtx,
+        label: &str,
+        value: f32,
+        which: u8,
+        baseline: (f32, f32, f32, f32, f32),
+    ) {
+        let slider = labeled_slider(label, 0.0, 65535.0, 1.0, value as f64);
+        let slider_ctx = ctx.clone();
+        let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        slider.scale.connect_value_changed(move |s| {
+            let mut params = slider_ctx.params.borrow_mut();
+            if !params.rwp_on {
+                // First interaction on a disabled row: take the whole shown
+                // baseline (the file's own levels) so the other channels keep
+                // what the row displays, then the dragged channel below.
+                params.rwp_black0 = baseline.0;
+                params.rwp_black1 = baseline.1;
+                params.rwp_black2 = baseline.2;
+                params.rwp_black3 = baseline.3;
+                params.rwp_white = baseline.4;
+                params.rwp_on = true;
+            }
+            match which {
+                0 => params.rwp_black0 = s as f32,
+                1 => params.rwp_black1 = s as f32,
+                2 => params.rwp_black2 = s as f32,
+                3 => params.rwp_black3 = s as f32,
+                _ => params.rwp_white = s as f32,
+            }
+            drop(params);
+            if let Some(id) = debounce.borrow_mut().take() {
+                id.remove();
+            }
+            let c = slider_ctx.clone();
+            let d = debounce.clone();
+            *debounce.borrow_mut() = Some(glib::timeout_add_local_once(
+                std::time::Duration::from_millis(160),
+                move || {
+                    *d.borrow_mut() = None;
+                    spawn_decode(&c);
+                },
+            ));
+        });
+        row.add_row(&slider.row);
+    }
+
+    let p0 = *ctx.params.borrow();
+    let row = adw::ExpanderRow::builder()
+        .title("Raw black/white point")
+        .use_markup(false)
+        .show_enable_switch(true)
+        .enable_expansion(p0.rwp_on)
+        .build();
+    row.set_tooltip_text(Some(
+        "Override the raw decoder's per-colour black level and white point; \
+         off (the default) uses the file's own levels",
+    ));
+    if !crate::raw_preview::is_raw_path(&ctx.decode_path.borrow()) {
+        row.set_visible(false);
+        return row;
+    }
+    // Seed: params own the sliders once the module is on; while off the row
+    // displays the file's own levels (sensor units) once the first decode has
+    // completed, else the inert sentinels that match [`PreviewParams`]'s
+    // defaults (rwp_black 0, rwp_white 65535).
+    let lvl = ctx.rawprepare_levels.borrow();
+    let levels_known = lvl.is_some();
+    let (seed0, seed1, seed2, seed3, seedw) = if p0.rwp_on {
+        (p0.rwp_black0, p0.rwp_black1, p0.rwp_black2, p0.rwp_black3, p0.rwp_white)
+    } else {
+        match lvl.as_ref() {
+            Some((blk, wht)) => (blk[0], blk[1], blk[2], blk[3], *wht),
+            None => (0.0, 0.0, 0.0, 0.0, 65535.0),
+        }
+    };
+    drop(lvl);
+    // Until the first decode lands, the FILE's levels are unknown, so seeding
+    // an override from the sentinels would normalise the whole frame at
+    // white=65535 (a near-black image). The row stays OUT of reach (the switch
+    // inert, the sliders inert) until then; the first-decode panel rebuild
+    // recreates this row with the levels filled in and everything enabled.
+    if !levels_known {
+        row.set_sensitive(false);
+    }
+    let on_ctx = ctx.clone();
+    row.connect_enable_expansion_notify(move |r| {
+        let mut params = on_ctx.params.borrow_mut();
+        let now_on = r.enables_expansion();
+        if now_on && !params.rwp_on {
+            // Seed the override from the file's own levels ONLY on the first
+            // enable from the pristine reset state (params still hold the
+            // sentinels), so enabling with untouched sliders keeps the decode
+            // identical. A disable→enable therefore preserves the user's
+            // previous edit (values stay in params while off), matching
+            // darktable's rawprepare toggle.
+            let pristine = params.rwp_black0 == 0.0
+                && params.rwp_black1 == 0.0
+                && params.rwp_black2 == 0.0
+                && params.rwp_black3 == 0.0
+                && params.rwp_white == 65535.0;
+            if pristine {
+                let lvl = on_ctx.rawprepare_levels.borrow();
+                if let Some((blk, wht)) = lvl.as_ref() {
+                    params.rwp_black0 = blk[0];
+                    params.rwp_black1 = blk[1];
+                    params.rwp_black2 = blk[2];
+                    params.rwp_black3 = blk[3];
+                    params.rwp_white = *wht;
+                }
+            }
+        }
+        params.rwp_on = now_on;
+        drop(params);
+        spawn_decode(&on_ctx);
+    });
+    let baseline = (seed0, seed1, seed2, seed3, seedw);
+    add_rwp_slider(&row, ctx, "Black R", seed0, 0, baseline);
+    add_rwp_slider(&row, ctx, "Black G", seed1, 1, baseline);
+    add_rwp_slider(&row, ctx, "Black B", seed2, 2, baseline);
+    add_rwp_slider(&row, ctx, "Black E", seed3, 3, baseline);
+    add_rwp_slider(&row, ctx, "White point", seedw, 4, baseline);
+    let reset = gtk4::Button::builder()
+        .icon_name("edit-clear-symbolic")
+        .tooltip_text("Reset Raw black/white point to defaults")
+        .has_frame(false)
+        .build();
+    let reset_ctx = ctx.clone();
+    reset.connect_clicked(move |_| {
+        reset_module_and_rebuild(&reset_ctx, "Raw black/white point", true);
+    });
+    row.add_suffix(&reset);
+    row
+}
+
 // ── Lens correction (lens.c via the lensfun database) ──────────────────────
 
 /// `DropDown` sentinel for "nothing selected" (GTK_INVALID_LIST_POSITION).
@@ -5303,6 +5498,10 @@ mod tests {
         assert!(is_live_module("Grain"), "the wired grain module must read as live");
         assert!(is_live_module("Soften"), "the wired soften module must read as live");
         assert!(is_live_module("Highpass"), "ported module should be live");
+        assert!(
+            is_live_module("Raw black/white point"),
+            "the wired rawprepare module must read as live"
+        );
     }
 
     /// Every live-module label must still exist verbatim in the catalog, else
@@ -5501,6 +5700,10 @@ mod tests {
         assert!(module_filter_matches(ModuleFilter::All, 0, "Grain", ""));
         assert!(module_filter_matches(ModuleFilter::All, 2, "Exposure", ""));
         // Active shows only live modules (Exposure, Grain and Soften are live).
+        // Raw black/white point is Base group row 0 — the rawprepare row wired
+        // this increment — and must read as live like the other decode-level
+        // rows (Hot pixels, Demosaic).
+        assert!(module_filter_matches(ModuleFilter::Active, 0, "Raw black/white point", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Exposure", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Grain", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
@@ -5770,6 +5973,14 @@ mod tests {
             p.hl_on = true;
             p.hl_opposed = false;
             p.hl_clip = M;
+        }),
+        ("Raw black/white point", |p| {
+            p.rwp_on = true;
+            p.rwp_black0 = M;
+            p.rwp_black1 = M;
+            p.rwp_black2 = M;
+            p.rwp_black3 = M;
+            p.rwp_white = M;
         }),
         ("Hot pixels", |p| {
             p.hotpixels_on = true;
@@ -6158,6 +6369,12 @@ mod tests {
             hotpixels_threshold: _,
             hotpixels_strength: _,
             hotpixels_permissive: _,
+            rwp_on: _,
+            rwp_black0: _,
+            rwp_black1: _,
+            rwp_black2: _,
+            rwp_black3: _,
+            rwp_white: _,
         } = PreviewParams::default();
     }
 

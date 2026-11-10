@@ -26,6 +26,9 @@ use crate::preview::PreviewParams;
 /// Byte-identical to the labels `history::describe_change` produces, so a
 /// history entry and a style row name the same module the same way.
 pub const MODULE_GROUPS: &[&str] = &[
+    // Base group row 0 — same position as the catalog and `describe_change`,
+    // which check the groups in the same pipeline / panel order.
+    "Raw black/white point",
     "Exposure",
     "Velvia",
     "Split-toning",
@@ -72,6 +75,15 @@ pub const MODULE_GROUPS: &[&str] = &[
 /// names no known module — the caller decides what an unknown name means.
 pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group: &str) -> bool {
     match group {
+        "Raw black/white point" => {
+            target.rwp_on = src.rwp_on;
+            target.rwp_black0 = src.rwp_black0;
+            target.rwp_black1 = src.rwp_black1;
+            target.rwp_black2 = src.rwp_black2;
+            target.rwp_black3 = src.rwp_black3;
+            target.rwp_white = src.rwp_white;
+            true
+        }
         "Exposure" => {
             target.exposure_on = src.exposure_on;
             target.black = src.black;
@@ -474,7 +486,7 @@ pub fn merge_modules(base: &PreviewParams, overlay: &PreviewParams, groups: &[&s
 /// its listed groups over what is already there. Unknown group names are
 /// skipped (see [`merge_modules`]).
 ///
-/// Note the whole-edit arm really is replace even though merging all 39 groups
+/// Note the whole-edit arm really is replace even though merging all groups
 /// would compute the same value — [`MODULE_GROUPS`] partitions every field —
 /// because "replace" is the intent and the direct copy says so.
 pub fn apply_style(current: &PreviewParams, style: &crate::persist::Style) -> PreviewParams {
@@ -493,13 +505,15 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 39);
+        assert_eq!(MODULE_GROUPS.len(), 40);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
         sorted.dedup();
         assert_eq!(sorted.len(), n, "duplicate group name");
-        assert_eq!(MODULE_GROUPS[0], "Exposure", "pipeline order starts at exposure");
+        // Base group row 0 (rawprepare) leads; exposure follows the catalog
+        // order after the decode-level controls.
+        assert_eq!(MODULE_GROUPS[0], "Raw black/white point", "pipeline order starts at rawprepare");
         assert_eq!(
             MODULE_GROUPS[MODULE_GROUPS.len() - 1],
             "Lens correction",
@@ -553,6 +567,29 @@ mod tests {
         let base = PreviewParams::default();
         let merged = merge_modules(&base, &populated, MODULE_GROUPS);
         assert_eq!(merged, populated, "every field must belong to exactly one listed group");
+    }
+
+    #[test]
+    fn raw_black_white_point_partial_style_copies_all_decode_controls() {
+        let overlay = PreviewParams {
+            rwp_on: true,
+            rwp_black0: 64.0,
+            rwp_black1: 32.0,
+            rwp_black2: 48.0,
+            rwp_black3: 16.0,
+            rwp_white: 4000.0,
+            ..PreviewParams::default()
+        };
+        let mut target = PreviewParams::default();
+        assert!(copy_module_group(&mut target, &overlay, "Raw black/white point"));
+        assert_eq!(target.rwp_on, overlay.rwp_on);
+        assert_eq!(target.rwp_black0, overlay.rwp_black0);
+        assert_eq!(target.rwp_black1, overlay.rwp_black1);
+        assert_eq!(target.rwp_black2, overlay.rwp_black2);
+        assert_eq!(target.rwp_black3, overlay.rwp_black3);
+        assert_eq!(target.rwp_white, overlay.rwp_white);
+        assert_eq!(target.exposure_on, PreviewParams::default().exposure_on);
+        assert_eq!(target.ev, PreviewParams::default().ev);
     }
 
     #[test]

@@ -57,4 +57,9 @@ pub mod xcf;
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Root-path re-export of the raw black/white decode override, so UI code can
+/// name the decode-level option like every other (`c41_core::RawPrepareOpts`)
+/// while it lives with its C twin in [`iop::rawprepare`].
+pub use iop::rawprepare::RawPrepareOpts;
+
 pub use c41_sys::{dt_imgid_t, dt_is_valid_imgid, NO_IMGID};

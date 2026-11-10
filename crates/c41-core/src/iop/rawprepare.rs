@@ -1,6 +1,25 @@
 use crate::{params::IopParams, roi::RoiIn, Result};
 use super::{ClBuffer, IopProcess};
 
+/// Raw black/white point override applied at CFA decode time (darktable's
+/// `rawprepare`): per-colour sensor black levels in RGBE order and a single
+/// white point broadcast to all four colours. The semantic contract is
+/// `commit_params` in `src/iop/rawprepare.c`: `sub[i] = black[i]` and
+/// `div[i] = white - sub[i]`, exactly the arrays `normalize_cfa` /
+/// `normalize_xtrans` consume — so a `Some` override substitutes only the
+/// black/white inputs, never the mosaic math. `None` keeps the raw's file
+/// metadata values (byte-identical decode).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RawPrepareOpts {
+    /// Per-colour black levels in sensor units, RGBE order (0=R, 1=G, 2=B,
+    /// 3=E — the index `CFA::color_at` produces). Values are clamped by the
+    /// normalizer's `(white - black).max(1.0)` range guard, never by us.
+    pub black: [f32; 4],
+    /// White point in sensor units, applied to every colour (`div[i] =
+    /// white - sub[i]` in `commit_params`).
+    pub white: f32,
+}
+
 pub struct Rawprepare;
 
 impl IopProcess for Rawprepare {

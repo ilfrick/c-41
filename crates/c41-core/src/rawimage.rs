@@ -61,6 +61,16 @@ pub struct RawImage {
     /// rawloader doesn't read that EXIF tag (darktable gets it via exiv2).
     pub clean_make: String,
     pub clean_model: String,
+    /// The file's own per-colour sensor black levels (RGBE order, as rawloader
+    /// reports them), BEFORE any [`crate::RawPrepareOpts`] override — the
+    /// metadata the darkroom's "Raw black/white point" row seeds its sliders
+    /// from. An override changes only the normalisation inputs (see
+    /// [`load_with`]), never this record of the file's values.
+    pub blacklevels: [f32; 4],
+    /// The file's own per-colour sensor white levels (RGBE order; all four are
+    /// equal in rawloader — the white *scalar* of the override plays the same
+    /// broadcast role). Same override policy as [`Self::blacklevels`].
+    pub whitelevels: [f32; 4],
     /// Black/white-normalised photosites, row-major, `width * height` long.
     pub mosaic: Vec<f32>,
 }
@@ -218,12 +228,36 @@ pub fn classify_cfa(color_at: impl Fn(usize, usize) -> usize) -> Result<CfaKind>
     Ok(CfaKind::Xtrans(xt))
 }
 
-/// Decode a camera raw file into a normalised [`RawImage`].
+/// Decode a camera raw file into a normalised [`RawImage`] using the file's
+/// own black/white metadata ([`load_with`] with no override).
 ///
 /// Only single-component CFA mosaics (`cpp == 1`, integer data) are supported
 /// for now — the demosaic front end's input. Already-demosaiced (`cpp == 3`) or
 /// float-encoded raws return [`Error::Raw`].
 pub fn load(path: impl AsRef<std::path::Path>) -> Result<RawImage> {
+    load_with(path, None)
+}
+
+/// Decode a camera raw file into a normalised [`RawImage`], optionally
+/// substituting the raw black/white level override `opts` for the file's own
+/// values (darktable's `rawprepare`, applied at decode time). `None` keeps
+/// today's bytes exactly: the file metadata values from rawloader.
+///
+/// The override substitutes only the two level arrays handed to
+/// [`normalize_cfa`] / [`normalize_xtrans`] — per-colour `black` (RGBE order)
+/// and the `white` scalar broadcast to all four colours, exactly as
+/// `src/iop/rawprepare.c`'s `commit_params` computes `sub[i] = black[i]`,
+/// `div[i] = white - sub[i]` — and never reorders or widens the mosaic math.
+/// The file's own levels stay on the struct ([`RawImage::blacklevels`] /
+/// [`RawImage::whitelevels`]) for UI seeding regardless of the override.
+///
+/// Only single-component CFA mosaics (`cpp == 1`, integer data) are supported
+/// for now — the demosaic front end's input. Already-demosaiced (`cpp == 3`) or
+/// float-encoded raws return [`Error::Raw`].
+pub fn load_with(
+    path: impl AsRef<std::path::Path>,
+    opts: Option<crate::RawPrepareOpts>,
+) -> Result<RawImage> {
     let raw = rawloader::decode_file(path).map_err(|e| Error::Raw(format!("{e:?}")))?;
 
     if raw.cpp != 1 {
@@ -243,8 +277,17 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<RawImage> {
         [raw.cfa.color_at(0, 0), raw.cfa.color_at(0, 1)],
         [raw.cfa.color_at(1, 0), raw.cfa.color_at(1, 1)],
     ];
-    let black: [f32; 4] = std::array::from_fn(|i| raw.blacklevels[i] as f32);
-    let white: [f32; 4] = std::array::from_fn(|i| raw.whitelevels[i] as f32);
+    // The FILE's levels are always the struct metadata (the rawprepare row's
+    // slider seeds); an override only reshapes what normalisation consumes.
+    let file_black: [f32; 4] = std::array::from_fn(|i| raw.blacklevels[i] as f32);
+    let file_white: [f32; 4] = std::array::from_fn(|i| raw.whitelevels[i] as f32);
+    // rawprepare override (commit_params): `sub[i] = black[i]`, `div[i] =
+    // white - sub[i]` with the white SCALAR broadcast to every colour. Only the
+    // two input arrays are substituted — the mosaic math below is untouched.
+    let (black, white) = match opts {
+        Some(o) => (o.black, [o.white, o.white, o.white, o.white]),
+        None => (file_black, file_white),
+    };
 
     // Classify the CFA period (Bayer 2×2 vs X-Trans 6×6) and normalise with the
     // matching layout. `cfa` (the origin 2×2 snapshot) is kept on the struct for
@@ -269,6 +312,8 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<RawImage> {
         cam_to_working: rec2020_from_cam_matrix(raw.xyz_to_cam),
         clean_make: raw.clean_make.clone(),
         clean_model: raw.clean_model.clone(),
+        blacklevels: file_black,
+        whitelevels: file_white,
         mosaic,
     })
 }
@@ -1517,6 +1562,8 @@ mod tests {
             // Diagonal gradient with over-range photosites carried in.
             clean_make: String::new(),
             clean_model: String::new(),
+            blacklevels: [0.0; 4],
+            whitelevels: [65535.0; 4],
             mosaic: (0..144).map(|i| (i % 29) as f32 / 20.0).collect(),
         };
         let a = img.to_linear_rgba_with(DemosaicMethod::Ppg, None);
@@ -1537,6 +1584,343 @@ mod tests {
     #[test]
     fn load_rejects_missing_file() {
         assert!(matches!(load("/no/such/raw.cr2"), Err(Error::Raw(_))));
+    }
+
+    /// Write a minimal-but-real Adobe DNG — the exact fixture
+    /// `scripts/make-raw-corpus.sh` generates (a little-endian TIFF whose IFD
+    /// carries every tag rawloader's DngDecoder requires: Make/Model,
+    /// DNGVersion, Compression=1, 16-bit LE RGGB CFA photosites, WhiteLevel,
+    /// ColorMatrix1, AsShotNeutral) — plus one addition: a **per-colour
+    /// BlackLevel tag** (50714, SHORT×4 in RGBE order) so the file carries
+    /// non-trivial black levels instead of rawloader's `[0;4]` fallback. This
+    /// is what lets the load_with tests tell per-colour override from
+    /// broadcast behaviour on real decode bytes. Hermetic: builds the file in
+    /// line, no corpus directory needed.
+    const DNG_W: usize = 24;
+    const DNG_H: usize = 20;
+    const DNG_WHITE: u16 = 4095;
+    const DNG_BLACK: [u16; 4] = [64, 32, 48, 16];
+
+    fn write_synthetic_dng(path: &std::path::Path) {
+        let u16b = |v: u16| v.to_le_bytes().to_vec();
+        let u32b = |v: u32| v.to_le_bytes().to_vec();
+        // (tag, type, count-in-elements, payload-bytes); type 1=BYTE, 2=ASCII,
+        // 3=SHORT, 4=LONG, 5=RATIONAL, 10=SRATIONAL.
+        #[derive(Clone)]
+        struct Entry {
+            tag: u16,
+            typ: u16,
+            count: u32,
+            payload: Vec<u8>,
+        }
+        let elem = |typ: u16| match typ {
+            1 | 2 => 1,
+            3 => 2,
+            4 => 4,
+            5 | 10 => 8,
+            _ => unreachable!(),
+        };
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut add = |tag: u16, typ: u16, payload: Vec<u8>| {
+            let size = elem(typ);
+            assert_eq!(payload.len() % size, 0, "tag {tag}: payload not whole elements");
+            entries.push(Entry {
+                tag,
+                typ,
+                count: (payload.len() / size) as u32,
+                payload,
+            });
+        };
+        add(256, 4, u32b(DNG_W as u32)); // ImageWidth
+        add(257, 4, u32b(DNG_H as u32)); // ImageLength
+        add(258, 3, u16b(16)); // BitsPerSample
+        add(259, 3, u16b(1)); // Compression = none
+        add(262, 3, u16b(32803)); // PhotometricInterpretation = CFA
+        add(271, 2, b"synthetic\0".to_vec()); // Make (rawloader requires it)
+        add(272, 2, b"opal-dng\0".to_vec()); // Model (rawloader requires it)
+        add(273, 4, u32b(0)); // StripOffsets (patched below)
+        add(274, 3, u16b(1)); // Orientation = top-left
+        add(277, 3, u16b(1)); // SamplesPerPixel = 1 (mosaic)
+        add(278, 4, u32b(DNG_H as u32)); // RowsPerStrip
+        add(279, 4, u32b((DNG_W * DNG_H * 2) as u32)); // StripByteCounts
+        let dim = [2u16, 2].into_iter().flat_map(u16b).collect::<Vec<_>>();
+        add(33421, 3, dim); // CFARepeatPatternDim
+        add(33422, 1, vec![0, 1, 1, 2]); // CFAPattern = RGGB
+        add(50706, 1, vec![1, 4, 0, 0]); // DNGVersion -> routes to DngDecoder
+        let bl = DNG_BLACK.into_iter().flat_map(u16b).collect::<Vec<_>>();
+        add(50714, 3, bl); // BlackLevel, SHORT×4 RGBE — NOT in the corpus script
+        add(50717, 4, u32b(DNG_WHITE as u32)); // WhiteLevel (fetch_tag!-required)
+        // Colour: the corpus script's plausible camera->XYZ(D50) matrix
+        // (9 SRATIONALs) plus a D65-ish AsShotNeutral (3 RATIONALs).
+        let cm = [
+            0.6339f64, -0.2569, -0.1024, -0.5447, 1.3153, 0.1264, -0.0511,
+            0.1080, 0.9231,
+        ];
+        let srat = |v: f64| {
+            (v * 100000.0).round() as i32
+        };
+        let cm_bytes: Vec<u8> = cm
+            .iter()
+            .flat_map(|&v| {
+                [srat(v).to_le_bytes(), 100000i32.to_le_bytes()].concat()
+            })
+            .collect();
+        add(50721, 10, cm_bytes); // ColorMatrix1
+        let asn = [0.517f64, 1.0, 0.588];
+        let asn_bytes: Vec<u8> = asn
+            .iter()
+            .flat_map(|&v| {
+                [(v * 100000.0).round() as u32, 100000u32]
+                    .into_iter()
+                    .flat_map(u32b)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        add(50728, 5, asn_bytes); // AsShotNeutral
+
+        // IFD after the 8-byte header; inline values fit in 4 bytes except the
+        // strings, the matrix, the neutral and the black levels — heap those.
+        let ifd_off = 8usize;
+        let ifd_size = 2 + entries.len() * 12 + 4;
+        let align4 = |x: usize| (x + 3) & !3;
+        let mut heap = align4(ifd_off + ifd_size);
+        let mut heap_offsets = vec![0u32; entries.len()];
+        for (i, e) in entries.iter().enumerate() {
+            if e.payload.len() > 4 {
+                heap = align4(heap);
+                heap_offsets[i] = heap as u32;
+                heap += e.payload.len();
+            }
+        }
+        let strip_off = align4(heap);
+        let strip_len = DNG_W * DNG_H * 2;
+        for e in entries.iter_mut() {
+            if e.tag == 273 {
+                e.payload = u32b(strip_off as u32);
+            }
+        }
+
+        // Deterministic RGGB gradient in [0, WhiteLevel] (corpus script's
+        // exact formula).
+        let pat = [[0usize, 1], [1, 2]];
+        let base = [0.42f64, 0.55, 0.62];
+        let mut strip = Vec::with_capacity(strip_len);
+        for y in 0..DNG_H {
+            for x in 0..DNG_W {
+                let c = pat[y % 2][x % 2];
+                let mut v = base[c] * DNG_WHITE as f64 * (0.75 + 0.25 * (x as f64 / (DNG_W - 1) as f64));
+                v += ((x * 7 + y * 13) % 9) as f64;
+                let val = (v.round() as i64).clamp(0, DNG_WHITE as i64) as u16;
+                strip.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(b"II");
+        blob.extend_from_slice(&42u16.to_le_bytes());
+        blob.extend_from_slice(&(ifd_off as u32).to_le_bytes());
+        blob.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (i, e) in entries.iter().enumerate() {
+            blob.extend_from_slice(&e.tag.to_le_bytes());
+            blob.extend_from_slice(&e.typ.to_le_bytes());
+            blob.extend_from_slice(&e.count.to_le_bytes());
+            if e.payload.len() > 4 {
+                blob.extend_from_slice(&heap_offsets[i].to_le_bytes());
+            } else {
+                blob.extend_from_slice(&e.payload);
+                blob.extend_from_slice(&[0u8; 4][..4 - e.payload.len()]);
+            }
+        }
+        blob.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        for (i, e) in entries.iter().enumerate() {
+            if e.payload.len() > 4 {
+                while blob.len() < heap_offsets[i] as usize {
+                    blob.push(0);
+                }
+                blob.extend_from_slice(&e.payload);
+            }
+        }
+        while blob.len() < strip_off {
+            blob.push(0);
+        }
+        assert_eq!(blob.len(), strip_off, "layout drift: {}", blob.len());
+        blob.extend_from_slice(&strip);
+        assert_eq!(blob.len(), strip_off + strip_len);
+        std::fs::write(path, blob).unwrap();
+    }
+
+    fn synthetic_dng_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "c41_rwp_{}_{}_{}",
+            std::process::id(),
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn load_carries_the_files_own_levels_before_any_override() {
+        let p = synthetic_dng_path("levels");
+        write_synthetic_dng(&p);
+        let img = load(&p).expect("synthetic DNG must decode");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(
+            img.blacklevels,
+            [64.0, 32.0, 48.0, 16.0],
+            "file black levels must be the rawloader metadata, RGBE order"
+        );
+        assert_eq!(
+            img.whitelevels,
+            [DNG_WHITE as f32; 4],
+            "rawloader broadcasts the single file white to all four colours"
+        );
+        // The mosaic is normalised from those levels: photosite (0,0) is R
+        // (colour 0): (1290 - 64) / (4095 - 64) = 1226 / 4031.
+        let expected = (1290.0 - 64.0) / (DNG_WHITE as f32 - 64.0);
+        assert!(
+            (img.mosaic[0] - expected).abs() < 1e-5,
+            "mosaic(0,0) = {}, expected {}",
+            img.mosaic[0],
+            expected
+        );
+    }
+
+    #[test]
+    fn load_with_none_is_byte_identical_to_load() {
+        let p = synthetic_dng_path("none");
+        write_synthetic_dng(&p);
+        let a = load(&p).expect("load must decode");
+        let b = load_with(&p, None).expect("load_with(None) must decode");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(a.mosaic, b.mosaic, "mosaic must be byte-identical");
+        assert_eq!(a.blacklevels, b.blacklevels);
+        assert_eq!(a.whitelevels, b.whitelevels);
+        assert_eq!(a.cfa, b.cfa);
+        assert_eq!(a.xtrans, b.xtrans);
+        // rawloader leaves the unused RGBE slot 3 of `wb_coeffs` as NaN; the
+        // two loads must produce the same trio (NaN-tolerantly — NaN != NaN).
+        assert!(
+            a.wb.iter().zip(b.wb.iter()).all(|(x, y)| x == y || (x.is_nan() && y.is_nan())),
+            "wb must be identical across the two loads: {:?} vs {:?}",
+            a.wb,
+            b.wb
+        );
+    }
+
+    #[test]
+    fn load_with_overrides_black_per_colour_and_broadcasts_white() {
+        let p = synthetic_dng_path("override");
+        write_synthetic_dng(&p);
+        let file = load(&p).expect("load must decode");
+        let over = load_with(
+            &p,
+            Some(crate::RawPrepareOpts {
+                black: [512.0, 100.0, 200.0, 300.0],
+                white: 4000.0,
+            }),
+        )
+        .expect("load_with(Some) must decode");
+        let _ = std::fs::remove_file(&p);
+
+        // The struct metadata keeps the FILE's values even under an override.
+        assert_eq!(over.blacklevels, file.blacklevels);
+        assert_eq!(over.whitelevels, file.whitelevels);
+        assert_ne!(over.mosaic, file.mosaic, "override must change the mosaic");
+
+        // Recompose the override from the file-normalised mosaic: each colour's
+        // photosites shift by the new (black_i, white) pair — per-colour black
+        // in RGBE order and the white SCALAR broadcast to every colour, exactly
+        // like commit_params' `sub[i] = black[i]`, `div[i] = white - sub[i]`.
+        // Both loads are invertible to the same raw sensor count: undo each
+        // with its OWN (white, black) pair and compare the recovered counts
+        // (within the DNG writer's integer rounding). The override value is
+        // then the file count re-mapped through the override pair.
+        let override_black: [f32; 4] = [512.0, 100.0, 200.0, 300.0];
+        let override_white: f32 = 4000.0;
+        let cfa = file.cfa;
+        let mut checked = 0;
+        for (row, v) in over.mosaic.iter().enumerate() {
+            let val = *v;
+            let file_val = file.mosaic[row];
+            let r = row / DNG_W;
+            let c = row % DNG_W;
+            let colour = cfa[r % 2][c % 2];
+            let fb = file.blacklevels[colour];
+            let fw = file.whitelevels[colour];
+            let ob = override_black[colour];
+            let ow = override_white;
+            // Invert with each pair's OWN (white, black) so both sides recover
+            // the raw sensor count.
+            let raw_file = file_val * (fw - fb).max(1.0) + fb;
+            let raw_over = val * (ow - ob).max(1.0) + ob;
+            assert!(
+                (raw_file - raw_over).abs() < 1.0,
+                "sensor counts must agree at ({r},{c}) colour {colour}: file {raw_file:.1} vs override {raw_over:.1}"
+            );
+            // And the override mosaic value is the file count re-mapped through
+            // the override pair (range guard and floor identical to the
+            // normalizer's).
+            let expected = ((raw_file - ob) / (ow - ob).max(1.0)).max(0.0);
+            assert!(
+                (val - expected).abs() < 5e-4,
+                "override photosite ({r},{c}) colour {colour}: got {val:.6}, expected {expected:.6}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, DNG_W * DNG_H, "every photosite was checked");
+    }
+
+    #[test]
+    fn normalize_cfa_units_take_the_rawprepare_level_arrays() {
+        // The pure normalizer is the only consumer of the override arrays —
+        // pin that an override is exactly the (black, white-broadcast) pair
+        // commit_params computes, with the range guard intact.
+        let cfa = [[0usize, 1], [1, 2]];
+        let plane: Vec<u16> = (0..16).map(|i| 100 + (i * 137) % 2000).collect();
+        let file = normalize_cfa(&plane, 4, 4, cfa, [64.0, 32.0, 48.0, 16.0], [4095.0; 4]);
+        let over = normalize_cfa(&plane, 4, 4, cfa, [512.0, 100.0, 200.0, 300.0], [4000.0; 4]);
+        assert_ne!(file, over);
+        // White broadcast: the single-scalar override equals an explicit
+        // [white; 4] array with the same black array.
+        assert_eq!(
+            over,
+            normalize_cfa(&plane, 4, 4, cfa, [512.0, 100.0, 200.0, 300.0], [4000.0; 4])
+        );
+        // And the scalar is a true broadcast (not, say, a red-only white):
+        // compare against a white that differs on the green channel.
+        assert_ne!(
+            over,
+            normalize_cfa(&plane, 4, 4, cfa, [512.0, 100.0, 200.0, 300.0], [4000.0, 3000.0, 4000.0, 4000.0])
+        );
+    }
+
+    #[test]
+    fn normalize_xtrans_units_take_the_rawprepare_level_arrays() {
+        let xt = XTRANS;
+        let plane: Vec<u16> = (0..36).map(|i| 100 + (i * 137) % 2000).collect();
+        let file = normalize_xtrans(&plane, 6, 6, &xt, [64.0, 32.0, 48.0, 16.0], [4095.0; 4]);
+        let over = normalize_xtrans(
+            &plane,
+            6,
+            6,
+            &xt,
+            [512.0, 100.0, 200.0, 300.0],
+            [4000.0; 4],
+        );
+        assert_ne!(file, over);
+        assert_eq!(
+            over,
+            normalize_xtrans(&plane, 6, 6, &xt, [512.0, 100.0, 200.0, 300.0], [4000.0; 4])
+        );
+        // The broadcast must reach the unused 4th slot too (harmless for
+        // X-Trans, whose colours stay < 3, but pins the commit_params shape).
+        assert_eq!(
+            over,
+            normalize_xtrans(&plane, 6, 6, &xt, [512.0, 100.0, 200.0, 300.0], [4000.0, 4000.0, 4000.0, 9999.0])
+        );
     }
 
     // 2x2 image, channel 0 = row*2+col marker, alpha = 1.
@@ -1641,6 +2025,8 @@ mod tests {
             cam_to_working: IDENTITY3, // colour matrix is a no-op for this fixture
             clean_make: String::new(),
             clean_model: String::new(),
+            blacklevels: [0.0; 4],
+            whitelevels: [65535.0; 4],
             mosaic: vec![0.4, 0.6, 0.2, 0.8],
         };
         let (w, h, rgba) = img.to_linear_rgba();
@@ -1676,6 +2062,8 @@ mod tests {
             cam_to_working: IDENTITY3,
             clean_make: String::new(),
             clean_model: String::new(),
+            blacklevels: [0.0; 4],
+            whitelevels: [65535.0; 4],
             mosaic,
         };
         // The no-arg entry point delegates to RCD, byte-for-byte.
@@ -1710,7 +2098,8 @@ mod tests {
         let bayer = RawImage {
             width: w, height: h, cfa, xtrans: None,
             wb: [1.0; 4], orientation: (false, false, false),
-            cam_to_working: IDENTITY3, clean_make: String::new(), clean_model: String::new(), mosaic,
+            cam_to_working: IDENTITY3, clean_make: String::new(), clean_model: String::new(),
+            blacklevels: [0.0; 4], whitelevels: [65535.0; 4], mosaic,
         };
         let legacy = bayer.to_linear_rgba_with(DemosaicMethod::Rcd, None);
         assert_eq!(legacy, bayer.to_linear_rgba_with_opts(DemosaicMethod::Rcd, None, None));
@@ -1724,7 +2113,8 @@ mod tests {
         let fuji = RawImage {
             width: w, height: h, cfa, xtrans: Some(xt), wb: [1.0; 4],
             orientation: (false, false, false), cam_to_working: IDENTITY3,
-            clean_make: String::new(), clean_model: String::new(), mosaic: xtrans,
+            clean_make: String::new(), clean_model: String::new(),
+            blacklevels: [0.0; 4], whitelevels: [65535.0; 4], mosaic: xtrans,
         };
         let legacy_xt = fuji.to_linear_rgba_with(DemosaicMethod::Rcd, None);
         assert_eq!(legacy_xt, fuji.to_linear_rgba_with_opts(DemosaicMethod::Rcd, None, None));
@@ -1742,7 +2132,8 @@ mod tests {
         let img = RawImage {
             width: w, height: h, cfa, xtrans: None, wb: [1.0; 4],
             orientation: (false, false, false), cam_to_working: IDENTITY3,
-            clean_make: String::new(), clean_model: String::new(), mosaic,
+            clean_make: String::new(), clean_model: String::new(),
+            blacklevels: [0.0; 4], whitelevels: [65535.0; 4], mosaic,
         };
         let legacy = img.to_linear_rgba_with(DemosaicMethod::Rcd, None);
         let corrected = img.to_linear_rgba_with_opts(
@@ -1765,7 +2156,8 @@ mod tests {
         let make = |mosaic| RawImage {
             width: w, height: h, cfa, xtrans: None, wb,
             orientation: (false, false, false), cam_to_working: IDENTITY3,
-            clean_make: String::new(), clean_model: String::new(), mosaic,
+            clean_make: String::new(), clean_model: String::new(),
+            blacklevels: [0.0; 4], whitelevels: [65535.0; 4], mosaic,
         };
         let opts = Some(crate::iop::hotpixels::HotpixelsOpts {
             strength: 1.0, threshold: 0.05, permissive: false,
@@ -1801,6 +2193,8 @@ mod tests {
             cam_to_working: IDENTITY3,
             clean_make: String::new(),
             clean_model: String::new(),
+            blacklevels: [0.0; 4],
+            whitelevels: [65535.0; 4],
             mosaic,
         };
         let rcd = img.to_linear_rgba_with(DemosaicMethod::Rcd, None);

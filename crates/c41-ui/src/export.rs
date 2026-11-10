@@ -436,6 +436,8 @@ mod tests {
             cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             clean_make: String::new(),
             clean_model: String::new(),
+            blacklevels: [0.0; 4],
+            whitelevels: [65535.0; 4],
             mosaic,
         }
     }
@@ -472,6 +474,97 @@ mod tests {
         assert_eq!((w8, h8), (w, h));
         assert_eq!(adobe8.len(), w * h * 3);
         assert!(adobe8.iter().any(|&v| v != 0), "8-bit Adobe RGB output is blank");
+    }
+
+    #[test]
+    fn raw_black_override_shifts_export_deterministically() {
+        // A raw black/white override changes the CFA normalisation BEFORE the
+        // demosaic — the export renderer's only input is the mosaic, so two
+        // mosaics normalised identically apart from the override must shift the
+        // output deterministically: R photosites below the new black clamp to
+        // 0, those above shift, the unaffected colours stay byte-identical, and
+        // the dims never move.
+        use c41_core::geometry::Geometry;
+        use c41_core::rawimage::{normalize_cfa, DemosaicMethod};
+        let (w, h) = (16usize, 12usize);
+        let cfa = [[0usize, 1], [1, 2]];
+        // Uniform G/B with a column gradient on the R photosites, so both
+        // halves of the override black land inside the frame: 500 at column 0
+        // (below the override black) .. 3000 at column w-1 (above it, but below
+        // the file white so neither render hard-clips).
+        let plane: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (r, c) = (i / w, i % w);
+                if cfa[r % 2][c % 2] == 0 {
+                    (500 + 2500 * c / (w - 1)) as u16
+                } else {
+                    1000u16
+                }
+            })
+            .collect();
+        let file_black = [64.0, 32.0, 48.0, 16.0];
+        let file_white = [4095.0; 4];
+        // Override: ONLY the R black moves (into the gradient). The white
+        // scalar stays at the file's 4095, so G/B/E normalise identically and
+        // the white broadcast is exercised without shifting either chroma.
+        let override_black = [2000.0, 32.0, 48.0, 16.0];
+        let override_white = 4095.0;
+        let make = |mosaic| c41_core::rawimage::RawImage {
+            width: w,
+            height: h,
+            cfa,
+            xtrans: None,
+            wb: [1.0; 4],
+            orientation: (false, false, false),
+            cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            clean_make: String::new(),
+            clean_model: String::new(),
+            blacklevels: file_black,
+            whitelevels: file_white,
+            mosaic,
+        };
+        let file = make(normalize_cfa(&plane, w, h, cfa, file_black, file_white));
+        let over = make(normalize_cfa(
+            &plane,
+            w,
+            h,
+            cfa,
+            override_black,
+            [override_white; 4],
+        ));
+        let params = crate::preview::PreviewParams::default();
+        let (fw, fh, frgb) = render_export_rgb8(&file, DemosaicMethod::Rcd, Geometry::default(), &params, 0);
+        let (ow, oh, orgb) = render_export_rgb8(&over, DemosaicMethod::Rcd, Geometry::default(), &params, 0);
+        let (ow2, oh2, orgb2) = render_export_rgb8(&over, DemosaicMethod::Rcd, Geometry::default(), &params, 0);
+        assert_eq!((ow, oh), (w, h), "dims stay identical under an override");
+        assert_eq!((fw, fh), (ow, oh));
+        assert_eq!((ow2, oh2), (ow, oh));
+        assert_eq!(orgb2, orgb, "an override render must be perfectly deterministic");
+        assert_ne!(frgb, orgb, "the override must change the exported pixels");
+        let r_of = |bytes: &[u8], y: usize, x: usize| bytes[(y * w + x) * 3];
+        // Column 0's R photosite (500) sits BELOW the override black (2000):
+        // the override clamps it to 0 (and sRGB(0) = 0), while the file render
+        // keeps it positive.
+        assert_eq!(r_of(&orgb, 0, 0), 0, "below-override-black R must clamp to 0");
+        assert!(r_of(&frgb, 0, 0) > 0, "file-level R at column 0 must be visible");
+        // Last column's R photosite (3000) sits ABOVE the override black but
+        // below the file white, so neither render clips: the override re-ranges
+        // (3000-2000)/(4095-2000) < (3000-64)/(4095-64), shifting R down by a
+        // deterministic amount instead of flattening it.
+        let file_r = r_of(&frgb, 0, w - 1);
+        let over_r = r_of(&orgb, 0, w - 1);
+        assert!(file_r > 0 && file_r < 255, "file R must stay inside the byte range");
+        assert!(
+            over_r > 0 && over_r < file_r,
+            "above-new-black R must shift deterministically: {over_r} vs {file_r}"
+        );
+        // G/B at R-adjacent sites are NOT pinned byte-equal: PPG/RCD couple the
+        // channels through colour differences during interpolation, so moving
+        // the R black shifts the interpolated chroma by a few LSB at every
+        // site. The per-photosite mosaic re-mapping itself is pinned exactly in
+        // `c41_core::rawimage` (load_with_overrides_black_per_colour_and_
+        // broadcasts_white), and this test pins the deterministic end-to-end
+        // shift and the clamp/downshift semantics above.
     }
 
     #[test]
