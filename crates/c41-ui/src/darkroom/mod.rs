@@ -32,7 +32,7 @@ use std::rc::Rc;
 use crate::dialogs;
 use crate::history::{describe_change, HistoryStack};
 use crate::preview::{Histogram, PreviewParams};
-use c41_core::geometry::{Crop, Geometry};
+use c41_core::geometry::{Crop, Geometry, Orientation};
 use c41_core::rawimage::DemosaicMethod;
 use crate::snapshots::{SnapshotStore, SNAPSHOT_CAP};
 
@@ -60,6 +60,7 @@ const PICKER_PROMPT: &str = "Pick: click the image to sample a pixel";
 /// image (the JPEG / gdk-pixbuf path) or a **linear scene-referred RGBA f32**
 /// image (the raw path). The raw variant skips the 8-bit round-trip so a
 /// tone-map stage sees the unclipped highlights.
+#[derive(Clone)]
 enum BaseImage {
     Srgb8 { bytes: Vec<u8>, width: i32, height: i32, rowstride: usize, nch: usize },
     Linear { width: usize, height: usize, pixels: Vec<f32> },
@@ -193,6 +194,11 @@ struct PreviewCtx {
     /// so a straighten/crop change re-applies [`Geometry`] to it without a full
     /// re-decode. `None` for the JPEG path (no geometry there yet).
     pristine: Rc<RefCell<Option<(usize, usize, Vec<f32>)>>>,
+    /// Original decoded non-raw pixels, retained so a manual-orientation change
+    /// recomposes losslessly without re-reading the source (JPEG crop/straighten
+    /// remain unsupported; only the discrete orientation applies). `None` for
+    /// the raw path, which uses [`PreviewCtx::pristine`] instead.
+    pristine_srgb: Rc<RefCell<Option<BaseImage>>>,
     /// Counts [`PreviewCtx::pristine`] writes so the cached lens warp
     /// ([`PreviewCtx::lens_frame`]) is invalidated by a re-decode.
     pristine_gen: Rc<std::cell::Cell<u64>>,
@@ -971,25 +977,92 @@ fn straighten_rad_to_deg(rad: f32) -> f64 {
     rad as f64 * 180.0 / std::f64::consts::PI
 }
 
-/// Apply the current [`PreviewCtx::geometry`] to the cached un-geometried raw
-/// buffer ([`PreviewCtx::pristine`], or its post-lens-warp form
-/// [`PreviewCtx::lens_frame`] when the pre-pass has run) to produce the
-/// displayed `base`, then re-render. No-op when there is no pristine buffer
-/// (the JPEG path, or before the first decode). Cheap enough to re-run on every
-/// geometry change (a downscaled-buffer resample), unlike a full re-decode.
+/// Apply a discrete orientation to a GdkPixbuf-backed image. GdkPixbuf rows
+/// may include alignment padding, while the core permutation works on tightly
+/// packed pixels; compact each source row before transforming. Preserve the
+/// original stride and bytes on the identity path.
+fn reorient_srgb8(
+    bytes: &[u8],
+    width: i32,
+    height: i32,
+    rowstride: usize,
+    nch: usize,
+    orientation: Orientation,
+) -> Option<BaseImage> {
+    if width <= 0 || height <= 0 || nch == 0 {
+        return None;
+    }
+    if orientation == Orientation::None {
+        return Some(BaseImage::Srgb8 {
+            bytes: bytes.to_vec(),
+            width,
+            height,
+            rowstride,
+            nch,
+        });
+    }
+    let (w, h) = (width as usize, height as usize);
+    let packed_row = w.checked_mul(nch)?;
+    let required = rowstride.checked_mul(h)?;
+    if rowstride < packed_row || bytes.len() < required {
+        return None;
+    }
+    let packed_len = packed_row.checked_mul(h)?;
+    let mut packed = vec![0; packed_len];
+    for y in 0..h {
+        let src = y * rowstride;
+        let dst = y * packed_row;
+        packed[dst..dst + packed_row].copy_from_slice(&bytes[src..src + packed_row]);
+    }
+    let (ow, oh, pixels) =
+        c41_core::geometry::apply_orientation(&packed, w, h, nch, orientation);
+    let output_stride = ow.checked_mul(nch)?;
+    Some(BaseImage::Srgb8 {
+        bytes: pixels,
+        width: i32::try_from(ow).ok()?,
+        height: i32::try_from(oh).ok()?,
+        rowstride: output_stride,
+        nch,
+    })
+}
+
+/// Apply the current [`PreviewCtx::geometry`] to the cached decoded source to
+/// produce the displayed `base`, then re-render. RAW frames use their linear
+/// pristine buffer (or its post-lens-warp form); non-RAW frames support the
+/// lossless discrete orientation without enabling JPEG crop/straighten. Cheap
+/// enough to re-run on every geometry change, unlike a full re-decode.
 fn apply_geometry_to_base(ctx: &PreviewCtx) {
     let geom = ctx.geometry.get();
     let editing = ctx.crop_editing.get();
     let compose = |pixels: &[f32], w: usize, h: usize| -> BaseImage {
-        // Crop-edit mode shows the rotated-but-uncropped frame (the overlay draws
-        // the crop rect on top); otherwise the actual cropped result.
         let (gw, gh, gpixels) = if editing {
-            c41_core::geometry::apply_rotate(pixels, w, h, geom.angle)
+            geom.apply_without_crop(pixels, w, h)
         } else {
             geom.apply(pixels, w, h)
         };
         BaseImage::Linear { width: gw, height: gh, pixels: gpixels }
     };
+    // JPEG geometry deliberately supports only the discrete manual orientation;
+    // crop and straighten remain raw-only as before.
+    if ctx.pristine.borrow().is_none() {
+        let source = ctx.pristine_srgb.borrow().clone();
+        if let Some(BaseImage::Srgb8 { bytes, width, height, rowstride, nch }) = source {
+            let Some(base) = reorient_srgb8(
+                &bytes,
+                width,
+                height,
+                rowstride,
+                nch,
+                geom.orientation,
+            ) else {
+                eprintln!("darkroom preview: invalid decoded pixel layout during orientation");
+                return;
+            };
+            *ctx.base.borrow_mut() = Some(base);
+            render_preview(ctx);
+        }
+        return;
+    }
     let base = {
         let lens_frame = ctx.lens_frame.borrow();
         if let Some(lf) = lens_frame.as_ref() {
@@ -1076,6 +1149,9 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     // module's camera dropdown (only while nothing is picked).
                     *ctx.cam_meta.borrow_mut() = (clean_make, clean_model);
                     lens_seed_camera_from_meta(&ctx);
+                    // A non-raw source (if any) is stale for a raw file; drop
+                    // it so the JPEG-orientation path never recomposes it.
+                    *ctx.pristine_srgb.borrow_mut() = None;
                     *ctx.pristine.borrow_mut() = Some((w, h, px));
                     ctx.pristine_gen.set(ctx.pristine_gen.get().wrapping_add(1));
                     apply_geometry_to_base(&ctx); // sets base + renders
@@ -1155,9 +1231,12 @@ fn spawn_decode(ctx: &PreviewCtx) {
         });
         match base {
             Some(base) => {
-                *ctx.pristine.borrow_mut() = None; // no geometry on the JPEG path
-                *ctx.base.borrow_mut() = Some(base);
-                render_preview(&ctx);
+                *ctx.pristine.borrow_mut() = None; // no linear geometry on the JPEG path
+                // Keep the original decoded pixels so orientation changes
+                // recompose without re-reading the source; `apply_geometry_to_base`
+                // applies the current geometry and renders.
+                *ctx.pristine_srgb.borrow_mut() = Some(base);
+                apply_geometry_to_base(&ctx);
             }
             None => eprintln!("darkroom preview: could not decode {path}"),
         }
@@ -1429,6 +1508,13 @@ pub fn darkroom_page(
             crate::persist::load_input_assumption(db_path, file_path).unwrap_or_default(),
         )
     };
+    // Shared handle to the header's Crop toggle (raw files only) so "Reset
+    // geometry" can also exit crop-edit mode; stays None for JPEGs where no
+    // crop mode exists. Declared here so both the Geometry panel and the
+    // header's crop button (built later) can see it.
+    let crop_btn_ref: Rc<RefCell<Option<gtk4::ToggleButton>>> =
+        Rc::new(RefCell::new(None));
+
     let ctx = PreviewCtx {
         picture: picture.downgrade(),
         hist_area: hist_area.downgrade(),
@@ -1438,6 +1524,7 @@ pub fn darkroom_page(
         pristine_gen: Rc::new(std::cell::Cell::new(0)),
         lens_frame: Rc::new(RefCell::new(None)),
         geometry: Rc::new(std::cell::Cell::new(geometry0)),
+        pristine_srgb: Rc::new(RefCell::new(None)),
         crop_editing: Rc::new(std::cell::Cell::new(false)),
         decode_gen: Rc::new(std::cell::Cell::new(0)),
         params,
@@ -1878,11 +1965,46 @@ pub fn darkroom_page(
                 });
             *g_debounce.borrow_mut() = Some(id);
         });
-        // Reset crop + straighten to identity — the only way to undo a geometry
-        // edit (the header Reset deliberately touches only the colour params).
+        let orientation_dd = gtk4::DropDown::from_strings(&[
+            "None",
+            "Flip vertical",
+            "Flip horizontal",
+            "Rotate 180°",
+            "Transpose",
+            "Rotate 90° CW",
+            "Rotate 90° CCW",
+            "Transverse",
+        ]);
+        orientation_dd.set_margin_start(10);
+        orientation_dd.set_margin_end(10);
+        orientation_dd.set_tooltip_text(Some(
+            "Manual orientation of the decoded pixels; RAW EXIF orientation is \
+             already applied during decode",
+        ));
+        orientation_dd.update_property(&[gtk4::accessible::Property::Label("Manual orientation")]);
+        orientation_dd.set_selected(ctx.geometry.get().orientation as u32);
+        let o_ctx = ctx.clone();
+        let o_path = file_path.to_string();
+        let o_db = db_path.to_string();
+        let o_crop = crop_area.downgrade();
+        orientation_dd.connect_selected_notify(move |dd| {
+            let mut g = o_ctx.geometry.get();
+            g.orientation = Orientation::from_u8(dd.selected() as u8);
+            o_ctx.geometry.set(g);
+            crate::persist::save_geometry(&o_db, &o_path, &g);
+            apply_geometry_to_base(&o_ctx);
+            // A 90° change swaps the base dims — repaint the crop overlay so its
+            // rectangle does not linger in the old aspect (sibling handler
+            // pattern from the aspect dropdown).
+            if let Some(area) = o_crop.upgrade() {
+                area.queue_draw();
+            }
+        });
+        // Reset crop, straighten, and manual orientation to identity (geometry
+        // edits remain separately persisted and outside HistoryStack).
         let reset_geom_btn = gtk4::Button::builder()
-            .label("Reset crop & straighten")
-            .tooltip_text("Clear the crop and straighten (geometry only)")
+            .label("Reset geometry")
+            .tooltip_text("Clear crop, straighten, and manual orientation (geometry only)")
             .margin_start(10)
             .margin_end(10)
             .margin_bottom(6)
@@ -1891,13 +2013,26 @@ pub fn darkroom_page(
         // BauhausSlider is Rc-backed and Clone; no GObject weak ref needed.
         let rg_scale = straighten.scale.clone();
         let rg_crop = crop_area.downgrade();
+        let rg_orientation = orientation_dd.downgrade();
+        let rg_crop_btn = crop_btn_ref.clone();
         let rg_db = db_path.to_string();
         let rg_path = file_path.to_string();
         reset_geom_btn.connect_clicked(move |_| {
+            // Leave crop-edit mode first (if active): its toggle handler paints
+            // the pre-reset geometry, which the default write below replaces.
+            if let Some(btn) = rg_crop_btn.borrow().as_ref() {
+                if btn.is_active() {
+                    btn.set_active(false);
+                }
+            }
             rg_ctx.geometry.set(Geometry::default());
-            // Reflect it on the slider (a no-op notify if already 0); the reset
-            // itself applies + persists below, so it doesn't rely on the handler.
+            // Reflect it on the controls (each notify handler re-applies the
+            // default geometry it reads from the shared ctx, so the explicit
+            // persist+apply below is the authoritative final write).
             rg_scale.set_value(0.0);
+            if let Some(dd) = rg_orientation.upgrade() {
+                dd.set_selected(Orientation::None as u32);
+            }
             crate::persist::save_geometry(&rg_db, &rg_path, &Geometry::default());
             apply_geometry_to_base(&rg_ctx); // re-render the (now un-cropped) frame
             if let Some(area) = rg_crop.upgrade() {
@@ -1949,6 +2084,7 @@ pub fn darkroom_page(
 
         right_box.append(&geom_header);
         right_box.append(&straighten.row);
+        right_box.append(&orientation_dd);
         right_box.append(&aspect_row);
         right_box.append(&reset_geom_btn);
         right_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
@@ -2025,6 +2161,7 @@ pub fn darkroom_page(
             .label("Crop")
             .tooltip_text("Crop / straighten overlay")
             .build();
+        *crop_btn_ref.borrow_mut() = Some(crop_btn.clone());
         crop_btn.update_property(&[gtk4::accessible::Property::Label("Crop mode")]);
         let cb_ctx = ctx.clone();
         let cb_area = crop_area.downgrade();
@@ -2169,7 +2306,9 @@ pub fn darkroom_page(
         if let Some(root) = btn.root().and_downcast::<gtk4::Window>() {
             // Bake the current c41-ui edit so a Rust-native export matches
             // the preview (geometry uses the committed crop even mid-crop-edit).
-            // Raws render via our pipeline; a JPEG falls back to darktable-cli.
+            // Raws and Rust-decodable non-raws (JPEG/PNG/TIFF) render via our
+            // pipeline — manual orientation included; only heic/heif/avif fall
+            // back to darktable-cli, which cannot see c41-only edit state.
             let edit = crate::export::ExportEdit {
                 method: crate::persist::load_demosaic(&ex_db, &path_for_export),
                 geometry: ex_ctx.geometry.get(),
@@ -2785,21 +2924,26 @@ pub(crate) fn is_live_module(label: &str) -> bool {
 
 /// Catalog labels represented by controls outside the module list: Crop has
 /// its own toggle/overlay; Rotate & perspective uses the Straighten slider;
-/// Demosaic has a Bayer-only selector above the list; Output color profile
-/// links to a global Export-dialog choice, not per-image module parity. These
-/// product capabilities count as active and are labeled with their controls.
+/// Orientation has a manual selector in Geometry; Demosaic has a Bayer-only
+/// selector above the list; Output color profile links to the global Export
+/// dialog, not per-image module parity. These capabilities count as active and
+/// are labeled with their controls.
 const ELSEWHERE_MODULE_LABELS: &[&str] = &[
     "Crop",
     "Rotate & perspective",
+    "Orientation",
     "Demosaic",
     "Output color profile",
 ];
 
-/// Where a module implemented outside this list keeps its controls.
+/// Where a capability represented outside this list keeps its controls.
 fn elsewhere_hint(label: &str) -> Option<&'static str> {
     match label {
         "Crop" => Some("use the Crop button above"),
         "Rotate & perspective" => Some("use the Straighten slider above"),
+        "Orientation" => Some(
+            "manual pixel transform in the Geometry panel; RAW EXIF orientation remains decode behavior",
+        ),
         "Demosaic" => Some("use the Bayer demosaic selector above (Bayer RAW only)"),
         "Output color profile" => Some("choose the global export profile in the Export dialog"),
         _ => None,
@@ -5284,6 +5428,12 @@ mod tests {
             Some("use the Straighten slider above")
         );
         assert_eq!(
+            elsewhere_hint("Orientation"),
+            Some(
+                "manual pixel transform in the Geometry panel; RAW EXIF orientation remains decode behavior"
+            )
+        );
+        assert_eq!(
             elsewhere_hint("Demosaic"),
             Some("use the Bayer demosaic selector above (Bayer RAW only)")
         );
@@ -5292,6 +5442,53 @@ mod tests {
             Some("choose the global export profile in the Export dialog")
         );
         assert_eq!(elsewhere_hint("Grain"), None);
+    }
+
+    /// GdkPixbuf rows carry alignment padding; the discrete orientation must
+    /// compact each row before permuting, and the identity path must keep the
+    /// original stride and bytes (so nothing downstream ever sees a padded
+    /// buffer treated as packed pixels).
+    #[test]
+    fn non_raw_orientation_repackages_gdk_row_padding() {
+        // Two 2-pixel RGB rows with 2 bytes of GdkPixbuf alignment padding each.
+        let source = [
+            1, 2, 3, 4, 5, 6, 90, 91, // row 0: rgb(1,2,3) rgb(4,5,6) + pad
+            7, 8, 9, 10, 11, 12, 92, 93, // row 1: rgb(7,8,9) rgb(10,11,12) + pad
+        ];
+        let BaseImage::Srgb8 { bytes, width, height, rowstride, nch } = reorient_srgb8(
+            &source,
+            2,
+            2,
+            8,
+            3,
+            Orientation::Rotate90Cw,
+        )
+        .expect("valid GdkPixbuf rowstride")
+        else {
+            panic!("expected the sRGB image path");
+        };
+        if width != 2 || height != 2 || rowstride != 6 || nch != 3 {
+            panic!("unexpected output layout: {width}x{height} stride {rowstride} nch {nch}");
+        }
+        // 90° CW of a 2×2: out(0,0) = src(0,1), out(1,0) = src(0,0), …
+        assert_eq!(bytes, [7, 8, 9, 1, 2, 3, 10, 11, 12, 4, 5, 6]);
+
+        let BaseImage::Srgb8 { bytes, rowstride, .. } = reorient_srgb8(
+            &source,
+            2,
+            2,
+            8,
+            3,
+            Orientation::None,
+        )
+        .expect("identity keeps the original layout")
+        else {
+            panic!("expected the sRGB image path");
+        };
+        assert_eq!(rowstride, 8);
+        assert_eq!(bytes, source);
+        // A stride narrower than a packed row is malformed → None.
+        assert!(reorient_srgb8(&source, 2, 2, 5, 3, Orientation::Rotate90Cw).is_none());
     }
 
     /// The filter scope + search matcher behind the w2 module filter bar.
@@ -5309,6 +5506,7 @@ mod tests {
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Highpass", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 0, "Demosaic", ""));
+        assert!(module_filter_matches(ModuleFilter::Active, 0, "Orientation", ""));
         assert!(module_filter_matches(ModuleFilter::Active, 2, "Output color profile", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));

@@ -210,13 +210,15 @@ async fn export_images_async(
 
             // Non-raw formats the pure-Rust `image` crate can decode (JPEG/PNG/
             // TIFF) also develop through the Rust pipeline — the SAME colour params
-            // as the preview (geometry/demosaic are raw-only), though not
-            // byte-identical to it (different decoder + 8-bit; see
-            // render_nonraw_export). Bakes a single-image darkroom edit if present,
-            // else the per-path persisted params seeded like the preview (sigmoid
+            // and manual orientation as the preview, though not byte-identical to
+            // it (different decoder + 8-bit; see render_nonraw_export). Crop and
+            // straighten stay raw-only (their controls are not exposed for
+            // non-raw). Bakes a single-image darkroom edit if present, else the
+            // per-path persisted params/geometry seeded like the preview (sigmoid
             // off). Formats with no Rust decoder (heic/heif/avif) fall through to
-            // darkroom-cli below — that path emits the C tool's own output profile,
-            // which this crate neither owns nor tags (G2b tags only the Rust paths).
+            // darkroom-cli below — that path emits the C tool's own output profile
+            // and cannot see c41-only per-image edit state (G2b tags only the Rust
+            // paths), so manual orientation is a Rust-path capability.
             if is_rust_image_path(path) {
                 let (params, lens) = match &edit {
                     Some(e) => (e.params, e.lens.clone()),
@@ -239,12 +241,23 @@ async fn export_images_async(
                         (params, lens)
                     }
                 };
+                // Geometry for the non-raw path = manual orientation only; the
+                // single-image edit carries it, otherwise it is loaded from the
+                // catalog like the params (identity when there is no db).
+                let geometry = match &edit {
+                    Some(e) => e.geometry,
+                    None => db_path
+                        .as_deref()
+                        .map(|db| crate::persist::load_geometry(db, path))
+                        .unwrap_or_default(),
+                };
                 if let Err(e) = render_nonraw_export(
                     path,
                     &dest,
                     &settings,
                     &params,
                     lens.as_deref(),
+                    &geometry,
                     db_path.as_deref(),
                 ) {
                     eprintln!("darkroom export: Rust render failed for {path}: {e}");
@@ -562,11 +575,18 @@ fn composite_rgba16_over_white(rgba: &image::ImageBuffer<image::Rgba<u16>, Vec<u
 }
 
 /// Export a **non-raw** image (JPEG/PNG/TIFF) through the Rust pipeline, applying
-/// the same colour pipeline as the darkroom preview's non-raw path (geometry/
-/// demosaic are raw-only, so ignored) → optional resize → encode. **JPEG is 8-bit**
+/// the same colour pipeline as the darkroom preview's non-raw path (demosaic is
+/// raw-only, so ignored) → optional resize → encode. **JPEG is 8-bit**
 /// (its container is); **PNG/TIFF are 16-bit** (via [`crate::preview::
-/// apply_pipeline_rgb16`]) so a 16-bit source round-trips losslessly and an edited
-/// gradient doesn't band. Alpha is composited over white before the pipeline.
+/// apply_pipeline_rgb16`]) so a 16-bit source round-trips losslessly and an
+/// edited gradient doesn't band. Alpha is composited over white before the
+/// pipeline.
+///
+/// Geometry on this path is *manual orientation only*: it permutes the decoded
+/// pixels (before the pipeline, like the raw export's geometry pass) so a JPEG
+/// rotated in the darkroom preview exports rotated and with swapped dimensions.
+/// Crop and straighten remain raw-only (their controls are not exposed for
+/// non-raw), so any crop/angle in `geometry` is ignored here by construction.
 ///
 /// NOT byte-identical WYSIWYG with the on-screen preview: the preview decodes via
 /// GdkPixbuf, this via the `image` crate (JPEG base pixels ±1-2 LSB; PNG/TIFF
@@ -584,6 +604,7 @@ fn render_nonraw_export(
     settings: &crate::export::ExportSettings,
     params: &crate::preview::PreviewParams,
     lens_gear: Option<&crate::preview::LensGear>,
+    geometry: &c41_core::geometry::Geometry,
     db_path: Option<&str>,
 ) -> Result<()> {
     use crate::export::ExportFormat;
@@ -597,10 +618,6 @@ fn render_nonraw_export(
         .map_err(|e| anyhow::anyhow!("decode {path}: {e}"))?;
     let (w, h) = (decoded.width() as usize, decoded.height() as usize);
     let dest_ext = format!("{dest}.{}", settings.format.out_ext());
-    let target = settings
-        .resize
-        .as_ref()
-        .map(|r| crate::export::fit_within(w as u32, h as u32, r));
     // Grain's per-image noise seed (see `Stage::Grain`), so an export carries
     // the same grain the preview showed for this file.
     let grain_seed = c41_core::iop::grain::hash_string(path);
@@ -649,15 +666,24 @@ fn render_nonraw_export(
             let rgba = ImageBuffer::from_raw(w as u32, h as u32, raw)
                 .ok_or_else(|| anyhow::anyhow!("empty decode of {path}"))?;
             let rgb = composite_rgba8_over_white(&rgba);
-            let mut processed =
-                crate::preview::apply_pipeline_gear(&rgb, w, h, w * 3, 3, params, lens_gear, grain_seed);
+            // Manual orientation, applied pre-pipeline exactly like the raw
+            // export's geometry pass; crop/straighten stay raw-only.
+            let (ow, oh, rgb) =
+                c41_core::geometry::apply_orientation(&rgb, w, h, 3, geometry.orientation);
+            let mut processed = crate::preview::apply_pipeline_gear(
+                &rgb, ow, oh, ow * 3, 3, params, lens_gear, grain_seed,
+            );
             // G2c: sRGB working space → the chosen output profile (no-op for sRGB).
             if let Some(t) = out_transform {
-                c41_core::icc::apply_rgb8(t, &mut processed, w, w * 3, 3);
+                c41_core::icc::apply_rgb8(t, &mut processed, ow, ow * 3, 3);
             }
+            let target = settings
+                .resize
+                .as_ref()
+                .map(|r| crate::export::fit_within(ow as u32, oh as u32, r));
             atomic_write(&dest_ext, move |out| {
                 let mut buf: ImageBuffer<Rgb<u8>, _> =
-                    ImageBuffer::from_raw(w as u32, h as u32, processed)
+                    ImageBuffer::from_raw(ow as u32, oh as u32, processed)
                         .ok_or_else(|| anyhow::anyhow!("empty render"))?;
                 if let Some((tw, th)) = target {
                     buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
@@ -680,18 +706,25 @@ fn render_nonraw_export(
             let rgba = ImageBuffer::from_raw(w as u32, h as u32, raw)
                 .ok_or_else(|| anyhow::anyhow!("empty decode of {path}"))?;
             let rgb = composite_rgba16_over_white(&rgba);
-            let mut processed =
-                crate::preview::apply_pipeline_rgb16_gear(&rgb, w, h, params, lens_gear, grain_seed);
+            let (ow, oh, rgb) =
+                c41_core::geometry::apply_orientation(&rgb, w, h, 3, geometry.orientation);
+            let mut processed = crate::preview::apply_pipeline_rgb16_gear(
+                &rgb, ow, oh, params, lens_gear, grain_seed,
+            );
             if let Some(t) = out_transform {
-                c41_core::icc::apply_rgb16(t, &mut processed, w, w * 3, 3);
+                c41_core::icc::apply_rgb16(t, &mut processed, ow, ow * 3, 3);
             }
             let fmt = match settings.format {
                 ExportFormat::Png => image::ImageFormat::Png,
                 _ => image::ImageFormat::Tiff,
             };
+            let target = settings
+                .resize
+                .as_ref()
+                .map(|r| crate::export::fit_within(ow as u32, oh as u32, r));
             atomic_write(&dest_ext, move |out| {
                 let mut buf: ImageBuffer<Rgb<u16>, _> =
-                    ImageBuffer::from_raw(w as u32, h as u32, processed)
+                    ImageBuffer::from_raw(ow as u32, oh as u32, processed)
                         .ok_or_else(|| anyhow::anyhow!("empty render"))?;
                 if let Some((tw, th)) = target {
                     buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
@@ -1137,6 +1170,7 @@ mod tests {
             &settings,
             &crate::preview::PreviewParams::default(),
             None,
+            &c41_core::geometry::Geometry::default(),
             None,
         )
         .unwrap();
@@ -1146,6 +1180,66 @@ mod tests {
         assert_eq!((out.width(), out.height()), (4, 3));
         assert_eq!(out.as_raw(), img.as_raw(), "passthrough export must be pixel-exact");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_nonraw_export_applies_manual_orientation_to_pixels() {
+        use image::{ImageBuffer, Rgb};
+        let dir = std::env::temp_dir().join(format!(
+            "darkroom_nonraw_orient_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 4×3 with a distinct value per pixel (lossless PNG keeps them exact).
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(4, 3, |x, y| Rgb([(x + 4 * y) as u8, 200, 60]));
+        let src = dir.join("in.png");
+        img.save(&src).unwrap();
+
+        let dest = dir.join("out");
+        let settings = crate::export::ExportSettings {
+            format: crate::export::ExportFormat::Png,
+            quality: 90,
+            resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb,
+        };
+        let geom = c41_core::geometry::Geometry {
+            orientation: c41_core::geometry::Orientation::Rotate90Cw,
+            ..c41_core::geometry::Geometry::default()
+        };
+        render_nonraw_export(
+            src.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            &settings,
+            &crate::preview::PreviewParams::default(),
+            None,
+            &geom,
+            None,
+        )
+        .unwrap();
+
+        let out_png = format!("{}.png", dest.to_str().unwrap());
+        let out = image::ImageReader::open(&out_png).unwrap().decode().unwrap().to_rgb8();
+        // Identity params ⇒ empty pipeline ⇒ the export is exactly the permutation.
+        assert_eq!((out.width(), out.height()), (3, 4));
+        let (ew, eh, expected) = c41_core::geometry::apply_orientation(
+            img.as_raw(),
+            4,
+            3,
+            3,
+            c41_core::geometry::Orientation::Rotate90Cw,
+        );
+        assert_eq!((ew as u32, eh as u32), (3, 4));
+        assert_eq!(
+            out.as_raw(),
+            &expected,
+            "non-raw export must rotate the decoded pixels exactly"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1183,6 +1277,7 @@ mod tests {
             &settings,
             &params,
             None,
+            &c41_core::geometry::Geometry::default(),
             None,
         )
         .unwrap();
@@ -1332,6 +1427,7 @@ mod tests {
                 &settings,
                 &crate::preview::PreviewParams::default(),
                 None,
+                &c41_core::geometry::Geometry::default(),
                 None,
             )
             .unwrap();
@@ -1397,6 +1493,7 @@ mod tests {
                 &settings,
                 &crate::preview::PreviewParams::default(),
                 None,
+                &c41_core::geometry::Geometry::default(),
                 None,
             )
             .unwrap();
@@ -1472,6 +1569,7 @@ mod tests {
                 &settings,
                 &crate::preview::PreviewParams::default(),
                 None,
+                &c41_core::geometry::Geometry::default(),
                 None,
             )
             .unwrap();
@@ -1606,6 +1704,7 @@ mod tests {
                 &settings,
                 &crate::preview::PreviewParams::default(),
                 None,
+                &c41_core::geometry::Geometry::default(),
                 None,
             )
             .unwrap();

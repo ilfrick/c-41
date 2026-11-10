@@ -9095,3 +9095,53 @@ to 44/52 active (40 live labels + 4 elsewhere links), 8 inert.
 parity; the source comment and audit now scope the row to the global export
 choice. `scripts/ci-local.sh` passed all four Docker steps; `git diff --check`
 passed. No production services or installer files changed.
+
+## 2026-11-10 08:33 UTC — G1: Orientation selector in Geometry
+
+**What.** Made darktable's `Orientation` capability usable instead of inert: a
+manual eight-state selector (None / flip vertical / flip horizontal / 180° /
+transpose / 90° CW / 90° CCW / transverse) in the darkroom Geometry panel,
+applied as a lossless pixel permutation on the already-decoded display pixels
+before straighten and crop — for both RAW (linear RGBA) and non-RAW previews —
+and in every Rust export funnel (raw 8/16-bit; non-raw JPEG/PNG/TIFF with
+post-orientation dimension/stride/resize recomputation). RAW EXIF orientation
+remains decode behaviour and is not part of the manual control. Persistence:
+Geometry blob bumped to v2 (+1 orientation byte, 22 bytes); v1 blobs decode as
+orientation-none. Reset geometry now clears orientation too and exits crop-edit
+mode; `ELSEWHERE_MODULE_LABELS` gains `Orientation` with a hint pointing to the
+Geometry panel; header count now 45/52 active, 7 inert.
+
+**Implementation notes.** New `c41_core::geometry::Orientation` +
+`apply_orientation<T: Copy>` (channel-generic; 90°-family swaps dims; values
+match `dt_image_orientation_t` bit convention and the imageio port's
+`oriented_layout` tables). `Geometry::apply_without_crop` (orientation then
+straighten, no crop — used by crop-edit mode) with an orientation-None early
+exit. Non-raw preview gained a `pristine_srgb` cache so orientation changes
+recompose without re-reading the source; `reorient_srgb8` compacts GdkPixbuf
+row-padding before permuting (identity path keeps the original stride). The
+non-raw export now resolves per-image geometry (`edit.geometry` or
+`persist::load_geometry`) and applies orientation pre-pipeline in both the
+8-bit and 16-bit legs, recomputing `ImageBuffer` dims, output-ICC stride and the
+resize target from the oriented size — so a JPEG rotated in the preview exports
+rotated.
+
+**Documented deviations (in PARITY_AUDIT).** (a) darktable composes its flip
+*after* rotatepixels in the iop order; C41 applies manual orientation *before*
+straighten because it lives at decode level like the raw EXIF path —
+self-consistent, but combined angle+orientation edits differ from the C
+reference per-pixel; (b) it is part of `Geometry` (outside the HistoryStack like
+crop/straighten), not the C flip module's params stack; (c)
+heic/heif/avif exports fall back to `darkroom-cli`, which cannot see c41-only
+edit state, so manual orientation is a Rust-path capability; (d) non-raw
+crop/straighten remain unsupported by design.
+
+**Verified.** Three review passes (initial full review; focused re-review of the
+MED-2 non-raw-export fix and LOW polish; final delta check) — coordinate tables
+independently re-derived against `src/common/image.h`/`imageio` port; no
+blockers/majors at any stage. `scripts/ci-local.sh` passed all four Docker
+steps: workspace check, clippy, release tests (1 935 `c41-core` — +3 geometry
+orientation/v1-decode tests; 545 `c41-ui` — +1 non-raw export orientation test,
++1 gdk rowstride-padding test), release binary link. `git diff --check` passed.
+Host `cargo test -p c41-core` cannot link (no lensfun/gphoto2 libs — known);
+docker is authoritative. No deployment/container/installer/service changed;
+`install-debuntu.sh` + checksum remain untracked and untouched.

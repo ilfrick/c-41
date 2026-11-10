@@ -164,28 +164,104 @@ pub fn apply_rotate(pixels: &[f32], w: usize, h: usize, angle: f32) -> (usize, u
     (w2, h2, out)
 }
 
-/// Version byte for [`Geometry::encode`] — bump if the field layout changes so
-/// an old persisted blob is rejected (→ defaults) rather than misread.
-const GEOMETRY_ENCODE_VERSION: u8 = 1;
-/// Encoded length: 1 version byte + 5 little-endian f32 (crop l/t/r/b + angle).
-const GEOMETRY_ENCODE_LEN: usize = 1 + 5 * 4;
+/// Current geometry blob version. Version 1 remains readable for compatibility.
+const GEOMETRY_ENCODE_VERSION: u8 = 2;
+const GEOMETRY_V1_LEN: usize = 1 + 5 * 4;
+const GEOMETRY_ENCODE_LEN: usize = GEOMETRY_V1_LEN + 1;
 
-/// The full per-image geometry edit: a straighten [`angle`](Self::angle) then a
-/// [`Crop`]. Applied [rotate-then-crop](Self::apply) so the crop rectangle lives
-/// in the *rotated* frame (darktable's straighten-and-crop), letting the crop
-/// trim the black corners the rotation introduces.
+/// Manual EXIF-style pixel permutation, applied to already-decoded display
+/// pixels. Codes are stable persistence/UI indices and deliberately independent
+/// of embedded EXIF metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Orientation {
+    #[default]
+    None = 0,
+    FlipVertical = 1,
+    FlipHorizontal = 2,
+    Rotate180 = 3,
+    Transpose = 4,
+    Rotate90Cw = 5,
+    Rotate90Ccw = 6,
+    Transverse = 7,
+}
+
+impl Orientation {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::FlipVertical,
+            2 => Self::FlipHorizontal,
+            3 => Self::Rotate180,
+            4 => Self::Transpose,
+            5 => Self::Rotate90Cw,
+            6 => Self::Rotate90Ccw,
+            7 => Self::Transverse,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Reorder tightly packed pixels losslessly. `channels` may include alpha;
+/// every channel value is copied verbatim and 90-degree transforms swap dimensions.
+pub fn apply_orientation<T: Copy>(
+    pixels: &[T],
+    w: usize,
+    h: usize,
+    channels: usize,
+    o: Orientation,
+) -> (usize, usize, Vec<T>) {
+    let needed = w.saturating_mul(h).saturating_mul(channels);
+    if w == 0 || h == 0 || channels == 0 || pixels.len() < needed || o == Orientation::None {
+        return (w, h, pixels.to_vec());
+    }
+    let swap = matches!(
+        o,
+        Orientation::Transpose
+            | Orientation::Rotate90Cw
+            | Orientation::Rotate90Ccw
+            | Orientation::Transverse
+    );
+    let (dw, dh) = if swap { (h, w) } else { (w, h) };
+    let mut out = pixels[..needed].to_vec();
+    for y in 0..dh {
+        for x in 0..dw {
+            // Output-to-source mapping for darktable's orientation bit values.
+            let (sx, sy) = match o {
+                Orientation::None => (x, y),
+                Orientation::FlipVertical => (x, h - 1 - y),
+                Orientation::FlipHorizontal => (w - 1 - x, y),
+                Orientation::Rotate180 => (w - 1 - x, h - 1 - y),
+                Orientation::Transpose => (y, x),
+                Orientation::Rotate90Cw => (y, h - 1 - x),
+                Orientation::Rotate90Ccw => (w - 1 - y, x),
+                Orientation::Transverse => (w - 1 - y, h - 1 - x),
+            };
+            let si = (sy * w + sx) * channels;
+            let di = (y * dw + x) * channels;
+            out[di..di + channels].copy_from_slice(&pixels[si..si + channels]);
+        }
+    }
+    (dw, dh, out)
+}
+
+/// The full per-image geometry edit: manual [`orientation`](Self::orientation),
+/// then a straighten [`angle`](Self::angle), then [`Crop`]. The crop rectangle
+/// lives in the oriented-and-straightened frame (darktable's straighten-and-crop),
+/// letting it trim the black corners the arbitrary rotation introduces.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
     /// Crop rectangle, in fractions of the rotated image.
     pub crop: Crop,
     /// Straighten angle in radians (positive = counter-clockwise).
     pub angle: f32,
+    /// Additional manual orientation, applied before straighten/crop.
+    pub orientation: Orientation,
 }
 
 impl Default for Geometry {
     /// Identity — no rotation, whole image.
     fn default() -> Self {
-        Self { crop: Crop::default(), angle: 0.0 }
+        Self { crop: Crop::default(), angle: 0.0, orientation: Orientation::None }
     }
 }
 
@@ -193,17 +269,36 @@ impl Geometry {
     /// True when neither the rotation nor the crop changes the image, so the
     /// geometry pass can be skipped.
     pub fn is_identity(&self) -> bool {
-        self.angle.abs() < MIN_ANGLE && self.crop.is_identity()
+        self.orientation == Orientation::None
+            && self.angle.abs() < MIN_ANGLE
+            && self.crop.is_identity()
     }
 
-    /// Apply the straighten then the crop to a packed linear RGBA `f32` buffer,
-    /// returning `(new_w, new_h, pixels)`. Identity (or a degenerate buffer)
-    /// returns the source dimensions and a verbatim copy.
+    /// Apply manual orientation then straighten, but do not crop. Used while the
+    /// crop overlay is being edited so the user can see the full transformed
+    /// frame. Skips the orientation pass entirely when it is `None` so a
+    /// crop/straighten-only edit never pays for a full-frame copy.
+    pub fn apply_without_crop(
+        &self,
+        pixels: &[f32],
+        w: usize,
+        h: usize,
+    ) -> (usize, usize, Vec<f32>) {
+        if self.orientation == Orientation::None {
+            return apply_rotate(pixels, w, h, self.angle);
+        }
+        let (ow, oh, oriented) = apply_orientation(pixels, w, h, 4, self.orientation);
+        apply_rotate(&oriented, ow, oh, self.angle)
+    }
+
+    /// Apply orientation, straighten, then crop to a packed linear RGBA `f32`
+    /// buffer, returning `(new_w, new_h, pixels)`. Identity or a degenerate
+    /// buffer returns the source dimensions and a verbatim copy.
     pub fn apply(&self, pixels: &[f32], w: usize, h: usize) -> (usize, usize, Vec<f32>) {
         if self.is_identity() {
             return (w, h, pixels.to_vec());
         }
-        let (rw, rh, rotated) = apply_rotate(pixels, w, h, self.angle);
+        let (rw, rh, rotated) = self.apply_without_crop(pixels, w, h);
         apply_crop(&rotated, rw, rh, self.crop)
     }
 
@@ -215,6 +310,7 @@ impl Geometry {
         for f in [self.crop.left, self.crop.top, self.crop.right, self.crop.bottom, self.angle] {
             v.extend_from_slice(&f.to_le_bytes());
         }
+        v.push(self.orientation as u8);
         v
     }
 
@@ -223,13 +319,16 @@ impl Geometry {
     /// values are returned unsanitised — [`apply`](Self::apply) normalises the
     /// crop and guards a non-finite angle.
     pub fn decode(bytes: &[u8]) -> Option<Geometry> {
-        if bytes.len() != GEOMETRY_ENCODE_LEN || bytes[0] != GEOMETRY_ENCODE_VERSION {
+        let v1 = bytes.len() == GEOMETRY_V1_LEN && bytes.first() == Some(&1);
+        let v2 = bytes.len() == GEOMETRY_ENCODE_LEN && bytes.first() == Some(&GEOMETRY_ENCODE_VERSION);
+        if !(v1 || v2) {
             return None;
         }
         let f = |i: usize| f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
         Some(Geometry {
             crop: Crop { left: f(1), top: f(5), right: f(9), bottom: f(13) },
             angle: f(17),
+            orientation: if bytes[0] == 1 { Orientation::None } else { Orientation::from_u8(bytes[21]) },
         })
     }
 }
@@ -480,7 +579,11 @@ mod tests {
         // A straighten + crop must equal apply_crop(apply_rotate(..)) — crop in
         // the rotated frame. Check against the manual composition.
         let px = uniform(40, 30, 0.5);
-        let g = Geometry { crop: Crop { left: 0.2, top: 0.2, right: 0.8, bottom: 0.8 }, angle: 0.2 };
+        let g = Geometry {
+            crop: Crop { left: 0.2, top: 0.2, right: 0.8, bottom: 0.8 },
+            angle: 0.2,
+            orientation: Orientation::None,
+        };
         let (rw, rh, rot) = apply_rotate(&px, 40, 30, 0.2);
         let expect = apply_crop(&rot, rw, rh, g.crop);
         assert_eq!(g.apply(&px, 40, 30), expect);
@@ -489,13 +592,17 @@ mod tests {
 
     #[test]
     fn geometry_encode_decode_round_trips() {
-        let g = Geometry { crop: Crop { left: 0.1, top: 0.2, right: 0.85, bottom: 0.9 }, angle: -0.05 };
+        let g = Geometry {
+            crop: Crop { left: 0.1, top: 0.2, right: 0.85, bottom: 0.9 },
+            angle: -0.05,
+            orientation: Orientation::Rotate90Ccw,
+        };
         let blob = g.encode();
         assert_eq!(blob.len(), GEOMETRY_ENCODE_LEN);
         assert_eq!(Geometry::decode(&blob), Some(g));
         // Wrong version / truncation / trailing byte ⇒ None (→ default on load).
         let mut bad_ver = blob.clone();
-        bad_ver[0] = 2;
+        bad_ver[0] = 3;
         assert_eq!(Geometry::decode(&bad_ver), None);
         assert_eq!(Geometry::decode(&blob[..blob.len() - 1]), None);
         let mut too_long = blob.clone();
@@ -504,10 +611,72 @@ mod tests {
     }
 
     #[test]
+    fn orientations_are_exact_rectangular_permutations() {
+        let src: Vec<u8> = (1..=6).collect();
+        let expected: [&[u8]; 8] = [
+            &[1, 2, 3, 4, 5, 6],   // None
+            &[4, 5, 6, 1, 2, 3],   // FlipVertical
+            &[3, 2, 1, 6, 5, 4],   // FlipHorizontal
+            &[6, 5, 4, 3, 2, 1],   // Rotate180
+            &[1, 4, 2, 5, 3, 6],   // Transpose
+            &[4, 1, 5, 2, 6, 3],   // Rotate90Cw
+            &[3, 6, 2, 5, 1, 4],   // Rotate90Ccw
+            &[6, 3, 5, 2, 4, 1],   // Transverse
+        ];
+        let all = [
+            Orientation::None,
+            Orientation::FlipVertical,
+            Orientation::FlipHorizontal,
+            Orientation::Rotate180,
+            Orientation::Transpose,
+            Orientation::Rotate90Cw,
+            Orientation::Rotate90Ccw,
+            Orientation::Transverse,
+        ];
+        for (i, o) in all.into_iter().enumerate() {
+            let (w, h, out) = apply_orientation(&src, 3, 2, 1, o);
+            assert_eq!((w, h), if i >= 4 { (2, 3) } else { (3, 2) });
+            assert_eq!(out, expected[i]);
+        }
+        let rgba: Vec<u8> = (0..24).collect();
+        let (_, _, out) = apply_orientation(&rgba, 3, 2, 4, Orientation::Rotate90Cw);
+        assert_eq!(&out[..4], &[12, 13, 14, 15]);
+        assert_eq!(out.len(), rgba.len());
+    }
+
+    #[test]
+    fn geometry_orientation_precedes_straighten_and_crop() {
+        let px = grid(3, 2);
+        let g = Geometry {
+            orientation: Orientation::Rotate90Cw,
+            angle: 0.3,
+            crop: Crop { left: 0.0, top: 0.0, right: 0.5, bottom: 1.0 },
+        };
+        let (ow, oh, oriented) = apply_orientation(&px, 3, 2, 4, g.orientation);
+        let (rw, rh, rotated) = apply_rotate(&oriented, ow, oh, g.angle);
+        let expected = apply_crop(&rotated, rw, rh, g.crop);
+        assert_eq!(g.apply(&px, 3, 2), expected);
+        assert_eq!(g.apply_without_crop(&px, 3, 2), (rw, rh, rotated));
+    }
+
+    #[test]
+    fn geometry_v1_decodes_with_identity_orientation() {
+        let mut v = vec![1u8];
+        for f in [0.0f32, 0.0, 1.0, 1.0, 0.0] {
+            v.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(Geometry::decode(&v), Some(Geometry::default()));
+        // A v1-length blob with an unsupported version byte is rejected.
+        v[0] = 9;
+        assert_eq!(Geometry::decode(&v), None);
+    }
+
+    #[test]
     fn geometry_encode_len_is_pinned() {
         // If this fails, a Geometry field changed — bump GEOMETRY_ENCODE_VERSION
         // and this constant together so old blobs are rejected, not misread.
-        assert_eq!(GEOMETRY_ENCODE_LEN, 21);
-        assert_eq!(Geometry::default().encode().len(), 21);
+        assert_eq!(GEOMETRY_V1_LEN, 21);
+        assert_eq!(GEOMETRY_ENCODE_LEN, 22);
+        assert_eq!(Geometry::default().encode().len(), 22);
     }
 }

@@ -812,6 +812,7 @@ mod tests {
         Geometry {
             crop: c41_core::geometry::Crop { left: 0.1, top: 0.15, right: 0.9, bottom: 0.85 },
             angle: 0.03,
+            orientation: c41_core::geometry::Orientation::Transverse,
         }
     }
 

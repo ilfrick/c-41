@@ -500,6 +500,7 @@ mod tests {
         let geom = Geometry {
             crop: Crop { left: 0.25, top: 0.0, right: 0.75, bottom: 1.0 },
             angle: 0.0,
+            orientation: c41_core::geometry::Orientation::None,
         };
         let (w, h, rgb) = render_export_rgb8(
             &img,
@@ -510,6 +511,34 @@ mod tests {
         );
         assert_eq!((w, h), (20, 30));
         assert_eq!(rgb.len(), 20 * 30 * 3);
+    }
+
+    #[test]
+    fn export_uses_geometry_orientation_and_swaps_dimensions() {
+        use c41_core::geometry::{apply_orientation, Geometry, Orientation};
+        use c41_core::rawimage::DemosaicMethod;
+
+        let img = synthetic_raw(24, 12);
+        let params = crate::preview::PreviewParams::default();
+        let (src_w, src_h, source) = render_export_rgb8(
+            &img,
+            DemosaicMethod::Ppg,
+            Geometry::default(),
+            &params,
+            0,
+        );
+        let geom = Geometry { orientation: Orientation::Rotate90Cw, ..Geometry::default() };
+        let (w, h, rotated) = render_export_rgb8(&img, DemosaicMethod::Ppg, geom, &params, 0);
+        let (expected_w, expected_h, expected) =
+            apply_orientation(&source, src_w, src_h, 3, Orientation::Rotate90Cw);
+
+        assert_eq!((w, h), (12, 24));
+        assert_eq!((w, h), (expected_w, expected_h));
+        assert_eq!(
+            rotated, expected,
+            "export pixels must be the exact requested permutation"
+        );
+        assert!(source.chunks_exact(3).any(|px| px != &source[..3]));
     }
 
     #[test]
@@ -550,6 +579,7 @@ mod tests {
             Geometry {
                 crop: Crop { left: 0.25, top: 0.0, right: 0.75, bottom: 1.0 },
                 angle: 0.0,
+                orientation: c41_core::geometry::Orientation::None,
             },
             &p,
             Some(&gear),
