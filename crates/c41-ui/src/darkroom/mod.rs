@@ -290,7 +290,7 @@ struct PreviewCtx {
     /// Catalogue database path (`""` = no db), for per-image lens-choice
     /// persistence ([`crate::persist::save_lens`]). Set once, never mutated.
     db_path: Rc<str>,
-    /// Module-list scope tab (All / Active / one catalog group). Session-only
+    /// Module-list scope tab (All / Wired / one catalog group). Session-only
     /// on purpose — darktable persists the tab, but that needs a pref key and
     /// this pass keeps the filter as ephemeral panel state. Lives in `ctx`
     /// (not in the rebuilt panel) so Reset / undo-jump / style-apply rebuilds
@@ -2565,19 +2565,19 @@ fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ModuleFilter {
     All,
-    Active,
+    Wired,
     Group(usize),
 }
 
 /// Whether the row `(group_idx, label)` passes `filter` plus the search
 /// `query` (a case-insensitive label substring; empty matches everything).
-/// Pure so it is unit-tested without GTK. `Active` reuses [`is_live_module`] —
-/// the same predicate behind the header count and the live-first ordering —
-/// so the three can never disagree about what "live" means.
+/// Pure so it is unit-tested without GTK. `Wired` reuses [`is_live_module`] —
+/// the same predicate behind the header count and live-first ordering — so the
+/// three cannot disagree about which modules are implemented.
 fn module_filter_matches(filter: ModuleFilter, group_idx: usize, label: &str, query: &str) -> bool {
     let scope_ok = match filter {
         ModuleFilter::All => true,
-        ModuleFilter::Active => is_live_module(label),
+        ModuleFilter::Wired => is_live_module(label),
         ModuleFilter::Group(gi) => gi == group_idx,
     };
     if !scope_ok {
@@ -2628,13 +2628,11 @@ fn apply_module_filter(
 /// would fire those handlers per row and re-enter `render_preview` mid-rebuild.
 /// `module_expander`/`add_param_slider` already follow this (build then connect).
 fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
-    // Count first so the header can state how much of the catalogue is real.
-    // Without this the panel is 44 near-identical rows and the ~30 placeholders
-    // are indistinguishable from working modules — which made every shipped
-    // increment invisible (see `is_live_module`). These are UNFILTERED totals
-    // (live / catalog size), not the visible-row count: the filter only hides
-    // rows, and the count answers "how much is ported", which filtering must
-    // not change.
+    // Count first so the header can state how much of the catalogue is wired.
+    // These are UNFILTERED totals (wired / catalog size), not the visible-row
+    // count: the filter only hides rows, and this count answers how much is
+    // implemented. Do not call this "active": it measures port status, not
+    // whether a module is enabled in the current edit.
     let total: usize = crate::catalog::module_catalog()
         .iter()
         .map(|g| g.modules.len())
@@ -2646,7 +2644,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
         .count();
 
     // Filter bar, above the header inside the scroller: scope toggles (All +
-    // Active + one per catalog group, labels read from the catalog) plus a
+    // Wired + one per catalog group, labels read from the catalog) plus a
     // search entry, mirroring darktable's modulegroups tab bar. The widgets
     // are rebuilt with the panel, but the SELECTION lives in `ctx`
     // (`module_filter` / `module_search`), so Reset / undo-jump / style-apply
@@ -2665,8 +2663,8 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     let mut toggles: Vec<(ModuleFilter, gtk4::ToggleButton)> = vec![
         (ModuleFilter::All, gtk4::ToggleButton::with_label("All")),
         (
-            ModuleFilter::Active,
-            gtk4::ToggleButton::with_label("Active"),
+            ModuleFilter::Wired,
+            gtk4::ToggleButton::with_label("Wired"),
         ),
     ];
     for (gi, group) in crate::catalog::module_catalog().iter().enumerate() {
@@ -2677,7 +2675,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     toggles[0].1.set_tooltip_text(Some("Show all modules"));
     toggles[1]
         .1
-        .set_tooltip_text(Some("Show only live (wired) modules"));
+        .set_tooltip_text(Some("Show only implemented (wired) modules"));
     // Radio-like single select: joining a group keeps exactly one armed (a
     // click on the armed button keeps it armed, so the filter never lands on
     // "none selected"). Seed from ctx BEFORE connecting, so seeding fires no
@@ -2705,7 +2703,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     panel.append(&header);
 
     let counter = gtk4::Label::builder()
-        .label(format!("{live} of {total} active"))
+        .label(format!("{live} of {total} wired"))
         .halign(gtk4::Align::Start)
         .build();
     counter.add_css_class("dim-label");
@@ -3019,7 +3017,7 @@ fn elsewhere_module_row(label: &str, hint: &str) -> adw::ActionRow {
 /// Whether `label` dispatches to a live preview module in [`populate_modules`].
 ///
 /// Single source of truth for both the dispatch's presentation (ordering, the
-/// "N of M active" count) and the drift test — previously this list existed only
+/// "N of M wired" count) and the drift test — previously this list existed only
 /// under `#[cfg(test)]`, so the UI had no way to tell a working module from a
 /// placeholder and rendered them identically.
 pub(crate) fn is_live_module(label: &str) -> bool {
@@ -3030,8 +3028,8 @@ pub(crate) fn is_live_module(label: &str) -> bool {
 /// its own toggle/overlay; Rotate & perspective uses the Straighten slider;
 /// Orientation has a manual selector in Geometry; Demosaic has a Bayer-only
 /// selector above the list; Output color profile links to the global Export
-/// dialog, not per-image module parity. These capabilities count as active and
-/// are labeled with their controls.
+/// dialog, not per-image module parity. These capabilities count as implemented
+/// and are labeled with their controls.
 const ELSEWHERE_MODULE_LABELS: &[&str] = &[
     "Crop",
     "Rotate & perspective",
@@ -6078,7 +6076,7 @@ mod tests {
     }
 
     /// `LIVE_MODULE_LABELS` now drives presentation (ordering + the "N of M
-    /// active" count), not just this test, so a module present in the dispatch
+    /// wired" count), not just this test, so a module present in the dispatch
     /// but missing from the list would render live yet be sorted and counted as
     /// a placeholder. Pin the two together by parsing the match arms from source
     /// (live arms call a `*_module_row` builder; the `other` fallback and the
@@ -6328,63 +6326,52 @@ mod tests {
     }
 
     /// The filter scope + search matcher behind the w2 module filter bar.
-    /// `Active` must agree with `is_live_module` (the count + ordering
-    /// predicate); the search is a case-insensitive label substring that
-    /// combines with the scope tab rather than replacing it.
+    /// `Wired` must agree with `is_live_module` (the count + ordering
+    /// predicate); it describes implementation status, not current edit state.
+    /// Search is a case-insensitive label substring combined with the scope.
     #[test]
     fn module_filter_matches_scope_and_search() {
-        // All shows everything, live or placeholder, on an empty query.
+        // All shows everything, wired or placeholder, on an empty query.
         assert!(module_filter_matches(ModuleFilter::All, 0, "Grain", ""));
         assert!(module_filter_matches(ModuleFilter::All, 2, "Exposure", ""));
-        // Active shows only live modules (Exposure, Grain and Soften are live).
+        // Wired shows implemented modules whether enabled or disabled in this edit.
         // Raw black/white point is Base group row 0 — the rawprepare row wired
-        // this increment — and must read as live like the other decode-level
-        // rows (Hot pixels, Demosaic).
-        assert!(module_filter_matches(ModuleFilter::Active, 0, "Raw black/white point", ""));
-        assert!(module_filter_matches(ModuleFilter::Active, 0, "Exposure", ""));
-        assert!(module_filter_matches(ModuleFilter::Active, 4, "Grain", ""));
-        assert!(module_filter_matches(ModuleFilter::Active, 4, "Soften", ""));
-        assert!(module_filter_matches(ModuleFilter::Active, 4, "Highpass", ""));
-        assert!(module_filter_matches(ModuleFilter::Active, 0, "Demosaic", ""));
-        assert!(module_filter_matches(ModuleFilter::Active, 0, "Orientation", ""));
-        assert!(module_filter_matches(ModuleFilter::Active, 2, "Output color profile", ""));
-        // Framing sits in the catalog's Effect group (index 4, next to the
-        // other display-referred creative modules) — pins the right group so
-        // the Active filter counts it where darktable shows it.
-        assert!(module_filter_matches(ModuleFilter::Active, 4, "Framing", ""));
-        // Chromatic aberrations sits in the catalog's Correct group (index 3,
-        // between Hot pixels and Defringe, mirroring darktable's presentation)
-        // and is live. Pin the group slot by scanning the catalog directly
-        // (`module_filter_matches(Group(gi))` only compares group indices and
-        // is agnostic to which label sits there).
+        // this increment — and must read as wired like other decode-level rows.
+        assert!(module_filter_matches(ModuleFilter::Wired, 0, "Raw black/white point", ""));
+        assert!(module_filter_matches(ModuleFilter::Wired, 0, "Exposure", ""));
+        assert!(module_filter_matches(ModuleFilter::Wired, 4, "Grain", ""));
+        assert!(module_filter_matches(ModuleFilter::Wired, 4, "Soften", ""));
+        assert!(module_filter_matches(ModuleFilter::Wired, 4, "Highpass", ""));
+        assert!(module_filter_matches(ModuleFilter::Wired, 0, "Demosaic", ""));
+        assert!(module_filter_matches(ModuleFilter::Wired, 0, "Orientation", ""));
+        assert!(module_filter_matches(ModuleFilter::Wired, 2, "Output color profile", ""));
+        // Framing sits in the catalog's Effect group (index 4).
+        assert!(module_filter_matches(ModuleFilter::Wired, 4, "Framing", ""));
+        // Pin representative Correct, Effect, and Color rows to their catalog groups.
         assert!(is_live_module("Chromatic aberrations"));
         let cac_group = crate::catalog::module_catalog()
             .iter()
             .position(|g| g.modules.iter().any(|m| m.label == "Chromatic aberrations"));
         assert_eq!(cac_group, Some(3));
-        assert!(module_filter_matches(ModuleFilter::Active, 3, "Chromatic aberrations", ""));
-        // Watermark sits in the catalog's Effect group (index 4 — darktable's
-        // own module group for it, next to Framing) and is live, so the
-        // Active filter counts it there.
+        assert!(module_filter_matches(ModuleFilter::Wired, 3, "Chromatic aberrations", ""));
         assert!(is_live_module("Watermark"));
         let wm_group = crate::catalog::module_catalog()
             .iter()
             .position(|g| g.modules.iter().any(|m| m.label == "Watermark"));
         assert_eq!(wm_group, Some(4));
-        assert!(module_filter_matches(ModuleFilter::Active, 4, "Watermark", ""));
-        // Color calibration sits in the catalog's Color group (index 2 —
-        // darktable already has it there, next to Color balance RGB) and is
-        // live, so the Active filter counts it there.
+        assert!(module_filter_matches(ModuleFilter::Wired, 4, "Watermark", ""));
         assert!(is_live_module("Color calibration"));
         let ccl_group = crate::catalog::module_catalog()
             .iter()
             .position(|g| g.modules.iter().any(|m| m.label == "Color calibration"));
         assert_eq!(ccl_group, Some(2));
-        assert!(module_filter_matches(ModuleFilter::Active, 2, "Color calibration", ""));
+        assert!(module_filter_matches(ModuleFilter::Wired, 2, "Color calibration", ""));
+        // A catalogue row that is not implemented is not shown as wired, even
+        // when the search text matches it.
+        assert!(!module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "reto"));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
-        // Group holds a catalog index, so every index resolves in-bounds.
         for gi in 0..crate::catalog::module_catalog().len() {
             let label = crate::catalog::module_catalog()[gi].modules[0].label;
             assert!(module_filter_matches(ModuleFilter::Group(gi), gi, label, ""));
@@ -6393,10 +6380,9 @@ mod tests {
         assert!(module_filter_matches(ModuleFilter::All, 0, "Exposure", "expo"));
         assert!(module_filter_matches(ModuleFilter::All, 0, "Exposure", "EXPO"));
         assert!(!module_filter_matches(ModuleFilter::All, 0, "Exposure", "velvia"));
-        // ... and it combines with the scope tab (Active + query still hides
-        // inert rows even when the query matches their label).
-        assert!(module_filter_matches(ModuleFilter::Active, 4, "Highpass", "hig"));
-        assert!(module_filter_matches(ModuleFilter::Active, 4, "Bloom", "loo"));
+        // Search combines with Wired: wired results match; placeholders do not.
+        assert!(module_filter_matches(ModuleFilter::Wired, 4, "Highpass", "hig"));
+        assert!(!module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "reto"));
     }
 
     /// Distinctive non-default value used by the reset tests. Must differ from

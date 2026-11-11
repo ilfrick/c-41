@@ -9560,3 +9560,23 @@ reviewer approved the revision. `git diff --check` is clean. `scripts/ci-local.s
 passed all four gates by exit code: workspace check, clippy, release tests
 (1,986 core / 573 UI), and release binary link. Existing unrelated warnings
 remain. No code changed, so no runtime deployment was performed.
+
+## 2026-11-11 18:52 UTC — UX P0: clarify wired-module filter
+
+**What.** Renamed the darkroom module filter from “Active” to “Wired” and the
+catalogue count from “N of M active” to “N of M wired”; the tooltip now clarifies
+that Wired means implemented, not enabled in the current edit. Updated matcher
+documentation and tests, including an inert Retouch search case. A true
+Enabled/Used-in-this-edit filter remains deferred until its state can be derived
+reliably for flags, raw-only modules, and controls hosted elsewhere. Updated
+`ROADMAP.md` and current module-count/source references in `PARITY_AUDIT.md`.
+
+**Reviewed.** Independent senior generalist review approved. Review caught stale
+parity-audit source references and a remaining `PreviewCtx` “Active” comment;
+all were corrected before approval. Installer files stayed untracked and
+untouched.
+
+**Verified.** `git diff --check` clean. `scripts/ci-local.sh` passed all four
+gates by exit code: workspace check, clippy, release tests (1,986 core / 573 UI),
+and release binary link. Existing unrelated warnings remain. No runtime deploy
+was performed.

@@ -350,16 +350,15 @@ look different.
 **Prioritized findings and actions** (P0 = correctness/discoverability, P1 =
 workflow efficiency, P2 = remaining feature parity, P3 = validation):
 
-1. **P0 — “Active” currently means “implemented”, not enabled/active in this
-   edit.** C-41's `ModuleFilter::Active` delegates to `is_live_module`, and the
-   catalogue counter says “N of M active”; darktable's Active Pipeline scope is
-   based on enabled modules or the current history, not port status. This is a
-   semantic mismatch that can hide the actual edit state from users. Rename the
-   existing scope and count to **Wired** (or **Available**) immediately. Add a
-   separately named **Enabled/Used in this edit** scope only when it can be
-   derived from the same module state as the switches/parameters; test flag-only,
-   default-on, raw-only, and elsewhere-driven controls so it never promises a
-   false pipeline view.
+1. **P0 — “Active” confused implementation with edit state.** At audit time,
+   C-41's `ModuleFilter::Active` delegated to `is_live_module`, and the catalogue
+   counter said “N of M active”; darktable's Active Pipeline scope is based on
+   enabled modules or the current history, not port status. The misleading
+   filter and counter are corrected here to **Wired** / “N of M wired”, with a
+   tooltip spelling out that this means implemented. A true **Enabled/Used in
+   this edit** scope remains future work: derive it from the same module state as
+   the controls and test flag-only, default-on, raw-only, and elsewhere-driven
+   cases before exposing it, so it cannot promise a false pipeline view.
 2. **P1 — No concise Quick Access workspace.** Darktable offers a
    user-configurable Basic Controls/Quick Access surface alongside its complete
    module groups; it is not a fixed curated preset. C-41 currently makes users
@@ -391,7 +390,8 @@ workflow efficiency, P2 = remaining feature parity, P3 = validation):
    panel widths, and help text; do not make a layout change based on screenshot
    resemblance alone.
 
-**Execution order.** Land P0 terminology/state semantics first, then P1 Basics
+**Execution order.** The P0 terminology correction is implemented; do not add
+an Enabled/Used filter until its state model is reliable. Next, land P1 Basics
 and alias-aware search as small independently reviewable UI increments. Continue
 Retouch/Liquify work through the existing parity sprint plan (P2). Run the P3
 task-based comparison after those changes and update this audit with results;
