@@ -12,6 +12,8 @@ pub struct ModuleInfo {
     pub label: &'static str,
     /// Whether the module is on by default in a fresh edit.
     pub default_on: bool,
+    /// English upstream search aliases, separate from the stable display label.
+    pub aliases: &'static [&'static str],
 }
 
 /// A darktable module group (a collapsible section in the panel).
@@ -21,7 +23,15 @@ pub struct ModuleGroup {
 }
 
 const fn m(label: &'static str, default_on: bool) -> ModuleInfo {
-    ModuleInfo { label, default_on }
+    ModuleInfo { label, default_on, aliases: &[] }
+}
+
+const fn with_aliases(
+    label: &'static str,
+    default_on: bool,
+    aliases: &'static [&'static str],
+) -> ModuleInfo {
+    ModuleInfo { label, default_on, aliases }
 }
 
 /// The default module catalogue, in pipeline-ish presentation order.
@@ -33,23 +43,68 @@ static CATALOG: &[ModuleGroup] = &[
             modules: &[
                 m("Raw black/white point", true),
                 m("Invert", false),
-                m("Negadoctor", false),
+                with_aliases(
+                    "Negadoctor",
+                    false,
+                    &["film", "invert", "negative", "scan"],
+                ),
                 m("White balance", true),
                 m("Highlight reconstruction", false),
                 m("Demosaic", true),
                 m("Exposure", true),
-                m("Lens correction", false),
-                m("Rotate & perspective", false),
-                m("Crop", false),
+                with_aliases(
+                    "Lens correction",
+                    false,
+                    &["vignette", "chromatic aberrations", "distortion"],
+                ),
+                with_aliases(
+                    "Rotate & perspective",
+                    false,
+                    &[
+                        "rotation",
+                        "flip",
+                        "mirror",
+                        "keystone",
+                        "distortion",
+                        "crop",
+                        "reframe",
+                    ],
+                ),
+                with_aliases("Crop", false, &["reframe", "distortion"]),
                 m("Orientation", true),
             ],
         },
         ModuleGroup {
             name: "Tone",
             modules: &[
-                m("Sigmoid", false),
-                m("Filmic RGB", true),
-                m("Tone equalizer", false),
+                with_aliases(
+                    "Sigmoid",
+                    false,
+                    &["tone mapping", "view transform", "display transform"],
+                ),
+                with_aliases(
+                    "Filmic RGB",
+                    true,
+                    &[
+                        "tone mapping",
+                        "curve",
+                        "view transform",
+                        "contrast",
+                        "saturation",
+                        "highlights",
+                    ],
+                ),
+                with_aliases(
+                    "Tone equalizer",
+                    false,
+                    &[
+                        "tone curve",
+                        "tone mapping",
+                        "relight",
+                        "background light",
+                        "shadows highlights",
+                    ],
+                ),
                 m("Tone curve", false),
                 m("Levels", false),
                 m("Contrast brightness saturation", false),
@@ -63,8 +118,25 @@ static CATALOG: &[ModuleGroup] = &[
         ModuleGroup {
             name: "Color",
             modules: &[
-                m("Color calibration", true),
-                m("Color balance RGB", false),
+                with_aliases(
+                    "Color calibration",
+                    true,
+                    &["channel mixer", "white balance", "monochrome"],
+                ),
+                with_aliases(
+                    "Color balance RGB",
+                    false,
+                    &[
+                        "offset power slope",
+                        "cdl",
+                        "color grading",
+                        "contrast",
+                        "chroma_highlights",
+                        "hue",
+                        "vibrance",
+                        "saturation",
+                    ],
+                ),
                 m("Input color profile", true),
                 m("Output color profile", true),
                 m("Color zones", false),
@@ -84,7 +156,20 @@ static CATALOG: &[ModuleGroup] = &[
                 m("Hot pixels", false),
                 m("Chromatic aberrations", false),
                 m("Defringe", false),
-                m("Retouch", false),
+                with_aliases(
+                    "Retouch",
+                    false,
+                    &[
+                        "split-frequency",
+                        "healing",
+                        "cloning",
+                        "stamp",
+                        "blur",
+                        "fill",
+                        "wavelets",
+                        "spot removal",
+                    ],
+                ),
                 m("Liquify", false),
             ],
         },
@@ -125,6 +210,7 @@ mod tests {
             assert!(!g.modules.is_empty(), "group {} is empty", g.name);
             for mi in g.modules {
                 assert!(!mi.label.is_empty());
+                assert!(mi.aliases.iter().all(|alias| !alias.trim().is_empty()));
             }
         }
         // a sane total and at least one default-on module

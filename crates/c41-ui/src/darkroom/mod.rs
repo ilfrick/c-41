@@ -2566,11 +2566,26 @@ fn build_modules_panel(ctx: &PreviewCtx) -> (gtk4::Widget, gtk4::Box) {
 enum ModuleFilter {
     All,
     Wired,
+    Basics,
     Group(usize),
 }
 
+/// C-41's first-pass Quick Access set. This is a curated view over the existing
+/// rows, not duplicated controls or a second edit state.
+const BASIC_MODULE_LABELS: &[&str] = &[
+    "Exposure",
+    "Sigmoid",
+    "Filmic RGB",
+    "Tone equalizer",
+    "Tone curve",
+    "Color calibration",
+    "Color balance RGB",
+    "White balance",
+    "Shadows/Highlights",
+];
+
 /// Whether the row `(group_idx, label)` passes `filter` plus the search
-/// `query` (a case-insensitive label substring; empty matches everything).
+/// `query` (case-insensitive label or upstream alias; empty matches everything).
 /// Pure so it is unit-tested without GTK. `Wired` reuses [`is_live_module`] —
 /// the same predicate behind the header count and live-first ordering — so the
 /// three cannot disagree about which modules are implemented.
@@ -2578,6 +2593,7 @@ fn module_filter_matches(filter: ModuleFilter, group_idx: usize, label: &str, qu
     let scope_ok = match filter {
         ModuleFilter::All => true,
         ModuleFilter::Wired => is_live_module(label),
+        ModuleFilter::Basics => BASIC_MODULE_LABELS.contains(&label),
         ModuleFilter::Group(gi) => gi == group_idx,
     };
     if !scope_ok {
@@ -2586,7 +2602,22 @@ fn module_filter_matches(filter: ModuleFilter, group_idx: usize, label: &str, qu
     if query.is_empty() {
         return true;
     }
-    label.to_lowercase().contains(&query.to_lowercase())
+    let aliases = crate::catalog::module_catalog()
+        .get(group_idx)
+        .and_then(|group| group.modules.iter().find(|module| module.label == label))
+        .map(|module| module.aliases)
+        .unwrap_or(&[]);
+    module_name_matches(label, aliases, query)
+}
+
+/// Match a module's stable display name or one of its upstream English aliases.
+/// Translations remain a separate concern; the current C-41 catalog is English.
+fn module_name_matches(label: &str, aliases: &[&str], query: &str) -> bool {
+    let query = query.to_lowercase();
+    label.to_lowercase().contains(&query)
+        || aliases
+            .iter()
+            .any(|alias| alias.to_lowercase().contains(&query))
 }
 
 /// Apply the current filter to an already-built module list: hide rows and
@@ -2644,7 +2675,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
         .count();
 
     // Filter bar, above the header inside the scroller: scope toggles (All +
-    // Wired + one per catalog group, labels read from the catalog) plus a
+    // Wired + Basics + one per catalog group, labels read from the catalog) plus a
     // search entry, mirroring darktable's modulegroups tab bar. The widgets
     // are rebuilt with the panel, but the SELECTION lives in `ctx`
     // (`module_filter` / `module_search`), so Reset / undo-jump / style-apply
@@ -2662,10 +2693,8 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
         .build();
     let mut toggles: Vec<(ModuleFilter, gtk4::ToggleButton)> = vec![
         (ModuleFilter::All, gtk4::ToggleButton::with_label("All")),
-        (
-            ModuleFilter::Wired,
-            gtk4::ToggleButton::with_label("Wired"),
-        ),
+        (ModuleFilter::Wired, gtk4::ToggleButton::with_label("Wired")),
+        (ModuleFilter::Basics, gtk4::ToggleButton::with_label("Basics")),
     ];
     for (gi, group) in crate::catalog::module_catalog().iter().enumerate() {
         let btn = gtk4::ToggleButton::with_label(group.name);
@@ -2676,6 +2705,9 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
     toggles[1]
         .1
         .set_tooltip_text(Some("Show only implemented (wired) modules"));
+    toggles[2]
+        .1
+        .set_tooltip_text(Some("Show common first-pass controls across groups"));
     // Radio-like single select: joining a group keeps exactly one armed (a
     // click on the armed button keeps it armed, so the filter never lands on
     // "none selected"). Seed from ctx BEFORE connecting, so seeding fires no
@@ -6328,7 +6360,7 @@ mod tests {
     /// The filter scope + search matcher behind the w2 module filter bar.
     /// `Wired` must agree with `is_live_module` (the count + ordering
     /// predicate); it describes implementation status, not current edit state.
-    /// Search is a case-insensitive label substring combined with the scope.
+    /// Search case-folds labels and aliases, combining with the selected scope.
     #[test]
     fn module_filter_matches_scope_and_search() {
         // All shows everything, wired or placeholder, on an empty query.
@@ -6369,6 +6401,11 @@ mod tests {
         // A catalogue row that is not implemented is not shown as wired, even
         // when the search text matches it.
         assert!(!module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "reto"));
+        // Basics is one curated cross-group scope over the same module rows.
+        assert!(module_filter_matches(ModuleFilter::Basics, 0, "Exposure", ""));
+        assert!(module_filter_matches(ModuleFilter::Basics, 2, "Color balance RGB", "cdl"));
+        assert!(!module_filter_matches(ModuleFilter::Basics, 3, "Retouch", ""));
+        assert!(!module_filter_matches(ModuleFilter::Basics, 4, "Grain", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
@@ -6376,13 +6413,19 @@ mod tests {
             let label = crate::catalog::module_catalog()[gi].modules[0].label;
             assert!(module_filter_matches(ModuleFilter::Group(gi), gi, label, ""));
         }
-        // Search is a case-insensitive substring over the label.
+        // Search is a case-insensitive substring over labels or aliases.
         assert!(module_filter_matches(ModuleFilter::All, 0, "Exposure", "expo"));
         assert!(module_filter_matches(ModuleFilter::All, 0, "Exposure", "EXPO"));
         assert!(!module_filter_matches(ModuleFilter::All, 0, "Exposure", "velvia"));
+        // Upstream aliases are case-insensitive and scoped to their module.
+        assert!(module_filter_matches(ModuleFilter::All, 2, "Color calibration", "WHITE BALANCE"));
+        assert!(module_filter_matches(ModuleFilter::All, 0, "Rotate & perspective", "keystone"));
+        assert!(module_filter_matches(ModuleFilter::All, 3, "Retouch", "spot removal"));
+        assert!(!module_filter_matches(ModuleFilter::All, 0, "Exposure", "spot removal"));
         // Search combines with Wired: wired results match; placeholders do not.
         assert!(module_filter_matches(ModuleFilter::Wired, 4, "Highpass", "hig"));
-        assert!(!module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "reto"));
+        assert!(module_filter_matches(ModuleFilter::Wired, 2, "Color calibration", "channel mixer"));
+        assert!(!module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "spot removal"));
     }
 
     /// Distinctive non-default value used by the reset tests. Must differ from

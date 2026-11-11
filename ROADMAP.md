@@ -359,21 +359,20 @@ workflow efficiency, P2 = remaining feature parity, P3 = validation):
    this edit** scope remains future work: derive it from the same module state as
    the controls and test flag-only, default-on, raw-only, and elsewhere-driven
    cases before exposing it, so it cannot promise a false pipeline view.
-2. **P1 — No concise Quick Access workspace.** Darktable offers a
-   user-configurable Basic Controls/Quick Access surface alongside its complete
-   module groups; it is not a fixed curated preset. C-41 currently makes users
-   browse the full grouped stack even for common first-pass edits. Add a compact
-   C-41 Basics/Quick Access section with frequently used exposure, tone,
-   white-balance, and color controls; bind it to the existing `PreviewCtx` and
-   module state (no duplicate edit state), and keep the full module panel as the
-   discoverable advanced path. Decide which controls are useful defaults and
-   whether users can customize them; do not imply exact parity with darktable's
-   configurable list.
-3. **P1 — Module search is narrower than darktable's.** C-41 searches only the
-   displayed label substring; darktable also searches localized aliases and
-   multi-instance names. Add stable module aliases (and instance labels when
-   available), case-fold matching, and pure tests for aliases, case, and empty
-   results. Keep localized display text separate from stable module identity.
+2. **P1 — Quick Access.** Darktable offers a user-configurable Basic
+   Controls/Quick Access surface alongside its complete module groups; it is not
+   a fixed curated preset. C-41's first slice now adds a **Basics** scope over
+   nine common modules (exposure, tone, white balance, and color), reusing their
+   existing rows and `PreviewCtx` state rather than duplicating controls or edit
+   state. The full module list remains available. This is a curated C-41 default,
+   not yet user-customizable; gather task-test feedback before adding preference
+   UI or claiming full parity.
+3. **P1 — Search aliases and instance names.** C-41 now searches the displayed
+   label plus selected English aliases from darktable's module metadata, using
+   case-insensitive matching and tests for alias scope. Remaining parity: import
+   the full localized alias set when C-41 has a localization source, and include
+   per-instance names if/when the UI supports multiple instances; neither should
+   be conflated with stable module identity.
 4. **P2 — Catalogue visibility exceeds editing parity.** The grouped stack can
    expose catalogue rows that are not usable controls: Retouch is still inert.
    Liquify is wired and usable, but is a fixed 5×5 panel lattice rather than
@@ -390,14 +389,13 @@ workflow efficiency, P2 = remaining feature parity, P3 = validation):
    panel widths, and help text; do not make a layout change based on screenshot
    resemblance alone.
 
-**Execution order.** The P0 terminology correction is implemented; do not add
-an Enabled/Used filter until its state model is reliable. Next, land P1 Basics
-and alias-aware search as small independently reviewable UI increments. Continue
-Retouch/Liquify work through the existing parity sprint plan (P2). Run the P3
-task-based comparison after those changes and update this audit with results;
-revisit the current design only where an observed task fails. This UI track is
-complementary to Phase 9's GTK-independent agent API and must share its single
-edit-session state rather than introduce another writer.
+**Execution order.** The P0 terminology correction and first P1 Quick Access /
+alias-search slice are implemented; do not add an Enabled/Used filter until its
+state model is reliable. Continue Retouch/Liquify work through the existing
+parity sprint plan (P2). Run the P3 task-based comparison on the resulting UI and
+update this audit with results; revisit the current design only where an observed
+task fails. This UI track is complementary to Phase 9's GTK-independent agent API
+and must share its single edit-session state rather than introduce another writer.
 
 ---
 

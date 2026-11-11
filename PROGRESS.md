@@ -9580,3 +9580,22 @@ untouched.
 gates by exit code: workspace check, clippy, release tests (1,986 core / 573 UI),
 and release binary link. Existing unrelated warnings remain. No runtime deploy
 was performed.
+
+## 2026-11-11 19:11 UTC — UX P1: Basics scope and module search aliases
+
+**What.** Added a **Basics** scope as a curated cross-group filter over nine
+existing darkroom module rows; it reuses their current controls and `PreviewCtx`
+state, so there is no duplicate edit state. Added upstream English aliases to
+catalogue entries and case-insensitive search across labels and aliases,
+including perspective terms (`keystone`, `distortion`, `crop`, `reframe`). Tests
+cover Basics membership, alias scope/case, and Wired + alias filtering. Updated
+`ROADMAP.md` to record the shipped slice and remaining limits: no user-editable
+Basics set, full localization, or multi-instance names yet.
+
+**Reviewed.** Independent senior generalist review approved after correcting a
+missing subset of the upstream `ashift` aliases and a stale test comment.
+
+**Verified.** `git diff --check` clean. `scripts/ci-local.sh` passed all four
+gates by exit code: workspace check, clippy, release tests (1,986 core / 573 UI),
+and release binary link. Existing unrelated warnings remain. No runtime deploy
+was performed.
