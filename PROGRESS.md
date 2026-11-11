@@ -9499,3 +9499,19 @@ argument to `_`; no behavior changed.
 and 573 UI release tests. The previous full build had surfaced this new unused
 variable warning; it is now absent. Existing unrelated compiler/deprecation
 warnings remain.
+
+## 2026-11-11 17:28 UTC — S5 deploy: Liquify image rolled out
+
+**What.** After explicit user approval, built the production cargo-only image
+with `CACHEBUST=ce006779f80d36afa300d4599277096f24b31040` and deployed it as
+`c-41:ce006779f8`. Preserved the prior container and image as
+`c-41-rollback-ce006779f8` / `c-41:rollback-ce006779f8` (old image ID
+`2795c81949f2`). Reused the same `/config` and `/photos` bind mounts, NVIDIA
+runtime, port mappings and restart policy. No other services were modified.
+
+**Verified.** The new image ID is
+`f7045bada0d20f595bca7f506d146e922b7b7ec06ac763180d8f89a16c524f44`. The
+container is healthy, restart count 0, `/usr/local/bin/c41-rs` is running, and
+HTTP/HTTPS both return 200. Logs show no app panic; the known Kasm/Xvnc,
+xkbcomp and Mesa/ZINK environment warnings remain non-fatal. Rollback container
+is stopped and retained.
