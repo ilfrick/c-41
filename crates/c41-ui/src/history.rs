@@ -254,6 +254,8 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if rawprepare {
         return "Raw black/white point";
     }
+    let liq = old.liq_on != new.liq_on || old.liq_offsets != new.liq_offsets;
+    if liq { return "Liquify"; }
     let exposure = old.exposure_on != new.exposure_on
         || old.black != new.black
         || old.ev != new.ev;
@@ -1459,6 +1461,8 @@ mod tests {
             brd_frame_color_r: _,
             brd_frame_color_g: _,
             brd_frame_color_b: _,
+            liq_on: _,
+            liq_offsets: _,
         } = PreviewParams::default();
     }
 
@@ -1592,7 +1596,8 @@ mod tests {
         // normalize_R/G/B/sat/light/grey, clip — + 27 f32 — temperature, the
         // 9 red/green/blue mix coefficients, saturation/lightness/grey
         // vectors, gamut).
-        assert_eq!(PreviewParams::default().encode().len(), 2122);
+        // S5 Liquify (v38): 2122 → 2323 (1 bool + 50 f32 lattice offsets).
+        assert_eq!(PreviewParams::default().encode().len(), 2323);
     }
 
     #[test]

@@ -827,6 +827,12 @@ pub enum Stage {
     /// (`opacity 0` is not gated: the C still renders the surface and runs
     /// the blend with a zero alpha — the result is byte-identical to input
     /// only after the rounding, not by construction.)
+    /// Fixed 5×5 liquify displacement lattice (S5 slice 1). A zero lattice is
+    /// identity; nonzero offsets are bilinearly interpolated into the global
+    /// map and sampled through the ported `darkroom_liquify_apply_map` kernel.
+    /// This intentionally replaces darktable's freehand bezier editor with a
+    /// compact, serializable mesh.
+    Liquify { offsets: [f32; 50] },
     Watermark {
         /// The c41 wiring subset of the C params (opacity %, scale %, offsets,
         /// alignment ordinal 0..8, rotation degrees, asset index).
@@ -907,6 +913,7 @@ impl Stage {
             Stage::Soften { .. } => "soften",
             Stage::Defringe { .. } => "defringe",
             Stage::Watermark { .. } => "watermark",
+            Stage::Liquify { .. } => "liquify",
         }
     }
 
@@ -1079,7 +1086,7 @@ impl Stage {
             // output pixel through a position-dependent inverse transform — a
             // band's (band_pixels, 1) rectangle would hand the transform the
             // wrong coordinates. Serial whole-frame only, like Vignette/Soften.
-            Stage::Watermark { .. } => false,
+            Stage::Watermark { .. } | Stage::Liquify { .. } => false,
         }
     }
 
@@ -2225,6 +2232,12 @@ impl Stage {
             // directly in linear RGB (no Lab round-trip). NOT pixel-local (the
             // box mean reads neighbours), so `process` guarantees (width,
             // height) is the whole frame here.
+            Stage::Liquify { offsets } => {
+                let warped = crate::iop::liquify::process_lattice(
+                    input, width, height, &crate::iop::liquify::LiquifyParams { offsets: offsets.clone() },
+                );
+                output.copy_from_slice(&warped);
+            }
             Stage::Watermark { ref params, scale } => {
                 // Composite the marker over the finished frame (v50 pos 69,
                 // the last in-pipeline stage). The driver paints the

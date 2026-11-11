@@ -2772,6 +2772,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "White balance" => whitebalance_module_row(ctx).upcast(),
                 "Framing" => framing_module_row(ctx).upcast(),
                 "Watermark" => watermark_module_row(ctx).upcast(),
+                "Liquify" => liquify_module_row(ctx).upcast(),
                 "Invert" => invert_module_row(ctx).upcast(),
                 other => match elsewhere_hint(other) {
                     // Implemented, but driven from its own control — point at it
@@ -3060,7 +3061,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Color calibration", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Defringe", "Invert", "White balance", "Input color profile", "Framing", "Watermark"];
+const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Color calibration", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Liquify", "Defringe", "Invert", "White balance", "Input color profile", "Framing", "Watermark"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3282,6 +3283,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
         "Denoise (profiled)" => set!(dn_on, dn_mode_y0u0v0, dn_strength, dn_shadows, dn_bias),
         "Chromatic aberrations" => set!(cac_on, cac_guide, cac_radius, cac_strength, cac_mode, cac_refine),
         "Watermark" => set!(wm_on, wm_asset, wm_opacity, wm_scale, wm_xoffset, wm_yoffset, wm_alignment, wm_rotate),
+        "Liquify" => set!(liq_on, liq_offsets),
         "Lens correction" => set!(
             lens_on,
             lens_inverse,
@@ -5708,6 +5710,78 @@ fn chromatic_aberrations_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
 /// Mix-matrix defaults are the identity (diagonal 1.0, off-diagonal 0); the
 /// sat/light/grey banks default to 0 (neutral). Temp/illuminant controls use
 /// darktable's model coefficient ranges.
+fn liquify_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Liquify", "drag the 5×5 normalized warp lattice; darktable's freehand bezier paths are not yet surfaced", p0.liq_on,
+        |p, on| p.liq_on = on, |expander, ctx| {
+            let area = gtk4::DrawingArea::builder().content_width(240).content_height(180).hexpand(true).build();
+            let draw_ctx = ctx.clone();
+            area.set_draw_func(move |_, cr, w, h| {
+                let offsets = draw_ctx.params.borrow().liq_offsets;
+                let (w, h) = (w as f64, h as f64);
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+                cr.set_line_width(1.0);
+                for row in 0..5 {
+                    for col in 0..5 {
+                        let x = col as f64 * w / 4.0 + offsets[(row * 5 + col) * 2] as f64 * w;
+                        let y = row as f64 * h / 4.0 + offsets[(row * 5 + col) * 2 + 1] as f64 * h;
+                        if col < 4 {
+                            let nx = (col as f64 + 1.0) * w / 4.0 + offsets[(row * 5 + col + 1) * 2] as f64 * w;
+                            let ny = row as f64 * h / 4.0 + offsets[(row * 5 + col + 1) * 2 + 1] as f64 * h;
+                            cr.move_to(x, y); cr.line_to(nx, ny);
+                        }
+                        if row < 4 {
+                            let nx = col as f64 * w / 4.0 + offsets[((row + 1) * 5 + col) * 2] as f64 * w;
+                            let ny = (row as f64 + 1.0) * h / 4.0 + offsets[((row + 1) * 5 + col) * 2 + 1] as f64 * h;
+                            cr.move_to(x, y); cr.line_to(nx, ny);
+                        }
+                    }
+                }
+                let _ = cr.stroke();
+                for row in 0..5 { for col in 0..5 {
+                    let i = row * 5 + col;
+                    let x = col as f64 * w / 4.0 + offsets[i * 2] as f64 * w;
+                    let y = row as f64 * h / 4.0 + offsets[i * 2 + 1] as f64 * h;
+                    cr.arc(x, y, 4.0, 0.0, std::f64::consts::TAU);
+                    cr.set_source_rgb(0.95, 0.7, 0.2); let _ = cr.fill();
+                }}
+            });
+            let drag_node = Rc::new(std::cell::RefCell::new(None::<(usize, f32, f32)>));
+            let drag = gtk4::GestureDrag::new();
+            let begin_ctx = ctx.clone(); let begin_area = area.clone(); let begin_node = drag_node.clone();
+            drag.connect_drag_begin(move |_, x, y| {
+                let (w, h) = (begin_area.width() as f64, begin_area.height() as f64);
+                let p = begin_ctx.params.borrow(); let mut best = None; let mut dist = 14.0f64;
+                for row in 0..5 { for col in 0..5 {
+                    let i = row * 5 + col;
+                    let px = col as f64 * w / 4.0 + p.liq_offsets[i * 2] as f64 * w;
+                    let py = row as f64 * h / 4.0 + p.liq_offsets[i * 2 + 1] as f64 * h;
+                    let d = ((px-x).powi(2)+(py-y).powi(2)).sqrt(); if d < dist { best=Some(i); dist=d; }
+                }}
+                *begin_node.borrow_mut() = best.map(|i| (i, p.liq_offsets[i * 2], p.liq_offsets[i * 2 + 1]));
+            });
+            let update_ctx = ctx.clone(); let update_area = area.clone(); let update_node = drag_node.clone(); let update_weak = area.downgrade();
+            drag.connect_drag_update(move |g, dx, dy| {
+                let Some((i, start_x, start_y)) = *update_node.borrow() else { return; };
+                let (w,h) = (update_area.width().max(1) as f64, update_area.height().max(1) as f64);
+                { let mut p = update_ctx.params.borrow_mut();
+                    p.liq_offsets[i*2] = (start_x + (dx / w) as f32).clamp(-0.5,0.5);
+                    p.liq_offsets[i*2+1] = (start_y + (dy / h) as f32).clamp(-0.5,0.5);
+                    p.liq_on = true;
+                }
+                if let Some(area) = update_weak.upgrade() { area.queue_draw(); }
+                render_preview(&update_ctx);
+            });
+            let end_node = drag_node.clone(); drag.connect_drag_end(move |_,_,_| *end_node.borrow_mut() = None);
+            area.add_controller(drag);
+            expander.add_row(&area);
+            let reset = gtk4::Button::with_label("Reset warp");
+            let reset_ctx = ctx.clone(); let reset_area = area.clone();
+            reset.connect_clicked(move |_| { reset_ctx.params.borrow_mut().liq_offsets = [0.0;50]; reset_area.queue_draw(); render_preview(&reset_ctx); });
+            expander.add_row(&reset);
+        })
+}
+
 fn colorcalibration_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     module_expander(ctx, "Color calibration", "channel mixing and white balance", p0.ccl_on,
@@ -6681,6 +6755,11 @@ mod tests {
             p.cac_mode = M;
             p.cac_refine = true;
         }),
+        ("Liquify", |p| {
+            p.liq_on = true;
+            p.liq_offsets[24] = 0.125;
+            p.liq_offsets[25] = -0.25;
+        }),
         ("Watermark", |p| {
             p.wm_on = true;
             p.wm_asset = M;
@@ -7089,6 +7168,8 @@ mod tests {
             wm_yoffset: _,
             wm_alignment: _,
             wm_rotate: _,
+            liq_on: _,
+            liq_offsets: _,
             brd_on: _,
             brd_size: _,
             brd_pos_h: _,

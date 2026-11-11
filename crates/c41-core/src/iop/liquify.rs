@@ -22,6 +22,69 @@ impl IopProcess for Liquify {
     }
 }
 
+/// A fixed 5×5 displacement lattice, row-major, with `(dx,dy)` pairs in
+/// normalized image units. One unit is one full image width/height. This is
+/// the first product slice: it deliberately replaces darktable's freehand
+/// bezier-stroke editor while driving the same global map sampler kernel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiquifyParams {
+    pub offsets: [f32; 50],
+}
+
+impl Default for LiquifyParams {
+    fn default() -> Self { Self { offsets: [0.0; 50] } }
+}
+
+/// Bilinearly sample the 5×5 normalized displacement lattice at image
+/// fraction `(u,v)`, then scale its two components to pixel units.
+fn lattice_displacement(offsets: &[f32; 50], u: f32, v: f32, width: usize, height: usize) -> [f32; 2] {
+    let gx = u.clamp(0.0, 1.0) * 4.0;
+    let gy = v.clamp(0.0, 1.0) * 4.0;
+    let x0 = (gx.floor() as usize).min(3);
+    let y0 = (gy.floor() as usize).min(3);
+    let tx = gx - x0 as f32;
+    let ty = gy - y0 as f32;
+    let at = |x: usize, y: usize, c: usize| offsets[(y * 5 + x) * 2 + c];
+    let mut out = [0.0; 2];
+    for c in 0..2 {
+        let top = at(x0, y0, c) + (at(x0 + 1, y0, c) - at(x0, y0, c)) * tx;
+        let bot = at(x0, y0 + 1, c) + (at(x0 + 1, y0 + 1, c) - at(x0, y0 + 1, c)) * tx;
+        out[c] = (top + (bot - top) * ty) * if c == 0 { width as f32 } else { height as f32 };
+    }
+    out
+}
+
+/// Apply the normalized lattice through darktable's already-ported global
+/// distortion-map kernel. A zero lattice is an exact copy (the C's zero map
+/// bypasses sampling); nonzero points are smoothly interpolated over the
+/// frame. `roi_scale` is 1 for c41's whole-frame stage, retained to make the
+/// coordinate contract explicit.
+pub fn process_lattice(pixels: &[f32], width: usize, height: usize, params: &LiquifyParams) -> Vec<f32> {
+    let Some(n) = width.checked_mul(height).and_then(|n| n.checked_mul(4)) else { return pixels.to_vec(); };
+    if width == 0 || height == 0 || pixels.len() < n { return pixels.to_vec(); }
+    if params.offsets.iter().all(|v| *v == 0.0) { return pixels[..n].to_vec(); }
+    let (Ok(w), Ok(h)) = (i32::try_from(width), i32::try_from(height)) else { return pixels[..n].to_vec(); };
+    let mut map = vec![0.0f32; width * height * 2];
+    for y in 0..height {
+        for x in 0..width {
+            let d = lattice_displacement(&params.offsets, x as f32 / (width - 1).max(1) as f32,
+                y as f32 / (height - 1).max(1) as f32, width, height);
+            let i = (y * width + x) * 2;
+            map[i] = d[0];
+            map[i + 1] = d[1];
+        }
+    }
+    let mut out = pixels[..n].to_vec();
+    // DT_INTERPOLATION_DEFAULT_WARP is bicubic (enum value 1). Full-frame
+    // input/output/extent all have origin (0,0), as in this serial c41 stage.
+    unsafe {
+        darkroom_liquify_apply_map(pixels.as_ptr(), out.as_mut_ptr(),
+            0, 0, w, h, 0, 0, w, h, 0, 0, w, h,
+            map.as_ptr(), 4, 1);
+    }
+    out
+}
+
 // Complex helpers: treat float complex as [f32; 2] = [real, imag]
 #[inline(always)]
 fn re(p: &[f32; 2]) -> f32 {
@@ -888,5 +951,29 @@ mod tests {
             &[3.0, 1.0],
             "outside-map point must not move"
         );
+    }
+
+    #[test]
+    fn lattice_zero_is_exact_copy_and_single_point_is_deterministic() {
+        let (w, h) = (48, 40);
+        let input: Vec<f32> = (0..w * h * 4).map(|i| (i % 251) as f32 / 250.0).collect();
+        assert_eq!(process_lattice(&input, w, h, &LiquifyParams::default()), input);
+        let mut p = LiquifyParams::default();
+        p.offsets[(2 * 5 + 2) * 2] = 0.08;
+        let a = process_lattice(&input, w, h, &p);
+        let b = process_lattice(&input, w, h, &p);
+        assert_eq!(a, b);
+        assert_ne!(a, input);
+        assert!(a.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn lattice_interpolation_hits_grid_knots_and_midpoints() {
+        let mut p = [0.0; 50];
+        p[(2 * 5 + 2) * 2] = 0.1;
+        assert_eq!(lattice_displacement(&p, 0.5, 0.5, 100, 80), [10.0, 0.0]);
+        p[(2 * 5 + 3) * 2] = 0.3;
+        let midpoint = lattice_displacement(&p, 0.625, 0.5, 100, 80);
+        assert!((midpoint[0] - 20.0).abs() < 1e-5 && midpoint[1] == 0.0);
     }
 }

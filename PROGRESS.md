@@ -9463,4 +9463,28 @@ NOTES
 - Deviation class watched (the ~10% primaries-vs-ICC gap): the cv span
   note — S4 does NOT chase ICC colourant tags; it uses the same Lindbloom
   nominal D65 primaries precedent as Primaries/ColorBalanceRgb.
-- Next G1 rows: S5 Liquify (L/XL — warp-grid UI), S6/S7 Retouch ×2 (XL).
+- Next G1 rows: S6/S7 Retouch ×2 (XL).
+
+## 2026-11-11 12:18 UTC — S5: Liquify lattice slice 1
+
+**What.** Wired Liquify through the Rust pipeline and darkroom UI. `Stage::Liquify`
+uses a fixed 5×5 row-major lattice of normalized `(dx, dy)` offsets to construct
+a displacement map, then samples through the existing bicubic C FFI kernel. The
+lattice is draggable in the module panel. The stage is pinned at v50 order 28.0,
+before Exposure. PreviewParams v38 appends one enabled flag and 50 `f32` offsets;
+v37 backward decoding defaults Liquify off. History, reset, and styles are wired.
+Added `.pi/agents/c41-senior-software-reviewer.md`, a read-only generalist
+software-review profile, and used it for independent review.
+
+**Verified.** Independent senior review APPROVE after fixing its MAJOR finding:
+Liquify had initially been ordered after Exposure; the stage and canonical-order
+test now put it before Exposure. `scripts/ci-local.sh` passed all four gates by
+exit code (workspace check, clippy, release tests, release binary link): 1,986
+`c41-core` and 573 `c41-ui` tests. `git diff --check` passed.
+
+**Notes.** This is slice 1, not full darktable Liquify parity: the UI is a fixed
+lattice in the module panel rather than the C freehand Bezier/stamp editor;
+interpolation mode selection is deferred, and no C golden-render parity is
+claimed. The catalogue is now 51/52 active (46 live + 5 elsewhere-driven); only
+Retouch remains inert. No container or deployment services were changed; the
+install scripts remain untouched.

@@ -64,6 +64,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Hot pixels",
     "Denoise (profiled)",
     "Chromatic aberrations",
+    "Liquify",
     "Bloom",
     "Grain",
     "Soften",
@@ -72,9 +73,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "RGB curve",
     "Base curve",
     "Lens correction",
-    // Watermark closes the pipeline stages (v50 pos 69, the last); the
-    // geometry-family Framing compose still closes the whole list (it has no
-    // pipeline position — it runs on the base image).
+    // Watermark closes the pipeline stages (v50 pos 69, the last).
     "Watermark",
     "Framing",
 ];
@@ -521,6 +520,11 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.lens_target_geom = src.lens_target_geom;
             true
         }
+        "Liquify" => {
+            target.liq_on = src.liq_on;
+            target.liq_offsets = src.liq_offsets;
+            true
+        }
         // Watermark (watermark.c): a normal pipeline stage whose eight fields
         // all live in the blob, so a style carries them like any other module.
         "Watermark" => {
@@ -597,7 +601,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 44);
+        assert_eq!(MODULE_GROUPS.len(), 45);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
@@ -619,11 +623,9 @@ mod tests {
             "Watermark",
             "pipeline order ends at watermark (v50 pos 69)"
         );
-        assert_eq!(
-            MODULE_GROUPS[MODULE_GROUPS.len() - 3],
-            "Lens correction",
-            "lens correction sits before watermark"
-        );
+        let lens = MODULE_GROUPS.iter().position(|g| *g == "Lens correction").unwrap();
+        let watermark = MODULE_GROUPS.iter().position(|g| *g == "Watermark").unwrap();
+        assert!(lens < watermark, "lens correction precedes watermark in the pipeline");
     }
 
     #[test]

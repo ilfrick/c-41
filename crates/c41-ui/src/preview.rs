@@ -813,6 +813,12 @@ pub struct PreviewParams {
     pub wm_alignment: f32,
     /// `rotate` degrees −180..180 (`$DEFAULT` 0).
     pub wm_rotate: f32,
+    // ── Liquify (liquify.c; v50 pos 28.0) ────────────────────────────────
+    /// Fixed 5×5 displacement lattice enabled; zero offsets are identity.
+    pub liq_on: bool,
+    /// Row-major normalized `(dx,dy)` offsets for the 25 lattice handles.
+    /// Each component is a fraction of the full image dimension.
+    pub liq_offsets: [f32; 50],
     // ── Color calibration (channelmixerrgb.c, iop_order.c v50 pos 28.5) ────
     // A normal pipeline stage, first in the 28.5 scene-referred rank (the
     // v50_order table lists channelmixerrgb before negadoctor / blurs /
@@ -1224,6 +1230,8 @@ impl Default for PreviewParams {
             wm_yoffset: 0.0,
             wm_alignment: 4.0, // DT_SCALE_MAINMENU_IMAGE centre
             wm_rotate: 0.0,
+            liq_on: false,
+            liq_offsets: [0.0; 50],
             // Color calibration: off, at the darktable `$DEFAULT`s
             // (channelmixerrgb.c:92-112) — identity mix rows, zero
             // saturation/lightness/grey, no normalization, illuminant D
@@ -1521,6 +1529,7 @@ impl PreviewParams {
         // `Stage::ColorCalibration`). The gate mirrors `to_pipeline`, which
         // emits the stage whenever `ccl_on`.
         let ccl_identity = !self.ccl_on;
+        let liq_identity = !self.liq_on || self.liq_offsets.iter().all(|v| *v == 0.0);
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1545,6 +1554,7 @@ impl PreviewParams {
             && cac_identity
             && wm_identity
             && ccl_identity
+            && liq_identity
     }
 
     /// Hot-pixel options for raw decode; `None` while the module is off.
@@ -1798,6 +1808,7 @@ impl PreviewParams {
             cac_on: false,
             wm_on: false,
             ccl_on: false,
+            liq_on: false,
             ..*self
         }
     }
@@ -1852,7 +1863,7 @@ impl PreviewParams {
             // toggles and clip — appended after the watermark bool.
             self.ccl_on, self.ccl_normalize_r, self.ccl_normalize_g,
             self.ccl_normalize_b, self.ccl_normalize_sat, self.ccl_normalize_light,
-            self.ccl_normalize_grey, self.ccl_clip] {
+            self.ccl_normalize_grey, self.ccl_clip, self.liq_on] {
             v.push(b as u8);
         }
         for f in [
@@ -2070,7 +2081,12 @@ impl PreviewParams {
                   self.ccl_grey_r, self.ccl_grey_g, self.ccl_grey_b,
                   self.ccl_x, self.ccl_y, self.ccl_temperature, self.ccl_gamut,
                   self.ccl_illuminant, self.ccl_illum_fluo, self.ccl_illum_led,
-                  self.ccl_adaptation, self.ccl_version] {
+                  self.ccl_adaptation, self.ccl_version,
+                  self.liq_offsets[0], self.liq_offsets[1], self.liq_offsets[2], self.liq_offsets[3], self.liq_offsets[4], self.liq_offsets[5], self.liq_offsets[6], self.liq_offsets[7], self.liq_offsets[8], self.liq_offsets[9],
+                  self.liq_offsets[10], self.liq_offsets[11], self.liq_offsets[12], self.liq_offsets[13], self.liq_offsets[14], self.liq_offsets[15], self.liq_offsets[16], self.liq_offsets[17], self.liq_offsets[18], self.liq_offsets[19],
+                  self.liq_offsets[20], self.liq_offsets[21], self.liq_offsets[22], self.liq_offsets[23], self.liq_offsets[24], self.liq_offsets[25], self.liq_offsets[26], self.liq_offsets[27], self.liq_offsets[28], self.liq_offsets[29],
+                  self.liq_offsets[30], self.liq_offsets[31], self.liq_offsets[32], self.liq_offsets[33], self.liq_offsets[34], self.liq_offsets[35], self.liq_offsets[36], self.liq_offsets[37], self.liq_offsets[38], self.liq_offsets[39],
+                  self.liq_offsets[40], self.liq_offsets[41], self.liq_offsets[42], self.liq_offsets[43], self.liq_offsets[44], self.liq_offsets[45], self.liq_offsets[46], self.liq_offsets[47], self.liq_offsets[48], self.liq_offsets[49]] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -2579,6 +2595,11 @@ impl PreviewParams {
             ccl_illum_led: f.get(513).copied().unwrap_or(d.ccl_illum_led),
             ccl_adaptation: f.get(514).copied().unwrap_or(d.ccl_adaptation),
             ccl_version: f.get(515).copied().unwrap_or(d.ccl_version),
+            liq_on: bools.get(57).map_or(d.liq_on, |&b| b != 0),
+            liq_offsets: std::array::from_fn(|i| {
+                let v = f.get(516 + i).copied().unwrap_or(0.0);
+                if v.is_finite() { v.clamp(-0.5, 0.5) } else { 0.0 }
+            }),
         })
     }
 
@@ -2757,6 +2778,12 @@ impl PreviewParams {
                 mode: self.cac_mode as u8,
                 refine: self.cac_refine,
             });
+        }
+        // Liquify (liquify.c, v50_order pos 28.0) is listed immediately
+        // before Exposure among the 28.0 peers. It warps scene-linear pixels
+        // before exposure/tone adjustment; bypass zero offsets exactly.
+        if self.liq_on && self.liq_offsets.iter().any(|v| *v != 0.0) {
+            p.push(Stage::Liquify { offsets: self.liq_offsets });
         }
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
@@ -3582,11 +3609,12 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// normalize toggles, clip, the 3×3 mix rows, saturation/lightness/grey
 /// vectors, illuminant x/y + temperature, gamut, and the illuminant/fluo/
 /// led/adaptation/version enum ordinals, stored as floats like every
-/// dropdown ordinal) — a normal pipeline stage (v50 pos 28.5, first of
-/// the rank before negadoctor), so it joins is_identity and to_pipeline.
-const ENCODE_VERSION: u8 = 37;
-/// 1 version byte + 57 bool bytes + 516 little-endian f32.
-const ENCODED_LEN: usize = 1 + 57 + 516 * 4;
+/// dropdown ordinal) — a normal pipeline stage (v50 pos 28.5).
+/// v38 appends Liquify's 5×5 normalized `(dx,dy)` lattice (50 f32s) and an
+/// enable flag; it is a frame-global stage before color calibration.
+const ENCODE_VERSION: u8 = 38;
+/// 1 version byte + 58 bool bytes + 566 little-endian f32.
+const ENCODED_LEN: usize = 1 + 58 + 566 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -3619,6 +3647,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (35, 48, 482), // v35: Chromatic aberrations (cacorrectrgb) added
     (36, 49, 489), // v36: Watermark (watermark.c) added
     (37, 57, 516), // v37: Color calibration (channelmixerrgb) added
+    (38, 58, 566), // v38: Liquify 5×5 normalized dx/dy lattice added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -4466,6 +4495,8 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         wm_yoffset: -0.27,
         wm_alignment: 6.0,   // bottom-left — non-default
         wm_rotate: 31.5,
+        liq_on: true,
+        liq_offsets: std::array::from_fn(|i| if i % 2 == 0 { (i as f32 - 24.0) / 100.0 } else { (24.0 - i as f32) / 120.0 }),
         // Color calibration (v37): on, with the mix rows/correction vectors
         // heavily off-default and pairwise distinct so a wrong offset in the
         // trailing block shows as a round-trip mismatch; normalize toggles
@@ -5187,6 +5218,8 @@ mod tests {
         let mut p = PreviewParams::default();
         p.exposure_on = true;
         p.ev = 0.5;
+        p.liq_on = true;
+        p.liq_offsets[24] = 0.05;
         p.primaries_on = true;
         p.primaries_red_hue = 10.0; // off-default so the stage is emitted
         p.mono_on = true;
@@ -5276,7 +5309,7 @@ mod tests {
         // placement. This is a known deviation tracked for a follow-up commit.
         assert_eq!(
             names,
-            ["denoiseprofile", "cacorrectrgb", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "highpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning", "watermark"]
+            ["denoiseprofile", "cacorrectrgb", "liquify", "exposure", "toneequal", "graduatednd", "negadoctor", "primaries", "channelmixer", "sharpen", "basicadj", "colorbalancergb", "rgbcurve", "basecurve", "shadhi", "defringe", "lowpass", "highpass", "bilat", "colorcorrection", "sigmoid", "filmicrgb", "tonecurve", "levels", "velvia", "bloom", "colorize", "grain", "soften", "splittoning", "watermark"]
         );
         // Watermark is the final stage (v50 pos 69.0): it must run after the
         // whole display-referred cluster — never before the tone map, because
@@ -6062,6 +6095,16 @@ mod tests {
         assert!(decoded.is_identity());
         assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
             "a pre-watermark edit must not gain a watermark stage");
+    }
+
+    #[test]
+    fn decode_v37_blob_defaults_liquify() {
+        let mut b = vec![0u8; 1 + 57 + 516 * 4];
+        b[0] = 37;
+        let decoded = PreviewParams::decode(&b).expect("v37 blob must decode");
+        assert!(!decoded.liq_on);
+        assert_eq!(decoded.liq_offsets, [0.0; 50]);
+        assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().all(|s| !matches!(s, Stage::Liquify { .. })));
     }
 
     #[test]
