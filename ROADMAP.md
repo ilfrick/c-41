@@ -328,6 +328,79 @@ A human can inspect and correct the agent's result using the regular editor.
 
 ---
 
+### Comparative UX audit: darktable 5.4.0 vs C-41 (2026-11-11)
+
+**Scope and method.** Compared the running C-41 UI and darktable 5.4.0 at a
+1440×900 desktop viewport; also captured C-41 at 900×600 to include a constrained
+window. Cross-checked the visible editing/navigation model against the GTK4 UI
+(`crates/c41-ui/src/darkroom/mod.rs`, `catalog.rs`, `bauhaus.rs`) and darktable's
+module-group implementation (`src/libs/modulegroups.c`). The darktable capture
+used an isolated temporary config/library and a synthetic image. This is a
+source-backed product audit, not a moderated usability study; lower-resolution
+and realistic-catalog interaction checks remain part of the follow-up.
+
+**What already translates well.** C-41 retains the lighttable → darkroom workflow,
+three-area darkroom with history, image preview, and scrollable module controls,
+module categories, case-insensitive name search, expandable modules, and
+keyboard/scroll/drag slider interaction. The module panel also has Reset,
+history navigation, and a wired-module filter. These are meaningful parity
+strengths; do not replace them with a redesigned navigation model merely to
+look different.
+
+**Prioritized findings and actions** (P0 = correctness/discoverability, P1 =
+workflow efficiency, P2 = remaining feature parity, P3 = validation):
+
+1. **P0 — “Active” currently means “implemented”, not enabled/active in this
+   edit.** C-41's `ModuleFilter::Active` delegates to `is_live_module`, and the
+   catalogue counter says “N of M active”; darktable's Active Pipeline scope is
+   based on enabled modules or the current history, not port status. This is a
+   semantic mismatch that can hide the actual edit state from users. Rename the
+   existing scope and count to **Wired** (or **Available**) immediately. Add a
+   separately named **Enabled/Used in this edit** scope only when it can be
+   derived from the same module state as the switches/parameters; test flag-only,
+   default-on, raw-only, and elsewhere-driven controls so it never promises a
+   false pipeline view.
+2. **P1 — No concise Quick Access workspace.** Darktable offers a
+   user-configurable Basic Controls/Quick Access surface alongside its complete
+   module groups; it is not a fixed curated preset. C-41 currently makes users
+   browse the full grouped stack even for common first-pass edits. Add a compact
+   C-41 Basics/Quick Access section with frequently used exposure, tone,
+   white-balance, and color controls; bind it to the existing `PreviewCtx` and
+   module state (no duplicate edit state), and keep the full module panel as the
+   discoverable advanced path. Decide which controls are useful defaults and
+   whether users can customize them; do not imply exact parity with darktable's
+   configurable list.
+3. **P1 — Module search is narrower than darktable's.** C-41 searches only the
+   displayed label substring; darktable also searches localized aliases and
+   multi-instance names. Add stable module aliases (and instance labels when
+   available), case-fold matching, and pure tests for aliases, case, and empty
+   results. Keep localized display text separate from stable module identity.
+4. **P2 — Catalogue visibility exceeds editing parity.** The grouped stack can
+   expose catalogue rows that are not usable controls: Retouch is still inert.
+   Liquify is wired and usable, but is a fixed 5×5 panel lattice rather than
+   darktable's freehand canvas editor. Keep inert Retouch explicitly
+   distinguished from wired modules; finish Retouch as its own parity increment,
+   and treat Liquify's canvas,
+   interpolation modes, and direct-on-image interaction as a separately scoped
+   follow-up rather than implying slice-1 parity.
+5. **P3 — Confirm density and discoverability at real window sizes.** At both
+   1440×900 and 900×600, run scripted first-edit tasks (find Exposure, locate
+   enabled edits, reset one module, recover from an empty search, and move between
+   history and controls). Record completion time, misclicks, clipped controls,
+   and keyboard-only blockers. Use the results to tune filter-bar wrapping,
+   panel widths, and help text; do not make a layout change based on screenshot
+   resemblance alone.
+
+**Execution order.** Land P0 terminology/state semantics first, then P1 Basics
+and alias-aware search as small independently reviewable UI increments. Continue
+Retouch/Liquify work through the existing parity sprint plan (P2). Run the P3
+task-based comparison after those changes and update this audit with results;
+revisit the current design only where an observed task fails. This UI track is
+complementary to Phase 9's GTK-independent agent API and must share its single
+edit-session state rather than introduce another writer.
+
+---
+
 ## Docker Deployment
 
 ### Files added in this repository

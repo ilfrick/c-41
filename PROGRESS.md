@@ -9533,3 +9533,30 @@ were applied: share one GTK-independent edit-session service (no parallel
 writer), use one atomic optimistic revision scheme across UI and agent, and
 require race-resistant descriptor-relative export creation. `git diff --check`
 passed. Documentation-only; no product code or services changed.
+
+## 2026-11-11 18:10 UTC — UX audit: darktable 5.4.0 vs C-41
+
+**What.** Added a comparative UI/interaction audit and prioritized action plan to
+`ROADMAP.md`. The audit records existing strengths (shared lighttable/darkroom
+flow, grouped modules, search, history, expandable controls) and separates four
+concrete gaps: “Active” means wired rather than enabled, C-41 lacks a Quick
+Access workspace (darktable's counterpart is user-configurable), search lacks
+aliases/instance names, and Retouch/Liquify have known parity limits. It orders
+corrective work as P0 terminology/state semantics, P1 Quick Access and search,
+P2 module parity, then P3 task-based usability validation.
+
+**Evidence.** Checked C-41's live GTK4 UI at 1440×900 and 900×600 (screenshots
+captured), darktable 5.4.0 in an isolated Xvfb session at 1440×900 with a
+synthetic image, and the corresponding UI/source implementations. Darktable's
+catalogue was not used; the small-window task study is explicitly left as a
+follow-up rather than claimed complete. The plan requires shared edit state and
+must not create a second writer alongside Phase 9.
+
+**Verified.** Documentation-only; no product code, container, or deployment
+service changed. Independent senior review requested clarification that
+darktable's Quick Access list is user-configurable and that Liquify is wired
+(only full canvas parity is missing); both corrections were applied and the
+reviewer approved the revision. `git diff --check` is clean. `scripts/ci-local.sh`
+passed all four gates by exit code: workspace check, clippy, release tests
+(1,986 core / 573 UI), and release binary link. Existing unrelated warnings
+remain. No code changed, so no runtime deployment was performed.
