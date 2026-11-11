@@ -9515,3 +9515,21 @@ container is healthy, restart count 0, `/usr/local/bin/c41-rs` is running, and
 HTTP/HTTPS both return 200. Logs show no app panic; the known Kasm/Xvnc,
 xkbcomp and Mesa/ZINK environment warnings remain non-fatal. Rollback container
 is stopped and retained.
+
+## 2026-11-11 17:39 UTC — Roadmap: agent-native photo editing
+
+**What.** Added Phase 9 to `ROADMAP.md` for making C-41 usable as an editing
+tool by external AI agents. The staged plan covers a GTK-independent, versioned
+Rust editing contract; read-only MCP-over-stdio discovery and bounded previews;
+validated plan/preview/commit operations with history and undo; confined,
+permission-gated derivative export; and human review with integration/security
+acceptance tests. Recorded the v1 trust boundaries: local-only, read-only by
+default, no shell/eval, no raw blob API or source overwrite, and explicit
+approval for writes/exports. Phase 9 is a priority track, separate from the old
+phase 0–8 duration estimate.
+
+**Reviewed.** Independent generalist reviewer APPROVE. Follow-up suggestions
+were applied: share one GTK-independent edit-session service (no parallel
+writer), use one atomic optimistic revision scheme across UI and agent, and
+require race-resistant descriptor-relative export creation. `git diff --check`
+passed. Documentation-only; no product code or services changed.

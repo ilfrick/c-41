@@ -2,7 +2,9 @@
 
 **Goal**: produce a Lightroom Classic/CC-competitive desktop photo editor built on the
 Darktable codebase, adding the major premium features that Lightroom has and Darktable
-currently lacks, while keeping (and improving) Darktable's existing strengths.
+currently lacks, while keeping (and improving) Darktable's existing strengths. C-41
+must also offer a safe, documented tool interface so external AI agents can inspect,
+preview, and make reversible photo edits without screen-scraping or driving GTK.
 
 ---
 
@@ -245,6 +247,87 @@ has multi-image grid layouts with fine typography.
 
 ---
 
+### Phase 9 – Agent-native photo editing (priority track; begin after the current UI/engine foundations)
+
+**Goal**: let an external AI agent use C-41 as a photo-editing tool through a
+stable, model-agnostic interface. The agent should discover supported controls,
+propose edits, inspect a preview, and—when authorized—save a reversible edit or
+export a derivative. It must not automate GTK or infer undocumented binary
+parameter blobs.
+
+**Product decision**: start with a local **MCP server over stdio** for
+compatibility with MCP-capable agent hosts. Keep the protocol adapter thin over a
+versioned C-41 Rust editing API; the API, not MCP, is the stable product
+contract. No network listener, shell/eval tool, cloud account, or arbitrary
+filesystem access in v1. A non-MCP host can later use the same API through a
+small CLI/JSON-RPC adapter.
+
+**Phases and deliverables**:
+
+1. **9a — Headless editing contract.** First map ownership of preview,
+   history, export, and catalogue writes. Extract a GTK-independent image-session
+   service from the current `c41-ui` flows (candidate `c41-engine`/`c41-session`
+   crate; name TBD) and have both UI and agent call it—do not duplicate rendering
+   or introduce a second independent edit writer. Separate image-session
+   operations (open a catalogue image, load its current edit, render a bounded
+   preview, inspect capabilities) from GTK widget callbacks; define versioned
+   contracts for patch validation, history, undo, and export before implementing
+   them in later slices. Publish a versioned capability/parameter schema derived
+   only from controls actually wired in C-41. Use stable module/parameter names,
+   typed values, limits, defaults, and clear unsupported-operation errors; never
+   expose raw `PreviewParams` bytes as the API.
+2. **9b — Read-only MCP MVP.** Implement tools to list/search catalogue images,
+   inspect metadata and current edit, enumerate supported modules/parameters,
+   and render a small before/current preview. Tools return bounded structured
+   results with image IDs and provenance; large image data is not returned
+   inline. Verify interoperability with at least one MCP client.
+3. **9c — Reversible edit loop.** Add `plan_edit` / `preview_edit` /
+   `commit_edit` operations for a validated parameter patch. Return a concise
+   diff and preview before persistence. Commit atomically as one named history
+   step, preserve undo/redo, and report exactly which requested changes were
+   accepted, clamped, or refused. Start with a deliberately small allowlist of
+   well-tested live modules; expand only when preview/export/history parity is
+   covered by tests.
+4. **9d — Safe derivative export.** Require an output directory explicitly
+   configured by the user in C-41; do not accept an agent-supplied root. Resolve
+   the configured root and use race-resistant descriptor-relative creation
+   (no-follow + create-exclusive semantics) so path traversal, symlink escapes,
+   and replacement of an existing destination are refused. Also reject
+   unsupported formats and resource-limit violations. Never modify or delete
+   the source photo. Require
+   explicit user approval for persistent edits and exports by default; provide a
+   narrowly scoped opt-in policy for unattended local workflows.
+5. **9e — Human-in-the-loop and quality gate.** Show agent-authored changes in
+   the C-41 UI with source/agent attribution, editable history labels, preview,
+   undo, and an obvious approval/rejection path. Add end-to-end tests for
+   tool-schema compatibility, restart persistence, undo, path confinement,
+   denied permissions, and representative edit tasks; document setup and a
+   sample agent workflow.
+
+**Security and trust invariants**: read-only is the initial/default mode; each
+write/export is an explicit capability, not implied by opening a catalogue.
+Target images by catalogue ID from user-configured roots, validate every patch
+against the published schema and current image state, cap preview dimensions and
+job resources, and log the agent identity plus accepted edit. Use an optimistic
+edit revision token shared by every writer (GTK and agent); check the token and
+persist the edit atomically in one transaction. If the UI or another client
+changes the image after the agent preview, reject the stale commit and require
+re-planning rather than clobbering either edit; the UI must refresh/reopen
+external commits safely. No
+arbitrary code, shell commands, raw-file overwrite, delete, unbounded path, or
+silent persistence. Human approval cannot depend on an MCP host feature that may
+not exist: the C-41 approval policy must work locally and fail closed when
+required.
+
+**Exit criteria**: a supported MCP host can discover C-41 capabilities, find an
+image, inspect its current edit, request a bounded preview, propose a valid
+multi-parameter edit, obtain a before/after preview, and commit it only with
+permission; the saved history survives restart, can be undone in the ordinary
+UI, and an optional derivative export is confined to the configured destination.
+A human can inspect and correct the agent's result using the regular editor.
+
+---
+
 ## Docker Deployment
 
 ### Files added in this repository
@@ -302,9 +385,12 @@ docker run --gpus all \
 | 6 | Cloud Sync + Web Viewer | Very High | 24–36 |
 | 7 | Mobile App | High | 30–42 |
 | 8 | Print Layouts | Low | 36–44 |
+| 9a–9e | Agent-native editing API + MCP tools | High; staged, gated by headless edit contract | Priority track; schedule after UI/engine foundations |
 
-**Total calendar time (single developer)**: ~44 weeks from today.
-**With a 4-developer team**: ~14–16 weeks for phases 0–5 in parallel.
+**Baseline estimate for phases 0–8 (single developer)**: ~44 weeks from the
+original plan date; Phase 9 is a separately prioritized track and is not included
+in that estimate. **With a 4-developer team**: ~14–16 weeks for phases 0–5 in
+parallel.
 
 ---
 
@@ -319,6 +405,7 @@ docker run --gpus all \
 | Flutter 3.x | Mobile app | 7 |
 | KasmVNC | Browser-accessible desktop in Docker | Docker |
 | NVIDIA Container Toolkit | Optional device passthrough (no C-41 GPU compute yet) | Docker |
+| MCP Rust SDK / protocol adapter (evaluate API maturity and licensing first) | Local stdio tool server for AI-agent hosts | 9b |
 
 ---
 
