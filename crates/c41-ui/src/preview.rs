@@ -813,6 +813,82 @@ pub struct PreviewParams {
     pub wm_alignment: f32,
     /// `rotate` degrees −180..180 (`$DEFAULT` 0).
     pub wm_rotate: f32,
+    // ── Color calibration (channelmixerrgb.c, iop_order.c v50 pos 28.5) ────
+    // A normal pipeline stage, first in the 28.5 scene-referred rank (the
+    // v50_order table lists channelmixerrgb before negadoctor / blurs /
+    // primaries at the same position): CAT16 chromatic adaptation of the
+    // working-space RGB to the illuminant (chromaticity x/y + a named
+    // illuminant or temperature), a user channel-mix 3×3 with per-row
+    // normalization, saturation/lightness/grey vectors, and the D50-gamut
+    // compression (1/gamut power) with negative clip. Runs on linear RGB,
+    // per-pixel (see [`Stage::ColorCalibration`](c41_core::pipeline::Stage::
+    // ColorCalibration), which carries the process-ready matrices built by
+    // `ChannelmixerRgbData::from_params`). Ships off, like darktable's
+    // default. All params prefixed `ccl_` to avoid colliding with the Color
+    // correction (`color_correction_*`) blob region.
+    /// Color calibration module enabled.
+    pub ccl_on: bool,
+    /// Red-channel mix row `[R, G, B, ·]`, default identity `[1, 0, 0, ·]`
+    /// (darktable `red[]`; `MIX[0][]` in channelmixerrgb.c commit_params).
+    pub ccl_red_r: f32,
+    pub ccl_red_g: f32,
+    pub ccl_red_b: f32,
+    /// Green-channel mix row, default `[0, 1, 0, ·]`.
+    pub ccl_green_r: f32,
+    pub ccl_green_g: f32,
+    pub ccl_green_b: f32,
+    /// Blue-channel mix row, default `[0, 0, 1, ·]`.
+    pub ccl_blue_r: f32,
+    pub ccl_blue_g: f32,
+    pub ccl_blue_b: f32,
+    /// Saturation vector `[R, G, B, ·]`, default 0 (darktable `saturation[]`).
+    pub ccl_sat_r: f32,
+    pub ccl_sat_g: f32,
+    pub ccl_sat_b: f32,
+    /// Lightness vector `[R, G, B, ·]`, default 0 (darktable `lightness[]`).
+    pub ccl_light_r: f32,
+    pub ccl_light_g: f32,
+    pub ccl_light_b: f32,
+    /// Show-grey vector `[R, G, B, ·]`, default 0 (darktable `grey[]`;
+    /// non-zero activates the grey pass, `apply_grey`).
+    pub ccl_grey_r: f32,
+    pub ccl_grey_g: f32,
+    pub ccl_grey_b: f32,
+    /// Normalize the red mix row (divide by the row sum), default off.
+    pub ccl_normalize_r: bool,
+    /// Normalize the green mix row, default off.
+    pub ccl_normalize_g: bool,
+    /// Normalize the blue mix row, default off.
+    pub ccl_normalize_b: bool,
+    /// Normalize the saturation vector (subtract its mean), default off.
+    pub ccl_normalize_sat: bool,
+    /// Normalize the lightness vector (subtract its mean), default off.
+    pub ccl_normalize_light: bool,
+    /// Normalize the grey vector (divide by its sum), default off.
+    pub ccl_normalize_grey: bool,
+    /// Illuminant chromaticity x, default 0.333 (channelmixerrgb.c `chroma.x`).
+    pub ccl_x: f32,
+    /// Illuminant chromaticity y, default 0.333 (`chroma.y`).
+    pub ccl_y: f32,
+    /// Colour temperature in Kelvin, default 5003 (the D50 nominal CCT).
+    pub ccl_temperature: f32,
+    /// Gamut-compression amount 0..12, default 1.0 (0 disables the map;
+    /// the C applies the `1/gamut` power).
+    pub ccl_gamut: f32,
+    /// Illuminant enum ordinal, stored as f32 like the other dropdown
+    /// ordinals. Default 2 = D (daylight).
+    pub ccl_illuminant: f32,
+    /// Fluorescent illuminant ordinal, default 2 = F3.
+    pub ccl_illum_fluo: f32,
+    /// LED illuminant ordinal, default 4 = B5.
+    pub ccl_illum_led: f32,
+    /// Adaptation kind ordinal (`dt_adaptation_t`), default 1 = CAT16.
+    pub ccl_adaptation: f32,
+    /// Saturation algorithm version ordinal, default 2 = V3.
+    pub ccl_version: f32,
+    /// Clip negative values to 0 after the transform, default true
+    /// (darktable `clip`; off = `minval -FLT_MAX`).
+    pub ccl_clip: bool,
 }
 
 /// The C-default 2-node identity curve `[(0,0), (1,1)]`, tail zeroed — shared
@@ -1148,6 +1224,37 @@ impl Default for PreviewParams {
             wm_yoffset: 0.0,
             wm_alignment: 4.0, // DT_SCALE_MAINMENU_IMAGE centre
             wm_rotate: 0.0,
+            // Color calibration: off, at the darktable `$DEFAULT`s
+            // (channelmixerrgb.c:92-112) — identity mix rows, zero
+            // saturation/lightness/grey, no normalization, illuminant D
+            // (daylight) @ 5003 K on neutral chromaticity (0.333, 0.333),
+            // gamut 1.0, clip TRUE, saturation V3. Inert because `ccl_on`
+            // gates the pipeline stage — and even enabled these defaults are
+            // a real edit (illuminant adaptation + gamut map + clip), never
+            // a no-op.
+            ccl_on: false,
+            ccl_red_r: 1.0, ccl_red_g: 0.0, ccl_red_b: 0.0,
+            ccl_green_r: 0.0, ccl_green_g: 1.0, ccl_green_b: 0.0,
+            ccl_blue_r: 0.0, ccl_blue_g: 0.0, ccl_blue_b: 1.0,
+            ccl_sat_r: 0.0, ccl_sat_g: 0.0, ccl_sat_b: 0.0,
+            ccl_light_r: 0.0, ccl_light_g: 0.0, ccl_light_b: 0.0,
+            ccl_grey_r: 0.0, ccl_grey_g: 0.0, ccl_grey_b: 0.0,
+            ccl_normalize_r: false,
+            ccl_normalize_g: false,
+            ccl_normalize_b: false,
+            ccl_normalize_sat: false,
+            ccl_normalize_light: false,
+            ccl_normalize_grey: false,
+            ccl_x: 0.333,
+            ccl_y: 0.333,
+            ccl_temperature: 5003.0,
+            ccl_gamut: 1.0,
+            ccl_illuminant: 2.0, // DT_ILLUMINANT_D (daylight)
+            ccl_illum_fluo: 2.0, // DT_ILLUMINANT_FLUO_F3
+            ccl_illum_led: 4.0,  // DT_ILLUMINANT_LED_B5
+            ccl_adaptation: 1.0, // KIND_CAT16
+            ccl_version: 2.0,    // VER_V3
+            ccl_clip: true,
             df_on: false,
             df_radius: 4.0,   // defringe.c $DEFAULT
             df_thresh: 20.0,  // defringe.c $DEFAULT
@@ -1407,6 +1514,13 @@ impl PreviewParams {
         // stage whenever `wm_on`.)
         let cac_identity = !self.cac_on;
         let wm_identity = !self.wm_on;
+        // Color calibration gates on the enable flag alone (Bloom policy):
+        // even at the darktable defaults the C adapts to the 5003 K daylight
+        // illuminant, runs the D50 gamut compression (gamut 1 → 1/1) and
+        // clips negatives — a real edit, never a no-op while enabled (see
+        // `Stage::ColorCalibration`). The gate mirrors `to_pipeline`, which
+        // emits the stage whenever `ccl_on`.
+        let ccl_identity = !self.ccl_on;
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1430,6 +1544,7 @@ impl PreviewParams {
             && soften_identity
             && cac_identity
             && wm_identity
+            && ccl_identity
     }
 
     /// Hot-pixel options for raw decode; `None` while the module is off.
@@ -1598,6 +1713,41 @@ impl PreviewParams {
         }
     }
 
+    /// The UI fields mapped onto the core's `ChannelmixerRgbParams` — the
+    /// single construction site for `to_pipeline`, so preview and export can
+    /// never disagree about what the sliders mean. The `[f32; 4]` vectors
+    /// leave the alpha lane 0 (read as 0 by the kernel math, like the C's
+    /// 3×3); the five enum ordinals (illuminant/fluo/led/adaptation/version)
+    /// are stored as floats in the blob and cast to the `u8` the core struct
+    /// expects.
+    fn ccl_params(&self) -> c41_core::iop::channelmixerrgb::ChannelmixerRgbParams {
+        use c41_core::iop::channelmixerrgb::ChannelmixerRgbParams;
+        ChannelmixerRgbParams {
+            red: [self.ccl_red_r, self.ccl_red_g, self.ccl_red_b, 0.0],
+            green: [self.ccl_green_r, self.ccl_green_g, self.ccl_green_b, 0.0],
+            blue: [self.ccl_blue_r, self.ccl_blue_g, self.ccl_blue_b, 0.0],
+            saturation: [self.ccl_sat_r, self.ccl_sat_g, self.ccl_sat_b, 0.0],
+            lightness: [self.ccl_light_r, self.ccl_light_g, self.ccl_light_b, 0.0],
+            grey: [self.ccl_grey_r, self.ccl_grey_g, self.ccl_grey_b, 0.0],
+            normalize_r: self.ccl_normalize_r,
+            normalize_g: self.ccl_normalize_g,
+            normalize_b: self.ccl_normalize_b,
+            normalize_sat: self.ccl_normalize_sat,
+            normalize_light: self.ccl_normalize_light,
+            normalize_grey: self.ccl_normalize_grey,
+            illuminant: self.ccl_illuminant as u8,
+            illum_fluo: self.ccl_illum_fluo as u8,
+            illum_led: self.ccl_illum_led as u8,
+            adaptation: self.ccl_adaptation as u8,
+            x: self.ccl_x,
+            y: self.ccl_y,
+            temperature: self.ccl_temperature,
+            gamut: self.ccl_gamut,
+            clip: self.ccl_clip,
+            version: self.ccl_version as u8,
+        }
+    }
+
     /// A copy with every stage disabled — `apply_pipeline` with it returns the
     /// input unchanged. Used by the darkroom view's before/after toggle to show
     /// the unprocessed image (and its histogram) without disturbing the params.
@@ -1637,6 +1787,17 @@ impl PreviewParams {
             bc_on: false,
             lens_on: false,
             lc_on: false,
+            // Stage flags added after `lc_on` (G1/sprint rows) — a flag-only
+            // stage's before/after toggle must also switch its stage OFF, or
+            // the "before" histogram/render keeps the processed image.
+            gr_on: false,
+            soften_on: false,
+            df_on: false,
+            highpass_on: false,
+            brd_on: false,
+            cac_on: false,
+            wm_on: false,
+            ccl_on: false,
             ..*self
         }
     }
@@ -1686,7 +1847,12 @@ impl PreviewParams {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ENCODED_LEN);
         v.push(ENCODE_VERSION);
-        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on, self.brd_on, self.cac_on, self.cac_refine, self.wm_on] {
+        for b in [self.exposure_on, self.velvia_on, self.split_on, self.mono_on, self.sigmoid_on, self.sharpen_on, self.vibrance_on, self.color_contrast_on, self.temperature_on, self.invert_on, self.colorize_on, self.color_correction_on, self.colorzones_on, self.levels_on, self.vignette_on, self.lowlight_on, self.gradnd_on, self.colisa_on, self.basicadj_on, self.lowpass_on, self.shadhi_on, self.primaries_on, self.negadoctor_on, self.toneeq_on, self.cb_on, self.filmic_on, self.hl_on, self.hl_opposed, self.dn_on, self.dn_mode_y0u0v0, self.bl_on, self.tc_on, self.tc_unbound, self.rc_on, self.bc_on, self.lens_on, self.lens_inverse, self.lc_on, self.gr_on, self.soften_on, self.df_on, self.highpass_on, self.hotpixels_on, self.hotpixels_permissive, self.rwp_on, self.brd_on, self.cac_on, self.cac_refine, self.wm_on,
+            // Color calibration (v37): the enable flag, six normalize
+            // toggles and clip — appended after the watermark bool.
+            self.ccl_on, self.ccl_normalize_r, self.ccl_normalize_g,
+            self.ccl_normalize_b, self.ccl_normalize_sat, self.ccl_normalize_light,
+            self.ccl_normalize_grey, self.ccl_clip] {
             v.push(b as u8);
         }
         for f in [
@@ -1889,7 +2055,22 @@ impl PreviewParams {
                   // after the cac block so the layout stays append-only.
                   self.wm_asset, self.wm_opacity, self.wm_scale,
                   self.wm_xoffset, self.wm_yoffset,
-                  self.wm_alignment, self.wm_rotate] {
+                  self.wm_alignment, self.wm_rotate,
+                  // Color calibration (v37): the three mix rows, the
+                  // saturation/lightness/grey vectors, illuminant x/y +
+                  // temperature, gamut, and the five enum/version ordinals
+                  // (stored as floats like every dropdown ordinal) —
+                  // appended after the watermark block so the layout stays
+                  // append-only.
+                  self.ccl_red_r, self.ccl_red_g, self.ccl_red_b,
+                  self.ccl_green_r, self.ccl_green_g, self.ccl_green_b,
+                  self.ccl_blue_r, self.ccl_blue_g, self.ccl_blue_b,
+                  self.ccl_sat_r, self.ccl_sat_g, self.ccl_sat_b,
+                  self.ccl_light_r, self.ccl_light_g, self.ccl_light_b,
+                  self.ccl_grey_r, self.ccl_grey_g, self.ccl_grey_b,
+                  self.ccl_x, self.ccl_y, self.ccl_temperature, self.ccl_gamut,
+                  self.ccl_illuminant, self.ccl_illum_fluo, self.ccl_illum_led,
+                  self.ccl_adaptation, self.ccl_version] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -2283,6 +2464,121 @@ impl PreviewParams {
                 let v = f.get(488).copied().unwrap_or(d.wm_rotate);
                 if v.is_finite() { v.clamp(-180.0, 180.0) } else { d.wm_rotate }
             },
+            // Color calibration (v37): bools 49–56, floats 489–515. v36-and-
+            // earlier blobs end before any of this — every `.get` misses and
+            // each slot keeps its default (ccl off ⇒ no stage, exactly like
+            // reading a fresh edit). The mix coefficients, saturation/
+            // lightness/grey vectors, temperature and gamut feed the committed
+            // matrices/illuminant math directly, so non-finite blob values
+            // fold to the defaults (a bare `clamp` leaves NaN intact and
+            // would propagate NaN colour through the CAT16 adaptation and
+            // the gamut map); finite values are bounded to the C hard ranges
+            // (mix ±2 = COLOR_MIN/MAX, temperature 1667..25000, gamut 0..12).
+            // x/y are chromaticity coordinates — finite-folded only, like
+            // the ordinals they have no hard range — and the five enum/
+            // version ordinals are stored raw like `cac_mode`/`df_mode` (a
+            // faithful record; the driver maps out-of-range to defaults).
+            ccl_on: bools.get(49).map_or(d.ccl_on, |&b| b != 0),
+            ccl_normalize_r: bools.get(50).map_or(d.ccl_normalize_r, |&b| b != 0),
+            ccl_normalize_g: bools.get(51).map_or(d.ccl_normalize_g, |&b| b != 0),
+            ccl_normalize_b: bools.get(52).map_or(d.ccl_normalize_b, |&b| b != 0),
+            ccl_normalize_sat: bools.get(53).map_or(d.ccl_normalize_sat, |&b| b != 0),
+            ccl_normalize_light: bools.get(54).map_or(d.ccl_normalize_light, |&b| b != 0),
+            ccl_normalize_grey: bools.get(55).map_or(d.ccl_normalize_grey, |&b| b != 0),
+            ccl_clip: bools.get(56).map_or(d.ccl_clip, |&b| b != 0),
+            ccl_red_r: {
+                let v = f.get(489).copied().unwrap_or(d.ccl_red_r);
+                if !v.is_finite() { d.ccl_red_r } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_red_g: {
+                let v = f.get(490).copied().unwrap_or(d.ccl_red_g);
+                if !v.is_finite() { d.ccl_red_g } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_red_b: {
+                let v = f.get(491).copied().unwrap_or(d.ccl_red_b);
+                if !v.is_finite() { d.ccl_red_b } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_green_r: {
+                let v = f.get(492).copied().unwrap_or(d.ccl_green_r);
+                if !v.is_finite() { d.ccl_green_r } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_green_g: {
+                let v = f.get(493).copied().unwrap_or(d.ccl_green_g);
+                if !v.is_finite() { d.ccl_green_g } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_green_b: {
+                let v = f.get(494).copied().unwrap_or(d.ccl_green_b);
+                if !v.is_finite() { d.ccl_green_b } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_blue_r: {
+                let v = f.get(495).copied().unwrap_or(d.ccl_blue_r);
+                if !v.is_finite() { d.ccl_blue_r } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_blue_g: {
+                let v = f.get(496).copied().unwrap_or(d.ccl_blue_g);
+                if !v.is_finite() { d.ccl_blue_g } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_blue_b: {
+                let v = f.get(497).copied().unwrap_or(d.ccl_blue_b);
+                if !v.is_finite() { d.ccl_blue_b } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_sat_r: {
+                let v = f.get(498).copied().unwrap_or(d.ccl_sat_r);
+                if !v.is_finite() { d.ccl_sat_r } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_sat_g: {
+                let v = f.get(499).copied().unwrap_or(d.ccl_sat_g);
+                if !v.is_finite() { d.ccl_sat_g } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_sat_b: {
+                let v = f.get(500).copied().unwrap_or(d.ccl_sat_b);
+                if !v.is_finite() { d.ccl_sat_b } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_light_r: {
+                let v = f.get(501).copied().unwrap_or(d.ccl_light_r);
+                if !v.is_finite() { d.ccl_light_r } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_light_g: {
+                let v = f.get(502).copied().unwrap_or(d.ccl_light_g);
+                if !v.is_finite() { d.ccl_light_g } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_light_b: {
+                let v = f.get(503).copied().unwrap_or(d.ccl_light_b);
+                if !v.is_finite() { d.ccl_light_b } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_grey_r: {
+                let v = f.get(504).copied().unwrap_or(d.ccl_grey_r);
+                if !v.is_finite() { d.ccl_grey_r } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_grey_g: {
+                let v = f.get(505).copied().unwrap_or(d.ccl_grey_g);
+                if !v.is_finite() { d.ccl_grey_g } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_grey_b: {
+                let v = f.get(506).copied().unwrap_or(d.ccl_grey_b);
+                if !v.is_finite() { d.ccl_grey_b } else { v.clamp(-2.0, 2.0) }
+            },
+            ccl_x: {
+                let v = f.get(507).copied().unwrap_or(d.ccl_x);
+                if v.is_finite() { v } else { d.ccl_x }
+            },
+            ccl_y: {
+                let v = f.get(508).copied().unwrap_or(d.ccl_y);
+                if v.is_finite() { v } else { d.ccl_y }
+            },
+            ccl_temperature: {
+                let v = f.get(509).copied().unwrap_or(d.ccl_temperature);
+                if !v.is_finite() { d.ccl_temperature } else { v.clamp(1667.0, 25000.0) }
+            },
+            ccl_gamut: {
+                let v = f.get(510).copied().unwrap_or(d.ccl_gamut);
+                if !v.is_finite() { d.ccl_gamut } else { v.clamp(0.0, 12.0) }
+            },
+            ccl_illuminant: f.get(511).copied().unwrap_or(d.ccl_illuminant),
+            ccl_illum_fluo: f.get(512).copied().unwrap_or(d.ccl_illum_fluo),
+            ccl_illum_led: f.get(513).copied().unwrap_or(d.ccl_illum_led),
+            ccl_adaptation: f.get(514).copied().unwrap_or(d.ccl_adaptation),
+            ccl_version: f.get(515).copied().unwrap_or(d.ccl_version),
         })
     }
 
@@ -2517,6 +2813,27 @@ impl PreviewParams {
                 offset: self.gradnd_offset,
                 hue: self.gradnd_hue,
                 saturation: self.gradnd_saturation,
+            });
+        }
+        // Color calibration (channelmixerrgb.c, iop_order.c v50_order pos
+        // 28.5 — scene-referred, listed FIRST of the 28.5 rank, before
+        // negadoctor / blurs / primaries). Per-pixel colour map: CAT16
+        // chromatic adaptation to the illuminant (x/y + temperature, or a
+        // named illuminant), the normalized channel-mix 3×3, saturation/
+        // lightness/grey vectors and the 1/gamut D50-gamut compression with
+        // negative clip, baked once per render by
+        // `ChannelmixerRgbData::from_params` into the process-ready matrices
+        // the stage carries. The stage is emitted on the enable flag alone
+        // (`is_identity` mirrors this): even at the darktable defaults the C
+        // adapts to the 5003 K daylight illuminant, runs the gamut map and
+        // clips — never a no-op.
+        if self.ccl_on {
+            p.push(Stage::ColorCalibration {
+                data: Box::new(c41_core::iop::channelmixerrgb::ChannelmixerRgbData::from_params(
+                    &self.ccl_params(),
+                    space,
+                )),
+                space,
             });
         }
         // Negadoctor (negadoctor.c, iop_order.c v50_order pos 28.5 — after
@@ -3261,9 +3578,15 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v36 adds Watermark (1 bool + 7 f32: asset index, opacity %, scale %,
 /// x/y offsets, alignment ordinal, rotation) — a normal pipeline stage
 /// (v50 pos 69, the last), so it joins is_identity and to_pipeline.
-const ENCODE_VERSION: u8 = 36;
-/// 1 version byte + 49 bool bytes + 489 little-endian f32.
-const ENCODED_LEN: usize = 1 + 49 + 489 * 4;
+/// v37 adds Color calibration (8 bools + 27 f32: the enable flag, six
+/// normalize toggles, clip, the 3×3 mix rows, saturation/lightness/grey
+/// vectors, illuminant x/y + temperature, gamut, and the illuminant/fluo/
+/// led/adaptation/version enum ordinals, stored as floats like every
+/// dropdown ordinal) — a normal pipeline stage (v50 pos 28.5, first of
+/// the rank before negadoctor), so it joins is_identity and to_pipeline.
+const ENCODE_VERSION: u8 = 37;
+/// 1 version byte + 57 bool bytes + 516 little-endian f32.
+const ENCODED_LEN: usize = 1 + 57 + 516 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -3295,6 +3618,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (34, 46, 478), // v34: Framing (borders) geometry compose added
     (35, 48, 482), // v35: Chromatic aberrations (cacorrectrgb) added
     (36, 49, 489), // v36: Watermark (watermark.c) added
+    (37, 57, 516), // v37: Color calibration (channelmixerrgb) added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -4142,6 +4466,36 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         wm_yoffset: -0.27,
         wm_alignment: 6.0,   // bottom-left — non-default
         wm_rotate: 31.5,
+        // Color calibration (v37): on, with the mix rows/correction vectors
+        // heavily off-default and pairwise distinct so a wrong offset in the
+        // trailing block shows as a round-trip mismatch; normalize toggles
+        // deliberately mixed (some on), illuminant E (3) diverges from the
+        // D (2) default, temperature/gamut off the 5003/1.0 defaults, clip
+        // off, adaptation moved to FULL_BRADFORD (2). Values stay inside the
+        // decode clamp ranges so the round-trip is exact.
+        ccl_on: true,
+        ccl_red_r: 1.5, ccl_red_g: -0.6, ccl_red_b: 0.2,
+        ccl_green_r: -0.7, ccl_green_g: 1.6, ccl_green_b: 0.3,
+        ccl_blue_r: 0.4, ccl_blue_g: -0.9, ccl_blue_b: 1.8,
+        ccl_sat_r: 0.7, ccl_sat_g: 1.9, ccl_sat_b: -0.2,
+        ccl_light_r: -1.1, ccl_light_g: 1.3, ccl_light_b: 0.8,
+        ccl_grey_r: -1.8, ccl_grey_g: 0.1, ccl_grey_b: 1.2,
+        ccl_normalize_r: true,
+        ccl_normalize_g: false,
+        ccl_normalize_b: true,
+        ccl_normalize_sat: true,
+        ccl_normalize_light: false,
+        ccl_normalize_grey: true,
+        ccl_x: 0.42,
+        ccl_y: 0.26,
+        ccl_temperature: 4200.0,
+        ccl_gamut: 7.0,
+        ccl_illuminant: 3.0, // DT_ILLUMINANT_E — non-default
+        ccl_illum_fluo: 1.0,
+        ccl_illum_led: 0.0,
+        ccl_adaptation: 2.0, // KIND_FULL_BRADFORD — non-default
+        ccl_version: 2.0,    // VER_V3
+        ccl_clip: false,
         df_on: true,
         df_radius: 7.5,
         df_thresh: 62.0,
@@ -4287,6 +4641,83 @@ mod tests {
         let out = render_linear_to_srgb8(&lin, 8, 8, &p);
         let off = render_linear_to_srgb8(&lin, 8, 8, &PreviewParams::default());
         assert_eq!(out, off, "opacity 0 must render byte-identical");
+    }
+
+    #[test]
+    fn color_calibration_default_off_stays_byte_identical() {
+        // The v37 constraint: a default edit (ccl off) must round-trip the
+        // 8-bit preview byte-for-byte, exactly as if the module did not exist.
+        let base = vec![
+            12u8, 34, 56, 200,  // pixel 0 RGBA
+            78, 90, 123, 111,   // pixel 1
+            45, 67, 89, 255,    // pixel 2
+        ];
+        let d = PreviewParams::default();
+        assert!(!d.ccl_on, "ccl must ship off");
+        assert!(d.is_identity());
+        let out = apply_pipeline(&base, 3, 1, 4, 4, &d);
+        assert_eq!(out, base, "default-off must be byte-identical");
+    }
+
+    #[test]
+    fn color_calibration_enabled_changes_preview_and_export_deterministically() {
+        // A synthetic frame of saturated colour quadrants (the cac test's own
+        // trick — a neutral-grey frame would survive the adaptation + gamut
+        // map unchanged, since chromatic adaptation and gamut compression
+        // both preserve the achromatic axis): enabling the module at a
+        // non-default temperature/gamut must change both the 8-bit preview
+        // and the 16-bit export encoding vs the disabled run (the CAT16
+        // adaptation to the 7000 K illuminant rebalances every saturated
+        // pixel and gamut 2 compresses the saturated primaries), and two
+        // enabled runs must agree bit-for-bit (a deterministic pipeline).
+        let (w, h) = (64usize, 48usize);
+        let mut lin = vec![0.2f32; w * h * 4];
+        for j in 0..h {
+            for i in 0..w {
+                let b = (j * w + i) * 4;
+                lin[b + 3] = 1.0;
+                match (j < h / 2, i < w / 2) {
+                    (true, true) => { lin[b] = 0.95; lin[b + 1] = 0.05; lin[b + 2] = 0.05; }   // red
+                    (true, false) => { lin[b] = 0.05; lin[b + 1] = 0.95; lin[b + 2] = 0.05; } // green
+                    (false, true) => { lin[b] = 0.05; lin[b + 1] = 0.05; lin[b + 2] = 0.95; }  // blue
+                    (false, false) => { lin[b] = 0.95; lin[b + 1] = 0.95; lin[b + 2] = 0.05; } // yellow
+                }
+            }
+        }
+        let off = render_linear_to_srgb8(&lin, w, h, &PreviewParams::default());
+        let mut on = PreviewParams::default();
+        on.ccl_on = true;
+        on.ccl_temperature = 7000.0; // off the 5003 K daylight default
+        on.ccl_gamut = 2.0;          // off the 1.0 default
+        let a = render_linear_to_srgb8(&lin, w, h, &on);
+        let b = render_linear_to_srgb8(&lin, w, h, &on);
+        assert_eq!(a, b, "enabled preview must be deterministic");
+        assert_ne!(a, off, "adapting to the 7000 K illuminant must change the preview");
+        // 16-bit exports share the same to_pipeline builder — the pipeline
+        // stage must show up there identically.
+        let off16 = render_linear_to_srgb16(&lin, w, h, &PreviewParams::default());
+        let a16 = render_linear_to_srgb16(&lin, w, h, &on);
+        assert_ne!(off16, a16, "export must change like the preview");
+        let b16 = render_linear_to_srgb16(&lin, w, h, &on);
+        assert_eq!(a16, b16, "enabled export must be deterministic");
+    }
+
+    #[test]
+    fn color_calibration_mix_rows_reach_the_rendered_pixels() {
+        // A non-identity red mix row must visibly change the preview through
+        // the public funnel (the stage's matrices are committed once per
+        // render, so a regression that dropped `ccl_params` from the stage —
+        // e.g. building from defaults — would leave the pixels untouched).
+        let (w, h) = (16usize, 1usize);
+        let lin = vec![0.3f32; w * h * 4];
+        let off = render_linear_to_srgb8(&lin, w, h, &PreviewParams::default());
+        let mut on = PreviewParams::default();
+        on.ccl_on = true;
+        on.ccl_red_r = 1.0;
+        on.ccl_red_g = 1.0;
+        on.ccl_red_b = 0.0; // R_out pulls from G too
+        let a = render_linear_to_srgb8(&lin, w, h, &on);
+        assert_ne!(a, off, "a mixed red row must reach the pixels");
     }
 
     #[test]
@@ -4438,6 +4869,27 @@ mod tests {
         // non-stage params (e.g. velvia_strength) are preserved for restore
         assert_eq!(b.velvia_strength, 80.0);
         assert_eq!(b.ev, 2.0);
+        let base = vec![60u8, 120, 180];
+        assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &b), base);
+    }
+
+    #[test]
+    fn bypassed_clears_flag_only_stage_flags() {
+        // S1–S4 stage rows gate on their enable flag alone (ccl/cac/wm/...):
+        // before/after must ALSO clear those flags, or the "before" render
+        // keeps the processed image (the systemic gap found in the S4 review
+        // — the old test only covered exposure/velvia/split).
+        let mut p = PreviewParams::default();
+        p.ccl_on = true;
+        p.ccl_temperature = 12000.0; // a real edit at any flag-on
+        p.cac_on = true;
+        p.wm_on = true;
+        p.highpass_on = true;
+        let b = p.bypassed();
+        assert!(b.is_identity());
+        assert!(!b.ccl_on && !b.cac_on && !b.wm_on && !b.highpass_on);
+        // param values are preserved for restore, only the flags cleared
+        assert_eq!(b.ccl_temperature, 12000.0);
         let base = vec![60u8, 120, 180];
         assert_eq!(apply_pipeline(&base, 1, 1, 3, 3, &b), base);
     }
@@ -5020,6 +5472,46 @@ mod tests {
     }
 
     #[test]
+    fn to_pipeline_orders_channelmixerrgb_before_negadoctor() {
+        // channelmixerrgb is v50 pos 28.5, listed FIRST of the 28.5 rank —
+        // immediately before negadoctor (also 28.5), then primaries (28.5),
+        // with the exposure (21) / denoise (9) cluster before and basicadj
+        // (40) after. Pinned on BOTH builders (to_pipeline_with and the raw
+        // lens-preapplied funnel) so the scene-referred placement cannot
+        // drift between the paths.
+        let mut p = PreviewParams::default();
+        p.dn_on = true;
+        p.exposure_on = true;
+        p.ev = 0.5; // off-default so exposure is emitted
+        p.ccl_on = true;
+        p.negadoctor_on = true;
+        p.primaries_on = true;
+        p.primaries_achromatic_tint_hue = 12.0; // non-neutral — stage emitted
+        p.basicadj_on = true;
+        p.basicadj_contrast = 0.5; // non-neutral — stage emitted
+        let expected = ["denoiseprofile", "exposure", "channelmixerrgb", "negadoctor", "primaries", "basicadj"];
+        let with: Vec<&str> = p
+            .to_pipeline_with(ColorSpace::LinearSrgb, 1.0, None, 0)
+            .stages
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(with, expected, "{with:?}");
+        let ccl = with.iter().position(|n| *n == "channelmixerrgb");
+        assert_eq!(with.get(ccl.unwrap() + 1), Some(&"negadoctor"), "channelmixerrgb must sit directly before negadoctor");
+        // The raw builder (lens pre-applied) lines the 28.5 rank up identically.
+        let pre: Vec<&str> = p
+            .to_pipeline_lens_preapplied(ColorSpace::LinearSrgb, 1.0, None, 0)
+            .stages
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(pre, expected, "{pre:?}");
+        let ccl_pre = pre.iter().position(|n| *n == "channelmixerrgb");
+        assert_eq!(pre.get(ccl_pre.unwrap() + 1), Some(&"negadoctor"), "{pre:?}");
+    }
+
+    #[test]
     fn to_pipeline_lens_preapplied_omits_only_the_lens_stage() {
         // The raw funnels receive an already-warped buffer (the m4-131 pre-pass
         // ran on the full frame before geometry), so their builder must drop
@@ -5570,6 +6062,151 @@ mod tests {
         assert!(decoded.is_identity());
         assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
             "a pre-watermark edit must not gain a watermark stage");
+    }
+
+    #[test]
+    fn decode_v36_blob_defaults_color_calibration() {
+        // A v36 blob (the last layout before Color calibration — 49 bools /
+        // 489 f32s) must decode with ccl OFF and its controls at the
+        // darktable defaults, so an image edited before the module existed
+        // loads unchanged instead of gaining a chromatic-adaptation + gamut
+        // pass behind the user's back. `ccl_on` is the load-bearing flag:
+        // `unwrap_or(true)` would adapt every saved edit — and even at the
+        // defaults an enabled module is a real edit (5003 K adaptation + gamut
+        // map + clip), never a no-op.
+        let v36 = {
+            let mut b = vec![0u8; 1 + 49 + 489 * 4];
+            b[0] = 36;
+            b
+        };
+        let decoded = PreviewParams::decode(&v36).expect("v36 blob must decode (backward compat)");
+        let def = PreviewParams::default();
+        assert!(!decoded.ccl_on);
+        assert_eq!(
+            (decoded.ccl_red_r, decoded.ccl_red_g, decoded.ccl_red_b),
+            (def.ccl_red_r, def.ccl_red_g, def.ccl_red_b)
+        );
+        assert_eq!(
+            (decoded.ccl_green_r, decoded.ccl_green_g, decoded.ccl_green_b),
+            (def.ccl_green_r, def.ccl_green_g, def.ccl_green_b)
+        );
+        assert_eq!(
+            (decoded.ccl_blue_r, decoded.ccl_blue_g, decoded.ccl_blue_b),
+            (def.ccl_blue_r, def.ccl_blue_g, def.ccl_blue_b)
+        );
+        assert_eq!(
+            (decoded.ccl_sat_r, decoded.ccl_sat_g, decoded.ccl_sat_b),
+            (def.ccl_sat_r, def.ccl_sat_g, def.ccl_sat_b)
+        );
+        assert_eq!(
+            (decoded.ccl_light_r, decoded.ccl_light_g, decoded.ccl_light_b),
+            (def.ccl_light_r, def.ccl_light_g, def.ccl_light_b)
+        );
+        assert_eq!(
+            (decoded.ccl_grey_r, decoded.ccl_grey_g, decoded.ccl_grey_b),
+            (def.ccl_grey_r, def.ccl_grey_g, def.ccl_grey_b)
+        );
+        assert_eq!(decoded.ccl_normalize_r, def.ccl_normalize_r);
+        assert_eq!(decoded.ccl_normalize_g, def.ccl_normalize_g);
+        assert_eq!(decoded.ccl_normalize_b, def.ccl_normalize_b);
+        assert_eq!(decoded.ccl_normalize_sat, def.ccl_normalize_sat);
+        assert_eq!(decoded.ccl_normalize_light, def.ccl_normalize_light);
+        assert_eq!(decoded.ccl_normalize_grey, def.ccl_normalize_grey);
+        assert_eq!(decoded.ccl_x, def.ccl_x);
+        assert_eq!(decoded.ccl_y, def.ccl_y);
+        assert_eq!(decoded.ccl_temperature, def.ccl_temperature);
+        assert_eq!(decoded.ccl_gamut, def.ccl_gamut);
+        assert_eq!(decoded.ccl_illuminant, def.ccl_illuminant);
+        assert_eq!(decoded.ccl_illum_fluo, def.ccl_illum_fluo);
+        assert_eq!(decoded.ccl_illum_led, def.ccl_illum_led);
+        assert_eq!(decoded.ccl_adaptation, def.ccl_adaptation);
+        assert_eq!(decoded.ccl_version, def.ccl_version);
+        assert_eq!(decoded.ccl_clip, def.ccl_clip);
+        // And it must still be an identity pipeline — the real consequence of
+        // the defaults being right.
+        assert!(decoded.is_identity());
+        assert!(decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.is_empty(),
+            "a pre-color-calibration edit must not gain a channelmixerrgb stage");
+    }
+
+    #[test]
+    fn encode_decode_roundtrips_color_calibration() {
+        // Every ccl_* field set off-default, then encoded and decoded back —
+        // an index slip inside the v37 bools 49–56 / floats 489–515 blocks
+        // (or a clamp that bites in-range values) shows up as a mismatch.
+        let mut p = PreviewParams::default();
+        p.ccl_on = true;
+        p.ccl_normalize_r = true;
+        p.ccl_normalize_g = false;
+        p.ccl_normalize_b = true;
+        p.ccl_normalize_sat = true;
+        p.ccl_normalize_light = false;
+        p.ccl_normalize_grey = true;
+        p.ccl_clip = false;
+        p.ccl_red_r = -1.5; p.ccl_red_g = 0.75; p.ccl_red_b = 1.25;
+        p.ccl_green_r = 0.8; p.ccl_green_g = -0.4; p.ccl_green_b = 0.2;
+        p.ccl_blue_r = 0.6; p.ccl_blue_g = 1.4; p.ccl_blue_b = -1.1;
+        p.ccl_sat_r = 0.5; p.ccl_sat_g = -0.25; p.ccl_sat_b = 1.1;
+        p.ccl_light_r = 0.9; p.ccl_light_g = -0.75; p.ccl_light_b = 0.35;
+        p.ccl_grey_r = -0.6; p.ccl_grey_g = 0.45; p.ccl_grey_b = 1.3;
+        p.ccl_x = 0.4;
+        p.ccl_y = 0.25;
+        p.ccl_temperature = 4200.0;
+        p.ccl_gamut = 7.0;
+        p.ccl_illuminant = 3.0;   // E — non-default
+        p.ccl_illum_fluo = 1.0;
+        p.ccl_illum_led = 0.0;
+        p.ccl_adaptation = 2.0;   // FULL_BRADFORD — non-default
+        p.ccl_version = 2.0;      // VER_V3
+        let blob = p.encode();
+        assert_eq!(blob.len(), ENCODED_LEN);
+        let q = PreviewParams::decode(&blob).expect("v37 blob must decode");
+        let tol = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert_eq!(q.ccl_on, p.ccl_on);
+        assert_eq!(q.ccl_normalize_r, p.ccl_normalize_r);
+        assert_eq!(q.ccl_normalize_g, p.ccl_normalize_g);
+        assert_eq!(q.ccl_normalize_b, p.ccl_normalize_b);
+        assert_eq!(q.ccl_normalize_sat, p.ccl_normalize_sat);
+        assert_eq!(q.ccl_normalize_light, p.ccl_normalize_light);
+        assert_eq!(q.ccl_normalize_grey, p.ccl_normalize_grey);
+        assert_eq!(q.ccl_clip, p.ccl_clip);
+        let pairs: &[(&str, f32, f32)] = &[
+            ("ccl_red_r", q.ccl_red_r, p.ccl_red_r),
+            ("ccl_red_g", q.ccl_red_g, p.ccl_red_g),
+            ("ccl_red_b", q.ccl_red_b, p.ccl_red_b),
+            ("ccl_green_r", q.ccl_green_r, p.ccl_green_r),
+            ("ccl_green_g", q.ccl_green_g, p.ccl_green_g),
+            ("ccl_green_b", q.ccl_green_b, p.ccl_green_b),
+            ("ccl_blue_r", q.ccl_blue_r, p.ccl_blue_r),
+            ("ccl_blue_g", q.ccl_blue_g, p.ccl_blue_g),
+            ("ccl_blue_b", q.ccl_blue_b, p.ccl_blue_b),
+            ("ccl_sat_r", q.ccl_sat_r, p.ccl_sat_r),
+            ("ccl_sat_g", q.ccl_sat_g, p.ccl_sat_g),
+            ("ccl_sat_b", q.ccl_sat_b, p.ccl_sat_b),
+            ("ccl_light_r", q.ccl_light_r, p.ccl_light_r),
+            ("ccl_light_g", q.ccl_light_g, p.ccl_light_g),
+            ("ccl_light_b", q.ccl_light_b, p.ccl_light_b),
+            ("ccl_grey_r", q.ccl_grey_r, p.ccl_grey_r),
+            ("ccl_grey_g", q.ccl_grey_g, p.ccl_grey_g),
+            ("ccl_grey_b", q.ccl_grey_b, p.ccl_grey_b),
+            ("ccl_x", q.ccl_x, p.ccl_x),
+            ("ccl_y", q.ccl_y, p.ccl_y),
+            ("ccl_temperature", q.ccl_temperature, p.ccl_temperature),
+            ("ccl_gamut", q.ccl_gamut, p.ccl_gamut),
+            ("ccl_illuminant", q.ccl_illuminant, p.ccl_illuminant),
+            ("ccl_illum_fluo", q.ccl_illum_fluo, p.ccl_illum_fluo),
+            ("ccl_illum_led", q.ccl_illum_led, p.ccl_illum_led),
+            ("ccl_adaptation", q.ccl_adaptation, p.ccl_adaptation),
+            ("ccl_version", q.ccl_version, p.ccl_version),
+        ];
+        for (name, got, want) in pairs {
+            assert!(tol(*got, *want), "{name} round-trip: {got} != {want}");
+        }
+        // The mapped core params agree too — the same construction site the
+        // pipeline stage uses (the values ride through the decode clamp
+        // unchanged since they are all in-range, so this is the exact
+        // post-fold contract).
+        assert_eq!(q.ccl_params(), p.ccl_params());
     }
 
     #[test]

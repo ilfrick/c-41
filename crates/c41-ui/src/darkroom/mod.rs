@@ -2744,6 +2744,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "Negadoctor" => negadoctor_module_row(ctx).upcast(),
                 "Tone equalizer" => toneequal_module_row(ctx).upcast(),
                 "Color balance RGB" => cbrgb_module_row(ctx).upcast(),
+                "Color calibration" => colorcalibration_module_row(ctx).upcast(),
                 "Filmic RGB" => filmic_module_row(ctx).upcast(),
                 "Highlight reconstruction" => highlights_module_row(ctx).upcast(),
                 "Hot pixels" => hotpixels_module_row(ctx).upcast(),
@@ -3059,7 +3060,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Defringe", "Invert", "White balance", "Input color profile", "Framing", "Watermark"];
+const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Color calibration", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Defringe", "Invert", "White balance", "Input color profile", "Framing", "Watermark"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3257,6 +3258,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             cb_contrast,
             cb_formula
         ),
+        "Color calibration" => set!(ccl_on, ccl_normalize_r, ccl_normalize_g, ccl_normalize_b, ccl_normalize_sat, ccl_normalize_light, ccl_normalize_grey, ccl_clip, ccl_red_r, ccl_red_g, ccl_red_b, ccl_green_r, ccl_green_g, ccl_green_b, ccl_blue_r, ccl_blue_g, ccl_blue_b, ccl_sat_r, ccl_sat_g, ccl_sat_b, ccl_light_r, ccl_light_g, ccl_light_b, ccl_grey_r, ccl_grey_g, ccl_grey_b, ccl_x, ccl_y, ccl_temperature, ccl_gamut, ccl_illuminant, ccl_illum_fluo, ccl_illum_led, ccl_adaptation, ccl_version),
         "Filmic RGB" => set!(
             filmic_on,
             filmic_black_point_source,
@@ -5694,6 +5696,127 @@ fn chromatic_aberrations_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
         })
 }
 
+/// Color calibration (channelmixerrgb.c): a 3×3 linear RGB mix matrix followed
+/// by optional per-bank saturation/lightness/grey corrections, a gamut clamp
+/// and a white-balance temperature. A normal pipeline stage, so
+/// `module_expander`'s plain re-render applies. All numeric params live in the
+/// blob (`ccl_*`); the white-point chromaticity `x`/`y`, illuminant and
+/// adaptation-choice fields are carried through the reset/history/style plumbing
+/// but have no dedicated slider here (darktable drives them from the
+/// temperature / comboboxes c41 exposes as fixed presets for now).
+///
+/// Mix-matrix defaults are the identity (diagonal 1.0, off-diagonal 0); the
+/// sat/light/grey banks default to 0 (neutral). Temp/illuminant controls use
+/// darktable's model coefficient ranges.
+fn colorcalibration_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Color calibration", "channel mixing and white balance", p0.ccl_on,
+        |p, on| p.ccl_on = on,
+        |e, ctx| {
+            // White-balance temperature (K), darktable's 1667..25000 range.
+            add_param_slider(e, ctx, "Temperature (K)", 1667.0, 25000.0, 20.0,
+                p0.ccl_temperature as f64, |p, v| p.ccl_temperature = v);
+
+            // The 3×3 channel mix matrix — output channel × input channel,
+            // identity by default (diagonal 1.0, off-diagonal 0).
+            add_param_slider(e, ctx, "Red R", -2.0, 2.0, 0.01, p0.ccl_red_r as f64,
+                |p, v| p.ccl_red_r = v);
+            add_param_slider(e, ctx, "Red G", -2.0, 2.0, 0.01, p0.ccl_red_g as f64,
+                |p, v| p.ccl_red_g = v);
+            add_param_slider(e, ctx, "Red B", -2.0, 2.0, 0.01, p0.ccl_red_b as f64,
+                |p, v| p.ccl_red_b = v);
+            add_param_slider(e, ctx, "Green R", -2.0, 2.0, 0.01, p0.ccl_green_r as f64,
+                |p, v| p.ccl_green_r = v);
+            add_param_slider(e, ctx, "Green G", -2.0, 2.0, 0.01, p0.ccl_green_g as f64,
+                |p, v| p.ccl_green_g = v);
+            add_param_slider(e, ctx, "Green B", -2.0, 2.0, 0.01, p0.ccl_green_b as f64,
+                |p, v| p.ccl_green_b = v);
+            add_param_slider(e, ctx, "Blue R", -2.0, 2.0, 0.01, p0.ccl_blue_r as f64,
+                |p, v| p.ccl_blue_r = v);
+            add_param_slider(e, ctx, "Blue G", -2.0, 2.0, 0.01, p0.ccl_blue_g as f64,
+                |p, v| p.ccl_blue_g = v);
+            add_param_slider(e, ctx, "Blue B", -2.0, 2.0, 0.01, p0.ccl_blue_b as f64,
+                |p, v| p.ccl_blue_b = v);
+
+            // Saturation bank (additive per-channel saturation offsets).
+            add_param_slider(e, ctx, "Saturation R", -2.0, 2.0, 0.01, p0.ccl_sat_r as f64,
+                |p, v| p.ccl_sat_r = v);
+            add_param_slider(e, ctx, "Saturation G", -2.0, 2.0, 0.01, p0.ccl_sat_g as f64,
+                |p, v| p.ccl_sat_g = v);
+            add_param_slider(e, ctx, "Saturation B", -2.0, 2.0, 0.01, p0.ccl_sat_b as f64,
+                |p, v| p.ccl_sat_b = v);
+
+            // Lightness bank.
+            add_param_slider(e, ctx, "Lightness R", -2.0, 2.0, 0.01, p0.ccl_light_r as f64,
+                |p, v| p.ccl_light_r = v);
+            add_param_slider(e, ctx, "Lightness G", -2.0, 2.0, 0.01, p0.ccl_light_g as f64,
+                |p, v| p.ccl_light_g = v);
+            add_param_slider(e, ctx, "Lightness B", -2.0, 2.0, 0.01, p0.ccl_light_b as f64,
+                |p, v| p.ccl_light_b = v);
+
+            // Grey bank.
+            add_param_slider(e, ctx, "Grey R", -2.0, 2.0, 0.01, p0.ccl_grey_r as f64,
+                |p, v| p.ccl_grey_r = v);
+            add_param_slider(e, ctx, "Grey G", -2.0, 2.0, 0.01, p0.ccl_grey_g as f64,
+                |p, v| p.ccl_grey_g = v);
+            add_param_slider(e, ctx, "Grey B", -2.0, 2.0, 0.01, p0.ccl_grey_b as f64,
+                |p, v| p.ccl_grey_b = v);
+
+            // Gamut compression exponent (always inverted to 1/gamut by the
+            // matrix builder; 0.disables compression): darktable's channelmixerrgb.c
+            // `gamut` slider, default 1.
+            add_param_slider(e, ctx, "Gamut", 0.0, 12.0, 0.05, p0.ccl_gamut as f64,
+                |p, v| p.ccl_gamut = v);
+
+            // Normalize toggles (CheckButton-in-ActionRow, the same shape as the
+            // cacorrectrgb "Refine manifolds" row): dividing the matching mix row
+            // (channels) or the saturation/lightness/grey vector by its algebraic
+            // sum, exactly as channelmixerrgb.c commit_params normalizes them
+            // (a [1,1,1] mix row becomes [1/3,1/3,1/3]).
+            let normalize_toggles: [(&str, bool, fn(&mut PreviewParams, bool)); 6] = [
+                ("Normalize red channel", p0.ccl_normalize_r, |p, b| p.ccl_normalize_r = b),
+                ("Normalize green channel", p0.ccl_normalize_g, |p, b| p.ccl_normalize_g = b),
+                ("Normalize blue channel", p0.ccl_normalize_b, |p, b| p.ccl_normalize_b = b),
+                ("Normalize saturation", p0.ccl_normalize_sat, |p, b| p.ccl_normalize_sat = b),
+                ("Normalize lightness", p0.ccl_normalize_light, |p, b| p.ccl_normalize_light = b),
+                ("Normalize grey", p0.ccl_normalize_grey, |p, b| p.ccl_normalize_grey = b),
+            ];
+            for (label, active, set) in normalize_toggles {
+                let check = gtk4::CheckButton::with_label(label);
+                check.set_active(active);
+                let n_ctx = ctx.clone();
+                check.connect_toggled(move |b| {
+                    set(&mut n_ctx.params.borrow_mut(), b.is_active());
+                    render_preview(&n_ctx);
+                });
+                let pref = adw::ActionRow::builder()
+                    .title(adw_markup_text(label))
+                    .tooltip_text(
+                        "divide that row / vector by the sum of its coefficients \
+                         (the C's channelmixerrgb normalize gate)",
+                    )
+                    .build();
+                pref.add_suffix(&check);
+                e.add_row(&pref);
+            }
+
+            // Clip gate on the matrix output (ccl_clip).
+            let clip = gtk4::CheckButton::with_label("Clip negative RGB");
+            clip.set_active(p0.ccl_clip);
+            let cl_ctx = ctx.clone();
+            clip.connect_toggled(move |b| {
+                cl_ctx.params.borrow_mut().ccl_clip = b.is_active();
+                render_preview(&cl_ctx);
+            });
+            let cl_row = adw::ActionRow::builder()
+                .title("Clip negative RGB")
+                .tooltip_text("clamp the mix-matrix output to non-negative RGB")
+                .build();
+            cl_row.add_suffix(&clip);
+            e.add_row(&cl_row);
+        })
+}
+
 fn whitebalance_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     let p0 = *ctx.params.borrow();
     module_expander(ctx, "White balance", "channel multipliers", p0.temperature_on,
@@ -6175,6 +6298,15 @@ mod tests {
             .position(|g| g.modules.iter().any(|m| m.label == "Watermark"));
         assert_eq!(wm_group, Some(4));
         assert!(module_filter_matches(ModuleFilter::Active, 4, "Watermark", ""));
+        // Color calibration sits in the catalog's Color group (index 2 —
+        // darktable already has it there, next to Color balance RGB) and is
+        // live, so the Active filter counts it there.
+        assert!(is_live_module("Color calibration"));
+        let ccl_group = crate::catalog::module_catalog()
+            .iter()
+            .position(|g| g.modules.iter().any(|m| m.label == "Color calibration"));
+        assert_eq!(ccl_group, Some(2));
+        assert!(module_filter_matches(ModuleFilter::Active, 2, "Color calibration", ""));
         // Group(gi) shows exactly that catalog group: Tone is index 1.
         assert!(module_filter_matches(ModuleFilter::Group(1), 1, "Sigmoid", ""));
         assert!(!module_filter_matches(ModuleFilter::Group(1), 2, "Sigmoid", ""));
@@ -6559,6 +6691,43 @@ mod tests {
             p.wm_alignment = M;
             p.wm_rotate = M;
         }),
+        ("Color calibration", |p| {
+            p.ccl_on = true;
+            p.ccl_normalize_r = true;
+            p.ccl_normalize_g = true;
+            p.ccl_normalize_b = true;
+            p.ccl_normalize_sat = true;
+            p.ccl_normalize_light = true;
+            p.ccl_normalize_grey = true;
+            p.ccl_clip = false;
+            p.ccl_red_r = M;
+            p.ccl_red_g = M;
+            p.ccl_red_b = M;
+            p.ccl_green_r = M;
+            p.ccl_green_g = M;
+            p.ccl_green_b = M;
+            p.ccl_blue_r = M;
+            p.ccl_blue_g = M;
+            p.ccl_blue_b = M;
+            p.ccl_sat_r = M;
+            p.ccl_sat_g = M;
+            p.ccl_sat_b = M;
+            p.ccl_light_r = M;
+            p.ccl_light_g = M;
+            p.ccl_light_b = M;
+            p.ccl_grey_r = M;
+            p.ccl_grey_g = M;
+            p.ccl_grey_b = M;
+            p.ccl_x = M;
+            p.ccl_y = M;
+            p.ccl_temperature = M;
+            p.ccl_gamut = M;
+            p.ccl_illuminant = M;
+            p.ccl_illum_fluo = M;
+            p.ccl_illum_led = M;
+            p.ccl_adaptation = M;
+            p.ccl_version = M;
+        }),
         ("Grain", |p| {
             p.gr_on = true;
             p.gr_coarseness = M;
@@ -6790,6 +6959,41 @@ mod tests {
             cb_grey_fulcrum: _,
             cb_contrast: _,
             cb_formula: _,
+            ccl_on: _,
+            ccl_normalize_r: _,
+            ccl_normalize_g: _,
+            ccl_normalize_b: _,
+            ccl_normalize_sat: _,
+            ccl_normalize_light: _,
+            ccl_normalize_grey: _,
+            ccl_clip: _,
+            ccl_red_r: _,
+            ccl_red_g: _,
+            ccl_red_b: _,
+            ccl_green_r: _,
+            ccl_green_g: _,
+            ccl_green_b: _,
+            ccl_blue_r: _,
+            ccl_blue_g: _,
+            ccl_blue_b: _,
+            ccl_sat_r: _,
+            ccl_sat_g: _,
+            ccl_sat_b: _,
+            ccl_light_r: _,
+            ccl_light_g: _,
+            ccl_light_b: _,
+            ccl_grey_r: _,
+            ccl_grey_g: _,
+            ccl_grey_b: _,
+            ccl_x: _,
+            ccl_y: _,
+            ccl_temperature: _,
+            ccl_gamut: _,
+            ccl_illuminant: _,
+            ccl_illum_fluo: _,
+            ccl_illum_led: _,
+            ccl_adaptation: _,
+            ccl_version: _,
             filmic_on: _,
             filmic_black_point_source: _,
             filmic_white_point_source: _,

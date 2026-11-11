@@ -570,6 +570,48 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if cac {
         return "Chromatic aberrations";
     }
+    // Color calibration (channelmixerrgb.c, iop_order.c v50 pos 28.5): a
+    // scene-referred 3×3 mix matrix + white balance. All 35 fields live in the
+    // blob, so an edit to any of them must be labelled rather than falling
+    // through to "Edit". Grouped with the cacorrectrgb block it mirrors.
+    let ccl = old.ccl_on != new.ccl_on
+        || old.ccl_normalize_r != new.ccl_normalize_r
+        || old.ccl_normalize_g != new.ccl_normalize_g
+        || old.ccl_normalize_b != new.ccl_normalize_b
+        || old.ccl_normalize_sat != new.ccl_normalize_sat
+        || old.ccl_normalize_light != new.ccl_normalize_light
+        || old.ccl_normalize_grey != new.ccl_normalize_grey
+        || old.ccl_clip != new.ccl_clip
+        || old.ccl_red_r != new.ccl_red_r
+        || old.ccl_red_g != new.ccl_red_g
+        || old.ccl_red_b != new.ccl_red_b
+        || old.ccl_green_r != new.ccl_green_r
+        || old.ccl_green_g != new.ccl_green_g
+        || old.ccl_green_b != new.ccl_green_b
+        || old.ccl_blue_r != new.ccl_blue_r
+        || old.ccl_blue_g != new.ccl_blue_g
+        || old.ccl_blue_b != new.ccl_blue_b
+        || old.ccl_sat_r != new.ccl_sat_r
+        || old.ccl_sat_g != new.ccl_sat_g
+        || old.ccl_sat_b != new.ccl_sat_b
+        || old.ccl_light_r != new.ccl_light_r
+        || old.ccl_light_g != new.ccl_light_g
+        || old.ccl_light_b != new.ccl_light_b
+        || old.ccl_grey_r != new.ccl_grey_r
+        || old.ccl_grey_g != new.ccl_grey_g
+        || old.ccl_grey_b != new.ccl_grey_b
+        || old.ccl_x != new.ccl_x
+        || old.ccl_y != new.ccl_y
+        || old.ccl_temperature != new.ccl_temperature
+        || old.ccl_gamut != new.ccl_gamut
+        || old.ccl_illuminant != new.ccl_illuminant
+        || old.ccl_illum_fluo != new.ccl_illum_fluo
+        || old.ccl_illum_led != new.ccl_illum_led
+        || old.ccl_adaptation != new.ccl_adaptation
+        || old.ccl_version != new.ccl_version;
+    if ccl {
+        return "Color calibration";
+    }
     let bl = old.bl_on != new.bl_on
         || old.bl_size != new.bl_size
         || old.bl_threshold != new.bl_threshold
@@ -1047,6 +1089,28 @@ mod tests {
             describe_change(&base, &PreviewParams { wm_alignment: 2.0, ..base }),
             "Watermark"
         );
+        // Color calibration labels the enable flag, temperature, a mix
+        // coefficient, a normalize toggle, and the gamut target.
+        assert_eq!(
+            describe_change(&base, &PreviewParams { ccl_on: true, ..base }),
+            "Color calibration"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { ccl_temperature: 6500.0, ..base }),
+            "Color calibration"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { ccl_red_g: -0.4, ..base }),
+            "Color calibration"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { ccl_normalize_r: true, ..base }),
+            "Color calibration"
+        );
+        assert_eq!(
+            describe_change(&base, &PreviewParams { ccl_gamut: 3.0, ..base }),
+            "Color calibration"
+        );
         // Framing labels both the enable flag and the sliders (geometry-family
         // compose; the fields live in the blob like any other module).
         assert_eq!(
@@ -1340,6 +1404,41 @@ mod tests {
             cac_strength: _,
             cac_mode: _,
             cac_refine: _,
+            ccl_on: _,
+            ccl_normalize_r: _,
+            ccl_normalize_g: _,
+            ccl_normalize_b: _,
+            ccl_normalize_sat: _,
+            ccl_normalize_light: _,
+            ccl_normalize_grey: _,
+            ccl_clip: _,
+            ccl_red_r: _,
+            ccl_red_g: _,
+            ccl_red_b: _,
+            ccl_green_r: _,
+            ccl_green_g: _,
+            ccl_green_b: _,
+            ccl_blue_r: _,
+            ccl_blue_g: _,
+            ccl_blue_b: _,
+            ccl_sat_r: _,
+            ccl_sat_g: _,
+            ccl_sat_b: _,
+            ccl_light_r: _,
+            ccl_light_g: _,
+            ccl_light_b: _,
+            ccl_grey_r: _,
+            ccl_grey_g: _,
+            ccl_grey_b: _,
+            ccl_x: _,
+            ccl_y: _,
+            ccl_temperature: _,
+            ccl_gamut: _,
+            ccl_illuminant: _,
+            ccl_illum_fluo: _,
+            ccl_illum_led: _,
+            ccl_adaptation: _,
+            ccl_version: _,
             wm_on: _,
             wm_asset: _,
             wm_opacity: _,
@@ -1489,7 +1588,11 @@ mod tests {
         // S3 Watermark (v36): 1977 → 2006 (1 more bool + 7 f32 controls —
         // asset index, opacity %, scale %, x/y offsets, alignment ordinal,
         // rotation).
-        assert_eq!(PreviewParams::default().encode().len(), 2006);
+        // S4 Color calibration (v37): 2006 → 2122 (8 more bools — on,
+        // normalize_R/G/B/sat/light/grey, clip — + 27 f32 — temperature, the
+        // 9 red/green/blue mix coefficients, saturation/lightness/grey
+        // vectors, gamut).
+        assert_eq!(PreviewParams::default().encode().len(), 2122);
     }
 
     #[test]

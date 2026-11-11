@@ -28,7 +28,7 @@
 //! pass channel 4 through. Don't "fix" exposure to preserve it — that diverges
 //! from the C pipeline.
 
-use crate::iop::{basecurve, basicadj, bloom, channelmixer, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, defringe, denoiseprofile, exposure, filmicrgb, grain, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, soften, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
+use crate::iop::{basecurve, basicadj, bloom, channelmixer, channelmixerrgb, colisa, colorbalancergb, colorcontrast, colorcorrection, colorize, colorzones, defringe, denoiseprofile, exposure, filmicrgb, grain, graduatednd, invert, levels, lowlight, lowpass, negadoctor, primaries, rgbcurve, shadhi, sharpen, sigmoid, soften, splittoning, temperature, tonecurve, toneequal, velvia, vibrance, vignette};
 
 /// C-compatible `sign(x)`: returns 1.0 for `+0.0` and `-0.0`, unlike
 /// `f32::signum` which returns `0.0` for both zeroes. Used where a ported
@@ -515,6 +515,41 @@ pub enum Stage {
         data: Box<colorbalancergb::CbRgbData>,
         space: ColorSpace,
     },
+    /// Color calibration (channelmixerrgb.c) — scene-referred channel mixing
+    /// plus chromatic adaptation to a user illuminant (temperature/tint), as a
+    /// matrix chain. iop_order.c v50 pos **28.5** (scene-referred), listed
+    /// first of the 28.5 rank (before negadoctor / blurs / primaries /
+    /// basicadj), so it runs among that cluster: after graduatednd (25) and
+    /// before negadoctor / primaries / basicadj.
+    ///
+    /// The stage carries the **prebuilt** per-commit packet
+    /// [`channelmixerrgb::ChannelmixerRgbData`] — the four transposed kernel
+    /// matrices (RGB→XYZ, RGB→LMS, MIX→XYZ, XYZ→RGB), the illuminant in
+    /// adaptation LMS, the sat/light/grey vectors and the Bradford blue power
+    /// — computed once at pipeline-build time by `from_params` (the full
+    /// `commit_params` port including the D65→D50/D50→D65 CAT16 matrix
+    /// bridge, because c41's working spaces are D65-referenced where the C's
+    /// channelmixerrgb math is D50; see its module doc for the algebra). The
+    /// per-band apply is a single elementwise call to the migrated FFI kernel
+    /// [`channelmixerrgb::ChannelmixerRgbData::process_data`].
+    ///
+    /// The kernel is **pixel-local** (a per-pixel colour map — WB + adapt +
+    /// mix + gamut + luma/chroma, no neighbour reads, no position
+    /// dependence), so the band-parallel path stays available. Like
+    /// ColorBalanceRgb it converts through XYZ and the matrices are baked
+    /// against the buffer's working space, so `working_space()` reports it
+    /// (raw Rec.2020, non-raw linear sRGB).
+    ///
+    /// **Identity gate: flag-only.** There is no slider combination that is a
+    /// pass-through while enabled: at the darktable defaults the C adapts to
+    /// the 5003 K daylight illuminant, runs the D50 gamut compression
+    /// (gamut 1 → 1/1) and clips negatives — a real edit. `to_pipeline` emits
+    /// the stage whenever the module is enabled and `is_identity` mirrors it
+    /// (exactly the Bloom / ChromaticAberrations policy).
+    ColorCalibration {
+        data: Box<channelmixerrgb::ChannelmixerRgbData>,
+        space: ColorSpace,
+    },
     /// Filmic RGB (filmicrgb.c) — scene-referred tone mapping, colour science
     /// v5. The stage carries the committed data (spline + scalars from
     /// `commit_params`/`compute_spline`, prebuilt once per render) and the
@@ -863,6 +898,7 @@ impl Stage {
             Stage::Negadoctor { .. } => "negadoctor",
             Stage::ToneEqual { .. } => "toneequal",
             Stage::ColorBalanceRgb { .. } => "colorbalancergb",
+            Stage::ColorCalibration { .. } => "channelmixerrgb",
             Stage::FilmicRgb { .. } => "filmicrgb",
             Stage::DenoiseProfile { .. } => "denoiseprofile",
             Stage::LensCorrection { .. } => "lens",
@@ -989,6 +1025,11 @@ impl Stage {
             // dependence. The gamut LUT it reads is prebuilt and immutable.
             // Band-parallel stays available.
             Stage::ColorBalanceRgb { .. } => true,
+            // ColorCalibration's kernel is a per-pixel colour map (whitening
+            // divide, chromatic adaptation, channel mix, gamut, luma/chroma) —
+            // every output pixel depends only on its own input pixel, so the
+            // band-parallel path stays available.
+            Stage::ColorCalibration { .. } => true,
             // FilmicRgb is pixel-local: per-pixel tone mapping + gamut map, all
             // driven by that pixel's own RGB through immutable prebuilt tables
             // (spline coefficients, Yrg matrices). No neighbour reads. The
@@ -1104,6 +1145,11 @@ impl Stage {
             // primaries at pipeline-build time — so it must agree with the
             // other Lab/space-aware stages exactly like Sharpen/Vibrance do.
             Stage::ColorBalanceRgb { space, .. } => Some(*space),
+            // ColorCalibration's kernel matrices are baked against the buffer's
+            // working space at to_pipeline time (raw Rec.2020, non-raw sRGB),
+            // so it must agree with the other space-aware stages — exactly
+            // like ColorBalanceRgb.
+            Stage::ColorCalibration { space, .. } => Some(*space),
             // FilmicRgb's Yrg matrices (input/outputs of the gamut map) are
             // selected per working space at apply time, so — like ColorBalanceRgb
             // — it must agree with the other space-aware stages.
@@ -2067,6 +2113,17 @@ impl Stage {
                         }
                     };
                 colorbalancergb::process_in_space(input, output, data, to_xyz, from_xyz);
+            }
+            // ── Color calibration (channelmixerrgb.c, v50 pos 28.5) ──────
+            // Scene-referred channel mixing + chromatic adaptation. The whole
+            // `commit_params` matrix chain (four transposed kernel matrices,
+            // illuminant, sat/light/grey, the Bradford power) is prebuilt by
+            // `from_params` and carried in the stage; `space` was already used
+            // at build time to pick the working-space D65 matrices (and the
+            // CAT16 D50 bridge), so the per-band call is a single elementwise
+            // kernel invocation. Pixel-local, so this runs over rayon bands.
+            Stage::ColorCalibration { ref data, .. } => {
+                data.process_data(input, output);
             }
             // ── FilmicRgb (filmicrgb.c, colour science v5) ───────────────
             // Scene-referred tone mapping: log encoding → derived spline →

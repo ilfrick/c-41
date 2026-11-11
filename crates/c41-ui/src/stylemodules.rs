@@ -52,6 +52,9 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Highpass",
     "Shadows/Highlights",
     "Local contrast",
+    // Color calibration (channelmixerrgb.c) is scene-referred at iop_order.c
+    // v50 pos 28.5, placed just before primaries/negadoctor per that order.
+    "Color calibration",
     "Primaries",
     "Negadoctor",
     "Tone equalizer",
@@ -280,6 +283,48 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.lc_shadows = src.lc_shadows;
             target.lc_highlights = src.lc_highlights;
             target.lc_detail = src.lc_detail;
+            true
+        }
+        // Color calibration (channelmixerrgb.c, iop_order.c v50 pos 28.5): a
+        // scene-referred 3×3 mix matrix whose 35 fields all live in the blob,
+        // so a style carries them (white-point chromaticity x/y, illuminant and
+        // adaptation choices included).
+        "Color calibration" => {
+            target.ccl_on = src.ccl_on;
+            target.ccl_normalize_r = src.ccl_normalize_r;
+            target.ccl_normalize_g = src.ccl_normalize_g;
+            target.ccl_normalize_b = src.ccl_normalize_b;
+            target.ccl_normalize_sat = src.ccl_normalize_sat;
+            target.ccl_normalize_light = src.ccl_normalize_light;
+            target.ccl_normalize_grey = src.ccl_normalize_grey;
+            target.ccl_clip = src.ccl_clip;
+            target.ccl_red_r = src.ccl_red_r;
+            target.ccl_red_g = src.ccl_red_g;
+            target.ccl_red_b = src.ccl_red_b;
+            target.ccl_green_r = src.ccl_green_r;
+            target.ccl_green_g = src.ccl_green_g;
+            target.ccl_green_b = src.ccl_green_b;
+            target.ccl_blue_r = src.ccl_blue_r;
+            target.ccl_blue_g = src.ccl_blue_g;
+            target.ccl_blue_b = src.ccl_blue_b;
+            target.ccl_sat_r = src.ccl_sat_r;
+            target.ccl_sat_g = src.ccl_sat_g;
+            target.ccl_sat_b = src.ccl_sat_b;
+            target.ccl_light_r = src.ccl_light_r;
+            target.ccl_light_g = src.ccl_light_g;
+            target.ccl_light_b = src.ccl_light_b;
+            target.ccl_grey_r = src.ccl_grey_r;
+            target.ccl_grey_g = src.ccl_grey_g;
+            target.ccl_grey_b = src.ccl_grey_b;
+            target.ccl_x = src.ccl_x;
+            target.ccl_y = src.ccl_y;
+            target.ccl_temperature = src.ccl_temperature;
+            target.ccl_gamut = src.ccl_gamut;
+            target.ccl_illuminant = src.ccl_illuminant;
+            target.ccl_illum_fluo = src.ccl_illum_fluo;
+            target.ccl_illum_led = src.ccl_illum_led;
+            target.ccl_adaptation = src.ccl_adaptation;
+            target.ccl_version = src.ccl_version;
             true
         }
         "Primaries" => {
@@ -552,7 +597,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 43);
+        assert_eq!(MODULE_GROUPS.len(), 44);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
@@ -707,6 +752,31 @@ mod tests {
     }
 
     #[test]
+    fn color_calibration_partial_style_copies_all_mix_matrix_fields() {
+        let overlay = PreviewParams {
+            ccl_on: true,
+            ccl_normalize_r: true,
+            ccl_red_g: -0.4,
+            ccl_blue_r: 0.3,
+            ccl_temperature: 7000.0,
+            ccl_gamut: 3.0,
+            ..PreviewParams::default()
+        };
+        let mut target = PreviewParams::default();
+        assert!(copy_module_group(&mut target, &overlay, "Color calibration"));
+        assert_eq!(target.ccl_on, overlay.ccl_on);
+        assert_eq!(target.ccl_normalize_r, overlay.ccl_normalize_r);
+        assert_eq!(target.ccl_red_g, overlay.ccl_red_g);
+        assert_eq!(target.ccl_blue_r, overlay.ccl_blue_r);
+        assert_eq!(target.ccl_temperature, overlay.ccl_temperature);
+        assert_eq!(target.ccl_gamut, overlay.ccl_gamut);
+        // A full uncovered field keeps its target default (off-diagonal mix)
+        // and another group's field must not move.
+        assert_eq!(target.ccl_green_b, 0.0);
+        assert_eq!(target.ev, PreviewParams::default().ev);
+        assert_eq!(target.primaries_on, PreviewParams::default().primaries_on);
+    }
+
     fn basic_adjustments_group_moves_the_non_user_control_too() {
         // Pins the deliberate divergence from describe_change: hlcomprthresh
         // never differs between history snapshots, but a style copy must still

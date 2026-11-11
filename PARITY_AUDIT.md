@@ -197,7 +197,7 @@ on 2026-11-08, Raw black/white point on 2026-11-10, and Framing on 2026-11-10.
 The current inert set is listed below.
 
 **Further closed 2026-10-11 (G2d)** — `Input color profile` is now a live
-darkroom row (see the G2 section). **Closed 2026-11-08 (Highpass and Demosaic). Hot Pixels wired and verified 2026-11-08.** Hot Pixels runs during raw decode (not as a `Stage`) with a raw-only UI on Bayer, X-Trans, and uniform 2×2 monochrome mosaics. The `Output color profile` catalog row is counted active only via the global Export-dialog choice; this is not per-image module parity. **Orientation is a manual selector in the Geometry panel (same date). Raw black/white point wired 2026-11-10** — decode-level override with per-colour black + white sliders, raw-only, preview/export parity. **Framing wired 2026-11-10** — constant-border compose (S1 of the sprint plan): canvas enlarges around the image, optional frame line, geometry-family (base compose like crop, not a `Stage`). **Chromatic aberrations wired 2026-11-10 (S2)** — a live `Stage::ChromaticAberrations` running the exhaustive full-frame manifold pipeline (bilinear downsample → gaussian-blurred get_manifolds → 6ch bilinear upsample → apply_correction → reduce_artifacts) over the seven previously-ported FFI kernels; guide/radius/strength/mode/refine controls in the Correct group. **Watermark wired 2026-11-10 (S3)** — live `Stage::Watermark` (v50 pos 69, last in-pipeline stage) porting `watermark.c`'s PNG branch: embedded 160×160 asset, IMAGE scale mode, rotation bbox, 3×3 alignment + x/y offsets, opacity — the C compositor math replicated by inverse-map bilinear sampling with premultiplied-BGRA blending through the existing `darkroom_watermark_blend` kernel. The live/elsewhere count is 49 of 52, with 3 inert.
+darkroom row (see the G2 section). **Closed 2026-11-08 (Highpass and Demosaic). Hot Pixels wired and verified 2026-11-08.** Hot Pixels runs during raw decode (not as a `Stage`) with a raw-only UI on Bayer, X-Trans, and uniform 2×2 monochrome mosaics. The `Output color profile` catalog row is counted active only via the global Export-dialog choice; this is not per-image module parity. **Orientation is a manual selector in the Geometry panel (same date). Raw black/white point wired 2026-11-10** — decode-level override with per-colour black + white sliders, raw-only, preview/export parity. **Framing wired 2026-11-10** — constant-border compose (S1 of the sprint plan): canvas enlarges around the image, optional frame line, geometry-family (base compose like crop, not a `Stage`). **Chromatic aberrations wired 2026-11-10 (S2)** — a live `Stage::ChromaticAberrations` running the exhaustive full-frame manifold pipeline (bilinear downsample → gaussian-blurred get_manifolds → 6ch bilinear upsample → apply_correction → reduce_artifacts) over the seven previously-ported FFI kernels; guide/radius/strength/mode/refine controls in the Correct group. **Watermark wired 2026-11-10 (S3)** — live `Stage::Watermark` (v50 pos 69, last in-pipeline stage) porting `watermark.c`'s PNG branch: embedded 160×160 asset, IMAGE scale mode, rotation bbox, 3×3 alignment + x/y offsets, opacity — the C compositor math replicated by inverse-map bilinear sampling with premultiplied-BGRA blending through the existing `darkroom_watermark_blend` kernel. **Color calibration wired 2026-11-10 (S4)** — live `Stage::ColorCalibration` (v50 pos 28.5, before negadoctor, both funnels) porting `channelmixerrgb.c`'s commit_params matrix chain: `ChannelmixerRgbData::from_params` builds the transposed RGB↔XYZ↔LMS matrices with the CAT16 D65→D50 white-point bridge (c41 is D65-referenced, the kernel D50-referenced — composition verified by review elementwise over all five adaptation modes), temperature/illuminant (daylight+blackbody polynomials + fluo/led), the mix matrix from red/green/blue + saturation/lightness/grey vectors + normalize toggles, gamut compression and clip, feeding the existing `darkroom_channelmixerrgb_loop_switch` kernel; all 35 blob params feed the math (UI exposes temperature, 9 mix, 9 sat/light/grey, gamut, 6 normalize, clip). The live/elsewhere count is 50 of 52, with 2 inert.
 The kernel mapping below originates as the 2026-10-01 snapshot; current UI
 status and Liquify test count were refreshed on 2026-11-08. The input-profile row always had a
 ported kernel; it now has a product surface. Highpass is now a live UI,
@@ -209,9 +209,9 @@ preview, history and style module (item 2.1).
 `Crop`, `Rotate & perspective`, `Orientation`, `Demosaic` and
 `Output color profile`, with the latter linked to the global Export-dialog
 setting). The header counter is `is_live_module`-derived
-(`mod.rs:2277`, `:2578`) and reads **"49 of 52 active"**.
+(`mod.rs:2277`, `:2578`) and reads **"50 of 52 active"**.
 
-So 3 rows are in neither list, and **all 3 render through `inert_module_row`**
+So 2 rows are in neither list, and **all 2 render through `inert_module_row`**
 (`mod.rs:2336-2341` dispatches on `elsewhere_hint`, which returns `Some` only
 for Crop, Rotate & perspective, Orientation, Demosaic and Output color profile;
 `inert_module_row` is the fall-through).
@@ -221,7 +221,7 @@ still suggests "turn me on", and an earlier version that shipped a *working*
 switch is exactly the "looks live, does nothing" bug the function was written to
 remove:
 
-`Color calibration` · `Retouch` ·
+`Retouch` ·
 `Liquify`
 
 `Orientation` is a manual eight-state selector in the Geometry panel (flip

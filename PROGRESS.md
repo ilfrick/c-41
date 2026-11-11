@@ -9380,3 +9380,87 @@ NOTES / FAILURES
 - G6 items landed in the backlog: `watermarks/` template picker (filename
   string table in the blob) + SVG/text watermark types + Cairo-faithful
   rendering in the future.
+
+## 2026-11-10 20:40 UTC — S4: Color calibration (channelmixerrgb) LIVE
+
+Sprint S4 of the parity plan: the catalogue row `Color calibration` is now a
+live darkroom module (Color group). Catalogue 49/52 → 50/52 active (45 live +
+5 elsewhere-driven), 2 inert left (`Retouch` · `Liquify`).
+
+WHAT
+- `crates/c41-core/src/iop/channelmixerrgb.rs` (+712): `ChannelmixerRgbParams`
+  (mirror of the v3 C struct: red/green/blue[3], saturation/lightness/grey[3],
+  six normalize toggles, x/y, temperature, gamut, clip — all 35 fields feed
+  the math even where the UI exposes a subset), `ChannelmixerRgbData::from_params`
+  porting `commit_params`' matrix chain, and `process` calling the existing
+  (unchanged) `darkroom_channelmixerrgb_loop_switch` FFI kernel — single source
+  of truth.
+  **D50/D65 bridge (the core of the sprint)**: the kernel is D50-referenced
+  (BRADFORD_D50, p = powf(illuminant[2]/D50[2], 0.0834)); c41 working spaces
+  are D65. `from_params` pre-composes the CAT16 D65↔D50 white-point bridge in
+  transposed storage with the S(B·A) convention matching the kernel's apply
+  contract: rgb_to_xyz = CAT16(D65→D50)·R65, xyz_to_rgb = X2R65·CAT16(D50→D65),
+  and the rgb_to_lms / mix_to_xyz / illuminant paths per the C's five
+  adaptation modes (incl. the RGB-bypass reversed-order trap). Illuminant
+  computed WITHOUT the bridge (space-independent, physically correct); the
+  daylight/blackbody + fluo/led polynomials transcribed with exact boundary
+  semantics (t >= 4000 daylight branch etc.).
+  Documented: CAT16-bridged rgb_to_xyz differs ~1–3% entry-wise from the C's
+  ICC/Bradford D50 matrix_in — the accepted c41-wide workspace approximation
+  (ColorBalanceRgb precedent); any future C pixel-golden must compare against
+  a bridged reference, not the profile matrices. CAMERA illuminant falls back
+  to stored x/y (c41 reads no RAW EXIF WB; the C's
+  _check_if_close_to_daylight override skipped).
+- `crates/c41-core/src/pipeline.rs`: `Stage::ColorCalibration { data, space }`
+  at iop_order **v50 pos 28.5** (channelmixerrgb is first in the 28.5 rank,
+  inserted before negadoctor) — pushed in the SHARED `to_pipeline_inner` before
+  `Stage::Negadoctor`, so BOTH the raw and non-raw funnels inherit the pin
+  (ordering test: exposure → channelmixerrgb → negadoctor → primaries →
+  basicadj on both builders). `is_pixel_local=true` (elementwise kernel → rayon
+  band path), `working_space=Some(space)` per the space-baked matrices.
+- `crates/c41-ui/src/preview.rs`: PreviewParams **v37** (append-only): +8 bools
+  (49–56: ccl_on + 6 normalize + clip) + 27 f32 (489–515: temperature +
+  9 mix + 3 sat + 3 light + 3 grey + gamut); ENCODE_VERSION 37, ENCODED_LEN
+  2122 = 1+57+516·4, layout (37,57,516); v36 blobs decode ccl OFF (load-bearing
+  — an enabled-at-defaults run is a real edit); decode clamps (mix ±2,
+  temperature 1667–25000, gamut 0–12) + NaN folds; flag-only identity gate
+  (at $DEFAULTS the C performs a real transform — 5003 K daylight adaptation +
+  gamut-1 uv-compression + clip).
+- `crates/c41-ui/src/darkroom/mod.rs`: row — temperature slider, 9 mix
+  coefficient sliders, 9 saturation/lightness/grey sliders, gamut, 6 normalize
+  toggles, clip toggle (ranges/steps from the C $MIN/$MAX/$DEFAULT); the
+  unexposed illuminant/adaptation/version fields carried through
+  reset/history/style. LIVE_MODULE_LABELS 44→45, dispatch, reset, MODULE_MUTATIONS.
+- `crates/c41-ui/src/history.rs`: describe_change "Color calibration" (all 35
+  fields), blob pin 2006→2122. `stylemodules.rs`: MODULE_GROUPS 44 (before
+  Primaries) + copy arm.
+
+VERIFY
+- `scripts/ci-local.sh` all four steps green (cargo check / clippy /
+  test --release with **1 984 c41-core / 572 c41-ui** / c41-rs release link);
+  `git diff --check` clean (fixed a trailing blank line at EOF in
+  channelmixerrgb.rs).
+- Independent senior review (sw-vv-engineer): **CHANGES REQUIRED → all
+  findings applied**. Algebra VERIFIED SOUND: storage-convention anchored from
+  dt_apply_transposed_color_matrix first principles, all five adaptation
+  modes verified elementwise, bridge constants byte-identical to the C,
+  defaults hand-verified (5003 K, D, CAT16, gamut 1, clip TRUE), pin 28.5 +
+  both funnels correct, v37 arithmetic re-checked (2122).
+  - MAJOR (fixed): `PreviewParams::bypassed()` never cleared the S1–S4
+    flag-only stage flags (ccl + cac + wm + brd + gr/soften/df/highpass —
+    systemic pre-existing gap that S1–S3 shipped unflagged): before/after
+    showed the processed image. Now all are cleared, with a new test
+    `bypassed_clears_flag_only_stage_flags` asserting is_identity + unchanged
+    8-bit output.
+  - MINOR accepted (documented): CAT16-bridge vs ICC D50 fidelity boundary
+    (~1–3%); NaN-as-u8 ordinal fold picks kind 0 (hand-edited blobs only).
+  - NIT applied: dead `illuminant[3] = 0.0` assignment removed.
+- Two CI failures fixed en route: (1) history blob pin still 2006 → 2122 with
+  the v37 annotation; (2) the new row's dynamic ActionRow title must call
+  `adw_markup_text` (markup-safety test).
+
+NOTES
+- Deviation class watched (the ~10% primaries-vs-ICC gap): the cv span
+  note — S4 does NOT chase ICC colourant tags; it uses the same Lindbloom
+  nominal D65 primaries precedent as Primaries/ColorBalanceRgb.
+- Next G1 rows: S5 Liquify (L/XL — warp-grid UI), S6/S7 Retouch ×2 (XL).
