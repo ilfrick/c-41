@@ -9599,3 +9599,17 @@ missing subset of the upstream `ashift` aliases and a stale test comment.
 gates by exit code: workspace check, clippy, release tests (1,986 core / 573 UI),
 and release binary link. Existing unrelated warnings remain. No runtime deploy
 was performed.
+
+## 2026-11-11 19:46 UTC — UX deploy: Wired filter and Basics/search
+
+**What.** After explicit user approval, built the cargo-only production image
+pinned to commit `8660a868c21fc85d3301e3577dc8a915f47edd59` and deployed it as
+`c-41:8660a868c2` (image ID
+`79bb403890a3a5e4ad1ea1bb34cb673743ab5bc469c9640825b70f67f5891a70`). Preserved
+the prior container/image as `c-41-rollback-8660a868c2` /
+`c-41:ce006779f8`. Reused the same `/config` and `/photos` mounts, NVIDIA
+runtime, ports, environment, and restart policy. No other services were changed.
+
+**Verified.** Both GitHub checks were green before rollout. The new container is
+healthy with restart count 0; HTTP and HTTPS return 200. Startup logs contain no
+panic or fatal error. The rollback container is stopped and retained.
