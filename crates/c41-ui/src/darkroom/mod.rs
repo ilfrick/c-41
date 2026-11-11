@@ -5761,7 +5761,7 @@ fn liquify_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 *begin_node.borrow_mut() = best.map(|i| (i, p.liq_offsets[i * 2], p.liq_offsets[i * 2 + 1]));
             });
             let update_ctx = ctx.clone(); let update_area = area.clone(); let update_node = drag_node.clone(); let update_weak = area.downgrade();
-            drag.connect_drag_update(move |g, dx, dy| {
+            drag.connect_drag_update(move |_, dx, dy| {
                 let Some((i, start_x, start_y)) = *update_node.borrow() else { return; };
                 let (w,h) = (update_area.width().max(1) as f64, update_area.height().max(1) as f64);
                 { let mut p = update_ctx.params.borrow_mut();

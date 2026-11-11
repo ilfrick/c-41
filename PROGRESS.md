@@ -9488,3 +9488,14 @@ interpolation mode selection is deferred, and no C golden-render parity is
 claimed. The catalogue is now 51/52 active (46 live + 5 elsewhere-driven); only
 Retouch remains inert. No container or deployment services were changed; the
 install scripts remain untouched.
+
+## 2026-11-11 16:17 UTC — S5 follow-up: remove Liquify UI warning
+
+**What.** Renamed the unused `GestureDrag::connect_drag_update` callback
+argument to `_`; no behavior changed.
+
+**Verified.** Independent generalist review APPROVE (no semantic/API risk).
+`scripts/ci-local.sh` passed all four gates by exit code, including 1,986 core
+and 573 UI release tests. The previous full build had surfaced this new unused
+variable warning; it is now absent. Existing unrelated compiler/deprecation
+warnings remain.
