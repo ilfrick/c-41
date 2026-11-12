@@ -62,8 +62,7 @@ not what it is not.
 | `Retouch` | `retouch.c` | wired S6 slice 1 + S7 feather (7 exports / clone-stamp driver and tests) plus GUI-only auto-levels | **XL** | Single non-destructive clone stamp with normalized source/destination, radius, opacity and smooth radial feather. Multi-stamp painting, heal, masks and wavelet preview remain deferred. |
 
 S1–S7 delivery order and outcomes are recorded in the sprint ledger below.
-S1–S6 are shipped; S7 implementation, review and Docker CI are complete, with
-post-push deployment pending. Remaining G1 scope is limited to deferred feature
+All seven increments are shipped; remaining G1 scope is limited to deferred feature
 parity (including broader Liquify and Retouch editors), not inert catalogue rows.
 
 ### G2 — colour management (soft-proofing + render seam)
@@ -138,7 +137,7 @@ RAW prepare combined, "XL" splits into two.
 | ✅ **S4 2026-11-10** | `Color calibration` (G1 L) | **SHIPPED** +1 live (49→50/52) — commit_params matrix chain (CAT16 D65↔D50 bridge, 5 adaptation modes, temperature/illuminant polys, mix+sat/light/grey+normalize, gamut, clip) over the pre-ported loop_switch kernel; v50 28.5 pin both funnels; v37 blob (2122 B); 25-control row; review: algebra verified, 1 MAJOR fixed (bypassed() now clears the S1–S4 flag-only stage flags) | CAT16-bridge ≠ ICC-profile D50 (~1–3%) — goldens need bridged reference |
 | ✅ **S5 2026-11-11** | `Liquify` (G1 L) | **LIVE, slice 1** +1 (50→51/52) — fixed 5×5 drag lattice in module panel, bilinear displacement map through C's bicubic sampler, stage v50 pos 28.0 before Exposure, PreviewParams v38 (2323 B); backward decode v37 verified; review APPROVE after fixing stage-order finding | freehand Bezier/stamp controls and selectable interpolation deferred; no C golden render parity claim |
 | ✅ **S6 2026-11-12** | `Retouch` slice 1 (G1 XL₁) | **SHIPPED** +1 live (51→52/52) — single clone stamp, normalized source/destination capture, hard brush radius/opacity, preview/export stage, PreviewParams v39 (2349 B), backward v38 decode; review APPROVE, Docker CI green | multi-stroke painting, heal, masks and wavelets deferred |
-| **S7 2026-11-12** | `Retouch` slice 2 (G1 XL₂) | **CI PASSED; deploy pending** — optional radial smoothstep feather with default hard edge, v40 blob (2353 B), v39 default decode, full-buffer hard-edge regression; senior review APPROVE; 1,992 core / 578 UI tests. Post-push deployment verification will be recorded in PROGRESS.md | multi-stroke painting, heal, masks and wavelets remain deferred |
+| ✅ **S7 2026-11-12** | `Retouch` slice 2 (G1 XL₂) | **SHIPPED** — optional radial smoothstep feather with default hard edge, v40 blob (2353 B), v39 default decode, full-buffer hard-edge regression; senior review APPROVE; Docker CI 1,992 core / 578 UI passed; commit `6472ccd434d3ea16cbcdc0befd5d1841ec35af58` deployed as `c-41:6472ccd434`, healthy, zero restarts, HTTP/HTTPS 200; GitHub checks green; both remotes verified | multi-stroke painting, heal, masks and wavelets remain deferred |
 | S8 | G2 S-B render/display space | user-selectable render seam, default byte-identical | regression risk on the pinned default path |
 | S9 | G2 S-A soft-proofing | proof toggle + proof profile + gamut check; docs | proof-of-sRGB-only display limits |
 | S10 | G3 S-D per-instance module stack | duplicate/remove instances end-to-end | touches every module's state |
@@ -148,11 +147,11 @@ RAW prepare combined, "XL" splits into two.
 
 > Sprint ledger: **S1 ✅ 2026-11-10** (Framing). **S2 ✅ 2026-11-10**
 > (Chromatic aberrations). **S3 ✅ 2026-11-10** (Watermark). **S4 ✅ 2026-11-10**
-> (Color calibration). **S5 ✅ 2026-11-11** (Liquify). **S6 ✅ 2026-11-12** (Retouch slice 1). **S7 (CI ✅; deploy pending, 2026-11-12)** (Retouch feather control). Broader editor parity remains deferred.
+> (Color calibration). **S5 ✅ 2026-11-11** (Liquify). **S6 ✅ 2026-11-12** (Retouch slice 1). **S7 ✅ 2026-11-12** (Retouch feather control). Broader editor parity remains deferred.
 | S12 | G6 decision batch | each G6 row: ship/withdraw/refuse recorded; cosmetic + clippy pass | — |
 | S13 | Closure | 52/52 counters, audit "Not on the table" rewrite, final CI + deploy | — |
 
-Counter bookkeeping: S1–S6 brought the wired count from 46 to 52 (current breakdown: 47 live + 5 elsewhere-driven). S7 adds feathering without changing the catalogue counter; its Docker CI is green and deployment is pending; G2/G3/G6 remain open.
+Counter bookkeeping: S1–S6 brought the wired count from 46 to 52 (current breakdown: 47 live + 5 elsewhere-driven). S7 adds feathering without changing the catalogue counter; its Docker CI and deployment are verified; G2/G3/G6 remain open.
 
 ## 5. Verification gates per sprint (fixed, not negotiable)
 

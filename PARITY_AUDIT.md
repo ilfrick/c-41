@@ -215,8 +215,11 @@ Retouch off; preview and export use the same immutable-source kernel. The
 Darkroom supports two-step placement, markers, cancel/clear, history, reset,
 and partial styles. Multi-stroke painting, heal, masks, wavelet behavior, and
 full C editor parity remain deferred. S7 independent review APPROVE; all four
-Docker CI gates passed (1 992 core / 578 UI tests). Post-push deployment
-verification will be recorded in PROGRESS.md. Catalogue remains 52 of 52 wired.
+Docker CI gates passed (1 992 core / 578 UI tests). Commit
+`6472ccd434d3ea16cbcdc0befd5d1841ec35af58` is pushed to both remotes and
+running as `c-41:6472ccd434` (healthy, zero restarts, HTTP/HTTPS 200); GitHub
+checks are green. Deployment details are recorded in PROGRESS.md. Catalogue
+remains 52 of 52 wired.
 
 The kernel mapping below originates as the 2026-10-01 snapshot; row statuses
 have been refreshed through S7 on 2026-11-12. The input-profile row always had a

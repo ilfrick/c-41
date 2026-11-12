@@ -9643,7 +9643,7 @@ applied; clippy then rejected a test-only zero-valued arithmetic expression,
 which was simplified. The final full Docker run passed. No deployment or
 production service changes were made; the installer files remain untouched.
 
-## 2026-11-12 20:58 UTC — S7: Retouch radial feather (CI passed; deploy pending)
+## 2026-11-12 20:58 UTC — S7: Retouch radial feather (CI and deploy verified)
 
 **What.** Added an optional smooth radial falloff to the single clone stamp.
 Feather zero takes the original hard-edge blend path and is regression-tested
@@ -9656,8 +9656,8 @@ masks, wavelet preview, and full editor parity remain deferred.
 **Reviewed.** Independent senior review APPROVE. Review suggestions were applied:
 docs describe the feathered mask, the 573-float size is documented, and the
 partial-style test asserts feather copying. Review also caught stale S1–S7
-status/count language; audit and plan now distinguish S6 shipped from S7
-CI-passed/deploy-pending.
+status/count language; audit and plan now reflect S7 as shipped after its
+CI-passed deployment.
 
 **Verified.** The first `scripts/ci-local.sh` run failed one new feather-edge
 test: the fixture set only one source pixel although the stamp samples source
@@ -9666,9 +9666,15 @@ final `scripts/ci-local.sh` passed all four gates by exit code: workspace check,
 clippy, release tests (1,992 core / 578 UI), and release binary link.
 `git diff --check` passed. Existing unrelated warnings remain.
 
-**Deployment state.** Before S7 work, S6 commit
+**Deployment.** Before S7 work, S6 commit
 `98af551b798f74421d329ef039bcc49905556388` was deployed as
-`c-41:98af551b79`; the container is healthy with zero restarts and HTTP/HTTPS
-return 200. Rollback `c-41-rollback-98af551b79` is retained. S7 has not yet been
-pushed or deployed; its deployment will follow the push, with verification
-recorded after rollout. The installer files remain untouched.
+`c-41:98af551b79`. S7 commit `6472ccd434d3ea16cbcdc0befd5d1841ec35af58` was
+pushed to GitHub and Gitea (both `master` refs verified) and deployed as
+`c-41:6472ccd434` (image ID
+`5aba8efaeb969bba6380678c1a06f1959952eb6f6ae52bf866201de34cfac171`). The
+container is healthy with zero restarts; HTTP and HTTPS return 200, the app
+process is running, and startup logs have no panic/fatal errors. Both GitHub
+checks (`check + test + clippy`, `Build & push Docker image`) completed
+successfully. Previous S6 image is retained as
+`c-41-rollback-6472ccd434` (`c-41:98af551b79`). No other services changed; the
+installer files remain untouched.
