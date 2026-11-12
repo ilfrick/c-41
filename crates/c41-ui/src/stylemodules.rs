@@ -65,6 +65,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Denoise (profiled)",
     "Chromatic aberrations",
     "Liquify",
+    "Retouch",
     "Bloom",
     "Grain",
     "Soften",
@@ -520,6 +521,17 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.lens_target_geom = src.lens_target_geom;
             true
         }
+        "Retouch" => {
+            target.retouch_source_set = src.retouch_source_set;
+            target.retouch_on = src.retouch_on;
+            target.retouch_source_x = src.retouch_source_x;
+            target.retouch_source_y = src.retouch_source_y;
+            target.retouch_dest_x = src.retouch_dest_x;
+            target.retouch_dest_y = src.retouch_dest_y;
+            target.retouch_radius = src.retouch_radius;
+            target.retouch_opacity = src.retouch_opacity;
+            true
+        }
         "Liquify" => {
             target.liq_on = src.liq_on;
             target.liq_offsets = src.liq_offsets;
@@ -601,7 +613,7 @@ mod tests {
 
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
-        assert_eq!(MODULE_GROUPS.len(), 45);
+        assert_eq!(MODULE_GROUPS.len(), 46);
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
@@ -644,6 +656,33 @@ mod tests {
         assert_eq!(target.velvia_strength, 42.0);
         assert_eq!(target.ev, -1.5, "another group's field must not move");
         assert_eq!(target.black, PreviewParams::default().black);
+    }
+
+    #[test]
+    fn retouch_partial_style_copies_all_fields_only() {
+        let overlay = PreviewParams {
+            retouch_source_set: true,
+            retouch_on: true,
+            retouch_source_x: 0.1,
+            retouch_source_y: 0.2,
+            retouch_dest_x: 0.7,
+            retouch_dest_y: 0.8,
+            retouch_radius: 0.15,
+            retouch_opacity: 63.0,
+            ev: 8.0,
+            ..PreviewParams::default()
+        };
+        let mut target = PreviewParams { ev: -1.5, ..PreviewParams::default() };
+        assert!(copy_module_group(&mut target, &overlay, "Retouch"));
+        assert_eq!(target.retouch_source_set, overlay.retouch_source_set);
+        assert_eq!(target.retouch_on, overlay.retouch_on);
+        assert_eq!(target.retouch_source_x, overlay.retouch_source_x);
+        assert_eq!(target.retouch_source_y, overlay.retouch_source_y);
+        assert_eq!(target.retouch_dest_x, overlay.retouch_dest_x);
+        assert_eq!(target.retouch_dest_y, overlay.retouch_dest_y);
+        assert_eq!(target.retouch_radius, overlay.retouch_radius);
+        assert_eq!(target.retouch_opacity, overlay.retouch_opacity);
+        assert_eq!(target.ev, -1.5, "copying Retouch must not touch Exposure");
     }
 
     #[test]

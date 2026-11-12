@@ -10,12 +10,12 @@
 
 ---
 
-## 1. Current state (2026-11-11)
+## 1. Current state (2026-11-12)
 
-- Catalogue: **51 of 52 module rows active** (46 live + 5 elsewhere-driven).
-  **1 inert row:** `Retouch`.
-- Tests: 1 986 `c41-core` / 573 `c41-ui` (Docker release). PreviewParams blob
-  v38 (2323 B); geometry blob v2.
+- Catalogue: **52 of 52 module rows wired** (47 live + 5 elsewhere-driven).
+  No inert rows remain.
+- Tests: 1 990 `c41-core` / 578 `c41-ui` (Docker release). PreviewParams blob
+  v39 (2349 B); geometry blob v2.
 - G2 colour: input profiling (embedded + per-image assumption) live; output
   profile choice (sRGB/Adobe RGB) live for all Rust exports; raw Adobe exports
   transform directly from linear Rec.2020. **Still open: soft-proofing and the
@@ -50,20 +50,20 @@ not what it is not.
 
 ## 3. Backlog (ordered by value / risk)
 
-### G1 — the six inert rows (kernel maths ✘ done, product wiring ✘ to do)
+### G1 — formerly inert catalogue rows (kernel and product wiring status)
 
 | Row | C module | Kernel status | Size | Notes |
 |---|---|---|---|---|
-| `Framing` | `borders.c` | ported (4 exports / 21 tests incl. geometry) | **M** | Effect-group border pass: per-side widths, colour, opacity, blend. New `Stage` or geometry post-pass; preview + all export funnels. |
-| `Chromatic aberrations` | `cacorrectrgb.c` | ported (7 exports / 11 tests) | **M** | Per-pixel RGBA stage: red/blue transverse shift sliders, RC/GC/BC factor. Straightforward `Stage` + slider row. |
-| `Watermark` | `watermark.c` | ported (`darkroom_watermark_blend`, tested) | **M** | Needs an asset-path picker (reuse `watermarks/` templates question) + compositing row (image, position, scale, opacity). First slice: single embedded PNG asset, one blend mode. |
-| `Color calibration` | `channelmixerrgb.c` | ported (2 exports / 6 tests) | **L** | 12 coeff sliders + RGB/Lab mode + auto-WB; best implemented on a proven matrix-stage precedent (Primaries). Watch the documented primaries-vs-ICC coefficient divergence class. |
+| ~~`Framing`~~ | `borders.c` | wired S1 (4 exports / 21 tests incl. geometry) | **M** | Constant-border compose and frame line shipped in the geometry family; basis/aspect controls remain deferred. |
+| ~~`Chromatic aberrations`~~ | `cacorrectrgb.c` | wired S2 (7 exports / 11 tests) | **M** | Full-frame manifold pipeline and Correct-group controls shipped. |
+| ~~`Watermark`~~ | `watermark.c` | wired S3 (`darkroom_watermark_blend`, tested) | **M** | Embedded PNG compositor shipped; asset picker, SVG/text assets and additional blend modes remain deferred. |
+| ~~`Color calibration`~~ | `channelmixerrgb.c` | wired S4 (2 exports / 6 tests) | **L** | Matrix chain and darkroom controls shipped; known CAT16 bridge divergence is documented in the audit. |
 | ~~`Liquify`~~ | `liquify.c` | wired S5 slice 1 (6 exports / 12 kernel tests; lattice driver + UI) | **L/XL** | Fixed 5×5 normalized dx/dy lattice, editable in the module panel, bilinear map interpolation through the existing bicubic C sampler. Not the C freehand Bezier/stamp editor; no selectable interpolation mode or pixel-golden parity claim. Stage at v50 pos 28.0 before Exposure. |
-| `Retouch` | `retouch.c` | ported kernels (7 exports / 12 tests) plus GUI-only auto-levels | **XL** | Clone/blur stamp needs a paint-UI; slice 1 = single-round brush stamp with radius/opacity, slice 2 = wavelet preview + feathering. Biggest G1 row. |
+| `Retouch` | `retouch.c` | wired S6 slice 1 (7 exports / clone-stamp driver and tests) plus GUI-only auto-levels | **XL** | Single non-destructive hard circular clone stamp with normalized source/destination, radius and opacity. Multi-stamp painting, feathering and wavelet preview remain deferred. |
 
-Suggested order: **Framing → Chromatic aberrations → Watermark** (three M
-sprints, fast wins, all Effect/Correct rows), then **Color calibration** (L),
-then **Liquify** (L, slice 1 shipped; C freehand-editor parity deferred), then **Retouch** (XL, planned as two slices).
+S1–S6 delivery order and outcomes are recorded in the sprint ledger below. All
+six increments are shipped; remaining G1 scope is limited to deferred feature
+parity (including broader Liquify and Retouch editors), not inert catalogue rows.
 
 ### G2 — colour management (soft-proofing + render seam)
 
@@ -136,7 +136,7 @@ RAW prepare combined, "XL" splits into two.
 | ✅ **S3 2026-11-10** | `Watermark` (G1 M) | **SHIPPED** +1 live (48→49/52) — full `watermark.c` PNG-branch compositor (scale/bbox/alignment/rot/opacity), embedded deterministic 160×160 asset, Stage at v50 pos 69 (last), v36 blob (2006 B), 3×3 grid row; slice 1: built-in PNG only (no picker/SVG/text) — see G6 notes | asset persistence deferred to serialized string table; C-render golden recorded follow-up |
 | ✅ **S4 2026-11-10** | `Color calibration` (G1 L) | **SHIPPED** +1 live (49→50/52) — commit_params matrix chain (CAT16 D65↔D50 bridge, 5 adaptation modes, temperature/illuminant polys, mix+sat/light/grey+normalize, gamut, clip) over the pre-ported loop_switch kernel; v50 28.5 pin both funnels; v37 blob (2122 B); 25-control row; review: algebra verified, 1 MAJOR fixed (bypassed() now clears the S1–S4 flag-only stage flags) | CAT16-bridge ≠ ICC-profile D50 (~1–3%) — goldens need bridged reference |
 | ✅ **S5 2026-11-11** | `Liquify` (G1 L) | **LIVE, slice 1** +1 (50→51/52) — fixed 5×5 drag lattice in module panel, bilinear displacement map through C's bicubic sampler, stage v50 pos 28.0 before Exposure, PreviewParams v38 (2323 B); backward decode v37 verified; review APPROVE after fixing stage-order finding | freehand Bezier/stamp controls and selectable interpolation deferred; no C golden render parity claim |
-| S6 | `Retouch` slice 1 (G1 XL₁) | +1 live; brush stamp, radius/opacity, painting on preview | paint-canvas + blend wiring |
+| ✅ **S6 2026-11-12** | `Retouch` slice 1 (G1 XL₁) | **SHIPPED** +1 live (51→52/52) — single clone stamp, normalized source/destination capture, hard brush radius/opacity, preview/export stage, PreviewParams v39 (2349 B), backward v38 decode; review APPROVE, Docker CI green | multi-stroke painting, feathering/wavelets deferred |
 | S7 | `Retouch` slice 2 (G1 XL₂) | feathering/wavelet preview or refuse | — |
 | S8 | G2 S-B render/display space | user-selectable render seam, default byte-identical | regression risk on the pinned default path |
 | S9 | G2 S-A soft-proofing | proof toggle + proof profile + gamut check; docs | proof-of-sRGB-only display limits |
@@ -147,12 +147,11 @@ RAW prepare combined, "XL" splits into two.
 
 > Sprint ledger: **S1 ✅ 2026-11-10** (Framing). **S2 ✅ 2026-11-10**
 > (Chromatic aberrations). **S3 ✅ 2026-11-10** (Watermark). **S4 ✅ 2026-11-10**
-> (Color calibration). Remaining G1 rows for S6–S7: `Retouch` ×2.
+> (Color calibration). **S5 ✅ 2026-11-11** (Liquify). **S6 ✅ 2026-11-12** (Retouch slice 1). S7 remains a scope decision on additional Retouch parity.
 | S12 | G6 decision batch | each G6 row: ship/withdraw/refuse recorded; cosmetic + clippy pass | — |
 | S13 | Closure | 52/52 counters, audit "Not on the table" rewrite, final CI + deploy | — |
 
-Counter bookkeeping: after S1–S7 the inert list is empty (46→52); G2/G3/G6
-work does not change the counter but closes PARITY_AUDIT sections.
+Counter bookkeeping: S1–S6 brought the wired count from 46 to 52 (current breakdown: 47 live + 5 elsewhere-driven). S7 and G2/G3/G6 work do not change the counter but close remaining parity sections.
 
 ## 5. Verification gates per sprint (fixed, not negotiable)
 

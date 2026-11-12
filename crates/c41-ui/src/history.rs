@@ -256,6 +256,15 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     }
     let liq = old.liq_on != new.liq_on || old.liq_offsets != new.liq_offsets;
     if liq { return "Liquify"; }
+    let retouch = old.retouch_source_set != new.retouch_source_set
+        || old.retouch_on != new.retouch_on
+        || old.retouch_source_x != new.retouch_source_x
+        || old.retouch_source_y != new.retouch_source_y
+        || old.retouch_dest_x != new.retouch_dest_x
+        || old.retouch_dest_y != new.retouch_dest_y
+        || old.retouch_radius != new.retouch_radius
+        || old.retouch_opacity != new.retouch_opacity;
+    if retouch { return "Retouch"; }
     let exposure = old.exposure_on != new.exposure_on
         || old.black != new.black
         || old.ev != new.ev;
@@ -853,6 +862,18 @@ mod tests {
             describe_change(&base, &PreviewParams { velvia_strength: 50.0, ..d() }),
             "Velvia"
         );
+        for (case, changed) in [
+            PreviewParams { retouch_source_set: true, ..d() },
+            PreviewParams { retouch_on: true, ..d() },
+            PreviewParams { retouch_source_x: 0.2, ..d() },
+            PreviewParams { retouch_source_y: 0.3, ..d() },
+            PreviewParams { retouch_dest_x: 0.4, ..d() },
+            PreviewParams { retouch_dest_y: 0.6, ..d() },
+            PreviewParams { retouch_radius: 0.1, ..d() },
+            PreviewParams { retouch_opacity: 50.0, ..d() },
+        ].into_iter().enumerate() {
+            assert_eq!(describe_change(&base, &changed), "Retouch", "case {case}: source_set={}, on={}, source=({},{}), destination=({},{}), radius={}, opacity={}", changed.retouch_source_set, changed.retouch_on, changed.retouch_source_x, changed.retouch_source_y, changed.retouch_dest_x, changed.retouch_dest_y, changed.retouch_radius, changed.retouch_opacity);
+        }
         assert_eq!(
             describe_change(&base, &PreviewParams { split_balance: 0.7, ..d() }),
             "Split-toning"
@@ -1463,6 +1484,14 @@ mod tests {
             brd_frame_color_b: _,
             liq_on: _,
             liq_offsets: _,
+            retouch_source_set: _,
+            retouch_on: _,
+            retouch_source_x: _,
+            retouch_source_y: _,
+            retouch_dest_x: _,
+            retouch_dest_y: _,
+            retouch_radius: _,
+            retouch_opacity: _,
         } = PreviewParams::default();
     }
 
@@ -1597,7 +1626,8 @@ mod tests {
         // 9 red/green/blue mix coefficients, saturation/lightness/grey
         // vectors, gamut).
         // S5 Liquify (v38): 2122 → 2323 (1 bool + 50 f32 lattice offsets).
-        assert_eq!(PreviewParams::default().encode().len(), 2323);
+        // S6 Retouch (v39): 2323 → 2349 (2 bools + 6 f32 controls).
+        assert_eq!(PreviewParams::default().encode().len(), 2349);
     }
 
     #[test]

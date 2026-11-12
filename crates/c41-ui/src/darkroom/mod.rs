@@ -310,7 +310,19 @@ struct PreviewCtx {
     /// global Reset does, so the two paths leave the viewport in the same state.
     /// Set once after the button is built (before the modules are built).
     before_after: glib::WeakRef<gtk4::ToggleButton>,
+    /// Ephemeral clone-stamp placement state; never persisted or recorded as history.
+    retouch_capture: Rc<std::cell::Cell<Option<RetouchCapture>>>,
+    retouch_pending_source: Rc<std::cell::Cell<Option<(f32, f32)>>>,
+    retouch_overlay: glib::WeakRef<gtk4::DrawingArea>,
+    retouch_status: glib::WeakRef<gtk4::Label>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetouchCapture {
+    Source,
+    Destination,
+}
+
 
 /// Debounced recorder that appends one [`HistoryStack`] entry per *settled* edit
 /// (so a slider drag coalesces into a single history item, like [`AutoSave`]),
@@ -730,6 +742,38 @@ struct CropDrag {
     start_fy: f32,
 }
 
+/// Map widget coordinates into normalized pixel-center coordinates in the current
+/// displayed base. This is the post-geometry frame supplied to preview/export
+/// (orientation, crop/straighten and borders composition as provided by PreviewCtx).
+fn widget_to_normalized_frame(
+    widget_w: f64,
+    widget_h: f64,
+    img_w: usize,
+    img_h: usize,
+    x: f64,
+    y: f64,
+) -> Option<(f32, f32)> {
+    let (px, py) = crate::preview::map_widget_to_image(widget_w, widget_h, img_w, img_h, x, y)?;
+    Some((
+        if img_w > 1 { px as f32 / (img_w - 1) as f32 } else { 0.5 },
+        if img_h > 1 { py as f32 / (img_h - 1) as f32 } else { 0.5 },
+    ))
+}
+
+/// Map a normalized image coordinate to a widget-space marker center and radius.
+fn retouch_marker_geometry(
+    rect: &crate::preview::ContainRect,
+    img_w: usize,
+    img_h: usize,
+    point: (f32, f32),
+    radius: f32,
+) -> (f64, f64, f64) {
+    let x = rect.off_x + ((point.0 as f64 * img_w.saturating_sub(1) as f64 + 0.5) / img_w as f64) * rect.disp_w;
+    let y = rect.off_y + ((point.1 as f64 * img_h.saturating_sub(1) as f64 + 0.5) / img_h as f64) * rect.disp_h;
+    let radius_px = radius.max(0.0) as f64 * img_w.min(img_h) as f64 * rect.scale;
+    (x, y, radius_px)
+}
+
 /// Display dimensions of the current base (`None` if not yet decoded).
 fn base_dims(base: &Option<BaseImage>) -> Option<(usize, usize)> {
     match base.as_ref()? {
@@ -786,6 +830,51 @@ fn draw_crop(cr: &gtk4::cairo::Context, w: i32, h: i32, base_w: usize, base_h: u
         cr.rectangle(hx - hs, hy - hs, hs * 2.0, hs * 2.0);
     }
     let _ = cr.fill();
+}
+
+/// Draw saved clone-stamp endpoints and brush bounds. This overlay is always
+/// click-through; crop and wipe overlays retain their independent input paths.
+fn draw_retouch(
+    cr: &gtk4::cairo::Context,
+    w: i32,
+    h: i32,
+    img_w: usize,
+    img_h: usize,
+    params: &PreviewParams,
+    pending: Option<(f32, f32)>,
+) {
+    let Some(rect) = crate::preview::contain_rect(w as f64, h as f64, img_w, img_h) else { return };
+    let source = (params.retouch_source_x, params.retouch_source_y);
+    let dest = (params.retouch_dest_x, params.retouch_dest_y);
+    let radius = params.retouch_radius;
+    let (sx, sy, sr) = retouch_marker_geometry(&rect, img_w, img_h, source, radius);
+    let (dx, dy, dr) = retouch_marker_geometry(&rect, img_w, img_h, dest, radius);
+    if params.retouch_source_set {
+        cr.set_source_rgba(0.2, 0.9, 1.0, 0.9);
+        cr.set_line_width(1.5);
+        cr.arc(sx, sy, sr.max(3.0), 0.0, std::f64::consts::TAU);
+        let _ = cr.stroke();
+        cr.move_to(sx - 5.0, sy); cr.line_to(sx + 5.0, sy);
+        cr.move_to(sx, sy - 5.0); cr.line_to(sx, sy + 5.0);
+        let _ = cr.stroke();
+        cr.set_source_rgba(1.0, 0.65, 0.15, 0.9);
+        cr.arc(dx, dy, dr.max(3.0), 0.0, std::f64::consts::TAU);
+        let _ = cr.stroke();
+        cr.move_to(sx, sy); cr.line_to(dx, dy);
+        let _ = cr.stroke();
+        cr.arc(dx, dy, 4.0, 0.0, std::f64::consts::TAU);
+        let _ = cr.fill();
+    }
+    if let Some(point) = pending {
+        let (x, y, _) = retouch_marker_geometry(&rect, img_w, img_h, point, 0.0);
+        cr.set_source_rgba(0.3, 1.0, 0.5, 0.95);
+        cr.set_line_width(2.0);
+        cr.arc(x, y, 7.0, 0.0, std::f64::consts::TAU);
+        let _ = cr.stroke();
+        cr.move_to(x - 5.0, y); cr.line_to(x + 5.0, y);
+        cr.move_to(x, y - 5.0); cr.line_to(x, y + 5.0);
+        let _ = cr.stroke();
+    }
 }
 
 /// The displayed-image rect for the crop overlay's current base, if editable.
@@ -937,6 +1026,9 @@ fn render_preview(ctx: &PreviewCtx) {
             &r.bytes, r.width as usize, r.height as usize, r.rowstride, r.nch,
         );
         if let Some(area) = ctx.hist_area.upgrade() {
+            area.queue_draw();
+        }
+        if let Some(area) = ctx.retouch_overlay.upgrade() {
             area.queue_draw();
         }
 
@@ -1522,6 +1614,11 @@ pub fn darkroom_page(
         .vexpand(true)
         .can_target(false)
         .build();
+    let retouch_area = gtk4::DrawingArea::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .can_target(false)
+        .build();
     let snapshots: SnapStore = Rc::new(RefCell::new(SnapshotStore::new(SNAPSHOT_CAP)));
 
     // ── Live RGB histogram strip under the image ───────────────────────────
@@ -1646,6 +1743,10 @@ pub fn darkroom_page(
         panel_box: glib::WeakRef::new(),
         history_list: history_list.downgrade(),
         before_after: glib::WeakRef::new(),
+        retouch_capture: Rc::new(std::cell::Cell::new(None)),
+        retouch_pending_source: Rc::new(std::cell::Cell::new(None)),
+        retouch_overlay: retouch_area.downgrade(),
+        retouch_status: glib::WeakRef::new(),
     };
     // Show the seed entry immediately.
     refresh_history_list(&history_list, &ctx.history.borrow());
@@ -1717,7 +1818,18 @@ pub fn darkroom_page(
         crop_area.add_controller(drag);
     }
 
-    // ── Colour picker: click the image to read the processed pixel ─────────
+    // Non-intercepting saved/pending retouch markers share the crop overlay's
+    // allocation and Contain geometry.
+    {
+        let draw_ctx = ctx.clone();
+        retouch_area.set_draw_func(move |_, cr, w, h| {
+            if let Some((bw, bh)) = base_dims(&draw_ctx.base.borrow()) {
+                draw_retouch(cr, w, h, bw, bh, &draw_ctx.params.borrow(), draw_ctx.retouch_pending_source.get());
+            }
+        });
+    }
+
+    // ── Colour picker / armed retouch capture share the image click path ────
     let click = gtk4::GestureClick::new();
     let pick_ctx = ctx.clone();
     let pick_pic = picture.downgrade();
@@ -1726,6 +1838,44 @@ pub fn darkroom_page(
         let (Some(pic), Some(label)) = (pick_pic.upgrade(), pick_label.upgrade()) else {
             return;
         };
+        if let Some(capture) = pick_ctx.retouch_capture.get() {
+            let (w, h) = {
+                let last_render = pick_ctx.last_render.borrow();
+                let Some(c) = last_render.as_ref() else { return };
+                (c.width as usize, c.height as usize)
+            };
+            let point = widget_to_normalized_frame(pic.width() as f64, pic.height() as f64, w, h, x, y);
+            let Some(point) = point else { return }; // letterbox clicks do nothing, never sample
+            match capture {
+                RetouchCapture::Source => {
+                    pick_ctx.retouch_pending_source.set(Some(point));
+                    pick_ctx.retouch_capture.set(Some(RetouchCapture::Destination));
+                    if let Some(status) = pick_ctx.retouch_status.upgrade() {
+                        status.set_text("Source set — click the image to place the stamp.");
+                    }
+                }
+                RetouchCapture::Destination => {
+                    let Some(source) = pick_ctx.retouch_pending_source.get() else { return };
+                    {
+                        let mut p = pick_ctx.params.borrow_mut();
+                        p.retouch_source_x = source.0;
+                        p.retouch_source_y = source.1;
+                        p.retouch_dest_x = point.0;
+                        p.retouch_dest_y = point.1;
+                        p.retouch_source_set = true;
+                        p.retouch_on = true;
+                    }
+                    pick_ctx.retouch_pending_source.set(None);
+                    pick_ctx.retouch_capture.set(None);
+                    if let Some(status) = pick_ctx.retouch_status.upgrade() {
+                        status.set_text("Stamp placed. Set source to place another stamp.");
+                    }
+                    render_preview(&pick_ctx);
+                }
+            }
+            if let Some(area) = pick_ctx.retouch_overlay.upgrade() { area.queue_draw(); }
+            return;
+        }
         // Sample the last displayed render (no re-render).
         if let Some(c) = pick_ctx.last_render.borrow().as_ref() {
             let (w, h) = (c.width as usize, c.height as usize);
@@ -1733,12 +1883,8 @@ pub fn darkroom_page(
                 pic.width() as f64, pic.height() as f64, w, h, x, y,
             ) {
                 Some((px, py)) => {
-                    if let Some((rr, gg, bb)) =
-                        crate::preview::sample_pixel(&c.bytes, w, h, c.rowstride, c.nch, px, py)
-                    {
-                        label.set_text(&format!(
-                            "Pick ({px},{py}):  R {rr}  G {gg}  B {bb}   #{rr:02X}{gg:02X}{bb:02X}"
-                        ));
+                    if let Some((rr, gg, bb)) = crate::preview::sample_pixel(&c.bytes, w, h, c.rowstride, c.nch, px, py) {
+                        label.set_text(&format!("Pick ({px},{py}):  R {rr}  G {gg}  B {bb}   #{rr:02X}{gg:02X}{bb:02X}"));
                     }
                 }
                 None => label.set_text("Pick: (outside image)"),
@@ -1760,6 +1906,7 @@ pub fn darkroom_page(
     image_overlay.set_child(Some(&picture));
     image_overlay.add_overlay(&wipe_area);
     image_overlay.add_overlay(&crop_area);
+    image_overlay.add_overlay(&retouch_area);
 
     let image_area = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -2265,6 +2412,9 @@ pub fn darkroom_page(
             let editing = b.is_active();
             cb_ctx.crop_editing.set(editing);
             if editing {
+                cb_ctx.retouch_capture.set(None);
+                cb_ctx.retouch_pending_source.set(None);
+                if let Some(area) = cb_ctx.retouch_overlay.upgrade() { area.queue_draw(); }
                 // Only one overlay may be interactive: dismiss any active wipe
                 // compare (it would show through the dim bands and its gesture
                 // would fight the crop drag).
@@ -2359,6 +2509,9 @@ pub fn darkroom_page(
     let reset_ba = before_after_btn.downgrade();
     let reset_list = history_list.downgrade();
     reset_btn.connect_clicked(move |_| {
+        reset_ctx.retouch_capture.set(None);
+        reset_ctx.retouch_pending_source.set(None);
+        if let Some(area) = reset_ctx.retouch_overlay.upgrade() { area.queue_draw(); }
         *reset_ctx.params.borrow_mut() = PreviewParams::default();
         reset_ctx.bypass.set(false); // source of truth for bypass
         if let Some(ba) = reset_ba.upgrade() {
@@ -2802,6 +2955,7 @@ fn populate_modules(panel: &gtk4::Box, ctx: &PreviewCtx) {
                 "White balance" => whitebalance_module_row(ctx).upcast(),
                 "Framing" => framing_module_row(ctx).upcast(),
                 "Watermark" => watermark_module_row(ctx).upcast(),
+                "Retouch" => retouch_module_row(ctx).upcast(),
                 "Liquify" => liquify_module_row(ctx).upcast(),
                 "Invert" => invert_module_row(ctx).upcast(),
                 other => match elsewhere_hint(other) {
@@ -3091,7 +3245,7 @@ fn elsewhere_hint(label: &str) -> Option<&'static str> {
 ///
 /// Keep in sync with the match arms — adding a module means adding it here too,
 /// or it will render live but be counted and sorted as a placeholder.
-const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Color calibration", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Liquify", "Defringe", "Invert", "White balance", "Input color profile", "Framing", "Watermark"];
+const LIVE_MODULE_LABELS: &[&str] = &["Raw black/white point", "Exposure", "Velvia", "Split-toning", "Monochrome", "Sigmoid", "Sharpen", "Vibrance", "Colorize", "Color correction", "Color contrast", "Color zones", "Tone curve", "RGB curve", "Base curve", "Levels", "Vignetting", "Lowlight vision", "Graduated density", "Contrast brightness saturation", "Basic adjustments", "Shadows/Highlights", "Local contrast", "Lowpass", "Highpass", "Primaries", "Negadoctor", "Tone equalizer", "Color balance RGB", "Color calibration", "Filmic RGB", "Highlight reconstruction", "Hot pixels", "Denoise (profiled)", "Lens correction", "Bloom", "Grain", "Soften", "Chromatic aberrations", "Liquify", "Defringe", "Invert", "White balance", "Input color profile", "Framing", "Watermark", "Retouch"];
 
 // Borrow invariant for the closures below: GTK callbacks run on the main
 // thread and never re-enter while a `params` borrow is held — each closure
@@ -3382,6 +3536,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             colorize_lightness_mix
         ),
         "Grain" => set!(gr_on, gr_coarseness, gr_strength, gr_midtones_bias),
+        "Retouch" => set!(retouch_on, retouch_source_set, retouch_source_x, retouch_source_y, retouch_dest_x, retouch_dest_y, retouch_radius, retouch_opacity),
         "Soften" => set!(soften_on, soften_size, soften_saturation, soften_brightness, soften_amount),
         "Defringe" => set!(df_on, df_radius, df_thresh, df_mode),
         _ => return false,
@@ -3402,6 +3557,11 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
 /// A no-op (no rebuild, no history entry) when the module is already at its
 /// defaults, so clicking reset on an untouched module does nothing.
 fn reset_module_and_rebuild(ctx: &PreviewCtx, which: &str, re_decode: bool) {
+    if which == "Retouch" {
+        ctx.retouch_capture.set(None);
+        ctx.retouch_pending_source.set(None);
+        if let Some(area) = ctx.retouch_overlay.upgrade() { area.queue_draw(); }
+    }
     let before = *ctx.params.borrow();
     {
         let mut p = ctx.params.borrow_mut();
@@ -3664,6 +3824,94 @@ fn exposure_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
             // Black point: lifted before scaling (out = (in - black) * scale).
             add_param_slider(e, ctx, "Black", 0.0, 0.2, 0.001, p0.black as f64,
                 |p, v| p.black = v);
+        })
+}
+
+/// Single clone-stamp retouch module. Placement is a two-click transaction;
+/// the source click remains ephemeral until the destination commits both points.
+fn retouch_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
+    let p0 = *ctx.params.borrow();
+    module_expander(ctx, "Retouch", "Single clone stamp: choose a source, then place it on the image.", p0.retouch_on,
+        |p, on| p.retouch_on = on,
+        |e, ctx| {
+            let instructions = gtk4::Label::builder()
+                .label("Click Set source, then click the image. Next click the image to place the stamp. A new stamp replaces the previous one.")
+                .wrap(true).xalign(0.0).margin_start(8).margin_end(8).build();
+            e.add_row(&instructions);
+            let status = gtk4::Label::builder()
+                .label(if ctx.retouch_capture.get() == Some(RetouchCapture::Source) {
+                    "Click the image to choose the source."
+                } else if ctx.retouch_capture.get() == Some(RetouchCapture::Destination) {
+                    "Click the image to place the stamp."
+                } else if p0.retouch_source_set {
+                    "Stamp saved. Choose a new source to replace it."
+                } else {
+                    "No stamp set. Choose a source to begin."
+                })
+                .wrap(true).xalign(0.0).margin_start(8).build();
+            ctx.retouch_status.set(Some(&status));
+            e.add_row(&status);
+            let actions = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal)
+                .spacing(6).margin_start(8).margin_end(8).build();
+            let source = gtk4::Button::with_label("Set source");
+            source.set_tooltip_text(Some("Next image click selects the clone source"));
+            let source_ctx = ctx.clone();
+            let source_status = status.downgrade();
+            source.connect_clicked(move |_| {
+                if source_ctx.crop_editing.get() {
+                    source_ctx.retouch_pending_source.set(None);
+                    source_ctx.retouch_capture.set(None);
+                    if let Some(s) = source_status.upgrade() { s.set_text("Exit crop mode before placing a retouch stamp."); }
+                    return;
+                }
+                source_ctx.retouch_pending_source.set(None);
+                source_ctx.retouch_capture.set(Some(RetouchCapture::Source));
+                if let Some(s) = source_status.upgrade() { s.set_text("Click the image to choose the source."); }
+                if let Some(area) = source_ctx.retouch_overlay.upgrade() { area.queue_draw(); }
+            });
+            actions.append(&source);
+            let place = gtk4::Button::with_label("Place stamp");
+            place.set_tooltip_text(Some("Next image click selects the destination; a source must be set first"));
+            let place_ctx = ctx.clone();
+            let place_status = status.downgrade();
+            place.connect_clicked(move |_| {
+                if place_ctx.crop_editing.get() {
+                    place_ctx.retouch_pending_source.set(None);
+                    place_ctx.retouch_capture.set(None);
+                    if let Some(s) = place_status.upgrade() { s.set_text("Exit crop mode before placing a retouch stamp."); }
+                } else if place_ctx.retouch_pending_source.get().is_some() {
+                    place_ctx.retouch_capture.set(Some(RetouchCapture::Destination));
+                    if let Some(s) = place_status.upgrade() { s.set_text("Click the image to place the stamp."); }
+                } else {
+                    if let Some(s) = place_status.upgrade() { s.set_text("Choose a source first with Set source."); }
+                }
+            });
+            actions.append(&place);
+            let cancel = gtk4::Button::with_label("Cancel");
+            let cancel_ctx = ctx.clone();
+            let cancel_status = status.downgrade();
+            cancel.connect_clicked(move |_| {
+                cancel_ctx.retouch_capture.set(None);
+                cancel_ctx.retouch_pending_source.set(None);
+                if let Some(s) = cancel_status.upgrade() { s.set_text("Placement cancelled. Saved stamp unchanged."); }
+                if let Some(area) = cancel_ctx.retouch_overlay.upgrade() { area.queue_draw(); }
+            });
+            actions.append(&cancel);
+            let clear = gtk4::Button::with_label("Clear stamp");
+            clear.set_tooltip_text(Some("Clear the stamp and restore Retouch defaults"));
+            let clear_ctx = ctx.clone();
+            clear.connect_clicked(move |_| {
+                clear_ctx.retouch_capture.set(None);
+                clear_ctx.retouch_pending_source.set(None);
+                if let Some(area) = clear_ctx.retouch_overlay.upgrade() { area.queue_draw(); }
+                reset_module_and_rebuild(&clear_ctx, "Retouch", false);
+            });
+            actions.append(&clear);
+            e.add_row(&actions);
+            add_param_slider(e, ctx, "Radius (%)", 0.0, 25.0, 0.1, (p0.retouch_radius * 100.0) as f64,
+                |p, v| p.retouch_radius = v / 100.0);
+            add_param_slider(e, ctx, "Opacity", 0.0, 100.0, 1.0, p0.retouch_opacity as f64,
+                |p, v| p.retouch_opacity = v);
         })
 }
 
@@ -6007,6 +6255,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retouch_click_mapping_uses_pixel_centers_and_rejects_letterbox() {
+        assert_eq!(widget_to_normalized_frame(100.0, 100.0, 1, 1, 50.0, 50.0), Some((0.5, 0.5)));
+        // One-pixel axes still map to the sole pixel's center, not an edge.
+        assert_eq!(widget_to_normalized_frame(3.0, 1.0, 3, 1, 0.5, 0.5), Some((0.0, 0.5)));
+        assert_eq!(widget_to_normalized_frame(1.0, 3.0, 1, 3, 0.5, 2.5), Some((0.5, 1.0)));
+        // 2:1 image is vertically letterboxed in a square; bars are rejected.
+        assert_eq!(widget_to_normalized_frame(100.0, 100.0, 2, 1, 50.0, 10.0), None);
+        assert_eq!(widget_to_normalized_frame(100.0, 100.0, 2, 1, 50.0, 50.0), Some((1.0, 0.5)));
+
+        let rect = crate::preview::contain_rect(100.0, 100.0, 3, 2).unwrap();
+        for (px, py) in [(0, 0), (1, 0), (2, 1)] {
+            let click_x = rect.off_x + (px as f64 + 0.5) * rect.scale;
+            let click_y = rect.off_y + (py as f64 + 0.5) * rect.scale;
+            let point = widget_to_normalized_frame(100.0, 100.0, 3, 2, click_x, click_y).unwrap();
+            let (marker_x, marker_y, _) = retouch_marker_geometry(&rect, 3, 2, point, 0.0);
+            assert!((marker_x - click_x).abs() < 1e-6);
+            assert!((marker_y - click_y).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn retouch_marker_geometry_tracks_contain_rect_and_brush_scale() {
+        let rect = crate::preview::contain_rect(200.0, 100.0, 4, 2).unwrap();
+        let (x, y, radius) = retouch_marker_geometry(&rect, 4, 2, (0.5, 0.5), 0.1);
+        assert_eq!((x, y), (100.0, 50.0));
+        assert!((radius - 10.0).abs() < 1e-5);
+    }
+
+    #[test]
     fn initial_params_seeding_matrix() {
         use crate::preview::PreviewParams;
         // no saved edit + raw ⇒ sigmoid defaulted on
@@ -6400,7 +6677,7 @@ mod tests {
         assert!(module_filter_matches(ModuleFilter::Wired, 2, "Color calibration", ""));
         // A catalogue row that is not implemented is not shown as wired, even
         // when the search text matches it.
-        assert!(!module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "reto"));
+        assert!(module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "reto"));
         // Basics is one curated cross-group scope over the same module rows.
         assert!(module_filter_matches(ModuleFilter::Basics, 0, "Exposure", ""));
         assert!(module_filter_matches(ModuleFilter::Basics, 2, "Color balance RGB", "cdl"));
@@ -6425,7 +6702,7 @@ mod tests {
         // Search combines with Wired: wired results match; placeholders do not.
         assert!(module_filter_matches(ModuleFilter::Wired, 4, "Highpass", "hig"));
         assert!(module_filter_matches(ModuleFilter::Wired, 2, "Color calibration", "channel mixer"));
-        assert!(!module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "spot removal"));
+        assert!(module_filter_matches(ModuleFilter::Wired, 3, "Retouch", "spot removal"));
     }
 
     /// Distinctive non-default value used by the reset tests. Must differ from
@@ -6798,6 +7075,16 @@ mod tests {
             p.wm_yoffset = M;
             p.wm_alignment = M;
             p.wm_rotate = M;
+        }),
+        ("Retouch", |p| {
+            p.retouch_on = true;
+            p.retouch_source_set = true;
+            p.retouch_source_x = M;
+            p.retouch_source_y = M;
+            p.retouch_dest_x = M;
+            p.retouch_dest_y = M;
+            p.retouch_radius = M;
+            p.retouch_opacity = M;
         }),
         ("Color calibration", |p| {
             p.ccl_on = true;
@@ -7211,6 +7498,14 @@ mod tests {
             brd_frame_color_r: _,
             brd_frame_color_g: _,
             brd_frame_color_b: _,
+            retouch_source_set: _,
+            retouch_on: _,
+            retouch_source_x: _,
+            retouch_source_y: _,
+            retouch_dest_x: _,
+            retouch_dest_y: _,
+            retouch_radius: _,
+            retouch_opacity: _,
         } = PreviewParams::default();
     }
 

@@ -9613,3 +9613,32 @@ runtime, ports, environment, and restart policy. No other services were changed.
 **Verified.** Both GitHub checks were green before rollout. The new container is
 healthy with restart count 0; HTTP and HTTPS return 200. Startup logs contain no
 panic or fatal error. The rollback container is stopped and retained.
+
+## 2026-11-12 19:24 UTC — S6: Retouch clone-stamp slice 1
+
+**What.** Added a single non-destructive clone stamp to the Rust product. The
+core pipeline uses immutable-source sampling with a hard circular mask, normalized
+source/destination coordinates, and editable radius/opacity. The darkroom adds
+source-then-destination capture, letterbox rejection, markers, cancel/clear,
+reset, history labels, and partial-style support. PreviewParams v39 appends the
+Retouch fields and decodes v38 with the new module disabled. Added the project
+agent profile `.pi/agents/c41-general-purpose-developer.md` after the requested
+general-purpose developer agent was unavailable; it limits development scope
+and explicitly separates the developer from the senior reviewer.
+
+**Reviewed.** Independent senior review APPROVE. It caught a possible RefCell
+borrow panic on destination placement; the render-buffer borrow is now scoped to
+extract dimensions before rendering. The follow-up review approved the fix.
+
+**Verified.** `scripts/ci-local.sh` passed all four gates by exit code: workspace
+check, clippy, release tests (1,990 core / 578 UI), and release binary link.
+`git diff --check` passed. Existing unrelated warnings remain.
+
+**Failures and corrections.** The first Docker run found two compile errors: a
+temporary render-buffer borrow and missing v39 fields in the populated params
+test fixture; both were fixed. The next run found four test issues (expected
+float tolerance, stale encoded-length pin, a Retouch history mutation equal to
+its default, and an identity test that still enabled Exposure). Fixes were
+applied; clippy then rejected a test-only zero-valued arithmetic expression,
+which was simplified. The final full Docker run passed. No deployment or
+production service changes were made; the installer files remain untouched.

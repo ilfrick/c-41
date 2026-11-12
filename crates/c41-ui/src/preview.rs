@@ -819,6 +819,18 @@ pub struct PreviewParams {
     /// Row-major normalized `(dx,dy)` offsets for the 25 lattice handles.
     /// Each component is a fraction of the full image dimension.
     pub liq_offsets: [f32; 50],
+    /// Retouch module enabled; the stamp is active only when a source is set.
+    pub retouch_source_set: bool,
+    pub retouch_on: bool,
+    /// Clone-stamp source/destination coordinates normalized to the full frame.
+    pub retouch_source_x: f32,
+    pub retouch_source_y: f32,
+    pub retouch_dest_x: f32,
+    pub retouch_dest_y: f32,
+    /// Stamp radius as a fraction of the shorter image dimension (default 0.02).
+    pub retouch_radius: f32,
+    /// Opacity on the UI's 0..100 scale (core receives 0..1).
+    pub retouch_opacity: f32,
     // ── Color calibration (channelmixerrgb.c, iop_order.c v50 pos 28.5) ────
     // A normal pipeline stage, first in the 28.5 scene-referred rank (the
     // v50_order table lists channelmixerrgb before negadoctor / blurs /
@@ -1232,6 +1244,14 @@ impl Default for PreviewParams {
             wm_rotate: 0.0,
             liq_on: false,
             liq_offsets: [0.0; 50],
+            retouch_source_set: false,
+            retouch_on: false,
+            retouch_source_x: 0.5,
+            retouch_source_y: 0.5,
+            retouch_dest_x: 0.5,
+            retouch_dest_y: 0.5,
+            retouch_radius: 0.02,
+            retouch_opacity: 100.0,
             // Color calibration: off, at the darktable `$DEFAULT`s
             // (channelmixerrgb.c:92-112) — identity mix rows, zero
             // saturation/lightness/grey, no normalization, illuminant D
@@ -1530,6 +1550,7 @@ impl PreviewParams {
         // emits the stage whenever `ccl_on`.
         let ccl_identity = !self.ccl_on;
         let liq_identity = !self.liq_on || self.liq_offsets.iter().all(|v| *v == 0.0);
+        let retouch_identity = !self.retouch_stage_active();
         exp_identity && vel_identity && split_identity && mono_identity && sigmoid_identity
             && sharpen_identity && vibrance_identity && cc_identity && temp_identity
             && invert_identity && colorize_identity && cc_corr_identity && cz_identity
@@ -1555,6 +1576,7 @@ impl PreviewParams {
             && wm_identity
             && ccl_identity
             && liq_identity
+            && retouch_identity
     }
 
     /// Hot-pixel options for raw decode; `None` while the module is off.
@@ -1809,6 +1831,7 @@ impl PreviewParams {
             wm_on: false,
             ccl_on: false,
             liq_on: false,
+            retouch_on: false,
             ..*self
         }
     }
@@ -1840,6 +1863,22 @@ impl PreviewParams {
     /// Read up to 20 interleaved (x, y) anchors starting at float index `base`,
     /// falling back to `dflt` slot-by-slot so short (older-version) blobs keep
     /// their defaults instead of panicking.
+    fn finite_clamp(value: f32, min: f32, max: f32, default: f32) -> f32 {
+        if value.is_finite() { value.clamp(min, max) } else { default }
+    }
+
+    fn decode_retouch_coord(f: &[f32], index: usize, default: f32) -> f32 {
+        f.get(index).copied().map_or(default, |v| Self::finite_clamp(v, 0.0, 1.0, default))
+    }
+
+    /// Shared identity/pipeline gate for the bounded single clone stamp.
+    fn retouch_stage_active(&self) -> bool {
+        self.retouch_on
+            && self.retouch_source_set
+            && Self::finite_clamp(self.retouch_radius, 0.0, 1.0, 0.02) > 0.0
+            && Self::finite_clamp(self.retouch_opacity, 0.0, 100.0, 100.0) > 0.0
+    }
+
     fn decode_nodes(f: &[f32], base: usize, dflt: [(f32, f32); 20]) -> [(f32, f32); 20] {
         let mut nodes = dflt;
         for (k, slot) in nodes.iter_mut().enumerate() {
@@ -1863,7 +1902,7 @@ impl PreviewParams {
             // toggles and clip — appended after the watermark bool.
             self.ccl_on, self.ccl_normalize_r, self.ccl_normalize_g,
             self.ccl_normalize_b, self.ccl_normalize_sat, self.ccl_normalize_light,
-            self.ccl_normalize_grey, self.ccl_clip, self.liq_on] {
+            self.ccl_normalize_grey, self.ccl_clip, self.liq_on, self.retouch_source_set, self.retouch_on] {
             v.push(b as u8);
         }
         for f in [
@@ -2086,7 +2125,9 @@ impl PreviewParams {
                   self.liq_offsets[10], self.liq_offsets[11], self.liq_offsets[12], self.liq_offsets[13], self.liq_offsets[14], self.liq_offsets[15], self.liq_offsets[16], self.liq_offsets[17], self.liq_offsets[18], self.liq_offsets[19],
                   self.liq_offsets[20], self.liq_offsets[21], self.liq_offsets[22], self.liq_offsets[23], self.liq_offsets[24], self.liq_offsets[25], self.liq_offsets[26], self.liq_offsets[27], self.liq_offsets[28], self.liq_offsets[29],
                   self.liq_offsets[30], self.liq_offsets[31], self.liq_offsets[32], self.liq_offsets[33], self.liq_offsets[34], self.liq_offsets[35], self.liq_offsets[36], self.liq_offsets[37], self.liq_offsets[38], self.liq_offsets[39],
-                  self.liq_offsets[40], self.liq_offsets[41], self.liq_offsets[42], self.liq_offsets[43], self.liq_offsets[44], self.liq_offsets[45], self.liq_offsets[46], self.liq_offsets[47], self.liq_offsets[48], self.liq_offsets[49]] {
+                  self.liq_offsets[40], self.liq_offsets[41], self.liq_offsets[42], self.liq_offsets[43], self.liq_offsets[44], self.liq_offsets[45], self.liq_offsets[46], self.liq_offsets[47], self.liq_offsets[48], self.liq_offsets[49],
+                  self.retouch_source_x, self.retouch_source_y, self.retouch_dest_x,
+                  self.retouch_dest_y, self.retouch_radius, self.retouch_opacity] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -2600,6 +2641,17 @@ impl PreviewParams {
                 let v = f.get(516 + i).copied().unwrap_or(0.0);
                 if v.is_finite() { v.clamp(-0.5, 0.5) } else { 0.0 }
             }),
+            retouch_source_set: bools.get(58).map_or(d.retouch_source_set, |&b| b != 0),
+            retouch_on: bools.get(59).map_or(d.retouch_on, |&b| b != 0),
+            retouch_source_x: Self::decode_retouch_coord(&f, 566, d.retouch_source_x),
+            retouch_source_y: Self::decode_retouch_coord(&f, 567, d.retouch_source_y),
+            retouch_dest_x: Self::decode_retouch_coord(&f, 568, d.retouch_dest_x),
+            retouch_dest_y: Self::decode_retouch_coord(&f, 569, d.retouch_dest_y),
+            retouch_radius: Self::decode_retouch_coord(&f, 570, d.retouch_radius),
+            retouch_opacity: {
+                let v = f.get(571).copied().unwrap_or(d.retouch_opacity);
+                Self::finite_clamp(v, 0.0, 100.0, d.retouch_opacity)
+            },
         })
     }
 
@@ -2787,6 +2839,22 @@ impl PreviewParams {
         }
         if self.exposure_on && (self.ev != 0.0 || self.black != 0.0) {
             p.push(Stage::Exposure { black: self.black, scale: 2.0f32.powf(self.ev) });
+        }
+        // Retouch is deliberately placed immediately after exposure and before
+        // tone equalization/display transforms, so its clone samples the same
+        // scene-linear working buffer as the core kernel. This is earlier than
+        // darktable's later retouch iop-order placement. Coordinates here are
+        // normalized against the full-frame extent (not C's ROI-relative brush
+        // coordinates); this single-stamp preview mapping is intentional.
+        if self.retouch_stage_active() {
+            p.push(Stage::Retouch {
+                source_x: Self::finite_clamp(self.retouch_source_x, 0.0, 1.0, 0.5),
+                source_y: Self::finite_clamp(self.retouch_source_y, 0.0, 1.0, 0.5),
+                dest_x: Self::finite_clamp(self.retouch_dest_x, 0.0, 1.0, 0.5),
+                dest_y: Self::finite_clamp(self.retouch_dest_y, 0.0, 1.0, 0.5),
+                radius: Self::finite_clamp(self.retouch_radius, 0.0, 1.0, 0.02),
+                opacity: Self::finite_clamp(self.retouch_opacity, 0.0, 100.0, 100.0) / 100.0,
+            });
         }
         // Tone equalizer (toneequal.c, iop_order.c v50_order pos 24.0 — "last
         // module that need enlarged roi_in", after exposure 21 and BEFORE
@@ -3612,9 +3680,10 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// dropdown ordinal) — a normal pipeline stage (v50 pos 28.5).
 /// v38 appends Liquify's 5×5 normalized `(dx,dy)` lattice (50 f32s) and an
 /// enable flag; it is a frame-global stage before color calibration.
-const ENCODE_VERSION: u8 = 38;
-/// 1 version byte + 58 bool bytes + 566 little-endian f32.
-const ENCODED_LEN: usize = 1 + 58 + 566 * 4;
+/// v39 appends one clone stamp (2 bools + 6 f32s).
+const ENCODE_VERSION: u8 = 39;
+/// 1 version byte + 60 bool bytes + 572 little-endian f32.
+const ENCODED_LEN: usize = 1 + 60 + 572 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -3648,6 +3717,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (36, 49, 489), // v36: Watermark (watermark.c) added
     (37, 57, 516), // v37: Color calibration (channelmixerrgb) added
     (38, 58, 566), // v38: Liquify 5×5 normalized dx/dy lattice added
+    (39, 60, 572), // v39: one Retouch clone stamp added
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -4533,6 +4603,16 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         // 1 = MODE_LOCAL_AVERAGE, deliberately NOT the default 0, so the fixture
         // catches an off-by-one in the ordinal round-trip.
         df_mode: 1.0,
+        // Retouch (v39): every field differs from its default, pinning the new
+        // appended persistence layout in the shared fully-populated fixture.
+        retouch_on: true,
+        retouch_source_set: true,
+        retouch_source_x: 0.17,
+        retouch_source_y: 0.29,
+        retouch_dest_x: 0.63,
+        retouch_dest_y: 0.81,
+        retouch_radius: 0.035,
+        retouch_opacity: 72.0,
     }
 }
 
@@ -5840,6 +5920,77 @@ mod tests {
         // default round-trips too
         let d = PreviewParams::default();
         assert_eq!(PreviewParams::decode(&d.encode()), Some(d));
+    }
+
+    #[test]
+    fn retouch_v38_compat_roundtrip_and_mapping() {
+        let mut current = PreviewParams::default().encode();
+        let v38_len = 1 + 58 + 566 * 4;
+        let mut v38 = Vec::with_capacity(v38_len);
+        v38.push(38);
+        v38.extend_from_slice(&current[1..1 + 58]);
+        v38.extend_from_slice(&current[1 + 60..]);
+        v38.truncate(v38_len);
+        let old = PreviewParams::decode(&v38).expect("v38 must decode");
+        assert_eq!(old.retouch_radius, 0.02);
+        assert_eq!(old.retouch_opacity, 100.0);
+        assert!(!old.retouch_on && !old.retouch_source_set);
+
+        let mut p = PreviewParams::default();
+        p.exposure_on = true;
+        p.ev = 1.0;
+        p.retouch_source_set = true;
+        p.retouch_on = true;
+        p.retouch_source_x = 0.2;
+        p.retouch_source_y = 0.3;
+        p.retouch_dest_x = 0.7;
+        p.retouch_dest_y = 0.8;
+        p.retouch_radius = 0.04;
+        p.retouch_opacity = 25.0;
+        current = p.encode();
+        assert_eq!(PreviewParams::decode(&current), Some(p));
+        let stages = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages;
+        let retouch = stages.iter().position(|s| matches!(s, Stage::Retouch { .. })).unwrap();
+        let exposure = stages.iter().position(|s| matches!(s, Stage::Exposure { .. })).unwrap();
+        assert_eq!(retouch, exposure + 1);
+        assert!(matches!(&stages[retouch], Stage::Retouch { source_x, source_y, dest_x, dest_y, radius, opacity }
+            if *source_x == 0.2 && *source_y == 0.3 && *dest_x == 0.7 && *dest_y == 0.8 && *radius == 0.04 && *opacity == 0.25));
+        assert!(!p.bypassed().retouch_on);
+        assert!(p.bypassed().retouch_source_set);
+        assert!(p.bypassed().is_identity());
+
+        let mut inactive = p;
+        inactive.retouch_source_set = false;
+        assert!(inactive.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().all(|s| !matches!(s, Stage::Retouch { .. })));
+        inactive.retouch_source_set = true;
+        inactive.retouch_on = false;
+        assert!(inactive.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().all(|s| !matches!(s, Stage::Retouch { .. })));
+
+        let mut neutral = p;
+        neutral.exposure_on = false;
+        neutral.retouch_radius = 0.0;
+        assert!(neutral.is_identity());
+        assert!(neutral.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().all(|s| !matches!(s, Stage::Retouch { .. })));
+        neutral.retouch_radius = 0.04;
+        neutral.retouch_opacity = 0.0;
+        assert!(neutral.is_identity());
+        assert!(neutral.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages.iter().all(|s| !matches!(s, Stage::Retouch { .. })));
+    }
+
+    #[test]
+    fn retouch_decode_sanitizes_non_finite_and_out_of_range_controls() {
+        let mut blob = PreviewParams::default().encode();
+        let float_base = 1 + 60;
+        for (index, value) in [(566, f32::NAN), (567, f32::INFINITY), (568, -4.0), (569, 4.0), (570, f32::NEG_INFINITY), (571, f32::NAN)] {
+            let start = float_base + index * 4;
+            blob[start..start + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let decoded = PreviewParams::decode(&blob).expect("malformed controls remain decodable");
+        assert_eq!((decoded.retouch_source_x, decoded.retouch_source_y), (0.5, 0.5));
+        assert_eq!((decoded.retouch_dest_x, decoded.retouch_dest_y), (0.0, 1.0));
+        assert_eq!(decoded.retouch_radius, 0.02);
+        assert_eq!(decoded.retouch_opacity, 100.0);
+        decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0);
     }
 
     #[test]

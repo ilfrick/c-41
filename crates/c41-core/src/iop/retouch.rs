@@ -29,6 +29,66 @@ impl IopProcess for Retouch {
     }
 }
 
+/// Apply a hard-edged circular clone stamp to packed RGBA pixels.
+///
+/// Coordinates are normalized to the image extent (`0..=1` maps to the first
+/// through last pixel); `radius` is a fraction of the shorter image dimension.
+/// Invalid dimensions or buffer lengths leave `output` untouched; invalid
+/// parameters with valid buffers produce an identity copy. The source is always
+/// sampled from `input`, never from already-stamped output.
+pub fn process_clone_stamp(
+    input: &[f32],
+    output: &mut [f32],
+    width: usize,
+    height: usize,
+    source_x: f32,
+    source_y: f32,
+    dest_x: f32,
+    dest_y: f32,
+    radius: f32,
+    opacity: f32,
+) {
+    let Some(pixel_count) = width.checked_mul(height) else { return };
+    let Some(len) = pixel_count.checked_mul(4) else { return };
+    if width == 0 || height == 0 || input.len() != len || output.len() != len {
+        return;
+    }
+    output.copy_from_slice(input);
+    if ![source_x, source_y, dest_x, dest_y, radius, opacity]
+        .iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        || radius == 0.0 || opacity == 0.0
+    {
+        return;
+    }
+
+    let src_cx = source_x * (width - 1) as f32;
+    let src_cy = source_y * (height - 1) as f32;
+    let dst_cx = dest_x * (width - 1) as f32;
+    let dst_cy = dest_y * (height - 1) as f32;
+    let radius_px = radius * width.min(height) as f32;
+    let x0 = ((dst_cx - radius_px).floor() as isize).max(0) as usize;
+    let y0 = ((dst_cy - radius_px).floor() as isize).max(0) as usize;
+    let x1 = ((dst_cx + radius_px).ceil() as usize).min(width - 1);
+    let y1 = ((dst_cy + radius_px).ceil() as usize).min(height - 1);
+    let radius_sq = radius_px * radius_px;
+
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f32 - dst_cx;
+            let dy = y as f32 - dst_cy;
+            if dx * dx + dy * dy > radius_sq { continue; }
+            let sx = (src_cx + dx).round() as isize;
+            let sy = (src_cy + dy).round() as isize;
+            if sx < 0 || sy < 0 || sx >= width as isize || sy >= height as isize { continue; }
+            let si = (sy as usize * width + sx as usize) * 4;
+            let di = (y * width + x) * 4;
+            for c in 0..4 {
+                output[di + c] = output[di + c] * (1.0 - opacity) + input[si + c] * opacity;
+            }
+        }
+    }
+}
+
 /// Copy y_to rows from `in` (with offset xoffs,yoffs) into `out`.
 /// rowsize is in bytes. Matches rt_copy_in_to_out DT_OMP_FOR at retouch.c:3250.
 #[no_mangle]
@@ -1021,6 +1081,66 @@ pub unsafe extern "C" fn darkroom_retouch_adjust_levels(
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod clone_stamp_tests {
+    use super::process_clone_stamp;
+
+    #[test]
+    fn clones_exact_rgba_from_immutable_input_and_blends_opacity() {
+        let input: Vec<f32> = (0..7 * 5 * 4).map(|v| v as f32).collect();
+        let mut output = vec![-1.0; input.len()];
+        process_clone_stamp(&input, &mut output, 7, 5, 0.0, 0.0, 0.5, 0.5, 0.3, 1.0);
+        let pixel = (2 * 7 + 3) * 4;
+        let source = 0;
+        assert_eq!(&output[pixel..pixel + 4], &input[source..source + 4]);
+        assert_eq!(output[pixel + 3], input[source + 3]);
+        let outside_stamp = 0;
+        assert_eq!(output[outside_stamp], input[outside_stamp]);
+        // Affected pixels are sourced from the original, not a previous write.
+        let mut expected = input.clone();
+        process_clone_stamp(&input, &mut expected, 7, 5, 0.0, 0.0, 0.5, 0.5, 0.3, 0.5);
+        assert_eq!(expected[pixel], input[pixel] * 0.5 + input[source] * 0.5);
+    }
+
+    #[test]
+    fn overlapping_stamp_reads_the_original_source() {
+        let input: Vec<f32> = (0..9 * 5 * 4).map(|v| v as f32).collect();
+        let mut output = vec![0.0; input.len()];
+        process_clone_stamp(&input, &mut output, 9, 5, 0.25, 0.5, 0.5, 0.5, 0.5, 1.0);
+        let previously_stamped_source = (2 * 9 + 2) * 4;
+        let destination = (2 * 9 + 4) * 4;
+        assert_ne!(&output[previously_stamped_source..previously_stamped_source + 4],
+                   &input[previously_stamped_source..previously_stamped_source + 4]);
+        assert_eq!(&output[destination..destination + 4],
+                   &input[previously_stamped_source..previously_stamped_source + 4]);
+    }
+
+    #[test]
+    fn edge_clips_and_invalid_requests_are_noops() {
+        let input: Vec<f32> = (0..4 * 3 * 4).map(|v| v as f32).collect();
+        let mut edge = vec![99.0; input.len()];
+        process_clone_stamp(&input, &mut edge, 4, 3, 1.0, 1.0, 0.0, 0.0, 0.5, 1.0);
+        assert_eq!(edge.len(), input.len());
+        assert_eq!(&edge[0..4], &input[11 * 4..12 * 4]);
+
+        for params in [([0.5, 0.5, 0.5, 0.5], f32::NAN, 0.5),
+                       ([0.5, 0.5, 0.5, 0.5], 0.2, f32::INFINITY),
+                       ([1.1, 0.5, 0.5, 0.5], 0.2, 1.0),
+                       ([0.5, 0.5, 0.5, 0.5], 0.0, 1.0),
+                       ([0.5, 0.5, 0.5, 0.5], 0.2, 0.0),
+                       ([0.5, 0.5, 0.5, 0.5], 0.2, 1.1)] {
+            let mut out = vec![77.0; input.len()];
+            process_clone_stamp(&input, &mut out, 4, 3, params.0[0], params.0[1], params.0[2], params.0[3], params.1, params.2);
+            assert_eq!(out, input);
+        }
+        let mut malformed = vec![77.0; input.len()];
+        process_clone_stamp(&input[..input.len() - 1], &mut malformed, 4, 3, 0.5, 0.5, 0.5, 0.5, 0.2, 1.0);
+        assert!(malformed.iter().all(|v| *v == 77.0));
+        process_clone_stamp(&input, &mut malformed, 0, 3, 0.5, 0.5, 0.5, 0.5, 0.2, 1.0);
+        assert!(malformed.iter().all(|v| *v == 77.0));
+    }
+}
 
 #[cfg(test)]
 mod levels_tests {

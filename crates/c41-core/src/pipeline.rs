@@ -833,6 +833,10 @@ pub enum Stage {
     /// This intentionally replaces darktable's freehand bezier editor with a
     /// compact, serializable mesh.
     Liquify { offsets: [f32; 50] },
+    /// Hard-edged spatial clone stamp. Centers are normalized image coordinates;
+    /// radius is a fraction of the shorter dimension. Whole-frame only because
+    /// destination pixels sample source pixels at a spatial offset.
+    Retouch { source_x: f32, source_y: f32, dest_x: f32, dest_y: f32, radius: f32, opacity: f32 },
     Watermark {
         /// The c41 wiring subset of the C params (opacity %, scale %, offsets,
         /// alignment ordinal 0..8, rotation degrees, asset index).
@@ -914,6 +918,7 @@ impl Stage {
             Stage::Defringe { .. } => "defringe",
             Stage::Watermark { .. } => "watermark",
             Stage::Liquify { .. } => "liquify",
+            Stage::Retouch { .. } => "retouch",
         }
     }
 
@@ -1086,7 +1091,7 @@ impl Stage {
             // output pixel through a position-dependent inverse transform — a
             // band's (band_pixels, 1) rectangle would hand the transform the
             // wrong coordinates. Serial whole-frame only, like Vignette/Soften.
-            Stage::Watermark { .. } | Stage::Liquify { .. } => false,
+            Stage::Watermark { .. } | Stage::Liquify { .. } | Stage::Retouch { .. } => false,
         }
     }
 
@@ -2056,6 +2061,12 @@ impl Stage {
             // `working_space()` returns `None`. The matrix is pre-computed by
             // `PreviewParams::to_pipeline` from the 8 UI params and cached in
             // the stage, so apply just dispatches to the FFI kernel.
+            Stage::Retouch { source_x, source_y, dest_x, dest_y, radius, opacity } => {
+                crate::iop::retouch::process_clone_stamp(
+                    input, output, width, height,
+                    source_x, source_y, dest_x, dest_y, radius, opacity,
+                );
+            }
             Stage::Primaries { matrix } => {
                 // Safe wrapper: applies the 4x4 matrix per-pixel, with bounds
                 // checks and an aliasing debug_assert. The matrix (including
@@ -2659,6 +2670,20 @@ mod tests {
         split.extend_from_slice(&p.process(&px[half..], (px.len() - half) / 4, 1));
 
         assert_eq!(full, split);
+    }
+
+    #[test]
+    fn retouch_is_a_named_whole_frame_stage() {
+        let stage = Stage::Retouch {
+            source_x: 0.0, source_y: 0.0, dest_x: 0.5, dest_y: 0.5,
+            radius: 0.25, opacity: 1.0,
+        };
+        assert_eq!(stage.name(), "retouch");
+        assert!(!stage.is_pixel_local());
+        let input: Vec<f32> = (0..64 * 64 * 4).map(|v| v as f32).collect();
+        assert_eq!(Pipeline { stages: vec![] }.process(&input, 64, 64), input);
+        let pipeline = Pipeline { stages: vec![stage] };
+        assert_ne!(pipeline.process(&input, 64, 64), input);
     }
 
     #[test]
