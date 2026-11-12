@@ -29,9 +29,10 @@ impl IopProcess for Retouch {
     }
 }
 
-/// Apply a hard-edged circular clone stamp to packed RGBA pixels.
+/// Apply a circular clone stamp with an optional smooth radial feather to packed RGBA pixels.
 ///
-/// Coordinates are normalized to the image extent (`0..=1` maps to the first
+/// A feather of zero retains the hard-edged mask. Coordinates are normalized
+/// to the image extent (`0..=1` maps to the first
 /// through last pixel); `radius` is a fraction of the shorter image dimension.
 /// Invalid dimensions or buffer lengths leave `output` untouched; invalid
 /// parameters with valid buffers produce an identity copy. The source is always
@@ -47,6 +48,7 @@ pub fn process_clone_stamp(
     dest_y: f32,
     radius: f32,
     opacity: f32,
+    feather: f32,
 ) {
     let Some(pixel_count) = width.checked_mul(height) else { return };
     let Some(len) = pixel_count.checked_mul(4) else { return };
@@ -54,7 +56,7 @@ pub fn process_clone_stamp(
         return;
     }
     output.copy_from_slice(input);
-    if ![source_x, source_y, dest_x, dest_y, radius, opacity]
+    if ![source_x, source_y, dest_x, dest_y, radius, opacity, feather]
         .iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v))
         || radius == 0.0 || opacity == 0.0
     {
@@ -71,19 +73,34 @@ pub fn process_clone_stamp(
     let x1 = ((dst_cx + radius_px).ceil() as usize).min(width - 1);
     let y1 = ((dst_cy + radius_px).ceil() as usize).min(height - 1);
     let radius_sq = radius_px * radius_px;
+    let inner_radius = radius_px * (1.0 - feather);
+    let feather_width = radius_px - inner_radius;
 
     for y in y0..=y1 {
         for x in x0..=x1 {
             let dx = x as f32 - dst_cx;
             let dy = y as f32 - dst_cy;
-            if dx * dx + dy * dy > radius_sq { continue; }
+            let distance_sq = dx * dx + dy * dy;
+            if distance_sq > radius_sq { continue; }
+            let edge_opacity = if feather == 0.0 {
+                1.0
+            } else {
+                let distance = distance_sq.sqrt();
+                if distance <= inner_radius {
+                    1.0
+                } else {
+                    let t = ((distance - inner_radius) / feather_width).clamp(0.0, 1.0);
+                    1.0 - t * t * (3.0 - 2.0 * t)
+                }
+            };
             let sx = (src_cx + dx).round() as isize;
             let sy = (src_cy + dy).round() as isize;
             if sx < 0 || sy < 0 || sx >= width as isize || sy >= height as isize { continue; }
             let si = (sy as usize * width + sx as usize) * 4;
             let di = (y * width + x) * 4;
             for c in 0..4 {
-                output[di + c] = output[di + c] * (1.0 - opacity) + input[si + c] * opacity;
+                let blend = opacity * edge_opacity;
+                output[di + c] = output[di + c] * (1.0 - blend) + input[si + c] * blend;
             }
         }
     }
@@ -1090,7 +1107,7 @@ mod clone_stamp_tests {
     fn clones_exact_rgba_from_immutable_input_and_blends_opacity() {
         let input: Vec<f32> = (0..7 * 5 * 4).map(|v| v as f32).collect();
         let mut output = vec![-1.0; input.len()];
-        process_clone_stamp(&input, &mut output, 7, 5, 0.0, 0.0, 0.5, 0.5, 0.3, 1.0);
+        process_clone_stamp(&input, &mut output, 7, 5, 0.0, 0.0, 0.5, 0.5, 0.3, 1.0, 0.0);
         let pixel = (2 * 7 + 3) * 4;
         let source = 0;
         assert_eq!(&output[pixel..pixel + 4], &input[source..source + 4]);
@@ -1099,15 +1116,71 @@ mod clone_stamp_tests {
         assert_eq!(output[outside_stamp], input[outside_stamp]);
         // Affected pixels are sourced from the original, not a previous write.
         let mut expected = input.clone();
-        process_clone_stamp(&input, &mut expected, 7, 5, 0.0, 0.0, 0.5, 0.5, 0.3, 0.5);
+        process_clone_stamp(&input, &mut expected, 7, 5, 0.0, 0.0, 0.5, 0.5, 0.3, 0.5, 0.0);
         assert_eq!(expected[pixel], input[pixel] * 0.5 + input[source] * 0.5);
+    }
+
+    #[test]
+    fn feather_zero_matches_the_pre_feather_hard_stamp_exactly() {
+        let (w, h) = (9usize, 7usize);
+        let input: Vec<f32> = (0..w * h * 4).map(|v| (v as f32 - 70.0) / 13.0).collect();
+        let (source_x, source_y, dest_x, dest_y, radius, opacity) = (0.13, 0.8, 0.61, 0.43, 0.31, 0.37);
+        let mut actual = vec![0.0; input.len()];
+        process_clone_stamp(&input, &mut actual, w, h, source_x, source_y, dest_x, dest_y, radius, opacity, 0.0);
+
+        // Test-only copy of the pre-feather implementation, pinning exact
+        // output compatibility rather than just selected interior pixels.
+        let mut expected = input.clone();
+        let src_cx = source_x * (w - 1) as f32;
+        let src_cy = source_y * (h - 1) as f32;
+        let dst_cx = dest_x * (w - 1) as f32;
+        let dst_cy = dest_y * (h - 1) as f32;
+        let radius_px = radius * w.min(h) as f32;
+        let x0 = ((dst_cx - radius_px).floor() as isize).max(0) as usize;
+        let y0 = ((dst_cy - radius_px).floor() as isize).max(0) as usize;
+        let x1 = ((dst_cx + radius_px).ceil() as usize).min(w - 1);
+        let y1 = ((dst_cy + radius_px).ceil() as usize).min(h - 1);
+        let radius_sq = radius_px * radius_px;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = x as f32 - dst_cx;
+                let dy = y as f32 - dst_cy;
+                if dx * dx + dy * dy > radius_sq { continue; }
+                let sx = (src_cx + dx).round() as isize;
+                let sy = (src_cy + dy).round() as isize;
+                if sx < 0 || sy < 0 || sx >= w as isize || sy >= h as isize { continue; }
+                let si = (sy as usize * w + sx as usize) * 4;
+                let di = (y * w + x) * 4;
+                for c in 0..4 {
+                    expected[di + c] = expected[di + c] * (1.0 - opacity) + input[si + c] * opacity;
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn feather_has_full_center_smooth_edge_and_zero_boundary() {
+        let (w, h) = (9usize, 9usize);
+        let mut input: Vec<f32> = (0..w * h * 4).map(|v| v as f32).collect();
+        input[..w * 4].fill(1000.0);
+        let mut out = vec![0.0; input.len()];
+        // Centered source/destination, radius 4 px, feather=0.5 gives a
+        // 2 px full-opacity core followed by a monotonic smooth transition.
+        process_clone_stamp(&input, &mut out, w, h, 0.0, 0.0, 0.5, 0.5, 4.0 / 9.0, 1.0, 0.5);
+        let at = |x: usize, y: usize| (y * w + x) * 4;
+        assert_eq!(out[at(4, 4)], 1000.0);
+        assert_eq!(out[at(6, 4)], 1000.0);
+        assert!(out[at(7, 4)] > input[at(7, 4)]);
+        assert!(out[at(7, 4)] < 1000.0);
+        assert_eq!(out[at(8, 4)], input[at(8, 4)]);
     }
 
     #[test]
     fn overlapping_stamp_reads_the_original_source() {
         let input: Vec<f32> = (0..9 * 5 * 4).map(|v| v as f32).collect();
         let mut output = vec![0.0; input.len()];
-        process_clone_stamp(&input, &mut output, 9, 5, 0.25, 0.5, 0.5, 0.5, 0.5, 1.0);
+        process_clone_stamp(&input, &mut output, 9, 5, 0.25, 0.5, 0.5, 0.5, 0.5, 1.0, 0.0);
         let previously_stamped_source = (2 * 9 + 2) * 4;
         let destination = (2 * 9 + 4) * 4;
         assert_ne!(&output[previously_stamped_source..previously_stamped_source + 4],
@@ -1120,7 +1193,7 @@ mod clone_stamp_tests {
     fn edge_clips_and_invalid_requests_are_noops() {
         let input: Vec<f32> = (0..4 * 3 * 4).map(|v| v as f32).collect();
         let mut edge = vec![99.0; input.len()];
-        process_clone_stamp(&input, &mut edge, 4, 3, 1.0, 1.0, 0.0, 0.0, 0.5, 1.0);
+        process_clone_stamp(&input, &mut edge, 4, 3, 1.0, 1.0, 0.0, 0.0, 0.5, 1.0, 0.0);
         assert_eq!(edge.len(), input.len());
         assert_eq!(&edge[0..4], &input[11 * 4..12 * 4]);
 
@@ -1131,14 +1204,20 @@ mod clone_stamp_tests {
                        ([0.5, 0.5, 0.5, 0.5], 0.2, 0.0),
                        ([0.5, 0.5, 0.5, 0.5], 0.2, 1.1)] {
             let mut out = vec![77.0; input.len()];
-            process_clone_stamp(&input, &mut out, 4, 3, params.0[0], params.0[1], params.0[2], params.0[3], params.1, params.2);
+            process_clone_stamp(&input, &mut out, 4, 3, params.0[0], params.0[1], params.0[2], params.0[3], params.1, params.2, 0.0);
             assert_eq!(out, input);
         }
         let mut malformed = vec![77.0; input.len()];
-        process_clone_stamp(&input[..input.len() - 1], &mut malformed, 4, 3, 0.5, 0.5, 0.5, 0.5, 0.2, 1.0);
+        process_clone_stamp(&input[..input.len() - 1], &mut malformed, 4, 3, 0.5, 0.5, 0.5, 0.5, 0.2, 1.0, 0.0);
         assert!(malformed.iter().all(|v| *v == 77.0));
-        process_clone_stamp(&input, &mut malformed, 0, 3, 0.5, 0.5, 0.5, 0.5, 0.2, 1.0);
+        process_clone_stamp(&input, &mut malformed, 0, 3, 0.5, 0.5, 0.5, 0.5, 0.2, 1.0, 0.0);
         assert!(malformed.iter().all(|v| *v == 77.0));
+
+        for feather in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            let mut out = vec![77.0; input.len()];
+            process_clone_stamp(&input, &mut out, 4, 3, 0.5, 0.5, 0.5, 0.5, 0.2, 1.0, feather);
+            assert_eq!(out, input, "invalid feather {feather} must be a no-op");
+        }
     }
 }
 

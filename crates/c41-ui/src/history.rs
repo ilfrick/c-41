@@ -263,7 +263,8 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
         || old.retouch_dest_x != new.retouch_dest_x
         || old.retouch_dest_y != new.retouch_dest_y
         || old.retouch_radius != new.retouch_radius
-        || old.retouch_opacity != new.retouch_opacity;
+        || old.retouch_opacity != new.retouch_opacity
+        || old.retouch_feather != new.retouch_feather;
     if retouch { return "Retouch"; }
     let exposure = old.exposure_on != new.exposure_on
         || old.black != new.black
@@ -871,6 +872,7 @@ mod tests {
             PreviewParams { retouch_dest_y: 0.6, ..d() },
             PreviewParams { retouch_radius: 0.1, ..d() },
             PreviewParams { retouch_opacity: 50.0, ..d() },
+            PreviewParams { retouch_feather: 0.5, ..d() },
         ].into_iter().enumerate() {
             assert_eq!(describe_change(&base, &changed), "Retouch", "case {case}: source_set={}, on={}, source=({},{}), destination=({},{}), radius={}, opacity={}", changed.retouch_source_set, changed.retouch_on, changed.retouch_source_x, changed.retouch_source_y, changed.retouch_dest_x, changed.retouch_dest_y, changed.retouch_radius, changed.retouch_opacity);
         }
@@ -1492,6 +1494,7 @@ mod tests {
             retouch_dest_y: _,
             retouch_radius: _,
             retouch_opacity: _,
+            retouch_feather: _,
         } = PreviewParams::default();
     }
 
@@ -1627,7 +1630,8 @@ mod tests {
         // vectors, gamut).
         // S5 Liquify (v38): 2122 → 2323 (1 bool + 50 f32 lattice offsets).
         // S6 Retouch (v39): 2323 → 2349 (2 bools + 6 f32 controls).
-        assert_eq!(PreviewParams::default().encode().len(), 2349);
+        // S7 Retouch feather (v40): 2349 → 2353 (1 f32 control).
+        assert_eq!(PreviewParams::default().encode().len(), 2353);
     }
 
     #[test]

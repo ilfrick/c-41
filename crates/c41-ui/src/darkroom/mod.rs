@@ -3536,7 +3536,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
             colorize_lightness_mix
         ),
         "Grain" => set!(gr_on, gr_coarseness, gr_strength, gr_midtones_bias),
-        "Retouch" => set!(retouch_on, retouch_source_set, retouch_source_x, retouch_source_y, retouch_dest_x, retouch_dest_y, retouch_radius, retouch_opacity),
+        "Retouch" => set!(retouch_on, retouch_source_set, retouch_source_x, retouch_source_y, retouch_dest_x, retouch_dest_y, retouch_radius, retouch_opacity, retouch_feather),
         "Soften" => set!(soften_on, soften_size, soften_saturation, soften_brightness, soften_amount),
         "Defringe" => set!(df_on, df_radius, df_thresh, df_mode),
         _ => return false,
@@ -3912,6 +3912,8 @@ fn retouch_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
                 |p, v| p.retouch_radius = v / 100.0);
             add_param_slider(e, ctx, "Opacity", 0.0, 100.0, 1.0, p0.retouch_opacity as f64,
                 |p, v| p.retouch_opacity = v);
+            add_param_slider(e, ctx, "Feather (%)", 0.0, 100.0, 1.0, (p0.retouch_feather * 100.0) as f64,
+                |p, v| p.retouch_feather = v / 100.0);
         })
 }
 
@@ -7085,6 +7087,7 @@ mod tests {
             p.retouch_dest_y = M;
             p.retouch_radius = M;
             p.retouch_opacity = M;
+            p.retouch_feather = M;
         }),
         ("Color calibration", |p| {
             p.ccl_on = true;
@@ -7506,6 +7509,7 @@ mod tests {
             retouch_dest_y: _,
             retouch_radius: _,
             retouch_opacity: _,
+            retouch_feather: _,
         } = PreviewParams::default();
     }
 

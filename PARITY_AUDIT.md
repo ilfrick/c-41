@@ -194,7 +194,7 @@ claim with no way to re-derive it does not go in.
 (see item 2.1 for the increments' scope notes). `Input color profile` followed
 on 2026-10-11; Highpass, the Demosaic elsewhere-row and Orientation were closed
 on 2026-11-08, Raw black/white point on 2026-11-10, and Framing on 2026-11-10.
-S6 wired Retouch slice 1; no inert catalogue rows remain.
+S6 wired Retouch slice 1 and S7 added radial feathering; no inert catalogue rows remain.
 
 **Further closed 2026-10-11 (G2d)** — `Input color profile` is now a live
 darkroom row (see the G2 section). **Closed 2026-11-08 (Highpass and Demosaic). Hot Pixels wired and verified 2026-11-08.** Hot Pixels runs during raw decode (not as a `Stage`) with a raw-only UI on Bayer, X-Trans, and uniform 2×2 monochrome mosaics. The `Output color profile` catalog row is counted wired only via the global Export-dialog choice; this is not per-image module parity. **Orientation is a manual selector in the Geometry panel (same date). Raw black/white point wired 2026-11-10** — decode-level override with per-colour black + white sliders, raw-only, preview/export parity. **Framing wired 2026-11-10** — constant-border compose (S1 of the sprint plan): canvas enlarges around the image, optional frame line, geometry-family (base compose like crop, not a `Stage`). **Chromatic aberrations wired 2026-11-10 (S2)** — a live `Stage::ChromaticAberrations` running the exhaustive full-frame manifold pipeline (bilinear downsample → gaussian-blurred get_manifolds → 6ch bilinear upsample → apply_correction → reduce_artifacts) over the seven previously-ported FFI kernels; guide/radius/strength/mode/refine controls in the Correct group. **Watermark wired 2026-11-10 (S3)** — live `Stage::Watermark` (v50 pos 69, last in-pipeline stage) porting `watermark.c`'s PNG branch: embedded 160×160 asset, IMAGE scale mode, rotation bbox, 3×3 alignment + x/y offsets, opacity — the C compositor math replicated by inverse-map bilinear sampling with premultiplied-BGRA blending through the existing `darkroom_watermark_blend` kernel. **Color calibration wired 2026-11-10 (S4)** — live `Stage::ColorCalibration` (v50 pos 28.5, before negadoctor, both funnels) porting `channelmixerrgb.c`'s commit_params matrix chain: `ChannelmixerRgbData::from_params` builds the transposed RGB↔XYZ↔LMS matrices with the CAT16 D65→D50 white-point bridge (c41 is D65-referenced, the kernel D50-referenced — composition verified by review elementwise over all five adaptation modes), temperature/illuminant (daylight+blackbody polynomials + fluo/led), the mix matrix from red/green/blue + saturation/lightness/grey vectors + normalize toggles, gamut compression and clip, feeding the existing `darkroom_channelmixerrgb_loop_switch` kernel; all 35 blob params feed the math (UI exposes temperature, 9 mix, 9 sat/light/grey, gamut, 6 normalize, clip). **Liquify wired 2026-11-11 (S5 slice 1)** — live `Stage::Liquify`, ordered at
@@ -206,17 +206,20 @@ lattice in the module panel (not over the image preview). Deliberate scope
 divergences: this is not darktable's freehand Bezier/stamp editor, interpolation
 mode is fixed to bicubic, and no C golden-render parity is claimed. Independent
 senior review APPROVE after fixing a stage-order finding; Docker CI passed
-1 986 core / 573 UI tests. **Retouch wired 2026-11-12 (S6 slice 1)** — live
-`Stage::Retouch` applies one hard circular clone stamp with normalized source
-and destination points, radius, and opacity. PreviewParams v39 (2349 B) decodes
-v38 with Retouch off; preview and export use the same immutable-source kernel.
-The darkroom supports two-step placement, markers, cancel/clear, history, reset,
-and partial styles. Multi-stroke painting, feathering/wavelet behavior, and full
-C editor parity remain deferred. Independent review APPROVE; all four Docker CI
-gates pass (1 990 core / 578 UI tests). Catalogue is now 52 of 52 wired.
+1 986 core / 573 UI tests. **Retouch wired 2026-11-12 (S6 slice 1; S7 feather)** — live
+`Stage::Retouch` applies one non-destructive circular clone stamp with normalized
+source and destination points, radius, opacity, and optional smooth radial
+feathering. Feather defaults to zero, preserving the hard-edge output exactly.
+PreviewParams v40 (2353 B) decodes v39 with feather zero and older v38 with
+Retouch off; preview and export use the same immutable-source kernel. The
+Darkroom supports two-step placement, markers, cancel/clear, history, reset,
+and partial styles. Multi-stroke painting, heal, masks, wavelet behavior, and
+full C editor parity remain deferred. S7 independent review APPROVE; all four
+Docker CI gates passed (1 992 core / 578 UI tests). Post-push deployment
+verification will be recorded in PROGRESS.md. Catalogue remains 52 of 52 wired.
 
 The kernel mapping below originates as the 2026-10-01 snapshot; row statuses
-have been refreshed through S6 on 2026-11-12. The input-profile row always had a
+have been refreshed through S7 on 2026-11-12. The input-profile row always had a
 ported kernel; it now has a product surface. Highpass is now a live UI,
 preview, history and style module (item 2.1).
 
@@ -313,7 +316,7 @@ returns, so the mapping is checkable against `src/iop/*.c` rather than asserted:
 | ~~`Hot pixels`~~ | `hotpixels.c` | `iop/hotpixels.rs` | raw decode + UI wired 2026-11-08: Bayer/X-Trans/uniform monochrome (3 exports / 14 kernel tests) |
 | ~~`Chromatic aberrations`~~ | `cacorrectrgb.c` | `iop/cacorrectrgb.rs` | wired S2: full manifold pipeline and darkroom controls; see item 2.1 |
 | ~~`Defringe`~~ | `defringe.c` | `iop/defringe.rs` | wired 2026-10-01 — see 2.1 |
-| ~~`Retouch`~~ | `retouch.c` | `iop/retouch.rs` | wired S6 slice 1: single clone stamp, preview/export Stage, v39 blob, history/reset/style; broader painting and wavelet parity deferred |
+| ~~`Retouch`~~ | `retouch.c` | `iop/retouch.rs` | wired S6 slice 1 + S7 radial feather: single clone stamp, preview/export Stage, v40 blob (v39 defaults feather to zero), history/reset/style; broader painting, heal, masks and wavelet parity deferred |
 | ~~`Liquify`~~ | `liquify.c` | `iop/liquify.rs` | wired S5 slice 1: 6 exports / 12 kernel+driver tests; lattice UI, preview/export Stage, v38 blob; fixed 5×5 displacement grid is not C freehand editor |
 | ~~`Grain`~~ | `grain.c` | `iop/grain.rs` | wired 2026-10-01 — see 2.1 |
 | ~~`Soften`~~ | `soften.c` | `iop/soften.rs` | wired 2026-10-01 — see 2.1 |

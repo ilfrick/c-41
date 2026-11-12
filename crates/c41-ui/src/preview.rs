@@ -831,6 +831,8 @@ pub struct PreviewParams {
     pub retouch_radius: f32,
     /// Opacity on the UI's 0..100 scale (core receives 0..1).
     pub retouch_opacity: f32,
+    /// Radial feather width as a fraction of radius, normalized 0..1.
+    pub retouch_feather: f32,
     // ── Color calibration (channelmixerrgb.c, iop_order.c v50 pos 28.5) ────
     // A normal pipeline stage, first in the 28.5 scene-referred rank (the
     // v50_order table lists channelmixerrgb before negadoctor / blurs /
@@ -1252,6 +1254,7 @@ impl Default for PreviewParams {
             retouch_dest_y: 0.5,
             retouch_radius: 0.02,
             retouch_opacity: 100.0,
+            retouch_feather: 0.0,
             // Color calibration: off, at the darktable `$DEFAULT`s
             // (channelmixerrgb.c:92-112) — identity mix rows, zero
             // saturation/lightness/grey, no normalization, illuminant D
@@ -2127,7 +2130,8 @@ impl PreviewParams {
                   self.liq_offsets[30], self.liq_offsets[31], self.liq_offsets[32], self.liq_offsets[33], self.liq_offsets[34], self.liq_offsets[35], self.liq_offsets[36], self.liq_offsets[37], self.liq_offsets[38], self.liq_offsets[39],
                   self.liq_offsets[40], self.liq_offsets[41], self.liq_offsets[42], self.liq_offsets[43], self.liq_offsets[44], self.liq_offsets[45], self.liq_offsets[46], self.liq_offsets[47], self.liq_offsets[48], self.liq_offsets[49],
                   self.retouch_source_x, self.retouch_source_y, self.retouch_dest_x,
-                  self.retouch_dest_y, self.retouch_radius, self.retouch_opacity] {
+                  self.retouch_dest_y, self.retouch_radius, self.retouch_opacity,
+                  Self::finite_clamp(self.retouch_feather, 0.0, 1.0, 0.0)] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -2652,6 +2656,9 @@ impl PreviewParams {
                 let v = f.get(571).copied().unwrap_or(d.retouch_opacity);
                 Self::finite_clamp(v, 0.0, 100.0, d.retouch_opacity)
             },
+            retouch_feather: Self::finite_clamp(
+                f.get(572).copied().unwrap_or(d.retouch_feather), 0.0, 1.0, d.retouch_feather,
+            ),
         })
     }
 
@@ -2854,6 +2861,7 @@ impl PreviewParams {
                 dest_y: Self::finite_clamp(self.retouch_dest_y, 0.0, 1.0, 0.5),
                 radius: Self::finite_clamp(self.retouch_radius, 0.0, 1.0, 0.02),
                 opacity: Self::finite_clamp(self.retouch_opacity, 0.0, 100.0, 100.0) / 100.0,
+                feather: Self::finite_clamp(self.retouch_feather, 0.0, 1.0, 0.0),
             });
         }
         // Tone equalizer (toneequal.c, iop_order.c v50_order pos 24.0 — "last
@@ -3681,9 +3689,9 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// v38 appends Liquify's 5×5 normalized `(dx,dy)` lattice (50 f32s) and an
 /// enable flag; it is a frame-global stage before color calibration.
 /// v39 appends one clone stamp (2 bools + 6 f32s).
-const ENCODE_VERSION: u8 = 39;
-/// 1 version byte + 60 bool bytes + 572 little-endian f32.
-const ENCODED_LEN: usize = 1 + 60 + 572 * 4;
+const ENCODE_VERSION: u8 = 40;
+/// 1 version byte + 60 bool bytes + 573 little-endian f32.
+const ENCODED_LEN: usize = 1 + 60 + 573 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -3718,6 +3726,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (37, 57, 516), // v37: Color calibration (channelmixerrgb) added
     (38, 58, 566), // v38: Liquify 5×5 normalized dx/dy lattice added
     (39, 60, 572), // v39: one Retouch clone stamp added
+    (40, 60, 573), // v40: Retouch feather appended
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -4613,6 +4622,7 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         retouch_dest_y: 0.81,
         retouch_radius: 0.035,
         retouch_opacity: 72.0,
+        retouch_feather: 0.37,
     }
 }
 
@@ -5923,8 +5933,10 @@ mod tests {
     }
 
     #[test]
-    fn retouch_v38_compat_roundtrip_and_mapping() {
-        let mut current = PreviewParams::default().encode();
+    fn retouch_v38_v39_compat_roundtrip_and_mapping() {
+        let mut current_params = PreviewParams::default();
+        current_params.retouch_feather = 0.73;
+        let mut current = current_params.encode();
         let v38_len = 1 + 58 + 566 * 4;
         let mut v38 = Vec::with_capacity(v38_len);
         v38.push(38);
@@ -5934,7 +5946,15 @@ mod tests {
         let old = PreviewParams::decode(&v38).expect("v38 must decode");
         assert_eq!(old.retouch_radius, 0.02);
         assert_eq!(old.retouch_opacity, 100.0);
+        assert_eq!(old.retouch_feather, 0.0);
         assert!(!old.retouch_on && !old.retouch_source_set);
+
+        let v39_len = 1 + 60 + 572 * 4;
+        let mut v39 = current.clone();
+        v39[0] = 39;
+        v39.truncate(v39_len);
+        let old = PreviewParams::decode(&v39).expect("v39 must decode");
+        assert_eq!(old.retouch_feather, 0.0);
 
         let mut p = PreviewParams::default();
         p.exposure_on = true;
@@ -5947,14 +5967,15 @@ mod tests {
         p.retouch_dest_y = 0.8;
         p.retouch_radius = 0.04;
         p.retouch_opacity = 25.0;
+        p.retouch_feather = 0.42;
         current = p.encode();
         assert_eq!(PreviewParams::decode(&current), Some(p));
         let stages = p.to_pipeline(ColorSpace::LinearSrgb, 1.0).stages;
         let retouch = stages.iter().position(|s| matches!(s, Stage::Retouch { .. })).unwrap();
         let exposure = stages.iter().position(|s| matches!(s, Stage::Exposure { .. })).unwrap();
         assert_eq!(retouch, exposure + 1);
-        assert!(matches!(&stages[retouch], Stage::Retouch { source_x, source_y, dest_x, dest_y, radius, opacity }
-            if *source_x == 0.2 && *source_y == 0.3 && *dest_x == 0.7 && *dest_y == 0.8 && *radius == 0.04 && *opacity == 0.25));
+        assert!(matches!(&stages[retouch], Stage::Retouch { source_x, source_y, dest_x, dest_y, radius, opacity, feather }
+            if *source_x == 0.2 && *source_y == 0.3 && *dest_x == 0.7 && *dest_y == 0.8 && *radius == 0.04 && *opacity == 0.25 && *feather == 0.42));
         assert!(!p.bypassed().retouch_on);
         assert!(p.bypassed().retouch_source_set);
         assert!(p.bypassed().is_identity());
@@ -5981,7 +6002,7 @@ mod tests {
     fn retouch_decode_sanitizes_non_finite_and_out_of_range_controls() {
         let mut blob = PreviewParams::default().encode();
         let float_base = 1 + 60;
-        for (index, value) in [(566, f32::NAN), (567, f32::INFINITY), (568, -4.0), (569, 4.0), (570, f32::NEG_INFINITY), (571, f32::NAN)] {
+        for (index, value) in [(566, f32::NAN), (567, f32::INFINITY), (568, -4.0), (569, 4.0), (570, f32::NEG_INFINITY), (571, f32::NAN), (572, 2.0)] {
             let start = float_base + index * 4;
             blob[start..start + 4].copy_from_slice(&value.to_le_bytes());
         }
@@ -5990,6 +6011,14 @@ mod tests {
         assert_eq!((decoded.retouch_dest_x, decoded.retouch_dest_y), (0.0, 1.0));
         assert_eq!(decoded.retouch_radius, 0.02);
         assert_eq!(decoded.retouch_opacity, 100.0);
+        assert_eq!(decoded.retouch_feather, 1.0);
+
+        for value in [f32::NAN, f32::INFINITY, -1.0] {
+            let mut invalid = PreviewParams::default().encode();
+            let start = float_base + 572 * 4;
+            invalid[start..start + 4].copy_from_slice(&value.to_le_bytes());
+            assert_eq!(PreviewParams::decode(&invalid).unwrap().retouch_feather, 0.0);
+        }
         decoded.to_pipeline(ColorSpace::LinearSrgb, 1.0);
     }
 

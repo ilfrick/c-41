@@ -9642,3 +9642,33 @@ its default, and an identity test that still enabled Exposure). Fixes were
 applied; clippy then rejected a test-only zero-valued arithmetic expression,
 which was simplified. The final full Docker run passed. No deployment or
 production service changes were made; the installer files remain untouched.
+
+## 2026-11-12 20:58 UTC — S7: Retouch radial feather (CI passed; deploy pending)
+
+**What.** Added an optional smooth radial falloff to the single clone stamp.
+Feather zero takes the original hard-edge blend path and is regression-tested
+against the pre-feather implementation over the full output buffer. Feather
+controls are threaded through the stage and UI; history, reset, partial styles,
+and append-only PreviewParams v40 (2353 bytes) include it. v39 blobs default
+feather to zero; v38 still decodes with Retouch off. Multi-stroke painting, heal,
+masks, wavelet preview, and full editor parity remain deferred.
+
+**Reviewed.** Independent senior review APPROVE. Review suggestions were applied:
+docs describe the feathered mask, the 573-float size is documented, and the
+partial-style test asserts feather copying. Review also caught stale S1–S7
+status/count language; audit and plan now distinguish S6 shipped from S7
+CI-passed/deploy-pending.
+
+**Verified.** The first `scripts/ci-local.sh` run failed one new feather-edge
+test: the fixture set only one source pixel although the stamp samples source
+pixels by destination offset. The fixture now fills the sampled source row. The
+final `scripts/ci-local.sh` passed all four gates by exit code: workspace check,
+clippy, release tests (1,992 core / 578 UI), and release binary link.
+`git diff --check` passed. Existing unrelated warnings remain.
+
+**Deployment state.** Before S7 work, S6 commit
+`98af551b798f74421d329ef039bcc49905556388` was deployed as
+`c-41:98af551b79`; the container is healthy with zero restarts and HTTP/HTTPS
+return 200. Rollback `c-41-rollback-98af551b79` is retained. S7 has not yet been
+pushed or deployed; its deployment will follow the push, with verification
+recorded after rollout. The installer files remain untouched.

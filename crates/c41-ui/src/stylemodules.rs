@@ -530,6 +530,7 @@ pub fn copy_module_group(target: &mut PreviewParams, src: &PreviewParams, group:
             target.retouch_dest_y = src.retouch_dest_y;
             target.retouch_radius = src.retouch_radius;
             target.retouch_opacity = src.retouch_opacity;
+            target.retouch_feather = src.retouch_feather;
             true
         }
         "Liquify" => {
@@ -669,6 +670,7 @@ mod tests {
             retouch_dest_y: 0.8,
             retouch_radius: 0.15,
             retouch_opacity: 63.0,
+            retouch_feather: 0.35,
             ev: 8.0,
             ..PreviewParams::default()
         };
@@ -682,6 +684,7 @@ mod tests {
         assert_eq!(target.retouch_dest_y, overlay.retouch_dest_y);
         assert_eq!(target.retouch_radius, overlay.retouch_radius);
         assert_eq!(target.retouch_opacity, overlay.retouch_opacity);
+        assert_eq!(target.retouch_feather, overlay.retouch_feather);
         assert_eq!(target.ev, -1.5, "copying Retouch must not touch Exposure");
     }
 

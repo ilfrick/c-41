@@ -373,12 +373,12 @@ workflow efficiency, P2 = remaining feature parity, P3 = validation):
    the full localized alias set when C-41 has a localization source, and include
    per-instance names if/when the UI supports multiple instances; neither should
    be conflated with stable module identity.
-4. **P2 — Catalogue visibility exceeds editing parity.** The grouped stack can
-   expose catalogue rows that are not usable controls: Retouch is still inert.
-   Liquify is wired and usable, but is a fixed 5×5 panel lattice rather than
-   darktable's freehand canvas editor. Keep inert Retouch explicitly
-   distinguished from wired modules; finish Retouch as its own parity increment,
-   and treat Liquify's canvas,
+4. **P2 — Catalogue visibility exceeds editing parity.** Retouch now has a live,
+   non-destructive single clone stamp with source/destination placement, radius,
+   opacity, and a smooth radial feather control. Multi-stroke painting, heal,
+   masks, and wavelet preview remain deferred; do not imply full darktable
+   editor parity. Liquify is also live, but remains a fixed 5×5 panel lattice
+   rather than darktable's freehand canvas editor. Treat Liquify's canvas,
    interpolation modes, and direct-on-image interaction as a separately scoped
    follow-up rather than implying slice-1 parity.
 5. **P3 — Confirm density and discoverability at real window sizes.** At both
