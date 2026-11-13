@@ -9704,3 +9704,13 @@ values were corrected against the actual direct profile transforms and the
 third full Docker run passed. A standalone core-only Docker test attempt also
 could not link because that command did not configure the workspace's bundled
 ONNX Runtime; the required workspace script ran the tests successfully.
+
+**Deployment.** Commit `6df767720c7eea6bff054d1e75c1623624bc962b` was pushed to
+GitHub and Gitea; both `master` refs were verified. Both GitHub checks (`check +
+test + clippy`, `Build & push Docker image`) passed. Built the cargo-only image
+with `CACHEBUST=6df767720c7eea6bff054d1e75c1623624bc962b` as `c-41:6df767720c`
+(image ID `459f756d4d6c13b8cb8daa5acc374209cb02d1ccb7045645d74299a0b0df22f6`)
+and deployed it. The container is healthy, restart count 0, HTTP/HTTPS return
+200, and startup logs have no panic/fatal errors. Previous container/image is
+retained as container `c-41-rollback-6df767720c` and image
+`c-41-rollback-6df767720c:latest`.
