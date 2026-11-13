@@ -9776,5 +9776,7 @@ config-path preservation, open parity gaps, ICC wording, and sprint-count
 consistency were corrected. `scripts/ci-local.sh` passed all four gates by exit
 code: workspace check, clippy, release tests (1,995 core / 584 UI), and release
 binary link. `git diff --check` passed. Existing unrelated compiler/deprecation
-warnings remain. Documentation-only change; commit/push, remote CI and deployment
-are pending.
+warnings remain. Commit `c2969039b6d5767ef72b7a8dcbf4217834780287` is on
+GitHub and Gitea; both `master` refs verified. GitHub `Build & push Docker image`
+check completed successfully. No deployment was made because this is a docs-only
+change; the running `c-41:8640ff3779` remains healthy and unchanged.
