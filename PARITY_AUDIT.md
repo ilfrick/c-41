@@ -437,11 +437,18 @@ output-profile token and perceptual intent to `darkroom-cli`, which applies its
 own pixelpipe conversion and sends the same ICC choice to the format writer.
 **G2g** preserves the raw path's linear Rec.2020 values through Adobe RGB
 exports: raw JPEG/PNG/TIFF outputs transform directly from the pipeline to the
-selected Adobe profile, while sRGB raw output remains byte-identical and
-non-raw exports retain their existing sRGB working seam. The file's ICC tag
-continues to match the pixel encoding. This is not a wide-gamut display preview;
-that seam stays sRGB, as do non-raw Rust renders. Still outstanding:
-soft-proofing and the sRGB-only display/non-raw render seams.
+selected Adobe profile, while sRGB raw output remains byte-identical. **S8a/b**
+adds the unclamped ICC-to-linear-Rec.2020 transforms and carries eligible
+non-raw inputs through the darkroom base/geometry and export pipeline; supported
+non-sRGB embedded profiles and an explicit remembered Adobe RGB assumption use
+that path. Missing-profile sRGB, sRGB profiles, malformed/unusable profiles, and
+unknown profiles retain the legacy sRGB path. Alpha is composited over white in
+linear light for the Rec.2020 path, and Adobe RGB exports convert directly from
+Rec.2020; sRGB output remains the existing sRGB result. Every output ICC tag
+continues to match its encoded pixels. This is not a wide-gamut display preview:
+GTK/KasmVNC screen bytes still encode as sRGB. Thumbnails, full-preview, and
+print retain their prior paths. Soft-proofing and a profile-aware display seam
+remain outstanding.
 
 Two corrections to the plan this audit previously implied, both found by checking
 rather than assuming:

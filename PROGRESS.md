@@ -9714,3 +9714,38 @@ and deployed it. The container is healthy, restart count 0, HTTP/HTTPS return
 200, and startup logs have no panic/fatal errors. Previous container/image is
 retained as container `c-41-rollback-6df767720c` and image
 `c-41-rollback-6df767720c:latest`.
+
+## 2026-11-13 09:56 UTC — S8b: non-raw wide-gamut processing and export
+
+**What.** Eligible non-raw inputs now lift directly from their supported
+embedded non-sRGB profile, or explicit remembered Adobe RGB assumption, into
+linear Rec.2020 for the darkroom base and non-raw export pipeline. Geometry
+orientation/framing carries the linear buffer; Adobe RGB export transforms
+directly from Rec.2020. Transparent pixels composite over white in linear light.
+Missing-profile sRGB, sRGB profiles, unusable/malformed profiles, and unknown
+profiles retain the established sRGB path; unsupported transform construction
+also falls back instead of rejecting decode. GTK-visible bytes, thumbnails,
+full-preview and print remain sRGB/prior-path behavior. No profile-aware wide-
+gamut display claim is made.
+
+**Reviewed.** Independent senior review APPROVE. The first review found two
+MAJOR issues: default/missing-profile sRGB was round-tripped through Rec.2020,
+and the linear preview lift discarded alpha. Both were corrected before final
+review; regression tests pin the sRGB assumption selector and linear-light
+alpha composition.
+
+**Verified.** `scripts/ci-local.sh` passed all four gates by exit code:
+workspace check, clippy, release tests (1,995 core / 584 UI), and release binary
+link. `git diff --check` passed. Existing unrelated warnings remain. The image
+build also linked successfully. GitHub `check + test + clippy` and `Build &
+push Docker image` checks passed.
+
+**Deployment.** Code commit `748a870ecd2100eabe37771e5f029c3e4035b593` was
+pushed to GitHub and Gitea; both `master` refs were verified. Built with
+`CACHEBUST=748a870ecd2100eabe37771e5f029c3e4035b593` as `c-41:748a870ecd`
+(image ID `ff80ef5b1431847b091bdafabc1e051bd98bf123f2e68ea8d6ff1cb22110f5f3`)
+and deployed. Container healthy, restart count 0, HTTP/HTTPS 200; no panic or
+fatal startup errors. Previous deployment retained as container
+`c-41-rollback-748a870ecd` and image `c-41-rollback-748a870ecd:latest`. The two
+pre-existing untracked installer artifacts were left untracked and untouched;
+no other services were changed.
