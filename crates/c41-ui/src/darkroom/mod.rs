@@ -57,13 +57,13 @@ fn adw_markup_text(s: &str) -> String {
 const PICKER_PROMPT: &str = "Pick: click the image to sample a pixel";
 
 /// Decoded preview source kept for live re-processing — either an 8-bit sRGB
-/// image (the JPEG / gdk-pixbuf path) or a **linear scene-referred RGBA f32**
-/// image (the raw path). The raw variant skips the 8-bit round-trip so a
-/// tone-map stage sees the unclipped highlights.
+/// image or a linear Rec.2020 RGBA f32 image. Linear sources skip the 8-bit
+/// round-trip; `lens_preapplied` distinguishes raw frames (lens ran before
+/// geometry) from non-raw ICC lifts (lens remains an ordinary pipeline stage).
 #[derive(Clone)]
 enum BaseImage {
     Srgb8 { bytes: Vec<u8>, width: i32, height: i32, rowstride: usize, nch: usize },
-    Linear { width: usize, height: usize, pixels: Vec<f32> },
+    Linear { width: usize, height: usize, pixels: Vec<f32>, lens_preapplied: bool },
 }
 
 /// An 8-bit image produced by running the pipeline over a [`BaseImage`], ready
@@ -122,10 +122,16 @@ impl BaseImage {
                     nch: *nch,
                 }
             }
-            BaseImage::Linear { width, height, pixels } => Rendered {
-                bytes: crate::preview::render_linear_to_srgb8_gear(
-                    pixels, *width, *height, params, lens_gear, grain_seed,
-                ),
+            BaseImage::Linear { width, height, pixels, lens_preapplied } => Rendered {
+                bytes: if *lens_preapplied {
+                    crate::preview::render_linear_to_srgb8_gear(
+                        pixels, *width, *height, params, lens_gear, grain_seed,
+                    )
+                } else {
+                    crate::preview::render_nonraw_linear_to_srgb8_gear(
+                        pixels, *width, *height, params, lens_gear, grain_seed,
+                    )
+                },
                 width: *width as i32,
                 height: *height as i32,
                 rowstride: width * 3,
@@ -1129,6 +1135,16 @@ fn reorient_srgb8(
     })
 }
 
+/// Apply discrete orientation to tightly packed linear Rec.2020 RGBA pixels.
+fn reorient_linear(pixels: &[f32], width: usize, height: usize, orientation: Orientation) -> Option<BaseImage> {
+    let needed = width.checked_mul(height)?.checked_mul(4)?;
+    if width == 0 || height == 0 || pixels.len() < needed {
+        return None;
+    }
+    let (w, h, pixels) = c41_core::geometry::apply_orientation(pixels, width, height, 4, orientation);
+    Some(BaseImage::Linear { width: w, height: h, pixels, lens_preapplied: false })
+}
+
 /// Compose the Framing (borders) params onto an 8-bit [`BaseImage::Srgb8`]
 /// base — the non-raw twin of the f32 compose that runs inside
 /// [`apply_geometry_to_base`]'s raw closure. Filled border pixels get the
@@ -1192,32 +1208,36 @@ fn apply_geometry_to_base(ctx: &PreviewCtx) {
             Some(bp) => c41_core::borders::Borders::apply(&gpixels, gw, gh, bp),
             None => (gw, gh, gpixels),
         };
-        BaseImage::Linear { width: bw, height: bh, pixels: bpixels }
+        BaseImage::Linear { width: bw, height: bh, pixels: bpixels, lens_preapplied: true }
     };
-    // JPEG geometry deliberately supports only the discrete manual orientation;
-    // crop and straighten remain raw-only as before. Framing is not raw-only:
-    // the 8-bit path gets the same border via borders_srgb8.
+    // Non-raw geometry supports only discrete orientation (crop/straighten stay
+    // raw-only). Linear Rec.2020 sources use the same f32 compose as raw; border
+    // colours are interpreted as linear Rec.2020 RGB, matching raw framing.
     if ctx.pristine.borrow().is_none() {
         let source = ctx.pristine_srgb.borrow().clone();
-        if let Some(BaseImage::Srgb8 { bytes, width, height, rowstride, nch }) = source {
-            let Some(base) = reorient_srgb8(
-                &bytes,
-                width,
-                height,
-                rowstride,
-                nch,
-                geom.orientation,
-            ) else {
-                eprintln!("darkroom preview: invalid decoded pixel layout during orientation");
-                return;
-            };
-            let Some(base) = borders_srgb8(
-                &base,
-                borders,
-            ) else {
-                eprintln!("darkroom preview: invalid decoded pixel layout during borders");
-                return;
-            };
+        let base = match source {
+            Some(BaseImage::Srgb8 { bytes, width, height, rowstride, nch }) => {
+                let Some(base) = reorient_srgb8(&bytes, width, height, rowstride, nch, geom.orientation) else {
+                    eprintln!("darkroom preview: invalid decoded pixel layout during orientation");
+                    return;
+                };
+                borders_srgb8(&base, borders)
+            }
+            Some(BaseImage::Linear { width, height, pixels, lens_preapplied }) => {
+                let Some(BaseImage::Linear { width, height, pixels, .. }) =
+                    reorient_linear(&pixels, width, height, geom.orientation) else {
+                    eprintln!("darkroom preview: invalid decoded linear buffer during orientation");
+                    return;
+                };
+                let (width, height, pixels) = match borders {
+                    Some(bp) => c41_core::borders::Borders::apply(&pixels, width, height, bp),
+                    None => (width, height, pixels),
+                };
+                Some(BaseImage::Linear { width, height, pixels, lens_preapplied })
+            }
+            None => None,
+        };
+        if let Some(base) = base {
             *ctx.base.borrow_mut() = Some(base);
             render_preview(ctx);
         }
@@ -1378,7 +1398,7 @@ fn spawn_decode(ctx: &PreviewCtx) {
         if ctx.decode_gen.get() != generation {
             return;
         }
-        let (transform, state) = transform_res;
+        let (transform, linear_rec2020, state) = transform_res;
         if let InputRowState::Assumed(a) = state {
             ctx.session_assumption.set(Some(a));
         }
@@ -1400,17 +1420,22 @@ fn spawn_decode(ctx: &PreviewCtx) {
                 // byte-exact path it has always been on: no profile means no
                 // matrix round trip, not a pointless one.
                 if let Some(t) = &transform {
+                    if linear_rec2020 {
+                        // ICC evaluation operates on normalized encoded samples and
+                        // intentionally avoids the clamping 8-bit convenience API.
+                        let width = pb.width() as usize;
+                        let height = pb.height() as usize;
+                        if let Some(pixels) = crate::preview::lift_rgb8_to_linear_rec2020(
+                            &bytes, width, height, rowstride, nch, pb.has_alpha(), t,
+                        ) {
+                            return BaseImage::Linear { width, height, pixels, lens_preapplied: false };
+                        }
+                    }
                     // `width` rather than `rowstride / nch`: gdk-pixbuf rounds
                     // rows to 4 bytes, and the padding is not a pixel.
                     c41_core::icc::apply_rgb8(t, &mut bytes, pb.width() as usize, rowstride, nch);
                 }
-                BaseImage::Srgb8 {
-                    bytes,
-                    width: pb.width(),
-                    height: pb.height(),
-                    rowstride,
-                    nch,
-                }
+                BaseImage::Srgb8 { bytes, width: pb.width(), height: pb.height(), rowstride, nch }
             })
         });
         match base {
@@ -1448,13 +1473,21 @@ async fn resolve_preview_transform_state(
     ctx: &PreviewCtx,
     path: &str,
     embedded: &c41_core::icc::Embedded,
-) -> (Option<c41_core::icc::Transform>, InputRowState) {
+) -> (Option<c41_core::icc::Transform>, bool, InputRowState) {
     use c41_core::icc::{InputAssumption, InputProfile};
     match c41_core::icc::input_profile(embedded) {
-        InputProfile::Transform(t) => (Some(t), InputRowState::Embedded),
-        InputProfile::Srgb => (None, InputRowState::Embedded),
-        InputProfile::Unusable => (None, InputRowState::Unusable),
-        InputProfile::Unknown => (None, InputRowState::Unknown),
+        InputProfile::Transform(srgb_transform) => {
+            if let Some(linear) = c41_core::icc::transform_embedded_to_linear_rec2020(embedded) {
+                (Some(linear), true, InputRowState::Embedded)
+            } else {
+                // A present usable profile which cannot enter the Rec.2020
+                // pipeline retains the established sRGB fallback.
+                (Some(srgb_transform), false, InputRowState::Embedded)
+            }
+        }
+        InputProfile::Srgb => (None, false, InputRowState::Embedded),
+        InputProfile::Unusable => (None, false, InputRowState::Unusable),
+        InputProfile::Unknown => (None, false, InputRowState::Unknown),
         InputProfile::Missing => {
             // Remembered for this file, else decided earlier this session, else
             // ask. Dismissing the prompt is "sRGB, this session only" — the same
@@ -1470,10 +1503,15 @@ async fn resolve_preview_transform_state(
                         .unwrap_or(InputAssumption::Srgb),
                 },
             };
-            (
-                assumed.transform_for_missing(),
-                InputRowState::Assumed(assumed),
-            )
+            match assumed {
+                // Keep the established byte-exact sRGB path for the default
+                // assumption. Only the explicit Adobe choice needs a wide-gamut lift.
+                InputAssumption::Srgb => (None, false, InputRowState::Assumed(assumed)),
+                InputAssumption::AdobeRgb1998 => match crate::preview::linear_rec2020_transform_for_assumption(assumed) {
+                    Some(t) => (Some(t), true, InputRowState::Assumed(assumed)),
+                    None => (None, false, InputRowState::Assumed(assumed)),
+                },
+            }
         }
     }
 }
@@ -6340,6 +6378,7 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            lens_preapplied: true,
         };
         let r = b.render(&PreviewParams::default(), None, 0);
         assert_eq!((r.width, r.height), (2, 1));
@@ -6634,6 +6673,34 @@ mod tests {
         assert_eq!(bytes, source);
         // A stride narrower than a packed row is malformed → None.
         assert!(reorient_srgb8(&source, 2, 2, 5, 3, Orientation::Rotate90Cw).is_none());
+    }
+
+    #[test]
+    fn nonraw_linear_geometry_reorients_and_frames_the_rec2020_base() {
+        let source = vec![
+            0.1, 0.2, 0.3, 1.0, 0.4, 0.5, 0.6, 1.0,
+            0.7, 0.8, 0.9, 1.0, 1.0, 1.1, 1.2, 1.0,
+        ];
+        let BaseImage::Linear { width, height, pixels, .. } = reorient_linear(
+            &source, 2, 2, Orientation::Rotate90Cw,
+        ).unwrap() else {
+            panic!("expected a linear base");
+        };
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(&pixels[0..4], &source[8..12]);
+        assert_eq!(&pixels[4..8], &source[0..4]);
+        // Framing uses linear Rec.2020 RGB, just as the raw path does; the
+        // appended opaque border leaves the oriented image pixels untouched.
+        let bp = c41_core::borders::BordersParams {
+            size: 0.25, pos_h: 0.5, pos_v: 0.5,
+            color: [0.2, 0.3, 0.4], frame_size: 0.0,
+            frame_offset: 0.5, frame_color: [0.0; 3],
+        };
+        let (fw, fh, framed) = c41_core::borders::Borders::apply(&pixels, width, height, bp);
+        assert!(fw >= width && fh >= height);
+        assert_eq!(framed.len(), fw * fh * 4);
+        assert!(framed.chunks_exact(4).all(|px| px[3] == 1.0));
+        assert!(framed.chunks_exact(4).any(|px| px[..3] == [0.2, 0.3, 0.4]));
     }
 
     /// The filter scope + search matcher behind the w2 module filter bar.

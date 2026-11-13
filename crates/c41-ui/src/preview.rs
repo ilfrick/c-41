@@ -4072,6 +4072,118 @@ pub fn render_linear_to_output16_gear(
     Some(out)
 }
 
+/// Only explicit Adobe RGB assumptions need the Rec.2020 input lift; the
+/// default/explicit sRGB assumption remains on its byte-exact legacy path.
+pub(crate) fn linear_rec2020_transform_for_assumption(
+    assumption: c41_core::icc::InputAssumption,
+) -> Option<c41_core::icc::Transform> {
+    match assumption {
+        c41_core::icc::InputAssumption::Srgb => None,
+        c41_core::icc::InputAssumption::AdobeRgb1998 => assumption.transform_to_linear_rec2020(),
+    }
+}
+
+/// Transform decoded encoded RGB8 pixels to linear Rec.2020, compositing alpha
+/// over white in linear light. Row padding is ignored; malformed layouts refuse.
+pub(crate) fn lift_rgb8_to_linear_rec2020(
+    bytes: &[u8], width: usize, height: usize, rowstride: usize, nch: usize,
+    has_alpha: bool, transform: &c41_core::icc::Transform,
+) -> Option<Vec<f32>> {
+    if width == 0 || height == 0 || nch == 0 { return None; }
+    let colour = (if has_alpha { nch.checked_sub(1)? } else { nch }).min(3).max(1);
+    let packed_row = width.checked_mul(nch)?;
+    let required = rowstride.checked_mul(height - 1)?.checked_add(packed_row)?;
+    if rowstride < packed_row || bytes.len() < required { return None; }
+    let count = width.checked_mul(height)?;
+    let mut out = vec![0.0f32; count.checked_mul(4)?];
+    for y in 0..height {
+        for x in 0..width {
+            let p = y * rowstride + x * nch;
+            let src = [0, 1, 2].map(|c| bytes[p + c.min(colour - 1)] as f32 / 255.0);
+            let mut dst = [0.0; 3];
+            transform.eval_into(&src, &mut dst);
+            let alpha = if has_alpha { bytes[p + nch - 1] as f32 / 255.0 } else { 1.0 };
+            let o = (y * width + x) * 4;
+            for c in 0..3 { out[o + c] = dst[c] * alpha + (1.0 - alpha); }
+            out[o + 3] = 1.0;
+        }
+    }
+    Some(out)
+}
+
+/// Render a non-raw linear Rec.2020 source through the ordinary pipeline (the
+/// lens stage has not been pre-applied), then encode the screen-visible sRGB.
+pub(crate) fn render_nonraw_linear_to_srgb8_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+) -> Vec<u8> {
+    let n = width.saturating_mul(height);
+    if linear.len() < n.saturating_mul(4) { return vec![0; n.saturating_mul(3)]; }
+    let mut processed = params.to_pipeline_with(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
+        .process(&linear[..n * 4], width, height);
+    c41_core::rawimage::apply_color_matrix(&mut processed, c41_core::rawimage::REC2020_TO_SRGB);
+    let mut out = vec![0u8; n * 3];
+    for i in 0..n {
+        for c in 0..3 {
+            let value = c41_core::color::linear_to_srgb(processed[i * 4 + c]);
+            out[i * 3 + c] = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    out
+}
+
+/// Render a non-raw linear Rec.2020 buffer directly to the selected 16-bit
+/// output encoding, retaining the in-pipeline lens stage for parity with the
+/// established non-raw sRGB funnel.
+pub(crate) fn render_nonraw_linear_to_output16_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Option<Vec<u16>> {
+    let n = width.saturating_mul(height);
+    if linear.len() < n.saturating_mul(4) { return Some(vec![0; n.saturating_mul(3)]); }
+    let processed = params.to_pipeline_with(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
+        .process(&linear[..n * 4], width, height);
+    let transform = if profile.is_srgb() { None } else {
+        Some(profile.transform_from_linear_rec2020()?)
+    };
+    let mut out = vec![0u16; n * 3];
+    for i in 0..n {
+        let rgb = [processed[i * 4], processed[i * 4 + 1], processed[i * 4 + 2]];
+        let mut encoded = [0.0; 3];
+        if let Some(t) = &transform {
+            t.eval_into(&rgb, &mut encoded);
+        } else {
+            for c in 0..3 {
+                let mapped = (0..3).map(|k| c41_core::rawimage::REC2020_TO_SRGB[c][k] * rgb[k]).sum();
+                encoded[c] = c41_core::color::linear_to_srgb(mapped);
+            }
+        }
+        for c in 0..3 {
+            let v = if encoded[c].is_finite() { encoded[c].clamp(0.0, 1.0) } else { 0.0 };
+            out[i * 3 + c] = (v * 65535.0 + 0.5) as u16;
+        }
+    }
+    Some(out)
+}
+
+/// Non-raw 8-bit output sibling: sRGB uses the existing Rec.2020 display seam;
+/// Adobe RGB uses its direct Rec.2020 transform before 8-bit quantisation.
+pub(crate) fn render_nonraw_linear_to_output8_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Option<Vec<u8>> {
+    if profile.is_srgb() {
+        return Some(render_nonraw_linear_to_srgb8_gear(
+            linear, width, height, params, lens_gear, grain_seed,
+        ));
+    }
+    Some(render_nonraw_linear_to_output16_gear(
+        linear, width, height, params, lens_gear, grain_seed, profile,
+    )?.into_iter().map(|v| ((v as u32 + 128) / 257) as u8).collect())
+}
+
 /// Shared render core: run the preview pipeline, map the Rec.2020 working space
 /// to sRGB, and apply the sRGB OETF, yielding tightly-packed **RGB** sRGB floats
 /// (`width*height*3`, pre-quantisation — values may fall outside `[0,1]` for
@@ -5277,6 +5389,31 @@ mod tests {
                 "is_identity vs empty-pipeline disagree for {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn sRGB_assumption_stays_on_legacy_path_but_adobe_assumption_lifts_to_rec2020() {
+        assert!(linear_rec2020_transform_for_assumption(c41_core::icc::InputAssumption::Srgb).is_none());
+        assert!(linear_rec2020_transform_for_assumption(c41_core::icc::InputAssumption::AdobeRgb1998).is_some());
+    }
+
+    #[test]
+    fn lift_wide_gamut_rgb8_composites_alpha_without_clipping_linear_values() {
+        let transform = c41_core::icc::InputAssumption::AdobeRgb1998
+            .transform_to_linear_rec2020().expect("Adobe RGB transform");
+        // Two RGBA pixels plus row padding: half-transparent green and fully
+        // transparent blue. Both composite over white in linear Rec.2020.
+        let bytes = [0, 255, 0, 128, 0, 0, 255, 0, 91, 92, 93, 94];
+        let out = lift_rgb8_to_linear_rec2020(&bytes, 2, 1, 12, 4, true, &transform)
+            .expect("valid RGBA layout");
+        assert_eq!(&out[4..8], &[1.0, 1.0, 1.0, 1.0]);
+        let mut green = [0.0; 3];
+        transform.eval_into(&[0.0, 1.0, 0.0], &mut green);
+        let alpha = 128.0 / 255.0;
+        for c in 0..3 {
+            assert!((out[c] - (green[c] * alpha + 1.0 - alpha)).abs() < 1e-6);
+        }
+        assert_eq!(out[3], 1.0);
     }
 
     #[test]

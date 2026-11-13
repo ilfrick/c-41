@@ -581,6 +581,29 @@ fn composite_rgba16_over_white(rgba: &image::ImageBuffer<image::Rgba<u16>, Vec<u
     rgb
 }
 
+/// Lift encoded RGBA samples into linear Rec.2020 and composite transparency
+/// over Rec.2020 white. ICC evaluation is deliberately unclamped; alpha is
+/// linear coverage, and output is packed opaque RGBA scratch for the pipeline.
+fn lift_rgba_to_linear_rec2020(
+    rgba: &[f32],
+    width: usize,
+    height: usize,
+    transform: &c41_core::icc::Transform,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; width * height * 4];
+    for i in 0..width * height {
+        let src = [rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]];
+        let mut linear = [0.0; 3];
+        transform.eval_into(&src, &mut linear);
+        let alpha = rgba[i * 4 + 3].clamp(0.0, 1.0);
+        for c in 0..3 {
+            out[i * 4 + c] = linear[c] * alpha + (1.0 - alpha);
+        }
+        out[i * 4 + 3] = 1.0;
+    }
+    out
+}
+
 /// Export a **non-raw** image (JPEG/PNG/TIFF) through the Rust pipeline, applying
 /// the same colour pipeline as the darkroom preview's non-raw path (demosaic is
 /// raw-only, so ignored) → optional resize → encode. **JPEG is 8-bit**
@@ -635,7 +658,8 @@ fn render_nonraw_export(
     // and falls back to the sRGB assumption, exactly as the preview does.
     let embedded = c41_core::icc::extract_embedded_file(std::path::Path::new(path))
         .unwrap_or(c41_core::icc::Embedded::UnsupportedFormat);
-    let transform = match c41_core::icc::input_profile(&embedded) {
+    let input_classification = c41_core::icc::input_profile(&embedded);
+    let transform = match input_classification {
         c41_core::icc::InputProfile::Transform(t) => Some(t),
         // G2a2, 1a: an untagged file's transform comes from the same per-file
         // remembered assumption the darkroom preview prompts for — so an image
@@ -647,6 +671,17 @@ fn render_nonraw_export(
             .and_then(|db| crate::persist::load_input_assumption(db, path))
             .unwrap_or_default()
             .transform_for_missing(),
+        _ => None,
+    };
+    // S8b keeps the established sRGB path for all sRGB/malformed/unknown
+    // cases. Only a transformable embedded non-sRGB profile or an explicit
+    // remembered Adobe assumption enters the linear Rec.2020 path.
+    let linear_transform = match c41_core::icc::input_profile(&embedded) {
+        c41_core::icc::InputProfile::Transform(_) =>
+            c41_core::icc::transform_embedded_to_linear_rec2020(&embedded),
+        c41_core::icc::InputProfile::Missing => db_path
+            .and_then(|db| crate::persist::load_input_assumption(db, path))
+            .and_then(crate::preview::linear_rec2020_transform_for_assumption),
         _ => None,
     };
 
@@ -662,6 +697,31 @@ fn render_nonraw_export(
     match settings.format {
         // JPEG is an 8-bit container — decode + process at 8-bit.
         ExportFormat::Jpeg => {
+            if let Some(t) = linear_transform.as_ref() {
+                let rgba = decoded.to_rgba8().into_raw().into_iter()
+                    .map(|v| v as f32 / 255.0).collect::<Vec<_>>();
+                let linear = lift_rgba_to_linear_rec2020(&rgba, w, h, t);
+                let (ow, oh, linear) = c41_core::geometry::apply_orientation(
+                    &linear, w, h, 4, geometry.orientation,
+                );
+                let (ow, oh, linear) = match params.borders_params() {
+                    Some(bp) => c41_core::borders::Borders::apply(&linear, ow, oh, bp),
+                    None => (ow, oh, linear),
+                };
+                let processed = crate::preview::render_nonraw_linear_to_output8_gear(
+                    &linear, ow, oh, params, lens_gear, grain_seed, settings.output_profile,
+                ).ok_or_else(|| anyhow::anyhow!("output profile transform unavailable"))?;
+                let target = settings.resize.as_ref()
+                    .map(|r| crate::export::fit_within(ow as u32, oh as u32, r));
+                return atomic_write(&dest_ext, move |out| {
+                    let mut buf: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(ow as u32, oh as u32, processed)
+                        .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+                    if let Some((tw, th)) = target {
+                        buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+                    }
+                    write_jpeg_rgb8(&buf, settings.quality, out, &profile)
+                });
+            }
             let mut raw = decoded.to_rgba8().into_raw();
             if let Some(t) = &transform {
                 // Before the white composite, never after: the backdrop's white
@@ -710,6 +770,35 @@ fn render_nonraw_export(
         // requantisation banding on an edited gradient (an unedited 16-bit source
         // is a lossless passthrough via apply_pipeline_rgb16).
         ExportFormat::Png | ExportFormat::Tiff => {
+            if let Some(t) = linear_transform.as_ref() {
+                let rgba = decoded.to_rgba16().into_raw().into_iter()
+                    .map(|v| v as f32 / 65535.0).collect::<Vec<_>>();
+                let linear = lift_rgba_to_linear_rec2020(&rgba, w, h, t);
+                let (ow, oh, linear) = c41_core::geometry::apply_orientation(
+                    &linear, w, h, 4, geometry.orientation,
+                );
+                let (ow, oh, linear) = match params.borders_params() {
+                    Some(bp) => c41_core::borders::Borders::apply(&linear, ow, oh, bp),
+                    None => (ow, oh, linear),
+                };
+                let processed = crate::preview::render_nonraw_linear_to_output16_gear(
+                    &linear, ow, oh, params, lens_gear, grain_seed, settings.output_profile,
+                ).ok_or_else(|| anyhow::anyhow!("output profile transform unavailable"))?;
+                let fmt = match settings.format {
+                    ExportFormat::Png => image::ImageFormat::Png,
+                    _ => image::ImageFormat::Tiff,
+                };
+                let target = settings.resize.as_ref()
+                    .map(|r| crate::export::fit_within(ow as u32, oh as u32, r));
+                return atomic_write(&dest_ext, move |out| {
+                    let mut buf: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(ow as u32, oh as u32, processed)
+                        .ok_or_else(|| anyhow::anyhow!("empty render"))?;
+                    if let Some((tw, th)) = target {
+                        buf = image::imageops::resize(&buf, tw, th, FilterType::Triangle);
+                    }
+                    save_rgb16_buf(&buf, out, fmt, &profile)
+                });
+            }
             let mut raw = decoded.to_rgba16().into_raw();
             if let Some(t) = &transform {
                 // The same rule as the JPEG leg — before the composite, never
@@ -1192,6 +1281,63 @@ mod tests {
     }
 
     #[test]
+    fn linear_rec2020_lift_composites_alpha_in_linear_light_without_clamping() {
+        let Some(transform) = c41_core::icc::InputAssumption::AdobeRgb1998
+            .transform_to_linear_rec2020()
+        else {
+            panic!("built-in Adobe RGB transform unavailable");
+        };
+        let rgba = [0.0, 1.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0];
+        let linear = lift_rgba_to_linear_rec2020(&rgba, 2, 1, &transform);
+        assert_eq!(linear[3], 1.0);
+        assert_eq!(&linear[4..7], &[1.0, 1.0, 1.0], "transparent pixel is Rec.2020 white");
+        let mut expected = [0.0; 3];
+        transform.eval_into(&[0.0, 1.0, 0.0], &mut expected);
+        assert!((linear[0] - (expected[0] * 0.5 + 0.5)).abs() < 1e-6);
+        assert!((linear[1] - (expected[1] * 0.5 + 0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nonraw_adobe_input_preserves_wide_gamut_in_direct_adobe_export() {
+        use image::ImageEncoder;
+        let dir = std::env::temp_dir().join(format!(
+            "c41_nonraw_adobe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("adobe.png");
+        let mut file = std::fs::File::create(&src).unwrap();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut file);
+        encoder.set_icc_profile(c41_core::icc::adobe_rgb1998_profile()).unwrap();
+        encoder.write_image(&[0, 255, 0], 1, 1, image::ExtendedColorType::Rgb8).unwrap();
+
+        let dest = dir.join("out");
+        let settings = crate::export::ExportSettings {
+            format: crate::export::ExportFormat::Png,
+            quality: 90,
+            resize: None,
+            output_profile: c41_core::icc::OutputProfile::AdobeRgb1998,
+        };
+        render_nonraw_export(
+            src.to_str().unwrap(), dest.to_str().unwrap(), &settings,
+            &crate::preview::PreviewParams::default(), None,
+            &c41_core::geometry::Geometry::default(), None,
+        ).unwrap();
+        let out_path = format!("{}.png", dest.to_str().unwrap());
+        let out = image::ImageReader::open(&out_path).unwrap().decode().unwrap().to_rgb16();
+        let pixel = out.get_pixel(0, 0);
+        assert!(pixel[1] > 65_000, "wide-gamut Adobe green was clipped: {pixel:?}");
+        assert!(pixel[0] < 500 && pixel[2] < 500, "unexpected Adobe green encoding: {pixel:?}");
+        assert_eq!(
+            c41_core::icc::extract_embedded_file(std::path::Path::new(&out_path)).unwrap(),
+            c41_core::icc::Embedded::Present(c41_core::icc::adobe_rgb1998_profile()),
+            "directly encoded pixels must carry the Adobe RGB profile"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn render_nonraw_export_roundtrips_a_png_passthrough() {
         use image::{ImageBuffer, Rgb};
         let dir = std::env::temp_dir().join(format!(
@@ -1234,6 +1380,40 @@ mod tests {
         assert_eq!((out.width(), out.height()), (4, 3));
         assert_eq!(out.as_raw(), img.as_raw(), "passthrough export must be pixel-exact");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tagged_srgb_no_edit_export_keeps_source_pixels_exact() {
+        use image::ImageEncoder;
+        let dir = std::env::temp_dir().join(format!(
+            "c41_tagged_srgb_noop_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.png");
+        let source = [17, 88, 209, 240, 33, 61];
+        let mut file = std::fs::File::create(&src).unwrap();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut file);
+        encoder.set_icc_profile(c41_core::icc::srgb_profile()).unwrap();
+        encoder.write_image(&source, 2, 1, image::ExtendedColorType::Rgb8).unwrap();
+
+        let dest = dir.join("out");
+        let settings = crate::export::ExportSettings {
+            format: crate::export::ExportFormat::Png,
+            quality: 90,
+            resize: None,
+            output_profile: c41_core::icc::OutputProfile::Srgb,
+        };
+        render_nonraw_export(
+            src.to_str().unwrap(), dest.to_str().unwrap(), &settings,
+            &crate::preview::PreviewParams::default(), None,
+            &c41_core::geometry::Geometry::default(), None,
+        ).unwrap();
+        let output = image::ImageReader::open(format!("{}.png", dest.to_str().unwrap()))
+            .unwrap().decode().unwrap().to_rgb8();
+        assert_eq!(output.as_raw(), &source, "tagged sRGB no-edit export must remain byte-identical");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
