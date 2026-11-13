@@ -1,10 +1,12 @@
 # Darkroom – Implementation Roadmap
 
-**Goal**: produce a Lightroom Classic/CC-competitive desktop photo editor built on the
-Darktable codebase, adding the major premium features that Lightroom has and Darktable
-currently lacks, while keeping (and improving) Darktable's existing strengths. C-41
-must also offer a safe, documented tool interface so external AI agents can inspect,
-preview, and make reversible photo edits without screen-scraping or driving GTK.
+**Goal**: deliver complete, evidence-based feature parity with a pinned upstream
+darktable baseline, except cloud sync and a mobile app (explicitly out of scope),
+while retaining C-41's Rust/GTK4 architecture. In parallel, provide a safe,
+documented, model-agnostic interface for AI agents to inspect, preview, and make
+reversible edits without screen-scraping or driving GTK. The parity inventory and
+upstream baseline are maintained in `PARITY_SPRINT_PLAN.md`; agent deliverables
+are in Phase 9.
 
 ---
 
@@ -25,18 +27,17 @@ exceeds Lightroom in several areas:
 | Lua 5.4 scripting | ✅ |
 | Formats: AVIF, JXL, HEIC, EXR, DNG … | ✅ |
 
-**Primary gaps vs Lightroom** (ordered by user impact):
+**Product gaps** (distinct from upstream-darktable parity):
 
-1. Face detection & recognition
-2. Cloud sync / remote catalog
-3. Smart Previews (offline editing without originals)
-4. Mobile companion app (or web remote)
-5. Virtual Copies with independent histories
-6. AI auto-tagging / keyword suggestions
-7. Batch AI processing (denoise / upscale on queue)
-8. People / People-groups view
-9. Print layout templates (multi-image layouts)
-10. Docker / container deployment
+1. Face detection, recognition, and People view
+2. Smart Previews for offline editing without originals
+3. Virtual Copies with independent histories
+4. AI auto-tagging and batch AI processing
+5. Multi-image print layout templates
+6. Complete darktable feature parity, tracked against a pinned upstream baseline
+7. Safe AI-agent editing through the shared API and local MCP tools (Phase 9)
+
+Cloud sync and a mobile app are explicitly excluded from this roadmap.
 
 ---
 
@@ -49,8 +50,10 @@ Prerequisite work; no user-visible features.
 - [x] **0.1** Fork darktable-org/darktable → ilfrick/c-41 on GitHub
 - [x] **0.2** Mirror to self-hosted Gitea (www.housefz.com/git/ilfrick/c-41)
 - [x] **0.3** Docker multi-stage build with KasmVNC (browser GUI) + optional GPU device passthrough (the launched C-41 GTK4 app remains CPU-only)
-- [ ] **0.4** Rename project string "darktable" → "Darkroom" in UI, about dialog,
-       config paths (`~/.config/darkroom`, `~/.cache/darkroom`)
+- [ ] **0.4** Finish C-41 branding in remaining user-facing strings and the app
+       icon. Preserve existing `/config/darkroom` data/config paths and
+       `DARKROOM_*` environment compatibility; any future path migration must
+       explicitly migrate existing catalogue/settings rather than strand them.
 - [ ] **0.5** CI pipeline: GitHub Actions build matrix (Linux/macOS/Windows) +
        Docker image publish to GHCR
 - [ ] **0.6** Branding: new app icon, splash screen, window title
@@ -59,7 +62,7 @@ Prerequisite work; no user-visible features.
 
 ### Phase 1 – Smart Previews (weeks 5–10)
 
-**Why first**: unblocks offline/mobile workflows and is self-contained.
+**Why first**: enables offline editing without originals and is self-contained.
 
 **Lightroom feature**: JPEG proxies embedded in the catalog that allow full editing
 without the original RAW file present (useful for travel, laptop editing).
@@ -173,67 +176,8 @@ once; the existing AI backend is single-image only.
 
 ---
 
-### Phase 6 – Cloud Sync & Remote Catalog (weeks 24–36)
+### Phase 6 – Print Layout Templates
 
-**Why**: the largest architectural gap; requires a new backend service.
-
-**Scope for v1**: catalog metadata + edit history sync (not raw pixel sync).
-
-**Architecture**:
-
-```
-Darkroom Desktop  ←──→  Darkroom Sync Server  ←──→  Darkroom Desktop / Web
-                          (REST + WebSocket)
-                          SQLite → PostgreSQL
-```
-
-**Components**:
-
-#### 6a – Sync Server (`darkroom-sync/`)
-- Language: Go (small binary, easy to self-host or run in the companion Docker
-  compose profile).
-- API: REST for catalog CRUD, WebSocket for real-time push notifications.
-- Auth: OAuth 2.0 / local accounts (Gitea-style).
-- Storage: PostgreSQL or SQLite for small installs.
-- Self-hosted first; cloud-hosted option (darkroom.app) later.
-
-#### 6b – Client Sync Engine (`src/sync/`)
-- `src/sync/client.{h,c}`: HTTP client (libcurl), conflict resolution (LWW or
-  three-way merge on history stacks).
-- Conflict UI: when two devices edited the same image, show diff of history stacks
-  and let user pick.
-- Sync scope selector: "This collection", "All rated ≥ 3★", "Everything".
-- Bandwidth throttle, pause/resume.
-
-#### 6c – Web Viewer (separate repo: `darkroom-web`)
-- Read-only web gallery rendered server-side from synced catalog + cached JPEGs.
-- Technology: SvelteKit + a small Rust service that renders edits via the
-  darktable pixel pipeline compiled to WASM (stretch goal) or pre-rendered
-  on the server.
-
----
-
-### Phase 7 – Mobile Companion App (weeks 30–42)
-
-**Scope**: iOS + Android app for browsing, rating, and basic adjustments that sync
-via the Phase 6 server.
-
-**Stack**: Flutter (single codebase, good camera API access).
-
-**Features v1**:
-- Browse synced catalog, view full-res previews.
-- Set star ratings, color labels, flags.
-- Write/read metadata: caption, keywords, GPS.
-- Send to AI queue (trigger server-side processing).
-- Capture to catalog: import photos from phone camera roll.
-
-**Features v2**:
-- Basic tone adjustments (exposure, contrast, white balance) synced back to desktop.
-- Push notifications: "AI processing complete".
-
----
-
-### Phase 8 – Print Layout Templates (weeks 36–44)
 
 **Why**: the existing print view in darktable supports single-image output; Lightroom
 has multi-image grid layouts with fine typography.
@@ -247,7 +191,7 @@ has multi-image grid layouts with fine typography.
 
 ---
 
-### Phase 9 – Agent-native photo editing (priority track; begin after the current UI/engine foundations)
+### Phase 9 – Agent-native photo editing (priority track; shares the parity engine)
 
 **Goal**: let an external AI agent use C-41 as a photo-editing tool through a
 stable, model-agnostic interface. The agent should discover supported controls,
@@ -328,7 +272,43 @@ A human can inspect and correct the agent's result using the regular editor.
 
 ---
 
-### Comparative UX audit: darktable 5.4.0 vs C-41 (2026-11-11)
+### Active track – Complete upstream darktable parity (ongoing priority track)
+
+**Goal.** Match every upstream darktable user-visible editing, catalog, import,
+export, color-management, and automation capability in the pinned baseline,
+excluding only cloud sync and a mobile app. This supersedes the earlier fixed
+52-row target: upstream grows, so each baseline refresh must regenerate the
+module, format, and workflow inventory. Do not call a feature complete because a
+catalogue row exists; require behavior, persistence, preview/export consistency,
+accessibility, and reference tests.
+
+**Execution.** `PARITY_SPRINT_PLAN.md` owns the gap matrix and order. First keep
+porting the currently identified gaps (proofing/display, multi-instance modules,
+masks, G6 decisions); then add every upstream module and non-module workflow
+missing from the refreshed inventory, including Lua scripting, GPU execution,
+additional RAW sensors/formats, complete geometry/retouch/liquify, metadata and
+history semantics. Reconcile C-41's existing 52 wired rows against current
+upstream names, versioned parameters, defaults, enable rules, stage order, and
+export behavior. Numerical parity is tested against the pinned C reference with
+explicit tolerances; any unavoidable deviation is recorded and approved, not
+silently excluded.
+
+**Upstream import policy.** Never merge upstream wholesale into the Rust rewrite.
+For each upstream change, classify it as: (1) transplantable shared C/FFI fix,
+(2) Rust port/adaptation required, (3) useful behavioral/UI reference, or
+(4) irrelevant/rejected with a reason. Record source SHA(s), affected C-41
+subsystem, tests, dependencies, and disposition. Prioritize security and
+correctness fixes in code C-41 calls through FFI, algorithm/default changes,
+new supported modules/formats, and fixes that alter reference renders. GTK3-only
+UI, unrelated architecture migrations, and OpenCL kernels are not cherry-picked;
+they are references for C-41's GTK4/Rust/GPU work. Keep a reviewed upstream
+baseline SHA and repeat this audit regularly.
+
+### Comparative UX audit (historical snapshot): darktable 5.4.0 vs C-41 (2026-11-11)
+
+This dated UI comparison predates the current pinned upstream baseline and is
+not the complete parity inventory. Refresh it against the baseline and capability
+ledger in `PARITY_SPRINT_PLAN.md` as part of the ongoing parity work.
 
 **Scope and method.** Compared the running C-41 UI and darktable 5.4.0 at a
 1440×900 desktop viewport; also captured C-41 at 900×600 to include a constrained
@@ -376,11 +356,11 @@ workflow efficiency, P2 = remaining feature parity, P3 = validation):
 4. **P2 — Catalogue visibility exceeds editing parity.** Retouch now has a live,
    non-destructive single clone stamp with source/destination placement, radius,
    opacity, and a smooth radial feather control. Multi-stroke painting, heal,
-   masks, and wavelet preview remain deferred; do not imply full darktable
-   editor parity. Liquify is also live, but remains a fixed 5×5 panel lattice
-   rather than darktable's freehand canvas editor. Treat Liquify's canvas,
-   interpolation modes, and direct-on-image interaction as a separately scoped
-   follow-up rather than implying slice-1 parity.
+   masks, and wavelet preview remain open parity work; do not imply full
+   darktable editor parity before that work is complete. Liquify is also live,
+   but remains a fixed 5×5 panel lattice rather than darktable's freehand canvas
+   editor. Its canvas, interpolation modes, and direct-on-image interaction are
+   recorded as open items in the parity backlog.
 5. **P3 — Confirm density and discoverability at real window sizes.** At both
    1440×900 and 900×600, run scripted first-edit tasks (find Exposure, locate
    enabled edits, reset one module, recover from an empty search, and move between
@@ -453,15 +433,14 @@ docker run --gpus all \
 | 3 | Face Detection + People View | High | 12–22 |
 | 4 | AI Auto-Tagging | Medium | 18–24 |
 | 5 | Batch AI Queue | Medium | 20–26 |
-| 6 | Cloud Sync + Web Viewer | Very High | 24–36 |
-| 7 | Mobile App | High | 30–42 |
-| 8 | Print Layouts | Low | 36–44 |
-| 9a–9e | Agent-native editing API + MCP tools | High; staged, gated by headless edit contract | Priority track; schedule after UI/engine foundations |
+| 6 | Print Layouts | Low | Estimate after parity inventory |
+| 7 | Complete upstream darktable parity | Very high; ongoing against a pinned upstream baseline | Iterative; workload is the full upstream gap inventory |
+| 9a–9e | Agent-native editing API + MCP tools | High; staged, gated by headless edit contract | Priority track; shares the parity engine and state model |
 
-**Baseline estimate for phases 0–8 (single developer)**: ~44 weeks from the
-original plan date; Phase 9 is a separately prioritized track and is not included
-in that estimate. **With a 4-developer team**: ~14–16 weeks for phases 0–5 in
-parallel.
+The previous 44-week estimate included cloud sync and a mobile app and is
+withdrawn. Full darktable parity has no credible fixed-duration estimate until
+the upstream inventory is complete; Phase 9 is separately tracked but shares
+engine and UI foundations with parity.
 
 ---
 
@@ -471,9 +450,6 @@ parallel.
 |---|---|---|
 | InsightFace / YOLOv8-face (ONNX) | Face detection | 3 |
 | CLIP ViT-B/32 (ONNX) | Auto-tagging, semantic search | 4 |
-| Go 1.22+ | Sync server | 6 |
-| PostgreSQL 16 (optional) | Cloud catalog backend | 6 |
-| Flutter 3.x | Mobile app | 7 |
 | KasmVNC | Browser-accessible desktop in Docker | Docker |
 | NVIDIA Container Toolkit | Optional device passthrough (no C-41 GPU compute yet) | Docker |
 | MCP Rust SDK / protocol adapter (evaluate API maturity and licensing first) | Local stdio tool server for AI-agent hosts | 9b |
@@ -490,8 +466,6 @@ parallel.
 | Face detection | ✅ | ✅ Phase 3 |
 | Smart Previews | ✅ | ✅ Phase 1 |
 | Virtual Copies | ✅ | ✅ Phase 2 |
-| Cloud sync | ✅ (Adobe) | ✅ self-hosted Phase 6 |
-| Mobile app | ✅ | ✅ Phase 7 |
 | GPU acceleration | Limited | Future target — not currently available in C-41; OpenCL (NVIDIA/AMD/Intel) |
 | Docker container | ❌ | ✅ Phase 0 |
 | Open source | ❌ | ✅ |

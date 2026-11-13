@@ -9749,3 +9749,32 @@ fatal startup errors. Previous deployment retained as container
 `c-41-rollback-748a870ecd` and image `c-41-rollback-748a870ecd:latest`. The two
 pre-existing untracked installer artifacts were left untracked and untouched;
 no other services were changed.
+
+## 2026-11-13 23:15 UTC — parity scope and upstream baseline reset
+
+**What.** Updated `ROADMAP.md`, `PARITY_SPRINT_PLAN.md`, and `PARITY_AUDIT.md`
+to make complete parity against a pinned upstream darktable baseline an ongoing
+target, excluding only cloud sync and a mobile app. Added an explicit requirement
+for owner approval before any further scope exception, expanded the plan to Lua,
+GPU execution, masks/instances, display/proof color management, RAW/formats,
+upstream modules, config/history/workflow compatibility, and kept the safe local
+AI-agent editing track in scope. Recast old refusals and deviations as open work
+or historical status. Preserved `/config/darkroom` and `DARKROOM_*` compatibility;
+no installer files or code were changed.
+
+**Upstream assessment.** Pinned `upstream/master` at
+`97912518a5a9a9786aeee3c38116fbc999412ff8` (2026-11-13), merge-base
+`2939f5949aa17405f247859bb4fc272fda3b45c0`, 2,379 upstream-only and 789
+C-41-only commits. Added a clearly labeled selective candidate ledger for new
+modules, DNG GainMap, white-balance/RAW correctness, highlights, precision, and
+HDR; no cherry-picks were made. The ledger does not claim exhaustive review of
+the full commit range.
+
+**Review and verification.** Independent senior review APPROVE after several
+rounds; findings on historical scope claims, CACorrect/lens applicability,
+config-path preservation, open parity gaps, ICC wording, and sprint-count
+consistency were corrected. `scripts/ci-local.sh` passed all four gates by exit
+code: workspace check, clippy, release tests (1,995 core / 584 UI), and release
+binary link. `git diff --check` passed. Existing unrelated compiler/deprecation
+warnings remain. Documentation-only change; commit/push, remote CI and deployment
+are pending.
