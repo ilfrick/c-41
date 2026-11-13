@@ -9678,3 +9678,29 @@ checks (`check + test + clippy`, `Build & push Docker image`) completed
 successfully. Previous S6 image is retained as
 `c-41-rollback-6472ccd434` (`c-41:98af551b79`). No other services changed; the
 installer files remain untouched.
+
+## 2026-11-13 08:41 UTC — S8a: ICC transforms into linear Rec.2020
+
+**What.** Began the safe S8 replacement: widen non-raw darkroom processing and
+export while keeping GTK/KasmVNC screen bytes sRGB. This foundation adds direct
+transforms from a present embedded ICC profile, or an explicit sRGB/Adobe RGB
+input assumption, into linear Rec.2020. Linear identity TRCs preserve values
+outside `[0,1]`; nonlinear curves and packed 8-/16-bit output helpers retain
+their existing clamp semantics. Existing sRGB-targeting APIs and raw rendering
+are unchanged. S8b remains: carry linear Rec.2020 through darkroom base/geometry
+and non-raw export. No parity-audit item is resolved by this foundation alone.
+
+**Reviewed.** Independent senior review APPROVE after one MAJOR fix: the linear
+Rec.2020 target's gamma-1 TRCs were still clamping out-of-range values. Identity
+and gamma-1 curves now preserve them; nonlinear TRCs still clamp.
+
+**Verified.** Final `scripts/ci-local.sh` passed all four gates by exit code:
+workspace check, clippy, release tests (1,995 core / 578 UI), and release binary
+link. `git diff --check` passed. Existing unrelated warnings remain.
+
+**Failures and corrections.** Two full CI runs initially failed the new ICC
+expected-value test: first the guessed sRGB golden, then the Adobe golden. The
+values were corrected against the actual direct profile transforms and the
+third full Docker run passed. A standalone core-only Docker test attempt also
+could not link because that command did not configure the workspace's bundled
+ONNX Runtime; the required workspace script ran the tests successfully.

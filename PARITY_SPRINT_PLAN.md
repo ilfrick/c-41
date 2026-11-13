@@ -73,10 +73,15 @@ parity (including broader Liquify and Retouch editors), not inert catalogue rows
   `dt_dev_draw_softproof` semantics); export keeps the normal path. Risk: the
   preview pipeline currently renders to sRGB bytes — proofing needs the seam
   work first (S-B) or a separate proof render path fed from the linear buffer.
-- **S-B: render/display space.** Stop hardcoding the sRGB display seam:
-  `ColorSpace::DisplaySrgb` → user-selectable working→display transform
-  (sRGB today, Adobe, wider Rec.2020 display). Non-raw preview/thumbs follow
-  raw. Must keep today's byte-identity when the default is chosen (pinned).
+- **S-B: wide-gamut rendering, sRGB presentation.** The GTK4/KasmVNC
+  `GdkTexture`/Cairo byte surfaces do not carry a selected ICC profile, so an
+  Adobe RGB or Rec.2020 encoded buffer cannot honestly be called a wide-gamut
+  display. Keep screen-visible previews sRGB; widen non-raw darkroom processing
+  and export to linear Rec.2020, with Adobe RGB exports transformed directly
+  from that buffer. S8a adds the unclamped ICC transform foundation; S8b must
+  carry the working buffer through darkroom decode/geometry and the non-raw
+  export funnel. Thumbnails/full-preview/print stay out of S8 and require their
+  own parity slice. Preserve current byte identity for sRGB/no-edit sources.
 - **S-C (after S-B): per-image Output color profile?** Decision recorded
   2026-11-08: the catalog row stays a global Export-dialog link. Revisit only
   if soft-proofing surfaces a per-image need; otherwise leave and say so.
@@ -138,7 +143,8 @@ RAW prepare combined, "XL" splits into two.
 | ✅ **S5 2026-11-11** | `Liquify` (G1 L) | **LIVE, slice 1** +1 (50→51/52) — fixed 5×5 drag lattice in module panel, bilinear displacement map through C's bicubic sampler, stage v50 pos 28.0 before Exposure, PreviewParams v38 (2323 B); backward decode v37 verified; review APPROVE after fixing stage-order finding | freehand Bezier/stamp controls and selectable interpolation deferred; no C golden render parity claim |
 | ✅ **S6 2026-11-12** | `Retouch` slice 1 (G1 XL₁) | **SHIPPED** +1 live (51→52/52) — single clone stamp, normalized source/destination capture, hard brush radius/opacity, preview/export stage, PreviewParams v39 (2349 B), backward v38 decode; review APPROVE, Docker CI green | multi-stroke painting, heal, masks and wavelets deferred |
 | ✅ **S7 2026-11-12** | `Retouch` slice 2 (G1 XL₂) | **SHIPPED** — optional radial smoothstep feather with default hard edge, v40 blob (2353 B), v39 default decode, full-buffer hard-edge regression; senior review APPROVE; Docker CI 1,992 core / 578 UI passed; commit `6472ccd434d3ea16cbcdc0befd5d1841ec35af58` deployed as `c-41:6472ccd434`, healthy, zero restarts, HTTP/HTTPS 200; GitHub checks green; both remotes verified | multi-stroke painting, heal, masks and wavelets remain deferred |
-| S8 | G2 S-B render/display space | user-selectable render seam, default byte-identical | regression risk on the pinned default path |
+| **S8a 2026-11-13** | G2 S-B ICC foundation | direct embedded/assumed RGB → linear Rec.2020 transforms; unclamped linear TRCs; sRGB screen path unchanged | curve semantics and gamut preservation |
+| S8b | G2 S-B non-raw integration | darkroom preview + non-raw export process in Rec.2020; GTK bytes remain sRGB; Adobe export stays direct | base-image, geometry, fallback, and export ordering |
 | S9 | G2 S-A soft-proofing | proof toggle + proof profile + gamut check; docs | proof-of-sRGB-only display limits |
 | S10 | G3 S-D per-instance module stack | duplicate/remove instances end-to-end | touches every module's state |
 | S11 | G3 S-E masks v1 | draw/parametric mask editor on ≥ 4 modules | biggest; splits further if needed |

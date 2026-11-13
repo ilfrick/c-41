@@ -457,6 +457,18 @@ fn adobe_rgb1998() -> Result<&'static Profile, IccError> {
     }
 }
 
+/// Build a transform from a present embedded ICC profile directly into linear
+/// Rec.2020. Absence, unsupported containers, malformed profiles, and profiles
+/// this engine cannot transform return `None`. This deliberately does not
+/// change [`input_profile`] classification or its sRGB-targeting behavior.
+pub fn transform_embedded_to_linear_rec2020(embedded: &Embedded) -> Option<Transform> {
+    let Embedded::Present(bytes) = embedded else {
+        return None;
+    };
+    let src = Profile::parse(bytes).ok()?;
+    Transform::new(&src, linear_rec2020().ok()?, INPUT_INTENT).ok()
+}
+
 // ── the public seam ───────────────────────────────────────────────────────
 
 /// What input profiling has to say about one decoded image.
@@ -592,6 +604,19 @@ impl InputAssumption {
                 _ => None,
             },
         }
+    }
+
+    /// Transform encoded samples in the assumed input space directly into
+    /// linear Rec.2020. Unlike [`Self::transform_for_missing`], sRGB also needs
+    /// a transform here: its encoded values must be linearized and converted
+    /// from sRGB primaries. Evaluate with [`Transform::eval_into`] to retain
+    /// out-of-gamut values; the packed-buffer helpers clamp their outputs.
+    pub fn transform_to_linear_rec2020(self) -> Option<Transform> {
+        let src = match self {
+            InputAssumption::Srgb => srgb().ok()?,
+            InputAssumption::AdobeRgb1998 => adobe_rgb1998().ok()?,
+        };
+        Transform::new(src, linear_rec2020().ok()?, INPUT_INTENT).ok()
     }
 }
 
@@ -1128,6 +1153,53 @@ mod tests {
             InputAssumption::Srgb.transform_for_missing().is_none(),
             "assuming sRGB must mean byte-exact, not a matrix round trip"
         );
+    }
+
+    #[test]
+    fn linear_rec2020_assumption_transforms_keep_encoded_input_semantics() {
+        let probe = [0.5f32, 0.25, 0.75];
+        let mut srgb_out = [0.0f32; 3];
+        InputAssumption::Srgb
+            .transform_to_linear_rec2020()
+            .expect("sRGB profile")
+            .eval_into(&probe, &mut srgb_out);
+        // Fixed reference for encoded sRGB [0.5, 0.25, 0.75] transformed
+        // through XYZ into linear Rec.2020.
+        let expected_srgb = [0.173604, 0.067491, 0.475884];
+        for i in 0..3 {
+            assert!((srgb_out[i] - expected_srgb[i]).abs() < 0.002, "{srgb_out:?}");
+        }
+
+        let mut adobe_out = [0.0f32; 3];
+        InputAssumption::AdobeRgb1998
+            .transform_to_linear_rec2020()
+            .expect("Adobe RGB profile")
+            .eval_into(&probe, &mut adobe_out);
+        let expected_adobe = [0.218667, 0.069568, 0.503115];
+        for i in 0..3 {
+            assert!((adobe_out[i] - expected_adobe[i]).abs() < 0.003, "{adobe_out:?}");
+        }
+        assert!(srgb_out.iter().zip(adobe_out).any(|(a, b)| (a - b).abs() > 0.01));
+    }
+
+    #[test]
+    fn embedded_linear_rec2020_helper_refuses_missing_unknown_and_malformed() {
+        assert!(transform_embedded_to_linear_rec2020(&Embedded::Absent).is_none());
+        assert!(transform_embedded_to_linear_rec2020(&Embedded::UnsupportedFormat).is_none());
+        assert!(transform_embedded_to_linear_rec2020(&Embedded::Present(b"invalid".to_vec())).is_none());
+        let mut truncated = srgb_profile();
+        truncated.truncate(133);
+        assert!(transform_embedded_to_linear_rec2020(&Embedded::Present(truncated)).is_none());
+        assert!(transform_embedded_to_linear_rec2020(&Embedded::Present(adobe_rgb1998_profile())).is_some());
+    }
+
+    #[test]
+    fn embedded_wide_gamut_transform_preserves_out_of_range_values() {
+        let t = transform_embedded_to_linear_rec2020(&Embedded::Present(fixture(&PROPHOTO, PROPHOTO_GAMMA)))
+            .expect("ProPhoto fixture should transform");
+        let mut out = [0.0f32; 3];
+        t.eval_into(&[0.0, 1.0, 0.0], &mut out);
+        assert!(out.iter().any(|v| *v < 0.0 || *v > 1.0), "gamut was clipped: {out:?}");
     }
 
     /// Stable codes for the DB (persist.rs stores these; renumbering would

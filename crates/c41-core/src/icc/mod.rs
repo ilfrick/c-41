@@ -82,7 +82,8 @@ pub use embed::{extract as extract_embedded, extract_file as extract_embedded_fi
 pub use lut::{parse_lut_tag, parse_lut_v2, parse_lut_v4, Pipeline, Stage};
 pub use parser::{Curve, IccError, Profile, Xyz};
 pub use standard::{
-    apply_rgb8, apply_rgb16, adobe_rgb1998_profile, input_profile, srgb_profile, InputAssumption,
-    InputProfile, OutputProfile, INPUT_INTENT,
+    apply_rgb8, apply_rgb16, adobe_rgb1998_profile, input_profile,
+    transform_embedded_to_linear_rec2020, srgb_profile, InputAssumption, InputProfile, OutputProfile,
+    INPUT_INTENT,
 };
 pub use transform::Transform;

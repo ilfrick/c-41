@@ -55,8 +55,9 @@ pub struct Xyz {
     pub z: f32,
 }
 
-/// A tone reproduction curve, forward (device value → linear), evaluated over the
-/// normalised domain `[0, 1]`.
+/// A tone reproduction curve, forward (device value → linear). Nonlinear curves
+/// are evaluated over the normalised domain `[0, 1]`; identity curves preserve
+/// out-of-range values so linear working profiles can carry extended-gamut data.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Curve {
     /// `curv` with count 0 — the identity `y = x`.
@@ -71,9 +72,14 @@ pub enum Curve {
 }
 
 impl Curve {
-    /// Evaluate the curve at `x` (clamped to `[0, 1]`).
+    /// Evaluate the curve. Nonlinear curves clamp to `[0, 1]`; identity curves
+    /// preserve out-of-range values for linear working-space transforms.
     pub fn eval(&self, x: f32) -> f32 {
-        let x = x.clamp(0.0, 1.0);
+        let x = match self {
+            Curve::Identity => return x,
+            Curve::Gamma(g) if *g == 1.0 => return x,
+            _ => x.clamp(0.0, 1.0),
+        };
         match self {
             Curve::Identity => x,
             Curve::Gamma(g) => x.powf(*g),
@@ -771,6 +777,10 @@ mod tests {
     #[test]
     fn identity_and_table_curves() {
         assert_eq!(Curve::Identity.eval(0.37), 0.37);
+        assert_eq!(Curve::Identity.eval(-0.2), -0.2);
+        assert_eq!(Curve::Identity.eval(1.2), 1.2);
+        assert_eq!(Curve::Gamma(1.0).eval(-0.2), -0.2);
+        assert_eq!(Curve::Gamma(1.0).eval(1.2), 1.2);
         // a 3-entry ramp table 0, 32768, 65535 → ~identity at endpoints & midpoint
         let t = Curve::Table(vec![0, 32768, 65535]);
         assert!((t.eval(0.0) - 0.0).abs() < 1e-4);
