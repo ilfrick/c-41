@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsecret-1-dev po4a python3-jsonschema xsltproc perl \
     opencl-headers ocl-icd-opencl-dev \
     pkg-config libgtk-4-dev libadwaita-1-dev \
-    curl \
+    curl libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust stable — needed so CMake can invoke cargo to build c41-core

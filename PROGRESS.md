@@ -9903,3 +9903,22 @@ loader/runtime; the GPU runtime image and KasmVNC flow still need verification.
 
 **Status.** GPU use remains partial (only Sigmoid RGB-ratio); the implementation
 is not deployed yet. Installer artifacts remain untracked and untouched.
+
+## 2026-11-14 09:56 UTC — S16 full-C image dependency failure and correction
+
+**Failure.** After pushing `e9ccdbc4`, the first cache-busted full-C Docker
+build failed in the builder stage while compiling Rust `c41-core`:
+`openssl-sys` could not find OpenSSL headers/pkg-config metadata. The full-C
+builder installed curl and other system development libraries but omitted
+`libssl-dev`; no image was produced and the running container was untouched.
+
+**Correction.** Added `libssl-dev` to the builder's apt packages. Independent
+senior review APPROVED the focused fix. `scripts/ci-local.sh` passed all four
+gates again, along with `docker compose ... config --quiet` and
+`git diff --check`. The cache-busted full-C image then built successfully
+(including the Release C build and Rust `c41-rs` link). Running the GPU
+differential test binary against that exact runtime image with `--gpus all`
+selected NVIDIA GeForce GTX 1060 6GB and passed actual OpenCL dispatch plus
+mixed-pipeline CPU differential. Thus the full-C image loader/ICD path is
+verified on this host. No deployment yet; running `c-41` remains on its prior
+healthy image. Installer artifacts remain untracked and untouched.
