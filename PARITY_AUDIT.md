@@ -524,7 +524,7 @@ hits, both prose in comments citing darktable's `lua scripts installer`
 one. `data/lua/darktable/debug.lua` still ships, inherited from the fork — dead
 weight that reads as evidence the feature exists.
 
-### G5 — GPU: initial Rust OpenCL slice; broad coverage and deployment remain open
+### G5 — GPU: initial Rust OpenCL slice deployed on NVIDIA; broad coverage remains open
 
 **Historical baseline (before the S16-first slice):** the audit found no `opencl3`
 dependency, and the OpenCL surface in `c41-core` was only a scaffold.
@@ -549,9 +549,13 @@ pipeline and real dispatch. The latest five-run transfer-inclusive diagnostic
 compared `Pipeline::process` with the Rayon CPU path on synthetic constant input:
 1280×720 median 12.41 ms GPU vs 50.62 ms CPU; 6000×4000 median 577.67 ms vs
 1.08 s. Earlier runs were materially slower, so these local results vary with
-system load and are not release-wide or image-quality claims. The supported GPU image/runtime/ICD and actual KasmVNC preview/export
-path still need deployment verification before the feature is considered
-available to users by default.
+system load and are not release-wide or image-quality claims. The NVIDIA full-C image/runtime path is now deployed as `c-41:8acf0f13e0`:
+`--gpus all`, NVIDIA ICD/loader visibility and container health were verified,
+and the GPU differential/mixed-pipeline test passed against that same runtime
+image before release. The live app remains limited to Sigmoid RGB-ratio; no
+live-photo benchmark/telemetry establishes user-facing speedup. AMD/Intel
+profiles pass device nodes but require a vendor OpenCL runtime/ICD inside the
+container and are not yet verified.
 
 The GPU **compose profiles are not a bug**, contrary to what a first pass at this
 suggested. `docker/docker-compose.yml:82,109,126` defines `nvidia`, `amd` and
@@ -562,8 +566,13 @@ and that image builds *both* the C app and `c41-rs` and launches `c41-rs`
 `RUST_MIGRATION_PLAN.md:2044-2045`). The `full-c` image label was a genuine overclaim:
 device passthrough alone did not accelerate the Rust front-end. This was
 corrected on 2026-11-07; image/Compose wording distinguishes device access from
-compute. The new OpenCL backend changes the product path only when the image
-contains an OpenCL loader/ICD and a GPU is exposed; verify that at deployment.
+compute. The OpenCL backend requires an OpenCL loader/ICD and an exposed GPU. As of
+2026-11-14, the NVIDIA full-C image is deployed and the live container's GPU
+request, NVIDIA ICD/loader visibility, health, and service endpoints are
+verified. The differential/mixed-pipeline test passed against that same image
+before release, but the live application path has not been instrumented to
+confirm which real user-image pipeline stages dispatched during interactive
+preview/export. AMD/Intel vendor runtimes/ICDs remain unavailable/unverified.
 
 **Priority update (owner, 2026-11-14):** actual GPU execution in the Rust product
 is a high-priority requirement. Keep extending C5 ahead of ordinary sprint order;

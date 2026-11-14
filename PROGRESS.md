@@ -9942,5 +9942,36 @@ inside the container.
 
 **Verification.** Independent senior review APPROVED after its corrections.
 `scripts/ci-local.sh` passed all four gates; `docker compose ... config --quiet`
-and `git diff --check` also passed. No container was changed. Installer
-artifacts remain untracked and untouched.
+and `git diff --check` also passed. No container was changed in this docs
+increment. Installer artifacts remain untracked and untouched.
+
+## 2026-11-14 10:52 UTC — S16 NVIDIA GPU runtime deployment
+
+**Deployment.** Released the OpenCL-enabled full-C image as `c-41:8acf0f13e0`
+(the Rust pipeline code is from `e9ccdbc4`; the full-C builder fix is in
+`ffbf7a65`; the final commit adds docs only). Recreated `c-41` preserving the
+existing environment, ports, persistent volumes, restart policy, and NVIDIA
+runtime, and explicitly added `--gpus all`, `NVIDIA_VISIBLE_DEVICES=all`, and
+compute/graphics/utility/video driver capabilities. The former `c-41` is stopped
+and retained as `c-41-rollback-8acf0f13e0`.
+
+**Verification.** New container is healthy with zero restarts; HTTP and HTTPS
+both return 200 and `c41-rs` is running. `docker inspect` confirms a GPU device
+request; inside the live container, `nvidia-smi` sees the GeForce GTX 1060 6GB,
+and the NVIDIA OpenCL ICD plus OpenCL loader are present. Before deployment,
+the GPU differential/mixed-pipeline test passed against this same full-C runtime
+image, selecting the GTX 1060 and asserting actual OpenCL dispatch. The backend
+accelerates only Sigmoid RGB-ratio; other stages remain CPU. No live user-image
+performance claim is made. The old container is retained for rollback; other
+services were untouched. Installer artifacts remain untracked and untouched.
+
+**Roadmap reconciliation.** Independent senior review caught stale canonical
+status claiming the previous deployment and that GPU image verification was
+still pending. Updated `ROADMAP.md` and `PARITY_AUDIT.md` to record the actual
+live NVIDIA deployment and remaining stage/runtime limitations. A second review
+caught stale deployment-pending wording in the G5 heading/caveat; clarified the
+difference between verified container GPU visibility and uninstrumented live
+user-image dispatch. `scripts/ci-local.sh` passed all four gates; Compose config
+and `git diff --check` passed. A final review then caught wording in the pipeline row that could imply live
+preview/export dispatch; clarified it to separate backend capability, test
+coverage, and the uninstrumented live path. Final independent review APPROVED after the wording correction.
