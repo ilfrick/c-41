@@ -10134,3 +10134,24 @@ upstream profile support to C-41. Source inspection of current `exif.cc`,
 senior review APPROVED the final distinction. All four `scripts/ci-local.sh`
 gates passed; `git diff --check` passed. No code or deployment changed; S9 is
 still incomplete.
+
+## 2026-11-14 16:21 UTC — S9 RAW white-balance/manual-calibration cluster triaged
+
+**Inventory.** Audited selected upstream white-balance and CameraCalibration
+commits against pinned darktable and C-41 source snapshot
+`bb8465414ccec026b76c102d18dba9a6d1afdf77`. Classified the Rust workflow gaps
+as partial S14 work: the Rust RAW path applies per-image rawloader WB and the
+GTK4 panel exposes manual RGB multipliers, while the retained C IOP has older
+picker/mode behavior. Coordinated manual WB/Color Calibration behavior and
+image-specific symbolic modes in later pinned commits are not in this C-41
+source snapshot. The existing C CameraCalibration path is not ForwardMatrix;
+that remains separately triaged. Updated the commit ledger, RAW matrix, and
+roadmap. Full commit lists and end-to-end parity remain open.
+
+**Review and verification.** Independent senior review APPROVED the substantive
+triage and recommended pinning the C-41 comparison SHA; added that source anchor.
+A final re-review attempt failed because Pi could not load the subagent extension
+(`subagent` tool conflict). The prior reviewer approved the source distinctions;
+only the suggested SHA anchor and this log entry followed. All four
+`scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or
+deployment changed; S9 remains incomplete.

@@ -150,12 +150,51 @@ interpolation and preview/export consistency; test CPU/GPU only if a GPU path is
 introduced. Do not infer ForwardMatrix interpolation or default selection from
 the existence of multiple matrices.
 
+## RAW white balance and manual calibration: workflow boundary and selected commits
+
+The commits below are ancestors of the pinned upstream SHA. C-41 source
+comparison: `bb8465414ccec026b76c102d18dba9a6d1afdf77` (later commits in this
+S9 documentation increment do not change code). Some early behavior is present
+in the retained C IOP; that does not mean it is exposed by the Rust GTK4 RAW
+workflow. This C-41 source includes the early commits but not the 2026
+manual-calibration/image-specific follow-ups listed below. The DNG ForwardMatrix
+commits are triaged separately above.
+
+| Upstream commit | Authored / committed | Pinned-baseline change | Triage |
+|---|---|---|---|
+| [`651f7fe868bbaa196885478d67a08c8f4b47c5bc`](https://github.com/darktable-org/darktable/commit/651f7fe868bbaa196885478d67a08c8f4b47c5bc) — `Rework temperature and channelmixerrgb` | 2023-10-26 / 2023-10-27 | Introduces shared white-balance/chroma state coordinated between temperature and Color Calibration. This commit is also in current C-41 HEAD's retained C history. | **REFERENCE** for cross-module state and invariants; the Rust UI currently stores separate fixed WB sliders and Color Calibration parameters. Do not treat the retained C code as Rust UI parity. |
+| [`1c5df700213ea71c88e9c08ee20748d845550fbc`](https://github.com/darktable-org/darktable/commit/1c5df700213ea71c88e9c08ee20748d845550fbc) — `Introduce as-shot to later D65 workflow` | 2024-02-06 / 2024-02-08 | Adds a late correction workflow that can apply as-shot WB early and correct toward the camera reference later, with distinct spot/picker behavior. Present in current C-41 HEAD's retained C IOP. | **REFERENCE** for stage ordering and mode semantics. The Rust RAW path applies decoded as-shot multipliers but exposes no corresponding mode/picker state. |
+| [`9540e292199cc78114a19d0501563233412d365f`](https://github.com/darktable-org/darktable/commit/9540e292199cc78114a19d0501563233412d365f) — `Fix temperature defaults` | 2024-02-17 / 2024-02-18 | Corrects mode-dependent temperature defaults. Present in current C-41 HEAD's retained C history. | **REFERENCE** for the default/migration tests needed if the Rust UI gains equivalent modes; not a request to change today's as-shot default. |
+| [`c73800e2654830ca99c2279c707d4312d2c58cb7`](https://github.com/darktable-org/darktable/commit/c73800e2654830ca99c2279c707d4312d2c58cb7) — `Add exif colorcalibration support` | 2024-04-15 / 2024-04-17 | Reads CameraCalibration metadata for the legacy C color-matrix calculation. Present in current C-41 HEAD's retained C path, but not carried by the Rust `RawImage` color transform. | **PORT to Rust RAW — S14** if pinned DNG calibration behavior is not otherwise covered. This is CameraCalibration/ColorMatrix behavior, not the later ForwardMatrix profile; see the ForwardMatrix section. |
+| [`fd7ddaf7ccb164fa3fddc2263a7935eab87a0e06`](https://github.com/darktable-org/darktable/commit/fd7ddaf7ccb164fa3fddc2263a7935eab87a0e06) — `colorcalibration also for manual wb (#20304)` | 2026-11-04 / 2026-11-04 | Defines broad interaction semantics between manual WB and Color Calibration, including chroma state, picker/illuminant behavior and trouble conditions. Not present in current C-41 HEAD. | **PORT — S14**, adapted to the Rust edit/pipeline model; do not transplant the GTK3/shared-global state design. |
+| [`3b875937e5556692f6b455e0375ca434a37ffdbb`](https://github.com/darktable-org/darktable/commit/3b875937e5556692f6b455e0375ca434a37ffdbb) — `temperature: as shot and camera reference use the image's multipliers` | 2026-11-10 / 2026-11-10 | Makes as-shot/camera-reference modes resolve from the image currently being edited, rather than multipliers stored by a copied history/style/preset. Not present in current C-41 HEAD. | **PORT / REFERENCE — S14.** If symbolic WB modes are introduced, persist the mode and resolve per-image coefficients at render time; test style/history transfer across different RAW files. |
+
+Current Rust RAW evidence: `crates/c41-core/src/rawimage.rs::load_with` stores
+decoder-provided WB multipliers and `RawImage` applies them around demosaic and
+highlight reconstruction; `crates/c41-ui/src/raw_preview.rs` and
+`dialogs/mod.rs` use that Rust path for preview/export. The GTK4 “White balance”
+row in `crates/c41-ui/src/darkroom/mod.rs` exposes three manual RGB multiplier
+sliders, while Color Calibration is a separate parameter group. The C-FFI
+`darkroom_temperature_*` functions in `crates/c41-core/src/iop/temperature.rs`
+replace pixel loops called by retained `src/iop/temperature.c`; the legacy C
+module has its own older mode/picker UI. Neither the FFI pixel kernels nor
+retained C UI prove Rust mode/picker/state parity.
+
+Keep these concepts separate in further triage: decoded/as-shot WB coefficients;
+a neutral picked from image pixels; camera-reference/D65 and late-correction
+modes; and DNG AnalogBalance, CameraCalibration, ColorMatrix and ForwardMatrix
+metadata. Verify mode/default migration, monochrome behavior, image-specific
+resolution after style/history copy, WB-before/after-demosaic ordering, picked
+neutral calculation, and consistent preview/export output against pinned
+fixtures. The 2026 `fd7…` manual-calibration changes are broad and require a
+Rust-native interaction design, not just more coefficient sliders.
+
 ## Remaining work
 
 The module, RAW/formats, and workflow/runtime matrices remain conservative inventories.
 Other candidate clusters named in `ROADMAP.md` §5.4—including Contrast & Texture,
-white balance, highlights, precision and HDR—remain unclassified until rows are
-added with pinned-source and C-41 call-path evidence. The Spektrafilm and DNG
-follow-up lists here are representative, not exhaustive; additional commits for
-all reviewed features may still need triage. S9 is incomplete until the remaining
+highlights, precision and HDR—remain unclassified until rows are added with
+pinned-source and C-41 call-path evidence. The Spektrafilm, DNG and WB follow-up
+lists here are representative, not exhaustive; additional commits for all
+reviewed features may still need triage. S9 is incomplete until the remaining
 capabilities and selected commit deltas are verified and prioritized.
