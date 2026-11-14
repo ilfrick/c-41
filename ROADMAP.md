@@ -79,7 +79,7 @@ Parità significa coprire tutte le capacità utente e di elaborazione del baseli
 | **S10** | Colore/proofing completo (C2). |
 | **S11** | Architettura multi-istanza e migrazioni (C3). |
 | **S12** | Maschere complete, dipende da S11 (C3). |
-| **S13** | Nuovi moduli upstream: Contrast & Texture, RGB Saturation Curve, Spektrafilm e inventario aggiornato. Audit algoritmi, dati/licenze, reference e memoria prima di ciascun port. |
+| **S13** | Nuovi moduli upstream: Contrast & Texture, RGB Saturation Curve, Spektrafilm e inventario aggiornato. Audit algoritmi, dati/licenze e reference. Per Contrast & Texture, mantenere il modello adattivo di budget risorse darktable (non un cap fisso); validare la tiling parity prima dei tile e propagare errori recuperabili. |
 | **S14** | RAW, formati, sensori e metadati (C6). |
 | **S15** | Compatibilità Lua e sandbox (C4). |
 | **S16 — priorità alta, anticipato/in corso** | Span Exposure/Sigmoid contigui dispatchati con un singolo upload/kernel/readback full-frame; deployed in `c-41:6b2ba54e4f`, differential GPU test passed su NVIDIA GTX 1060 e fallback CPU conservato. Resta da strumentare il dispatch con foto utente. Poi: esporre stato backend, valutare soglia d’uso e allargare a più stage compatibili/residenti; spatial/tiling. AMD/Intel richiedono runtime/ICD nel container. Il solo device passthrough e OpenCL C legacy non soddisfano il gate. |
