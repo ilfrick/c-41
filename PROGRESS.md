@@ -10094,3 +10094,24 @@ S9 are explicitly incomplete.
 **Review and verification.** Independent senior review APPROVED. All four
 `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code,
 services, or installer artifacts changed.
+
+## 2026-11-14 15:55 UTC — S9 DNG OpcodeList3 GainMap cluster triaged
+
+**Inventory.** Verified the GainMap feature and selected fixes/release-note
+commits as ancestors of pinned darktable
+`97912518a5a9a9786aeee3c38116fbc999412ff8`. Classified the OpcodeList3
+GainMap capability **PORT, S14**; parser-bounds, map-geometry, and CPU/GPU
+follow-ups are `REFERENCE`, while the release-notes-only commit is not a code
+port. Refined `raw-formats.md` and the commit ledger to distinguish three
+existing partial paths: legacy C stores/applies OpcodeList2 Bayer maps; its
+OpcodeList3 parser supports warp/vignette but not GainMap; the Rust rawloader
+preview/export path has no OpcodeList3 GainMap payload or application stage.
+C-41's four-map Bayer helper alone is not evidence of OpcodeList3 parity.
+Selected commit rows are not exhaustive; S9 remains incomplete.
+
+**Review and verification.** Independent senior review APPROVED after checking
+the exact retained C handlers and rawloader dependency; an initial concern that
+the OpcodeList3 parser handled GainMap was resolved by confirming it only
+accepts warp/vignette and logs other opcodes as unsupported. All four
+`scripts/ci-local.sh` gates passed; `git diff --check` passed. No code, services,
+or installer artifacts changed.

@@ -61,11 +61,55 @@ spectral film/print simulation. Relevant C-41 evidence:
 `crates/c41-core/src/iop/{negadoctor,channelmixerrgb,filmicrgb}.rs`,
 `crates/c41-core/src/pipeline.rs`, and `crates/c41-ui/src/{preview.rs,darkroom/mod.rs}`.
 
+## DNG OpcodeList3 GainMap: pipeline feature and selected follow-ups
+
+All commits below are ancestors of the pinned SHA. The authored and committed
+dates differ for several commits because they were rebased together; both are
+recorded to avoid presenting author time as landing order.
+
+| Upstream commit | Authored / committed | Pinned-baseline change | Triage |
+|---|---|---|---|
+| [`c7d98b58ea4ff39a3f30bd1f16bbccc34191b927`](https://github.com/darktable-org/darktable/commit/c7d98b58ea4ff39a3f30bd1f16bbccc34191b927) — `dng_opcode: apply the GainMap from DNG OpcodeList3` | 2026-10-11 / 2026-11-09 | Parses and applies supported OpcodeList3 GainMap data through image metadata/cache, demosaic for CFA data and rawprepare for linear DNG; includes CPU/OpenCL paths and compatibility/default handling. | **PORT — S14.** A distinct RAW capability; implement after defining supported DNG/map shapes, metadata ownership, crop/active-area geometry, edit defaults and CPU-correct behavior. The existing OpcodeList2 helper is not this feature. |
+| [`26117d31144737704283888644b1915fb219dd85`](https://github.com/darktable-org/darktable/commit/26117d31144737704283888644b1915fb219dd85) — `dng_opcode: reject GainMap spacings that cannot be reciprocated` | 2026-08-04 / 2026-11-09 | Rejects map spacing/origin values that cannot be safely used by the sampler. | **REFERENCE** for finite/range/reciprocal validation and malformed-input tests in the port. |
+| [`2657ff3bc4515a8b500ceb4fd02e77ea3bfa8dbf`](https://github.com/darktable-org/darktable/commit/2657ff3bc4515a8b500ceb4fd02e77ea3bfa8dbf) — `dng_opcode: compare the GainMap rectangle against the active area` | 2026-08-30 / 2026-11-09 | Validates the map rectangle against active image dimensions rather than padded raw-buffer dimensions. | **REFERENCE** for active-area/crop geometry tests; C-41 currently has no corresponding RAW active-area model in its Rust decode path. |
+| [`dcb52f7ffe16e1d255d43b8634c77c217cd52719`](https://github.com/darktable-org/darktable/commit/dcb52f7ffe16e1d255d43b8634c77c217cd52719) — `demosaic, rawprepare: do not read and write one image in the GainMap kernel` | 2026-09-05 / 2026-11-09 | Uses separate/scratch storage to avoid in-place OpenCL image read/write. | **REFERENCE** only if a C-41 GPU path is added; first establish the CPU path and CPU differential. |
+| [`e43fbf3f7323775de78739257722d686c2d9da79`](https://github.com/darktable-org/darktable/commit/e43fbf3f7323775de78739257722d686c2d9da79) — `Validate DNG opcode payload sizes` | 2026-10-07 / 2026-10-12 | Adds parser payload-size validation for DNG opcodes. | **REFERENCE** for bounds-checked parsing, truncation/overflow tests and fail-closed behavior. |
+| [`eebdfbfd403d3a416c3c43e98905088718999079`](https://github.com/darktable-org/darktable/commit/eebdfbfd403d3a416c3c43e98905088718999079) — `RELEASE_NOTES: DNG OpcodeList3 GainMap` | 2026-11-09 / 2026-11-09 | Release notes only; no additional implementation delta. | **NOT APPLICABLE** as a standalone code port; retain as evidence of the feature's upstream landing/release. |
+
+The pinned upstream call path is broader than a kernel: `src/common/exif.cc`
+locates the opcode payload; `src/common/dng_opcode.c` parses/validates and
+stores the map; `src/iop/demosaic.c` and `src/iop/rawprepare.c` apply it to
+supported CFA/demosaiced and linear-DNG paths; image-cache ownership and the
+OpenCL code are in `src/common/{image,image_cache,opencl,dng_opcode}.*` and
+`data/kernels/dng_opcode.cl`. The map is not applied by simply recognizing a
+`.dng` extension. The supported shapes and documented no-clamp/headroom behavior
+must be carried into the compatibility and reference tests.
+
+C-41 has **partial adjacent code, not OpcodeList3 GainMap parity**. Its retained
+C path in `src/common/dng_opcode.c` parses OpcodeList2 Bayer gain maps and some
+OpcodeList3 warp/vignette opcodes; `src/iop/rawprepare.c` passes four Bayer
+OpcodeList2 maps to `darkroom_rawprepare_apply_gainmaps` in
+`crates/c41-core/src/iop/rawprepare.rs`. That helper is a per-pixel four-map
+Bayer sampler, not the OpcodeList3 three-plane/general-geometry path. The Rust
+RAW path used by preview/export calls `crates/c41-core/src/rawimage.rs::load_with`
+through `crates/c41-ui/src/raw_preview.rs` and `dialogs/mod.rs`; no OpcodeList3
+GainMap payload, active-area geometry, or application stage is wired there.
+This distinction preserves the evidence for the legacy C/FFI path without
+claiming it covers the current Rust RAW workflow.
+
+Before changing status, test supported and rejected opcode shapes, malformed
+and truncated payloads, finite/reciprocal spacing, active-area and crop offsets,
+padded/unpadded sensor buffers, pixel-centre interpolation and edge behavior,
+legacy-edit defaults, CFA and linear-DNG paths, and consistent preview/export
+output. Decide and document the supported map forms before implementation;
+exercise GPU parity only if a GPU path is later introduced.
+
 ## Remaining work
 
 The module, RAW/formats, and workflow/runtime matrices remain conservative inventories.
 Other candidate clusters named in `ROADMAP.md` §5.4—including Contrast & Texture,
-Spektrafilm, DNG GainMap, white balance, highlights, precision and HDR—are not
-classified here unless a row is added with pinned-source and C-41 call-path
-evidence. S9 is incomplete until the remaining capabilities and selected commit
-deltas are verified and prioritized.
+white balance, highlights, precision and HDR—remain unclassified until rows are
+added with pinned-source and C-41 call-path evidence. The Spektrafilm and DNG
+follow-up lists here are representative, not exhaustive; additional commits for
+all reviewed features may still need triage. S9 is incomplete until the remaining
+capabilities and selected commit deltas are verified and prioritized.
