@@ -10115,3 +10115,22 @@ the OpcodeList3 parser handled GainMap was resolved by confirming it only
 accepts warp/vignette and logs other opcodes as unsupported. All four
 `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code, services,
 or installer artifacts changed.
+
+## 2026-11-14 16:08 UTC — S9 DNG ForwardMatrix/HueSatMap cluster triaged
+
+**Inventory.** Verified commits `525c68c5361a5967e5a4c7cfc3039513a6622287`,
+`f00505df6f13cbb58d32094ae7b730f92bb69f6f`, and
+`47002f161c6915a8202a1a3a08bf764ca82e8633` are in the pinned upstream baseline.
+Classified the missing Rust RAW profile behavior **PORT, S14**, with the
+ForwardMatrix profile and ProfileHueSatMap as distinct slices. Refined
+`commit-triage.md`, `raw-formats.md`, and the roadmap. C-41's legacy EXIF code
+reads ForwardMatrix tags but builds its embedded matrix from ColorMatrix inputs;
+its colorin has no ForwardMatrix/HueSatMap application. The Rust `xyz_to_cam`
+path does not imply ForwardMatrix parity.
+
+**Correction.** An initial research pass attributed post-candidate pinned
+upstream profile support to C-41. Source inspection of current `exif.cc`,
+`colorin.c`, `image.h`, and the Rust RAW path corrected that claim; independent
+senior review APPROVED the final distinction. All four `scripts/ci-local.sh`
+gates passed; `git diff --check` passed. No code or deployment changed; S9 is
+still incomplete.

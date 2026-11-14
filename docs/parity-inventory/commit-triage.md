@@ -104,6 +104,52 @@ legacy-edit defaults, CFA and linear-DNG paths, and consistent preview/export
 output. Decide and document the supported map forms before implementation;
 exercise GPU parity only if a GPU path is later introduced.
 
+## DNG ForwardMatrix and ProfileHueSatMap: color-profile feature and selected commits
+
+All three candidates are ancestors of the pinned SHA and absent from current C-41
+HEAD. Their authored and committed timestamps differ for the first two commits.
+
+| Upstream commit | Authored / committed | Pinned-baseline change | Triage |
+|---|---|---|---|
+| [`525c68c5361a5967e5a4c7cfc3039513a6622287`](https://github.com/darktable-org/darktable/commit/525c68c5361a5967e5a4c7cfc3039513a6622287) — `First part of using DNG forward matrix` | 2026-09-30 / 2026-10-01 | Reads DNG ForwardMatrix tags and constructs the corresponding profile matrix using illuminant-associated ForwardMatrix, AnalogBalance and CameraCalibration rather than treating it as ColorMatrix. | **PORT — S14.** Implement explicit matrix semantics/profile choice in the Rust RAW path; preserve ordinary ColorMatrix and current defaults unless the product decision changes them. |
+| [`f00505df6f13cbb58d32094ae7b730f92bb69f6f`](https://github.com/darktable-org/darktable/commit/f00505df6f13cbb58d32094ae7b730f92bb69f6f) — `Use forward matrix in dng files via a new cmsHPROFILE` | 2026-09-30 / 2026-10-01 | Adds a selectable DNG ForwardMatrix input profile using a constructed LittleCMS profile. | **PORT — S14.** This is user-visible behavior absent from C-41’s Rust RAW UI/render path; keep it distinct from the default embedded ColorMatrix profile. |
+| [`47002f161c6915a8202a1a3a08bf764ca82e8633`](https://github.com/darktable-org/darktable/commit/47002f161c6915a8202a1a3a08bf764ca82e8633) — `Full support for dng forward matrix images` | 2026-10-07 / 2026-10-07 | Completes the profile path, including DNG ProfileHueSatMap processing and CPU/OpenCL application. | **PORT — S14 follow-up.** Treat HueSatMap parsing, table semantics, profile association and interpolation as a distinct extension; ForwardMatrix alone does not imply it. |
+
+At the pinned upstream baseline, `src/common/exif.cc` reads the DNG color,
+calibration, analog-balance and ForwardMatrix tags and selects the associated
+illuminant. The profile path composes the ForwardMatrix with the inverse
+AnalogBalance×CameraCalibration and adapts D50 to the working profile. It is a
+selectable profile, not the fresh-import default; the pinned implementation
+selects an illuminant rather than interpolating matrices. `470…` adds the
+associated ProfileHueSatMap data and applies it after the matrix transform.
+Relevant upstream paths include `src/iop/colorin.c`, `src/common/exif.cc`,
+`src/common/image.h`, `src/common/image_cache.c`, and CPU/OpenCL colorin code.
+
+C-41 has **partial adjacent matrix handling, not ForwardMatrix profile parity**.
+The retained C `src/common/exif.cc` reads ForwardMatrix tags into temporary
+arrays and logs/marks native DNGs with ForwardMatrix for missing-sample review,
+but does not store or use them to build `d65_color_matrix`: that matrix is
+computed from AnalogBalance×CameraCalibration×ColorMatrix. The current C
+`src/iop/colorin.c` exposes the embedded matrix profile, not a ForwardMatrix or
+DNG-look profile; ProfileHueSatMap tags in EXIF handling are not applied. The
+Rust RAW path uses `rawloader`'s `xyz_to_cam` in
+`crates/c41-core/src/rawimage.rs::rec2020_from_cam_matrix`; that does not carry
+ForwardMatrix, CameraCalibration, AnalogBalance, illuminant-specific profile
+selection or HueSatMap data into the Rust preview/export transform. Evidence:
+`crates/c41-ui/src/raw_preview.rs` and `crates/c41-ui/src/dialogs/mod.rs` call
+through the Rust `RawImage` rendering path. The tag being present or read is not
+evidence that the ForwardMatrix profile transform is applied.
+
+Before changing status, compare real DNG fixtures with ColorMatrix and multiple
+ForwardMatrix/illuminant combinations, AnalogBalance/CameraCalibration,
+malformed or singular matrices, default versus explicit profile selection, and
+resulting neutral/profile values against pinned darktable. Test missing tags and
+safe fallback. For ProfileHueSatMap, separately test dimensions/encoding,
+illuminant association, hue wrap, saturation/value boundaries, table
+interpolation and preview/export consistency; test CPU/GPU only if a GPU path is
+introduced. Do not infer ForwardMatrix interpolation or default selection from
+the existence of multiple matrices.
+
 ## Remaining work
 
 The module, RAW/formats, and workflow/runtime matrices remain conservative inventories.
