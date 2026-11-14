@@ -10169,3 +10169,9 @@ deployment changed; S9 remains incomplete.
 **Correction.** The first draft described current exports as sRGB-only. Inspection of `OutputProfile` showed that C-41 also offers Adobe RGB (1998); the final wording records both as SDR destinations and makes no false HDR/Rec.2020 output claim.
 
 **Verification.** Manually inspected pinned commit metadata/diffs, Rust import/export and display call paths, and the existing Rec.2020 and ICC seams. The independent subagent/reviewer tool remains unavailable due the Pi extension conflict recorded above; no independent verdict is claimed for this documentation-only increment. All four `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or deployment changed; S9 remains incomplete.
+
+## 2026-11-14 16:44 UTC — S9 RCD precision/OpenCL candidate triaged
+
+**Inventory.** Verified pinned commit `748066d59b22e52a50bd06355a4f9ad52f708e9a`. It improves the upstream RCD OpenCL/CPU differential through corrected edge initialization/guards, FMA contraction and precise division; it does not change CPU RCD. Classified **REFERENCE — S16 GPU follow-up**, since C-41's active Rust RAW path uses CPU/Rayon `demosaic_rcd` and has no GPU demosaicer. Updated the commit ledger, demosaic matrix and roadmap. Broader precision-related commits remain untriaged.
+
+**Verification.** Manually checked the full upstream diff, ancestry and Rust/C demosaic paths. The Pi subagent/reviewer extension conflict remains unresolved; no independent reviewer verdict is claimed for this documentation-only increment. All four `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or deployment changed; S9 remains incomplete.

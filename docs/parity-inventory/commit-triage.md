@@ -196,6 +196,23 @@ PQ/HLG profile decoder/encoder or HDR signal path. The retained C tree has
 broader HDR paths, but its presence does not wire them into the Rust GTK4
 product. See `raw-formats.md` for the product capability matrix.
 
+## Demosaic precision: selected RCD OpenCL differential fix
+
+The selected commit is an ancestor of the pinned SHA and absent from C-41 source
+comparison `23c26a1728dd78a5f858bfcdc05449cf3ddf2bc3` (code in that snapshot is
+unchanged from earlier documentation-only commits).
+
+| Upstream commit | Authored / committed | Pinned-baseline change | Triage |
+|---|---|---|---|
+| [`748066d59b22e52a50bd06355a4f9ad52f708e9a`](https://github.com/darktable-org/darktable/commit/748066d59b22e52a50bd06355a4f9ad52f708e9a) — `Increase precision in rcd demosaicer` | 2026-10-18 / 2026-10-18 | Fixes the pinned RCD OpenCL path's CPU differential: initializes/guards edge data, enables contraction to match CPU FMA, and adds an FMA/Newton-refined `fp32_div` where OpenCL's relaxed default division caused larger numerical error. This commit changes `data/kernels/common.h` and `demosaic_rcd.cl`; it does not change the CPU RCD algorithm. | **REFERENCE — S16 GPU follow-up.** Rust `RawImage::demosaic_rcd` is the CPU product path; it has no OpenCL RCD backend, so do not apply an OpenCL helper as a CPU feature. Preserve this commit as the acceptance/reference test if Rust RCD is later dispatched to GPU; compare edge rows/columns and CPU/GPU error over representative CFA patterns. |
+
+C-41's Rust raw decode calls `crates/c41-core/src/rawimage.rs::demosaic_rcd`
+from `RawImage::to_linear_rgba_with_opts`; it uses CPU/Rayon and is upstream's
+RCD family, but algorithm naming and method presence do not establish full
+behavioral parity. The retained C `src/iop/demosaicing/rcd.c` and its OpenCL
+kernels are separate from the Rust GTK4 RAW preview/export path. Broader
+precision-related commits and CPU reference comparisons remain untriaged.
+
 ## RAW white balance and manual calibration: workflow boundary and selected commits
 
 The commits below are ancestors of the pinned upstream SHA. C-41 source
@@ -239,10 +256,11 @@ Rust-native interaction design, not just more coefficient sliders.
 
 The module, RAW/formats, and workflow/runtime matrices remain conservative inventories.
 Other candidate clusters named in `ROADMAP.md` §5.4—including Contrast & Texture
-and precision—remain unclassified until rows are added with pinned-source and
-C-41 call-path evidence. HDR now has selected transfer/display commits triaged,
-not a full feature/path audit. The highlights, Spektrafilm, DNG and WB clusters
-are also partial; all follow-up lists are representative, not exhaustive.
+and broader precision work—remain unclassified until rows are added with
+pinned-source and C-41 call-path evidence. HDR has selected transfer/display
+commits triaged, not a full feature/path audit. The highlights, Spektrafilm,
+DNG and WB clusters are also partial; all follow-up lists are representative,
+not exhaustive.
 Additional commits for all reviewed features may still need triage. S9 is
 incomplete until the remaining capabilities and selected commit deltas are
 verified and prioritized.
