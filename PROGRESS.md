@@ -10026,6 +10026,27 @@ Independent senior review APPROVED. `scripts/ci-local.sh` passed all four
 gates; Compose configuration and `git diff --check` passed. No image rebuild or
 deployment has occurred yet; `c-41:8acf0f13e0` remains live.
 
+## 2026-11-14 15:30 UTC — S9 satcurvergb commit cluster triaged
+
+**Inventory.** Verified full upstream SHAs `92c0f79a835125609efc68761922629b700d8c8d`
+(add satcurvergb) and `7076cab1033da4ba4e5e009bbca3b78f76f1c0e3` (histogram fix)
+are ancestors of pinned darktable `97912518a5a9a9786aeee3c38116fbc999412ff8`.
+The module is registered, ordered, and has CPU/OpenCL processing in the pinned
+source. The histogram correction samples the preview pipeline. C-41's
+ColorBalanceRGB/ColorZones/Velvia are overlapping but non-equivalent; the
+saturation-indexed saturation/brilliance curves are absent. Classified the
+feature as **PORT, S13**, with the histogram fix folded into the port. Added
+`docs/parity-inventory/commit-triage.md`, refined the `satcurvergb` module row,
+and linked the partial ledger from `ROADMAP.md`. Other candidate clusters remain
+explicitly unclassified; S9 is not complete.
+
+**Review and verification.** Independent senior review APPROVED. All four
+`scripts/ci-local.sh` gates passed; `git diff --check` passed. An initial source
+search incorrectly assumed the upstream file existed in the C-41 worktree; it
+was corrected to query the pinned commit object directly. No code, services, or
+installer artifacts changed. The GitHub Docker-image check for the preceding
+deployment documentation commit `c5d9d40d` was still in progress at this entry.
+
 ## 2026-11-14 15:13 UTC — S16 Exposure/Sigmoid fusion full-C rollout
 
 **Release.** After source commit `868a94e6`, the documentation release commit
