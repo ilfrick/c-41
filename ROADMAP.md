@@ -1,6 +1,6 @@
 # C-41 — Roadmap unica
 
-> **Documento canonico del piano.** Qui convergono roadmap di prodotto, parità con darktable, migrazione Rust/GTK4 e integrazione degli agenti AI. `PARITY_SPRINT_PLAN.md` è sostituito da questo documento; `RUST_MIGRATION_PLAN.md` resta solo un registro tecnico/storico. `PROGRESS.md` è il diario delle consegne e verifiche, mentre `PARITY_AUDIT.md` conserva il registro dettagliato delle lacune e deviazioni osservate.
+> **Documento canonico del piano.** Qui convergono roadmap di prodotto, parità con darktable, migrazione Rust/GTK4 e integrazione degli agenti AI. `PARITY_SPRINT_PLAN.md` è sostituito da questo documento; `RUST_MIGRATION_PLAN.md` resta solo un registro tecnico/storico. `PROGRESS.md` è il diario delle consegne e verifiche, mentre `PARITY_AUDIT.md` conserva il registro delle lacune/deviazioni osservate. `docs/parity-inventory/` contiene evidenze e matrici di capability a supporto di S9: non è una seconda roadmap e non decide priorità.
 >
 > **Obiettivo:** mantenere C-41 funzionante durante la riscrittura incrementale Rust/GTK4 e raggiungere la parità verificabile con una versione upstream fissata di darktable. Le sole esclusioni di prodotto approvate sono cloud sync e app mobile. In parallelo, offrire agli agenti AI locali un’interfaccia sicura e reversibile sullo stesso motore usato dalla UI.
 
@@ -15,7 +15,7 @@
 ## 2. Stato sintetico e baseline
 
 - **Baseline darktable:** `97912518a5a9a9786aeee3c38116fbc999412ff8` (2026-11-13); merge-base `2939f5949aa17405f247859bb4fc272fda3b45c0`. Il confronto iniziale conta 2.379 commit upstream-only e 789 C-41-only: conteggi puntuali, non una proposta di merge.
-- La ricognizione dei commit è stata **selettiva**, non esaustiva. Sono già emersi `contrastntexture`, `satcurvergb`, `spektrafilm`, DNG OpcodeList3 GainMap, modifiche RAW/white balance, highlights, precisione, HDR, maschere e cambiamenti GTK3/OpenCL.
+- La ricognizione dei commit è stata **selettiva**, non esaustiva. Sono già emersi `contrastntexture`, `satcurvergb`, `spektrafilm`, DNG OpcodeList3 GainMap, modifiche RAW/white balance, highlights, precisione, HDR, maschere e cambiamenti GTK3/OpenCL. La prima sweep S9 è suddivisa in `docs/parity-inventory/modules.md`, `raw-formats.md` e `workflows-runtime.md`; sono matrici strutturali conservative, non l’inventario comportamentale completo né il triage di tutti i commit.
 - **Consegne di parità registrate S1–S8:** framing, chromatic aberrations, watermark, color calibration, prime slice di liquify e retouch, fondazione ICC e Rec.2020 per non-RAW. Non equivalgono a parità completa: le lacune residue sono elencate sotto.
 - **Prossimo incremento formale: S9**, inventario upstream completo e prima ondata di import/porting. Un primo tentativo di Contrast & Texture è stato abbandonato prima del commit: il limite arbitrario di 4 milioni di pixel saltava silenziosamente l’effetto sulle immagini più grandi; rimuoverlo senza una strategia memoria/tiling coerente con il riferimento non è sicuro.
 - Deploy corrente: `c-41:0b4befd923` (commit `0b4befd92366ef57f056a5c7fc6cc2517b28c48d`), healthy, zero restart; `c-41-rollback-0b4befd923` conserva l’immagine precedente `c-41:053395cf39`. Le modifiche di codice non verificate o non committate non sono parte delle release.
@@ -73,7 +73,7 @@ Parità significa coprire tutte le capacità utente e di elaborazione del baseli
 | **S1–S4 — consegnati** | Framing, Chromatic Aberrations, Watermark e Color Calibration collegati ai rispettivi percorsi. Restano aperte slice di parità completa indicate in C1/C7. |
 | **S5–S7 — consegnati a slice** | Liquify con lattice UI; Retouch con singolo clone stamp e feather. La canvas libera e le funzioni avanzate restano aperte. |
 | **S8a–S8b — consegnati** | Fondazione ICC e processing/export Rec.2020 per fonti non-RAW idonee; preview visibile resta sRGB. Proof/display completo è ancora S10. |
-| **S9 — prossimo** | Inventario capability/delta completo per lo SHA fissato; classificare ogni commit/capacità (PORT, APPLY, REFERENCE o motivata non applicabilità), assegnare priorità e owner sprint, avviare solo port con riferimenti e test. |
+| **S9 — in corso** | Completare inventario capability/delta per lo SHA fissato; le prime matrici per moduli, RAW/formati e workflow/runtime sono in `docs/parity-inventory/`. Verificare le classificazioni conservative, triagiare i commit (PORT, APPLY, REFERENCE o non applicabile con motivazione), assegnare priorità e sprint; il fallback rawprepare è il primo slice portato. Nessuna sweep è completa finché ogni riga ha evidenza e verifica. |
 | **S10** | Colore/proofing completo (C2). |
 | **S11** | Architettura multi-istanza e migrazioni (C3). |
 | **S12** | Maschere complete, dipende da S11 (C3). |
@@ -88,7 +88,7 @@ Parità significa coprire tutte le capacità utente e di elaborazione del baseli
 
 ### 5.4 Prima triage upstream (campione, non inventario completo)
 
-La prima analisi ha evidenziato: `1067c653c0`/`23d5544c8d` (Contrast & Texture); `92c0f79a83`/`7076cab103` (RGB Saturation Curve e fix); `d81ccfe23b` e follow-up Spektrafilm; `c7d98b58ea`, `dcb52f7ffe`, `26117d3114` (DNG GainMap); cambiamenti white-balance/manual calibration; `56b0ca0081` (fallback rawprepare quando white ≤ black; portato in `rawimage.rs` nel primo slice S9, con test Bayer/X-Trans/override); fix highlight; e semantica HDR/PQ/HLG. Ogni elemento deve essere confrontato con il call path e la versione C-41, non cherry-picked alla cieca. Il registro completo deve includere SHA, feature, decisione, motivazione, sprint e verifica.
+La prima analisi ha evidenziato: `1067c653c0`/`23d5544c8d` (Contrast & Texture); `92c0f79a83`/`7076cab103` (RGB Saturation Curve e fix); `d81ccfe23b` e follow-up Spektrafilm; `c7d98b58ea`, `dcb52f7ffe`, `26117d3114` (DNG GainMap); cambiamenti white-balance/manual calibration; `56b0ca0081` (fallback rawprepare quando white ≤ black; portato in `rawimage.rs` nel primo slice S9, con test Bayer/X-Trans/override); fix highlight; e semantica HDR/PQ/HLG. Le matrici in `docs/parity-inventory/` sono il punto di partenza per la verifica, non classificazioni definitive. Ogni elemento deve essere confrontato con il call path e la versione C-41, non cherry-picked alla cieca. Il registro completo deve includere SHA, feature, decisione, motivazione, sprint e verifica.
 
 ## 6. Filone D — Agent-native editing, Phase 9
 

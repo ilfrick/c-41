@@ -9831,3 +9831,23 @@ ports, NVIDIA runtime, and restart policy. `c-41` is healthy with zero restarts;
 errors; existing Openbox/Mesa/XKB warnings remain. The previous image is
 retained as container `c-41-rollback-0b4befd923` and image
 target `c-41-rollback-0b4befd923:latest`. No other services were changed.
+
+## 2026-11-14 06:32 UTC — S9 inventory first sweep
+
+**Inventory.** Added pinned-source matrices for upstream IOP source paths,
+RAW/formats, and cross-cutting workflows/runtime under
+`docs/parity-inventory/`. These are evidence appendices, not a competing plan;
+`ROADMAP.md` now marks S9 in progress and links their scope. The 114 upstream
+`.c` path set was mechanically compared against the pinned `git ls-tree` output
+(no missing/extra paths; 92 partial, 5 absent, 17 uncertain). Independent senior
+review caught and corrected overclaims for the Rust color-reconstruction kernel
+slice and product-wide GPU/soft-proof absence; final review APPROVE. RAW/format
+support remains explicitly unverified where only helper kernels/extensions were
+observed. This is an initial structural sweep, not complete behavioral parity
+or commit-delta triage.
+
+**Verification.** `git diff --check` passed. `scripts/ci-local.sh` passed all
+four gates (workspace check, clippy, release tests: 1,995 core / 584 UI, and
+release binary link). Existing compiler warnings remain; no test failures.
+No application code changed, so no deployment was performed. Installer files
+remain untracked and untouched.
