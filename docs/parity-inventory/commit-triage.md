@@ -150,6 +150,30 @@ interpolation and preview/export consistency; test CPU/GPU only if a GPU path is
 introduced. Do not infer ForwardMatrix interpolation or default selection from
 the existence of multiple matrices.
 
+## Highlight reconstruction: opposed follow-ups and RAW default workflow
+
+All candidates are ancestors of the pinned upstream SHA and absent from the
+C-41 source comparison at `fb48c23ce063b3bc1e76b9a51b89f525560f6b1c`. C-41's
+Rust opposed/clip workflow was added earlier in `356c54af3a7240b71e46e9d25beb44bb12ec7b81`;
+that implementation predates these upstream follow-ups.
+
+| Upstream commit | Authored / committed | Pinned-baseline change | Triage |
+|---|---|---|---|
+| [`8482e4cff2108b5c64b0fd342896bcd0548feb61`](https://github.com/darktable-org/darktable/commit/8482e4cff2108b5c64b0fd342896bcd0548feb61) — `Code update for opposed highlights` | 2026-09-29 / 2026-09-30 | Refactors opposed-state sharing, changes mask padding/boundary handling and chroma reductions, and removes the lower-quality thumbnail path that produced small-thumbnail color artifacts. The pinned C implementation includes CPU/OpenCL paths; this is not just a parameter change. | **REFERENCE — S14 validation.** The Rust RAW port is CPU-only and always runs its full-frame reconstruction; it has distinct buffer rounding/border logic. Differentially test odd/small dimensions, Bayer/X-Trans edges, clipped-mask boundaries and numerical output before deciding whether any delta must be applied. Do not port OpenCL or the old thumbnail-quality switch as a standalone feature. |
+| [`a42d70c8bcb0c8a93e992b41d45c679dd55dd4ee`](https://github.com/darktable-org/darktable/commit/a42d70c8bcb0c8a93e992b41d45c679dd55dd4ee) — `Auto-disable opposed highlights for unclipped raw images` | 2026-10-02 / 2026-10-02 | On a fresh, unaltered RAW with opposed selected, waits for the full-pipe clipped-pixel result, then disables the enabled module and records a history item if no photosites are clipped. The pinned behavior is coupled to upstream's default-enabled module/preset and GUI/history lifecycle. | **PORT — S14.** C-41's Rust `hl_on` default is false and there is no clipped-result/history auto-disable; this avoids work by default but differs in initial module state, clipped-RAW recovery and edit history. Adapt only with a Rust-native default/history design and tests for fresh vs edited RAWs, clipped/unclipped images and stable preview/export results. |
+| [`93c8f6efaf6c7a316daf5f1f5b303bb23906930e`](https://github.com/darktable-org/darktable/commit/93c8f6efaf6c7a316daf5f1f5b303bb23906930e) — `Let's cleanup the highlights parameters` | 2026-09-05 / 2026-09-05 | Bumps the C IOP parameter version and removes unused legacy fields while preserving old-version migration. | **REFERENCE** for retained-C parameter/history migration only; the Rust `PreviewParams` blob is independently versioned and does not serialize this C struct. Do not port as a Rust feature. |
+
+Pinned-source paths are `src/iop/highlights.c` and
+`src/iop/hlreconstruct/opposed.c`; the auto-disable uses full-pipe results,
+image edit state, GUI synchronization and history. C-41 Rust evidence is
+`crates/c41-core/src/iop/highlights.rs::reconstruct_mosaic`,
+`crates/c41-core/src/rawimage.rs::to_linear_rgba_with_opts`, and
+`crates/c41-ui/src/preview.rs` / `darkroom/mod.rs`. Both Rust preview and export
+pass `hl_opts`, but highlight reconstruction is disabled by default. The C-41
+port has only Clip and Opposed and no raw-history auto-disable. Its source
+comments note different Bayer mask/buffer handling; do not infer algorithmic
+parity from the shared method name.
+
 ## RAW white balance and manual calibration: workflow boundary and selected commits
 
 The commits below are ancestors of the pinned upstream SHA. C-41 source
@@ -193,8 +217,9 @@ Rust-native interaction design, not just more coefficient sliders.
 
 The module, RAW/formats, and workflow/runtime matrices remain conservative inventories.
 Other candidate clusters named in `ROADMAP.md` §5.4—including Contrast & Texture,
-highlights, precision and HDR—remain unclassified until rows are added with
-pinned-source and C-41 call-path evidence. The Spektrafilm, DNG and WB follow-up
-lists here are representative, not exhaustive; additional commits for all
-reviewed features may still need triage. S9 is incomplete until the remaining
-capabilities and selected commit deltas are verified and prioritized.
+precision and HDR—remain unclassified until rows are added with pinned-source
+and C-41 call-path evidence. The selected highlights cluster, like Spektrafilm,
+DNG and WB, is partial; its follow-up list is representative, not exhaustive.
+Additional commits for all reviewed features may still need triage. S9 is
+incomplete until the remaining capabilities and selected commit deltas are
+verified and prioritized.

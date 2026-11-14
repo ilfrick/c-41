@@ -10155,3 +10155,9 @@ A final re-review attempt failed because Pi could not load the subagent extensio
 only the suggested SHA anchor and this log entry followed. All four
 `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or
 deployment changed; S9 remains incomplete.
+
+## 2026-11-14 16:32 UTC — S9 highlight-reconstruction follow-ups triaged
+
+**Inventory.** Verified pinned ancestry and diffs for `8482e4cff2108b5c64b0fd342896bcd0548feb61`, `a42d70c8bcb0c8a93e992b41d45c679dd55dd4ee`, and `93c8f6efaf6c7a316daf5f1f5b303bb23906930e`. Classified the opposed algorithm/boundary update as **REFERENCE, S14 validation**; the fresh-unclipped-RAW auto-disable workflow as **PORT, S14**; and the C parameter-schema cleanup as C-history reference only. Distinguished the upstream default-enabled/history behavior from C-41's earlier Rust port, which is CPU-only and disabled by default. Updated the commit ledger, RAW matrix and roadmap. Other highlight methods and full cluster coverage remain open.
+
+**Verification caveat.** A delegated research/review attempt could not launch because Pi reported a duplicate `subagent` tool extension conflict. I manually checked the exact upstream diffs, SHAs/ancestry and C-41 call paths; this documentation-only increment has no independent reviewer verdict. All four `scripts/ci-local.sh` gates passed and `git diff --check` passed. No code or deployment changed; S9 remains incomplete.
