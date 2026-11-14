@@ -2454,10 +2454,10 @@ impl Pipeline {
         output
     }
 
-    /// Execute stages over full-frame buffers. Pixel-local CPU stages are
-    /// parallelized over pixel-aligned chunks; spatial stages receive the full
-    /// image dimensions. The injected sigmoid dispatcher is called once per
-    /// sigmoid stage, once for the complete frame.
+    /// Execute GPU-supported spans with one full-frame dispatch per span;
+    /// unsupported stages run on CPU and delimit spans. Pixel-local CPU stages
+    /// are parallelized over pixel-aligned chunks; spatial stages receive the
+    /// full image dimensions.
     fn process_stagewise<F>(
         &self,
         input: &[f32],
@@ -2466,7 +2466,7 @@ impl Pipeline {
         mut dispatch_sigmoid: F,
     ) -> anyhow::Result<Vec<f32>>
     where
-        F: FnMut(&[f32], &mut [f32], [f32; 6]) -> anyhow::Result<()>,
+        F: FnMut(&[f32], &mut [f32], &[Stage]) -> anyhow::Result<()>,
     {
         fn frame_buffer(len: usize) -> anyhow::Result<Vec<f32>> {
             let mut buffer = Vec::new();
@@ -2475,15 +2475,20 @@ impl Pipeline {
             Ok(buffer)
         }
 
+        let spans = gpu_stage_spans(&self.stages);
         let mut current = frame_buffer(input.len())?;
         current.copy_from_slice(input);
         let mut next = frame_buffer(input.len())?;
-        for stage in &self.stages {
-            if let Stage::Sigmoid {
-                white_target, black_target, paper_exp, film_fog, film_power, paper_power,
-            } = stage {
-                dispatch_sigmoid(&current, &mut next, [*white_target, *black_target, *paper_exp, *film_fog, *film_power, *paper_power])?;
-            } else if stage.is_pixel_local() {
+        let mut index = 0;
+        while index < self.stages.len() {
+            if let Some(span) = spans.iter().find(|span| span.start == index) {
+                dispatch_sigmoid(&current, &mut next, &self.stages[span.clone()])?;
+                index = span.end;
+                std::mem::swap(&mut current, &mut next);
+                continue;
+            }
+            let stage = &self.stages[index];
+            if stage.is_pixel_local() {
                 use rayon::prelude::*;
                 const BAND: usize = 64 * 1024 * 4;
                 current.par_chunks(BAND).zip(next.par_chunks_mut(BAND)).for_each(|(src, dst)| {
@@ -2493,6 +2498,7 @@ impl Pipeline {
                 stage.apply(&current, &mut next, width, height);
             }
             std::mem::swap(&mut current, &mut next);
+            index += 1;
         }
         Ok(current)
     }
@@ -2525,6 +2531,30 @@ impl Pipeline {
             output.copy_from_slice(scratch);
         }
     }
+}
+
+/// Contiguous exposure/sigmoid runs eligible for a single GPU submission.
+/// Exposure-only runs stay CPU; every other stage is a hard boundary.
+fn gpu_stage_spans(stages: &[Stage]) -> Vec<std::ops::Range<usize>> {
+    let supported = |stage: &Stage| matches!(stage, Stage::Exposure { .. } | Stage::Sigmoid { .. });
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < stages.len() {
+        if !supported(&stages[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut contains_sigmoid = false;
+        while index < stages.len() && supported(&stages[index]) {
+            contains_sigmoid |= matches!(stages[index], Stage::Sigmoid { .. });
+            index += 1;
+        }
+        if contains_sigmoid {
+            spans.push(start..index);
+        }
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -2635,12 +2665,15 @@ mod tests {
         ]);
         let input = ramp(32 * 32);
         let mut dispatched = 0;
-        let actual = pipeline.process_stagewise(&input, 32, 32, |src, dst, params| {
+        let actual = pipeline.process_stagewise(&input, 32, 32, |src, dst, stages| {
             dispatched += 1;
-            Stage::Sigmoid {
-                white_target: params[0], black_target: params[1], paper_exp: params[2],
-                film_fog: params[3], film_power: params[4], paper_power: params[5],
-            }.apply(src, dst, 32, 32);
+            let mut current = src.to_vec();
+            let mut next = vec![0.0; src.len()];
+            for stage in stages {
+                stage.apply(&current, &mut next, 32, 32);
+                std::mem::swap(&mut current, &mut next);
+            }
+            dst.copy_from_slice(&current);
             Ok(())
         }).unwrap();
         let mut expected = vec![0.0; input.len()];
@@ -2648,6 +2681,26 @@ mod tests {
         pipeline.process_band(&input, &mut expected, &mut scratch, 32, 32);
         assert_eq!(dispatched, 2);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn gpu_span_planning_requires_sigmoid_and_splits_on_unsupported_stages() {
+        let sigmoid = Stage::Sigmoid {
+            white_target: 1.0, black_target: 0.0, paper_exp: 0.3,
+            film_fog: 0.0, film_power: 1.0, paper_power: 1.0,
+        };
+        let exposure = Stage::Exposure { black: 0.01, scale: 1.2 };
+        assert!(gpu_stage_spans(&[exposure.clone(), exposure.clone()]).is_empty());
+        assert_eq!(
+            gpu_stage_spans(&[
+                exposure.clone(),
+                Stage::Velvia { strength: 0.0, bias: 1.0 },
+                exposure.clone(), sigmoid, exposure.clone(),
+                Stage::Velvia { strength: 0.0, bias: 1.0 },
+                exposure,
+            ]),
+            vec![2..5],
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
 use std::sync::{atomic::{AtomicUsize, Ordering}, Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
+use crate::pipeline::Stage;
 use opencl3::{
     command_queue::CommandQueue,
     context::Context,
@@ -101,15 +102,50 @@ pub fn gpu_name() -> Option<String> {
         .map(|backend| backend.device_name.clone())
 }
 
-/// Run the transfer-inclusive RGB-ratio stage. Any error is returned to the
-/// caller, which must execute the unchanged CPU reference instead.
-pub(crate) fn sigmoid_rgb_ratio(input: &[f32], output: &mut [f32], params: [f32; 6]) -> Result<()> {
+/// Run one ordered supported span with one full-frame upload/kernel/readback
+/// (no tiling). Any error requires rerunning the original full pipeline on CPU.
+pub(crate) fn sigmoid_rgb_ratio(input: &[f32], output: &mut [f32], stages: &[Stage]) -> Result<()> {
     if input.len() != output.len() || input.len() % 4 != 0 {
         return Err(anyhow!("invalid packed RGBA buffer lengths"));
     }
     let pixels = input.len() / 4;
     if pixels == 0 {
         return Ok(());
+    }
+    let stage_data_len = stages
+        .len()
+        .checked_mul(7)
+        .ok_or_else(|| anyhow!("OpenCL stage parameter size overflow"))?;
+    let mut stage_data = Vec::new();
+    stage_data.try_reserve_exact(stage_data_len)?;
+    for stage in stages {
+        match stage {
+            Stage::Exposure { black, scale } => {
+                stage_data.extend_from_slice(&[0.0, *black, *scale, 0.0, 0.0, 0.0, 0.0]);
+            }
+            Stage::Sigmoid {
+                white_target,
+                black_target,
+                paper_exp,
+                film_fog,
+                film_power,
+                paper_power,
+            } => {
+                stage_data.extend_from_slice(&[
+                    1.0,
+                    *white_target,
+                    *black_target,
+                    *paper_exp,
+                    *film_fog,
+                    *film_power,
+                    *paper_power,
+                ]);
+            }
+            _ => return Err(anyhow!("unsupported stage in OpenCL span")),
+        }
+    }
+    if !stages.iter().any(|stage| matches!(stage, Stage::Sigmoid { .. })) {
+        return Err(anyhow!("OpenCL span contains no sigmoid stage"));
     }
     let bytes = input
         .len()
@@ -123,6 +159,8 @@ pub(crate) fn sigmoid_rgb_ratio(input: &[f32], output: &mut [f32], params: [f32;
         .ok_or_else(|| anyhow!("OpenCL global size overflow"))?;
     let count = cl_ulong::try_from(pixels)
         .map_err(|_| anyhow!("pixel count exceeds OpenCL kernel range"))?;
+    let stage_count = cl_ulong::try_from(stages.len())
+        .map_err(|_| anyhow!("stage count exceeds OpenCL kernel range"))?;
     // Select/initialize the backend before allocating or writing any host frame.
     let runtime = backend().ok_or_else(|| anyhow!("OpenCL GPU backend unavailable"))?;
     let backend = runtime
@@ -142,15 +180,23 @@ pub(crate) fn sigmoid_rgb_ratio(input: &[f32], output: &mut [f32], params: [f32;
             output.len(),
             std::ptr::null_mut(),
         )?;
+        let mut stages_buffer = Buffer::<cl_float>::create(
+            &backend._context,
+            CL_MEM_READ_ONLY,
+            stage_data.len(),
+            std::ptr::null_mut(),
+        )?;
         backend
             .queue
             .enqueue_write_buffer(&mut input_buffer, CL_BLOCKING, 0, input, &[])?;
+        backend
+            .queue
+            .enqueue_write_buffer(&mut stages_buffer, CL_BLOCKING, 0, &stage_data, &[])?;
         backend.kernel.set_arg(0, &input_buffer)?;
         backend.kernel.set_arg(1, &output_buffer)?;
-        backend.kernel.set_arg(2, &count)?;
-        for (index, value) in params.iter().enumerate() {
-            backend.kernel.set_arg((index + 3) as u32, value)?;
-        }
+        backend.kernel.set_arg(2, &stages_buffer)?;
+        backend.kernel.set_arg(3, &stage_count)?;
+        backend.kernel.set_arg(4, &count)?;
         backend.queue.enqueue_nd_range_kernel(
             backend.kernel.get(),
             1,
@@ -217,7 +263,8 @@ mod tests {
         let mut cpu = vec![0.0; input.len()];
         stage.apply(&input, &mut cpu, 65_537, 1);
         let mut gpu = vec![f32::NAN; input.len()];
-        sigmoid_rgb_ratio(&input, &mut gpu, params).expect("GPU dispatch/readback");
+        sigmoid_rgb_ratio(&input, &mut gpu, std::slice::from_ref(&stage))
+            .expect("GPU dispatch/readback");
         for (pixel, (actual, expected)) in gpu.chunks_exact(4).zip(cpu.chunks_exact(4)).enumerate()
         {
             assert_eq!(actual[3], input[pixel * 4 + 3], "alpha contract");
@@ -245,18 +292,22 @@ mod tests {
             "tail or output lanes were not written"
         );
         let pipeline = Pipeline::with_stages(vec![
-            Stage::Exposure { black: 0.0, scale: 0.75 },
+            Stage::Exposure { black: 0.001, scale: 0.75 },
+            Stage::Exposure { black: -0.002, scale: 1.03 },
             stage.clone(),
             Stage::Exposure { black: 0.01, scale: 1.1 },
+            Stage::Retouch {
+                source_x: 0.0, source_y: 0.0, dest_x: 0.5, dest_y: 0.5,
+                radius: 0.0, opacity: 0.0, feather: 0.0,
+            },
+            Stage::Exposure { black: 0.003, scale: 0.91 },
+            stage.clone(),
+            Stage::Exposure { black: -0.001, scale: 1.02 },
         ]);
-        let mut expected = vec![0.0; input.len()];
-        let mut intermediate = vec![0.0; input.len()];
-        pipeline.stages[0].apply(&input, &mut expected, 65_537, 1);
-        stage.apply(&expected, &mut intermediate, 65_537, 1);
-        pipeline.stages[2].apply(&intermediate, &mut expected, 65_537, 1);
+        let expected = pipeline.process_cpu(&input, 65_537, 1);
         let before = dispatch_count();
         let actual = pipeline.process(&input, 65_537, 1);
-        assert!(dispatch_count() > before, "pipeline silently fell back to CPU");
+        assert!(dispatch_count() >= before + 2, "pipeline did not dispatch both GPU spans");
         for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
             let tolerance = 2.0e-5 + 2.0e-4 * expected.abs();
             assert!((actual - expected).abs() <= tolerance, "mixed pipeline mismatch at {index}: {actual} vs {expected}");

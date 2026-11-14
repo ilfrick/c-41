@@ -9991,3 +9991,25 @@ ambiguity; clarified the inventory convention and explicitly marked the GPU row
 as post-pin, then review APPROVED. `scripts/ci-local.sh` passed all four gates;
 Compose configuration and `git diff --check` passed. Installer artifacts remain
 untracked and untouched.
+
+## 2026-11-14 14:35 UTC — S16 fused Exposure/Sigmoid OpenCL span
+
+**Implementation.** Fused contiguous `Exposure` and `Sigmoid` stages into one
+full-frame OpenCL submission per supported span. Exposure retains the CPU
+`(v - black) * scale` operation on all four lanes and original ordering; spans
+must contain Sigmoid, while exposure-only runs and unsupported stages remain on
+CPU. Any OpenCL error still causes the whole pipeline to restart from original
+input on the CPU reference. This remains un-tiled and does not accelerate other
+stages.
+
+**Review and verification.** Independent senior review APPROVED with no
+findings. `scripts/ci-local.sh` passed all four gates. The ignored GPU
+CPU-differential test passed on NVIDIA GeForce GTX 1060 6GB, including repeated
+exposure/sigmoid stages and two GPU spans separated by a CPU Retouch stage.
+Initially that test could not find an OpenCL backend: `c41-rust-dev` had the
+NVIDIA ICD but not `libOpenCL.so.1`. Installing via apt was blocked by Ubuntu
+repository network timeouts; rerunning with the OpenCL loader copied from the
+live runtime image and mounted read-only succeeded. No production files or
+services were changed by this workaround. Full-C image rebuild/deploy and docs
+scope reconciliation remain pending; live `c-41` remains `c-41:8acf0f13e0`.
+Installer artifacts remain untracked and untouched.
