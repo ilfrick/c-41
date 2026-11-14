@@ -5,9 +5,15 @@ Incremental rewrite of the Darkroom codebase (C/GTK3) into Rust + GTK4 via the
 each subsystem is replaced one at a time behind a stable C FFI layer, keeping the
 application runnable throughout.
 
+> **Status/document role:** this file is a technical and historical migration
+> reference, not the current roadmap. Scope, priorities, and exclusions are owned
+> exclusively by [`ROADMAP.md`](ROADMAP.md). In particular, the older 2026-08-31
+> scope decision below is superseded by the full-parity decision recorded in the
+> roadmap; its A→B loop-port history is retained for technical context only.
+
 ---
 
-## Scope decision — 2026-08-31 (user-approved)
+## Historical scope decision — 2026-08-31 (superseded)
 
 Work front splits into four tiers:
 - **A. Remaining `src/common` / `src/include` / `src/imageio` shared-infra

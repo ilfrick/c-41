@@ -9780,3 +9780,37 @@ warnings remain. Commit `c2969039b6d5767ef72b7a8dcbf4217834780287` is on
 GitHub and Gitea; both `master` refs verified. GitHub `Build & push Docker image`
 check completed successfully. No deployment was made because this is a docs-only
 change; the running `c-41:8640ff3779` remains healthy and unchanged.
+
+## 2026-11-14 05:48 UTC — unified roadmap and S9 rawprepare fallback
+
+**Roadmap consolidation.** Folded the product roadmap (infrastructure/branding,
+Smart Previews, Virtual Copies, People, AI tagging/batch and print layouts),
+Rust/GTK4 migration status, pinned-baseline parity backlog and S1–S20, and safe
+agent editing Phase 9 into `ROADMAP.md` as the single canonical roadmap.
+`PARITY_SPRINT_PLAN.md` now redirects there; `RUST_MIGRATION_PLAN.md` is marked
+technical/historical, and `CLAUDE.md` plus `PARITY_AUDIT.md` point to the unified
+source. Cloud sync and mobile remain the only scope exclusions.
+
+**S9 development.** Ported upstream `rawprepare.c`'s invalid-white fallback:
+when white is at or below the maximum black level, use `UINT16_MAX` for all CFA
+colours. Added Bayer, X-Trans, and synthetic-DNG `load_with` override coverage.
+The first Docker CI attempt failed two legacy normalization tests because their
+unused E-channel white value (`1`) now correctly triggered the upstream global
+fallback; changed those fixtures to valid white levels. The rerun passed all
+four `scripts/ci-local.sh` gates by exit code: workspace check, clippy, release
+tests (1,998 core / 584 UI), and release binary link. `git diff --check` passed.
+
+**Abandoned draft / failure retained.** The uncommitted Contrast & Texture draft
+was removed rather than shipped: its fixed 4M-pixel cutoff caused silent
+identity output for larger images, and the current whole-frame Rust pipeline has
+no exact bounded-memory/tiling path matching upstream. A delegated investigation
+confirmed that simply removing the cutoff would risk large infallible
+allocations; correct handling needs fallible Gaussian/EIGF allocations and a
+pipeline error/tiling design. No Contrast & Texture code was committed.
+
+**Deployment record correction.** The prior docs-only commit `053395cf39` was
+deployed after the earlier progress entry: direct Docker inspection confirms
+`c-41:053395cf39` healthy with zero restarts; previous `c-41:8640ff3779` is
+retained as `c-41-rollback-053395cf39`. This new roadmap/rawprepare change has
+not yet been committed or deployed. Installer files remain untracked and
+untouched.

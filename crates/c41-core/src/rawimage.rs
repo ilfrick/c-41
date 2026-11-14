@@ -83,6 +83,17 @@ pub struct RawImage {
 /// white when reconstruction is off). `cfa` gives the colour index at
 /// `[row % 2][col % 2]`; `black`/`white` are indexed by that colour (RGBE
 /// order). Pure — no decode dependency.
+fn effective_white_levels(black: [f32; 4], white: [f32; 4]) -> [f32; 4] {
+    // Mirrors rawprepare.c: if the configured white point is not above the
+    // maximum black level, use the full uint16 range for every CFA colour.
+    let max_black = black.into_iter().fold(0.0_f32, f32::max);
+    if white.iter().any(|&level| level <= max_black) {
+        [u16::MAX as f32; 4]
+    } else {
+        white
+    }
+}
+
 pub fn normalize_cfa(
     data: &[u16],
     width: usize,
@@ -95,11 +106,12 @@ pub fn normalize_cfa(
     if data.len() < out.len() {
         return out; // malformed: short plane ⇒ all-black rather than a panic
     }
+    let white = effective_white_levels(black, white);
     for row in 0..height {
         for col in 0..width {
             let color = cfa[row % 2][col % 2];
             let b = black[color];
-            // Guard a degenerate level pair so we never divide by ~0.
+            // Keep a final per-colour guard for malformed/non-finite metadata.
             let range = (white[color] - b).max(1.0);
             let v = (data[row * width + col] as f32 - b) / range;
             out[row * width + col] = v.max(0.0);
@@ -124,6 +136,7 @@ pub fn normalize_xtrans(
     if data.len() < out.len() {
         return out; // malformed: short plane ⇒ all-black rather than a panic
     }
+    let white = effective_white_levels(black, white);
     for row in 0..height {
         for col in 0..width {
             let color = xtrans[row % 6][col % 6] as usize;
@@ -1489,7 +1502,7 @@ mod tests {
         // 2x2 RGGB: R=0, G=1, B=2. blacks: R=10,G=20,B=30; whites all 1010 etc.
         let cfa = [[0usize, 1], [1, 2]];
         let black = [10.0, 20.0, 30.0, 0.0];
-        let white = [1010.0, 1020.0, 1030.0, 1.0]; // range 1000 for each
+        let white = [1010.0, 1020.0, 1030.0, 1000.0]; // all valid levels; RGB ranges are 1000
         // data row-major: (0,0)=R=510, (0,1)=G=520, (1,0)=G=270, (1,1)=B=530
         let data = [510u16, 520, 270, 530];
         let out = normalize_cfa(&data, 2, 2, cfa, black, white);
@@ -1515,16 +1528,41 @@ mod tests {
     }
 
     #[test]
-    fn normalize_clamps_and_guards_degenerate_range() {
+    fn normalize_clamps_and_falls_back_for_white_equal_to_max_black() {
         let cfa = [[0usize, 0], [0, 0]];
         let black = [100.0; 4];
-        let white = [100.0; 4]; // degenerate: range guarded to 1.0
+        let white = [100.0; 4];
         let data = [50u16, 100, 150, 99];
         let out = normalize_cfa(&data, 2, 2, cfa, black, white);
-        assert_eq!(out[0], 0.0); // (50-100)/1 → -50 → clamp 0
-        assert_eq!(out[1], 0.0); // (100-100)/1 → 0
-        assert_eq!(out[2], 50.0); // (150-100)/1 → carried over-range (m4-119)
-        assert_eq!(out[3], 0.0); // (99-100)/1 → clamp 0
+        assert_eq!(out[0], 0.0); // below black still clamps
+        assert!((out[1] - 0.0).abs() < 1e-6);
+        assert!((out[2] - 50.0 / (u16::MAX as f32 - 100.0)).abs() < 1e-6);
+        assert_eq!(out[3], 0.0);
+    }
+
+    #[test]
+    fn normalize_white_below_another_colour_black_falls_back_to_full_range() {
+        let cfa = [[0usize, 1], [2, 3]];
+        let black = [10.0, 20.0, 300.0, 40.0];
+        let out = normalize_cfa(
+            &[1010, 1020, 1300, 1040],
+            2,
+            2,
+            cfa,
+            black,
+            [299.0; 4],
+        );
+        assert!((out[0] - 1000.0 / (u16::MAX as f32 - 10.0)).abs() < 1e-6);
+        assert!((out[2] - 1000.0 / (u16::MAX as f32 - 300.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_xtrans_white_at_black_uses_full_range() {
+        let xt = [[0u8; 6]; 6];
+        let out = normalize_xtrans(&[100], 1, 1, &xt, [100.0; 4], [100.0; 4]);
+        assert_eq!(out, vec![0.0]);
+        let out = normalize_xtrans(&[200], 1, 1, &xt, [100.0; 4], [100.0; 4]);
+        assert!((out[0] - 100.0 / (u16::MAX as f32 - 100.0)).abs() < 1e-6);
     }
 
     #[test]
@@ -1871,6 +1909,31 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, DNG_W * DNG_H, "every photosite was checked");
+    }
+
+    #[test]
+    fn invalid_load_with_white_matches_uint16_fallback() {
+        let p = synthetic_dng_path("invalid-white-fallback");
+        write_synthetic_dng(&p);
+        let invalid = load_with(
+            &p,
+            Some(crate::RawPrepareOpts {
+                black: [512.0, 100.0, 200.0, 300.0],
+                white: 100.0,
+            }),
+        )
+        .expect("invalid white override must still decode safely");
+        let fallback = load_with(
+            &p,
+            Some(crate::RawPrepareOpts {
+                black: [512.0, 100.0, 200.0, 300.0],
+                white: u16::MAX as f32,
+            }),
+        )
+        .expect("explicit full-range override must decode");
+        let _ = std::fs::remove_file(&p);
+
+        assert_eq!(invalid.mosaic, fallback.mosaic);
     }
 
     #[test]
@@ -2650,7 +2713,7 @@ mod tests {
         // 6×6 X-Trans, per-colour black/white. A handful of photosites of each
         // colour must pick the right colour's levels via xtrans[row%6][col%6].
         let black = [10.0, 20.0, 30.0, 0.0];
-        let white = [1010.0, 1020.0, 1030.0, 1.0]; // range 1000 each
+        let white = [1010.0, 1020.0, 1030.0, 1000.0]; // RGB ranges are 1000; E unused
         let data = vec![520u16; 36];
         let out = normalize_xtrans(&data, 6, 6, &XTRANS, black, white);
         // (0,0)=G → (520-20)/1000 = 0.5; (0,2)=R → (520-10)/1000 = 0.51;

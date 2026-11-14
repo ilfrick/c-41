@@ -1,473 +1,120 @@
-# Darkroom – Implementation Roadmap
+# C-41 — Roadmap unica
 
-**Goal**: deliver complete, evidence-based feature parity with a pinned upstream
-darktable baseline, except cloud sync and a mobile app (explicitly out of scope),
-while retaining C-41's Rust/GTK4 architecture. In parallel, provide a safe,
-documented, model-agnostic interface for AI agents to inspect, preview, and make
-reversible edits without screen-scraping or driving GTK. The parity inventory and
-upstream baseline are maintained in `PARITY_SPRINT_PLAN.md`; agent deliverables
-are in Phase 9.
+> **Documento canonico del piano.** Qui convergono roadmap di prodotto, parità con darktable, migrazione Rust/GTK4 e integrazione degli agenti AI. `PARITY_SPRINT_PLAN.md` è sostituito da questo documento; `RUST_MIGRATION_PLAN.md` resta solo un registro tecnico/storico. `PROGRESS.md` è il diario delle consegne e verifiche, mentre `PARITY_AUDIT.md` conserva il registro dettagliato delle lacune e deviazioni osservate.
+>
+> **Obiettivo:** mantenere C-41 funzionante durante la riscrittura incrementale Rust/GTK4 e raggiungere la parità verificabile con una versione upstream fissata di darktable. Le sole esclusioni di prodotto approvate sono cloud sync e app mobile. In parallelo, offrire agli agenti AI locali un’interfaccia sicura e reversibile sullo stesso motore usato dalla UI.
 
----
+## 1. Regole di scope e architettura
 
-## Upstream Current State (Darktable v5.x baseline — not the C-41 GTK4 application)
+- Non unire darktable upstream in blocco. Per ogni delta decidere se adattare in Rust, applicare una correzione C/FFI solo quando il call path è provato, usare il comportamento come riferimento oppure escluderlo motivandolo.
+- GTK3 e OpenCL upstream sono riferimenti, non codice da importare automaticamente: la UI di prodotto resta GTK4/Rust; il GPU backend C-41 è lavoro esplicito.
+- La parità copre moduli e utility, import/export, formati e RAW, UI/workflow, parametri/default/storia/persistenza, colore/proofing, maschere, istanze multiple, Lua e GPU. Nessuna eccezione ulteriore senza decisione esplicita del proprietario.
+- Preservare `/config/darkroom`, la tabella SQLite `darkroom_ui_prefs` e le variabili `DARKROOM_*`. Ogni migrazione futura di percorso o schema deve migrare i dati esistenti.
+- Preview, export, undo/redo, persistenza e comportamento numerico vanno verificati insieme. Le differenze numeriche ammesse richiedono riferimento C e tolleranza esplicita.
 
-Darktable already covers the core RAW-editing workflow at a level that rivals or
-exceeds Lightroom in several areas:
+## 2. Stato sintetico e baseline
 
-| Category | Darktable today |
+- **Baseline darktable:** `97912518a5a9a9786aeee3c38116fbc999412ff8` (2026-11-13); merge-base `2939f5949aa17405f247859bb4fc272fda3b45c0`. Il confronto iniziale conta 2.379 commit upstream-only e 789 C-41-only: conteggi puntuali, non una proposta di merge.
+- La ricognizione dei commit è stata **selettiva**, non esaustiva. Sono già emersi `contrastntexture`, `satcurvergb`, `spektrafilm`, DNG OpcodeList3 GainMap, modifiche RAW/white balance, highlights, precisione, HDR, maschere e cambiamenti GTK3/OpenCL.
+- **Consegne di parità registrate S1–S8:** framing, chromatic aberrations, watermark, color calibration, prime slice di liquify e retouch, fondazione ICC e Rec.2020 per non-RAW. Non equivalgono a parità completa: le lacune residue sono elencate sotto.
+- **Prossimo incremento formale: S9**, inventario upstream completo e prima ondata di import/porting. Un primo tentativo di Contrast & Texture è stato abbandonato prima del commit: il limite arbitrario di 4 milioni di pixel saltava silenziosamente l’effetto sulle immagini più grandi; rimuoverlo senza una strategia memoria/tiling coerente con il riferimento non è sicuro.
+- Il deploy registrato in questa sessione è `c-41:053395cf39`; il container precedente è conservato come rollback. Le modifiche di codice non verificate o non committate non sono parte delle release.
+
+## 3. Filone A — Fondazioni e migrazione Rust/GTK4
+
+Strategia: sostituire sottosistemi un passo alla volta dietro confini FFI stabili, mantenendo il prodotto eseguibile.
+
+| Area | Stato / prossimo lavoro |
 |---|---|
-| RAW demosaicing & processing | ✅ Full (RawSpeed + LibRaw, 106 IOP modules) |
-| Non-destructive parametric editing | ✅ Superior (fully modular pipeline) |
-| Filmic / AGX / sigmoid tone mapping | ✅ Best-in-class |
-| AI object masking (SAM2.1 / SegNext) | ✅ Exceeds Lightroom |
-| AI denoise / super-resolution | ✅ (BSRGAN, NAFNet, NIND) |
-| OpenCL GPU acceleration | ✅ NVIDIA / AMD / Intel |
-| Tethering via libgphoto2 | ✅ |
-| Lua 5.4 scripting | ✅ |
-| Formats: AVIF, JXL, HEIC, EXR, DNG … | ✅ |
+| Infrastruttura | Fork e mirror GitHub/Gitea, build Docker/KasmVNC e packaging di base esistono. Restano branding completo e icona, matrice CI Linux/macOS/Windows e pubblicazione GHCR da valutare/completare. Il pass-through GPU del container non accelera ancora `c41-rs`. |
+| Pipeline immagini | Fase al confine Rust/FFI: i kernel portati continuano a crescere per incrementi; la copertura dei moduli C non è sinonimo di funzionalità UI o parità di prodotto. |
+| Database | `c41-db` fornisce CRUD per immagini, collezioni, tag, metadati e storia. Le nuove funzioni richiedono migrazioni compatibili e test di restart. |
+| UI GTK4 | Lighttable, darkroom, pannelli, storia, import/export e funzioni correlate sono in sviluppo incrementale. Ogni controllo deve essere realmente collegato a pipeline, storia e persistenza. |
+| Tecnica legacy C/FFI | Conservare solo dove necessario o conveniente; compilare le modifiche C con la build completa Release `-Werror`. Il binario Rust cargo-only deve restare senza dipendenze CMake non richieste. |
 
-**Product gaps** (distinct from upstream-darktable parity):
+`RUST_MIGRATION_PLAN.md` contiene la ricognizione tecnica storica di kernel, loop e crate; le sue vecchie decisioni di scope sono superate da questo documento.
 
-1. Face detection, recognition, and People view
-2. Smart Previews for offline editing without originals
-3. Virtual Copies with independent histories
-4. AI auto-tagging and batch AI processing
-5. Multi-image print layout templates
-6. Complete darktable feature parity, tracked against a pinned upstream baseline
-7. Safe AI-agent editing through the shared API and local MCP tools (Phase 9)
+## 4. Filone B — Funzioni di prodotto pianificate
 
-Cloud sync and a mobile app are explicitly excluded from this roadmap.
+Queste voci vengono mantenute dalla roadmap precedente, ma non sono dichiarate completate né ordinate prima del lavoro di parità: priorità e dipendenze si aggiornano attraverso gli sprint qui sotto.
 
----
-
-## Milestones
-
-### Phase 0 – Infrastructure (weeks 1–4)
-
-Prerequisite work; no user-visible features.
-
-- [x] **0.1** Fork darktable-org/darktable → ilfrick/c-41 on GitHub
-- [x] **0.2** Mirror to self-hosted Gitea (www.housefz.com/git/ilfrick/c-41)
-- [x] **0.3** Docker multi-stage build with KasmVNC (browser GUI) + optional GPU device passthrough (the launched C-41 GTK4 app remains CPU-only)
-- [ ] **0.4** Finish C-41 branding in remaining user-facing strings and the app
-       icon. Preserve existing `/config/darkroom` data/config paths and
-       `DARKROOM_*` environment compatibility; any future path migration must
-       explicitly migrate existing catalogue/settings rather than strand them.
-- [ ] **0.5** CI pipeline: GitHub Actions build matrix (Linux/macOS/Windows) +
-       Docker image publish to GHCR
-- [ ] **0.6** Branding: new app icon, splash screen, window title
-
----
-
-### Phase 1 – Smart Previews (weeks 5–10)
-
-**Why first**: enables offline editing without originals and is self-contained.
-
-**Lightroom feature**: JPEG proxies embedded in the catalog that allow full editing
-without the original RAW file present (useful for travel, laptop editing).
-
-**Implementation**:
-- Add `smart_preview` table to `library.db` (imgid, embedded JPEG or EXR, mipmap
-  level, generation timestamp).
-- New IOP: `smart_preview_source` — transparently substitutes original with proxy
-  when original path is unavailable.
-- `darkroom-cli` export mode: `--generate-smart-previews [--size 2560]` builds
-  proxies for an entire collection.
-- UI indicator in lighttable thumbnails: lock icon when working off proxy.
-- Sync logic: if original becomes available, discard proxy and re-apply the same
-  edit history without re-editing.
-
-**Files to create/modify**:
-- `src/common/smart_previews.{h,c}` – proxy management API
-- `src/iop/smart_preview_source.c` – proxy IOP
-- `src/common/collection.c` – add offline filter
-- `src/gui/preferences.c` – proxy quality / size settings
-- `data/ui/smart_preview_prefs.ui`
-
----
-
-### Phase 2 – Virtual Copies (weeks 8–14)
-
-**Why**: directly requested by Lightroom power users; relatively self-contained
-change to the database schema.
-
-**Lightroom feature**: multiple independent edit histories per physical file,
-each showing as a separate thumbnail.
-
-**Implementation**:
-- Current darktable "duplicates" share the same `images` row with a `group_id`.
-  True virtual copies need an independent `history` stack per copy.
-- Schema change: add `virtual_copy_of` column to `images`; copies share `film_id`
-  and `filename` but have independent `history` and `masks_history`.
-- Context menu: "Create Virtual Copy", "Promote to Master".
-- Lighttable: stack badge shows copy count; expanding a stack shows all copies.
-- Export: optional "export all copies" mode.
-
-**Files**:
-- `src/common/image.c` / `image.h` – add virtual copy fields
-- `src/common/history.c` – copy isolation
-- `src/gui/lib/filmstrip.c` – stack UI
-- Database migration script: `src/common/database.c` (schema version bump)
-
----
-
-### Phase 3 – Face Detection & People View (weeks 12–22)
-
-**Why**: the highest-profile missing feature vs Lightroom.
-
-**Implementation**:
-
-#### 3a – Face Detection (weeks 12–16)
-- Integrate **InsightFace** (ONNX model, fits the existing AI ONNX backend in
-  `src/ai/`), or alternatively **YOLOv8-face** for lighter weight.
-- New AI task type `FACE_DETECT` alongside existing segmentation/denoise tasks.
-- Detection runs as background job on import; results stored in `faces` table:
-  `(id, imgid, rect_x, rect_y, rect_w, rect_h, embedding BLOB, person_id)`.
-- Drawn face-mask overlay in darkroom: detected faces show as bounding boxes,
-  clickable to apply a parametric or drawn mask scoped to the face region.
-
-#### 3b – Face Recognition & People View (weeks 17–22)
-- Cluster face embeddings (cosine similarity, DBSCAN) → `persons` table.
-- Lighttable "People" view: grid of person clusters, similar to LR's People view.
-- UI: drag a face crop onto a person to confirm; click "Unknown" to name a new
-  person.
-- Keyword integration: confirmed person → auto-tag image with person's name.
-- Privacy: all embeddings stored locally; no cloud upload ever.
-
-**New files**:
-- `src/common/faces.{h,c}` – detection, storage, clustering
-- `src/ai/face_detect.{h,c}` – ONNX inference wrapper
-- `src/views/people.{h,c}` – new lighttable view
-- `src/libs/people_panel.{h,c}` – panel widget
-
----
-
-### Phase 4 – AI Auto-Tagging (weeks 18–24)
-
-**Lightroom feature**: AI-suggested keywords based on image content (places, objects,
-people).
-
-**Implementation**:
-- Integrate **CLIP** (ViT-B/32 ONNX) or **MobileNet-v3** for image classification.
-- New AI task `AUTO_TAG`: runs post-import, produces ranked keyword suggestions
-  stored in `suggested_tags(imgid, tag, confidence)`.
-- Lighttable: "AI Suggestions" panel shows top-5 tags with checkboxes; accept to
-  write to `tags` table.
-- Batch: `darkroom-cli --auto-tag [collection]`
-- Optional: CLIP-powered semantic image search ("find images with mountains at
-  sunset") via a search bar in the collection module.
-
----
-
-### Phase 5 – Batch AI Processing (weeks 20–26)
-
-**Why**: Lightroom users expect to apply denoise/upscale to hundreds of images at
-once; the existing AI backend is single-image only.
-
-**Implementation**:
-- New `ai_queue` table: `(id, imgid, task_type, params JSON, status, priority)`.
-- `src/common/ai_queue.{h,c}`: enqueue/dequeue, worker thread pool (configurable
-  N workers), progress reporting via existing progress-bar API.
-- Lighttable context menu: "Send to AI Queue → [Denoise / 2× Upscale / 4× Upscale
-  / Auto-tag]".
-- Processing priority: active darkroom image always pre-empts queue jobs.
-- Export integration: "Apply AI enhancement on export" option (on-the-fly, no queue).
-
----
-
-### Phase 6 – Print Layout Templates
-
-
-**Why**: the existing print view in darktable supports single-image output; Lightroom
-has multi-image grid layouts with fine typography.
-
-**Implementation**:
-- Extend `src/views/print.c` with a layout engine: JSON template format describing
-  cell grids, margins, text fields.
-- Bundled templates: contact sheet, 4×6 grid, triptych, photo book page.
-- Template editor: drag-and-drop cells, resize, snap to grid.
-- Variables in text fields: `{title}`, `{date}`, `{camera}`, `{lens}`.
-
----
-
-### Phase 9 – Agent-native photo editing (priority track; shares the parity engine)
-
-**Goal**: let an external AI agent use C-41 as a photo-editing tool through a
-stable, model-agnostic interface. The agent should discover supported controls,
-propose edits, inspect a preview, and—when authorized—save a reversible edit or
-export a derivative. It must not automate GTK or infer undocumented binary
-parameter blobs.
-
-**Product decision**: start with a local **MCP server over stdio** for
-compatibility with MCP-capable agent hosts. Keep the protocol adapter thin over a
-versioned C-41 Rust editing API; the API, not MCP, is the stable product
-contract. No network listener, shell/eval tool, cloud account, or arbitrary
-filesystem access in v1. A non-MCP host can later use the same API through a
-small CLI/JSON-RPC adapter.
-
-**Phases and deliverables**:
-
-1. **9a — Headless editing contract.** First map ownership of preview,
-   history, export, and catalogue writes. Extract a GTK-independent image-session
-   service from the current `c41-ui` flows (candidate `c41-engine`/`c41-session`
-   crate; name TBD) and have both UI and agent call it—do not duplicate rendering
-   or introduce a second independent edit writer. Separate image-session
-   operations (open a catalogue image, load its current edit, render a bounded
-   preview, inspect capabilities) from GTK widget callbacks; define versioned
-   contracts for patch validation, history, undo, and export before implementing
-   them in later slices. Publish a versioned capability/parameter schema derived
-   only from controls actually wired in C-41. Use stable module/parameter names,
-   typed values, limits, defaults, and clear unsupported-operation errors; never
-   expose raw `PreviewParams` bytes as the API.
-2. **9b — Read-only MCP MVP.** Implement tools to list/search catalogue images,
-   inspect metadata and current edit, enumerate supported modules/parameters,
-   and render a small before/current preview. Tools return bounded structured
-   results with image IDs and provenance; large image data is not returned
-   inline. Verify interoperability with at least one MCP client.
-3. **9c — Reversible edit loop.** Add `plan_edit` / `preview_edit` /
-   `commit_edit` operations for a validated parameter patch. Return a concise
-   diff and preview before persistence. Commit atomically as one named history
-   step, preserve undo/redo, and report exactly which requested changes were
-   accepted, clamped, or refused. Start with a deliberately small allowlist of
-   well-tested live modules; expand only when preview/export/history parity is
-   covered by tests.
-4. **9d — Safe derivative export.** Require an output directory explicitly
-   configured by the user in C-41; do not accept an agent-supplied root. Resolve
-   the configured root and use race-resistant descriptor-relative creation
-   (no-follow + create-exclusive semantics) so path traversal, symlink escapes,
-   and replacement of an existing destination are refused. Also reject
-   unsupported formats and resource-limit violations. Never modify or delete
-   the source photo. Require
-   explicit user approval for persistent edits and exports by default; provide a
-   narrowly scoped opt-in policy for unattended local workflows.
-5. **9e — Human-in-the-loop and quality gate.** Show agent-authored changes in
-   the C-41 UI with source/agent attribution, editable history labels, preview,
-   undo, and an obvious approval/rejection path. Add end-to-end tests for
-   tool-schema compatibility, restart persistence, undo, path confinement,
-   denied permissions, and representative edit tasks; document setup and a
-   sample agent workflow.
-
-**Security and trust invariants**: read-only is the initial/default mode; each
-write/export is an explicit capability, not implied by opening a catalogue.
-Target images by catalogue ID from user-configured roots, validate every patch
-against the published schema and current image state, cap preview dimensions and
-job resources, and log the agent identity plus accepted edit. Use an optimistic
-edit revision token shared by every writer (GTK and agent); check the token and
-persist the edit atomically in one transaction. If the UI or another client
-changes the image after the agent preview, reject the stale commit and require
-re-planning rather than clobbering either edit; the UI must refresh/reopen
-external commits safely. No
-arbitrary code, shell commands, raw-file overwrite, delete, unbounded path, or
-silent persistence. Human approval cannot depend on an MCP host feature that may
-not exist: the C-41 approval policy must work locally and fail closed when
-required.
-
-**Exit criteria**: a supported MCP host can discover C-41 capabilities, find an
-image, inspect its current edit, request a bounded preview, propose a valid
-multi-parameter edit, obtain a before/after preview, and commit it only with
-permission; the saved history survives restart, can be undone in the ordinary
-UI, and an optional derivative export is confined to the configured destination.
-A human can inspect and correct the agent's result using the regular editor.
-
----
-
-### Active track – Complete upstream darktable parity (ongoing priority track)
-
-**Goal.** Match every upstream darktable user-visible editing, catalog, import,
-export, color-management, and automation capability in the pinned baseline,
-excluding only cloud sync and a mobile app. This supersedes the earlier fixed
-52-row target: upstream grows, so each baseline refresh must regenerate the
-module, format, and workflow inventory. Do not call a feature complete because a
-catalogue row exists; require behavior, persistence, preview/export consistency,
-accessibility, and reference tests.
-
-**Execution.** `PARITY_SPRINT_PLAN.md` owns the gap matrix and order. First keep
-porting the currently identified gaps (proofing/display, multi-instance modules,
-masks, G6 decisions); then add every upstream module and non-module workflow
-missing from the refreshed inventory, including Lua scripting, GPU execution,
-additional RAW sensors/formats, complete geometry/retouch/liquify, metadata and
-history semantics. Reconcile C-41's existing 52 wired rows against current
-upstream names, versioned parameters, defaults, enable rules, stage order, and
-export behavior. Numerical parity is tested against the pinned C reference with
-explicit tolerances; any unavoidable deviation is recorded and approved, not
-silently excluded.
-
-**Upstream import policy.** Never merge upstream wholesale into the Rust rewrite.
-For each upstream change, classify it as: (1) transplantable shared C/FFI fix,
-(2) Rust port/adaptation required, (3) useful behavioral/UI reference, or
-(4) irrelevant/rejected with a reason. Record source SHA(s), affected C-41
-subsystem, tests, dependencies, and disposition. Prioritize security and
-correctness fixes in code C-41 calls through FFI, algorithm/default changes,
-new supported modules/formats, and fixes that alter reference renders. GTK3-only
-UI, unrelated architecture migrations, and OpenCL kernels are not cherry-picked;
-they are references for C-41's GTK4/Rust/GPU work. Keep a reviewed upstream
-baseline SHA and repeat this audit regularly.
-
-### Comparative UX audit (historical snapshot): darktable 5.4.0 vs C-41 (2026-11-11)
-
-This dated UI comparison predates the current pinned upstream baseline and is
-not the complete parity inventory. Refresh it against the baseline and capability
-ledger in `PARITY_SPRINT_PLAN.md` as part of the ongoing parity work.
-
-**Scope and method.** Compared the running C-41 UI and darktable 5.4.0 at a
-1440×900 desktop viewport; also captured C-41 at 900×600 to include a constrained
-window. Cross-checked the visible editing/navigation model against the GTK4 UI
-(`crates/c41-ui/src/darkroom/mod.rs`, `catalog.rs`, `bauhaus.rs`) and darktable's
-module-group implementation (`src/libs/modulegroups.c`). The darktable capture
-used an isolated temporary config/library and a synthetic image. This is a
-source-backed product audit, not a moderated usability study; lower-resolution
-and realistic-catalog interaction checks remain part of the follow-up.
-
-**What already translates well.** C-41 retains the lighttable → darkroom workflow,
-three-area darkroom with history, image preview, and scrollable module controls,
-module categories, case-insensitive name search, expandable modules, and
-keyboard/scroll/drag slider interaction. The module panel also has Reset,
-history navigation, and a wired-module filter. These are meaningful parity
-strengths; do not replace them with a redesigned navigation model merely to
-look different.
-
-**Prioritized findings and actions** (P0 = correctness/discoverability, P1 =
-workflow efficiency, P2 = remaining feature parity, P3 = validation):
-
-1. **P0 — “Active” confused implementation with edit state.** At audit time,
-   C-41's `ModuleFilter::Active` delegated to `is_live_module`, and the catalogue
-   counter said “N of M active”; darktable's Active Pipeline scope is based on
-   enabled modules or the current history, not port status. The misleading
-   filter and counter are corrected here to **Wired** / “N of M wired”, with a
-   tooltip spelling out that this means implemented. A true **Enabled/Used in
-   this edit** scope remains future work: derive it from the same module state as
-   the controls and test flag-only, default-on, raw-only, and elsewhere-driven
-   cases before exposing it, so it cannot promise a false pipeline view.
-2. **P1 — Quick Access.** Darktable offers a user-configurable Basic
-   Controls/Quick Access surface alongside its complete module groups; it is not
-   a fixed curated preset. C-41's first slice now adds a **Basics** scope over
-   nine common modules (exposure, tone, white balance, and color), reusing their
-   existing rows and `PreviewCtx` state rather than duplicating controls or edit
-   state. The full module list remains available. This is a curated C-41 default,
-   not yet user-customizable; gather task-test feedback before adding preference
-   UI or claiming full parity.
-3. **P1 — Search aliases and instance names.** C-41 now searches the displayed
-   label plus selected English aliases from darktable's module metadata, using
-   case-insensitive matching and tests for alias scope. Remaining parity: import
-   the full localized alias set when C-41 has a localization source, and include
-   per-instance names if/when the UI supports multiple instances; neither should
-   be conflated with stable module identity.
-4. **P2 — Catalogue visibility exceeds editing parity.** Retouch now has a live,
-   non-destructive single clone stamp with source/destination placement, radius,
-   opacity, and a smooth radial feather control. Multi-stroke painting, heal,
-   masks, and wavelet preview remain open parity work; do not imply full
-   darktable editor parity before that work is complete. Liquify is also live,
-   but remains a fixed 5×5 panel lattice rather than darktable's freehand canvas
-   editor. Its canvas, interpolation modes, and direct-on-image interaction are
-   recorded as open items in the parity backlog.
-5. **P3 — Confirm density and discoverability at real window sizes.** At both
-   1440×900 and 900×600, run scripted first-edit tasks (find Exposure, locate
-   enabled edits, reset one module, recover from an empty search, and move between
-   history and controls). Record completion time, misclicks, clipped controls,
-   and keyboard-only blockers. Use the results to tune filter-bar wrapping,
-   panel widths, and help text; do not make a layout change based on screenshot
-   resemblance alone.
-
-**Execution order.** The P0 terminology correction and first P1 Quick Access /
-alias-search slice are implemented; do not add an Enabled/Used filter until its
-state model is reliable. Continue Retouch/Liquify work through the existing
-parity sprint plan (P2). Run the P3 task-based comparison on the resulting UI and
-update this audit with results; revisit the current design only where an observed
-task fails. This UI track is complementary to Phase 9's GTK-independent agent API
-and must share its single edit-session state rather than introduce another writer.
-
----
-
-## Docker Deployment
-
-### Files added in this repository
-
-```
-docker/
-├── Dockerfile               # Multi-stage: builder (Ubuntu 24.04) + runtime (KasmVNC)
-├── docker-compose.yml       # Profiles: default (CPU), nvidia, amd, intel (device passthrough; c41-rs remains CPU-only)
-└── kasmvnc-autostart.sh     # Launches Darkroom inside the VNC desktop
-```
-
-### GPU access
-
-| GPU vendor | How to enable |
+| Fase | Risultato richiesto |
 |---|---|
-| NVIDIA | `docker compose -f docker/docker-compose.yml --profile nvidia up darkroom-nvidia` (requires nvidia-container-toolkit) |
-| AMD | `docker compose -f docker/docker-compose.yml --profile amd up darkroom-amd` (requires ROCm driver on host) |
-| Intel Arc / iGPU | `docker compose -f docker/docker-compose.yml --profile intel up darkroom-intel` (requires intel-opencl-icd on host) |
+| **P0 — Infrastruttura/branding** | Fork/mirror e Docker multi-stage con KasmVNC esistono; completare stringhe/nome/icona/splash/titolo, matrice CI Linux/macOS/Windows e publish GHCR. Mantenere opzionale il device passthrough e non dichiararlo accelerazione GPU dell’app Rust. Conservare percorsi e compatibilità dati. |
+| **P1 — Smart Previews** | Tabella `smart_preview` nel catalogo (imgid, proxy JPEG/EXR, mipmap, timestamp); generazione collection-wide da CLI; sostituzione trasparente dell’originale offline; indicatore nelle miniature e preferenze qualità/dimensione. Quando l’originale torna disponibile, rimuovere il proxy e riapplicare la stessa storia. |
+| **P2 — Copie virtuali** | Colonna `virtual_copy_of`/migrazione DB; copie condividono originale e film ma hanno `history` e `masks_history` indipendenti. Aggiungere “Create Virtual Copy”/“Promote to Master”, badge/stack in lighttable ed export singolo o di tutte le copie. |
+| **P3 — Volti e People view** | Valutare InsightFace o YOLO-face su ONNX; job d’import; tabella faces (rettangolo, embedding, person_id); clustering cosine/DBSCAN e tabella persons; vista Persone, assegnazione/creazione persone, tag automatico solo dopo conferma. Tutti i dati restano locali. |
+| **P4 — AI auto-tagging** | Valutare CLIP ViT-B/32 o MobileNet; task post-import; `suggested_tags(imgid, tag, confidence)`; pannello con suggerimenti selezionabili e CLI batch. Ricerca semantica è un’estensione da valutare, non prerequisito per i tag. |
+| **P5 — Coda AI batch** | Tabella `ai_queue` con task/params/stato/priorità; pool di worker configurabile, progress reporting e precedenza al darkroom attivo; azioni lighttable per denoise/upscale/tag ed eventuale enhancement on-export. |
+| **P6 — Template stampa** | Motore JSON per griglie, margini e campi; template contact sheet, 4×6, trittico e pagina fotolibro; editor drag/resize/snap; variabili titolo, data, camera e obiettivo. |
 
-These profiles pass GPU devices into the opt-in full-C image. The launched
-`c41-rs` GTK4 application is currently CPU-only; the OpenCL kernels in the C
-code are not used by that application. GPU acceleration is therefore not yet
-available in the C-41 product, despite the legacy C build being included in
-that image.
+Le stime settimanali nella vecchia roadmap sono indicative e non sono un impegno temporale. Non esiste una stima credibile della fine della parità prima dell’inventario completo.
 
-### Quick start
+## 5. Filone C — Parità completa con darktable
 
-```bash
-# Build
-docker build -t darkroom -f docker/Dockerfile .
+### 5.1 Definizione di completamento
 
-# Run with NVIDIA device passthrough (does not accelerate the C-41 GTK4 app yet)
-docker run --gpus all \
-  -e PUID=$(id -u) -e PGID=$(id -g) \
-  -p 3000:3000 \
-  -v ~/Pictures:/photos \
-  -v ~/.config/darkroom-docker:/config \
-  darkroom
+Parità significa coprire tutte le capacità utente e di elaborazione del baseline fissato. Il programma è **a baseline mobile**: ogni refresh crea un nuovo SHA, rigenera l’inventario, classifica ogni delta e pianifica le nuove differenze. Non basta avere una riga di catalogo o un kernel: servono UI utilizzabile, comportamento, persistenza, coerenza preview/export e test di riferimento.
 
-# Open browser at http://localhost:3000
-```
+### 5.2 Backlog per aree
 
----
+- **C1 — Moduli visibili e interazione:** le righe storicamente inerti sono state collegate a slice di Framing, CACorrectRGB, Watermark, Color Calibration, Liquify e Retouch. Restano aperti, tra gli altri, controlli/asset completi di Watermark, canvas e interpolazioni di Liquify, multi-stroke/heal/masks/wavelets di Retouch e moduli nuovi del baseline.
+- **C2 — Colore:** input/output profile e percorso non-RAW Rec.2020 sono parzialmente implementati. Restano soft proof, gamut-check, selezione/trasformazione display profile, adattamento alla presentazione finale sRGB e coerenza di thumbnail, full preview, stampa ed export.
+- **C3 — Istanze e maschere:** stack di istanze indipendenti con parametri, blending, storia, identità UI, preset, serializzazione e ordine pipeline; poi tutte le famiglie/operazioni di maschera e le loro interazioni/persistenza.
+- **C4 — Lua:** inventariare e implementare l’API Lua supportata dal baseline, lifecycle, eventi, storage/UI extension, test di compatibilità e sandbox.
+- **C5 — GPU:** backend GPU effettivo (OpenCL o equivalente), scelta runtime, fallback CPU, tiling/memoria e test differenziali CPU↔GPU. Il solo accesso ai device non conta.
+- **C6 — RAW, formati, risorse e workflow:** HEIC/HEIF/AVIF, X3F, GainMap DNG, forward matrices, demosaic/highlights, white balance, default/auto-enable, profili, preset, stili, `darktablerc`, metadati/XMP, storia e re-decode su undo/redo/jump, selezione, layout, unità, localizzazione, export/stampa e scorciatoie.
+- **C7 — Registro deviazioni:** confrontare e risolvere ogni comportamento divergente annotato in `PARITY_AUDIT.md`; le deviazioni non possono diventare esclusioni implicite.
 
-## Effort Estimates
+### 5.3 Sequenza sprint
 
-| Phase | Feature | Complexity | Weeks |
-|---|---|---|---|
-| 0 | Infrastructure, branding, CI | Low | 1–4 |
-| 1 | Smart Previews | Medium | 5–10 |
-| 2 | Virtual Copies | Medium | 8–14 |
-| 3 | Face Detection + People View | High | 12–22 |
-| 4 | AI Auto-Tagging | Medium | 18–24 |
-| 5 | Batch AI Queue | Medium | 20–26 |
-| 6 | Print Layouts | Low | Estimate after parity inventory |
-| 7 | Complete upstream darktable parity | Very high; ongoing against a pinned upstream baseline | Iterative; workload is the full upstream gap inventory |
-| 9a–9e | Agent-native editing API + MCP tools | High; staged, gated by headless edit contract | Priority track; shares the parity engine and state model |
+| Sprint | Obiettivo e criterio di uscita |
+|---|---|
+| **S1–S4 — consegnati** | Framing, Chromatic Aberrations, Watermark e Color Calibration collegati ai rispettivi percorsi. Restano aperte slice di parità completa indicate in C1/C7. |
+| **S5–S7 — consegnati a slice** | Liquify con lattice UI; Retouch con singolo clone stamp e feather. La canvas libera e le funzioni avanzate restano aperte. |
+| **S8a–S8b — consegnati** | Fondazione ICC e processing/export Rec.2020 per fonti non-RAW idonee; preview visibile resta sRGB. Proof/display completo è ancora S10. |
+| **S9 — prossimo** | Inventario capability/delta completo per lo SHA fissato; classificare ogni commit/capacità (PORT, APPLY, REFERENCE o motivata non applicabilità), assegnare priorità e owner sprint, avviare solo port con riferimenti e test. |
+| **S10** | Colore/proofing completo (C2). |
+| **S11** | Architettura multi-istanza e migrazioni (C3). |
+| **S12** | Maschere complete, dipende da S11 (C3). |
+| **S13** | Nuovi moduli upstream: Contrast & Texture, RGB Saturation Curve, Spektrafilm e inventario aggiornato. Audit algoritmi, dati/licenze, reference e memoria prima di ciascun port. |
+| **S14** | RAW, formati, sensori e metadati (C6). |
+| **S15** | Compatibilità Lua e sandbox (C4). |
+| **S16** | GPU e confronto CPU/GPU (C5). |
+| **S17** | Workflow, UI, configurazione, preset e stampa (C6). |
+| **S18** | Chiudere il registro delle deviazioni (C7). |
+| **S19 — ricorrente** | Aggiornare SHA upstream e rigenerare inventario/delta. |
+| **S20 — gate di release** | Suite differenziale e UX, sicurezza agenti, CI completa, dual push e deploy; ripetere sul baseline successivo. |
 
-The previous 44-week estimate included cloud sync and a mobile app and is
-withdrawn. Full darktable parity has no credible fixed-duration estimate until
-the upstream inventory is complete; Phase 9 is separately tracked but shares
-engine and UI foundations with parity.
+### 5.4 Prima triage upstream (campione, non inventario completo)
 
----
+La prima analisi ha evidenziato: `1067c653c0`/`23d5544c8d` (Contrast & Texture); `92c0f79a83`/`7076cab103` (RGB Saturation Curve e fix); `d81ccfe23b` e follow-up Spektrafilm; `c7d98b58ea`, `dcb52f7ffe`, `26117d3114` (DNG GainMap); cambiamenti white-balance/manual calibration; `56b0ca0081` (fallback rawprepare quando white ≤ black; portato in `rawimage.rs` nel primo slice S9, con test Bayer/X-Trans/override); fix highlight; e semantica HDR/PQ/HLG. Ogni elemento deve essere confrontato con il call path e la versione C-41, non cherry-picked alla cieca. Il registro completo deve includere SHA, feature, decisione, motivazione, sprint e verifica.
 
-## Technology Dependencies to Add
+## 6. Filone D — Agent-native editing, Phase 9
 
-| Dependency | Purpose | Phase |
-|---|---|---|
-| InsightFace / YOLOv8-face (ONNX) | Face detection | 3 |
-| CLIP ViT-B/32 (ONNX) | Auto-tagging, semantic search | 4 |
-| KasmVNC | Browser-accessible desktop in Docker | Docker |
-| NVIDIA Container Toolkit | Optional device passthrough (no C-41 GPU compute yet) | Docker |
-| MCP Rust SDK / protocol adapter (evaluate API maturity and licensing first) | Local stdio tool server for AI-agent hosts | 9b |
+MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.
 
----
+1. **9a — Sessione headless condivisa:** isolare apertura immagine, edit corrente, rendering preview, capacità, validazione patch, storia, undo ed export dal codice GTK. UI e agenti devono chiamare lo stesso servizio; schema pubblico tipizzato, mai byte grezzi `PreviewParams`.
+2. **9b — MCP read-only:** ricerca catalogo, metadati, edit corrente, capacità e preview limitata; risultati strutturati e client interoperabile.
+3. **9c — Edit reversibile:** `plan_edit`, `preview_edit`, `commit_edit`, diff chiaro, allowlist testata, commit atomico come un passo di storia e undo/redo.
+4. **9d — Export derivato confinato:** root configurata in C-41, creazione race-resistant senza symlink/path escape o sovrascrittura, limiti risorse e mai scrittura sull’originale.
+5. **9e — Approvazione e audit:** attribuzione visibile, revisione umana, persistenza, rifiuto permessi, test end-to-end e guida d’uso.
 
-## Competitive Positioning
+**Invarianti:** sola lettura di default; permessi espliciti per scritture/export; targeting tramite ID catalogo; patch validate contro schema e revisione corrente; token ottimistico condiviso tra UI e agenti; commit stale rifiutato e ri-pianificato; limiti preview/job; fail-closed quando serve approvazione.
 
-| Feature | Lightroom CC | Darkroom (target) |
-|---|---|---|
-| Non-destructive RAW editing | ✅ | ✅ |
-| AI object masking | Basic | ✅ Superior (SAM2.1) |
-| AI denoise / upscale | ✅ (Denoise AI) | ✅ (NAFNet, BSRGAN) |
-| Face detection | ✅ | ✅ Phase 3 |
-| Smart Previews | ✅ | ✅ Phase 1 |
-| Virtual Copies | ✅ | ✅ Phase 2 |
-| GPU acceleration | Limited | Future target — not currently available in C-41; OpenCL (NVIDIA/AMD/Intel) |
-| Docker container | ❌ | ✅ Phase 0 |
-| Open source | ❌ | ✅ |
-| Cost | $9.99/month | Free |
-| Privacy | Adobe cloud | Self-hosted, local-first |
+**Uscita:** un client MCP supportato può scoprire immagini e controlli, ispezionare un edit, chiedere preview bounded, proporre una modifica, vedere prima/dopo, committare solo se autorizzato, ritrovare l’edit dopo restart e annullarlo dalla UI ordinaria; export opzionale confinato.
+
+## 7. Verifica, rilascio e tracciamento
+
+Per ogni incremento, senza scorciatoie:
+
+1. Delegare lo sviluppo pesante a un agente generalista con file/scope e mandato read-only sul resto.
+2. Far eseguire una review indipendente a un agente senior distinto dallo sviluppatore; correggere tutti i rilievi.
+3. Eseguire `scripts/ci-local.sh` in Docker e fidarsi dei codici di uscita: workspace check, Clippy, test workspace `--release`, link del binario Rust.
+4. Per C, aggiungere la build full-app Release `-Werror`; per l’immagine usare `CACHEBUST` o `--no-cache`.
+5. Eseguire `git diff --check`; aggiungere a `PROGRESS.md` una voce UTC con cambiamento, verifiche, errori e correzioni. Aggiornare `PARITY_AUDIT.md` nello stesso commit quando cambia il registro.
+6. Commit deliberato, push a GitHub e Gitea, verifica di entrambi i ref e dei check CI.
+7. Deploy al container `c-41` quando appropriato, smoke test e conservazione del rollback. Cambiare solo quel servizio senza autorizzazione.
+8. Nessun segreto in task, diff, log, progress o commit. `install-debuntu.sh` e `.sha256sum` restano untracked e intatti.
+
+**Fonti di stato:** questo documento è l’unica roadmap. `PROGRESS.md` registra le consegne, `PARITY_AUDIT.md` i dettagli delle lacune/deviazioni, `RUST_MIGRATION_PLAN.md` i dettagli tecnici storici. A ogni sessione riprendere da roadmap → coda di `PROGRESS.md` → sezioni pertinenti dell’audit.

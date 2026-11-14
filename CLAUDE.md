@@ -1,9 +1,10 @@
 # C-41 — working agreement for Claude Code
 
 This repo is **C-41**, an incremental rewrite of darktable (C/GTK3) into Rust + GTK4,
-behind a stable C FFI boundary. Status and roadmap live in
-`RUST_MIGRATION_PLAN.md` (Phase 0 infra ✅, Phase 1 pipeline at boundary,
-Phase 2 db ✅, Phase 3 GTK4 UI in progress). Rust crates are under `crates/`
+behind a stable C FFI boundary. The single canonical development roadmap is
+`ROADMAP.md`; `PROGRESS.md` records completed work and `PARITY_AUDIT.md` tracks
+observed gaps/deviations. `RUST_MIGRATION_PLAN.md` is a technical/historical
+reference, not a competing roadmap. Rust crates are under `crates/`
 (`c41-sys`, `c41-core`, `c41-db`, `c41-ui`, `c41`).
 
 ## Required per-change workflow (do every time — no shortcuts)
@@ -75,9 +76,9 @@ migration; until then, leave them.
 
 Work **continuously toward the current goal** — do not stop between increments.
 Only stop when: (a) the goal is fully reached, (b) you genuinely need the user's
-input/decision, or (c) you run out of context/tokens. Chain Phase increments
+input/decision, or (c) you run out of context/tokens. Chain increments
 back-to-back, each through the full workflow above. After finishing one
-increment, pick the next step from `RUST_MIGRATION_PLAN.md` and continue.
+increment, pick the next step from `ROADMAP.md` and continue.
 
 ## Context efficiency (delegated development)
 
@@ -100,10 +101,12 @@ session that hand-writes each increment exhausts itself after ~1–2. So:
 - If delegated development comes back broken, prefer **re-delegating with a
   corrected spec** over hand-fixing at length — the fix usually costs less
   context than the diagnosis.
-- State lives in the repo, not the session: `PROGRESS.md` (newest last),
-  `RUST_MIGRATION_PLAN.md`, `PARITY_AUDIT.md`. Any fresh session must be
-  able to resume from those alone; keep them current for exactly that
-  reason.
+- State lives in the repo, not the session: `ROADMAP.md` is the single source
+  of roadmap scope/order; `PROGRESS.md` is newest-last delivery history;
+  `PARITY_AUDIT.md` is the detailed gap/deviation register. Keep
+  `RUST_MIGRATION_PLAN.md` only as technical/historical reference. A fresh
+  session must be able to resume from the roadmap, progress tail, and relevant
+  audit sections.
 
 ## Notes
 

@@ -17,7 +17,7 @@ KasmVNC container, plus a code sweep of `crates/c41-ui`. Ordered by **severity**
 not roadmap position: severity 1 is "a user hits this and something is broken or
 blocked", severity 3 is "darktable has it and we don't, but nothing misbehaves".
 This UI audit is not a complete capability inventory; its upstream baseline is
-superseded by the pinned SHA in `PARITY_SPRINT_PLAN.md`.
+superseded by the pinned SHA in the canonical `ROADMAP.md`.
 
 > **2026-11-13 scope update:** the owner has set complete parity with the pinned
 > upstream darktable baseline as the ongoing target. Only cloud sync and a mobile
@@ -25,7 +25,7 @@ superseded by the pinned SHA in `PARITY_SPRINT_PLAN.md`.
 > `darktablerc` is out of scope/refused is historical and superseded. Recorded
 > behavioral deviations describe current gaps, not approved exceptions, unless
 > an explicit owner-approved scope change says otherwise. Re-open those gaps and
-> classify upstream changes in the sprint plan's versioned ledger.
+> classify upstream changes in the versioned inventory tracked by `ROADMAP.md`.
 
 > **2026-08-31 scope decision:** severity-1.9 (geotagging/neural-restore
 > panel) and severity-3.4 (map/print/tethering views) are **deferred for
@@ -277,9 +277,10 @@ the first decode lands; the row is inert until then (no sentinel-seeded
 override is possible). Export shares the same `params.rawprepare_opts()` →
 `load_with` seam, so preview and disk agree. Documented deviations:
 (a) gain-map (flat-field) support and the raw crop/left/top/right/bottom in
-the C module are not surfaced (only black/white levels); (b) `white <= black`
-degenerate pairs are guarded by `(white-black).max(1.0)` (never negative-div)
-and sanitised to the sensor range on decode-option construction;
+the C module are not surfaced (only black/white levels); (b) **resolved in the
+S9 rawprepare fallback increment:** when white is at or below the maximum black
+level, normalization now uses `UINT16_MAX` for all CFA colours, matching
+`rawprepare.c` and covered for Bayer, X-Trans, and `load_with` overrides;
 (c) rawloader's black-level source is used for the file defaults (cameras that
 report 0 and expect the masked-black do not get a border estimate —
 pre-existing, documented in `rawimage.rs`); (d) history jump/undo/redo restores
@@ -603,10 +604,9 @@ with a pinned upstream baseline, excluding only cloud sync and a mobile app.
 The historical warning remains useful: this severity audit and the "Known gaps"
 section are not exhaustive. G1–G6 were a discovered subset, not the full distance
 to parity, and the detailed UI sweep has not been repeated since 2026-08-11.
-Use `PARITY_SPRINT_PLAN.md` for the current upstream SHA, full inventory
-process, candidate commit dispositions, and ordered backlog. Refresh this audit
-from that inventory; do not treat old refusals or missing rows as approved
-exceptions.
+Use `ROADMAP.md` for the current upstream SHA, full inventory process,
+candidate commit dispositions, and ordered backlog. Refresh this audit from that
+inventory; do not treat old refusals or missing rows as approved exceptions.
 
 Other roadmap additions (smart previews, virtual copies, face/People, AI
 auto-tagging, batch AI, print templates) remain product work, but do not replace
