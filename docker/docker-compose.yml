@@ -5,10 +5,10 @@
 #   docker compose -f docker/docker-compose.yml build darkroom
 #   docker compose -f docker/docker-compose.yml up darkroom
 #
-# Device-passthrough profiles use the FULL C+Rust image (docker/Dockerfile.full-c).
-# The launched c41-rs GTK4 application is currently CPU-only; the C darktable
-# OpenCL kernels are not called by it. These profiles do not enable GPU compute
-# in the C-41 product.
+# GPU profiles use the FULL C+Rust image (docker/Dockerfile.full-c). The Rust
+# c41-rs pipeline uses OpenCL for Sigmoid RGB-ratio when a supported GPU/runtime
+# is visible; other stages remain CPU-only. Legacy C darktable OpenCL kernels
+# are not called by c41-rs. The backend falls back to CPU on failure.
 #   docker compose -f docker/docker-compose.yml --profile nvidia up darkroom-nvidia
 #   docker compose -f docker/docker-compose.yml --profile amd up darkroom-amd
 #   docker compose -f docker/docker-compose.yml --profile intel up darkroom-intel
@@ -43,9 +43,10 @@ x-common: &common
     - "3001:3001"   # KasmVNC HTTPS → open https://localhost:3001
   restart: unless-stopped
 
-# The full C+Rust build (CMake) is used by the device-passthrough profiles.
-# It includes C darktable/OpenCL binaries, but the container entrypoint launches
-# c41-rs, which currently performs image processing on CPU only.
+# The full C+Rust build (CMake) is used by the GPU profiles. It includes the
+# OpenCL loader/CPU ICD, and c41-rs uses OpenCL for Sigmoid RGB-ratio only when
+# a GPU ICD is visible; other stages remain CPU. AMD/Intel vendor GPU runtimes
+# are not bundled and must be made available inside the container.
 x-full-build: &full-build
   build:
     context: ..
@@ -98,11 +99,12 @@ services:
               count: all
               capabilities: [gpu, compute, utility, video]
 
-  # ── AMD GPU (full C image; Rust pipeline uses OpenCL for Sigmoid) ──────────
+  # ── AMD device passthrough (requires container OpenCL GPU runtime/ICD) ─────
   # Prerequisites on host:
   #   1. ROCm installed: https://rocm.docs.amd.com/
   #   2. User in 'video' and 'render' groups: sudo usermod -aG video,render $USER
-  # Verify: rocm-smi  (or clinfo | grep "Device Name")
+  # Verify host: rocm-smi. Also provide the matching ROCm OpenCL runtime/ICD
+  # inside the container; this profile alone only passes device nodes.
   darkroom-amd:
     <<: [*common, *full-build]
     container_name: darkroom-amd
@@ -115,11 +117,12 @@ services:
       - video
       - render
 
-  # ── Intel GPU (full C image; Rust pipeline uses OpenCL for Sigmoid) ────────
-  # Prerequisites on host:
-  #   1. Intel OpenCL runtime: sudo apt install intel-opencl-icd
+  # ── Intel device passthrough (requires container OpenCL GPU runtime/ICD) ───
+  # Prerequisites:
+  #   1. Intel OpenCL runtime/ICD available inside the container (not bundled by
+  #      this full-C image); host runtime package alone is not sufficient.
   #   2. User in 'video' and 'render' groups: sudo usermod -aG video,render $USER
-  # Verify: clinfo | grep "Device Name"
+  # Verify GPU visibility with clinfo inside the container.
   darkroom-intel:
     <<: [*common, *full-build]
     container_name: darkroom-intel

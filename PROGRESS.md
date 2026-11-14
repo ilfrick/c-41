@@ -9922,3 +9922,25 @@ selected NVIDIA GeForce GTX 1060 6GB and passed actual OpenCL dispatch plus
 mixed-pipeline CPU differential. Thus the full-C image loader/ICD path is
 verified on this host. No deployment yet; running `c-41` remains on its prior
 healthy image. Installer artifacts remain untracked and untouched.
+
+## 2026-11-14 10:38 UTC — S16 GPU documentation aligned
+
+**Docs.** Updated `README.md` and the Compose header to replace stale CPU-only
+claims with the shipped scope: OpenCL Sigmoid RGB-ratio in the GPU profiles,
+CPU for all other stages, automatic CPU fallback, and `C41_GPU=off` override.
+The running `c-41` container was also inspected: it had `runtime=nvidia` but no
+GPU device request, NVIDIA driver libraries, or OpenCL ICD visibility. This
+explains why runtime selection alone did not expose the GPU; deployment must
+explicitly pass the device; deployment is pending the documentation commit and
+its CI.
+
+**Review correction.** Independent review caught one stale Compose CPU-only
+comment and overbroad AMD/Intel acceleration instructions: those services pass
+device nodes but do not bundle vendor OpenCL runtimes. Updated README/Compose to
+state that NVIDIA was hardware-tested and AMD/Intel require a matching runtime
+inside the container.
+
+**Verification.** Independent senior review APPROVED after its corrections.
+`scripts/ci-local.sh` passed all four gates; `docker compose ... config --quiet`
+and `git diff --check` also passed. No container was changed. Installer
+artifacts remain untracked and untouched.
