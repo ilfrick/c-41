@@ -27,7 +27,7 @@ Strategia: sostituire sottosistemi un passo alla volta dietro confini FFI stabil
 | Area | Stato / prossimo lavoro |
 |---|---|
 | Infrastruttura | Fork e mirror GitHub/Gitea, build Docker/KasmVNC e packaging di base esistono. Restano branding completo e icona, matrice CI Linux/macOS/Windows e pubblicazione GHCR da valutare/completare. Il pass-through GPU del container non accelera ancora `c41-rs`. |
-| Pipeline immagini | Fase al confine Rust/FFI: i kernel portati continuano a crescere per incrementi; la copertura dei moduli C non è sinonimo di funzionalità UI o parità di prodotto. |
+| Pipeline immagini | Fase al confine Rust/FFI: i kernel portati continuano a crescere per incrementi; la copertura dei moduli C non è sinonimo di funzionalità UI o parità di prodotto. L’esecuzione GPU effettiva è un requisito ad **alta priorità**: il binario `c41-rs` oggi elabora su CPU, indipendentemente dal device passthrough del container. |
 | Database | `c41-db` fornisce CRUD per immagini, collezioni, tag, metadati e storia. Le nuove funzioni richiedono migrazioni compatibili e test di restart. |
 | UI GTK4 | Lighttable, darkroom, pannelli, storia, import/export e funzioni correlate sono in sviluppo incrementale. Ogni controllo deve essere realmente collegato a pipeline, storia e persistenza. |
 | Tecnica legacy C/FFI | Conservare solo dove necessario o conveniente; compilare le modifiche C con la build completa Release `-Werror`. Il binario Rust cargo-only deve restare senza dipendenze CMake non richieste. |
@@ -62,11 +62,13 @@ Parità significa coprire tutte le capacità utente e di elaborazione del baseli
 - **C2 — Colore:** input/output profile e percorso non-RAW Rec.2020 sono parzialmente implementati. Restano soft proof, gamut-check, selezione/trasformazione display profile, adattamento alla presentazione finale sRGB e coerenza di thumbnail, full preview, stampa ed export.
 - **C3 — Istanze e maschere:** stack di istanze indipendenti con parametri, blending, storia, identità UI, preset, serializzazione e ordine pipeline; poi tutte le famiglie/operazioni di maschera e le loro interazioni/persistenza.
 - **C4 — Lua:** inventariare e implementare l’API Lua supportata dal baseline, lifecycle, eventi, storage/UI extension, test di compatibilità e sandbox.
-- **C5 — GPU:** backend GPU effettivo (OpenCL o equivalente), scelta runtime, fallback CPU, tiling/memoria e test differenziali CPU↔GPU. Il solo accesso ai device non conta.
+- **C5 — GPU (priorità owner alta):** backend GPU effettivo nella pipeline Rust, scelta runtime, fallback CPU, limiti memoria/tiling e test differenziali CPU↔GPU. Anticipare l’architettura e una slice end-to-end rispetto alla sequenza ordinaria degli sprint; il solo accesso ai device o il backend OpenCL del C legacy non conta.
 - **C6 — RAW, formati, risorse e workflow:** HEIC/HEIF/AVIF, X3F, GainMap DNG, forward matrices, demosaic/highlights, white balance, default/auto-enable, profili, preset, stili, `darktablerc`, metadati/XMP, storia e re-decode su undo/redo/jump, selezione, layout, unità, localizzazione, export/stampa e scorciatoie.
 - **C7 — Registro deviazioni:** confrontare e risolvere ogni comportamento divergente annotato in `PARITY_AUDIT.md`; le deviazioni non possono diventare esclusioni implicite.
 
 ### 5.3 Sequenza sprint
+
+**Priorità trasversale:** l’uso effettivo della GPU è requisito ad alta priorità e il lavoro C5 va avviato subito, in parallelo all’inventario S9, prima degli altri sprint numerati quando la capacità lo consente. La numerazione S16 resta per tracciabilità del backlog, non indica priorità bassa. Il primo incremento deve dimostrare dispatch GPU reale nella pipeline Rust, mantenendo fallback CPU e CI senza hardware GPU; misurare anche trasferimenti e sincronizzazione, senza dichiarare accelerazione finché il percorso completo non è più veloce su workload rappresentativi.
 
 | Sprint | Obiettivo e criterio di uscita |
 |---|---|
@@ -80,7 +82,7 @@ Parità significa coprire tutte le capacità utente e di elaborazione del baseli
 | **S13** | Nuovi moduli upstream: Contrast & Texture, RGB Saturation Curve, Spektrafilm e inventario aggiornato. Audit algoritmi, dati/licenze, reference e memoria prima di ciascun port. |
 | **S14** | RAW, formati, sensori e metadati (C6). |
 | **S15** | Compatibilità Lua e sandbox (C4). |
-| **S16** | GPU e confronto CPU/GPU (C5). |
+| **S16 — priorità alta, anticipato** | Prototipo e integrazione GPU effettivi nella pipeline Rust (C5): backend scelto con evidenza, fallback CPU, test differenziali e misure end-to-end. Estendere da una slice pixel-local a più stage compatibili e poi affrontare spatial/tiling; device passthrough e OpenCL C legacy non soddisfano il gate. |
 | **S17** | Workflow, UI, configurazione, preset e stampa (C6). |
 | **S18** | Chiudere il registro delle deviazioni (C7). |
 | **S19 — ricorrente** | Aggiornare SHA upstream e rigenerare inventario/delta. |

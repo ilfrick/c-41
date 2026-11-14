@@ -549,6 +549,10 @@ acceleration for an image whose launched `c41-rs` front-end is CPU-only. This
 was corrected on 2026-11-07; the image description, README, roadmap and Compose
 comments now clearly distinguish device passthrough from available GPU compute.
 
+**Priority update (owner, 2026-11-14):** actual GPU execution in the Rust product
+is a high-priority requirement. Keep this gap open and pull C5 forward; historical
+statements about optional device passthrough do not de-scope GPU compute.
+
 The roadmap's obsolete `gpu`/`opencl` Compose profile names and repository-root
 command paths were corrected on 2026-11-07; all three profile configurations
 pass `docker compose config`.

@@ -9851,3 +9851,26 @@ four gates (workspace check, clippy, release tests: 1,995 core / 584 UI, and
 release binary link). Existing compiler warnings remain; no test failures.
 No application code changed, so no deployment was performed. Installer files
 remain untracked and untouched.
+
+## 2026-11-14 07:04 UTC — S9 rawprepare arithmetic; GPU priority raised
+
+**Code.** Ported upstream commit `f33906d8bd3578909b560a7d0a81bfcd150a6620`'s
+FMA-compensated reciprocal division into Bayer and X-Trans raw normalization in
+`crates/c41-core/src/rawimage.rs`, retaining existing range guards, clamps and
+white fallback. A regression pins expected f32 bit patterns over near-black,
+midrange, near-white and over-range samples. The independent review APPROVED;
+a suggestion that the test oracle duplicated the implementation was addressed
+by pinning expected bit patterns.
+
+**Priority update.** Owner clarified that actual GPU execution is a high-priority
+requirement. `ROADMAP.md` now pulls GPU architecture and an end-to-end Rust
+pipeline slice forward; `PARITY_AUDIT.md` preserves the CPU-only gap and records
+this priority. Read-only architecture review verified that the deployed
+`c41-rs` path is CPU-only and that legacy C OpenCL is not used by it. Initial
+reconnaissance recommends a portable, CPU-fallback GPU backend and a measured
+pixel-local vertical slice; backend and API selection remain to be decided.
+
+**Verification.** `git diff --check` and `scripts/ci-local.sh` passed all four
+gates (1,995 core / 584 UI release tests and release binary link). Existing
+compiler warnings remain. No deployment yet; installer files remain untracked
+and untouched.

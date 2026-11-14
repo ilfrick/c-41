@@ -113,8 +113,12 @@ pub fn normalize_cfa(
             let b = black[color];
             // Keep a final per-colour guard for malformed/non-finite metadata.
             let range = (white[color] - b).max(1.0);
-            let v = (data[row * width + col] as f32 - b) / range;
-            out[row * width + col] = v.max(0.0);
+            let n = data[row * width + col] as f32 - b;
+            let reciprocal = 1.0 / range;
+            let q = n * reciprocal;
+            let rem = (-q).mul_add(range, n);
+            let normalized = rem.mul_add(reciprocal, q);
+            out[row * width + col] = normalized.max(0.0);
         }
     }
     out
@@ -142,8 +146,12 @@ pub fn normalize_xtrans(
             let color = xtrans[row % 6][col % 6] as usize;
             let b = black[color];
             let range = (white[color] - b).max(1.0);
-            let v = (data[row * width + col] as f32 - b) / range;
-            out[row * width + col] = v.max(0.0);
+            let n = data[row * width + col] as f32 - b;
+            let reciprocal = 1.0 / range;
+            let q = n * reciprocal;
+            let rem = (-q).mul_add(range, n);
+            let normalized = rem.mul_add(reciprocal, q);
+            out[row * width + col] = normalized.max(0.0);
         }
     }
     out
@@ -1510,6 +1518,42 @@ mod tests {
         assert!((out[1] - 0.5).abs() < 1e-6); // (520-20)/1000
         assert!((out[2] - 0.25).abs() < 1e-6); // (270-20)/1000
         assert!((out[3] - 0.5).abs() < 1e-6); // (530-30)/1000
+    }
+
+    #[test]
+    fn normalize_cfa_and_xtrans_match_rawprepare_compensated_division_bits() {
+        // Independently reproduce rawprepare's reciprocal-plus-FMA division;
+        // the input levels exercise near-black, midrange, near-white, and
+        // over-range samples with a non-integral sensor range.
+        fn upstream_normalized(sample: u16, black: f32, white: f32) -> f32 {
+            let n = sample as f32 - black;
+            let range = (white - black).max(1.0);
+            let reciprocal = 1.0 / range;
+            let q = n * reciprocal;
+            let rem = (-q).mul_add(range, n);
+            rem.mul_add(reciprocal, q).max(0.0)
+        }
+
+        let samples = [65u16, 2048, 4094, 5000];
+        let black = [64.25, 0.0, 0.0, 0.0];
+        let white = [4095.75; 4];
+        // Bit patterns are pinned from the upstream fmaf sequence so a shared
+        // arithmetic mistake in this test helper and the implementation cannot
+        // silently move the reference.
+        let expected = [0x3943_1262, 0x3efb_ef9e, 0x3f7f_e38d, 0x3f9c_b5bd];
+        assert_eq!(
+            samples
+                .iter()
+                .map(|&sample| upstream_normalized(sample, black[0], white[0]).to_bits())
+                .collect::<Vec<_>>(),
+            expected,
+        );
+
+        let bayer = normalize_cfa(&samples, 4, 1, [[0, 0], [0, 0]], black, white);
+        assert_eq!(bayer.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), expected);
+
+        let xtrans = normalize_xtrans(&samples, 4, 1, &[[0; 6]; 6], black, white);
+        assert_eq!(xtrans.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), expected);
     }
 
     #[test]
