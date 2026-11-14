@@ -174,6 +174,28 @@ port has only Clip and Opposed and no raw-history auto-disable. Its source
 comments note different Bayer mask/buffer handling; do not infer algorithmic
 parity from the shared method name.
 
+## HDR PQ/HLG transfer and display output: selected commits
+
+The following selected commits are ancestors of the pinned SHA and absent from
+C-41 source comparison `3c21e36d7dacace646a5b6db716e3e11235c6d5c` (code in that
+snapshot is unchanged from earlier documentation-only commits). This is a
+partial HDR cluster, not a complete input/output or display-profile inventory.
+
+| Upstream commit | Authored / committed | Pinned-baseline change | Triage |
+|---|---|---|---|
+| [`4b0878d14a11d016ef37e08b1a7d3a42355319ed`](https://github.com/darktable-org/darktable/commit/4b0878d14a11d016ef37e08b1a7d3a42355319ed) — `color: Fix PQ luminance scaling and HLG display conversion` | 2026-10-05 / 2026-10-07 | Adds shared CPU/OpenCL HDR transfer handling for built-in PQ/HLG profiles: PQ reference white at 203 nits and RGB-dependent HLG OOTF for nominal 1000-nit display. Keeps gamut matrix/LittleCMS operations linear to avoid double transfer and preserves structured HDR signaling in PNG/JPEG XL; adds transfer/CLI tests. | **PORT — S14 candidate, gated.** C-41 has no general PQ/HLG input/output profile or HDR export path. Treat this as a coordinated color-management + format feature, not a transfer-function-only cherry-pick. First define absolute-luminance/reference-white and target-display semantics, HDR metadata preservation, supported codecs and CPU reference tests. |
+| [`6a4830844be8f3a08712429dfec5c37bc49afdea`](https://github.com/darktable-org/darktable/commit/6a4830844be8f3a08712429dfec5c37bc49afdea) — `colorspaces: encode PQ and HLG thumbnails the way the pipe does` | 2026-10-21 / 2026-10-23 | Makes lighttable, filmstrip and tethering thumbnails use the same PQ/HLG encoding as the display pipe instead of relying on incompatible built-in ICC shapers. | **REFERENCE** for any future HDR screen/thumbnail support. C-41 deliberately presents through sRGB and has no PQ/HLG display-profile path; this is not a current standalone fix. |
+
+C-41's linear Rec.2020 processing/export seam does not mean HDR transfer or
+absolute-luminance support: eligible non-RAW inputs are converted to linear
+working space; current SDR exports offer sRGB by default and Adobe RGB (1998)
+as a selectable destination. `crates/c41-ui/src/export.rs` only exposes JPEG/TIFF/PNG;
+its preview path displays sRGB. `crates/c41-core/src/color.rs` includes PQ
+math inside JzAzBz, but that perceptual-coordinate transform is not a general
+PQ/HLG profile decoder/encoder or HDR signal path. The retained C tree has
+broader HDR paths, but its presence does not wire them into the Rust GTK4
+product. See `raw-formats.md` for the product capability matrix.
+
 ## RAW white balance and manual calibration: workflow boundary and selected commits
 
 The commits below are ancestors of the pinned upstream SHA. C-41 source
@@ -216,10 +238,11 @@ Rust-native interaction design, not just more coefficient sliders.
 ## Remaining work
 
 The module, RAW/formats, and workflow/runtime matrices remain conservative inventories.
-Other candidate clusters named in `ROADMAP.md` §5.4—including Contrast & Texture,
-precision and HDR—remain unclassified until rows are added with pinned-source
-and C-41 call-path evidence. The selected highlights cluster, like Spektrafilm,
-DNG and WB, is partial; its follow-up list is representative, not exhaustive.
+Other candidate clusters named in `ROADMAP.md` §5.4—including Contrast & Texture
+and precision—remain unclassified until rows are added with pinned-source and
+C-41 call-path evidence. HDR now has selected transfer/display commits triaged,
+not a full feature/path audit. The highlights, Spektrafilm, DNG and WB clusters
+are also partial; all follow-up lists are representative, not exhaustive.
 Additional commits for all reviewed features may still need triage. S9 is
 incomplete until the remaining capabilities and selected commit deltas are
 verified and prioritized.
