@@ -22,6 +22,7 @@ pub mod exif;
 pub mod fast_guided_filter;
 pub mod focus_peaking;
 pub mod gaussian;
+pub mod gpu;
 pub mod geometry;
 pub mod guided_filter;
 pub mod heal;

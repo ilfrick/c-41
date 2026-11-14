@@ -2390,6 +2390,29 @@ impl Pipeline {
             return input.to_vec();
         }
 
+        // Initialize/lookup before any frame-sized GPU-path allocations. A missing
+        // backend takes the original CPU band path below without extra buffers.
+        if self.stages.iter().any(|stage| matches!(stage, Stage::Sigmoid { .. })) {
+            if crate::gpu::backend_available() {
+                match self.process_stagewise(input, width, height, crate::gpu::sigmoid_rgb_ratio) {
+                    Ok(output) => return output,
+                    Err(error) => crate::gpu::report_fallback(&error),
+                }
+            } else if !crate::gpu::explicitly_disabled() {
+                crate::gpu::report_fallback(&anyhow::anyhow!("OpenCL GPU backend unavailable"));
+            }
+        }
+
+        self.process_cpu(input, width, height)
+    }
+
+    /// Execute the original CPU pipeline path, including its band-parallel
+    /// pixel-local execution. Kept as the fallback and as the CPU performance
+    /// reference for GPU validation.
+    pub(crate) fn process_cpu(&self, input: &[f32], width: usize, height: usize) -> Vec<f32> {
+        if self.stages.is_empty() {
+            return input.to_vec();
+        }
         let mut output = vec![0.0f32; input.len()];
         // Band size in f32s (pixel-aligned: PIXELS_PER_BAND * 4 channels). 64k px
         // ≈ a 1 MB band — cache-friendly and large enough to amortise rayon's
@@ -2429,6 +2452,49 @@ impl Pipeline {
                 );
         }
         output
+    }
+
+    /// Execute stages over full-frame buffers. Pixel-local CPU stages are
+    /// parallelized over pixel-aligned chunks; spatial stages receive the full
+    /// image dimensions. The injected sigmoid dispatcher is called once per
+    /// sigmoid stage, once for the complete frame.
+    fn process_stagewise<F>(
+        &self,
+        input: &[f32],
+        width: usize,
+        height: usize,
+        mut dispatch_sigmoid: F,
+    ) -> anyhow::Result<Vec<f32>>
+    where
+        F: FnMut(&[f32], &mut [f32], [f32; 6]) -> anyhow::Result<()>,
+    {
+        fn frame_buffer(len: usize) -> anyhow::Result<Vec<f32>> {
+            let mut buffer = Vec::new();
+            buffer.try_reserve_exact(len)?;
+            buffer.resize(len, 0.0);
+            Ok(buffer)
+        }
+
+        let mut current = frame_buffer(input.len())?;
+        current.copy_from_slice(input);
+        let mut next = frame_buffer(input.len())?;
+        for stage in &self.stages {
+            if let Stage::Sigmoid {
+                white_target, black_target, paper_exp, film_fog, film_power, paper_power,
+            } = stage {
+                dispatch_sigmoid(&current, &mut next, [*white_target, *black_target, *paper_exp, *film_fog, *film_power, *paper_power])?;
+            } else if stage.is_pixel_local() {
+                use rayon::prelude::*;
+                const BAND: usize = 64 * 1024 * 4;
+                current.par_chunks(BAND).zip(next.par_chunks_mut(BAND)).for_each(|(src, dst)| {
+                    stage.apply(src, dst, src.len() / 4, 1);
+                });
+            } else {
+                stage.apply(&current, &mut next, width, height);
+            }
+            std::mem::swap(&mut current, &mut next);
+        }
+        Ok(current)
     }
 
     /// Run every stage over one band `input` into `output` (equal lengths, both a
@@ -2550,6 +2616,41 @@ mod tests {
     }
 
     #[test]
+    fn stagewise_dispatch_preserves_order_and_whole_frame_spatial_stages() {
+        let pipeline = Pipeline::with_stages(vec![
+            Stage::Exposure { black: 0.0, scale: 0.8 },
+            Stage::Sigmoid {
+                white_target: 1.0, black_target: 0.0, paper_exp: 0.3,
+                film_fog: 0.0, film_power: 1.0, paper_power: 1.0,
+            },
+            Stage::Retouch {
+                source_x: 0.0, source_y: 0.0, dest_x: 0.5, dest_y: 0.5,
+                radius: 0.25, opacity: 0.7, feather: 0.0,
+            },
+            Stage::Sigmoid {
+                white_target: 1.0, black_target: 0.0, paper_exp: 0.3,
+                film_fog: 0.0, film_power: 1.0, paper_power: 1.0,
+            },
+            Stage::Exposure { black: 0.02, scale: 1.1 },
+        ]);
+        let input = ramp(32 * 32);
+        let mut dispatched = 0;
+        let actual = pipeline.process_stagewise(&input, 32, 32, |src, dst, params| {
+            dispatched += 1;
+            Stage::Sigmoid {
+                white_target: params[0], black_target: params[1], paper_exp: params[2],
+                film_fog: params[3], film_power: params[4], paper_power: params[5],
+            }.apply(src, dst, 32, 32);
+            Ok(())
+        }).unwrap();
+        let mut expected = vec![0.0; input.len()];
+        let mut scratch = vec![0.0; input.len()];
+        pipeline.process_band(&input, &mut expected, &mut scratch, 32, 32);
+        assert_eq!(dispatched, 2);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn mixed_stages_dispatch_in_order() {
         // exposure ×2 → (2.0,1.0,0.0), then monochrome (0.2,0.7,0.1):
         // luma = 0.2*2 + 0.7*1 + 0.1*0 = 1.1, R=G=B.
@@ -2666,6 +2767,7 @@ mod tests {
         ]);
 
         let full = p.process(&px, px.len() / 4, 1);
+        assert_eq!(full, p.process_cpu(&px, px.len() / 4, 1));
         let half = (px.len() / 2) & !3; // pixel-aligned split point
         let mut split = p.process(&px[..half], half / 4, 1);
         split.extend_from_slice(&p.process(&px[half..], (px.len() - half) / 4, 1));

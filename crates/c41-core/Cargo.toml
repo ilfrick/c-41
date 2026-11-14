@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 c41-sys = { workspace = true }
 anyhow       = { workspace = true }
 ort          = { workspace = true }
+opencl3      = { workspace = true }
 rayon        = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }

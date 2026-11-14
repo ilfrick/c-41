@@ -9874,3 +9874,32 @@ pixel-local vertical slice; backend and API selection remain to be decided.
 gates (1,995 core / 584 UI release tests and release binary link). Existing
 compiler warnings remain. No deployment yet; installer files remain untracked
 and untouched.
+
+## 2026-11-14 09:37 UTC — S16: initial Rust OpenCL Sigmoid slice
+
+**Code.** Added a dynamically loaded `opencl3` backend and an attributed
+OpenCL derivative of darktable's `sigmoid_loglogistic_rgb_ratio` kernel. The
+Rust pipeline now dispatches `Stage::Sigmoid` on a selected OpenCL GPU within
+mixed full-frame pipelines; all other stages remain ordered on CPU. The original
+Rayon CPU pipeline is preserved as the fail-closed fallback, and `C41_GPU=off`
+forces CPU. Added CPU-only stage-order tests, an ignored hardware differential
+that asserts real dispatch (including mixed stages), and a repeated
+transfer-inclusive GPU-vs-CPU diagnostic. Updated the roadmap, parity audit,
+and full-C/Compose descriptions to distinguish actual supported compute from
+mere device passthrough.
+
+**Review.** Independent senior review APPROVED the current implementation and
+fallback with no findings. `scripts/ci-local.sh` passed all four gates
+(workspace check, clippy, release tests: 1,995 core / 584 UI, and release binary
+link); `git diff --check` passed. The first hardware-test attempt failed because
+the Rust dev image has no OpenCL loader. Installing `ocl-icd-libopencl1` in the
+ephemeral test container corrected the environment: the differential passed on
+NVIDIA GeForce GTX 1060 6GB through the NVIDIA CUDA OpenCL platform. The
+transfer-inclusive five-run medians were 12.41 ms GPU vs 50.62 ms CPU at
+1280×720, and 577.67 ms GPU vs 1.08 s CPU at 6000×4000. Earlier runs varied
+substantially; these synthetic one-host measurements are diagnostic only, not
+a speedup promise. The production full-C image already installs the OpenCL
+loader/runtime; the GPU runtime image and KasmVNC flow still need verification.
+
+**Status.** GPU use remains partial (only Sigmoid RGB-ratio); the implementation
+is not deployed yet. Installer artifacts remain untracked and untouched.

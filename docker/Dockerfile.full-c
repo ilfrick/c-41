@@ -17,7 +17,7 @@
 # Run (CPU only):
 #   docker run -p 3000:3000 -v /photos:/photos -v /config:/config darkroom
 #
-# Run (NVIDIA device passthrough; c41-rs remains CPU-only):
+# Run (GPU passthrough; c41-rs uses OpenCL for supported stages when available):
 #   docker run --gpus all -e PUID=1000 -e PGID=1000 \
 #     -p 3000:3000 -p 3001:3001 \
 #     -v /path/to/photos:/photos \
@@ -100,7 +100,7 @@ FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
 
 LABEL maintainer="darkroom-project" \
       org.opencontainers.image.title="Darkroom" \
-      org.opencontainers.image.description="Full C+Rust image; the launched C-41 GTK4 app currently uses CPU processing" \
+      org.opencontainers.image.description="Full C+Rust image; c41-rs uses OpenCL GPU acceleration for Sigmoid when a GPU is available, with CPU fallback" \
       org.opencontainers.image.source="https://github.com/ilfrick/c-41"
 
 ENV DEBIAN_FRONTEND=noninteractive

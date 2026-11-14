@@ -524,19 +524,34 @@ hits, both prose in comments citing darktable's `lua scripts installer`
 one. `data/lua/darktable/debug.lua` still ships, inherited from the fork — dead
 weight that reads as evidence the feature exists.
 
-### G5 — GPU: the Rust product is CPU-only; one image label over-promises
+### G5 — GPU: initial Rust OpenCL slice; broad coverage and deployment remain open
 
-No `opencl3` dependency (zero hits in `Cargo.lock`). The OpenCL surface in
-`c41-core` is a scaffold, not an implementation. `IopProcess::process_cl` has
-96 implementors crate-wide (74 explicit + the 22 `geom_iop_stub!` expansions, as
-in G1) and **every one of them is an unconditional `Err`** — not one contains
-an `Ok(` path — so none has a GPU implementation to call. 15 say
-`Error::OpenCl("… OpenCL path not yet ported")`, the rest `Error::Pipeline`.
-Alongside them sit `Error::OpenCl`, `has_opencl()` — whose only definition is a
-default returning a flat `false` (`iop/mod.rs:117-119`) — and a `ClBuffer` with
-a single private zero-sized field (`iop/mod.rs:96-98`). The product is CPU-only
-via `rayon`, consistent with the AI backend's own "is CPU only" note
-(`ai/mod.rs:34`).
+**Historical baseline (before the S16-first slice):** the audit found no `opencl3`
+dependency, and the OpenCL surface in `c41-core` was only a scaffold.
+`IopProcess::process_cl` had 96 implementors crate-wide (74 explicit + the 22
+`geom_iop_stub!` expansions, as in G1), all unconditional `Err`; `has_opencl()`
+returned false and `ClBuffer` was a zero-sized placeholder. That remains true of
+the legacy `IopProcess` API: the new Rust backend is deliberately wired through
+the active `Pipeline::process`, not those stubs.
+
+**Current initial implementation:** `opencl3` dynamically loads the OpenCL
+runtime, selects only `CL_DEVICE_TYPE_GPU`, and routes `Stage::Sigmoid` RGB-ratio
+through a whole-frame OpenCL kernel from mixed preview/export pipelines. It is
+automatic when a supported GPU/runtime is available; `C41_GPU=off` forces the
+unchanged CPU path. GPU initialization/dispatch failures fall back to the
+original CPU band-parallel pipeline, with a one-time diagnostic. Other stages,
+spatial operations, and the rest of the C-41 pipeline remain CPU-only; this is a
+first slice, not general GPU parity or device-resident stage fusion.
+
+**Hardware evidence:** the ignored OpenCL differential test passed on an NVIDIA
+GeForce GTX 1060 6GB via the NVIDIA CUDA OpenCL platform, including a mixed
+pipeline and real dispatch. The latest five-run transfer-inclusive diagnostic
+compared `Pipeline::process` with the Rayon CPU path on synthetic constant input:
+1280×720 median 12.41 ms GPU vs 50.62 ms CPU; 6000×4000 median 577.67 ms vs
+1.08 s. Earlier runs were materially slower, so these local results vary with
+system load and are not release-wide or image-quality claims. The supported GPU image/runtime/ICD and actual KasmVNC preview/export
+path still need deployment verification before the feature is considered
+available to users by default.
 
 The GPU **compose profiles are not a bug**, contrary to what a first pass at this
 suggested. `docker/docker-compose.yml:82,109,126` defines `nvidia`, `amd` and
@@ -544,14 +559,15 @@ suggested. `docker/docker-compose.yml:82,109,126` defines `nvidia`, `amd` and
 and that image builds *both* the C app and `c41-rs` and launches `c41-rs`
 (`kasmvnc-autostart.sh:48`). Choosing full-c for GPU is a recorded decision
 ("the GPU profiles (OpenCL is a C-core feature) build full-c",
-`RUST_MIGRATION_PLAN.md:2044-2045`). The `full-c` image label was a genuine overclaim: it described GPU
-acceleration for an image whose launched `c41-rs` front-end is CPU-only. This
-was corrected on 2026-11-07; the image description, README, roadmap and Compose
-comments now clearly distinguish device passthrough from available GPU compute.
+`RUST_MIGRATION_PLAN.md:2044-2045`). The `full-c` image label was a genuine overclaim:
+device passthrough alone did not accelerate the Rust front-end. This was
+corrected on 2026-11-07; image/Compose wording distinguishes device access from
+compute. The new OpenCL backend changes the product path only when the image
+contains an OpenCL loader/ICD and a GPU is exposed; verify that at deployment.
 
 **Priority update (owner, 2026-11-14):** actual GPU execution in the Rust product
-is a high-priority requirement. Keep this gap open and pull C5 forward; historical
-statements about optional device passthrough do not de-scope GPU compute.
+is a high-priority requirement. Keep extending C5 ahead of ordinary sprint order;
+historical statements about optional device passthrough do not de-scope GPU compute.
 
 The roadmap's obsolete `gpu`/`opencl` Compose profile names and repository-root
 command paths were corrected on 2026-11-07; all three profile configurations

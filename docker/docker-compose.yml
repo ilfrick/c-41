@@ -69,7 +69,7 @@ services:
     container_name: darkroom
     image: darkroom:latest
 
-  # ── NVIDIA device passthrough (full C image; c41-rs remains CPU-only) ───────
+  # ── NVIDIA GPU (full C image; Rust pipeline uses OpenCL for Sigmoid) ────────
   # Prerequisites on host:
   #   1. NVIDIA driver installed
   #   2. nvidia-container-toolkit installed and configured
@@ -98,7 +98,7 @@ services:
               count: all
               capabilities: [gpu, compute, utility, video]
 
-  # ── AMD device passthrough (full C image; c41-rs remains CPU-only) ─────────
+  # ── AMD GPU (full C image; Rust pipeline uses OpenCL for Sigmoid) ──────────
   # Prerequisites on host:
   #   1. ROCm installed: https://rocm.docs.amd.com/
   #   2. User in 'video' and 'render' groups: sudo usermod -aG video,render $USER
@@ -115,7 +115,7 @@ services:
       - video
       - render
 
-  # ── Intel device passthrough (full C image; c41-rs remains CPU-only) ───────
+  # ── Intel GPU (full C image; Rust pipeline uses OpenCL for Sigmoid) ────────
   # Prerequisites on host:
   #   1. Intel OpenCL runtime: sudo apt install intel-opencl-icd
   #   2. User in 'video' and 'render' groups: sudo usermod -aG video,render $USER
