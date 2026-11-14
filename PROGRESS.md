@@ -10013,3 +10013,15 @@ live runtime image and mounted read-only succeeded. No production files or
 services were changed by this workaround. Full-C image rebuild/deploy and docs
 scope reconciliation remain pending; live `c-41` remains `c-41:8acf0f13e0`.
 Installer artifacts remain untracked and untouched.
+
+## 2026-11-14 14:41 UTC — S16 fused-span release docs
+
+Updated `README.md`, Compose comments, the full-C image label, `ROADMAP.md`,
+`PARITY_AUDIT.md`, and the post-pin GPU row in
+`docs/parity-inventory/workflows-runtime.md` to distinguish the newly tested
+Exposure/Sigmoid span-fusion code from the still-deployed Sigmoid-only image.
+Documentation keeps CPU fallback, full-frame/no-tiling, one-stage limits, and
+unverified live user-image dispatch/AMD-Intel runtime boundaries explicit.
+Independent senior review APPROVED. `scripts/ci-local.sh` passed all four
+gates; Compose configuration and `git diff --check` passed. No image rebuild or
+deployment has occurred yet; `c-41:8acf0f13e0` remains live.

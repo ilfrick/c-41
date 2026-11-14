@@ -6,9 +6,10 @@
 #   docker compose -f docker/docker-compose.yml up darkroom
 #
 # GPU profiles use the FULL C+Rust image (docker/Dockerfile.full-c). The Rust
-# c41-rs pipeline uses OpenCL for Sigmoid RGB-ratio when a supported GPU/runtime
-# is visible; other stages remain CPU-only. Legacy C darktable OpenCL kernels
-# are not called by c41-rs. The backend falls back to CPU on failure.
+# c41-rs fuses contiguous Exposure/Sigmoid stages into one OpenCL dispatch
+# when a supported GPU/runtime is visible and the span contains Sigmoid; all
+# other stages remain CPU-only. Legacy C OpenCL kernels are not called. The
+# backend falls back to CPU on failure.
 #   docker compose -f docker/docker-compose.yml --profile nvidia up darkroom-nvidia
 #   docker compose -f docker/docker-compose.yml --profile amd up darkroom-amd
 #   docker compose -f docker/docker-compose.yml --profile intel up darkroom-intel
@@ -44,9 +45,9 @@ x-common: &common
   restart: unless-stopped
 
 # The full C+Rust build (CMake) is used by the GPU profiles. It includes the
-# OpenCL loader/CPU ICD, and c41-rs uses OpenCL for Sigmoid RGB-ratio only when
-# a GPU ICD is visible; other stages remain CPU. AMD/Intel vendor GPU runtimes
-# are not bundled and must be made available inside the container.
+# OpenCL loader/CPU ICD. c41-rs fuses contiguous Exposure/Sigmoid stages into
+# one OpenCL dispatch when the span contains Sigmoid; all other stages stay on
+# CPU. AMD/Intel vendor GPU runtimes are not bundled and must be supplied inside.
 x-full-build: &full-build
   build:
     context: ..
@@ -70,7 +71,7 @@ services:
     container_name: darkroom
     image: darkroom:latest
 
-  # ── NVIDIA GPU (full C image; Rust pipeline uses OpenCL for Sigmoid) ────────
+  # ── NVIDIA GPU (full C image; Rust pipeline fuses Exposure/Sigmoid spans) ──
   # Prerequisites on host:
   #   1. NVIDIA driver installed
   #   2. nvidia-container-toolkit installed and configured

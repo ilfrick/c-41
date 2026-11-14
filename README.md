@@ -15,7 +15,7 @@ See [CHANGES.md](CHANGES.md) for the full changelog.
 | Smart Previews (offline editing) | ✅ | ❌ |
 | Virtual Copies | ✅ | ❌ |
 | Print Layout Templates | ✅ | ❌ |
-| GPU-accelerated C-41 application | ⚠️ (OpenCL accelerates Sigmoid RGB-ratio in GPU profiles; other stages use CPU) | ✅ |
+| GPU-accelerated C-41 application | ⚠️ (GPU profiles fuse contiguous Exposure/Sigmoid spans containing Sigmoid; all other stages use CPU) | ✅ |
 
 ---
 
@@ -36,7 +36,7 @@ docker run -d \
 open http://localhost:3000
 ```
 
-Docker Compose includes optional NVIDIA/AMD/Intel GPU profiles for the full C+Rust image. The Rust pipeline currently accelerates only Sigmoid RGB-ratio via OpenCL; other stages remain on CPU, with CPU fallback when no supported GPU/runtime is available. See [docker/docker-compose.yml](docker/docker-compose.yml) and the [Docker section](#docker) below.
+Docker Compose includes optional NVIDIA/AMD/Intel GPU profiles for the full C+Rust image. The Rust pipeline fuses contiguous Exposure and Sigmoid stages into one OpenCL dispatch when the span contains Sigmoid; exposure-only runs and all other stages stay on CPU, with CPU fallback when no supported GPU/runtime is available. This is partial acceleration, not general pipeline-wide GPU parity. See [docker/docker-compose.yml](docker/docker-compose.yml) and the [Docker section](#docker) below.
 
 ---
 
@@ -66,7 +66,7 @@ Build arguments:
 # CPU only
 docker compose -f docker/docker-compose.yml up darkroom
 
-# NVIDIA GPU (OpenCL Sigmoid acceleration; requires nvidia-container-toolkit)
+# NVIDIA GPU (OpenCL fused Exposure/Sigmoid spans; requires nvidia-container-toolkit)
 docker compose -f docker/docker-compose.yml --profile nvidia up darkroom-nvidia
 
 # AMD device passthrough (GPU compute also requires a ROCm OpenCL ICD inside the container)
@@ -76,7 +76,7 @@ docker compose -f docker/docker-compose.yml --profile amd up darkroom-amd
 docker compose -f docker/docker-compose.yml --profile intel up darkroom-intel
 ```
 
-The browser UI is available at `http://localhost:3000`. With a supported GPU runtime visible, C-41's Rust image pipeline uses OpenCL for Sigmoid RGB-ratio; all other stages use CPU. NVIDIA passthrough was tested on a GTX 1060. The AMD and Intel profiles only pass device nodes; their vendor OpenCL runtimes/ICDs are not bundled and must be provided inside the container. The backend falls back to CPU on initialization or dispatch failure, and `C41_GPU=off` forces CPU processing.
+The browser UI is available at `http://localhost:3000`. With a supported GPU runtime visible, C-41 fuses contiguous Exposure and Sigmoid stages in the same full-frame OpenCL dispatch when the span contains Sigmoid; exposure-only spans and all other stages use CPU. The backend currently has no tiling; allocation or dispatch failure falls back to CPU, and `C41_GPU=off` forces CPU processing. NVIDIA passthrough and differential tests were verified on a GTX 1060. AMD and Intel profiles only pass device nodes; their vendor OpenCL runtimes/ICDs are not bundled and must be provided inside the container.
 
 Volumes:
 

@@ -534,28 +534,33 @@ returned false and `ClBuffer` was a zero-sized placeholder. That remains true of
 the legacy `IopProcess` API: the new Rust backend is deliberately wired through
 the active `Pipeline::process`, not those stubs.
 
-**Current initial implementation:** `opencl3` dynamically loads the OpenCL
-runtime, selects only `CL_DEVICE_TYPE_GPU`, and routes `Stage::Sigmoid` RGB-ratio
-through a whole-frame OpenCL kernel from mixed preview/export pipelines. It is
-automatic when a supported GPU/runtime is available; `C41_GPU=off` forces the
-unchanged CPU path. GPU initialization/dispatch failures fall back to the
-original CPU band-parallel pipeline, with a one-time diagnostic. Other stages,
-spatial operations, and the rest of the C-41 pipeline remain CPU-only; this is a
-first slice, not general GPU parity or device-resident stage fusion.
+**Current source implementation (`868a94e6`):** `opencl3` dynamically loads
+the OpenCL runtime, selects only `CL_DEVICE_TYPE_GPU`, and fuses each contiguous
+`Exposure`/`Sigmoid` span that contains a Sigmoid into one full-frame OpenCL
+kernel dispatch. Exposure-only runs and unsupported stages stay CPU-side and
+delimit spans; stage order and all-four-channel exposure semantics are
+preserved. `C41_GPU=off` forces CPU, and any GPU allocation/dispatch/readback
+failure restarts the complete pipeline on its original CPU path. This still has
+no tiling or device-resident fusion across unsupported stages; other stages and
+spatial operations remain CPU-only. This is partial GPU execution, not general
+GPU parity.
 
 **Hardware evidence:** the ignored OpenCL differential test passed on an NVIDIA
 GeForce GTX 1060 6GB via the NVIDIA CUDA OpenCL platform, including a mixed
 pipeline and real dispatch. The latest five-run transfer-inclusive diagnostic
-compared `Pipeline::process` with the Rayon CPU path on synthetic constant input:
-1280×720 median 12.41 ms GPU vs 50.62 ms CPU; 6000×4000 median 577.67 ms vs
-1.08 s. Earlier runs were materially slower, so these local results vary with
-system load and are not release-wide or image-quality claims. The NVIDIA full-C image/runtime path is now deployed as `c-41:8acf0f13e0`:
-`--gpus all`, NVIDIA ICD/loader visibility and container health were verified,
-and the GPU differential/mixed-pipeline test passed against that same runtime
-image before release. The live app remains limited to Sigmoid RGB-ratio; no
-live-photo benchmark/telemetry establishes user-facing speedup. AMD/Intel
-profiles pass device nodes but require a vendor OpenCL runtime/ICD inside the
-container and are not yet verified.
+compared the pre-fusion `Pipeline::process` with Rayon CPU on synthetic constant
+input: 1280×720 median 12.41 ms GPU vs 50.62 ms CPU; 6000×4000 median 577.67 ms
+vs 1.08 s. Earlier runs were materially slower; these are variable local
+diagnostics, not release-wide or image-quality claims. The NVIDIA full-C
+image/runtime `c-41:8acf0f13e0` remains deployed: `--gpus all`, NVIDIA
+ICD/loader visibility and health were verified; that image contains only the
+Sigmoid-only first slice. The post-fusion ignored GPU differential passed on GTX
+1060 in the Rust dev container using the loader copied read-only from the live
+runtime image; it covered repeated exposures, two GPU spans around a CPU Retouch
+stage, and whole-pipeline CPU equivalence. The new Exposure fusion has not yet
+been rebuilt into or deployed with the full-C image. No live-photo dispatch or
+speedup has been measured. AMD/Intel profiles pass device nodes but require a
+vendor OpenCL runtime/ICD inside the container and remain unverified.
 
 The GPU **compose profiles are not a bug**, contrary to what a first pass at this
 suggested. `docker/docker-compose.yml:82,109,126` defines `nvidia`, `amd` and

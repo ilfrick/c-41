@@ -100,7 +100,7 @@ FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble AS runtime
 
 LABEL maintainer="darkroom-project" \
       org.opencontainers.image.title="Darkroom" \
-      org.opencontainers.image.description="Full C+Rust image; c41-rs uses OpenCL GPU acceleration for Sigmoid when a GPU is available, with CPU fallback" \
+      org.opencontainers.image.description="Full C+Rust image; c41-rs fuses Exposure and Sigmoid spans on OpenCL GPUs, with CPU fallback" \
       org.opencontainers.image.source="https://github.com/ilfrick/c-41"
 
 ENV DEBIAN_FRONTEND=noninteractive
