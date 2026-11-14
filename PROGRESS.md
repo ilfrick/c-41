@@ -9975,3 +9975,19 @@ user-image dispatch. `scripts/ci-local.sh` passed all four gates; Compose config
 and `git diff --check` passed. A final review then caught wording in the pipeline row that could imply live
 preview/export dispatch; clarified it to separate backend capability, test
 coverage, and the uninstrumented live path. Final independent review APPROVED after the wording correction.
+
+## 2026-11-14 11:25 UTC — S9 runtime inventory GPU row refreshed
+
+**Inventory correction.** Updated `docs/parity-inventory/workflows-runtime.md`:
+its actual-GPU row still claimed no Rust backend and unresolved runtime status,
+which was true at the inventory's pinned C-41 revision but stale after S16. The
+matrix now labels GPU status as a post-pin update, retaining the original pin,
+and records the one-stage Sigmoid RGB-ratio backend, CPU fallback/disable switch,
+whole-frame/no-tiling limitation, NVIDIA test/deployment evidence, and the
+unverified live user-image dispatch and AMD/Intel runtimes.
+
+**Review and verification.** Independent senior review caught the pinned-revision
+ambiguity; clarified the inventory convention and explicitly marked the GPU row
+as post-pin, then review APPROVED. `scripts/ci-local.sh` passed all four gates;
+Compose configuration and `git diff --check` passed. Installer artifacts remain
+untracked and untouched.
