@@ -10180,4 +10180,10 @@ deployment changed; S9 remains incomplete.
 
 **Inventory.** Verified pinned commit `1d19780b9c81a42242a17b7da1499156eaaf6930`, which sums per-row picker statistics in double to avoid large-area CPU mean drift and CPU/OpenCL disagreement. C-41's GTK4 click path samples one pixel from the displayed 8-bit sRGB `CachedRender`; it has no area ROI, mean/min/max statistics or multi-space sample. Classified the precision change **REFERENCE — S17** for a future area-picker workflow, not as a standalone fix to point sampling. Added the workflow matrix row, selected commit evidence and roadmap note.
 
-**Verification.** Manually checked the full upstream diff/ancestry and traced the C-41 click-to-`sample_pixel` path. The Pi subagent/reviewer extension conflict remains unresolved; no independent verdict is claimed for this documentation-only increment. All four `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or deployment changed; S9 remains incomplete.
+**Verification.** Manually checked the full upstream diff/ancestry and traced the C-41 click-to-`sample_pixel` path. At that time the Pi subagent/reviewer extension conflict remained unresolved; no independent verdict was claimed for this documentation-only increment. All four `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or deployment changed; S9 remains incomplete.
+
+## 2026-11-14 17:26 UTC — Subagent conflict resolved; S9 docs independently reviewed
+
+**Correction.** The earlier failed delegation reported a duplicate `subagent` tool registration, not an authentication error. The user supplied a diagnosis of a separate child model/provider inheritance bug; that detail does not match the error observed here. The duplicate `/home/nicola/.pi/agent/extensions/subagent/index.ts` is now under `disabled-extensions`, and a fresh independent senior-review call succeeds. One first retry hit a transient DNS tunnel timeout; the next succeeded.
+
+**Review and verification.** Independent senior reviewer APPROVED the S9 documentation triage from `bb8465414ccec026b76c102d18dba9a6d1afdf77` through `462d8344719b753ec2909edb59843ce0f62eb587`, with no findings. All four `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or deployment changed. S9 remains incomplete.
