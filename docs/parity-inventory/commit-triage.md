@@ -213,6 +213,22 @@ behavioral parity. The retained C `src/iop/demosaicing/rcd.c` and its OpenCL
 kernels are separate from the Rust GTK4 RAW preview/export path. Broader
 precision-related commits and CPU reference comparisons remain untriaged.
 
+## Color-picker statistics precision: area-picker follow-up
+
+The selected commit is an ancestor of the pinned SHA and absent from C-41 source
+comparison `23c26a1728dd78a5f858bfcdc05449cf3ddf2bc3`.
+
+| Upstream commit | Authored / committed | Pinned-baseline change | Triage |
+|---|---|---|---|
+| [`1d19780b9c81a42242a17b7da1499156eaaf6930`](https://github.com/darktable-org/darktable/commit/1d19780b9c81a42242a17b7da1499156eaaf6930) — `color picker: add up the rows of the statistics in double on the CPU` | 2026-11-11 / 2026-11-11 | Accumulates each row's float statistics into double totals for 4-channel, no-matrix and 1-channel CPU picker paths, reducing large-area mean error and CPU/OpenCL disagreement without changing per-pixel work. | **REFERENCE — S17 workflow/UI.** C-41's GTK4 picker samples one pixel from the displayed 8-bit render; it has no area ROI or mean/min/max statistics to which this precision fix could apply. If area sampling is implemented, use row-local float plus double row accumulation and test large boxes, low-value sums, hue wrap and CPU/reference agreement. |
+
+C-41 evidence is `crates/c41-ui/src/darkroom/mod.rs` (image click path and
+`CachedRender`) plus `crates/c41-ui/src/preview.rs::sample_pixel`; sampling
+deliberately reuses the displayed sRGB bytes and
+reports one RGB8 value. Upstream implementation is `src/common/color_picker.c`
+with view/UI integration in `src/views/darkroom.c`. A shared label or click
+handler is not full color-picker parity.
+
 ## RAW white balance and manual calibration: workflow boundary and selected commits
 
 The commits below are ancestors of the pinned upstream SHA. C-41 source

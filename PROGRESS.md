@@ -10175,3 +10175,9 @@ deployment changed; S9 remains incomplete.
 **Inventory.** Verified pinned commit `748066d59b22e52a50bd06355a4f9ad52f708e9a`. It improves the upstream RCD OpenCL/CPU differential through corrected edge initialization/guards, FMA contraction and precise division; it does not change CPU RCD. Classified **REFERENCE — S16 GPU follow-up**, since C-41's active Rust RAW path uses CPU/Rayon `demosaic_rcd` and has no GPU demosaicer. Updated the commit ledger, demosaic matrix and roadmap. Broader precision-related commits remain untriaged.
 
 **Verification.** Manually checked the full upstream diff, ancestry and Rust/C demosaic paths. The Pi subagent/reviewer extension conflict remains unresolved; no independent reviewer verdict is claimed for this documentation-only increment. All four `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or deployment changed; S9 remains incomplete.
+
+## 2026-11-14 16:52 UTC — S9 color-picker precision candidate triaged
+
+**Inventory.** Verified pinned commit `1d19780b9c81a42242a17b7da1499156eaaf6930`, which sums per-row picker statistics in double to avoid large-area CPU mean drift and CPU/OpenCL disagreement. C-41's GTK4 click path samples one pixel from the displayed 8-bit sRGB `CachedRender`; it has no area ROI, mean/min/max statistics or multi-space sample. Classified the precision change **REFERENCE — S17** for a future area-picker workflow, not as a standalone fix to point sampling. Added the workflow matrix row, selected commit evidence and roadmap note.
+
+**Verification.** Manually checked the full upstream diff/ancestry and traced the C-41 click-to-`sample_pixel` path. The Pi subagent/reviewer extension conflict remains unresolved; no independent verdict is claimed for this documentation-only increment. All four `scripts/ci-local.sh` gates passed; `git diff --check` passed. No code or deployment changed; S9 remains incomplete.
