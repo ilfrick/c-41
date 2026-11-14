@@ -10025,3 +10025,33 @@ unverified live user-image dispatch/AMD-Intel runtime boundaries explicit.
 Independent senior review APPROVED. `scripts/ci-local.sh` passed all four
 gates; Compose configuration and `git diff --check` passed. No image rebuild or
 deployment has occurred yet; `c-41:8acf0f13e0` remains live.
+
+## 2026-11-14 15:13 UTC — S16 Exposure/Sigmoid fusion full-C rollout
+
+**Release.** After source commit `868a94e6`, the documentation release commit
+`6b2ba54e4f` updated the full-C build and release notes. Source commit
+`868a94e6` passed both GitHub checks (`check + test + clippy`, `Build & push
+Docker image`); docs commit `6b2ba54e4f` passed its Docker image check, with no
+`check + test + clippy` run listed for that commit. All four local Docker CI
+gates passed in the docs commit's pre-push hook. Built
+`c-41:6b2ba54e4f` with `CACHEBUST=6b2ba54e4f...`; full-C Release C build and
+Rust `c41-rs` link succeeded. Unlike the earlier Rust-dev workaround, the
+ignored hardware differential was then run against this exact full-C image with
+a read-only mounted test binary: GTX 1060 selected and actual Exposure/Sigmoid
+GPU dispatch, multiple spans around CPU Retouch, and CPU-equivalent output all
+passed.
+
+**Deployment.** Rolled out `c-41:6b2ba54e4f`, preserving environment, ports,
+persistent volume source, NVIDIA runtime/device request, and restart policy.
+The former live `c-41:8acf0f13e0` is stopped and retained as
+`c-41-rollback-6b2ba54e4f`. New container is healthy, zero restarts; HTTP and
+HTTPS both return 200, and NVIDIA ICD/loader plus GTX 1060 are visible. No other
+services were changed. The deployed code still only accelerates supported
+Exposure/Sigmoid spans; live user-image preview/export dispatch remains
+uninstrumented, with no general speedup claim. AMD/Intel runtimes remain
+unverified.
+
+**Documentation.** Updated `ROADMAP.md`, `PARITY_AUDIT.md`, and the S9 GPU row
+to record the exact deployed image, matching-image hardware test, rollback, and
+remaining limits. Independent senior review and final checks are pending.
+Installer artifacts remain untracked and untouched.

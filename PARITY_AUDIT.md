@@ -524,7 +524,7 @@ hits, both prose in comments citing darktable's `lua scripts installer`
 one. `data/lua/darktable/debug.lua` still ships, inherited from the fork — dead
 weight that reads as evidence the feature exists.
 
-### G5 — GPU: initial Rust OpenCL slice deployed on NVIDIA; broad coverage remains open
+### G5 — GPU: Exposure/Sigmoid fusion deployed on NVIDIA; broad coverage remains open
 
 **Historical baseline (before the S16-first slice):** the audit found no `opencl3`
 dependency, and the OpenCL surface in `c41-core` was only a scaffold.
@@ -551,16 +551,16 @@ pipeline and real dispatch. The latest five-run transfer-inclusive diagnostic
 compared the pre-fusion `Pipeline::process` with Rayon CPU on synthetic constant
 input: 1280×720 median 12.41 ms GPU vs 50.62 ms CPU; 6000×4000 median 577.67 ms
 vs 1.08 s. Earlier runs were materially slower; these are variable local
-diagnostics, not release-wide or image-quality claims. The NVIDIA full-C
-image/runtime `c-41:8acf0f13e0` remains deployed: `--gpus all`, NVIDIA
-ICD/loader visibility and health were verified; that image contains only the
-Sigmoid-only first slice. The post-fusion ignored GPU differential passed on GTX
-1060 in the Rust dev container using the loader copied read-only from the live
-runtime image; it covered repeated exposures, two GPU spans around a CPU Retouch
-stage, and whole-pipeline CPU equivalence. The new Exposure fusion has not yet
-been rebuilt into or deployed with the full-C image. No live-photo dispatch or
-speedup has been measured. AMD/Intel profiles pass device nodes but require a
-vendor OpenCL runtime/ICD inside the container and remain unverified.
+diagnostics, not release-wide or image-quality claims. The NVIDIA full-C image/runtime `c-41:6b2ba54e4f` is deployed; it was rebuilt
+from the Exposure/Sigmoid fusion source, and the ignored differential passed on
+GTX 1060 in that exact runtime image before rollout. It covered repeated
+exposures, multiple GPU spans around CPU Retouch, and whole-pipeline CPU
+equivalence. The live container is healthy, has zero restarts, requests
+`--gpus all`, and exposes NVIDIA ICD/loader; HTTP and HTTPS return 200. The prior
+`c-41:8acf0f13e0` image remains available as
+`c-41-rollback-6b2ba54e4f`. No live-photo dispatch or speedup has been measured.
+AMD/Intel profiles pass device nodes but require a vendor OpenCL runtime/ICD
+inside the container and remain unverified.
 
 The GPU **compose profiles are not a bug**, contrary to what a first pass at this
 suggested. `docker/docker-compose.yml:82,109,126` defines `nvidia`, `amd` and
