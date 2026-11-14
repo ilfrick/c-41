@@ -9811,6 +9811,23 @@ pipeline error/tiling design. No Contrast & Texture code was committed.
 **Deployment record correction.** The prior docs-only commit `053395cf39` was
 deployed after the earlier progress entry: direct Docker inspection confirms
 `c-41:053395cf39` healthy with zero restarts; previous `c-41:8640ff3779` is
-retained as `c-41-rollback-053395cf39`. This new roadmap/rawprepare change has
-not yet been committed or deployed. Installer files remain untracked and
-untouched.
+retained as `c-41-rollback-053395cf39`. At the time of this entry the new
+roadmap/rawprepare change had not yet been committed or deployed. Installer
+files remain untracked and untouched.
+
+## 2026-11-14 06:11 UTC — S9 release confirmation
+
+**Review and release.** Final independent senior review APPROVE. Commit
+`0b4befd92366ef57f056a5c7fc6cc2517b28c48d` was pushed to GitHub and Gitea;
+both `master` refs were verified. GitHub `check + test + clippy` and `Build &
+push Docker image` both completed successfully. The local full-image build
+succeeded with `CACHEBUST=0b4befd92366ef57f056a5c7fc6cc2517b28c48d` as
+`c-41:0b4befd923` (image ID
+`ef0e23ebe6600f6a2decaa2ff988fb3d01756467412ea1283aac9e4844b7c480`).
+
+**Deployment.** Swapped the running container, preserving mounts, environment,
+ports, NVIDIA runtime, and restart policy. `c-41` is healthy with zero restarts;
+`c41-rs` is running and HTTP/HTTPS both return 200. Startup logs have no fatal
+errors; existing Openbox/Mesa/XKB warnings remain. The previous image is
+retained as container `c-41-rollback-0b4befd923` and image
+target `c-41-rollback-0b4befd923:latest`. No other services were changed.

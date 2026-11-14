@@ -18,7 +18,7 @@
 - La ricognizione dei commit è stata **selettiva**, non esaustiva. Sono già emersi `contrastntexture`, `satcurvergb`, `spektrafilm`, DNG OpcodeList3 GainMap, modifiche RAW/white balance, highlights, precisione, HDR, maschere e cambiamenti GTK3/OpenCL.
 - **Consegne di parità registrate S1–S8:** framing, chromatic aberrations, watermark, color calibration, prime slice di liquify e retouch, fondazione ICC e Rec.2020 per non-RAW. Non equivalgono a parità completa: le lacune residue sono elencate sotto.
 - **Prossimo incremento formale: S9**, inventario upstream completo e prima ondata di import/porting. Un primo tentativo di Contrast & Texture è stato abbandonato prima del commit: il limite arbitrario di 4 milioni di pixel saltava silenziosamente l’effetto sulle immagini più grandi; rimuoverlo senza una strategia memoria/tiling coerente con il riferimento non è sicuro.
-- Il deploy registrato in questa sessione è `c-41:053395cf39`; il container precedente è conservato come rollback. Le modifiche di codice non verificate o non committate non sono parte delle release.
+- Deploy corrente: `c-41:0b4befd923` (commit `0b4befd92366ef57f056a5c7fc6cc2517b28c48d`), healthy, zero restart; `c-41-rollback-0b4befd923` conserva l’immagine precedente `c-41:053395cf39`. Le modifiche di codice non verificate o non committate non sono parte delle release.
 
 ## 3. Filone A — Fondazioni e migrazione Rust/GTK4
 
