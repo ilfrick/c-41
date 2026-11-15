@@ -193,10 +193,13 @@ impl LensFrame {
 }
 
 /// C&T proxy metadata, not an exact conversion to upstream piece/ROI values.
-/// Input dimensions and scale describe the pipeline input before geometry;
-/// content dimensions describe geometry output before borders. Preserve the
-/// input scale across geometry rather than inferring an upstream conversion.
-/// ROI scale is unknown here and must not be inferred from GTK.
+/// Input dimensions describe the raw preview buffer before geometry;
+/// `piece_scale` is C-41's source-to-preview proxy ratio, not a proven
+/// `piece.iscale` conversion. Content dimensions describe geometry output
+/// before borders. Preserve the proxy ratio instead of deriving it from geometry.
+/// Raw preview ROI scale records the pinned upstream finalscale reference
+/// (`roi_in.scale = 1.0`); non-raw metadata remains unknown. This does not
+/// establish C-41 proxy-to-C numerical equivalence.
 // Intentionally staged before C&T parameter/UI wiring; the next increment will
 // consume this metadata when constructing the enabled pipeline stage.
 #[allow(dead_code)]
@@ -1464,7 +1467,7 @@ fn spawn_decode(ctx: &PreviewCtx) {
                         content_height: h,
                         downscale_factor,
                         piece_scale,
-                        roi_scale: None,
+                        roi_scale: Some(1.0),
                     });
                     *ctx.pristine.borrow_mut() = Some((w, h, px));
                     ctx.pristine_gen.set(ctx.pristine_gen.get().wrapping_add(1));
@@ -6444,7 +6447,7 @@ mod tests {
             downscale_factor: 3,
             piece_scale: crate::raw_preview::piece_scale_from_dimensions(601, 401, 201, 134)
                 .unwrap(),
-            roi_scale: None,
+            roi_scale: Some(1.0),
         };
         let geometry = Geometry {
             orientation: Orientation::Rotate90Cw,
@@ -6468,7 +6471,13 @@ mod tests {
             transformed.max_piece_dimension(),
             original.input_width.max(original.input_height)
         );
-        assert_eq!(transformed.roi_scale, None);
+        assert_eq!(transformed.roi_scale, Some(1.0));
+
+        let non_raw = PieceRenderContext {
+            roi_scale: None,
+            ..original
+        };
+        assert_eq!(non_raw.with_geometry(geometry, true).roi_scale, None);
 
         let crop_edit = original.with_geometry(geometry, false);
         assert_eq!(
