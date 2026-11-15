@@ -29,6 +29,10 @@ use std::fmt;
 #[derive(Debug)]
 pub enum PreviewRenderError {
     InvalidInput(&'static str),
+    MissingContrastTextureContext,
+    UnsupportedInputProvenance,
+    InvalidContrastTextureContext,
+    InvalidContrastTextureParameters,
     ArithmeticOverflow,
     Allocation(std::collections::TryReserveError),
     Pipeline(PipelineError),
@@ -38,6 +42,10 @@ impl fmt::Display for PreviewRenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidInput(message) => f.write_str(message),
+            Self::MissingContrastTextureContext => f.write_str("Contrast & Texture requires an explicit render context"),
+            Self::UnsupportedInputProvenance => f.write_str("Contrast & Texture requires scene-referred linear input"),
+            Self::InvalidContrastTextureContext => f.write_str("invalid Contrast & Texture frame, content rectangle, or scales"),
+            Self::InvalidContrastTextureParameters => f.write_str("invalid Contrast & Texture parameters"),
             Self::ArithmeticOverflow => f.write_str("preview dimensions overflow"),
             Self::Allocation(error) => write!(f, "preview buffer allocation failed: {error}"),
             Self::Pipeline(error) => write!(f, "preview pipeline failed: {error}"),
@@ -46,6 +54,30 @@ impl fmt::Display for PreviewRenderError {
 }
 
 impl std::error::Error for PreviewRenderError {}
+
+/// Provenance of the numerical input, independent of its working primaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputProvenance { SceneReferredLinear, DisplayReferred }
+
+/// Geometry and scale information required by spatial Contrast & Texture.
+/// `content_rect` is in current-frame coordinates and must be the exact
+/// content region represented by matching Borders metadata (or the full frame).
+/// The frame is scene-linear; display-referred buffers must not opt in.
+#[derive(Clone, Copy, Debug)]
+pub struct ContrastTextureRenderContext {
+    pub frame_width: usize,
+    pub frame_height: usize,
+    pub content_rect: c41_core::borders::ContentRect,
+    /// Maximum piece dimension before scaling, as used by darktable's detail
+    /// radius calculation.
+    pub max_piece_dimension: f32,
+    /// Source-piece scale and viewport ROI scale are distinct quantities.
+    pub piece_scale: f32,
+    pub roi_scale: f32,
+    pub resource_level: c41_core::resource_budget::ResourceLevel,
+    pub provenance: InputProvenance,
+}
+
 
 impl From<PipelineError> for PreviewRenderError {
     fn from(error: PipelineError) -> Self {
@@ -298,6 +330,16 @@ pub struct PreviewParams {
     pub lc_shadows: f32,
     /// Highlight contrast, 0..2 default 0.5 (C `sigma_r`, same GUI treatment).
     pub lc_highlights: f32,
+    /// Contrast & Texture stage on/off. Requires explicit scene-linear render context.
+    pub contrast_texture_on: bool,
+    pub contrast_texture_gain_coarse: f32,
+    pub contrast_texture_gain_medium: f32,
+    pub contrast_texture_gain_fine: f32,
+    pub contrast_texture_detail_level: f32,
+    pub contrast_texture_halo_control: f32,
+    pub contrast_texture_noise_bias: f32,
+    pub contrast_texture_gain_shadows: f32,
+    pub contrast_texture_gain_highlights: f32,
     /// Detail strength, -1..4 default 0.25 (C `detail`; negative smooths,
     /// positive adds local contrast).
     pub lc_detail: f32,
@@ -1113,6 +1155,15 @@ impl Default for PreviewParams {
             lc_midtone: 0.5,
             lc_shadows: 0.5,
             lc_highlights: 0.5,
+            contrast_texture_on: false,
+            contrast_texture_gain_coarse: 0.0,
+            contrast_texture_gain_medium: 0.0,
+            contrast_texture_gain_fine: 0.0,
+            contrast_texture_detail_level: 5.0,
+            contrast_texture_halo_control: 0.0,
+            contrast_texture_noise_bias: 0.001,
+            contrast_texture_gain_shadows: 0.0,
+            contrast_texture_gain_highlights: 0.0,
             lc_detail: 0.25,
             // Primaries defaults: off, all hues at 0, all RGB purities at 1.0
             // (unchanged), achromatic tint purity at 0 (white point fixed).
@@ -1570,6 +1621,7 @@ impl PreviewParams {
         // while enabled (amount 0 does reproduce the input, but `to_pipeline`
         // still emits the stage whenever enabled, so the gate mirrors it).
         let soften_identity = !self.soften_on;
+        let contrast_texture_identity = !self.contrast_texture_on;
         // Chromatic aberrations gates on the enable flag alone (Bloom policy):
         // there is no slider combination that is a pass-through while enabled.
         // At the darktable defaults (guide G, radius 5, strength 0.5, standard)
@@ -1620,6 +1672,7 @@ impl PreviewParams {
             && soften_identity
             && cac_identity
             && wm_identity
+            && contrast_texture_identity
             && ccl_identity
             && liq_identity
             && retouch_identity
@@ -1948,7 +2001,7 @@ impl PreviewParams {
             // toggles and clip — appended after the watermark bool.
             self.ccl_on, self.ccl_normalize_r, self.ccl_normalize_g,
             self.ccl_normalize_b, self.ccl_normalize_sat, self.ccl_normalize_light,
-            self.ccl_normalize_grey, self.ccl_clip, self.liq_on, self.retouch_source_set, self.retouch_on] {
+            self.ccl_normalize_grey, self.ccl_clip, self.liq_on, self.retouch_source_set, self.retouch_on, self.contrast_texture_on] {
             v.push(b as u8);
         }
         for f in [
@@ -2174,7 +2227,15 @@ impl PreviewParams {
                   self.liq_offsets[40], self.liq_offsets[41], self.liq_offsets[42], self.liq_offsets[43], self.liq_offsets[44], self.liq_offsets[45], self.liq_offsets[46], self.liq_offsets[47], self.liq_offsets[48], self.liq_offsets[49],
                   self.retouch_source_x, self.retouch_source_y, self.retouch_dest_x,
                   self.retouch_dest_y, self.retouch_radius, self.retouch_opacity,
-                  Self::finite_clamp(self.retouch_feather, 0.0, 1.0, 0.0)] {
+                  Self::finite_clamp(self.retouch_feather, 0.0, 1.0, 0.0),
+                  Self::finite_clamp(self.contrast_texture_gain_coarse, -1.0, 5.0, 0.0),
+                  Self::finite_clamp(self.contrast_texture_gain_medium, -1.0, 5.0, 0.0),
+                  Self::finite_clamp(self.contrast_texture_gain_fine, -1.0, 5.0, 0.0),
+                  Self::finite_clamp(self.contrast_texture_detail_level, 1.0, 15.0, 5.0),
+                  Self::finite_clamp(self.contrast_texture_halo_control, -10.0, 10.0, 0.0),
+                  Self::finite_clamp(self.contrast_texture_noise_bias, 0.0, 1.0, 0.001),
+                  Self::finite_clamp(self.contrast_texture_gain_shadows, -5.0, 5.0, 0.0),
+                  Self::finite_clamp(self.contrast_texture_gain_highlights, -5.0, 5.0, 0.0)] {
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -2702,44 +2763,187 @@ impl PreviewParams {
             retouch_feather: Self::finite_clamp(
                 f.get(572).copied().unwrap_or(d.retouch_feather), 0.0, 1.0, d.retouch_feather,
             ),
+            contrast_texture_on: bools.get(60).map_or(d.contrast_texture_on, |&b| b != 0),
+            contrast_texture_gain_coarse: Self::finite_clamp(
+                f.get(573).copied().unwrap_or(d.contrast_texture_gain_coarse),
+                -1.0,
+                5.0,
+                d.contrast_texture_gain_coarse,
+            ),
+            contrast_texture_gain_medium: Self::finite_clamp(
+                f.get(574).copied().unwrap_or(d.contrast_texture_gain_medium),
+                -1.0,
+                5.0,
+                d.contrast_texture_gain_medium,
+            ),
+            contrast_texture_gain_fine: Self::finite_clamp(
+                f.get(575).copied().unwrap_or(d.contrast_texture_gain_fine),
+                -1.0,
+                5.0,
+                d.contrast_texture_gain_fine,
+            ),
+            contrast_texture_detail_level: Self::finite_clamp(
+                f.get(576).copied().unwrap_or(d.contrast_texture_detail_level),
+                1.0,
+                15.0,
+                d.contrast_texture_detail_level,
+            ),
+            contrast_texture_halo_control: Self::finite_clamp(
+                f.get(577).copied().unwrap_or(d.contrast_texture_halo_control),
+                -10.0,
+                10.0,
+                d.contrast_texture_halo_control,
+            ),
+            contrast_texture_noise_bias: Self::finite_clamp(
+                f.get(578).copied().unwrap_or(d.contrast_texture_noise_bias),
+                0.0,
+                1.0,
+                d.contrast_texture_noise_bias,
+            ),
+            contrast_texture_gain_shadows: Self::finite_clamp(
+                f.get(579).copied().unwrap_or(d.contrast_texture_gain_shadows),
+                -5.0,
+                5.0,
+                d.contrast_texture_gain_shadows,
+            ),
+            contrast_texture_gain_highlights: Self::finite_clamp(
+                f.get(580).copied().unwrap_or(d.contrast_texture_gain_highlights),
+                -5.0,
+                5.0,
+                d.contrast_texture_gain_highlights,
+            ),
         })
     }
 
-    /// Map the UI params to a `c41_core::pipeline::Pipeline`, converting UI
-    /// ranges to the physical params the core stages expect (EV→scale, velvia
-    /// strength /100, split compress (c/110)/2) and including only the enabled
-    /// stages that would actually change the image (so a bypassed/neutral set
-    /// yields an empty, identity pipeline).
-    ///
-    /// Stage order follows darktable's canonical v3.0 iop order
-    /// (`src/common/iop_order.c`: invert 2 → temperature 3 → exposure 21 →
-    /// channelmixerrgb 39 → sharpen 53 → colorcorrection 55 → colorcontrast 56 →
-    /// colorzones 60 → sigmoid 45.3 → levels 49 → velvia 57 → colorize 62 →
-    /// splittoning 67). The scene-referred stages
-    /// (exposure, the channel-mix to grey) run on unbounded linear data; sigmoid
-    /// tone-maps to display range; the display-referred creative stages (levels,
-    /// velvia, splittoning) run after it, where their [0,1] clamps are semantically
-    /// correct — running them before the tone map would hard-clip scene-linear
-    /// highlights (>1.0) that sigmoid is meant to roll off.
-    ///
-    /// Note the grey conversion here ports the *legacy* `channelmixer`, which in
-    /// darktable ran display-referred (~pos 65); we place it at the scene-referred
-    /// `channelmixerrgb` position 39 because linear luminance is the correct
-    /// domain to tone-map as luminance. A visible consequence of the reorder: with
-    /// `mono_on && split_on`, splittoning now tints the tone-mapped B&W image (the
-    /// intended split-toned-monochrome result). In the old order mono ran last and
-    /// silently discarded whatever velvia/splittoning had done.
-    ///
-    /// This only eliminates the highlight crush when sigmoid is *enabled*. With
-    /// `sigmoid_on == false` and a scene-linear source (the raw path, values
-    /// >1.0), velvia and splittoning still assume [0,1] display-referred input
-    /// and clamp — sigmoid is off for already-display-referred JPEGs, where that
-    /// assumption holds, and on for raws, where it is what saves the highlights.
-    /// [`Self::to_pipeline_with`] with the filename-derived grain seed. Only
-    /// useful where no image path is in scope; the darkroom and export funnels
-    /// pass `grain::hash_string(path)` so grain decorrelates per image exactly
-    /// as darktable's `_hash_string` does.
+    /// Fallible pipeline builder for an explicitly described render input.
+    /// When C&T is enabled, `context` must prove scene-referred linear
+    /// provenance and provide valid frame geometry, content bounds, and both
+    /// independent scales. With C&T disabled, the legacy stage list is retained.
+    pub fn try_to_pipeline_with_context(
+        &self,
+        space: ColorSpace,
+        scale: f32,
+        context: Option<ContrastTextureRenderContext>,
+    ) -> Result<Pipeline, PreviewRenderError> {
+        self.try_to_pipeline_with_context_and_gear(space, scale, context, None, 0)
+    }
+
+    /// Context-aware builder that preserves the in-pipeline lens stage and
+    /// caller-provided per-image grain seed.
+    pub fn try_to_pipeline_with_context_and_gear(
+        &self,
+        space: ColorSpace,
+        scale: f32,
+        context: Option<ContrastTextureRenderContext>,
+        lens_gear: Option<&LensGear>,
+        grain_seed: u32,
+    ) -> Result<Pipeline, PreviewRenderError> {
+        self.try_to_pipeline_with_context_inner(space, scale, context, lens_gear, grain_seed, true)
+    }
+
+    /// Context-aware builder for inputs whose lens correction was already
+    /// applied before geometry; it preserves the caller's grain seed.
+    pub fn try_to_pipeline_lens_preapplied_with_context(
+        &self,
+        space: ColorSpace,
+        scale: f32,
+        context: Option<ContrastTextureRenderContext>,
+        lens_gear: Option<&LensGear>,
+        grain_seed: u32,
+    ) -> Result<Pipeline, PreviewRenderError> {
+        self.try_to_pipeline_with_context_inner(space, scale, context, lens_gear, grain_seed, false)
+    }
+
+    fn try_to_pipeline_with_context_inner(
+        &self,
+        space: ColorSpace,
+        scale: f32,
+        context: Option<ContrastTextureRenderContext>,
+        lens_gear: Option<&LensGear>,
+        grain_seed: u32,
+        lens_stage: bool,
+    ) -> Result<Pipeline, PreviewRenderError> {
+        if !self.contrast_texture_on {
+            return Ok(self.to_pipeline_inner(
+                space,
+                scale,
+                lens_gear,
+                grain_seed,
+                lens_stage,
+                None,
+            ));
+        }
+
+        let context = context.ok_or(PreviewRenderError::MissingContrastTextureContext)?;
+        if context.provenance != InputProvenance::SceneReferredLinear {
+            return Err(PreviewRenderError::UnsupportedInputProvenance);
+        }
+
+        let rect = context.content_rect;
+        let invalid_rect = rect.width == 0
+            || rect.height == 0
+            || rect
+                .x
+                .checked_add(rect.width)
+                .is_none_or(|right| right > context.frame_width)
+            || rect
+                .y
+                .checked_add(rect.height)
+                .is_none_or(|bottom| bottom > context.frame_height);
+        if context.frame_width == 0
+            || context.frame_height == 0
+            || invalid_rect
+            || !context.max_piece_dimension.is_finite()
+            || context.max_piece_dimension <= 0.0
+            || !context.piece_scale.is_finite()
+            || context.piece_scale <= 0.0
+            || !context.roi_scale.is_finite()
+            || context.roi_scale <= 0.0
+        {
+            return Err(PreviewRenderError::InvalidContrastTextureContext);
+        }
+
+        let params = c41_core::iop::contrastntexture::ContrastTextureParams {
+            gain_coarse: self.contrast_texture_gain_coarse,
+            gain_medium: self.contrast_texture_gain_medium,
+            gain_fine: self.contrast_texture_gain_fine,
+            detail_level: self.contrast_texture_detail_level,
+            halo_control: self.contrast_texture_halo_control,
+            noise_bias: self.contrast_texture_noise_bias,
+            gain_shadows: self.contrast_texture_gain_shadows,
+            gain_highlights: self.contrast_texture_gain_highlights,
+        }
+        .validate()
+        .map_err(|_| PreviewRenderError::InvalidContrastTextureParameters)?;
+
+        let mut params_without_ct = *self;
+        params_without_ct.contrast_texture_on = false;
+        let stage = Stage::ContrastTexture {
+            content_rect: rect,
+            params,
+            max_piece_dimension: context.max_piece_dimension,
+            piece_scale: context.piece_scale,
+            roi_scale: context.roi_scale,
+            resource_level: context.resource_level,
+        };
+        Ok(params_without_ct.to_pipeline_inner(
+            space,
+            scale,
+            lens_gear,
+            grain_seed,
+            lens_stage,
+            Some(stage),
+        ))
+    }
+
+    /// Legacy infallible builder. Panics if C&T is enabled because it cannot
+    /// prove source provenance or provide the spatial render context; use
+    /// [`Self::try_to_pipeline_with_context`] for that case.
     pub fn to_pipeline(&self, space: ColorSpace, scale: f32) -> Pipeline {
+        assert!(
+            !self.contrast_texture_on,
+            "Contrast & Texture is spatial and requires explicit input provenance/context; use try_to_pipeline_with_context"
+        );
         self.to_pipeline_with(space, scale, None, 0)
     }
 
@@ -2767,7 +2971,11 @@ impl PreviewParams {
         )>,
         grain_seed: u32,
     ) -> Pipeline {
-        self.to_pipeline_inner(space, scale, lens_gear, grain_seed, true)
+        assert!(
+            !self.contrast_texture_on,
+            "Contrast & Texture is spatial and requires explicit input provenance/context; use try_to_pipeline_with_context"
+        );
+        self.to_pipeline_inner(space, scale, lens_gear, grain_seed, true, None)
     }
 
     /// [`Self::to_pipeline_with`] for buffers the lens warp has **already been
@@ -2786,7 +2994,11 @@ impl PreviewParams {
         )>,
         grain_seed: u32,
     ) -> Pipeline {
-        self.to_pipeline_inner(space, scale, lens_gear, grain_seed, false)
+        assert!(
+            !self.contrast_texture_on,
+            "Contrast & Texture is spatial and requires explicit input provenance/context; use try_to_pipeline_with_context"
+        );
+        self.to_pipeline_inner(space, scale, lens_gear, grain_seed, false, None)
     }
 
     /// Shared builder; `lens_stage` selects whether the lens-correction stage
@@ -2803,6 +3015,7 @@ impl PreviewParams {
         )>,
         grain_seed: u32,
         lens_stage: bool,
+        contrast_texture_stage: Option<Stage>,
     ) -> Pipeline {
         let mut p = Pipeline::new();
         // Invert (film-camera negative, iop_order.c pos 2, before temperature 3) —
@@ -3053,6 +3266,7 @@ impl PreviewParams {
                 ),
             });
         }
+        if let Some(stage) = contrast_texture_stage { p.push(stage); }
         if self.mono_on {
             p.push(Stage::Monochrome { r: self.mono_r, g: self.mono_g, b: self.mono_b });
         }
@@ -3731,10 +3945,11 @@ const LEVELS_MIN_RANGE: f32 = 1.0;
 /// dropdown ordinal) — a normal pipeline stage (v50 pos 28.5).
 /// v38 appends Liquify's 5×5 normalized `(dx,dy)` lattice (50 f32s) and an
 /// enable flag; it is a frame-global stage before color calibration.
-/// v39 appends one clone stamp (2 bools + 6 f32s).
-const ENCODE_VERSION: u8 = 40;
-/// 1 version byte + 60 bool bytes + 573 little-endian f32.
-const ENCODED_LEN: usize = 1 + 60 + 573 * 4;
+/// v39 appends one clone stamp (2 bools + 6 f32s); v40 appends Retouch
+/// feather (1 f32); v41 appends C&T enable + 8 f32 settings.
+const ENCODE_VERSION: u8 = 41;
+/// v41: 1 version byte + 61 bool bytes + 581 little-endian f32.
+const ENCODED_LEN: usize = 1 + 61 + 581 * 4;
 
 /// `(version, n_bools, n_f32s)` for every `PreviewParams` layout ever written.
 /// Append-only: a new module appends to both regions. Public so
@@ -3770,6 +3985,7 @@ pub(crate) const PARAMS_LAYOUTS: &[(u8, usize, usize)] = &[
     (38, 58, 566), // v38: Liquify 5×5 normalized dx/dy lattice added
     (39, 60, 572), // v39: one Retouch clone stamp added
     (40, 60, 573), // v40: Retouch feather appended
+    (41, 61, 581), // v41: Contrast & Texture appended
 ];
 
 /// Encoded byte length of a `PreviewParams` blob at `version`, or `None` if the
@@ -3846,6 +4062,10 @@ pub fn apply_pipeline_gear(
     lens_gear: Option<&LensGear>,
     grain_seed: u32,
 ) -> Vec<u8> {
+    assert!(
+        !params.contrast_texture_on,
+        "Contrast & Texture requires scene-referred render context; use a context-aware builder"
+    );
     try_apply_pipeline_gear(base, width, height, rowstride, nch, params, lens_gear, grain_seed)
         .unwrap_or_else(|_| base.to_vec())
 }
@@ -3864,6 +4084,9 @@ pub fn try_apply_pipeline_gear(
     lens_gear: Option<&LensGear>,
     grain_seed: u32,
 ) -> Result<Vec<u8>, PreviewRenderError> {
+    if params.contrast_texture_on {
+        return Err(PreviewRenderError::UnsupportedInputProvenance);
+    }
     if nch == 0 || width == 0 || height == 0 {
         return Err(PreviewRenderError::InvalidInput("zero image dimension or channel count"));
     }
@@ -3941,6 +4164,7 @@ pub fn apply_pipeline_rgb16_gear(
     lens_gear: Option<&LensGear>,
     grain_seed: u32,
 ) -> Vec<u16> {
+    assert!(!params.contrast_texture_on, "Contrast & Texture requires explicit scene-referred render context; use try_to_pipeline_with_context");
     let n = width.saturating_mul(height);
     if width == 0 || height == 0 || base.len() < n * 3 {
         return base.to_vec();
@@ -3979,6 +4203,9 @@ pub fn try_apply_pipeline_rgb16_gear(
     lens_gear: Option<&LensGear>,
     grain_seed: u32,
 ) -> Result<Vec<u16>, PreviewRenderError> {
+    if params.contrast_texture_on {
+        return Err(PreviewRenderError::UnsupportedInputProvenance);
+    }
     let (pixels, _) = checked_pixel_shape(width, height)?;
     let expected = pixels.checked_mul(3).ok_or(PreviewRenderError::ArithmeticOverflow)?;
     if base.len() < expected {
@@ -4306,6 +4533,9 @@ fn try_srgb_encode_rgb(
     lens_gear: Option<&LensGear>,
     grain_seed: u32,
 ) -> Result<Vec<f32>, PreviewRenderError> {
+    if params.contrast_texture_on {
+        return Err(PreviewRenderError::MissingContrastTextureContext);
+    }
     let (pixels, rgba_len) = checked_linear_shape(linear, width, height)?;
     let mut processed = params
         .to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
@@ -4358,6 +4588,9 @@ pub fn try_render_linear_to_output16_gear(
     lens_gear: Option<&LensGear>, grain_seed: u32,
     profile: c41_core::icc::OutputProfile,
 ) -> Result<Option<Vec<u16>>, PreviewRenderError> {
+    if params.contrast_texture_on {
+        return Err(PreviewRenderError::MissingContrastTextureContext);
+    }
     if profile.is_srgb() {
         return try_render_linear_to_srgb16_gear(linear, width, height, params, lens_gear, grain_seed)
             .map(Some);
@@ -4389,6 +4622,9 @@ pub(crate) fn try_render_nonraw_linear_to_srgb8_gear(
     linear: &[f32], width: usize, height: usize, params: &PreviewParams,
     lens_gear: Option<&LensGear>, grain_seed: u32,
 ) -> Result<Vec<u8>, PreviewRenderError> {
+    if params.contrast_texture_on {
+        return Err(PreviewRenderError::UnsupportedInputProvenance);
+    }
     let (pixels, rgba_len) = checked_linear_shape(linear, width, height)?;
     let mut processed = params
         .to_pipeline_with(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
@@ -4410,6 +4646,9 @@ pub(crate) fn try_render_nonraw_linear_to_output16_gear(
     lens_gear: Option<&LensGear>, grain_seed: u32,
     profile: c41_core::icc::OutputProfile,
 ) -> Result<Option<Vec<u16>>, PreviewRenderError> {
+    if params.contrast_texture_on {
+        return Err(PreviewRenderError::UnsupportedInputProvenance);
+    }
     let (pixels, rgba_len) = checked_linear_shape(linear, width, height)?;
     let processed = params
         .to_pipeline_with(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
@@ -5009,12 +5248,286 @@ pub(crate) fn fully_populated_params() -> PreviewParams {
         retouch_radius: 0.035,
         retouch_opacity: 72.0,
         retouch_feather: 0.37,
+        contrast_texture_on: true,
+        contrast_texture_gain_coarse: 0.2,
+        contrast_texture_gain_medium: -0.3,
+        contrast_texture_gain_fine: 0.4,
+        contrast_texture_detail_level: 2.5,
+        contrast_texture_halo_control: 0.35,
+        contrast_texture_noise_bias: 0.02,
+        contrast_texture_gain_shadows: -0.15,
+        contrast_texture_gain_highlights: 0.25,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ct_context(provenance: InputProvenance) -> ContrastTextureRenderContext {
+        ContrastTextureRenderContext {
+            frame_width: 32, frame_height: 24,
+            content_rect: c41_core::borders::ContentRect { x: 0, y: 0, width: 32, height: 24 },
+            max_piece_dimension: 64.0, piece_scale: 1.0, roi_scale: 1.0,
+            resource_level: c41_core::resource_budget::ResourceLevel::Default, provenance,
+        }
+    }
+
+    fn ct_params() -> PreviewParams {
+        PreviewParams {
+            contrast_texture_on: true,
+            contrast_texture_gain_coarse: 0.5,
+            contrast_texture_gain_medium: -0.25,
+            contrast_texture_gain_fine: 1.0,
+            contrast_texture_detail_level: 7.0,
+            contrast_texture_halo_control: -1.5,
+            contrast_texture_noise_bias: 0.75,
+            contrast_texture_gain_shadows: -2.0,
+            contrast_texture_gain_highlights: 1.5,
+            ..PreviewParams::default()
+        }
+    }
+
+    fn ct_pipeline(params: &PreviewParams) -> Pipeline {
+        params
+            .try_to_pipeline_with_context(
+                ColorSpace::LinearSrgb,
+                1.0,
+                Some(ct_context(InputProvenance::SceneReferredLinear)),
+            )
+            .unwrap()
+    }
+
+    fn stage_index(pipeline: &Pipeline, name: &str) -> usize {
+        pipeline.stages.iter().position(|stage| stage.name() == name).unwrap()
+    }
+
+    #[test]
+    fn contrast_texture_v41_roundtrip_and_v40_defaults() {
+        let params = ct_params();
+        let encoded = params.encode();
+        assert_eq!(encoded.len(), 2386);
+        assert_eq!(encoded[0], 41);
+        assert_eq!(encoded_len_for_version(40), Some(2353));
+        assert_eq!(encoded_len_for_version(41), Some(2386));
+        let decoded = PreviewParams::decode(&encoded).unwrap();
+        assert_eq!(decoded.contrast_texture_on, params.contrast_texture_on);
+        assert_eq!(decoded.contrast_texture_gain_coarse, params.contrast_texture_gain_coarse);
+        assert_eq!(decoded.contrast_texture_gain_medium, params.contrast_texture_gain_medium);
+        assert_eq!(decoded.contrast_texture_gain_fine, params.contrast_texture_gain_fine);
+        assert_eq!(decoded.contrast_texture_detail_level, params.contrast_texture_detail_level);
+        assert_eq!(decoded.contrast_texture_halo_control, params.contrast_texture_halo_control);
+        assert_eq!(decoded.contrast_texture_noise_bias, params.contrast_texture_noise_bias);
+        assert_eq!(decoded.contrast_texture_gain_shadows, params.contrast_texture_gain_shadows);
+        assert_eq!(decoded.contrast_texture_gain_highlights, params.contrast_texture_gain_highlights);
+
+        let mut invalid = ct_params();
+        invalid.contrast_texture_gain_coarse = f32::NAN;
+        invalid.contrast_texture_detail_level = 99.0;
+        let sanitized = PreviewParams::decode(&invalid.encode()).unwrap();
+        assert_eq!(sanitized.contrast_texture_gain_coarse, 0.0);
+        assert_eq!(sanitized.contrast_texture_detail_level, 15.0);
+
+        let mut v40_params = PreviewParams::default();
+        v40_params.ev = 0.65;
+        v40_params.retouch_feather = 0.73;
+        let mut v40 = v40_params.encode();
+        // v41 adds the C&T enable byte at bool index 60. Remove it before
+        // interpreting this as the historical v40 layout.
+        v40.remove(1 + 60);
+        v40[0] = 40;
+        v40.truncate(1 + 60 + 573 * 4);
+        let decoded = PreviewParams::decode(&v40).unwrap();
+        assert_eq!(decoded.ev, v40_params.ev);
+        assert_eq!(decoded.retouch_feather, v40_params.retouch_feather);
+        assert!(!decoded.contrast_texture_on);
+        assert_eq!(decoded.contrast_texture_gain_coarse, 0.0);
+        assert_eq!(decoded.contrast_texture_gain_medium, 0.0);
+        assert_eq!(decoded.contrast_texture_gain_fine, 0.0);
+        assert_eq!(decoded.contrast_texture_detail_level, 5.0);
+        assert_eq!(decoded.contrast_texture_halo_control, 0.0);
+        assert_eq!(decoded.contrast_texture_noise_bias, 0.001);
+        assert_eq!(decoded.contrast_texture_gain_shadows, 0.0);
+        assert_eq!(decoded.contrast_texture_gain_highlights, 0.0);
+        assert!(PreviewParams::default().is_identity());
+    }
+
+    #[test]
+    fn contrast_texture_context_validates_domain_geometry_and_scales() {
+        let params = ct_params();
+        let build = |context| params.try_to_pipeline_with_context(ColorSpace::LinearSrgb, 1.0, Some(context));
+        assert!(matches!(params.try_to_pipeline_with_context(ColorSpace::LinearSrgb, 1.0, None), Err(PreviewRenderError::MissingContrastTextureContext)));
+        assert!(matches!(build(ct_context(InputProvenance::DisplayReferred)), Err(PreviewRenderError::UnsupportedInputProvenance)));
+
+        let mut invalid = ct_context(InputProvenance::SceneReferredLinear);
+        invalid.frame_width = 0;
+        assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+        invalid = ct_context(InputProvenance::SceneReferredLinear);
+        invalid.frame_height = 0;
+        assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+        invalid = ct_context(InputProvenance::SceneReferredLinear);
+        invalid.content_rect.width = 0;
+        assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+        invalid = ct_context(InputProvenance::SceneReferredLinear);
+        invalid.content_rect.height = 0;
+        assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+        invalid = ct_context(InputProvenance::SceneReferredLinear);
+        invalid.content_rect.x = invalid.frame_width;
+        invalid.content_rect.width = 1;
+        assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+        invalid = ct_context(InputProvenance::SceneReferredLinear);
+        invalid.content_rect.y = invalid.frame_height;
+        invalid.content_rect.height = 1;
+        assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+        invalid = ct_context(InputProvenance::SceneReferredLinear);
+        invalid.content_rect.x = usize::MAX;
+        invalid.content_rect.width = 1;
+        assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            invalid = ct_context(InputProvenance::SceneReferredLinear);
+            invalid.piece_scale = scale;
+            assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+            invalid = ct_context(InputProvenance::SceneReferredLinear);
+            invalid.roi_scale = scale;
+            assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+        }
+        for max_dimension in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            invalid = ct_context(InputProvenance::SceneReferredLinear);
+            invalid.max_piece_dimension = max_dimension;
+            assert!(matches!(build(invalid), Err(PreviewRenderError::InvalidContrastTextureContext)));
+        }
+        let mut invalid_params = params;
+        invalid_params.contrast_texture_gain_coarse = 6.0;
+        assert!(matches!(invalid_params.try_to_pipeline_with_context(ColorSpace::LinearSrgb, 1.0, Some(ct_context(InputProvenance::SceneReferredLinear))), Err(PreviewRenderError::InvalidContrastTextureParameters)));
+    }
+
+    #[test]
+    fn contrast_texture_stage_mapping_and_fixed_order() {
+        let mut context = ct_context(InputProvenance::SceneReferredLinear);
+        context.content_rect = c41_core::borders::ContentRect { x: 3, y: 4, width: 12, height: 9 };
+        context.max_piece_dimension = 128.0;
+        context.piece_scale = 0.5;
+        context.roi_scale = 1.25;
+        let mut params = ct_params();
+        params.vibrance_on = true;
+        params.vibrance_amount = 25.0;
+        let pipeline = params.try_to_pipeline_with_context(ColorSpace::Rec2020, 1.0, Some(context)).unwrap();
+        let ct_index = stage_index(&pipeline, "contrastntexture");
+        assert!(ct_index < stage_index(&pipeline, "vibrance"));
+        match &pipeline.stages[ct_index] {
+            Stage::ContrastTexture { content_rect, params, max_piece_dimension, piece_scale, roi_scale, .. } => {
+                assert_eq!((content_rect.x, content_rect.y, content_rect.width, content_rect.height), (3, 4, 12, 9));
+                assert_eq!(*max_piece_dimension, 128.0);
+                assert_eq!(*piece_scale, 0.5);
+                assert_eq!(*roi_scale, 1.25);
+                assert_eq!(params.gain_coarse, 0.5);
+                assert_eq!(params.gain_medium, -0.25);
+                assert_eq!(params.gain_fine, 1.0);
+                assert_eq!(params.detail_level, 7.0);
+                assert_eq!(params.halo_control, -1.5);
+                assert_eq!(params.noise_bias, 0.75);
+                assert_eq!(params.gain_shadows, -2.0);
+                assert_eq!(params.gain_highlights, 1.5);
+            }
+            _ => panic!("expected Contrast & Texture stage"),
+        }
+
+        params.ccl_on = true;
+        params.negadoctor_on = true;
+        params.primaries_on = true;
+        params.primaries_red_hue = 10.0;
+        params.mono_on = true;
+        params.sharpen_on = true;
+        params.sharpen_amount = 0.5;
+        params.sharpen_radius = 1.0;
+        let pipeline = ct_pipeline(&params);
+        let ct_index = stage_index(&pipeline, "contrastntexture");
+        for preceding in ["channelmixerrgb", "negadoctor", "primaries"] {
+            assert!(stage_index(&pipeline, preceding) < ct_index, "{preceding} must precede C&T");
+        }
+        for following in ["channelmixer", "sharpen", "vibrance"] {
+            assert!(ct_index < stage_index(&pipeline, following), "C&T must precede {following}");
+        }
+    }
+
+    #[test]
+    fn contrast_texture_context_builder_preserves_disabled_order_and_grain_seed() {
+        let params = PreviewParams::default();
+        let legacy = params.to_pipeline_with(ColorSpace::Rec2020, 1.0, None, 0);
+        let context = params
+            .try_to_pipeline_with_context(ColorSpace::Rec2020, 1.0, None)
+            .unwrap();
+        assert_eq!(legacy.stages, context.stages);
+
+        let mut params = ct_params();
+        params.gr_on = true;
+        params.gr_strength = 0.5;
+        let context = Some(ct_context(InputProvenance::SceneReferredLinear));
+        let pipeline = params
+            .try_to_pipeline_with_context_and_gear(ColorSpace::Rec2020, 1.0, context, None, 0x1234)
+            .unwrap();
+        assert!(pipeline.stages.iter().any(|stage| matches!(
+            stage,
+            Stage::Grain { hash_seed: 0x1234, .. }
+        )));
+    }
+
+    #[test]
+    fn contrast_texture_context_builder_preserves_lens_preapplied_selection() {
+        if !std::path::Path::new("/usr/share/lensfun").is_dir() {
+            eprintln!("skipping lens-selection assertions: /usr/share/lensfun is unavailable");
+            return;
+        }
+        let Some(gear) = c41_core::iop::lens::resolve(
+            "Canon",
+            "Canon EOS 5D Mark II",
+            "Canon",
+            "Canon EF 24-70mm f/2.8L USM",
+        ) else {
+            eprintln!("skipping lens-selection assertions: Canon test gear is unavailable");
+            return;
+        };
+        let mut params = ct_params();
+        params.lens_on = true;
+        let context = Some(ct_context(InputProvenance::SceneReferredLinear));
+        let normal = params
+            .try_to_pipeline_with_context_and_gear(
+                ColorSpace::Rec2020,
+                1.0,
+                context,
+                Some(&gear),
+                0,
+            )
+            .unwrap();
+        let preapplied = params
+            .try_to_pipeline_lens_preapplied_with_context(
+                ColorSpace::Rec2020,
+                1.0,
+                context,
+                Some(&gear),
+                0,
+            )
+            .unwrap();
+        assert!(normal.stages.iter().any(|stage| matches!(stage, Stage::LensCorrection { .. })));
+        assert!(!preapplied.stages.iter().any(|stage| matches!(stage, Stage::LensCorrection { .. })));
+    }
+
+    #[test]
+    fn contrast_texture_legacy_and_fallible_helpers_fail_explicitly() {
+        let params = ct_params();
+        assert!(std::panic::catch_unwind(|| params.to_pipeline(ColorSpace::LinearSrgb, 1.0)).is_err());
+        assert!(std::panic::catch_unwind(|| params.to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, None, 0)).is_err());
+        assert!(std::panic::catch_unwind(|| apply_pipeline_gear(&[0, 0, 0], 1, 1, 3, 3, &params, None, 0)).is_err());
+        assert!(matches!(try_apply_pipeline_gear(&[0, 0, 0], 1, 1, 3, 3, &params, None, 0), Err(PreviewRenderError::UnsupportedInputProvenance)));
+        assert!(matches!(try_apply_pipeline_rgb16_gear(&[0; 3], 1, 1, &params, None, 0), Err(PreviewRenderError::UnsupportedInputProvenance)));
+        let linear = [0.1, 0.2, 0.3, 1.0];
+        assert!(matches!(try_render_linear_to_srgb8_gear(&linear, 1, 1, &params, None, 0), Err(PreviewRenderError::MissingContrastTextureContext)));
+        assert!(matches!(try_render_linear_to_output16_gear(&linear, 1, 1, &params, None, 0, c41_core::icc::OutputProfile::Srgb), Err(PreviewRenderError::MissingContrastTextureContext)));
+        assert!(matches!(try_render_nonraw_linear_to_srgb8_gear(&linear, 1, 1, &params, None, 0), Err(PreviewRenderError::UnsupportedInputProvenance)));
+        assert!(matches!(try_render_nonraw_linear_to_output16_gear(&linear, 1, 1, &params, None, 0, c41_core::icc::OutputProfile::Srgb), Err(PreviewRenderError::UnsupportedInputProvenance)));
+        assert!(matches!(try_render_nonraw_linear_to_output8_gear(&linear, 1, 1, &params, None, 0, c41_core::icc::OutputProfile::Srgb), Err(PreviewRenderError::UnsupportedInputProvenance)));
+    }
 
     fn exposure_only(black: f32, ev: f32) -> PreviewParams {
         PreviewParams {
@@ -6388,7 +6901,7 @@ mod tests {
         let mut v38 = Vec::with_capacity(v38_len);
         v38.push(38);
         v38.extend_from_slice(&current[1..1 + 58]);
-        v38.extend_from_slice(&current[1 + 60..]);
+        v38.extend_from_slice(&current[1 + 61..]);
         v38.truncate(v38_len);
         let old = PreviewParams::decode(&v38).expect("v38 must decode");
         assert_eq!(old.retouch_radius, 0.02);
@@ -6448,7 +6961,7 @@ mod tests {
     #[test]
     fn retouch_decode_sanitizes_non_finite_and_out_of_range_controls() {
         let mut blob = PreviewParams::default().encode();
-        let float_base = 1 + 60;
+        let float_base = 1 + 61;
         for (index, value) in [(566, f32::NAN), (567, f32::INFINITY), (568, -4.0), (569, 4.0), (570, f32::NEG_INFINITY), (571, f32::NAN), (572, 2.0)] {
             let start = float_base + index * 4;
             blob[start..start + 4].copy_from_slice(&value.to_le_bytes());

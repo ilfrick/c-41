@@ -3274,7 +3274,19 @@ fn styles_module_group(
     apply_btn.connect_clicked(move |_| {
         let Some(dd) = dd_w.upgrade() else { return };
         let Some(style) = styles.get(dd.selected() as usize) else { return };
-        let merged = crate::stylemodules::apply_style(&ctx_cl.params.borrow(), style);
+        let merged = match crate::stylemodules::apply_style(&ctx_cl.params.borrow(), style) {
+            Ok(merged) => merged,
+            Err(error) => {
+                let message = format!("Style not applied: {error}");
+                if let Some(group) = group_w.upgrade() {
+                    group.set_description(Some(&message));
+                }
+                if let Some(overlay) = ctx_cl.render_toast.borrow().as_ref().and_then(|weak| weak.upgrade()) {
+                    overlay.add_toast(adw::Toast::new(&message));
+                }
+                return;
+            }
+        };
         *ctx_cl.params.borrow_mut() = merged;
         ctx_cl.bypass.set(false); // applying exits the before/after peek, like Reset
         if let Some(ba) = ba_w.upgrade() {
@@ -3640,6 +3652,7 @@ fn reset_module(params: &mut PreviewParams, which: &str) -> bool {
         "Chromatic aberrations" => set!(cac_on, cac_guide, cac_radius, cac_strength, cac_mode, cac_refine),
         "Watermark" => set!(wm_on, wm_asset, wm_opacity, wm_scale, wm_xoffset, wm_yoffset, wm_alignment, wm_rotate),
         "Liquify" => set!(liq_on, liq_offsets),
+        "C&T" => set!(contrast_texture_on, contrast_texture_gain_coarse, contrast_texture_gain_medium, contrast_texture_gain_fine, contrast_texture_detail_level, contrast_texture_halo_control, contrast_texture_noise_bias, contrast_texture_gain_shadows, contrast_texture_gain_highlights),
         "Lens correction" => set!(
             lens_on,
             lens_inverse,
@@ -7322,6 +7335,17 @@ mod tests {
             p.liq_offsets[24] = 0.125;
             p.liq_offsets[25] = -0.25;
         }),
+        ("C&T", |p| {
+            p.contrast_texture_on = true;
+            p.contrast_texture_gain_coarse = M;
+            p.contrast_texture_gain_medium = -M;
+            p.contrast_texture_gain_fine = M;
+            p.contrast_texture_detail_level = 2.5;
+            p.contrast_texture_halo_control = M;
+            p.contrast_texture_noise_bias = 0.02;
+            p.contrast_texture_gain_shadows = -M;
+            p.contrast_texture_gain_highlights = M;
+        }),
         ("Watermark", |p| {
             p.wm_on = true;
             p.wm_asset = M;
@@ -7764,6 +7788,15 @@ mod tests {
             retouch_radius: _,
             retouch_opacity: _,
             retouch_feather: _,
+            contrast_texture_on: _,
+            contrast_texture_gain_coarse: _,
+            contrast_texture_gain_medium: _,
+            contrast_texture_gain_fine: _,
+            contrast_texture_detail_level: _,
+            contrast_texture_halo_control: _,
+            contrast_texture_noise_bias: _,
+            contrast_texture_gain_shadows: _,
+            contrast_texture_gain_highlights: _,
         } = PreviewParams::default();
     }
 
@@ -7795,6 +7828,8 @@ mod tests {
     /// by the file's embedded profile and the per-file assumption in the DB, not
     /// by the edit params, and its row has no enable switch or reset button.
     const PARAMLESS_MODULES: &[&str] = &["Input color profile"];
+    // PreviewParams/history/style support exists before the GTK module is live.
+    const STAGED_MODULE_LABELS: &[&str] = &["C&T"];
 
     /// The mutation table and `reset_module` cover the same module set as the
     /// live-module list — every live module *that has parameters*, so a newly
@@ -7824,9 +7859,15 @@ mod tests {
         }
         for (label, _) in MODULE_MUTATIONS {
             assert!(
-                LIVE_MODULE_LABELS.contains(label),
-                "mutation-table entry {label:?} is not a live module"
+                LIVE_MODULE_LABELS.contains(label) || STAGED_MODULE_LABELS.contains(label),
+                "mutation-table entry {label:?} is neither live nor explicitly staged"
             );
+        }
+        for label in STAGED_MODULE_LABELS {
+            assert!(!LIVE_MODULE_LABELS.contains(label), "staged module {label:?} must not render as live");
+            assert!(MODULE_MUTATIONS.iter().any(|(l, _)| l == label));
+            let mut params = PreviewParams { ev: 1.0, ..Default::default() };
+            assert!(reset_module(&mut params, label));
         }
         // The exception list must name real live modules, or it would silently
         // stop exempting anything.

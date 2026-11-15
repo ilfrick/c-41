@@ -7,10 +7,11 @@
 //! module-group names in `c41_styles.modules`; this module owns what such a
 //! name means: which `PreviewParams` fields belong to it.
 //!
-//! Coupling, stated plainly — three places must know every field:
-//! [`crate::preview::PreviewParams`]'s encode/decode, `history::describe_change`'s
-//! group comparisons, and [`copy_module_group`] here. Adding a field without
-//! extending all three compiles fine; the drift guards are
+//! Supported modules couple [`crate::preview::PreviewParams`]'s encode/decode,
+//! `history::describe_change`'s group comparisons, and [`copy_module_group`]
+//! here. C&T is a staged exception: its settings and history label exist, but
+//! partial-style apply deliberately ignores it until rendering can accept its
+//! required scene-linear context. Drift guards include
 //! `params_encode_decode_roundtrips`, the exhaustive-destructure test in
 //! `history.rs`, and `merging_every_group_equals_a_wholesale_copy` here.
 //!
@@ -22,9 +23,9 @@
 
 use crate::preview::PreviewParams;
 
-/// Every module group a partial style can name, in pipeline / panel order.
-/// Byte-identical to the labels `history::describe_change` produces, so a
-/// history entry and a style row name the same module the same way.
+/// Every supported module group a partial style can name, in pipeline / panel
+/// order. C&T is intentionally absent until style application can supply its
+/// required scene-linear render context; unknown C&T groups are ignored.
 pub const MODULE_GROUPS: &[&str] = &[
     // Base group row 0 — same position as the catalog and `describe_change`,
     // which check the groups in the same pipeline / panel order.
@@ -57,6 +58,7 @@ pub const MODULE_GROUPS: &[&str] = &[
     "Color calibration",
     "Primaries",
     "Negadoctor",
+    // Staged C&T is tracked in history but excluded from partial-style UI/apply.
     "Tone equalizer",
     "Color balance RGB",
     "Filmic RGB",
@@ -595,16 +597,25 @@ pub fn merge_modules(base: &PreviewParams, overlay: &PreviewParams, groups: &[&s
 /// its listed groups over what is already there. Unknown group names are
 /// skipped (see [`merge_modules`]).
 ///
-/// Note the whole-edit arm really is replace even though merging all groups
-/// would compute the same value — [`MODULE_GROUPS`] partitions every field —
-/// because "replace" is the intent and the direct copy says so.
-pub fn apply_style(current: &PreviewParams, style: &crate::persist::Style) -> PreviewParams {
-    match &style.modules {
+/// Note the whole-edit arm really is replace even though merging all supported
+/// groups would compute most of the same value — C&T remains excluded until
+/// callers can provide render context. Any resulting active C&T state is
+/// rejected, since legacy render paths cannot process it safely.
+pub fn apply_style(
+    current: &PreviewParams,
+    style: &crate::persist::Style,
+) -> Result<PreviewParams, crate::preview::PreviewRenderError> {
+    let merged = match &style.modules {
         None => style.params,
         Some(groups) => {
             let names: Vec<&str> = groups.iter().map(String::as_str).collect();
             merge_modules(current, &style.params, &names)
         }
+    };
+    if merged.contrast_texture_on {
+        Err(crate::preview::PreviewRenderError::MissingContrastTextureContext)
+    } else {
+        Ok(merged)
     }
 }
 
@@ -615,6 +626,7 @@ mod tests {
     #[test]
     fn module_groups_are_unique_and_complete_in_pipeline_order() {
         assert_eq!(MODULE_GROUPS.len(), 46);
+        assert!(!MODULE_GROUPS.contains(&"C&T"), "staged C&T must not be selectable in partial styles");
         let mut sorted = MODULE_GROUPS.to_vec();
         sorted.sort_unstable();
         let n = sorted.len();
@@ -706,16 +718,25 @@ mod tests {
 
     #[test]
     fn merging_every_group_equals_a_wholesale_copy() {
-        // The drift guard for this file: if a field exists but belongs to no
-        // group, merging ALL groups cannot reproduce a wholesale copy and this
-        // fails. `populated_params` names every field explicitly, so adding a
-        // PreviewParams field breaks THIS test's compile (missing-field error)
-        // until both the fixture and a group arm are extended — same discipline
-        // as params_encode_decode_roundtrips.
+        // The drift guard for this file: every supported field belongs to one
+        // listed group. C&T serialization is staged, but it cannot be exposed
+        // through style application until render callers can supply its context.
+        // `fully_populated_params` still names every field explicitly, so adding
+        // a PreviewParams field breaks this test's compile until classified.
         let populated = crate::preview::fully_populated_params();
         let base = PreviewParams::default();
         let merged = merge_modules(&base, &populated, MODULE_GROUPS);
-        assert_eq!(merged, populated, "every field must belong to exactly one listed group");
+        let mut expected = populated;
+        expected.contrast_texture_on = base.contrast_texture_on;
+        expected.contrast_texture_gain_coarse = base.contrast_texture_gain_coarse;
+        expected.contrast_texture_gain_medium = base.contrast_texture_gain_medium;
+        expected.contrast_texture_gain_fine = base.contrast_texture_gain_fine;
+        expected.contrast_texture_detail_level = base.contrast_texture_detail_level;
+        expected.contrast_texture_halo_control = base.contrast_texture_halo_control;
+        expected.contrast_texture_noise_bias = base.contrast_texture_noise_bias;
+        expected.contrast_texture_gain_shadows = base.contrast_texture_gain_shadows;
+        expected.contrast_texture_gain_highlights = base.contrast_texture_gain_highlights;
+        assert_eq!(merged, expected, "every supported field must belong to exactly one listed group");
     }
 
     #[test]
@@ -835,6 +856,21 @@ mod tests {
     }
 
     #[test]
+    fn staged_contrast_texture_is_not_applied_from_partial_styles() {
+        let base = PreviewParams::default();
+        let mut overlay = crate::preview::fully_populated_params();
+        overlay.contrast_texture_on = true;
+        assert!(!MODULE_GROUPS.contains(&"C&T"));
+        assert!(!copy_module_group(&mut PreviewParams::default(), &overlay, "C&T"));
+        let out = apply_style(
+            &base,
+            &style_with(overlay, Some(vec!["C&T".to_owned()])),
+        )
+        .unwrap();
+        assert_eq!(out, base, "unsupported staged group must not activate C&T");
+    }
+
+    #[test]
     fn merge_moves_exactly_the_listed_groups() {
         // Populated base + default overlay: the listed groups take the
         // overlay's (default) values, and unlisted groups keep base's — spot-
@@ -861,17 +897,39 @@ mod tests {
     #[test]
     fn applying_a_whole_style_replaces_the_current_edit() {
         let current = crate::preview::fully_populated_params();
-        let out = apply_style(&current, &style_with(PreviewParams::default(), None));
+        let out = apply_style(&current, &style_with(PreviewParams::default(), None)).unwrap();
         assert_eq!(out, PreviewParams::default());
     }
 
     #[test]
+    fn applying_style_rejects_any_result_with_contrast_texture_enabled() {
+        let current = PreviewParams::default();
+        let mut params = PreviewParams::default();
+        params.contrast_texture_on = true;
+        let whole = style_with(params, None);
+        assert!(matches!(
+            apply_style(&current, &whole),
+            Err(crate::preview::PreviewRenderError::MissingContrastTextureContext)
+        ));
+
+        let mut active_current = current;
+        active_current.contrast_texture_on = true;
+        let partial = style_with(PreviewParams::default(), Some(vec!["Exposure".into()]));
+        assert!(matches!(
+            apply_style(&active_current, &partial),
+            Err(crate::preview::PreviewRenderError::MissingContrastTextureContext)
+        ));
+    }
+
+    #[test]
     fn applying_a_partial_style_merges_over_the_current_edit() {
-        let current = crate::preview::fully_populated_params();
+        let mut current = crate::preview::fully_populated_params();
+        current.contrast_texture_on = false;
         let out = apply_style(
             &current,
             &style_with(PreviewParams::default(), Some(vec!["Velvia".into(), "Garbage".into()])),
-        );
+        )
+        .unwrap();
         assert_eq!(out.velvia_strength, PreviewParams::default().velvia_strength);
         assert_eq!(out.ev, current.ev, "Exposure is not in the style");
         assert_eq!(out.lens_focal, current.lens_focal, "Lens correction is not in the style");

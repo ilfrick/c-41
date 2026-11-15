@@ -483,6 +483,18 @@ pub fn describe_change(old: &PreviewParams, new: &PreviewParams) -> &'static str
     if negadoctor {
         return "Negadoctor";
     }
+    let contrast_texture = old.contrast_texture_on != new.contrast_texture_on
+        || old.contrast_texture_gain_coarse != new.contrast_texture_gain_coarse
+        || old.contrast_texture_gain_medium != new.contrast_texture_gain_medium
+        || old.contrast_texture_gain_fine != new.contrast_texture_gain_fine
+        || old.contrast_texture_detail_level != new.contrast_texture_detail_level
+        || old.contrast_texture_halo_control != new.contrast_texture_halo_control
+        || old.contrast_texture_noise_bias != new.contrast_texture_noise_bias
+        || old.contrast_texture_gain_shadows != new.contrast_texture_gain_shadows
+        || old.contrast_texture_gain_highlights != new.contrast_texture_gain_highlights;
+    if contrast_texture {
+        return "C&T";
+    }
     let toneeq = old.toneeq_on != new.toneeq_on
         || old.toneeq_noise != new.toneeq_noise
         || old.toneeq_ultra_deep_blacks != new.toneeq_ultra_deep_blacks
@@ -1150,6 +1162,9 @@ mod tests {
             describe_change(&base, &PreviewParams { brd_frame_color_b: 0.9, ..base }),
             "Framing"
         );
+        // C&T is tracked as a history group even though it has no UI row yet.
+        assert_eq!(describe_change(&base, &PreviewParams { contrast_texture_on: true, ..base }), "C&T");
+        assert_eq!(describe_change(&base, &PreviewParams { contrast_texture_gain_coarse: 0.2, ..base }), "C&T");
         // No recognised difference ⇒ the generic fallback.
         assert_eq!(describe_change(&base, &base), "Edit");
     }
@@ -1495,6 +1510,15 @@ mod tests {
             retouch_radius: _,
             retouch_opacity: _,
             retouch_feather: _,
+            contrast_texture_on: _,
+            contrast_texture_gain_coarse: _,
+            contrast_texture_gain_medium: _,
+            contrast_texture_gain_fine: _,
+            contrast_texture_detail_level: _,
+            contrast_texture_halo_control: _,
+            contrast_texture_noise_bias: _,
+            contrast_texture_gain_shadows: _,
+            contrast_texture_gain_highlights: _,
         } = PreviewParams::default();
     }
 
@@ -1631,7 +1655,8 @@ mod tests {
         // S5 Liquify (v38): 2122 → 2323 (1 bool + 50 f32 lattice offsets).
         // S6 Retouch (v39): 2323 → 2349 (2 bools + 6 f32 controls).
         // S7 Retouch feather (v40): 2349 → 2353 (1 f32 control).
-        assert_eq!(PreviewParams::default().encode().len(), 2353);
+        // S8 Contrast & Texture (v41): 2353 → 2386 (1 bool + 8 f32 controls).
+        assert_eq!(PreviewParams::default().encode().len(), 2386);
     }
 
     #[test]

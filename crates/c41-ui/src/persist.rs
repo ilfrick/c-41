@@ -1148,7 +1148,12 @@ pub fn apply_style_to(db_path: &str, full_paths: &[String], style: &Style) -> us
             // whole-edit styles replace outright regardless of what the target
             // had, partial ones merge their listed groups over it.
             let base = load_saved_conn(&conn, imgid).unwrap_or_default();
-            let merged = crate::stylemodules::apply_style(&base, style);
+            let Ok(merged) = crate::stylemodules::apply_style(&base, style) else {
+                // A style can contain staged C&T state without the render
+                // context required to use it. Do not persist a setting that
+                // would make the legacy preview path panic or silently skip it.
+                continue;
+            };
             if save_params_conn(&conn, imgid, &merged).is_ok() {
                 written += 1;
             }
@@ -1746,6 +1751,23 @@ mod style_tests {
         for t in &targets {
             assert_eq!(load_params(&db, t).ev, 2.5, "{t} did not receive the style");
         }
+    }
+
+    #[test]
+    fn apply_rejects_whole_style_with_staged_contrast_texture() {
+        let (_d, db) = tmp_db("applyct");
+        catalogue(&db, "/photos", &["a.dng"]);
+        let img = "/photos/a.dng";
+        let base = PreviewParams { ev: 1.25, ..PreviewParams::default() };
+        save_params(&db, img, &base);
+
+        let mut unsupported = PreviewParams::default();
+        unsupported.contrast_texture_on = true;
+        assert!(save_style(&db, "Staged C&T", "", &unsupported, None));
+        let style = load_styles(&db).remove(0);
+
+        assert_eq!(apply_style_to(&db, &[img.to_string()], &style), 0);
+        assert_eq!(load_params(&db, img), base, "rejected style must not persist any changes");
     }
 
     #[test]
