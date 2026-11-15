@@ -833,9 +833,15 @@ pub enum Stage {
     /// This intentionally replaces darktable's freehand bezier editor with a
     /// compact, serializable mesh.
     Liquify { offsets: [f32; 50] },
-    /// Whole-frame Contrast & Texture. The source-piece and ROI scales are
-    /// required explicitly because they determine detail radii and preparation.
+    /// Spatial content-region Contrast & Texture. The explicit rect is processed;
+    /// pixels outside it (including borders/frames) are preserved unchanged.
+    /// `content_rect` is mandatory and uses coordinates in the current full
+    /// pipeline input frame. It must be non-empty and in bounds; use metadata
+    /// from the matching Borders operation, or the full-frame rect when no
+    /// border was composed. Downstream struct-variant constructors must supply it.
+    /// Source-piece and ROI scales determine detail radii and preparation.
     ContrastTexture {
+        content_rect: crate::borders::ContentRect,
         params: crate::iop::contrastntexture::ContrastTextureParams,
         max_piece_dimension: f32,
         piece_scale: f32,
@@ -2345,6 +2351,7 @@ impl Stage {
 #[derive(Debug)]
 pub enum PipelineError {
     Shape { width: usize, height: usize, input_len: usize },
+    InvalidContentRect { rect: crate::borders::ContentRect, width: usize, height: usize },
     ArithmeticOverflow,
     Allocation(std::collections::TryReserveError),
     ContrastTexturePrepare(crate::iop::contrastntexture::PrepareError),
@@ -2357,6 +2364,7 @@ impl std::fmt::Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Shape { width, height, input_len } => write!(f, "pipeline shape {width}x{height} does not match packed RGBA input length {input_len}"),
+            Self::InvalidContentRect { .. } => f.write_str("invalid contrast & texture content rectangle"),
             Self::ArithmeticOverflow => f.write_str("pipeline dimensions overflow"),
             Self::Allocation(error) => write!(f, "pipeline buffer allocation failed: {error}"),
             Self::ContrastTexturePrepare(error) => write!(f, "contrast & texture preparation failed: {error:?}"),
@@ -2463,35 +2471,188 @@ impl Pipeline {
     }
 
     fn try_process_with_contrast_texture_using(
-        &self, input: &[f32], width: usize, height: usize,
+        &self,
+        input: &[f32],
+        width: usize,
+        height: usize,
         mut allocate: impl FnMut(usize) -> Result<Vec<f32>, PipelineError>,
-        budget_for: impl Fn(crate::resource_budget::ResourceLevel) -> Result<crate::resource_budget::ResourceBudget, PipelineError>,
+        budget_for: impl Fn(
+            crate::resource_budget::ResourceLevel,
+        ) -> Result<crate::resource_budget::ResourceBudget, PipelineError>,
     ) -> Result<Vec<f32>, PipelineError> {
-        // Preflight before either runner frame allocation. memory_plan counts
-        // current internally; external live bytes are the original caller frame
-        // and planned `next` output. Largest external buffer is one frame.
-        let bytes = u64::try_from(input.len()).ok().and_then(|n| n.checked_mul(4)).ok_or(PipelineError::ArithmeticOverflow)?;
-        let external_live = bytes.checked_add(bytes).ok_or(PipelineError::ArithmeticOverflow)?;
+        let frame_bytes = u64::try_from(input.len())
+            .ok()
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or(PipelineError::ArithmeticOverflow)?;
+        // Check every C&T stage before allocating either full-frame runner buffer.
         for stage in &self.stages {
-            if let Stage::ContrastTexture { params, max_piece_dimension, piece_scale, roi_scale, resource_level } = stage {
-                let prepared = crate::iop::contrastntexture::prepare(*params, *max_piece_dimension, *piece_scale, *roi_scale, width, height).map_err(PipelineError::ContrastTexturePrepare)?;
-                let budget = budget_for(*resource_level)?;
-                let plan = crate::iop::contrastntexture::memory_plan(width, height, prepared.used_radius_details(), external_live, bytes, budget).map_err(|error| PipelineError::ContrastTextureProcess(crate::iop::contrastntexture::ProcessError::MemoryPlan(error)))?;
-                // Plan validates the C&T peak; subsequent stages retain the same
-                // two frame buffers and caller input.
-                let _ = plan;
+            let Stage::ContrastTexture {
+                content_rect,
+                params,
+                max_piece_dimension,
+                piece_scale,
+                roi_scale,
+                resource_level,
+            } = stage
+            else {
+                continue;
+            };
+
+            if content_rect.width == 0
+                || content_rect.height == 0
+                || content_rect.x > width
+                || content_rect.y > height
+                || content_rect.width > width - content_rect.x
+                || content_rect.height > height - content_rect.y
+            {
+                return Err(PipelineError::InvalidContentRect {
+                    rect: *content_rect,
+                    width,
+                    height,
+                });
             }
+
+            let region_width = content_rect.width;
+            let region_height = content_rect.height;
+            let region_len = region_width
+                .checked_mul(region_height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or(PipelineError::ArithmeticOverflow)?;
+            let region_bytes = u64::try_from(region_len)
+                .ok()
+                .and_then(|len| len.checked_mul(std::mem::size_of::<f32>() as u64))
+                .ok_or(PipelineError::ArithmeticOverflow)?;
+            let is_full_frame = content_rect.x == 0
+                && content_rect.y == 0
+                && region_width == width
+                && region_height == height;
+            let prepared = crate::iop::contrastntexture::prepare(
+                *params,
+                *max_piece_dimension,
+                *piece_scale,
+                *roi_scale,
+                region_width,
+                region_height,
+            )
+            .map_err(PipelineError::ContrastTexturePrepare)?;
+            let budget = budget_for(*resource_level)?;
+            let external_live_bytes = if is_full_frame {
+                frame_bytes
+                    .checked_mul(2)
+                    .ok_or(PipelineError::ArithmeticOverflow)?
+            } else {
+                frame_bytes
+                    .checked_mul(3)
+                    .and_then(|live| live.checked_add(region_bytes))
+                    .ok_or(PipelineError::ArithmeticOverflow)?
+            };
+            crate::iop::contrastntexture::memory_plan(
+                region_width,
+                region_height,
+                prepared.used_radius_details(),
+                external_live_bytes,
+                frame_bytes.max(region_bytes),
+                budget,
+            )
+            .map_err(|error| {
+                PipelineError::ContrastTextureProcess(
+                    crate::iop::contrastntexture::ProcessError::MemoryPlan(error),
+                )
+            })?;
         }
+
         let mut current = allocate(input.len())?;
         current.copy_from_slice(input);
         let mut next = allocate(input.len())?;
         for stage in &self.stages {
-            if let Stage::ContrastTexture { params, max_piece_dimension, piece_scale, roi_scale, resource_level } = stage {
-                let prepared = crate::iop::contrastntexture::prepare(*params, *max_piece_dimension, *piece_scale, *roi_scale, width, height).map_err(PipelineError::ContrastTexturePrepare)?;
-                let budget = crate::resource_budget::ResourceBudget::from_system_memory(*resource_level, crate::system_memory::detect(), None, None).map_err(PipelineError::ContrastTextureBudget)?;
-                // `process_into` counts `current` internally and adds `next`
-                // to external live bytes itself; only original input is external.
-                crate::iop::contrastntexture::process_into(&current, &mut next, width, height, *params, &prepared, bytes, bytes, budget).map_err(PipelineError::ContrastTextureProcess)?;
+            if let Stage::ContrastTexture {
+                content_rect,
+                params,
+                max_piece_dimension,
+                piece_scale,
+                roi_scale,
+                resource_level,
+            } = stage
+            {
+                let region_width = content_rect.width;
+                let region_height = content_rect.height;
+                let prepared = crate::iop::contrastntexture::prepare(
+                    *params,
+                    *max_piece_dimension,
+                    *piece_scale,
+                    *roi_scale,
+                    region_width,
+                    region_height,
+                )
+                .map_err(PipelineError::ContrastTexturePrepare)?;
+                let budget = crate::resource_budget::ResourceBudget::from_system_memory(
+                    *resource_level,
+                    crate::system_memory::detect(),
+                    None,
+                    None,
+                )
+                .map_err(PipelineError::ContrastTextureBudget)?;
+                let is_full_frame = content_rect.x == 0
+                    && content_rect.y == 0
+                    && region_width == width
+                    && region_height == height;
+
+                if is_full_frame {
+                    crate::iop::contrastntexture::process_into(
+                        &current,
+                        &mut next,
+                        width,
+                        height,
+                        *params,
+                        &prepared,
+                        frame_bytes,
+                        frame_bytes,
+                        budget,
+                    )
+                    .map_err(PipelineError::ContrastTextureProcess)?;
+                } else {
+                    let region_len = region_width
+                        .checked_mul(region_height)
+                        .and_then(|pixels| pixels.checked_mul(4))
+                        .ok_or(PipelineError::ArithmeticOverflow)?;
+                    let mut region_input = allocate(region_len)?;
+                    let mut region_output = allocate(region_len)?;
+                    let row_len = region_width
+                        .checked_mul(4)
+                        .ok_or(PipelineError::ArithmeticOverflow)?;
+
+                    for row in 0..region_height {
+                        let source_start = ((content_rect.y + row) * width + content_rect.x) * 4;
+                        let region_start = row * row_len;
+                        region_input[region_start..region_start + row_len]
+                            .copy_from_slice(&current[source_start..source_start + row_len]);
+                    }
+
+                    // Preserve the frame, including every pixel outside the content rect.
+                    next.copy_from_slice(&current);
+                    let external_live_bytes = frame_bytes
+                        .checked_mul(3)
+                        .ok_or(PipelineError::ArithmeticOverflow)?;
+                    crate::iop::contrastntexture::process_into(
+                        &region_input,
+                        &mut region_output,
+                        region_width,
+                        region_height,
+                        *params,
+                        &prepared,
+                        external_live_bytes,
+                        frame_bytes,
+                        budget,
+                    )
+                    .map_err(PipelineError::ContrastTextureProcess)?;
+
+                    for row in 0..region_height {
+                        let destination_start = ((content_rect.y + row) * width + content_rect.x) * 4;
+                        let region_start = row * row_len;
+                        next[destination_start..destination_start + row_len]
+                            .copy_from_slice(&region_output[region_start..region_start + row_len]);
+                    }
+                }
             } else {
                 stage.apply(&current, &mut next, width, height);
             }
@@ -2713,8 +2874,9 @@ fn gpu_stage_spans(stages: &[Stage]) -> Vec<std::ops::Range<usize>> {
 mod tests {
     use super::*;
 
-    fn ct_stage() -> Stage {
+    fn ct_stage(width: usize, height: usize) -> Stage {
         Stage::ContrastTexture {
+            content_rect: crate::borders::ContentRect { x: 0, y: 0, width, height },
             params: crate::iop::contrastntexture::ContrastTextureParams {
                 gain_coarse: 1.0, gain_medium: 1.0, gain_fine: 2.0, ..Default::default()
             },
@@ -2726,7 +2888,7 @@ mod tests {
     #[test]
     fn contrast_texture_budget_preflight_precedes_frame_allocations() {
         let input = vec![0.2; 64 * 64 * 4];
-        let pipeline = Pipeline::with_stages(vec![ct_stage()]);
+        let pipeline = Pipeline::with_stages(vec![ct_stage(64, 64)]);
         let mut allocations = 0;
         let result = pipeline.try_process_with_contrast_texture_using(&input, 64, 64, |_| {
             allocations += 1;
@@ -2740,7 +2902,7 @@ mod tests {
     fn contrast_texture_preflight_accepts_exact_memory_threshold() {
         let input = vec![0.2; 64 * 64 * 4];
         let bytes = (input.len() * std::mem::size_of::<f32>()) as u64;
-        let stage = ct_stage();
+        let stage = ct_stage(64, 64);
         let Stage::ContrastTexture { params, max_piece_dimension, piece_scale, roi_scale, .. } = &stage else { unreachable!() };
         let prepared = crate::iop::contrastntexture::prepare(
             *params, *max_piece_dimension, *piece_scale, *roi_scale, 64, 64,
@@ -2781,9 +2943,87 @@ mod tests {
     }
 
     #[test]
+    fn contrast_texture_content_rect_preserves_everything_outside_region() {
+        let mut stage = ct_stage(32, 32);
+        if let Stage::ContrastTexture { content_rect, .. } = &mut stage {
+            *content_rect = crate::borders::ContentRect { x: 8, y: 6, width: 20, height: 18 };
+        }
+        let input: Vec<f32> = (0..32 * 32).flat_map(|i| {
+            let v = if (i / 32 + i % 32) % 2 == 0 { 0.1 } else { 0.8 };
+            [v, v * 0.8, v * 0.6, (i as f32) / 2048.0]
+        }).collect();
+        let output = Pipeline::with_stages(vec![stage]).try_process(&input, 32, 32).unwrap();
+        let mut changed = false;
+        for y in 0..32 { for x in 0..32 {
+            let i = (y * 32 + x) * 4;
+            if (8..28).contains(&x) && (6..24).contains(&y) {
+                changed |= output[i..i + 3] != input[i..i + 3];
+                assert_eq!(output[i + 3], input[i + 3]);
+            } else { assert_eq!(&output[i..i + 4], &input[i..i + 4]); }
+        }}
+        assert!(changed, "content region C&T must alter active RGB");
+    }
+
+    #[test]
+    fn contrast_texture_partial_region_budget_is_exact_and_preflights() {
+        let width = 32;
+        let height = 32;
+        let rect = crate::borders::ContentRect { x: 8, y: 6, width: 20, height: 18 };
+        let input = vec![0.2; width * height * 4];
+        let mut stage = ct_stage(width, height);
+        if let Stage::ContrastTexture { content_rect, .. } = &mut stage { *content_rect = rect; }
+        let Stage::ContrastTexture { params, max_piece_dimension, piece_scale, roi_scale, .. } = &stage else { unreachable!() };
+        let prepared = crate::iop::contrastntexture::prepare(*params, *max_piece_dimension, *piece_scale, *roi_scale, rect.width, rect.height).unwrap();
+        let frame_bytes = (input.len() * 4) as u64;
+        let packed_bytes = (rect.width * rect.height * 4 * 4) as u64;
+        let planned = crate::iop::contrastntexture::memory_plan(rect.width, rect.height, prepared.used_radius_details(), frame_bytes * 3 + packed_bytes, frame_bytes.max(packed_bytes), crate::resource_budget::ResourceBudget { cpu_available_bytes: u64::MAX, cpu_single_buffer_bytes: u64::MAX, mipmap_bytes: 0, opencl_available_bytes: 0 }).unwrap();
+        let exact = crate::resource_budget::ResourceBudget { cpu_available_bytes: planned.estimated_bytes, cpu_single_buffer_bytes: planned.largest_buffer_bytes, mipmap_bytes: 0, opencl_available_bytes: 0 };
+        let pipeline = Pipeline::with_stages(vec![stage]);
+        assert!(pipeline.try_process_with_contrast_texture_using(&input, width, height, fallible_buffer, |_| Ok(exact)).is_ok());
+        let mut allocations = 0;
+        let below = crate::resource_budget::ResourceBudget { cpu_available_bytes: planned.estimated_bytes - 1, ..exact };
+        assert!(matches!(pipeline.try_process_with_contrast_texture_using(&input, width, height, |_| { allocations += 1; fallible_buffer(0) }, |_| Ok(below)), Err(PipelineError::ContrastTextureProcess(crate::iop::contrastntexture::ProcessError::MemoryPlan(crate::iop::contrastntexture::MemoryPlanError::BudgetExceeded { .. })))));
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn contrast_texture_partial_region_allocation_failure_propagates() {
+        let mut stage = ct_stage(32, 32);
+        if let Stage::ContrastTexture { content_rect, .. } = &mut stage { *content_rect = crate::borders::ContentRect { x: 8, y: 6, width: 20, height: 18 }; }
+        let pipeline = Pipeline::with_stages(vec![stage]);
+        let input = vec![0.2; 32 * 32 * 4];
+        let mut calls = 0;
+        let result = pipeline.try_process_with_contrast_texture_using(&input, 32, 32, |n| {
+            calls += 1;
+            if calls <= 2 { fallible_buffer(n) } else { let mut v = Vec::<f32>::new(); v.try_reserve_exact(usize::MAX).map_err(PipelineError::Allocation)?; Ok(v) }
+        }, |_| Ok(crate::resource_budget::ResourceBudget { cpu_available_bytes: u64::MAX, cpu_single_buffer_bytes: u64::MAX, mipmap_bytes: 0, opencl_available_bytes: 0 }));
+        assert!(matches!(result, Err(PipelineError::Allocation(_))));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn contrast_texture_rejects_invalid_content_rect_before_allocation() {
+        for rect in [
+            crate::borders::ContentRect { x: 0, y: 0, width: 0, height: 1 },
+            crate::borders::ContentRect { x: usize::MAX, y: 0, width: 1, height: 1 },
+            crate::borders::ContentRect { x: 31, y: 0, width: 2, height: 1 },
+        ] {
+            let mut stage = ct_stage(32, 32);
+            if let Stage::ContrastTexture { content_rect, .. } = &mut stage { *content_rect = rect; }
+            let pipeline = Pipeline::with_stages(vec![stage]);
+            let mut allocations = 0;
+            let result = pipeline.try_process_with_contrast_texture_using(&[0.2; 32 * 32 * 4], 32, 32, |_| {
+                allocations += 1; fallible_buffer(0)
+            }, |_| unreachable!());
+            assert!(matches!(result, Err(PipelineError::InvalidContentRect { .. })));
+            assert_eq!(allocations, 0);
+        }
+    }
+
+    #[test]
     fn contrast_texture_runs_and_preserves_fourth_channel() {
         let input: Vec<f32> = (0..32*32).flat_map(|i| { let v = if (i / 32 + i % 32) % 2 == 0 { 0.1 } else { 0.8 }; [v, v*0.8, v*0.6, 0.375] }).collect();
-        let pipeline = Pipeline::with_stages(vec![ct_stage()]);
+        let pipeline = Pipeline::with_stages(vec![ct_stage(32, 32)]);
         assert!(!pipeline.stages[0].is_pixel_local());
         let output = pipeline.try_process(&input, 32, 32).unwrap();
         assert_ne!(output, input, "valid multi-band C&T fixture must alter RGB");
@@ -2794,7 +3034,7 @@ mod tests {
 
     #[test]
     fn contrast_texture_prepare_failure_propagates_and_legacy_api_fails_explicitly() {
-        let mut stage = ct_stage();
+        let mut stage = ct_stage(1, 1);
         if let Stage::ContrastTexture { max_piece_dimension, .. } = &mut stage { *max_piece_dimension = f32::NAN; }
         let pipeline = Pipeline::with_stages(vec![stage]);
         assert!(matches!(pipeline.try_process(&[0.1,0.2,0.3,0.4], 1, 1), Err(PipelineError::ContrastTexturePrepare(_))));
@@ -3025,43 +3265,125 @@ mod tests {
     #[test]
     fn mixed_sigmoid_and_contrast_texture_runs_cpu_in_stage_order() {
         let sigmoid_stage = Stage::Sigmoid {
-            white_target: 1.0, black_target: 0.0, paper_exp: 0.3,
-            film_fog: 0.0, film_power: 1.0, paper_power: 1.0,
+            white_target: 1.0,
+            black_target: 0.0,
+            paper_exp: 0.3,
+            film_fog: 0.0,
+            film_power: 1.0,
+            paper_power: 1.0,
         };
-        let pipeline = Pipeline::with_stages(vec![sigmoid_stage.clone(), ct_stage()]);
-        let input: Vec<f32> = (0..32 * 32).flat_map(|i| {
-            let value = if (i / 32 + i % 32) % 2 == 0 { 0.1 } else { 0.8 };
-            [value, value * 0.8, value * 0.6, 1.0]
-        }).collect();
-        let mut sigmoid_output = vec![0.0; input.len()];
-        sigmoid_stage.apply(&input, &mut sigmoid_output, 32, 32);
+        let rect = crate::borders::ContentRect {
+            x: 8,
+            y: 6,
+            width: 20,
+            height: 18,
+        };
+        let mut contrast_texture_stage = ct_stage(32, 32);
+        if let Stage::ContrastTexture { content_rect, .. } = &mut contrast_texture_stage {
+            *content_rect = rect;
+        }
+        let pipeline = Pipeline::with_stages(vec![
+            sigmoid_stage.clone(),
+            contrast_texture_stage,
+            sigmoid_stage.clone(),
+        ]);
+        let input: Vec<f32> = (0..32 * 32)
+            .flat_map(|i| {
+                let value = if (i / 32 + i % 32) % 2 == 0 { 0.1 } else { 0.8 };
+                [value, value * 0.8, value * 0.6, 1.0]
+            })
+            .collect();
+
+        let mut sigmoid_once = vec![0.0; input.len()];
+        sigmoid_stage.apply(&input, &mut sigmoid_once, 32, 32);
+
+        let params = crate::iop::contrastntexture::ContrastTextureParams {
+            gain_coarse: 1.0,
+            gain_medium: 1.0,
+            gain_fine: 2.0,
+            ..Default::default()
+        };
         let prepared = crate::iop::contrastntexture::prepare(
-            crate::iop::contrastntexture::ContrastTextureParams {
-                gain_coarse: 1.0, gain_medium: 1.0, gain_fine: 2.0, ..Default::default()
-            },
-            256.0, 1.0, 1.0, 32, 32,
-        ).unwrap();
-        let mut expected = vec![0.0; input.len()];
+            params,
+            256.0,
+            1.0,
+            1.0,
+            rect.width,
+            rect.height,
+        )
+        .unwrap();
+        let packed_len = rect.width * rect.height * 4;
+        let mut packed_input = vec![0.0; packed_len];
+        for row in 0..rect.height {
+            let source_start = ((rect.y + row) * 32 + rect.x) * 4;
+            let packed_start = row * rect.width * 4;
+            packed_input[packed_start..packed_start + rect.width * 4]
+                .copy_from_slice(&sigmoid_once[source_start..source_start + rect.width * 4]);
+        }
         let budget = crate::resource_budget::ResourceBudget {
-            cpu_available_bytes: u64::MAX, cpu_single_buffer_bytes: u64::MAX,
-            mipmap_bytes: 0, opencl_available_bytes: 0,
+            cpu_available_bytes: u64::MAX,
+            cpu_single_buffer_bytes: u64::MAX,
+            mipmap_bytes: 0,
+            opencl_available_bytes: 0,
         };
+        let mut packed_output = vec![0.0; packed_len];
         crate::iop::contrastntexture::process_into(
-            &sigmoid_output, &mut expected, 32, 32,
-            crate::iop::contrastntexture::ContrastTextureParams {
-                gain_coarse: 1.0, gain_medium: 1.0, gain_fine: 2.0, ..Default::default()
-            },
-            &prepared, 0, 0, budget,
-        ).unwrap();
+            &packed_input,
+            &mut packed_output,
+            rect.width,
+            rect.height,
+            params,
+            &prepared,
+            0,
+            0,
+            budget,
+        )
+        .unwrap();
+        let mut after_contrast_texture = sigmoid_once.clone();
+        for row in 0..rect.height {
+            let destination_start = ((rect.y + row) * 32 + rect.x) * 4;
+            let packed_start = row * rect.width * 4;
+            after_contrast_texture[destination_start..destination_start + rect.width * 4]
+                .copy_from_slice(&packed_output[packed_start..packed_start + rect.width * 4]);
+        }
+
+        let mut expected = vec![0.0; input.len()];
+        sigmoid_stage.apply(&after_contrast_texture, &mut expected, 32, 32);
+        let mut sigmoid_only = vec![0.0; input.len()];
+        sigmoid_stage.apply(&sigmoid_once, &mut sigmoid_only, 32, 32);
+
         let mut dispatches = 0;
-        let actual = pipeline.try_process_with_dispatch(
-            &input, 32, 32, || true, || false,
-            |_, _, _| { dispatches += 1; Err(anyhow::anyhow!("must not dispatch")) },
-        ).unwrap();
+        let actual = pipeline
+            .try_process_with_dispatch(
+                &input,
+                32,
+                32,
+                || true,
+                || false,
+                |_, _, _| {
+                    dispatches += 1;
+                    Err(anyhow::anyhow!("C&T pipeline must not dispatch to GPU"))
+                },
+            )
+            .unwrap();
         assert_eq!(dispatches, 0);
         assert_eq!(actual, expected);
-        assert_ne!(actual, sigmoid_output, "C&T must change the Sigmoid-only result");
-        assert!(actual.chunks_exact(4).all(|px| px[3] == 1.0));
+        assert_ne!(actual, sigmoid_only, "C&T must change the Sigmoid-only result");
+        for y in 0..32 {
+            for x in 0..32 {
+                let pixel = (y * 32 + x) * 4;
+                if !(rect.x..rect.x + rect.width).contains(&x)
+                    || !(rect.y..rect.y + rect.height).contains(&y)
+                {
+                    assert_eq!(
+                        &after_contrast_texture[pixel..pixel + 4],
+                        &sigmoid_once[pixel..pixel + 4],
+                        "C&T changed a pixel outside its content rect at ({x},{y})"
+                    );
+                }
+                assert_eq!(actual[pixel + 3], 1.0, "alpha changed at ({x},{y})");
+            }
+        }
     }
 
     #[test]
@@ -3707,7 +4029,6 @@ mod tests {
         assert_eq!(p.process(&img, w, h), img, "small image must pass through");
     }
 
-    #[test]
     /// Regression test for a defect that shipped nowhere near the kernel: the
     /// `Stage::Defringe` `apply` arm originally wrapped its `defringe::process`
     /// call in `debug_assert!(... .is_ok())`. That is not "check then run" —
@@ -3823,6 +4144,7 @@ mod tests {
         assert!(out.iter().all(|v| v.is_finite()), "radius NaN produced non-finite output");
     }
 
+    #[test]
     fn sharpen_routes_conversion_by_working_space() {
         // A COLOURED edge: Y (hence Lab L) differs between Rec.2020 and sRGB
         // primaries, so the two working spaces must give different sharpening —
