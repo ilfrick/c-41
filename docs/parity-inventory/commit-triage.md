@@ -290,12 +290,11 @@ Rust-native interaction design, not just more coefficient sliders.
 ## Remaining work
 
 The module, RAW/formats, and workflow/runtime matrices remain conservative inventories.
-Other candidate clusters named in `ROADMAP.md` §5.4—including Contrast & Texture
-and broader precision work—remain unclassified until rows are added with
-pinned-source and C-41 call-path evidence. HDR has selected transfer/display
-commits triaged, not a full feature/path audit. The highlights, Spektrafilm,
-DNG and WB clusters are also partial; all follow-up lists are representative,
-not exhaustive.
-Additional commits for all reviewed features may still need triage. S9 is
-incomplete until the remaining capabilities and selected commit deltas are
-verified and prioritized.
+Several candidate clusters named in `ROADMAP.md` §5.4 now have selected commit rows,
+including Contrast & Texture, DNG OpcodeList3 GainMap, DNG ForwardMatrix/ProfileHueSatMap,
+and RAW loader behavior. Those rows document only verified deltas; they are not an
+exhaustive feature/path audit, and unreviewed commits in those clusters still need
+pinned-source and C-41 call-path evidence. Broader precision, HDR, highlights,
+Spektrafilm and WB work likewise remains partial; follow-up lists are representative,
+not exhaustive. S9 is incomplete until remaining capabilities and commit deltas are
+verified, classified and prioritized.
