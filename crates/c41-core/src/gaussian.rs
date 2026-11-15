@@ -85,9 +85,44 @@ pub struct Gaussian {
     buf: Vec<f32>, // temp (width*height*4) — the vertical-pass result
 }
 
+#[derive(Debug)]
+pub enum GaussianError {
+    SizeOverflow,
+    Allocation(std::collections::TryReserveError),
+}
+
+impl std::fmt::Display for GaussianError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SizeOverflow => write!(f, "Gaussian buffer size overflow"),
+            Self::Allocation(error) => write!(f, "Gaussian buffer allocation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GaussianError {}
+
 impl Gaussian {
-    /// Allocate for a `width × height` RGBA image (matches `dt_gaussian_init` with
-    /// `channels == 4`). `min`/`max` clamp each channel entering the recursion.
+    /// Fallibly allocate for a `width × height` RGBA image. The caller should
+    /// validate dimensions and account for this workspace in any memory budget.
+    pub fn try_new(
+        width: usize,
+        height: usize,
+        min: [f32; 4],
+        max: [f32; 4],
+        sigma: f32,
+        order: GaussianOrder,
+    ) -> Result<Self, GaussianError> {
+        let len = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(GaussianError::SizeOverflow)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len).map_err(GaussianError::Allocation)?;
+        buf.resize(len, 0.0);
+        Ok(Self { width, height, sigma, order, min, max, buf })
+    }
+
     pub fn new(
         width: usize,
         height: usize,

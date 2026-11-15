@@ -76,6 +76,131 @@ pub fn eigf_variance_correct_4c(buf: &mut [f32], n_elements: usize) {
     }
 }
 
+/// Errors reported by [`fast_eigf_surface_blur_no_mask`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceBlurError {
+    InvalidSigma,
+    InvalidFeathering,
+    InvalidDimensions,
+    SizeOverflow,
+    Allocation,
+}
+
+impl std::fmt::Display for SurfaceBlurError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for SurfaceBlurError {}
+
+fn zeroed_f32(len: usize) -> Result<Vec<f32>, SurfaceBlurError> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len).map_err(|_| SurfaceBlurError::Allocation)?;
+    buffer.resize(len, 0.0);
+    Ok(buffer)
+}
+
+/// In-place, no-mask C&T surface blur (one iteration, quantization zero).
+/// All frame and Gaussian workspaces are checked and fallibly reserved. This
+/// cannot prevent Linux overcommit from killing the process after reservation.
+pub fn fast_eigf_surface_blur_no_mask(
+    image: &mut [f32],
+    width: usize,
+    height: usize,
+    sigma: f32,
+    feathering: f32,
+) -> Result<(), SurfaceBlurError> {
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return Err(SurfaceBlurError::InvalidSigma);
+    }
+    if !feathering.is_finite() {
+        return Err(SurfaceBlurError::InvalidFeathering);
+    }
+    if width == 0 || height == 0 {
+        return Err(SurfaceBlurError::InvalidDimensions);
+    }
+    let count = width.checked_mul(height).ok_or(SurfaceBlurError::SizeOverflow)?;
+    if image.len() != count {
+        return Err(SurfaceBlurError::InvalidDimensions);
+    }
+
+    let scaling = sigma.min(4.0).max(1.0);
+    let ds_sigma = (sigma / scaling).max(1.0);
+    if !ds_sigma.is_finite() {
+        return Err(SurfaceBlurError::InvalidSigma);
+    }
+    let ds_width = ((width as f32) / scaling) as usize;
+    let ds_height = ((height as f32) / scaling) as usize;
+    // The pinned CPU helper passes zero dimensions into Gaussian for this case.
+    // That behavior is undefined; return a recoverable error instead of silently
+    // bypassing the effect. C&T-derived sigma should keep this case unreachable.
+    if ds_width == 0 || ds_height == 0 {
+        return Err(SurfaceBlurError::InvalidDimensions);
+    }
+
+    let ds_count = ds_width.checked_mul(ds_height).ok_or(SurfaceBlurError::SizeOverflow)?;
+    let packed_len = ds_count.checked_mul(2).ok_or(SurfaceBlurError::SizeOverflow)?;
+    let full_av_len = count.checked_mul(2).ok_or(SurfaceBlurError::SizeOverflow)?;
+    let rgba_len = ds_count.checked_mul(4).ok_or(SurfaceBlurError::SizeOverflow)?;
+    let mut downsampled = zeroed_f32(ds_count)?;
+    let mut packed = zeroed_f32(packed_len)?;
+    let mut blurred = zeroed_f32(rgba_len)?;
+    let mut averages = zeroed_f32(full_av_len)?;
+
+    crate::fast_guided_filter::interpolate_bilinear(
+        image,
+        width,
+        height,
+        &mut downsampled,
+        ds_width,
+        ds_height,
+        1,
+    );
+    let mut min = [0.0; 2];
+    let mut max = [0.0; 2];
+    pack_variance_minmax_2c(&mut packed, &downsampled, ds_count, &mut min, &mut max);
+
+    // Gaussian's available port is 4-channel; repeat the two moments into the
+    // extra channels, which are processed independently with the same filter.
+    let mut rgba = zeroed_f32(rgba_len)?;
+    for (k, moments) in packed.chunks_exact(2).enumerate() {
+        rgba[4 * k] = moments[0];
+        rgba[4 * k + 1] = moments[1];
+        rgba[4 * k + 2] = moments[0];
+        rgba[4 * k + 3] = moments[1];
+    }
+    let mut gaussian = crate::gaussian::Gaussian::try_new(
+        ds_width,
+        ds_height,
+        [min[0], min[1], min[0], min[1]],
+        [max[0], max[1], max[0], max[1]],
+        ds_sigma,
+        crate::gaussian::GaussianOrder::Zero,
+    )
+    .map_err(|error| match error {
+        crate::gaussian::GaussianError::SizeOverflow => SurfaceBlurError::SizeOverflow,
+        crate::gaussian::GaussianError::Allocation(_) => SurfaceBlurError::Allocation,
+    })?;
+    gaussian.blur_4c(&rgba, &mut blurred);
+    for (k, moments) in packed.chunks_exact_mut(2).enumerate() {
+        moments[0] = blurred[4 * k];
+        moments[1] = blurred[4 * k + 1];
+    }
+    eigf_variance_correct_2c(&mut packed, ds_count);
+    crate::fast_guided_filter::interpolate_bilinear(
+        &packed,
+        ds_width,
+        ds_height,
+        &mut averages,
+        width,
+        height,
+        2,
+    );
+    eigf_blending_no_mask(image, &averages, count, 0, feathering);
+    Ok(())
+}
+
 /// Variance correction for the 2-channel eigf variance analysis (no mask).
 ///
 /// Port of the `DT_OMP_FOR_SIMD` loop in `eigf_variance_analysis_no_mask`
@@ -561,6 +686,54 @@ fn ref_eigf_blending_no_mask(
 mod tests {
     use super::*;
     use crate::masks::test_util::lcg_fill;
+
+    #[test]
+    fn surface_blur_identity_and_invalid_shapes() {
+        let mut one = vec![0.75];
+        fast_eigf_surface_blur_no_mask(&mut one, 1, 1, 0.5, 1.0).unwrap();
+        assert!((one[0] - 0.75).abs() < 1e-6);
+        assert_eq!(
+            fast_eigf_surface_blur_no_mask(&mut one, 2, 1, 0.5, 1.0),
+            Err(SurfaceBlurError::InvalidDimensions)
+        );
+        assert_eq!(
+            fast_eigf_surface_blur_no_mask(&mut one, 0, 1, 0.5, 1.0),
+            Err(SurfaceBlurError::InvalidDimensions)
+        );
+        let mut too_small = vec![0.25; 4];
+        assert_eq!(
+            fast_eigf_surface_blur_no_mask(&mut too_small, 2, 2, 4.0, 1.0),
+            Err(SurfaceBlurError::InvalidDimensions)
+        );
+        assert_eq!(
+            fast_eigf_surface_blur_no_mask(&mut one, 1, 1, 0.0, 1.0),
+            Err(SurfaceBlurError::InvalidSigma)
+        );
+        assert_eq!(
+            fast_eigf_surface_blur_no_mask(&mut one, 1, 1, 0.5, f32::NAN),
+            Err(SurfaceBlurError::InvalidFeathering)
+        );
+    }
+
+    #[test]
+    fn surface_blur_flat_field_remains_stable() {
+        let mut image = vec![0.5; 16 * 12];
+        fast_eigf_surface_blur_no_mask(&mut image, 16, 12, 3.0, 1.0).unwrap();
+        assert!(image.iter().all(|&v| (v - 0.5).abs() < 2e-3));
+    }
+
+    #[test]
+    fn surface_blur_changes_non_flat_input_without_non_finite_output() {
+        let mut image: Vec<f32> = (0..8 * 8)
+            .map(|index| if index % 8 < 4 { 0.1 } else { 0.9 })
+            .collect();
+        let original = image.clone();
+        fast_eigf_surface_blur_no_mask(&mut image, 8, 8, 2.0, 0.2).unwrap();
+        assert!(image.iter().all(|value| value.is_finite()));
+        assert_ne!(image, original);
+        assert!(image[3] > original[3], "dark edge should move toward its local mean");
+        assert!(image[4] < original[4], "bright edge should move toward its local mean");
+    }
 
     // ── eigf_variance_correct_4c ─────────────────────────────────────────────────
 
