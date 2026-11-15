@@ -78,6 +78,7 @@ pub mod demosaic;
 pub mod markesteijn;
 pub mod fdc_tables;
 pub mod fdc;
+pub mod contrastntexture;
 pub mod colormapping;
 pub mod colorequal;
 pub mod toneequal;
