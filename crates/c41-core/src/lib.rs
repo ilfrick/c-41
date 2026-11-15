@@ -50,6 +50,7 @@ pub mod rawimage;
 pub mod rgbe;
 pub mod roi;
 pub mod resource_budget;
+pub mod system_memory;
 pub mod splines;
 pub mod thumbnail;
 pub mod tiff;
