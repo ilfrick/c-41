@@ -1,0 +1,10 @@
+diff --git a/src/tests/unittests/iop/CMakeLists.txt b/src/tests/unittests/iop/CMakeLists.txt
+index 8bdd39232b..0000000000 100644
+--- a/src/tests/unittests/iop/CMakeLists.txt
++++ b/src/tests/unittests/iop/CMakeLists.txt
+@@ -22,1 +22,5 @@ if(USE_OPENCL)
++add_cmocka_test(test_contrastntexture_golden
++                SOURCES test_contrastntexture_golden.c
++                LINK_LIBRARIES lib_darktable cmocka)
++
+ if(USE_OPENCL)
