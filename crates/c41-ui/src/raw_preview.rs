@@ -34,6 +34,14 @@ pub struct RawPreview {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<f32>,
+    /// Full decoded source dimensions before preview downscaling.
+    pub source_width: usize,
+    pub source_height: usize,
+    /// Integer box-downscale factor; edge remainder pixels are discarded.
+    pub downscale_factor: usize,
+    /// C&T piece scale: max(source dimensions) / max(preview dimensions).
+    /// This is distinct from ROI scale and remains independent of geometry.
+    pub piece_scale: f32,
     /// True if the source sensor is X-Trans (demosaiced with fixed Markesteijn).
     /// The UI uses this to hide the Bayer demosaic-method selector, which is a
     /// no-op for X-Trans files.
@@ -50,6 +58,23 @@ pub struct RawPreview {
     /// lens-correction module's camera dropdown. Empty when unknown.
     pub clean_make: String,
     pub clean_model: String,
+}
+
+/// Return the C&T piece scale that maps the preview input's longest side to
+/// the original decoded image's longest side. The raw preview's integer box
+/// factor can drop edge remainders, so it is not always the exact scale.
+fn piece_scale_from_dimensions(
+    source_width: usize,
+    source_height: usize,
+    preview_width: usize,
+    preview_height: usize,
+) -> Option<f32> {
+    if source_width == 0 || source_height == 0 || preview_width == 0 || preview_height == 0 {
+        return None;
+    }
+    let source_max = source_width.max(source_height);
+    let preview_max = preview_width.max(preview_height);
+    Some(source_max as f32 / preview_max as f32)
 }
 
 /// File extensions we route through the raw decoder rather than gdk-pixbuf.
@@ -157,6 +182,10 @@ pub fn decode_raw_preview_with_opts(
         width: w2,
         height: h2,
         pixels: small,
+        source_width: w,
+        source_height: h,
+        downscale_factor: factor,
+        piece_scale: piece_scale_from_dimensions(w, h, w2, h2)?,
         is_xtrans,
         blacklevels,
         whitelevels,
@@ -191,6 +220,21 @@ mod tests {
         assert!((out[1] - 0.4).abs() < 1e-6); // (0+0.4+0.4+0.8)/4
         assert!((out[2] - 0.5).abs() < 1e-6); // (0+0.6+0.4+1.0)/4
         assert_eq!(out[3], 1.0);
+    }
+
+    #[test]
+    fn non_divisible_raw_dimensions_retain_source_and_scale_metadata() {
+        // The integer box factor drops edge remainders, so the C&T scale uses
+        // the max-dimension ratio rather than blindly using that factor.
+        let (width, height, _) = downscale_rgba(&vec![0.0; 11 * 7 * 4], 11, 7, 3);
+        assert_eq!((width, height), (3, 2));
+        let piece_scale = piece_scale_from_dimensions(11, 7, width, height).unwrap();
+        assert_eq!(piece_scale, 11.0 / 3.0);
+        assert_ne!(piece_scale, 3.0);
+        assert_eq!(piece_scale_from_dimensions(0, 7, width, height), None);
+        assert_eq!(piece_scale_from_dimensions(11, 0, width, height), None);
+        assert_eq!(piece_scale_from_dimensions(11, 7, 0, height), None);
+        assert_eq!(piece_scale_from_dimensions(11, 7, width, 0), None);
     }
 
     #[test]

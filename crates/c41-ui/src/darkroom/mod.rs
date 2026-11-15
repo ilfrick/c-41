@@ -192,6 +192,33 @@ impl LensFrame {
     }
 }
 
+/// C&T render metadata for one frame. Input dimensions are the pipeline INPUT
+/// dimensions before geometry/borders. Source dimensions and the integer raw
+/// downscale factor preserve the decoder context; non-raw images use input dims
+/// and factor 1. `piece_scale` maps the input's longest side to the source's.
+/// `roi_scale` is the processing ROI scale, not display zoom; the current
+/// full-frame render consumes the whole input buffer at ROI scale 1.0.
+// Intentionally staged before C&T parameter/UI wiring; the next increment will
+// consume this metadata when constructing the enabled pipeline stage.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PieceRenderContext {
+    input_width: usize,
+    input_height: usize,
+    source_width: usize,
+    source_height: usize,
+    downscale_factor: usize,
+    piece_scale: f32,
+    roi_scale: f32,
+}
+
+impl PieceRenderContext {
+    #[allow(dead_code)]
+    fn max_piece_dimension(self) -> usize {
+        self.input_width.max(self.input_height)
+    }
+}
+
 /// Shared live-preview state, cloned into every widget callback. Widgets are
 /// held as `glib::WeakRef` to avoid widget→closure→widget reference cycles
 /// (the page is dropped on navigation); the `Rc<RefCell<…>>` data is shared
@@ -204,6 +231,10 @@ struct PreviewCtx {
     /// sample never lingers after an edit changes the displayed pixels.
     picker: glib::WeakRef<gtk4::Label>,
     base: Rc<RefCell<Option<BaseImage>>>,
+    /// Original pipeline input metadata; geometry/border composition never rewrites it.
+    /// Intentionally unused until the C&T stage is wired into preview rendering.
+    #[allow(dead_code)]
+    piece_context: Rc<RefCell<Option<PieceRenderContext>>>,
     /// The decoded raw preview BEFORE geometry (linear RGBA `f32` + dims), kept
     /// so a straighten/crop change re-applies [`Geometry`] to it without a full
     /// re-decode. `None` for the JPEG path (no geometry there yet).
@@ -1341,6 +1372,10 @@ fn spawn_decode(ctx: &PreviewCtx) {
                         rp.width,
                         rp.height,
                         rp.pixels,
+                        rp.source_width,
+                        rp.source_height,
+                        rp.downscale_factor,
+                        rp.piece_scale,
                         rp.is_xtrans,
                         rp.blacklevels,
                         rp.whitelevels,
@@ -1358,7 +1393,20 @@ fn spawn_decode(ctx: &PreviewCtx) {
                 return;
             }
             match decoded {
-                Some((w, h, px, is_xtrans, blacklevels, whitelevels, clean_make, clean_model)) => {
+                Some((
+                    w,
+                    h,
+                    px,
+                    source_width,
+                    source_height,
+                    downscale_factor,
+                    piece_scale,
+                    is_xtrans,
+                    blacklevels,
+                    whitelevels,
+                    clean_make,
+                    clean_model,
+                )) => {
                     // The first completed decode seeds the raw black/white row
                     // with the FILE's own levels (sensor units; before that the
                     // row shows inert sentinels). Only the None→Some transition
@@ -1388,6 +1436,15 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     // A non-raw source (if any) is stale for a raw file; drop
                     // it so the JPEG-orientation path never recomposes it.
                     *ctx.pristine_srgb.borrow_mut() = None;
+                    *ctx.piece_context.borrow_mut() = Some(PieceRenderContext {
+                        input_width: w,
+                        input_height: h,
+                        source_width,
+                        source_height,
+                        downscale_factor,
+                        piece_scale,
+                        roi_scale: 1.0,
+                    });
                     *ctx.pristine.borrow_mut() = Some((w, h, px));
                     ctx.pristine_gen.set(ctx.pristine_gen.get().wrapping_add(1));
                     apply_geometry_to_base(&ctx); // sets base + renders
@@ -1472,6 +1529,16 @@ fn spawn_decode(ctx: &PreviewCtx) {
         });
         match base {
             Some(base) => {
+                let (input_width, input_height) = base.dims();
+                *ctx.piece_context.borrow_mut() = Some(PieceRenderContext {
+                    input_width,
+                    input_height,
+                    source_width: input_width,
+                    source_height: input_height,
+                    downscale_factor: 1,
+                    piece_scale: 1.0,
+                    roi_scale: 1.0,
+                });
                 *ctx.pristine.borrow_mut() = None; // no linear geometry on the JPEG path
                 // Keep the original decoded pixels so orientation changes
                 // recompose without re-reading the source; `apply_geometry_to_base`
@@ -1779,6 +1846,7 @@ pub fn darkroom_page(
         hist_area: hist_area.downgrade(),
         picker: picker_label.downgrade(),
         base: Rc::new(RefCell::new(None)),
+        piece_context: Rc::new(RefCell::new(None)),
         pristine: Rc::new(RefCell::new(None)),
         pristine_gen: Rc::new(std::cell::Cell::new(0)),
         lens_frame: Rc::new(RefCell::new(None)),
