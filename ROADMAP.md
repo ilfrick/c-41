@@ -58,7 +58,7 @@ Parità significa coprire tutte le capacità utente e di elaborazione del baseli
 
 ### 5.2 Backlog per aree
 
-- **C1 — Moduli visibili e interazione:** le righe storicamente inerti sono state collegate a slice di Framing, CACorrectRGB, Watermark, Color Calibration, Liquify e Retouch. Restano aperti, tra gli altri, controlli/asset completi di Watermark, canvas e interpolazioni di Liquify, multi-stroke/heal/masks/wavelets di Retouch e moduli nuovi del baseline.
+- **C1 — Moduli visibili e interazione:** le righe storicamente inerti sono state collegate a slice di Framing, CACorrectRGB, Watermark, Color Calibration, Liquify e Retouch. L'API Borders aggiunge un rettangolo di contenuto derivato dalle posizioni effettive del compose, senza modificare gli output storici. Restano aperti, tra gli altri, controlli/asset completi di Watermark, canvas e interpolazioni di Liquify, multi-stroke/heal/masks/wavelets di Retouch e moduli nuovi del baseline.
 - **C2 — Colore:** input/output profile e percorso non-RAW Rec.2020 sono parzialmente implementati. Restano soft proof, gamut-check, selezione/trasformazione display profile, adattamento alla presentazione finale sRGB e coerenza di thumbnail, full preview, stampa ed export.
 - **C3 — Istanze e maschere:** stack di istanze indipendenti con parametri, blending, storia, identità UI, preset, serializzazione e ordine pipeline; poi tutte le famiglie/operazioni di maschera e le loro interazioni/persistenza.
 - **C4 — Lua:** inventariare e implementare l’API Lua supportata dal baseline, lifecycle, eventi, storage/UI extension, test di compatibilità e sandbox.

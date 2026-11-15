@@ -441,8 +441,32 @@ impl BordersParams {
     }
 }
 
+/// Rectangle occupied by the original image content in a composed frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl ContentRect {
+    fn source(w: usize, h: usize) -> Self {
+        Self { x: 0, y: 0, width: w, height: h }
+    }
+
+    fn from_binfo(b: &BorderPositions) -> Self {
+        Self {
+            x: b.image_left.max(0) as usize,
+            y: b.image_top.max(0) as usize,
+            width: (b.image_right - b.image_left).max(0) as usize,
+            height: (b.image_bot - b.image_top).max(0) as usize,
+        }
+    }
+}
+
 /// The `Framing`/`borders` compose. See the module docs for the port scope.
-///
+
 /// `apply` is the linear-RGBA (4-float) form used by the raw preview and raw
 /// export funnels; `apply_srgb8` is the 8-bit form used by the non-raw paths.
 pub struct Borders;
@@ -635,19 +659,24 @@ impl Borders {
     /// degenerate/malformed buffer returns the source dimensions and a
     /// verbatim copy, as does any non-finite parameter — geometry never fails
     /// a render.
-    pub fn apply(
+    pub fn apply(pixels: &[f32], w: usize, h: usize, params: BordersParams) -> (usize, usize, Vec<f32>) {
+        let (ow, oh, out, _) = Self::apply_with_content_rect(pixels, w, h, params);
+        (ow, oh, out)
+    }
+
+    pub fn apply_with_content_rect(
         pixels: &[f32],
         w: usize,
         h: usize,
         params: BordersParams,
-    ) -> (usize, usize, Vec<f32>) {
+    ) -> (usize, usize, Vec<f32>, ContentRect) {
         if w == 0
             || h == 0
             || pixels.len() < w.saturating_mul(h).saturating_mul(4)
             || params.size == 0.0
             || !params.is_finite()
         {
-            return (w, h, pixels.to_vec());
+            return (w, h, pixels.to_vec(), ContentRect::source(w, h));
         }
         let (ow, oh) = Self::modify_roi_out(w, h, params.size);
         let binfo = Self::setup_binfo(
@@ -665,7 +694,8 @@ impl Borders {
         let n = ow.saturating_mul(oh).saturating_mul(4);
         let mut out = vec![0.0f32; n];
         copy_image_with_border_kernel(&mut out, pixels, &binfo);
-        (ow, oh, out)
+        let content = ContentRect::from_binfo(&binfo);
+        (ow, oh, out, content)
     }
 
     /// Compose an **8-bit** interleaved image (`bytes`, `w × h`, `nch`
@@ -685,13 +715,36 @@ impl Borders {
         rowstride: usize,
         params: BordersParams,
     ) -> Option<(usize, usize, Vec<u8>)> {
-        if nch == 0 || w == 0 || h == 0 || params.size == 0.0 || !params.is_finite() {
+        if params.size == 0.0 || !params.is_finite() {
+            return None;
+        }
+        Self::apply_srgb8_with_content_rect(bytes, w, h, nch, rowstride, params)
+            .map(|(ow, oh, out, _)| (ow, oh, out))
+    }
+
+    pub fn apply_srgb8_with_content_rect(
+        bytes: &[u8],
+        w: usize,
+        h: usize,
+        nch: usize,
+        rowstride: usize,
+        params: BordersParams,
+    ) -> Option<(usize, usize, Vec<u8>, ContentRect)> {
+        if nch == 0 || w == 0 || h == 0 || !params.is_finite() {
             return None;
         }
         let packed_row = w.checked_mul(nch)?;
         let required = rowstride.checked_mul(h)?;
         if rowstride < packed_row || bytes.len() < required {
             return None;
+        }
+        if params.size == 0.0 {
+            let mut out = Vec::with_capacity(packed_row.checked_mul(h)?);
+            for row in 0..h {
+                let start = row.checked_mul(rowstride)?;
+                out.extend_from_slice(&bytes[start..start + packed_row]);
+            }
+            return Some((w, h, out, ContentRect::source(w, h)));
         }
         let (ow, oh) = Self::modify_roi_out(w, h, params.size);
         let binfo = Self::setup_binfo(
@@ -735,7 +788,8 @@ impl Borders {
                 }
             }
         }
-        Some((ow, oh, out))
+        let content = ContentRect::from_binfo(&binfo);
+        Some((ow, oh, out, content))
     }
 
     /// Compose an **16-bit** interleaved image (`samples: &[u16]`, `w × h`,
@@ -754,13 +808,36 @@ impl Borders {
         rowstride: usize,
         params: BordersParams,
     ) -> Option<(usize, usize, Vec<u16>)> {
-        if nch == 0 || w == 0 || h == 0 || params.size == 0.0 || !params.is_finite() {
+        if params.size == 0.0 || !params.is_finite() {
+            return None;
+        }
+        Self::apply_srgb16_with_content_rect(samples, w, h, nch, rowstride, params)
+            .map(|(ow, oh, out, _)| (ow, oh, out))
+    }
+
+    pub fn apply_srgb16_with_content_rect(
+        samples: &[u16],
+        w: usize,
+        h: usize,
+        nch: usize,
+        rowstride: usize,
+        params: BordersParams,
+    ) -> Option<(usize, usize, Vec<u16>, ContentRect)> {
+        if nch == 0 || w == 0 || h == 0 || !params.is_finite() {
             return None;
         }
         let packed_row = w.checked_mul(nch)?;
         let required = rowstride.checked_mul(h)?;
         if rowstride < packed_row || samples.len() < required {
             return None;
+        }
+        if params.size == 0.0 {
+            let mut out = Vec::with_capacity(packed_row.checked_mul(h)?);
+            for row in 0..h {
+                let start = row.checked_mul(rowstride)?;
+                out.extend_from_slice(&samples[start..start + packed_row]);
+            }
+            return Some((w, h, out, ContentRect::source(w, h)));
         }
         let (ow, oh) = Self::modify_roi_out(w, h, params.size);
         let binfo = Self::setup_binfo(
@@ -804,7 +881,8 @@ impl Borders {
                 }
             }
         }
-        Some((ow, oh, out))
+        let content = ContentRect::from_binfo(&binfo);
+        Some((ow, oh, out, content))
     }
 }
 
@@ -1600,6 +1678,72 @@ mod tests {
             ref_copy_image_with_border(&mut reference, &px, &binfo);
             assert_eq!(to_bits(&direct), to_bits(&reference));
         }
+    }
+
+    #[test]
+    fn content_rect_apis_preserve_outputs_and_report_binfo_content() {
+        let (w, h) = (10usize, 6usize);
+        let floats = vec![0.25f32; w * h * 4];
+        let bytes = vec![73u8; w * h * 3];
+        let samples = vec![19000u16; w * h * 3];
+        for params in [
+            BordersParams { size: 0.25, pos_h: 0.0, pos_v: 1.0, ..Default::default() },
+            BordersParams { size: 0.25, pos_h: 0.35, pos_v: 0.7, frame_size: 0.8, ..Default::default() },
+            BordersParams { size: 0.25, pos_h: 1.0, pos_v: 0.0, frame_size: 0.5, ..Default::default() },
+        ] {
+            let (ow, oh, of, rect) = Borders::apply_with_content_rect(&floats, w, h, params);
+            let (old_w, old_h, old_f) = Borders::apply(&floats, w, h, params);
+            assert_eq!((ow, oh), (old_w, old_h));
+            assert_eq!(to_bits(&of), to_bits(&old_f));
+            let b = Borders::setup_binfo(w as i32, h as i32, ow as i32, oh as i32,
+                params.pos_v, params.pos_h, &params.color, &params.frame_color,
+                params.frame_size, params.frame_offset);
+            assert_eq!(rect, ContentRect::from_binfo(&b));
+
+            let out8 = Borders::apply_srgb8_with_content_rect(&bytes, w, h, 3, w * 3, params).unwrap();
+            let old8 = Borders::apply_srgb8(&bytes, w, h, 3, w * 3, params).unwrap();
+            assert_eq!((out8.0, out8.1, out8.2.clone()), old8);
+            assert_eq!(out8.3, rect);
+            let out16 = Borders::apply_srgb16_with_content_rect(&samples, w, h, 3, w * 3, params).unwrap();
+            let old16 = Borders::apply_srgb16(&samples, w, h, 3, w * 3, params).unwrap();
+            assert_eq!((out16.0, out16.1, out16.2.clone()), old16);
+            assert_eq!(out16.3, rect);
+        }
+        let identity = BordersParams { size: 0.0, ..Default::default() };
+        assert_eq!(Borders::apply_with_content_rect(&floats, w, h, identity).3, ContentRect::source(w, h));
+        let no_op8 = Borders::apply_srgb8_with_content_rect(&bytes, w, h, 3, w * 3, identity).unwrap();
+        assert_eq!(no_op8.2, bytes);
+        assert_eq!(no_op8.3, ContentRect::source(w, h));
+        assert_eq!(Borders::apply_srgb8(&bytes, w, h, 3, w * 3, identity), None);
+        let no_op16 = Borders::apply_srgb16_with_content_rect(&samples, w, h, 3, w * 3, identity).unwrap();
+        assert_eq!(no_op16.2, samples);
+        assert_eq!(no_op16.3, ContentRect::source(w, h));
+        assert_eq!(Borders::apply_srgb16(&samples, w, h, 3, w * 3, identity), None);
+
+        let padded_rowstride8 = w * 3 + 2;
+        let mut padded8 = vec![0u8; padded_rowstride8 * h];
+        let padded_rowstride16 = w * 3 + 2;
+        let mut padded16 = vec![0u16; padded_rowstride16 * h];
+        for row in 0..h {
+            padded8[row * padded_rowstride8..row * padded_rowstride8 + w * 3]
+                .copy_from_slice(&bytes[row * w * 3..(row + 1) * w * 3]);
+            padded16[row * padded_rowstride16..row * padded_rowstride16 + w * 3]
+                .copy_from_slice(&samples[row * w * 3..(row + 1) * w * 3]);
+        }
+        let padded_no_op8 = Borders::apply_srgb8_with_content_rect(
+            &padded8, w, h, 3, padded_rowstride8, identity,
+        ).unwrap();
+        assert_eq!(padded_no_op8.2, bytes);
+        let padded_no_op16 = Borders::apply_srgb16_with_content_rect(
+            &padded16, w, h, 3, padded_rowstride16, identity,
+        ).unwrap();
+        assert_eq!(padded_no_op16.2, samples);
+
+        assert!(Borders::apply_srgb8_with_content_rect(&bytes[..2], w, h, 3, w * 3, Default::default()).is_none());
+        assert!(Borders::apply_srgb16_with_content_rect(&samples[..2], w, h, 3, w * 3, Default::default()).is_none());
+        let malformed_float = Borders::apply_with_content_rect(&floats[..4], w, h, Default::default());
+        assert_eq!(malformed_float.2, floats[..4]);
+        assert_eq!(malformed_float.3, ContentRect::source(w, h));
     }
 
     /// The composed canvas keeps the border colour on the border runs, the
