@@ -1,15 +1,15 @@
 //! Geometry operations on the linear RGBA preview buffer — **crop** first, with
 //! rotate to follow. Kept deliberately separate from the per-pixel colour
-//! [`crate::pipeline`]: every current pipeline stage is position-independent, so
-//! a rectangular crop yields identical colour whether applied before or after
-//! them. Geometry therefore runs as its own pass rather than as a
-//! dimension-changing `Stage`, which keeps the ping-pong `Pipeline` size-agnostic.
+//! [`crate::pipeline`]: the active preview stages are currently position-independent,
+//! so a rectangular crop yields identical colour whether applied before or after
+//! them. Geometry therefore runs as its own pass rather than as a dimension-changing
+//! `Stage`, which keeps the ping-pong `Pipeline` size-agnostic.
 //!
-//! **Note:** this commutativity holds only while every pipeline stage is
-//! position-independent (per-pixel). Once a spatially-varying IOP such as lens
-//! correction, local contrast, or denoise is added, crop placement relative to
-//! that stage becomes order-sensitive and this separation must be revisited (the
-//! same caveat is recorded in [`crate::pipeline`]).
+//! **Note:** this commutativity holds only while every stage in the active pipeline
+//! is position-independent (per-pixel). Once a spatial stage such as Contrast &
+//! Texture is wired into the preview, crop placement becomes order-sensitive and
+//! geometry/pipeline ordering must be revisited (the same caveat is recorded in
+//! [`crate::pipeline`]).
 
 /// A rectangular crop expressed as fractions of the source image in `[0, 1]`
 /// (resolution-independent, so the same `Crop` survives the preview downscale
@@ -129,18 +129,9 @@ pub fn apply_rotate(pixels: &[f32], w: usize, h: usize, angle: f32) -> (usize, u
     {
         return (w, h, pixels.to_vec());
     }
+    let (w2, h2) = rotated_dimensions(w, h, angle);
     let (sin, cos) = angle.sin_cos();
     let (wf, hf) = (w as f32, h as f32);
-    // Axis-aligned bounding box of the rotated rectangle. Subtract a sub-pixel
-    // epsilon before `ceil` so float sin/cos artefacts at near-axis angles (e.g.
-    // cos(π/2) ≈ 4e-8 instead of 0) can't inflate the canvas by a spurious
-    // row/column. Safe while w,h ≲ 22 000 px (worst-case artefact w·4.37e-8 <
-    // 1e-3); for larger buffers shrink the epsilon or use f64 here. The cost is
-    // ≤ 1e-3 px of extremal-corner content excluded — visually zero for a
-    // preview (those corners are the least-reliable mirror-clamp samples anyway).
-    let ceil_dim = |v: f32| (v - 1e-3).ceil().max(1.0) as usize;
-    let w2 = ceil_dim((wf * cos.abs()) + (hf * sin.abs()));
-    let h2 = ceil_dim((wf * sin.abs()) + (hf * cos.abs()));
     // Grid centres in pixel-index space (integer for odd extents).
     let (scx, scy) = ((wf - 1.0) * 0.5, (hf - 1.0) * 0.5);
     let (dcx, dcy) = ((w2 as f32 - 1.0) * 0.5, (h2 as f32 - 1.0) * 0.5);
@@ -162,6 +153,21 @@ pub fn apply_rotate(pixels: &[f32], w: usize, h: usize, angle: f32) -> (usize, u
         }
     }
     (w2, h2, out)
+}
+
+/// Canvas dimensions used by `apply_rotate`; shared with the allocation-free
+/// dimensions API so its rounding cannot diverge from pixel rotation.
+fn rotated_dimensions(w: usize, h: usize, angle: f32) -> (usize, usize) {
+    if w == 0 || h == 0 || !angle.is_finite() || angle.abs() < MIN_ANGLE {
+        return (w, h);
+    }
+    let (sin, cos) = angle.sin_cos();
+    let (wf, hf) = (w as f32, h as f32);
+    // Axis-aligned bounding box of the rotated rectangle. Subtract a sub-pixel
+    // epsilon before `ceil` to prevent sin/cos noise at axis-aligned angles from
+    // spuriously adding a row or column (same behavior as the former inline code).
+    let ceil_dim = |v: f32| (v - 1e-3).ceil().max(1.0) as usize;
+    (ceil_dim(wf * cos.abs() + hf * sin.abs()), ceil_dim(wf * sin.abs() + hf * cos.abs()))
 }
 
 /// Current geometry blob version. Version 1 remains readable for compatibility.
@@ -291,6 +297,34 @@ impl Geometry {
         apply_rotate(&oriented, ow, oh, self.angle)
     }
 
+    /// Return dimensions after orientation → straighten → optional crop without
+    /// allocating or inspecting frame pixels. `crop` is false while editing the
+    /// crop overlay, matching `apply_without_crop`.
+    pub fn dimensions(&self, w: usize, h: usize, crop: bool) -> (usize, usize) {
+        // Orientation/rotation/crop all no-op on degenerate frames in `apply`.
+        if w == 0 || h == 0 {
+            return (w, h);
+        }
+        let (w, h) = if matches!(
+            self.orientation,
+            Orientation::Transpose
+                | Orientation::Rotate90Cw
+                | Orientation::Rotate90Ccw
+                | Orientation::Transverse
+        ) {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        let (w, h) = rotated_dimensions(w, h, self.angle);
+        if crop {
+            let (_, _, cw, ch) = self.crop.pixel_rect(w, h);
+            (cw, ch)
+        } else {
+            (w, h)
+        }
+    }
+
     /// Apply orientation, straighten, then crop to a packed linear RGBA `f32`
     /// buffer, returning `(new_w, new_h, pixels)`. Identity or a degenerate
     /// buffer returns the source dimensions and a verbatim copy.
@@ -350,6 +384,45 @@ mod tests {
             }
         }
         v
+    }
+
+    #[test]
+    fn dimensions_match_apply_for_orientation_rotation_and_crop() {
+        for (w, h) in [(0, 0), (0, 7), (11, 0)] {
+            let geometry = Geometry {
+                orientation: Orientation::Rotate90Cw,
+                angle: 0.41,
+                crop: Crop { left: 0.1, top: 0.2, right: 0.8, bottom: 0.9 },
+            };
+            let input = vec![];
+            let (actual_w, actual_h, _) = geometry.apply(&input, w, h);
+            assert_eq!(geometry.dimensions(w, h, true), (actual_w, actual_h));
+            let (actual_w, actual_h, _) = geometry.apply_without_crop(&input, w, h);
+            assert_eq!(geometry.dimensions(w, h, false), (actual_w, actual_h));
+        }
+        let input = grid(11, 7);
+        let geometries = [
+            Geometry::default(),
+            Geometry { orientation: Orientation::Transpose, ..Geometry::default() },
+            Geometry { angle: 0.41, ..Geometry::default() },
+            Geometry { angle: f32::NAN, ..Geometry::default() },
+            Geometry { angle: f32::INFINITY, ..Geometry::default() },
+            Geometry { crop: Crop { left: 0.1, top: 0.2, right: 0.8, bottom: 0.9 }, ..Geometry::default() },
+            Geometry { orientation: Orientation::Rotate90Cw, angle: -0.27, crop: Crop { left: 0.12, top: 0.08, right: 0.91, bottom: 0.84 } },
+        ];
+        for geometry in geometries {
+            let (w, h, _) = geometry.apply(&input, 11, 7);
+            assert_eq!(geometry.dimensions(11, 7, true), (w, h));
+            let (w, h, _) = geometry.apply_without_crop(&input, 11, 7);
+            assert_eq!(geometry.dimensions(11, 7, false), (w, h));
+        }
+        for orientation in [Orientation::None, Orientation::FlipVertical, Orientation::FlipHorizontal,
+            Orientation::Rotate180, Orientation::Transpose, Orientation::Rotate90Cw,
+            Orientation::Rotate90Ccw, Orientation::Transverse] {
+            let geometry = Geometry { orientation, ..Geometry::default() };
+            let (w, h, _) = geometry.apply(&input, 11, 7);
+            assert_eq!(geometry.dimensions(11, 7, true), (w, h));
+        }
     }
 
     #[test]

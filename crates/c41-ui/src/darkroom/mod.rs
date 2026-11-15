@@ -192,12 +192,10 @@ impl LensFrame {
     }
 }
 
-/// C&T render metadata for one frame. Input dimensions are the pipeline INPUT
-/// dimensions before geometry/borders. Source dimensions and the integer raw
-/// downscale factor preserve the decoder context; non-raw images use input dims
-/// and factor 1. `piece_scale` maps the input's longest side to the source's.
-/// `roi_scale` is the processing ROI scale, not display zoom; the current
-/// full-frame render consumes the whole input buffer at ROI scale 1.0.
+/// C&T metadata. Source/input dimensions remain decode-context dimensions;
+/// content dimensions describe geometry output before borders. Piece scale is
+/// recomputed from transformed full-source/content dimensions. ROI scale is
+/// independent of geometry and remains 1.0.
 // Intentionally staged before C&T parameter/UI wiring; the next increment will
 // consume this metadata when constructing the enabled pipeline stage.
 #[allow(dead_code)]
@@ -207,6 +205,8 @@ struct PieceRenderContext {
     input_height: usize,
     source_width: usize,
     source_height: usize,
+    content_width: usize,
+    content_height: usize,
     downscale_factor: usize,
     piece_scale: f32,
     roi_scale: f32,
@@ -215,7 +215,23 @@ struct PieceRenderContext {
 impl PieceRenderContext {
     #[allow(dead_code)]
     fn max_piece_dimension(self) -> usize {
-        self.input_width.max(self.input_height)
+        self.content_width.max(self.content_height)
+    }
+
+    fn with_geometry(mut self, geometry: Geometry, crop: bool) -> Self {
+        (self.content_width, self.content_height) =
+            geometry.dimensions(self.input_width, self.input_height, crop);
+        let (source_width, source_height) =
+            geometry.dimensions(self.source_width, self.source_height, crop);
+        if let Some(piece_scale) = crate::raw_preview::piece_scale_from_dimensions(
+            source_width,
+            source_height,
+            self.content_width,
+            self.content_height,
+        ) {
+            self.piece_scale = piece_scale;
+        }
+        self
     }
 }
 
@@ -231,7 +247,8 @@ struct PreviewCtx {
     /// sample never lingers after an edit changes the displayed pixels.
     picker: glib::WeakRef<gtk4::Label>,
     base: Rc<RefCell<Option<BaseImage>>>,
-    /// Original pipeline input metadata; geometry/border composition never rewrites it.
+    /// Decode-context metadata with content dimensions recalculated from the
+    /// immutable input on geometry changes; border dimensions are excluded.
     /// Intentionally unused until the C&T stage is wired into preview rendering.
     #[allow(dead_code)]
     piece_context: Rc<RefCell<Option<PieceRenderContext>>>,
@@ -1261,6 +1278,17 @@ fn apply_geometry_to_base(ctx: &PreviewCtx) {
     // never touches them — like crop, a border persists under the before/after
     // toggle, which only strips pipeline stages.
     let borders = ctx.params.borrow().borders_params();
+    let original_context = *ctx.piece_context.borrow();
+    if let Some(context) = original_context {
+        // Non-raw rendering currently applies only the discrete orientation;
+        // raw rendering uses the full straighten/crop geometry.
+        let transform = if ctx.pristine.borrow().is_some() {
+            geom
+        } else {
+            Geometry { crop: Crop::default(), angle: 0.0, orientation: geom.orientation }
+        };
+        *ctx.piece_context.borrow_mut() = Some(context.with_geometry(transform, !editing));
+    }
     let compose = |pixels: &[f32], w: usize, h: usize| -> BaseImage {
         let (gw, gh, gpixels) = if editing {
             geom.apply_without_crop(pixels, w, h)
@@ -1441,6 +1469,8 @@ fn spawn_decode(ctx: &PreviewCtx) {
                         input_height: h,
                         source_width,
                         source_height,
+                        content_width: w,
+                        content_height: h,
                         downscale_factor,
                         piece_scale,
                         roi_scale: 1.0,
@@ -1535,6 +1565,8 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     input_height,
                     source_width: input_width,
                     source_height: input_height,
+                    content_width: input_width,
+                    content_height: input_height,
                     downscale_factor: 1,
                     piece_scale: 1.0,
                     roi_scale: 1.0,
@@ -6395,6 +6427,57 @@ fn draw_histogram(cr: &gtk4::cairo::Context, w: i32, h: i32, hist: &Histogram) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn piece_context_geometry_is_derived_from_decode_dimensions() {
+        let original = PieceRenderContext {
+            input_width: 201,
+            input_height: 134,
+            source_width: 601,
+            source_height: 401,
+            content_width: 201,
+            content_height: 134,
+            downscale_factor: 3,
+            piece_scale: crate::raw_preview::piece_scale_from_dimensions(601, 401, 201, 134)
+                .unwrap(),
+            roi_scale: 1.0,
+        };
+        let geometry = Geometry {
+            orientation: Orientation::Rotate90Cw,
+            angle: 0.37,
+            crop: Crop { left: 0.08, top: 0.12, right: 0.92, bottom: 0.88 },
+        };
+        let transformed = original.with_geometry(geometry, true);
+        let repeated = original.with_geometry(geometry, true);
+        assert_eq!(transformed, repeated, "geometry recomputes from decode dimensions");
+        assert_eq!(
+            (transformed.content_width, transformed.content_height),
+            geometry.dimensions(original.input_width, original.input_height, true)
+        );
+        let (source_width, source_height) =
+            geometry.dimensions(original.source_width, original.source_height, true);
+        assert_eq!(
+            transformed.piece_scale,
+            crate::raw_preview::piece_scale_from_dimensions(
+                source_width,
+                source_height,
+                transformed.content_width,
+                transformed.content_height,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            transformed.max_piece_dimension(),
+            transformed.content_width.max(transformed.content_height)
+        );
+        assert_eq!(transformed.roi_scale, original.roi_scale);
+
+        let crop_edit = original.with_geometry(geometry, false);
+        assert_eq!(
+            (crop_edit.content_width, crop_edit.content_height),
+            geometry.dimensions(original.input_width, original.input_height, false)
+        );
+    }
 
     #[test]
     fn retouch_click_mapping_uses_pixel_centers_and_rejects_letterbox() {

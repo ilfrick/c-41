@@ -63,7 +63,7 @@ pub struct RawPreview {
 /// Return the C&T piece scale that maps the preview input's longest side to
 /// the original decoded image's longest side. The raw preview's integer box
 /// factor can drop edge remainders, so it is not always the exact scale.
-fn piece_scale_from_dimensions(
+pub(crate) fn piece_scale_from_dimensions(
     source_width: usize,
     source_height: usize,
     preview_width: usize,
