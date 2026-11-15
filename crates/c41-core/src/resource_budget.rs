@@ -107,6 +107,26 @@ impl fmt::Display for BudgetError {
 impl std::error::Error for BudgetError {}
 
 impl ResourceBudget {
+    /// Build configured limits from detected total/effective system memory.
+    ///
+    /// Uses `memory.effective_bytes`, not `host_bytes`, so a cgroup memory
+    /// limit constrains C-41's safety budget. `SystemMemory` reports total
+    /// memory, not currently free memory. Applying cgroup adjustment here is
+    /// C-41 safety behavior, not darktable upstream parity.
+    pub fn from_system_memory(
+        level: ResourceLevel,
+        memory: crate::system_memory::SystemMemory,
+        cache_deduction_bytes: Option<u64>,
+        reference: Option<AbsoluteReferenceProfile>,
+    ) -> Result<Self, BudgetError> {
+        Self::calculate(
+            level,
+            memory.effective_bytes,
+            cache_deduction_bytes,
+            reference,
+        )
+    }
+
     /// Calculate configured resource limits from total memory. The optional
     /// cache deduction affects only the CPU-available budget.
     ///
@@ -240,6 +260,33 @@ mod tests {
         .unwrap();
         assert_eq!(p.cpu_available_bytes, 1024 * 1024 * 1024);
         assert_eq!(p.cpu_single_buffer_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn system_memory_budget_uses_effective_cgroup_total() {
+        let memory = crate::system_memory::SystemMemory {
+            host_bytes: 64 * 1024 * 1024 * 1024,
+            effective_bytes: 4 * 1024 * 1024 * 1024,
+            source: crate::system_memory::MemorySource::CgroupV2,
+        };
+        let budget =
+            ResourceBudget::from_system_memory(ResourceLevel::Default, memory, None, None).unwrap();
+        let host_budget =
+            ResourceBudget::calculate(ResourceLevel::Default, memory.host_bytes, None, None)
+                .unwrap();
+
+        assert_eq!(budget.cpu_available_bytes, 1536 * 1024 * 1024);
+        assert_ne!(budget.cpu_available_bytes, host_budget.cpu_available_bytes);
+
+        let fallback = crate::system_memory::SystemMemory {
+            host_bytes: 2 * 1024 * 1024 * 1024,
+            effective_bytes: 2 * 1024 * 1024 * 1024,
+            source: crate::system_memory::MemorySource::Fallback,
+        };
+        let fallback_budget =
+            ResourceBudget::from_system_memory(ResourceLevel::Default, fallback, None, None)
+                .unwrap();
+        assert_eq!(fallback_budget.cpu_available_bytes, 512 * 1024 * 1024);
     }
 
     #[test]
