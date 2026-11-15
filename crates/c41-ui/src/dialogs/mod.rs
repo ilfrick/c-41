@@ -335,19 +335,19 @@ fn render_raw_export(
         match settings.format {
             ExportFormat::Jpeg => {
                 let direct = if direct_rec2020 {
-                    crate::export::render_export_rgb8_output_gear(
+                    crate::export::try_render_export_rgb8_output_gear(
                         &img, edit.method, edit.geometry, &edit.params, lens_gear, grain_seed,
                         settings.output_profile,
-                    )
+                    )?
                 } else {
                     None
                 };
                 let (w, h, rgb) = if let Some(direct) = direct {
                     direct
                 } else {
-                    let (w, h, mut rgb) = crate::export::render_export_rgb8_gear(
+                    let (w, h, mut rgb) = crate::export::try_render_export_rgb8_gear(
                         &img, edit.method, edit.geometry, &edit.params, lens_gear, grain_seed,
-                    );
+                    )?;
                     if let Some(t) = out_transform {
                         // Tightly packed RGB, so rowstride == width·3.
                         c41_core::icc::apply_rgb8(t, &mut rgb, w, w * 3, 3);
@@ -363,19 +363,19 @@ fn render_raw_export(
             }
             ExportFormat::Png | ExportFormat::Tiff => {
                 let direct = if direct_rec2020 {
-                    crate::export::render_export_rgb16_output_gear(
+                    crate::export::try_render_export_rgb16_output_gear(
                         &img, edit.method, edit.geometry, &edit.params, lens_gear, grain_seed,
                         settings.output_profile,
-                    )
+                    )?
                 } else {
                     None
                 };
                 let (w, h, rgb) = if let Some(direct) = direct {
                     direct
                 } else {
-                    let (w, h, mut rgb) = crate::export::render_export_rgb16_gear(
+                    let (w, h, mut rgb) = crate::export::try_render_export_rgb16_gear(
                         &img, edit.method, edit.geometry, &edit.params, lens_gear, grain_seed,
-                    );
+                    )?;
                     if let Some(t) = out_transform {
                         c41_core::icc::apply_rgb16(t, &mut rgb, w, w * 3, 3);
                     }
@@ -708,9 +708,10 @@ fn render_nonraw_export(
                     Some(bp) => c41_core::borders::Borders::apply(&linear, ow, oh, bp),
                     None => (ow, oh, linear),
                 };
-                let processed = crate::preview::render_nonraw_linear_to_output8_gear(
+                let processed = crate::preview::try_render_nonraw_linear_to_output8_gear(
                     &linear, ow, oh, params, lens_gear, grain_seed, settings.output_profile,
-                ).ok_or_else(|| anyhow::anyhow!("output profile transform unavailable"))?;
+                )?
+                .ok_or_else(|| anyhow::anyhow!("output profile transform unavailable"))?;
                 let target = settings.resize.as_ref()
                     .map(|r| crate::export::fit_within(ow as u32, oh as u32, r));
                 return atomic_write(&dest_ext, move |out| {
@@ -745,9 +746,9 @@ fn render_nonraw_export(
                     .ok_or_else(|| anyhow::anyhow!("borders compose: bad decoded buffer"))?,
                 None => (ow, oh, rgb),
             };
-            let mut processed = crate::preview::apply_pipeline_gear(
+            let mut processed = crate::preview::try_apply_pipeline_gear(
                 &rgb, ow, oh, ow * 3, 3, params, lens_gear, grain_seed,
-            );
+            )?;
             // G2c: sRGB working space → the chosen output profile (no-op for sRGB).
             if let Some(t) = out_transform {
                 c41_core::icc::apply_rgb8(t, &mut processed, ow, ow * 3, 3);
@@ -781,9 +782,10 @@ fn render_nonraw_export(
                     Some(bp) => c41_core::borders::Borders::apply(&linear, ow, oh, bp),
                     None => (ow, oh, linear),
                 };
-                let processed = crate::preview::render_nonraw_linear_to_output16_gear(
+                let processed = crate::preview::try_render_nonraw_linear_to_output16_gear(
                     &linear, ow, oh, params, lens_gear, grain_seed, settings.output_profile,
-                ).ok_or_else(|| anyhow::anyhow!("output profile transform unavailable"))?;
+                )?
+                .ok_or_else(|| anyhow::anyhow!("output profile transform unavailable"))?;
                 let fmt = match settings.format {
                     ExportFormat::Png => image::ImageFormat::Png,
                     _ => image::ImageFormat::Tiff,
@@ -821,9 +823,9 @@ fn render_nonraw_export(
                     .ok_or_else(|| anyhow::anyhow!("borders compose: bad decoded buffer"))?,
                 None => (ow, oh, rgb),
             };
-            let mut processed = crate::preview::apply_pipeline_rgb16_gear(
+            let mut processed = crate::preview::try_apply_pipeline_rgb16_gear(
                 &rgb, ow, oh, params, lens_gear, grain_seed,
-            );
+            )?;
             if let Some(t) = out_transform {
                 c41_core::icc::apply_rgb16(t, &mut processed, ow, ow * 3, 3);
             }

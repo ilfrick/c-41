@@ -49,6 +49,7 @@ pub mod raw;
 pub mod rawimage;
 pub mod rgbe;
 pub mod roi;
+pub mod resource_budget;
 pub mod splines;
 pub mod thumbnail;
 pub mod tiff;

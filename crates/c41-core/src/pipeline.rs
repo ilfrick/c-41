@@ -2330,6 +2330,32 @@ impl Stage {
     }
 }
 
+/// Recoverable failures at the pipeline input/output boundary.
+#[derive(Debug)]
+pub enum PipelineError {
+    Shape { width: usize, height: usize, input_len: usize },
+    ArithmeticOverflow,
+    Allocation(std::collections::TryReserveError),
+}
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shape { width, height, input_len } => write!(f, "pipeline shape {width}x{height} does not match packed RGBA input length {input_len}"),
+            Self::ArithmeticOverflow => f.write_str("pipeline dimensions overflow"),
+            Self::Allocation(error) => write!(f, "pipeline buffer allocation failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for PipelineError {}
+
+fn fallible_buffer(len: usize) -> Result<Vec<f32>, PipelineError> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len).map_err(PipelineError::Allocation)?;
+    buffer.resize(len, 0.0);
+    Ok(buffer)
+}
+
 /// An ordered sequence of [`Stage`]s applied to a scene-referred RGBA buffer.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pipeline {
@@ -2347,6 +2373,69 @@ impl Pipeline {
 
     pub fn push(&mut self, stage: Stage) {
         self.stages.push(stage);
+    }
+
+    /// Fallible processing API for callers that must surface resource/shape
+    /// failures. The legacy [`Self::process`] API remains for compatibility.
+    pub fn try_process(&self, input: &[f32], width: usize, height: usize) -> Result<Vec<f32>, PipelineError> {
+        self.try_process_with_dispatch(
+            input,
+            width,
+            height,
+            crate::gpu::backend_available,
+            crate::gpu::explicitly_disabled,
+            crate::gpu::sigmoid_rgb_ratio,
+        )
+    }
+
+    fn try_process_with_dispatch<F>(
+        &self,
+        input: &[f32],
+        width: usize,
+        height: usize,
+        backend_available: impl FnOnce() -> bool,
+        explicitly_disabled: impl FnOnce() -> bool,
+        dispatch_sigmoid: F,
+    ) -> Result<Vec<f32>, PipelineError>
+    where
+        F: FnMut(&[f32], &mut [f32], &[Stage]) -> anyhow::Result<()>,
+    {
+        let expected = width.checked_mul(height).and_then(|n| n.checked_mul(4)).ok_or(PipelineError::ArithmeticOverflow)?;
+        if !input.len().is_multiple_of(4) || expected != input.len() {
+            return Err(PipelineError::Shape { width, height, input_len: input.len() });
+        }
+        debug_assert!(
+            {
+                let mut spaces = self.stages.iter().filter_map(Stage::working_space);
+                spaces.next().is_none_or(|first| spaces.all(|space| space == first))
+            },
+            "colour-space-dependent stages disagree on the working space"
+        );
+        if self.stages.is_empty() {
+            let mut output = fallible_buffer(input.len())?;
+            output.copy_from_slice(input);
+            return Ok(output);
+        }
+
+        // Keep the established GPU Sigmoid dispatch and CPU fallback semantics.
+        // The stagewise GPU path owns its own fallibly reserved frame buffers;
+        // allocate the CPU fallback buffers only if that path is unavailable or
+        // fails, avoiding an unnecessary extra full-frame allocation on success.
+        if self.stages.iter().any(|stage| matches!(stage, Stage::Sigmoid { .. })) {
+            if backend_available() {
+                match self.process_stagewise(input, width, height, dispatch_sigmoid) {
+                    Ok(output) => return Ok(output),
+                    Err(error) => crate::gpu::report_fallback(&error),
+                }
+            } else if !explicitly_disabled() {
+                crate::gpu::report_fallback(&anyhow::anyhow!("OpenCL GPU backend unavailable"));
+            }
+        }
+
+        let mut output = fallible_buffer(input.len())?;
+        let mut scratch = fallible_buffer(input.len())?;
+        self.process_band(input, &mut output, &mut scratch, width, height);
+        Ok(output)
     }
 
     /// Run all stages in order over `input` (packed RGBA `f32`, length a multiple
@@ -2560,6 +2649,85 @@ fn gpu_stage_spans(stages: &[Stage]) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_process_reports_invalid_shapes_and_overflow() {
+        let pipeline = Pipeline::new();
+        assert!(matches!(pipeline.try_process(&[0.0; 3], 1, 1), Err(PipelineError::Shape { .. })));
+        assert!(matches!(pipeline.try_process(&[], usize::MAX, 2), Err(PipelineError::ArithmeticOverflow)));
+        assert!(matches!(pipeline.try_process(&[0.0; 4], 2, 1), Err(PipelineError::Shape { .. })));
+    }
+
+    #[test]
+    fn fallible_buffer_reports_capacity_allocation_failure() {
+        assert!(matches!(fallible_buffer(usize::MAX), Err(PipelineError::Allocation(_))));
+    }
+
+    #[test]
+    fn try_process_preserves_successful_pipeline_output() {
+        let input = [0.25, 0.5, 0.75, 1.0];
+        assert_eq!(Pipeline::new().try_process(&input, 1, 1).unwrap(), input);
+        let p = Pipeline::with_stages(vec![Stage::Exposure { black: 0.0, scale: 2.0 }]);
+        assert_eq!(p.try_process(&input, 1, 1).unwrap(), p.process(&input, 1, 1));
+    }
+
+    #[test]
+    fn try_process_preserves_sigmoid_dispatch_output() {
+        let [white_target, black_target, paper_exp, film_fog, film_power, paper_power] =
+            sigmoid::rgb_ratio_params(1.5, 0.0, 100.0, 0.0152);
+        let pipeline = Pipeline::with_stages(vec![Stage::Sigmoid {
+            white_target,
+            black_target,
+            paper_exp,
+            film_fog,
+            film_power,
+            paper_power,
+        }]);
+        let input = [0.02, 0.02, 0.02, 1.0, 0.5, 0.5, 0.5, 1.0];
+        let expected = pipeline.process(&input, 2, 1);
+        let actual = pipeline.try_process(&input, 2, 1).unwrap();
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn try_process_invokes_injected_sigmoid_dispatch() {
+        let pipeline = Pipeline::with_stages(vec![Stage::Sigmoid {
+            white_target: 1.0,
+            black_target: 0.0,
+            paper_exp: 0.3,
+            film_fog: 0.0,
+            film_power: 1.0,
+            paper_power: 1.0,
+        }]);
+        let input = [0.25, 0.5, 0.75, 1.0];
+        let mut dispatches = 0;
+        let output = pipeline
+            .try_process_with_dispatch(
+                &input,
+                1,
+                1,
+                || true,
+                || false,
+                |source, target, stages| {
+                    dispatches += 1;
+                    assert_eq!(stages.len(), 1);
+                    target.copy_from_slice(source);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(dispatches, 1);
+        assert_eq!(output, input);
+
+        let fallback = pipeline
+            .try_process_with_dispatch(&input, 1, 1, || true, || false, |_, _, _| {
+                Err(anyhow::anyhow!("injected GPU dispatch failure"))
+            })
+            .unwrap();
+        assert_eq!(fallback, pipeline.process_cpu(&input, 1, 1));
+    }
 
     #[test]
     fn empty_pipeline_is_identity() {

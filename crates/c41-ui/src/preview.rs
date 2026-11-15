@@ -22,7 +22,50 @@
 
 use c41_core::iop::colorzones;
 use c41_core::iop::primaries;
-use c41_core::pipeline::{ColorSpace, Pipeline, Stage};
+use c41_core::pipeline::{ColorSpace, Pipeline, PipelineError, Stage};
+use std::fmt;
+
+/// Errors that can be reported by fallible preview/render helpers.
+#[derive(Debug)]
+pub enum PreviewRenderError {
+    InvalidInput(&'static str),
+    ArithmeticOverflow,
+    Allocation(std::collections::TryReserveError),
+    Pipeline(PipelineError),
+}
+
+impl fmt::Display for PreviewRenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput(message) => f.write_str(message),
+            Self::ArithmeticOverflow => f.write_str("preview dimensions overflow"),
+            Self::Allocation(error) => write!(f, "preview buffer allocation failed: {error}"),
+            Self::Pipeline(error) => write!(f, "preview pipeline failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PreviewRenderError {}
+
+impl From<PipelineError> for PreviewRenderError {
+    fn from(error: PipelineError) -> Self {
+        Self::Pipeline(error)
+    }
+}
+
+fn try_filled<T: Clone>(len: usize, value: T) -> Result<Vec<T>, PreviewRenderError> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len).map_err(PreviewRenderError::Allocation)?;
+    buffer.resize(len, value);
+    Ok(buffer)
+}
+
+fn try_copy<T: Copy>(source: &[T]) -> Result<Vec<T>, PreviewRenderError> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(source.len()).map_err(PreviewRenderError::Allocation)?;
+    buffer.extend_from_slice(source);
+    Ok(buffer)
+}
 
 /// Live, user-tunable parameters for the preview pipeline. Each enabled stage
 /// runs the corresponding migrated `c41-core` IOP, in pixelpipe order
@@ -3803,33 +3846,45 @@ pub fn apply_pipeline_gear(
     lens_gear: Option<&LensGear>,
     grain_seed: u32,
 ) -> Vec<u8> {
-    // Degenerate input: nothing to process (also guards `colour - 1` below
-    // against underflow when nch == 0).
+    try_apply_pipeline_gear(base, width, height, rowstride, nch, params, lens_gear, grain_seed)
+        .unwrap_or_else(|_| base.to_vec())
+}
+
+/// Fallible form of [`apply_pipeline_gear`]. Errors indicate malformed image
+/// geometry or failure reserving the conversion buffers / core pipeline frames.
+/// This is not a general OOM guarantee: individual stages may allocate
+/// infallibly, and Linux memory overcommit can still terminate the process.
+pub fn try_apply_pipeline_gear(
+    base: &[u8],
+    width: usize,
+    height: usize,
+    rowstride: usize,
+    nch: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+    grain_seed: u32,
+) -> Result<Vec<u8>, PreviewRenderError> {
     if nch == 0 || width == 0 || height == 0 {
-        return base.to_vec();
+        return Err(PreviewRenderError::InvalidInput("zero image dimension or channel count"));
     }
-    // Defensive: a malformed pixbuf (rowstride/len smaller than the geometry
-    // implies) would otherwise panic on indexing user-supplied image data.
-    if base.len() < (height - 1) * rowstride + width * nch {
-        return base.to_vec();
+    let row_bytes = width.checked_mul(nch).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    let required = height
+        .checked_sub(1)
+        .and_then(|rows| rows.checked_mul(rowstride))
+        .and_then(|bytes| bytes.checked_add(row_bytes))
+        .ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    if rowstride < row_bytes || base.len() < required {
+        return Err(PreviewRenderError::InvalidInput("buffer is shorter than its image layout"));
     }
-    // No active stage ⇒ return the source untouched (byte-exact; also avoids a
-    // pointless sRGB linearise/encode round-trip that could drift ±1 LSB).
+    let n = width.checked_mul(height).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    let rgba_len = n.checked_mul(4).ok_or(PreviewRenderError::ArithmeticOverflow)?;
     let pipeline = params.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, lens_gear, grain_seed);
     if pipeline.stages.is_empty() {
-        return base.to_vec();
+        return try_copy(base);
     }
 
     let colour = nch.min(3);
-    let n = width * height;
-
-    // ── gather colour → packed RGBA f32, LINEAR light [0,1] ────────────────
-    // The 8-bit pixbuf is gamma-encoded sRGB; decode to linear so the core
-    // stages (exposure, velvia, …) run in the same scene-referred-ish domain as
-    // the real pixelpipe. 4th channel = 1.0 scratch (exposure scales all four;
-    // we discard it on scatter and keep the real source alpha). Sources with <3
-    // colour channels (greyscale) replicate their last channel.
-    let mut rgba = vec![0.0f32; n * 4];
+    let mut rgba = try_filled(rgba_len, 0.0f32)?;
     for y in 0..height {
         let row = y * rowstride;
         for x in 0..width {
@@ -3843,10 +3898,8 @@ pub fn apply_pipeline_gear(
         }
     }
 
-    let processed = pipeline.process(&rgba, width, height);
-
-    // ── scatter colour back (linear → sRGB), preserving alpha + padding ────
-    let mut outbuf = base.to_vec();
+    let processed = pipeline.try_process(&rgba, width, height)?;
+    let mut outbuf = try_copy(base)?;
     for y in 0..height {
         let row = y * rowstride;
         for x in 0..width {
@@ -3858,7 +3911,7 @@ pub fn apply_pipeline_gear(
             }
         }
     }
-    outbuf
+    Ok(outbuf)
 }
 
 /// 16-bit sibling of [`apply_pipeline`] for the non-raw **export** path: packed
@@ -3915,6 +3968,43 @@ pub fn apply_pipeline_rgb16_gear(
         }
     }
     out
+}
+
+/// Fallible 16-bit sRGB input path used by active lossless non-raw exports.
+pub fn try_apply_pipeline_rgb16_gear(
+    base: &[u16],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+    grain_seed: u32,
+) -> Result<Vec<u16>, PreviewRenderError> {
+    let (pixels, _) = checked_pixel_shape(width, height)?;
+    let expected = pixels.checked_mul(3).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    if base.len() < expected {
+        return Err(PreviewRenderError::InvalidInput("16-bit RGB buffer is shorter than its dimensions"));
+    }
+    let pipeline = params.to_pipeline_with(ColorSpace::LinearSrgb, 1.0, lens_gear, grain_seed);
+    if pipeline.stages.is_empty() {
+        return try_copy(&base[..expected]);
+    }
+    let rgba_len = pixels.checked_mul(4).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    let mut rgba = try_filled(rgba_len, 0.0f32)?;
+    for i in 0..pixels {
+        for c in 0..3 {
+            rgba[i * 4 + c] = c41_core::color::srgb_to_linear(base[i * 3 + c] as f32 / 65535.0);
+        }
+        rgba[i * 4 + 3] = 1.0;
+    }
+    let processed = pipeline.try_process(&rgba, width, height)?;
+    let mut out = try_filled(expected, 0u16)?;
+    for i in 0..pixels {
+        for c in 0..3 {
+            let value = c41_core::color::linear_to_srgb(processed[i * 4 + c]);
+            out[i * 3 + c] = (value.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+        }
+    }
+    Ok(out)
 }
 
 /// Run the preview pipeline on a packed **linear Rec.2020** RGBA `f32` buffer
@@ -4182,6 +4272,190 @@ pub(crate) fn render_nonraw_linear_to_output8_gear(
     Some(render_nonraw_linear_to_output16_gear(
         linear, width, height, params, lens_gear, grain_seed, profile,
     )?.into_iter().map(|v| ((v as u32 + 128) / 257) as u8).collect())
+}
+
+fn checked_pixel_shape(
+    width: usize,
+    height: usize,
+) -> Result<(usize, usize), PreviewRenderError> {
+    if width == 0 || height == 0 {
+        return Err(PreviewRenderError::InvalidInput("zero image dimension"));
+    }
+    let pixels = width.checked_mul(height).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    let rgba_len = pixels.checked_mul(4).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    Ok((pixels, rgba_len))
+}
+
+fn checked_linear_shape(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+) -> Result<(usize, usize), PreviewRenderError> {
+    let (pixels, rgba_len) = checked_pixel_shape(width, height)?;
+    if linear.len() < rgba_len {
+        return Err(PreviewRenderError::InvalidInput("linear buffer is shorter than its image dimensions"));
+    }
+    Ok((pixels, rgba_len))
+}
+
+fn try_srgb_encode_rgb(
+    linear: &[f32],
+    width: usize,
+    height: usize,
+    params: &PreviewParams,
+    lens_gear: Option<&LensGear>,
+    grain_seed: u32,
+) -> Result<Vec<f32>, PreviewRenderError> {
+    let (pixels, rgba_len) = checked_linear_shape(linear, width, height)?;
+    let mut processed = params
+        .to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
+        .try_process(&linear[..rgba_len], width, height)?;
+    c41_core::rawimage::apply_color_matrix(
+        &mut processed,
+        c41_core::rawimage::REC2020_TO_SRGB,
+    );
+    let output_len = pixels.checked_mul(3).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    let mut out = try_filled(output_len, 0.0f32)?;
+    for i in 0..pixels {
+        for c in 0..3 {
+            out[i * 3 + c] = c41_core::color::linear_to_srgb(processed[i * 4 + c]);
+        }
+    }
+    Ok(out)
+}
+
+/// Fallible sRGB renderer for a raw Rec.2020 frame; unlike the compatibility
+/// wrapper it reports malformed layouts and errors from `Pipeline::try_process`.
+pub fn try_render_linear_to_srgb8_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+) -> Result<Vec<u8>, PreviewRenderError> {
+    let encoded = try_srgb_encode_rgb(linear, width, height, params, lens_gear, grain_seed)?;
+    let mut out = try_filled(encoded.len(), 0u8)?;
+    for (dst, value) in out.iter_mut().zip(encoded) {
+        *dst = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    }
+    Ok(out)
+}
+
+/// Fallible 16-bit sRGB renderer for a raw Rec.2020 frame.
+pub fn try_render_linear_to_srgb16_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+) -> Result<Vec<u16>, PreviewRenderError> {
+    let encoded = try_srgb_encode_rgb(linear, width, height, params, lens_gear, grain_seed)?;
+    let mut out = try_filled(encoded.len(), 0u16)?;
+    for (dst, value) in out.iter_mut().zip(encoded) {
+        *dst = (value.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+    }
+    Ok(out)
+}
+
+/// Fallible raw output-profile renderer. `Ok(None)` means the requested ICC
+/// transform is unavailable; processing/layout failures are returned as Err.
+pub fn try_render_linear_to_output16_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Result<Option<Vec<u16>>, PreviewRenderError> {
+    if profile.is_srgb() {
+        return try_render_linear_to_srgb16_gear(linear, width, height, params, lens_gear, grain_seed)
+            .map(Some);
+    }
+    let (pixels, rgba_len) = checked_linear_shape(linear, width, height)?;
+    let Some(transform) = profile.transform_from_linear_rec2020() else {
+        return Ok(None);
+    };
+    let processed = params
+        .to_pipeline_lens_preapplied(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
+        .try_process(&linear[..rgba_len], width, height)?;
+    let output_len = pixels.checked_mul(3).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    let mut out = try_filled(output_len, 0u16)?;
+    for i in 0..pixels {
+        let input = [processed[i * 4], processed[i * 4 + 1], processed[i * 4 + 2]];
+        let mut encoded = [0.0f32; 3];
+        transform.eval_into(&input, &mut encoded);
+        for c in 0..3 {
+            let value = if encoded[c].is_finite() { encoded[c].clamp(0.0, 1.0) } else { 0.0 };
+            out[i * 3 + c] = (value * 65535.0 + 0.5) as u16;
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Fallible non-raw renderer: the source is Rec.2020 linear but the ordinary
+/// pipeline (including lens correction) has not been pre-applied.
+pub(crate) fn try_render_nonraw_linear_to_srgb8_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+) -> Result<Vec<u8>, PreviewRenderError> {
+    let (pixels, rgba_len) = checked_linear_shape(linear, width, height)?;
+    let mut processed = params
+        .to_pipeline_with(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
+        .try_process(&linear[..rgba_len], width, height)?;
+    c41_core::rawimage::apply_color_matrix(&mut processed, c41_core::rawimage::REC2020_TO_SRGB);
+    let output_len = pixels.checked_mul(3).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    let mut out = try_filled(output_len, 0u8)?;
+    for i in 0..pixels {
+        for c in 0..3 {
+            let value = c41_core::color::linear_to_srgb(processed[i * 4 + c]);
+            out[i * 3 + c] = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn try_render_nonraw_linear_to_output16_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Result<Option<Vec<u16>>, PreviewRenderError> {
+    let (pixels, rgba_len) = checked_linear_shape(linear, width, height)?;
+    let processed = params
+        .to_pipeline_with(ColorSpace::Rec2020, 1.0, lens_gear, grain_seed)
+        .try_process(&linear[..rgba_len], width, height)?;
+    let transform = if profile.is_srgb() { None } else {
+        let Some(transform) = profile.transform_from_linear_rec2020() else { return Ok(None); };
+        Some(transform)
+    };
+    let output_len = pixels.checked_mul(3).ok_or(PreviewRenderError::ArithmeticOverflow)?;
+    let mut out = try_filled(output_len, 0u16)?;
+    for i in 0..pixels {
+        let rgb = [processed[i * 4], processed[i * 4 + 1], processed[i * 4 + 2]];
+        let mut encoded = [0.0; 3];
+        if let Some(transform) = &transform {
+            transform.eval_into(&rgb, &mut encoded);
+        } else {
+            for c in 0..3 {
+                let mapped = (0..3).map(|k| c41_core::rawimage::REC2020_TO_SRGB[c][k] * rgb[k]).sum();
+                encoded[c] = c41_core::color::linear_to_srgb(mapped);
+            }
+        }
+        for c in 0..3 {
+            let value = if encoded[c].is_finite() { encoded[c].clamp(0.0, 1.0) } else { 0.0 };
+            out[i * 3 + c] = (value * 65535.0 + 0.5) as u16;
+        }
+    }
+    Ok(Some(out))
+}
+
+pub(crate) fn try_render_nonraw_linear_to_output8_gear(
+    linear: &[f32], width: usize, height: usize, params: &PreviewParams,
+    lens_gear: Option<&LensGear>, grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Result<Option<Vec<u8>>, PreviewRenderError> {
+    if profile.is_srgb() {
+        return try_render_nonraw_linear_to_srgb8_gear(linear, width, height, params, lens_gear, grain_seed)
+            .map(Some);
+    }
+    let Some(output) = try_render_nonraw_linear_to_output16_gear(
+        linear, width, height, params, lens_gear, grain_seed, profile,
+    )? else { return Ok(None); };
+    let mut out = try_filled(output.len(), 0u8)?;
+    for (dst, value) in out.iter_mut().zip(output) {
+        *dst = ((value as u32 + 128) / 257).min(255) as u8;
+    }
+    Ok(Some(out))
 }
 
 /// Shared render core: run the preview pipeline, map the Rec.2020 working space
@@ -4753,6 +5027,42 @@ mod tests {
     }
 
     #[test]
+    fn try_apply_pipeline_rejects_malformed_layout() {
+        let error = try_apply_pipeline_gear(
+            &[1, 2, 3],
+            2,
+            1,
+            3,
+            3,
+            &PreviewParams::default(),
+            None,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PreviewRenderError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn try_apply_pipeline_matches_legacy_output() {
+        let base = vec![10u8, 20, 30, 200, 100, 50];
+        let params = exposure_only(0.0, 0.5);
+        let fallible = try_apply_pipeline_gear(&base, 2, 1, 6, 3, &params, None, 0).unwrap();
+        let legacy = apply_pipeline_gear(&base, 2, 1, 6, 3, &params, None, 0);
+        assert_eq!(fallible, legacy);
+    }
+
+    #[test]
+    fn try_linear_render_reports_bad_shape_and_matches_legacy() {
+        let params = exposure_only(0.0, 0.5);
+        assert!(try_render_linear_to_srgb8_gear(&[0.1, 0.2, 0.3], 1, 1, &params, None, 0).is_err());
+        let input = [0.2f32, 0.4, 0.6, 1.0, 0.7, 0.5, 0.3, 1.0];
+        let fallible = try_render_linear_to_srgb8_gear(&input, 2, 1, &params, None, 0).unwrap();
+        let legacy = render_linear_to_srgb8_gear(&input, 2, 1, &params, None, 0);
+        assert_eq!(fallible, legacy);
+        assert!(try_render_nonraw_linear_to_srgb8_gear(&[0.1], 1, 1, &params, None, 0).is_err());
+    }
+
+    #[test]
     fn identity_params_leave_image_unchanged() {
         // default: exposure on but ev 0 & black 0, velvia off ⇒ no-op
         let p = PreviewParams::default();
@@ -5141,7 +5451,7 @@ mod tests {
         p.tc_nodes_l[2] = (1.0, 1.0);
         assert!(!p.is_identity());
         let base = vec![128u8, 128, 128, 250, 250, 250];
-        let out = apply_pipeline(&base, 2, 1, 3, 3, &p);
+        let out = apply_pipeline(&base, 2, 1, 6, 3, &p);
         assert!(out[0] < 110, "midtone must darken, got {}", out[0]);
         assert!(
             out[3] > 200 && out[3] >= out[0],

@@ -392,6 +392,86 @@ pub fn render_export_rgb16_gear(
     (gw, gh, rgb)
 }
 
+/// Fallible active raw-export path. Failures from the pixel pipeline are
+/// returned to the export caller instead of producing a source/empty fallback.
+pub(crate) fn try_render_export_rgb8_gear(
+    img: &c41_core::rawimage::RawImage,
+    method: c41_core::rawimage::DemosaicMethod,
+    geometry: c41_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
+    grain_seed: u32,
+) -> Result<(usize, usize, Vec<u8>), crate::preview::PreviewRenderError> {
+    let (w, h, linear) = img.to_linear_rgba_with_opts(method, params.hl_opts(), params.hotpixels_opts());
+    let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
+    let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    let (gw, gh, geom_linear) = apply_framing_linear(params, gw, gh, geom_linear);
+    let rgb = crate::preview::try_render_linear_to_srgb8_gear(
+        &geom_linear, gw, gh, params, lens_gear, grain_seed,
+    )?;
+    Ok((gw, gh, rgb))
+}
+
+pub(crate) fn try_render_export_rgb16_gear(
+    img: &c41_core::rawimage::RawImage,
+    method: c41_core::rawimage::DemosaicMethod,
+    geometry: c41_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
+    grain_seed: u32,
+) -> Result<(usize, usize, Vec<u16>), crate::preview::PreviewRenderError> {
+    let (w, h, linear) = img.to_linear_rgba_with_opts(method, params.hl_opts(), params.hotpixels_opts());
+    let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
+    let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    let (gw, gh, geom_linear) = apply_framing_linear(params, gw, gh, geom_linear);
+    let rgb = crate::preview::try_render_linear_to_srgb16_gear(
+        &geom_linear, gw, gh, params, lens_gear, grain_seed,
+    )?;
+    Ok((gw, gh, rgb))
+}
+
+pub(crate) fn try_render_export_rgb16_output_gear(
+    img: &c41_core::rawimage::RawImage,
+    method: c41_core::rawimage::DemosaicMethod,
+    geometry: c41_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
+    grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Result<Option<(usize, usize, Vec<u16>)>, crate::preview::PreviewRenderError> {
+    let (w, h, linear) = img.to_linear_rgba_with_opts(method, params.hl_opts(), params.hotpixels_opts());
+    let linear = crate::preview::apply_lens_prepass(&linear, w, h, params, lens_gear);
+    let (gw, gh, geom_linear) = geometry.apply(&linear, w, h);
+    let (gw, gh, geom_linear) = apply_framing_linear(params, gw, gh, geom_linear);
+    let Some(rgb) = crate::preview::try_render_linear_to_output16_gear(
+        &geom_linear, gw, gh, params, lens_gear, grain_seed, profile,
+    )? else { return Ok(None); };
+    Ok(Some((gw, gh, rgb)))
+}
+
+pub(crate) fn try_render_export_rgb8_output_gear(
+    img: &c41_core::rawimage::RawImage,
+    method: c41_core::rawimage::DemosaicMethod,
+    geometry: c41_core::geometry::Geometry,
+    params: &crate::preview::PreviewParams,
+    lens_gear: Option<&crate::preview::LensGear>,
+    grain_seed: u32,
+    profile: c41_core::icc::OutputProfile,
+) -> Result<Option<(usize, usize, Vec<u8>)>, crate::preview::PreviewRenderError> {
+    if profile.is_srgb() {
+        return try_render_export_rgb8_gear(img, method, geometry, params, lens_gear, grain_seed)
+            .map(Some);
+    }
+    let Some((w, h, rgb16)) = try_render_export_rgb16_output_gear(
+        img, method, geometry, params, lens_gear, grain_seed, profile,
+    )? else { return Ok(None); };
+    let mut rgb8 = Vec::new();
+    rgb8.try_reserve_exact(rgb16.len())
+        .map_err(crate::preview::PreviewRenderError::Allocation)?;
+    rgb8.extend(rgb16.into_iter().map(|v| ((v as u32 + 128) / 257).min(255) as u8));
+    Ok(Some((w, h, rgb8)))
+}
+
 /// Raw export in the requested output profile. The sRGB variant reuses the
 /// established renderer byte-for-byte; Adobe RGB keeps the Rec.2020 render
 /// through the final ICC transform instead of clipping through sRGB first.

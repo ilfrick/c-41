@@ -31,7 +31,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use crate::dialogs;
 use crate::history::{describe_change, HistoryStack};
-use crate::preview::{Histogram, PreviewParams};
+use crate::preview::{Histogram, PreviewParams, PreviewRenderError};
 use c41_core::geometry::{Crop, Geometry, Orientation};
 use c41_core::rawimage::DemosaicMethod;
 use crate::snapshots::{SnapshotStore, SNAPSHOT_CAP};
@@ -108,36 +108,44 @@ impl BaseImage {
         params: &PreviewParams,
         lens_gear: Option<&crate::preview::LensGear>,
         grain_seed: u32,
-    ) -> Rendered {
-        match self {
+    ) -> Result<Rendered, PreviewRenderError> {
+        Ok(match self {
             BaseImage::Srgb8 { bytes, width, height, rowstride, nch } => {
                 let (w, h) = (*width as usize, *height as usize);
                 Rendered {
-                    bytes: crate::preview::apply_pipeline_gear(
+                    bytes: crate::preview::try_apply_pipeline_gear(
                         bytes, w, h, *rowstride, *nch, params, lens_gear, grain_seed,
-                    ),
+                    )?,
                     width: *width,
                     height: *height,
                     rowstride: *rowstride,
                     nch: *nch,
                 }
             }
-            BaseImage::Linear { width, height, pixels, lens_preapplied } => Rendered {
-                bytes: if *lens_preapplied {
-                    crate::preview::render_linear_to_srgb8_gear(
-                        pixels, *width, *height, params, lens_gear, grain_seed,
-                    )
-                } else {
-                    crate::preview::render_nonraw_linear_to_srgb8_gear(
-                        pixels, *width, *height, params, lens_gear, grain_seed,
-                    )
-                },
-                width: *width as i32,
-                height: *height as i32,
-                rowstride: width * 3,
-                nch: 3,
+            BaseImage::Linear { width, height, pixels, lens_preapplied } => {
+                let render_width = i32::try_from(*width)
+                    .map_err(|_| PreviewRenderError::InvalidInput("preview width exceeds GTK limits"))?;
+                let render_height = i32::try_from(*height)
+                    .map_err(|_| PreviewRenderError::InvalidInput("preview height exceeds GTK limits"))?;
+                Rendered {
+                    bytes: if *lens_preapplied {
+                        crate::preview::try_render_linear_to_srgb8_gear(
+                            pixels, *width, *height, params, lens_gear, grain_seed,
+                        )?
+                    } else {
+                        crate::preview::try_render_nonraw_linear_to_srgb8_gear(
+                            pixels, *width, *height, params, lens_gear, grain_seed,
+                        )?
+                    },
+                    width: render_width,
+                    height: render_height,
+                    rowstride: width
+                        .checked_mul(3)
+                        .ok_or(PreviewRenderError::ArithmeticOverflow)?,
+                    nch: 3,
+                }
             },
-        }
+        })
     }
 }
 
@@ -321,6 +329,8 @@ struct PreviewCtx {
     retouch_pending_source: Rc<std::cell::Cell<Option<(f32, f32)>>>,
     retouch_overlay: glib::WeakRef<gtk4::DrawingArea>,
     retouch_status: glib::WeakRef<gtk4::Label>,
+    /// Toast target for recoverable preview-processing failures.
+    render_toast: Rc<RefCell<Option<glib::WeakRef<adw::ToastOverlay>>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1026,7 +1036,29 @@ fn render_preview(ctx: &PreviewCtx) {
     // image with the same grain pattern.
     let grain_seed = c41_core::iop::grain::hash_string(&ctx.decode_path.borrow());
     if let Some(b) = ctx.base.borrow().as_ref() {
-        let r = b.render(&params, lens_gear.as_deref(), grain_seed);
+        let r = match b.render(&params, lens_gear.as_deref(), grain_seed) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+                *ctx.last_render.borrow_mut() = None;
+                *ctx.hist.borrow_mut() = [[0u32; 256]; 3];
+                if let Some(area) = ctx.hist_area.upgrade() {
+                    area.queue_draw();
+                }
+                if let Some(area) = ctx.retouch_overlay.upgrade() {
+                    area.queue_draw();
+                }
+                if let Some(label) = ctx.picker.upgrade() {
+                    label.set_text(PICKER_PROMPT);
+                }
+                if let Some(overlay) = ctx.render_toast.borrow().as_ref().and_then(|weak| weak.upgrade()) {
+                    overlay.add_toast(adw::Toast::new(&format!("Preview failed: {error}")));
+                } else {
+                    eprintln!("preview failed: {error}");
+                }
+                return;
+            }
+        };
 
         *ctx.hist.borrow_mut() = crate::preview::compute_histogram(
             &r.bytes, r.width as usize, r.height as usize, r.rowstride, r.nch,
@@ -1785,6 +1817,7 @@ pub fn darkroom_page(
         retouch_pending_source: Rc::new(std::cell::Cell::new(None)),
         retouch_overlay: retouch_area.downgrade(),
         retouch_status: glib::WeakRef::new(),
+        render_toast: Rc::new(RefCell::new(None)),
     };
     // Show the seed entry immediately.
     refresh_history_list(&history_list, &ctx.history.borrow());
@@ -2405,6 +2438,7 @@ pub fn darkroom_page(
     // the darkroom view previously logged export results only to stderr.
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&content));
+    *ctx.render_toast.borrow_mut() = Some(toast_overlay.downgrade());
 
     // ── Header bar with Export button ─────────────────────────────────────
     let header = adw::HeaderBar::new();
@@ -6380,7 +6414,9 @@ mod tests {
             pixels: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             lens_preapplied: true,
         };
-        let r = b.render(&PreviewParams::default(), None, 0);
+        let r = b
+            .render(&PreviewParams::default(), None, 0)
+            .expect("valid linear render succeeds");
         assert_eq!((r.width, r.height), (2, 1));
         assert_eq!(r.nch, 3);
         assert_eq!(r.rowstride, 2 * 3);
