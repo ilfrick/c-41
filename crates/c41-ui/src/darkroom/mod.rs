@@ -192,10 +192,11 @@ impl LensFrame {
     }
 }
 
-/// C&T metadata. Source/input dimensions remain decode-context dimensions;
-/// content dimensions describe geometry output before borders. Piece scale is
-/// recomputed from transformed full-source/content dimensions. ROI scale is
-/// independent of geometry and remains 1.0.
+/// C&T proxy metadata, not an exact conversion to upstream piece/ROI values.
+/// Input dimensions and scale describe the pipeline input before geometry;
+/// content dimensions describe geometry output before borders. Preserve the
+/// input scale across geometry rather than inferring an upstream conversion.
+/// ROI scale is unknown here and must not be inferred from GTK.
 // Intentionally staged before C&T parameter/UI wiring; the next increment will
 // consume this metadata when constructing the enabled pipeline stage.
 #[allow(dead_code)]
@@ -209,28 +210,18 @@ struct PieceRenderContext {
     content_height: usize,
     downscale_factor: usize,
     piece_scale: f32,
-    roi_scale: f32,
+    roi_scale: Option<f32>,
 }
 
 impl PieceRenderContext {
     #[allow(dead_code)]
     fn max_piece_dimension(self) -> usize {
-        self.content_width.max(self.content_height)
+        self.input_width.max(self.input_height)
     }
 
     fn with_geometry(mut self, geometry: Geometry, crop: bool) -> Self {
         (self.content_width, self.content_height) =
             geometry.dimensions(self.input_width, self.input_height, crop);
-        let (source_width, source_height) =
-            geometry.dimensions(self.source_width, self.source_height, crop);
-        if let Some(piece_scale) = crate::raw_preview::piece_scale_from_dimensions(
-            source_width,
-            source_height,
-            self.content_width,
-            self.content_height,
-        ) {
-            self.piece_scale = piece_scale;
-        }
         self
     }
 }
@@ -1473,7 +1464,7 @@ fn spawn_decode(ctx: &PreviewCtx) {
                         content_height: h,
                         downscale_factor,
                         piece_scale,
-                        roi_scale: 1.0,
+                        roi_scale: None,
                     });
                     *ctx.pristine.borrow_mut() = Some((w, h, px));
                     ctx.pristine_gen.set(ctx.pristine_gen.get().wrapping_add(1));
@@ -1569,7 +1560,7 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     content_height: input_height,
                     downscale_factor: 1,
                     piece_scale: 1.0,
-                    roi_scale: 1.0,
+                    roi_scale: None,
                 });
                 *ctx.pristine.borrow_mut() = None; // no linear geometry on the JPEG path
                 // Keep the original decoded pixels so orientation changes
@@ -6442,7 +6433,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn piece_context_geometry_is_derived_from_decode_dimensions() {
+    fn piece_context_geometry_changes_content_but_preserves_input_metadata() {
         let original = PieceRenderContext {
             input_width: 201,
             input_height: 134,
@@ -6453,7 +6444,7 @@ mod tests {
             downscale_factor: 3,
             piece_scale: crate::raw_preview::piece_scale_from_dimensions(601, 401, 201, 134)
                 .unwrap(),
-            roi_scale: 1.0,
+            roi_scale: None,
         };
         let geometry = Geometry {
             orientation: Orientation::Rotate90Cw,
@@ -6467,23 +6458,17 @@ mod tests {
             (transformed.content_width, transformed.content_height),
             geometry.dimensions(original.input_width, original.input_height, true)
         );
-        let (source_width, source_height) =
-            geometry.dimensions(original.source_width, original.source_height, true);
-        assert_eq!(
-            transformed.piece_scale,
-            crate::raw_preview::piece_scale_from_dimensions(
-                source_width,
-                source_height,
-                transformed.content_width,
-                transformed.content_height,
-            )
-            .unwrap()
-        );
+        assert_eq!(transformed.input_width, original.input_width);
+        assert_eq!(transformed.input_height, original.input_height);
+        assert_eq!(transformed.source_width, original.source_width);
+        assert_eq!(transformed.source_height, original.source_height);
+        assert_eq!(transformed.downscale_factor, original.downscale_factor);
+        assert_eq!(transformed.piece_scale, original.piece_scale);
         assert_eq!(
             transformed.max_piece_dimension(),
-            transformed.content_width.max(transformed.content_height)
+            original.input_width.max(original.input_height)
         );
-        assert_eq!(transformed.roi_scale, original.roi_scale);
+        assert_eq!(transformed.roi_scale, None);
 
         let crop_edit = original.with_geometry(geometry, false);
         assert_eq!(
