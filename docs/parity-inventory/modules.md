@@ -132,3 +132,13 @@
 ## Boundary of this inventory
 
 This covers only the upstream `src/iop/*.c` source-path inventory and a structural comparison with the listed C-41 wiring. It does **not** classify upstream commits, non-IOP capabilities, or establish a complete parity audit. In particular, it does **not** claim that the full **2,379 upstream-only commit** audit is complete. The commit/capability delta remains a separate S9 deliverable.
+
+## Targeted C&T delta after the inventory snapshot (2026-11-15)
+
+The table and its counts above remain the source-path snapshot at C-41 `d908a71bb8345f69f07208ffd92ff88ff2266f47`; the `contrastntexture` row's absence is independently true at `dfbd3bf6ccc3bbc6a51dd1a019291b796c08513c`. This targeted recheck updates only that operation for current C-41 `969ad06b87178b7fd4f615f76430064252c4c297`:
+
+| Upstream operation | Current C-41 core / pipeline | Current darkroom UI and render path | Current evidence | State |
+|---|---|---|---|---|
+| `contrastntexture` | `c41_core::iop::contrastntexture` and `Stage::ContrastTexture` are present; execution requires fallible `Pipeline::try_process` and uses the CPU path with adaptive budget/error reporting. | No live GTK4 control; the product preview/export callers do not pass C&T render context or activate the stage. | Core tests plus two pinned-C synthetic 256×256 samples at `piece.iscale` 1 and 2 in `crates/c41-core/tests/contrastntexture_darktable_golden.rs`; these do not test C-41 max-2048 proxy vs resampled-original equivalence. | **partial** — core capability only, not end-to-end parity. |
+
+This supersedes only the old `contrastntexture` status for the current C-41 revision. All other rows and the 114-path classification counts remain tied to the stated historical snapshot; this delta is not a refreshed full inventory.
