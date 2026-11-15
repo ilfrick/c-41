@@ -1,9 +1,7 @@
-//! Pure Contrast & Texture parameter preparation and full-frame resource planning.
+//! Pure Contrast & Texture processing, parameter preparation, and resource planning.
 //!
-//! Parameter and ROI formulas are ported from darktable commit
-//! `97912518a5a9a9786aeee3c38116fbc999412ff8`,
-//! `src/iop/contrastntexture.c`. This module does not process pixels and the
-//! memory plan is not yet consumed by a pipeline stage.
+//! Parameter, ROI, and pixel formulas follow darktable commit
+//! `97912518a5a9a9786aeee3c38116fbc999412ff8`, `src/iop/contrastntexture.c`.
 
 use crate::resource_budget::ResourceBudget;
 
@@ -102,29 +100,45 @@ impl ContrastTextureParams {
     }
 }
 
-/// Derived values shared by the later per-pixel C&T implementation.
+/// Derived values shared by the per-pixel C&T implementation.
+///
+/// Fields are private so callers can only obtain a prepared value through
+/// [`prepare`], keeping its parameters, dimensions, and derived arrays coherent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedContrastTexture {
+    params: ContrastTextureParams,
+    width: usize,
+    height: usize,
     /// `log2(max_piece_size * piece_scale) - detail_level - 1`.
-    pub max_detail_level: f32,
+    max_detail_level: f32,
     /// Highest processed level, selected by darktable's radius-<2 rule.
-    pub max_used_level: usize,
+    max_used_level: usize,
     /// Full-frame blur radius for each detail level, in processing pixels.
-    pub radius_details: [f32; MAX_ITERATIONS],
+    radius_details: [f32; MAX_ITERATIONS],
     /// Per-level scale factors from darktable's `commit_params`.
-    pub scale_details: [f32; MAX_ITERATIONS],
+    scale_details: [f32; MAX_ITERATIONS],
     /// Per-level noise-bias values.
-    pub noise_bias: [f32; MAX_ITERATIONS],
+    noise_bias: [f32; MAX_ITERATIONS],
     /// Guided-filter feathering after halo-control conversion.
-    pub feathering: f32,
+    feathering: f32,
     /// Log-domain shadow slope.
-    pub slope_shadows: f32,
+    slope_shadows: f32,
     /// Log-domain highlight slope.
-    pub slope_highlights: f32,
+    slope_highlights: f32,
     /// Fixed width of the midtone transition.
-    pub midtones_width: f32,
+    midtones_width: f32,
     /// Quadratic coefficients for the midtone transition.
-    pub midtones_polynomial: [f32; 3],
+    midtones_polynomial: [f32; 3],
+}
+
+impl PreparedContrastTexture {
+    pub fn max_detail_level(&self) -> f32 { self.max_detail_level }
+
+    pub fn max_used_level(&self) -> usize { self.max_used_level }
+
+    pub fn used_radius_details(&self) -> &[f32] {
+        &self.radius_details[..=self.max_used_level]
+    }
 }
 
 fn finite(value: f32) -> Result<f32, PrepareError> {
@@ -209,6 +223,9 @@ pub fn prepare(
     }
 
     Ok(PreparedContrastTexture {
+        params,
+        width,
+        height,
         max_detail_level,
         max_used_level,
         radius_details,
@@ -361,6 +378,188 @@ pub fn memory_plan(
     })
 }
 
+/// Recoverable full-frame processing failures.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProcessError {
+    InvalidDimensions,
+    InvalidPrepared,
+    Allocation,
+    MemoryPlan(MemoryPlanError),
+    Blur(crate::eigf::SurfaceBlurError),
+}
+
+fn zeroed_f32(len: usize) -> Result<Vec<f32>, ProcessError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).map_err(|_| ProcessError::Allocation)?;
+    v.resize(len, 0.0);
+    Ok(v)
+}
+
+/// Process packed RGBA f32 pixels using full-frame CPU C&T. Resource planning
+/// precedes workspace allocation; Linux overcommit and allocator behavior can
+/// still cause failure after reservation despite this policy check.
+///
+/// The plan includes the input frame and automatically adds `output` to the
+/// live-byte and largest-buffer totals. `external_live_bytes` and
+/// `external_largest_buffer_bytes` account for all other simultaneous buffers,
+/// excluding these two frame slices.
+pub fn process_into(
+    input: &[f32],
+    output: &mut [f32],
+    width: usize,
+    height: usize,
+    params: ContrastTextureParams,
+    prepared: &PreparedContrastTexture,
+    external_live_bytes: u64,
+    external_largest_buffer_bytes: u64,
+    budget: ResourceBudget,
+) -> Result<ContrastTextureMemoryPlan, ProcessError> {
+    let n = width
+        .checked_mul(height)
+        .ok_or(ProcessError::InvalidDimensions)?;
+    let len = n.checked_mul(4).ok_or(ProcessError::InvalidDimensions)?;
+    if width == 0 || height == 0 || input.len() != len || output.len() != len {
+        return Err(ProcessError::InvalidDimensions);
+    }
+    params.validate().map_err(|_| ProcessError::InvalidPrepared)?;
+    if prepared.params != params || prepared.width != width || prepared.height != height {
+        return Err(ProcessError::InvalidPrepared);
+    }
+    if prepared.max_used_level >= MAX_ITERATIONS
+        || !prepared.max_detail_level.is_finite()
+        || !prepared.feathering.is_finite()
+        || prepared.feathering <= 0.0
+        || !prepared.slope_shadows.is_finite()
+        || prepared.slope_shadows <= 0.0
+        || !prepared.slope_highlights.is_finite()
+        || prepared.slope_highlights <= 0.0
+        || !prepared.midtones_width.is_finite()
+        || prepared.midtones_width <= 0.0
+        || prepared
+            .midtones_polynomial
+            .iter()
+            .any(|coefficient| !coefficient.is_finite())
+        || prepared.scale_details.iter().any(|scale| !scale.is_finite() || *scale <= 0.0)
+        || prepared.radius_details.iter().any(|radius| !radius.is_finite() || *radius <= 0.0)
+        || prepared.noise_bias.iter().any(|bias| !bias.is_finite() || *bias < 0.0)
+    {
+        return Err(ProcessError::InvalidPrepared);
+    }
+
+    // darktable processes levels 0 through max_used_level regardless of the
+    // sign or zero value of max_detail_level (the latter affects band weights).
+    let levels = prepared.max_used_level + 1;
+    let sigmas = &prepared.radius_details[..levels];
+    let output_bytes = u64::try_from(len)
+        .map_err(|_| ProcessError::MemoryPlan(MemoryPlanError::ArithmeticOverflow))?
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .ok_or(ProcessError::MemoryPlan(MemoryPlanError::ArithmeticOverflow))?;
+    let all_external_live_bytes = external_live_bytes
+        .checked_add(output_bytes)
+        .ok_or(ProcessError::MemoryPlan(MemoryPlanError::ArithmeticOverflow))?;
+    let all_external_largest_buffer_bytes = external_largest_buffer_bytes.max(output_bytes);
+    let plan = memory_plan(
+        width,
+        height,
+        sigmas,
+        all_external_live_bytes,
+        all_external_largest_buffer_bytes,
+        budget,
+    )
+    .map_err(ProcessError::MemoryPlan)?;
+
+    let mut high = zeroed_f32(n)?;
+    let mut low = zeroed_f32(n)?;
+    let mut corrections = zeroed_f32(n)?;
+    let max_bias = prepared.noise_bias[prepared.max_used_level];
+    const MIN_FLOAT: f32 = 1.525_878_9e-5; // darktable common/math.h:30
+    let normalize_luminance = 1.0 / 3.0_f32.sqrt();
+    for pixel in 0..n {
+        let offset = pixel * 4;
+        let norm = (input[offset] * input[offset]
+            + input[offset + 1] * input[offset + 1]
+            + input[offset + 2] * input[offset + 2])
+            .sqrt()
+            .max(MIN_FLOAT);
+        low[pixel] = normalize_luminance * norm + max_bias;
+    }
+
+    let mut gains = [0.0_f32; MAX_ITERATIONS];
+    for (level, gain) in gains[..levels].iter_mut().enumerate() {
+        // C fminf/fmaxf map NaN from 0/0 to +0.5 here.
+        let t = if prepared.max_detail_level == 0.0 {
+            0.5
+        } else {
+            (level as f32 / prepared.max_detail_level - 0.5)
+                .min(0.5)
+                .max(-0.5)
+        };
+        let coarse = if t < 0.0 {
+            (std::f32::consts::PI * t).sin()
+        } else {
+            0.0
+        };
+        let medium = (std::f32::consts::PI * t).cos();
+        let fine = if t >= 0.0 {
+            (std::f32::consts::PI * t).sin()
+        } else {
+            0.0
+        };
+        *gain = params.gain_coarse * coarse * coarse
+            + params.gain_medium * medium * medium
+            + params.gain_fine * fine * fine;
+    }
+
+    for level in (0..levels).rev() {
+        high.copy_from_slice(&low);
+        crate::eigf::fast_eigf_surface_blur_no_mask(
+            &mut low,
+            width,
+            height,
+            prepared.radius_details[level],
+            prepared.feathering,
+        )
+        .map_err(ProcessError::Blur)?;
+        let bias = prepared.noise_bias[level];
+        for pixel in 0..n {
+            let lowpass = low[pixel].max(MIN_FLOAT);
+            let highpass = high[pixel].max(MIN_FLOAT);
+            let power = lowpass * lowpass;
+            let noise_power = bias * bias;
+            let wiener_gain = (power - noise_power).max(0.0) / power.max(MIN_FLOAT);
+            let detail = (highpass.log2() - lowpass.log2()).min(5.0).max(-5.0);
+            corrections[pixel] += gains[level] * wiener_gain * detail;
+            if level > 0 {
+                low[pixel] -= bias - prepared.noise_bias[level - 1];
+            }
+        }
+    }
+
+    // Output is written only after every fallible allocation/helper operation.
+    let pivot_offset = (prepared.noise_bias[0] + 0.1845).log2();
+    for pixel in 0..n {
+        let normalized_ev = low[pixel].max(MIN_FLOAT).log2() - pivot_offset;
+        let width = prepared.midtones_width;
+        let correction_ev = if normalized_ev <= -width {
+            prepared.slope_shadows * normalized_ev
+        } else if normalized_ev >= width {
+            prepared.slope_highlights * normalized_ev
+        } else {
+            let [a0, a1, a2] = prepared.midtones_polynomial;
+            let shifted_ev = normalized_ev + width;
+            a0 + a1 * shifted_ev + a2 * shifted_ev * shifted_ev
+        };
+        let lowpass_correction = correction_ev - normalized_ev;
+        let multiplier = (corrections[pixel] + lowpass_correction).exp2();
+        let offset = pixel * 4;
+        for channel in 0..3 {
+            output[offset + channel] = input[offset + channel] * multiplier;
+        }
+        output[offset + 3] = input[offset + 3];
+    }
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +571,180 @@ mod tests {
             mipmap_bytes: 0,
             opencl_available_bytes: 0,
         }
+    }
+
+    #[test]
+    fn processing_preserves_default_rgb_and_alpha_and_rejects_budget_before_write() {
+        let params = ContrastTextureParams::default();
+        let prepared = prepare(params, 8.0, 1.0, 1.0, 8, 8).unwrap();
+        let input: Vec<f32> = (0..64)
+            .flat_map(|i| [i as f32 / 64.0, 0.2, 0.4, 0.37])
+            .collect();
+        let mut output = vec![-1.0; input.len()];
+        process_into(
+            &input,
+            &mut output,
+            8,
+            8,
+            params,
+            &prepared,
+            0,
+            0,
+            large_budget(),
+        )
+        .unwrap();
+        for i in 0..64 {
+            for c in 0..3 {
+                assert!((output[4 * i + c] - input[4 * i + c]).abs() < 1e-6);
+            }
+            assert_eq!(output[4 * i + 3], input[4 * i + 3]);
+        }
+        output.fill(-7.0);
+        let tiny = ResourceBudget {
+            cpu_available_bytes: 0,
+            ..large_budget()
+        };
+        assert!(matches!(
+            process_into(&input, &mut output, 8, 8, params, &prepared, 0, 0, tiny),
+            Err(ProcessError::MemoryPlan(_))
+        ));
+        assert!(output.iter().all(|value| *value == -7.0));
+    }
+
+    #[test]
+    fn process_budget_includes_distinct_output_frame() {
+        let params = ContrastTextureParams::default();
+        let prepared = prepare(params, 4.0, 1.0, 1.0, 4, 4).unwrap();
+        let input = [0.25; 64];
+        let mut output = [-1.0; 64];
+        let base_plan = memory_plan(
+            4,
+            4,
+            prepared.used_radius_details(),
+            0,
+            0,
+            large_budget(),
+        )
+        .unwrap();
+        let output_bytes = (output.len() * std::mem::size_of::<f32>()) as u64;
+        let budget_without_output = ResourceBudget {
+            cpu_available_bytes: base_plan.estimated_bytes + output_bytes - 1,
+            ..large_budget()
+        };
+        assert!(matches!(
+            process_into(
+                &input,
+                &mut output,
+                4,
+                4,
+                params,
+                &prepared,
+                0,
+                0,
+                budget_without_output,
+            ),
+            Err(ProcessError::MemoryPlan(MemoryPlanError::BudgetExceeded { .. }))
+        ));
+        assert!(output.iter().all(|value| *value == -1.0));
+    }
+
+    #[test]
+    fn nonzero_detail_gain_changes_nonflat_input_deterministically() {
+        let params = ContrastTextureParams {
+            gain_coarse: 0.7,
+            gain_medium: 1.1,
+            gain_fine: 1.8,
+            ..ContrastTextureParams::default()
+        };
+        let prepared = prepare(params, 256.0, 1.0, 1.0, 16, 16).unwrap();
+        let input: Vec<f32> = (0..16)
+            .flat_map(|y| {
+                (0..16).flat_map(move |x| {
+                    let value = ((x * 3 + y * 5) % 31) as f32 / 31.0 + 0.05;
+                    [value, value * 0.8, value * 0.6, 0.73]
+                })
+            })
+            .collect();
+        let mut output = vec![0.0; input.len()];
+        process_into(
+            &input,
+            &mut output,
+            16,
+            16,
+            params,
+            &prepared,
+            0,
+            0,
+            large_budget(),
+        )
+        .unwrap();
+        assert!(output.iter().all(|value| value.is_finite()));
+        assert!(output
+            .chunks_exact(4)
+            .zip(input.chunks_exact(4))
+            .any(|(out, source)| (out[0] - source[0]).abs() > 1e-5));
+        for (out, source) in output.chunks_exact(4).zip(input.chunks_exact(4)) {
+            assert_eq!(out[3], source[3]);
+        }
+    }
+
+    #[test]
+    fn constant_neutral_detail_shadow_highlight_matches_reference_formula() {
+        let params = ContrastTextureParams {
+            noise_bias: 0.0,
+            gain_shadows: 1.0,
+            gain_highlights: -1.0,
+            ..ContrastTextureParams::default()
+        };
+        let prepared = prepare(params, 8.0, 1.0, 1.0, 1, 1).unwrap();
+        let input = [0.4, 0.4, 0.4, 0.37];
+        let mut output = [0.0; 4];
+        process_into(
+            &input,
+            &mut output,
+            1,
+            1,
+            params,
+            &prepared,
+            0,
+            0,
+            large_budget(),
+        )
+        .unwrap();
+        // From pinned apply_shadows_highlights: both slopes are 0.5, so
+        // correction = -0.5 * (log2(0.4) - log2(0.1845)). This is a
+        // deterministic formula regression, not a C-built pixel fixture.
+        assert!((output[0] - 0.271_661_55).abs() < 2e-6);
+        assert!((output[1] - 0.271_661_55).abs() < 2e-6);
+        assert!((output[2] - 0.271_661_55).abs() < 2e-6);
+        assert_eq!(output[3], input[3]);
+    }
+
+    #[test]
+    fn process_rejects_mismatched_prepared_state_before_writing() {
+        let params = ContrastTextureParams::default();
+        let prepared = prepare(params, 8.0, 1.0, 1.0, 2, 2).unwrap();
+        let mismatched_params = ContrastTextureParams {
+            gain_fine: 1.0,
+            ..params
+        };
+        let input = [0.4; 16];
+        let mut output = [-3.0; 16];
+        assert_eq!(
+            process_into(
+                &input,
+                &mut output,
+                2,
+                2,
+                mismatched_params,
+                &prepared,
+                0,
+                0,
+                large_budget(),
+            ),
+            Err(ProcessError::InvalidPrepared)
+        );
+        assert!(output.iter().all(|value| *value == -3.0));
     }
 
     #[test]
