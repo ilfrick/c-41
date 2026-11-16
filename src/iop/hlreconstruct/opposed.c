@@ -186,7 +186,7 @@ static float *_process_opposed(dt_iop_module_t *self,
   const dt_aligned_pixel_t clips = { clipval * icoeffs[0], clipval * icoeffs[1], clipval * icoeffs[2]};
 
   const dt_dev_chroma_t *chr = &self->dev->chroma;
-  const gboolean late = chr->late_correction;
+  const gboolean late = dt_dev_wb_late_correction_applies(chr->late_correction, dsc);
   const dt_aligned_pixel_t correction = { late ? (float)(chr->D65coeffs[0] / chr->as_shot[0]) : 1.0f,
                                           late ? (float)(chr->D65coeffs[1] / chr->as_shot[1]) : 1.0f,
                                           late ? (float)(chr->D65coeffs[2] / chr->as_shot[2]) : 1.0f,
@@ -304,7 +304,7 @@ static cl_int process_opposed_cl(dt_iop_module_t *self,
   dt_aligned_pixel_t clips = { clipval * icoeffs[0], clipval * icoeffs[1], clipval * icoeffs[2], 1.0f};
 
   const dt_dev_chroma_t *chr = &self->dev->chroma;
-  const gboolean late = chr->late_correction;
+  const gboolean late = dt_dev_wb_late_correction_applies(chr->late_correction, dsc);
   dt_aligned_pixel_t correction = { late ? (float)(chr->D65coeffs[0] / chr->as_shot[0]) : 1.0f,
                                     late ? (float)(chr->D65coeffs[1] / chr->as_shot[1]) : 1.0f,
                                     late ? (float)(chr->D65coeffs[2] / chr->as_shot[2]) : 1.0f,

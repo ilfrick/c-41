@@ -63,6 +63,13 @@ typedef struct dt_iop_buffer_dsc_t
 
 } dt_iop_buffer_dsc_t;
 
+// Late WB correction applies only to buffers processed by white balance.
+static inline gboolean dt_dev_wb_late_correction_applies(
+    const gboolean late_correction, const dt_iop_buffer_dsc_t *dsc)
+{
+  return dsc->temperature.enabled && late_correction;
+}
+
 size_t dt_iop_buffer_dsc_to_bpp(const struct dt_iop_buffer_dsc_t *dsc);
 
 void default_input_format(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_t *pipe,

@@ -328,7 +328,7 @@ static void _process_segmentation(dt_dev_pixelpipe_iop_t *piece,
   const dt_aligned_pixel_t cube_coeffs = {cbrtf(clips[0]), cbrtf(clips[1]), cbrtf(clips[2]), 0.0f};
 
   const dt_dev_chroma_t *chr = &piece->module->dev->chroma;
-  const gboolean late = chr->late_correction;
+  const gboolean late = dt_dev_wb_late_correction_applies(chr->late_correction, &piece->pipe->dsc);
   const dt_aligned_pixel_t correction = { late ? (float)(chr->D65coeffs[0] / chr->as_shot[0]) : 1.0f,
                                           late ? (float)(chr->D65coeffs[1] / chr->as_shot[1]) : 1.0f,
                                           late ? (float)(chr->D65coeffs[2] / chr->as_shot[2]) : 1.0f,

@@ -725,7 +725,7 @@ int process_cl(dt_iop_module_t *self,
   }
 
   const dt_dev_chroma_t *chr = &self->dev->chroma;
-  const gboolean corrected = chr->late_correction;
+  const gboolean corrected = dt_dev_wb_late_correction_applies(chr->late_correction, &pipe->dsc);
   dt_aligned_pixel_t coeffs = { corrected ? chr->D65coeffs[0] / chr->as_shot[0] : 1.0f,
                                 corrected ? chr->D65coeffs[1] / chr->as_shot[1] : 1.0f,
                                 corrected ? chr->D65coeffs[2] / chr->as_shot[2] : 1.0f,
@@ -1088,14 +1088,15 @@ void process(dt_iop_module_t *self,
                                         ivoid, ovoid, roi_in, roi_out))
     return;
 
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
   const dt_dev_chroma_t *chr = &self->dev->chroma;
   const dt_iop_colorin_data_t *const d = piece->data;
-  const gboolean corrected = chr->late_correction && d->type != DT_COLORSPACE_LAB;
+  const gboolean corrected = dt_dev_wb_late_correction_applies(chr->late_correction, &pipe->dsc)
+                             && d->type != DT_COLORSPACE_LAB;
   const dt_aligned_pixel_t coeffs = { corrected ? chr->D65coeffs[0] / chr->as_shot[0] : 1.0f,
                                       corrected ? chr->D65coeffs[1] / chr->as_shot[1] : 1.0f,
                                       corrected ? chr->D65coeffs[2] / chr->as_shot[2] : 1.0f,
                                       corrected ? chr->D65coeffs[3] / chr->as_shot[3] : 1.0f };
-  dt_dev_pixelpipe_t *pipe = piece->pipe;
   if(corrected)
   {
     for_four_channels(k)
