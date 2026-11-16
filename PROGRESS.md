@@ -10717,3 +10717,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior review APPROVED with no findings. Confirmed exact pinned first-parent delta, call path and optional-C scope; no targeted test harness is justified for the static GTK draw callback.
 
 **Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) rebuilt the camera module in 8 steps; all seven CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` while generating `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
+
+## 2026-11-16 23:10 UTC — S9: finalize color-harmony SQLite statements
+
+**Change.** Applied pinned darktable `d05bf54627bcdd375e1c601bd94adc30d68006bd` (parent `82a718da58c62cb62af493066fb1cdde931179d6`) in `src/common/color_harmony.c::dt_color_harmony_get()`: save the `SQLITE_ROW` result, preserve layout assignments/custom-angle reset, finalize the prepared statement exactly once before either return. Added `test_color_harmony_get.c` with an in-memory SQLite DB, exercising present/missing imgids, asserting `sqlite3_next_stmt(db, NULL) == NULL` and successful `sqlite3_close()`. Registered it in common CMake and added an APPLY—S9 retained-C row; no Rust parity claim.
+
+**Review.** First independent reviewer timed out; after a retry request, a fresh same-model senior reviewer APPROVED with no findings. Confirmed pinned behavior, test cleanup assertions and CMake/triage consistency.
+
+**Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 186 steps; all eight CTests passed. The disposable root container emitted the nonfatal Git `dubious ownership` warning for `/src` while generating `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed, including 598 release Rust tests. No host C build or deployment.

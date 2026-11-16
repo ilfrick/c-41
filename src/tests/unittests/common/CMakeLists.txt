@@ -21,3 +21,11 @@ add_cmocka_mock_test(test_image_cache_null
 if(WIN32)
     _copy_required_library(test_image_cache_null lib_darktable)
 endif(WIN32)
+
+add_cmocka_mock_test(test_color_harmony_get
+                     SOURCES test_color_harmony_get.c ${CMAKE_SOURCE_DIR}/src/common/color_harmony.c
+                     LINK_LIBRARIES lib_darktable cmocka)
+
+if(WIN32)
+    _copy_required_library(test_color_harmony_get lib_darktable)
+endif(WIN32)
