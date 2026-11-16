@@ -10653,3 +10653,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior reviewer APPROVED with no findings or suggestions; confirmed pinned behavior, error reporting and safe cleanup.
 
 **Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 8 incremental steps and compiled/linked `libwebp.so`; all six CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` and generated `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
+
+## 2026-11-16 15:15 UTC — S9: prevent JPEG decode-size signed overflow
+
+**Change.** Applied pinned darktable `27fb7ad7858a1036390f0c28fc81c0808405df7a` in `src/imageio/imageio_jpeg.c::dt_imageio_open_jpeg()` and `src/imageio/imageio.c::dt_imageio_large_thumbnail()`: cast the first allocation-size factor to `size_t` before multiplying by JPEG dimensions. This prevents signed-`int` overflow for extreme images on 64-bit targets in full JPEG loads/smart previews and embedded-thumbnail decode. The `size_t` product can still overflow on 32-bit systems; no broader cross-architecture claim. Added an APPLY — S9 row covering both retained-C decode paths and no Rust JPEG parity claim. No matching `PARITY_AUDIT.md` item exists. No boundary test was added because the dimension is extreme and attempting the resulting multi-gigabyte allocation is unsafe.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. Confirmed both code changes exactly match the pinned diff, both allocation paths are covered, and the row/progress state the 32-bit limitation. Reviewer suggested an extreme-dimension test only if it can avoid impractical allocation; no build or tests were run by the reviewer.
+
+**Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 183 steps; all six CTests passed (`test_sample`, `test_dng_opcode`, `test_iop_introspection`, `test_image_cache_null`, `test_filmicrgb`, `test_wb_late_correction`). `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
