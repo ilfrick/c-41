@@ -1842,6 +1842,85 @@ void gui_cleanup(dt_lib_module_t *self)
   self->data = NULL;
 }
 
+typedef struct dt_export_params_view_t
+{
+  const uint8_t *cursor;
+  size_t remaining;
+} dt_export_params_view_t;
+
+typedef struct dt_export_params_t
+{
+  int32_t values[9];
+  const char *scale;
+  const char *metadata_export;
+  const char *iccfilename;
+  const char *fname;
+  const char *sname;
+  int32_t fversion;
+  int32_t sversion;
+  int32_t fsize;
+  int32_t ssize;
+  const void *fdata;
+  const void *sdata;
+} dt_export_params_t;
+
+static gboolean _view_read_int32(dt_export_params_view_t *view,
+                                 int32_t *value)
+{
+  if(view->remaining < sizeof(*value)) return FALSE;
+  memcpy(value, view->cursor, sizeof(*value));
+  view->cursor += sizeof(*value);
+  view->remaining -= sizeof(*value);
+  return TRUE;
+}
+
+static gboolean _view_read_string(dt_export_params_view_t *view,
+                                  const char **value)
+{
+  const char *end = memchr(view->cursor, '\0', view->remaining);
+  if(!end) return FALSE;
+  *value = (const char *)view->cursor;
+  const size_t length = (size_t)(end - (const char *)view->cursor) + 1;
+  view->cursor += length;
+  view->remaining -= length;
+  return TRUE;
+}
+
+static gboolean _view_read_bytes(dt_export_params_view_t *view,
+                                 size_t length,
+                                 const void **value)
+{
+  if(length > view->remaining) return FALSE;
+  *value = view->cursor;
+  view->cursor += length;
+  view->remaining -= length;
+  return TRUE;
+}
+
+static gboolean _parse_export_params(const void *params,
+                                     size_t size,
+                                     dt_export_params_t *parsed)
+{
+  if(!params || !parsed) return FALSE;
+  dt_export_params_view_t view = { params, size };
+  for(size_t i = 0; i < G_N_ELEMENTS(parsed->values); i++)
+    if(!_view_read_int32(&view, &parsed->values[i])) return FALSE;
+  if(!_view_read_string(&view, &parsed->scale)
+     || !_view_read_string(&view, &parsed->metadata_export)
+     || !_view_read_string(&view, &parsed->iccfilename)
+     || !_view_read_string(&view, &parsed->fname)
+     || !_view_read_string(&view, &parsed->sname)
+     || !_view_read_int32(&view, &parsed->fversion)
+     || !_view_read_int32(&view, &parsed->sversion)
+     || !_view_read_int32(&view, &parsed->fsize)
+     || !_view_read_int32(&view, &parsed->ssize)
+     || parsed->fsize < 0 || parsed->ssize < 0
+     || !_view_read_bytes(&view, (size_t)parsed->fsize, &parsed->fdata)
+     || !_view_read_bytes(&view, (size_t)parsed->ssize, &parsed->sdata))
+    return FALSE;
+  return view.remaining == 0;
+}
+
 void init_presets(dt_lib_module_t *self)
 {
   // TODO: store presets in db: dt_lib_presets_add(const char *name,
@@ -1891,46 +1970,27 @@ void init_presets(dt_lib_module_t *self)
     }
     else
     {
-      // extract the interesting parts from the blob
-      const char *buf = (const char *)op_params;
-
-      // skip 9*int32_t: max_width, max_height, upscale, high_quality,
-      // export_masks, iccintent, icctype, dimensions_type, print_dpi
-      buf += 9 * sizeof(int32_t);
-      // skip scale string
-      buf += strlen(buf) + 1;
-      // skip metadata presets string
-      buf += strlen(buf) + 1;
-      // next skip iccfilename
-      buf += strlen(buf) + 1;
-
-      // parse both names to '\0'
-      const char *fname = buf;
-      buf += strlen(fname) + 1;
-      const char *sname = buf;
-      buf += strlen(sname) + 1;
+      // Parse the complete blob before touching modules or preset data.
+      dt_export_params_t parsed;
+      if(!_parse_export_params(op_params, op_params_size, &parsed)) continue;
+      const char *fname = parsed.fname;
+      const char *sname = parsed.sname;
+      const int32_t fversion = parsed.fversion;
+      const int32_t sversion = parsed.sversion;
+      const int fsize = parsed.fsize;
+      const int ssize = parsed.ssize;
+      const void *fdata = parsed.fdata;
+      const void *sdata = parsed.sdata;
 
       // get module by name and skip if not there.
       dt_imageio_module_format_t *fmod = dt_imageio_get_format_by_name(fname);
       dt_imageio_module_storage_t *smod = dt_imageio_get_storage_by_name(sname);
       if(!fmod || !smod) continue;
 
-      // next we have fversion, sversion, fsize, ssize, fdata, sdata
-      // which is the stuff that might change
-      size_t copy_over_part = (void *)buf - (void *)op_params;
-
-      const int fversion = *(const int *)buf;
-      buf += sizeof(int32_t);
-      const int sversion = *(const int *)buf;
-      buf += sizeof(int32_t);
-      const int fsize = *(const int *)buf;
-      buf += sizeof(int32_t);
-      const int ssize = *(const int *)buf;
-      buf += sizeof(int32_t);
-
-      const void *fdata = buf;
-      buf += fsize;
-      const void *sdata = buf;
+      // Preserve the immutable prefix for preset migration.
+      size_t copy_over_part = (size_t)((const uint8_t *)parsed.fdata
+                                      - (const uint8_t *)op_params)
+                              - sizeof(int32_t) * 4;
 
       void *new_fdata = NULL;
       void *new_sdata = NULL;
@@ -1942,14 +2002,17 @@ void init_presets(dt_lib_module_t *self)
       int32_t cversion = fversion;
       int32_t new_version = new_fversion;
       size_t new_size = 0;
-      void *data = (void *)malloc(fsize);
-      memcpy(data, fdata, fsize);
+      void *data = malloc(fsize ? (size_t)fsize : 1);
+      if(!data) continue;
+      if(fsize) memcpy(data, fdata, (size_t)fsize);
       while(cversion < new_fversion)
       {
         if(fmod->legacy_params
            && (new_fdata = fmod->legacy_params(fmod, data, new_fsize,
                                                cversion, &new_version, &new_size))
-                != NULL)
+                != NULL
+           && new_version > cversion && new_version <= new_fversion
+           && new_size <= INT32_MAX)
         {
           free(data);
           data = new_fdata;
@@ -1967,14 +2030,21 @@ void init_presets(dt_lib_module_t *self)
       cversion = sversion;
       new_version = new_sversion;
       new_size = 0;
-      data = (void *)malloc(ssize);
-      memcpy(data, sdata, ssize);
+      data = malloc(ssize ? (size_t)ssize : 1);
+      if(!data)
+      {
+        free(new_fdata);
+        continue;
+      }
+      if(ssize) memcpy(data, sdata, (size_t)ssize);
       while(cversion < new_sversion)
       {
         if(smod->legacy_params
            && (new_sdata = smod->legacy_params(smod, data, new_ssize,
                                                cversion, &new_version, &new_size))
-           != NULL)
+           != NULL
+           && new_version > cversion && new_version <= new_sversion
+           && new_size <= INT32_MAX)
         {
           free(data);
           data = new_sdata;
@@ -1992,9 +2062,32 @@ void init_presets(dt_lib_module_t *self)
       if(new_fdata || new_sdata)
       {
         // we got an updated blob -> reassemble the parts and update the preset
+        if((size_t)fsize > SIZE_MAX - (size_t)ssize
+           || new_fsize > INT32_MAX || new_ssize > INT32_MAX
+           || (size_t)new_fsize > SIZE_MAX - (size_t)new_ssize)
+        {
+          free(new_fdata);
+          free(new_sdata);
+          continue;
+        }
+        const size_t old_payload_size = (size_t)fsize + (size_t)ssize;
+        const size_t new_payload_size = new_fsize + new_ssize;
+        if(old_payload_size > op_params_size
+           || op_params_size - old_payload_size > SIZE_MAX - new_payload_size)
+        {
+          free(new_fdata);
+          free(new_sdata);
+          continue;
+        }
         const size_t new_params_size =
-          op_params_size - (fsize + ssize) + (new_fsize + new_ssize);
+          op_params_size - old_payload_size + new_payload_size;
         void *new_params = malloc(new_params_size);
+        if(!new_params)
+        {
+          free(new_fdata);
+          free(new_sdata);
+          continue;
+        }
         memcpy(new_params, op_params, copy_over_part);
         // next we have fversion, sversion, fsize, ssize, fdata, sdata
         // which is the stuff that might change
@@ -2003,9 +2096,13 @@ void init_presets(dt_lib_module_t *self)
         pos += sizeof(int32_t);
         memcpy((uint8_t *)new_params + pos, &new_sversion, sizeof(int32_t));
         pos += sizeof(int32_t);
-        memcpy((uint8_t *)new_params + pos, &new_fsize, sizeof(int32_t));
+        const int32_t serialized_fsize = (int32_t)new_fsize;
+        const int32_t serialized_ssize = (int32_t)new_ssize;
+        memcpy((uint8_t *)new_params + pos, &serialized_fsize,
+               sizeof(serialized_fsize));
         pos += sizeof(int32_t);
-        memcpy((uint8_t *)new_params + pos, &new_ssize, sizeof(int32_t));
+        memcpy((uint8_t *)new_params + pos, &serialized_ssize,
+               sizeof(serialized_ssize));
         pos += sizeof(int32_t);
         if(new_fdata)
           memcpy((uint8_t *)new_params + pos, new_fdata, new_fsize);
@@ -2461,38 +2558,59 @@ int set_params(dt_lib_module_t *self,
                const int size)
 {
   dt_lib_export_t *d = self->data;
-  // apply these stored presets again (parse blob)
-  const char *buf = (const char *)params;
+  dt_export_params_t parsed;
+  if(size < 0 || !_parse_export_params(params, (size_t)size, &parsed)) return 1;
 
   //??? WARNING: Any change here must be also done on get_params AND init_presets
   //             if some parameters are added before fname & sname
-  const int max_width = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int max_height = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int upscale = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int high_quality = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int export_masks = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int iccintent = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int icctype = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int dimensions_type = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int print_dpi = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const char *scale = buf;
-  buf += strlen(scale) + 1;
-  const char *metadata_export = buf;
-  buf += strlen(metadata_export) + 1;
+  const int max_width = parsed.values[0];
+  const int max_height = parsed.values[1];
+  const int upscale = parsed.values[2];
+  const int high_quality = parsed.values[3];
+  const int export_masks = parsed.values[4];
+  const int iccintent = parsed.values[5];
+  const int icctype = parsed.values[6];
+  const int dimensions_type = parsed.values[7];
+  const int print_dpi = parsed.values[8];
+  const char *scale = parsed.scale;
+  const char *metadata_export = parsed.metadata_export;
+  const char *iccfilename = parsed.iccfilename;
+  const char *fname = parsed.fname;
+  const char *sname = parsed.sname;
+  dt_imageio_module_format_t *fmod = dt_imageio_get_format_by_name(fname);
+  dt_imageio_module_storage_t *smod = dt_imageio_get_storage_by_name(sname);
+  if(!fmod || !smod) return 1;
+  const int32_t fversion = parsed.fversion;
+  const int32_t sversion = parsed.sversion;
+  if(fversion != fmod->version() || sversion != smod->version()) return 1;
+  const int fsize = parsed.fsize;
+  const int ssize = parsed.ssize;
+  if((fsize >= 0 && (size_t)fsize != fmod->params_size(fmod))
+     || (ssize >= 0 && (size_t)ssize != smod->params_size(smod)))
+    return 1;
+
+  // Allocate both aligned callback buffers before changing GUI/config state.
+  dt_imageio_module_data_t *fdata = fsize ? malloc((size_t)fsize) : NULL;
+  if(fsize && !fdata) return 1;
+  void *sdata = ssize ? malloc((size_t)ssize) : NULL;
+  if(ssize && !sdata)
+  {
+    free(fdata);
+    return 1;
+  }
+  if(fsize) memcpy(fdata, parsed.fdata, (size_t)fsize);
+  if(ssize) memcpy(sdata, parsed.sdata, (size_t)ssize);
+  if(fsize >= (int)sizeof(dt_imageio_module_data_t)
+     && !memchr(fdata->style, '\0', sizeof(fdata->style)))
+  {
+    free(fdata);
+    free(sdata);
+    return 1;
+  }
+
   g_free(d->metadata_export);
   d->metadata_export = g_strdup(metadata_export);
   dt_lib_export_metadata_set_conf(d->metadata_export);
-  const char *iccfilename = buf;
-  buf += strlen(iccfilename) + 1;
 
   // reverse these by setting the gui, not the conf vars!
   dt_bauhaus_combobox_set(d->intent, iccintent + 1);
@@ -2515,47 +2633,13 @@ int set_params(dt_lib_module_t *self,
     }
   }
 
-  // parse both names to '\0'
-  const char *fname = buf;
-  buf += strlen(fname) + 1;
-  const char *sname = buf;
-  buf += strlen(sname) + 1;
-
-  // get module by name and fail if not there.
-  dt_imageio_module_format_t *fmod = dt_imageio_get_format_by_name(fname);
-  dt_imageio_module_storage_t *smod = dt_imageio_get_storage_by_name(sname);
-  if(!fmod || !smod) return 1;
-
-  const int32_t fversion = *(const int32_t *)buf;
-  buf += sizeof(int32_t);
-  const int32_t sversion = *(const int32_t *)buf;
-  buf += sizeof(int32_t);
-
-  const int fsize = *(const int *)buf;
-  buf += sizeof(int32_t);
-  const int ssize = *(const int *)buf;
-  buf += sizeof(int32_t);
-
-  if(size
-     != strlen(fname) + 1
-        + strlen(sname) + 1
-        + 4 * sizeof(int32_t)
-        + fsize
-        + ssize
-        + 9 * sizeof(int32_t)
-        + strlen(scale) + 1
-        + strlen(metadata_export) + 1
-        + strlen(iccfilename) + 1)
-    return 1;
-  if(fversion != fmod->version() || sversion != smod->version()) return 1;
-
-  const dt_imageio_module_data_t *fdata = (const dt_imageio_module_data_t *)buf;
-
-  _update_style_label(d, fdata->style);
-  dt_bauhaus_combobox_set(d->style_mode, fdata->style_append ? 1 : 0);
-
-  buf += fsize;
-  const void *sdata = buf;
+  // The format and storage modules read their structs in place, so use the
+  // aligned copies made before any GUI/config changes.
+  if(fsize >= (int)sizeof(dt_imageio_module_data_t))
+  {
+    _update_style_label(d, fdata->style);
+    dt_bauhaus_combobox_set(d->style_mode, fdata->style_append ? 1 : 0);
+  }
 
   // switch modules
   set_storage_by_name(d, sname);
@@ -2575,6 +2659,8 @@ int set_params(dt_lib_module_t *self,
     res += smod->set_params(smod, sdata, ssize);
   if(fsize)
     res += fmod->set_params(fmod, fdata, fsize);
+  free(fdata);
+  free(sdata);
   return res;
 }
 
