@@ -1864,6 +1864,15 @@ void dt_iop_cleanup_module(dt_iop_module_t *module)
      && darktable.lib->proxy.colorpicker.picker_proxy->module == module)
     darktable.lib->proxy.colorpicker.picker_proxy = NULL;
 
+  // Keep the chroma cache from retaining a pointer to the module being freed.
+  if(module->dev)
+  {
+    if(module->dev->chroma.temperature == module)
+      module->dev->chroma.temperature = NULL;
+    if(module->dev->chroma.adaptation == module)
+      module->dev->chroma.adaptation = NULL;
+  }
+
   free(module->histogram);
   module->histogram = NULL;
   g_hash_table_destroy(module->raster_mask.source.users);
