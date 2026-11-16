@@ -10661,3 +10661,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior reviewer APPROVED with no findings. Confirmed both code changes exactly match the pinned diff, both allocation paths are covered, and the row/progress state the 32-bit limitation. Reviewer suggested an extreme-dimension test only if it can avoid impractical allocation; no build or tests were run by the reviewer.
 
 **Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 183 steps; all six CTests passed (`test_sample`, `test_dng_opcode`, `test_iop_introspection`, `test_image_cache_null`, `test_filmicrgb`, `test_wb_late_correction`). `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
+
+## 2026-11-16 15:36 UTC — S9: guard empty gradient double-clicks
+
+**Change.** Applied pinned darktable `4031a8cbbf679b4fe62e5931581bc54cec99cfb9` in `src/develop/masks/gradient.c`: only run the double-click curvature reset when creation is off and the form has points (`!gui->creation && form->points`). This prevents dereferencing an empty point list while starting a gradient or after a panel action. Added focused CMocka coverage for double-click during creation, single-click creation, and double-click on an empty non-creating form; registered the mask test target and added an APPLY — S9 row scoped to the optional retained GTK3/full-C callback. No Rust GTK4 parity claim and no matching `PARITY_AUDIT.md` item.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. Confirmed empty-form cases, that `module == NULL` test calls stay away from history/form-rebuild side effects, and the CMake/CTest registration.
+
+**Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 184 steps; all seven CTests passed, including `test_gradient_doubleclick`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
