@@ -10733,3 +10733,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** The first independent review identified two issues: test linkage was not portable to Windows, and setup/teardown functions were not registered. Restricted the target to Linux and changed the case to `cmocka_unit_test_setup_teardown`; final independent same-model re-review found no residual issue.
 
 **Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 186 steps; all nine CTests passed, including `test_masks_history_statement`. The disposable root container emitted nonfatal `fatal: detected dubious ownership in repository at '/src'` while generating `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
+
+## 2026-11-16 23:54 UTC — S9: free quick-check result on legacy database path
+
+**Change.** Applied pinned darktable `e8889ce3832804e12d2db8099e54eb6c5b899ab6` (first-parent delta from `ee6dd415dffbff90a30bc9cfed3a85a230fb31a3`) in `src/common/database.c::dt_database_init()`: free heap-allocated `libdb_status` at the start of the legacy `settings` fallback. The normal `db_info` and corruption paths already freed it; this closes the leak only when quick-check is valid but no usable `db_info` row/table is available. Added one APPLY—S9 row scoped to retained-C startup/migration; no Rust parity claim. No isolated test was added because exercising `dt_database_init()` requires broad database/GTK initialization.
+
+**Review.** Independent same-model senior review APPROVED. Verified `_get_pragma_string_val()` returns a `g_strdup`-allocated value, branches free it exactly once, no use follows the fallback cleanup, and the triage scope/test rationale are accurate.
+
+**Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 185 steps; all nine CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
