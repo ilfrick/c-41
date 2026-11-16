@@ -1832,6 +1832,7 @@ void reload_defaults(dt_iop_module_t *self)
       g_free(tooltip_part_profile_dirs);
       if(bufsize)
         free(iccCopyr);
+      cmsCloseProfile(cmsprofile);
     }
 
     // Make a generic tooltip if there is no ICC profile in the current image,
