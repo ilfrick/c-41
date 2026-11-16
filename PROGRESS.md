@@ -10471,3 +10471,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** First independent review `a52f4a19-446e-43ed-97b3-7ead973495e6` found a minor overgeneralization: “saved modes retain their identity” ignored modes displayed as “user modified.” Narrowed the wording to say saved modes are not inferred as as-shot/camera-reference from matching coefficients and explicitly named the unmatched display cases. Independent same-model re-review `2f65f1f7-901d-48ef-b6c8-dbaa0d135b78` APPROVED with no findings.
 
 **Verification.** `git diff --check` passed; `scripts/ci-local.sh` exited 0 with all four Docker gates passing (c41-core 2045 passed/2 ignored, C&T 2, c41-db 100, c41-sys 1, c41-ui 598). Documentation-only; no C build or deployment. Existing Rust warnings only. Protected installer files remain untracked and untouched.
+
+## 2026-11-16 01:58 UTC — Record checker-overlay reset on image switch
+
+**Change.** Added a `REFERENCE — S14` row for pinned `9a0ec3605b9538e645d9f679cea1208c92fa5480`: on `DT_SIGNAL_ACTIVE_IMAGES_CHANGE`, the `channelmixerrgb` GUI callback clears `checker_ready` so the calibration checker overlay recomputes its bounding box for the new image. Distinguished this draggable GUI overlay from the separate `colorchecker` IOP. The current Rust Color Calibration row has sliders but no equivalent overlay/reset state; no current pixel behavior is affected. The row is ordered by pinned date with nearby WB commits.
+
+**Review.** Independent same-model senior reviewer `3aec1677-5fad-4669-9d77-4d3494f6da4f` initially reported an apparent duplicate/out-of-order WB row. A direct read and `rg` of the working tree showed one row each for `9a0ec`, `3b875`, and `48474` in chronological order. Fresh full-diff review `a793a157-419d-4b9f-890a-a4ec64672215` APPROVED with no findings, confirming the reported issue was absent from the current file and the new row was accurate.
+
+**Verification.** `git diff --check` passed; `scripts/ci-local.sh` exited 0 and all four Docker Rust gates passed. Documentation-only; no C build or deployment. Existing Rust warnings only. Protected installer files remain untracked and untouched.
