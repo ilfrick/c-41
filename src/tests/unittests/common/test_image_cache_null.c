@@ -33,6 +33,7 @@ static void test_image_cache_functions_handle_null_cache(void **state)
   (void)state;
 
   const dt_imgid_t imgid = 1;
+  dt_image_cache_cleanup();
   assert_null(dt_image_cache_get(imgid, 'r'));
   assert_null(dt_image_cache_testget(imgid, 'r'));
 
@@ -43,7 +44,6 @@ static void test_image_cache_functions_handle_null_cache(void **state)
   dt_image_cache_unset_change_timestamp(imgid);
   dt_image_cache_set_export_timestamp(imgid);
   dt_image_cache_set_print_timestamp(imgid);
-
 }
 
 int main(void)
