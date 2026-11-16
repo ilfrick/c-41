@@ -3802,6 +3802,17 @@ static float _process_action(dt_action_t *action,
 
   gpointer action_target = action->type == DT_ACTION_TYPE_LIB ? action : action->target;
 
+  // Shared blend shape actions retain the last focused module as their target.
+  // Do not let a shortcut add a shape after focus has left that module.
+  if(action->owner
+     && action->owner->owner == &darktable.control->actions_blend
+     && !g_strcmp0(action->owner->id, "shapes")
+     && !dt_dev_gui_module())
+  {
+    dt_toast_log(_("no module is focused"));
+    return return_value;
+  }
+
   if(owner && owner->type == DT_ACTION_TYPE_IOP)
   {
     // find module instance

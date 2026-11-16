@@ -10677,3 +10677,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior review found no code issues. It requested progressively narrower wording on Rust's catalog sorting; the final row accurately states live-first sorting within each catalog group. Final review APPROVED with no findings.
 
 **Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 183 steps; all seven CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
+
+## 2026-11-16 16:11 UTC — S9: refuse shape shortcuts without module focus
+
+**Change.** Applied pinned darktable `33fc47fc8b2b3d3ad7ee5a15bcc7f98e76c36ec5` in `src/gui/accelerators.c::_process_action()`: when the shared `actions_blend` `shapes` action has no focused module, display the translated “no module is focused” message and return before dispatch. This prevents the stale last-focused module target from receiving a shape/parametric shortcut. Button clicks bypass this shortcut path and remain unaffected. Added an APPLY — S9 row scoped to optional retained GTK3/full-C shortcuts; no default Rust UI parity claim. No focused test was added because action dispatch depends on GTK global/action state; do not force a brittle harness. No matching `PARITY_AUDIT.md` item exists.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. Confirmed the owner-chain predicate matches upstream, shared target retention is the source of the stale-target risk, and button callbacks are separate.
+
+**Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 183 steps; all seven CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
