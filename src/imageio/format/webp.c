@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2013-2024 darktable developers.
+    Copyright (C) 2013-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -187,7 +187,14 @@ int write_image(dt_imageio_module_data_t *webp, const char *filename, const void
   pic.writer = WebPMemoryWrite;
   pic.custom_ptr = &writer;
 
-  WebPPictureImportRGBX(&pic, (const uint8_t *)in_tmp, webp_data->global.width * 4);
+  if(!WebPPictureImportRGBX(&pic, (const uint8_t *)in_tmp, webp_data->global.width * 4))
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[webp export] error (%d) during WebPPictureImportRGBX: %s",
+             pic.error_code,
+             get_error_str(pic.error_code));
+    goto error;
+  }
+
   if(!config.lossless)
   {
     // webp is more efficient at coding YUV images, as we go lossy
@@ -242,7 +249,7 @@ error:
   g_free(buf); // instead of WebPDataClear(&icc_profile)
   WebPDataClear(&assembled_data);
   WebPMuxDelete(mux);
-  fclose(out);
+  if(out) fclose(out);
   if(!res && exif) dt_exif_write_blob(exif, exif_len, filename, 1);
   return res;
 }

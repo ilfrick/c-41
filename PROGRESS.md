@@ -10645,3 +10645,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior reviewer APPROVED with no blocking findings. Confirmed pointer membership is checked before dereference, module cleanup clears cached references after module-specific cleanup and before the struct is freed, and the local `dt_iop_set_module_trouble_message(..., NULL, ...)` call matches pinned clear behavior. Reviewer noted pointer-address reuse is theoretically possible but cleanup clearing reduces that risk.
 
 **Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 183 steps and rebuilt `develop/imageop.c` and `develop/develop.c`; all six CTests passed. Root container emitted Git's nonfatal `dubious ownership` warning for `/src` and generated `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
+
+## 2026-11-16 15:01 UTC — S9: check WebP RGBX import failures
+
+**Change.** Adapted pinned darktable `b9bc75987336d3108d6e7f7f1a61a1a45ad9d17a` in `src/imageio/format/webp.c::write_image()`: check `WebPPictureImportRGBX()`, log `pic.error_code`, and take the shared cleanup path instead of encoding after an import failure. Guarded `fclose(out)` because output creation occurs later and prior failures can also reach cleanup while `out == NULL`. Updated the file copyright through 2026. Added an APPLY — S9 row scoped to retained-C WebP export; this makes no Rust exporter parity claim. No matching `PARITY_AUDIT.md` item exists. No targeted test was added because the normal CTest harness does not inject an RGBX import failure.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings or suggestions; confirmed pinned behavior, error reporting and safe cleanup.
+
+**Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 8 incremental steps and compiled/linked `libwebp.so`; all six CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` and generated `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
