@@ -10599,3 +10599,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior reviewer APPROVED with no findings or suggestions. Verified `call_once` publication, retry-on-exception behavior, and the cache-lock/`plugin_threadsafe` inversion from the current import/export call paths against the pinned upstream rationale. Reviewer did not build or test.
 
 **Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) compiled `imageio_rawspeed.cc` and completed all 183 steps; all six CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` while generating `unknown-version`; build and tests succeeded. `scripts/ci-local.sh` exited 0; all four gates passed. No C build on host.
+
+## 2026-11-16 13:21 UTC — S9: avoid NULL pointer arithmetic in implicit combobox entries
+
+**Change.** Applied pinned darktable `d929d6bc677c5cdb587494e2d42b381fdb078dd3` in `src/bauhaus/bauhaus.c::dt_bauhaus_combobox_add_full()`: derive the next implicit entry value with `GPOINTER_TO_INT`/`GINT_TO_POINTER` rather than evaluating `NULL + 1` when the first implicit combobox entry has NULL data. This preserves the established integer-index sequence and leaves explicit data unchanged. Added an APPLY — S9 retained-C correctness row to `docs/parity-inventory/commit-triage.md`. No dedicated test was added because the available CMocka harness does not initialize the GTK Bauhaus widget; the independent reviewer considered a new test optional for this exact one-line upstream fix.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. Confirmed the integer-pointer conversion matches pinned upstream and preserves the implicit value sequence; explicit-data entries are unaffected. Reviewer did not build or test.
+
+**Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed all 182 steps; all six CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
