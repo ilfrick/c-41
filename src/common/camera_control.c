@@ -184,36 +184,81 @@ static void _disable_debug()
   gp_log_remove_func(logid);
 }
 
+static gboolean _camctl_ptp_error_is_fatal(const gchar *lower)
+{
+  if(!lower) return FALSE;
+  return g_strstr_len(lower, -1, "i/o error")
+      || g_strstr_len(lower, -1, "io error")
+      || g_strstr_len(lower, -1, "could not claim")
+      || g_strstr_len(lower, -1, "no such device")
+      || g_strstr_len(lower, -1, "device not found")
+      || g_strstr_len(lower, -1, "usb claim")
+      || g_strstr_len(lower, -1, "usb_claim")
+      || g_strstr_len(lower, -1, "ptp no device")
+      || g_strstr_len(lower, -1, "0x02f9");
+}
+
 static void _error_func_dispatch25(GPContext *context,
                                    const char *text,
                                    void *data)
 {
   dt_camctl_t *camctl = (dt_camctl_t *)data;
-  dt_print(DT_DEBUG_CAMCTL, "[camera_control] gphoto2 error: %s", text);
+  GList *ci = camctl->active_camera
+                 ? g_list_find(camctl->cameras, camctl->active_camera)
+                 : NULL;
+  if(ci && ((dt_camera_t *)ci->data)->ptperror)
+    return;
 
-  if(strstr(text, "PTP"))
+  dt_print(DT_DEBUG_CAMCTL, "[camera_control] gphoto2 error: %s", text ? text : "(null)");
+  if(!text)
   {
-    /* the camera updating thread should get a note about an error from here */
-    GList *ci = g_list_find(camctl->cameras, camctl->active_camera);
-    if(ci)
-    {
-      dt_camera_t *cam = (dt_camera_t *)ci->data;
-      dt_print(DT_DEBUG_CAMCTL,
-               "[camera_control] PTP error `%s' for camera %s on port %s",
-               text, cam->model, cam->port);
-      dt_control_log
-        (_("camera `%s' on port `%s' error %s\n"
-           "\nmake sure your camera allows access and is not mounted otherwise"),
-         cam->model, cam->port, text);
-      cam->ptperror = TRUE;
-    }
-
-    /* notify client of camera connection broken */
-    _dispatch_camera_error(camctl, camctl->active_camera, CAMERA_CONNECTION_BROKEN);
-
-    /* notify client of camera disconnection */
-    _dispatch_camera_disconnected(camctl, camctl->active_camera);
+    dt_control_log(_("camera error: %s"), "(null)");
+    return;
   }
+
+  gchar *lower = g_ascii_strdown(text, -1);
+  if(!g_strstr_len(lower, -1, "ptp"))
+  {
+    g_free(lower);
+    dt_control_log(_("camera error: %s"), text);
+    return;
+  }
+
+  if(!_camctl_ptp_error_is_fatal(lower))
+  {
+    g_free(lower);
+    dt_print(DT_DEBUG_CAMCTL,
+             "[camera_control] non-fatal PTP error: %s", text);
+    dt_control_log(_("camera error: %s"), text);
+    return;
+  }
+  g_free(lower);
+
+  /* Fatal PTP: mark remount needed and tear the session down. */
+  if(!ci)
+  {
+    dt_print(DT_DEBUG_CAMCTL,
+             "[camera_control] fatal PTP error for untracked camera: %s", text);
+    return;
+  }
+
+  dt_camera_t *cam = (dt_camera_t *)ci->data;
+  if(cam->ptperror)
+    return;
+  dt_print(DT_DEBUG_CAMCTL,
+           "[camera_control] PTP error `%s' for camera %s on port %s",
+           text, cam->model, cam->port);
+  dt_control_log
+    (_("camera `%s' on port `%s' error %s\n"
+       "\nmake sure your camera allows access and is not mounted otherwise"),
+     cam->model, cam->port, text);
+  cam->ptperror = TRUE;
+
+  /* notify client of camera connection broken */
+  _dispatch_camera_error(camctl, camctl->active_camera, CAMERA_CONNECTION_BROKEN);
+
+  /* notify client of camera disconnection */
+  _dispatch_camera_disconnected(camctl, camctl->active_camera);
 }
 
 static void _status_func_dispatch25(GPContext *context,
