@@ -10607,3 +10607,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior reviewer APPROVED with no findings. Confirmed the integer-pointer conversion matches pinned upstream and preserves the implicit value sequence; explicit-data entries are unaffected. Reviewer did not build or test.
 
 **Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed all 182 steps; all six CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
+
+## 2026-11-16 13:36 UTC — S9: zero-initialize path-border slots
+
+**Change.** Applied pinned darktable `78f66f802183c6d241656f82b03ce6c10c1724d8` in `src/develop/masks/path.c::_path_get_pts_border()`: allocate `border_init` with `dt_calloc_align_float()` so conditionally unset slots are zero before the later loop copies slots 2–5 for every path point. This avoids reading indeterminate float values while preserving per-segment assignments. Added an APPLY — S9 retained-C mask-geometry row to `docs/parity-inventory/commit-triage.md`; no matching `PARITY_AUDIT.md` item exists. No targeted test was added for path-mask border construction.
+
+**Review.** Independent same-model senior reviewer initially noted the documentation row had landed before the source line change; applied the one-line `dt_calloc_align_float()` fix. Final review APPROVED with no findings, confirming copied slots 3 and 5 can otherwise be unset and the row matches the pinned diff. Reviewer did not build or test.
+
+**Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed all 182 steps; all six CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` while generating `unknown-version`; compilation/link and tests succeeded. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
