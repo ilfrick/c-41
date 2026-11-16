@@ -10709,3 +10709,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior review APPROVED with no findings; confirmed one allocation/list-owner path and no second record free. Reviewer did not build or test.
 
 **Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) rebuilt the camera module in 8 steps; all seven CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` while generating `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
+
+## 2026-11-16 18:00 UTC — S9: copy tethering camera model safely
+
+**Change.** Applied pinned darktable `4eb18a7b0979c016be10fee4af32eb64d5ee3b33` in `src/libs/camera.c::_expose_info_bar()`: guard a NULL `lib->data.camera_model` and pass `sizeof(model)` to `g_strlcpy()`. The old destination is zero-initialized, so `strlen(model)` evaluates to 0 and silently copies no model; a NULL source could also reach `g_strlcpy()`. Added an APPLY—S9 row scoped to optional retained-C GTK3 tethering; no Rust GTK4 parity claim. A worker initially reported the guard already present, but direct source inspection/blame confirmed the defect remained; the source fix was then applied.
+
+**Review.** Independent same-model senior review APPROVED with no findings. Confirmed exact pinned first-parent delta, call path and optional-C scope; no targeted test harness is justified for the static GTK draw callback.
+
+**Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) rebuilt the camera module in 8 steps; all seven CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` while generating `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
