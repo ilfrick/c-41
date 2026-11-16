@@ -13,3 +13,11 @@ add_cmocka_mock_test(test_iop_introspection
 if(WIN32)
     _copy_required_library(test_iop_introspection lib_darktable)
 endif(WIN32)
+
+add_cmocka_mock_test(test_image_cache_null
+                     SOURCES test_image_cache_null.c
+                     LINK_LIBRARIES lib_darktable cmocka)
+
+if(WIN32)
+    _copy_required_library(test_image_cache_null lib_darktable)
+endif(WIN32)
