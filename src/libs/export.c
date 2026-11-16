@@ -1962,6 +1962,8 @@ void init_presets(dt_lib_module_t *self)
         }
       }
 
+      if(data != new_fdata) free(data);
+
       cversion = sversion;
       new_version = new_sversion;
       new_size = 0;
@@ -1984,6 +1986,8 @@ void init_presets(dt_lib_module_t *self)
           goto delete_preset;
         }
       }
+
+      if(data != new_sdata) free(data);
 
       if(new_fdata || new_sdata)
       {
@@ -2038,6 +2042,7 @@ void init_presets(dt_lib_module_t *self)
       continue;
 
     delete_preset:
+      if(data != new_fdata && data != new_sdata) free(data);
       free(new_fdata);
       free(new_sdata);
       dt_print(DT_DEBUG_ALWAYS,
