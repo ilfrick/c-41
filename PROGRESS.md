@@ -10669,3 +10669,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior reviewer APPROVED with no findings. Confirmed empty-form cases, that `module == NULL` test calls stay away from history/form-rebuild side effects, and the CMake/CTest registration.
 
 **Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 184 steps; all seven CTests passed, including `test_gradient_doubleclick`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
+
+## 2026-11-16 15:58 UTC — S9: validate module drag source before reorder
+
+**Change.** Applied pinned darktable `40c6131e31621028a5f2f46b3c943278d41c3fb3` in `src/develop/imageop.c::_on_drag_motion()`: only resolve a dragged module when the source is the expander's header event box. Drags from child widgets such as mask-list rows are no longer misinterpreted as module reorder operations. Added an APPLY — S9 row scoped to optional retained GTK3 drag/reorder behavior; the default Rust GTK4 module list has static catalog groups, sorts live modules first within each group, and has no user-controlled reorder drag path. No Rust parity claim or matching `PARITY_AUDIT.md` item. No isolated non-GTK test was added because it would not exercise the widget-ancestry and GDK conditions; the retained full-C UI was not interactively tested.
+
+**Review.** Independent same-model senior review found no code issues. It requested progressively narrower wording on Rust's catalog sorting; the final row accurately states live-first sorting within each catalog group. Final review APPROVED with no findings.
+
+**Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 183 steps; all seven CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.

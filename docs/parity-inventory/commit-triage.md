@@ -316,6 +316,12 @@ neutral calculation, and consistent preview/export output against pinned
 fixtures. The 2026 `fd7…` manual-calibration changes are broad and require a
 Rust-native interaction design, not just more coefficient sliders.
 
+## Module reorder drag source guard
+
+| Upstream commit | Pinned-baseline change | C-41 comparison | Triage |
+|---|---|---|---|
+| [`40c6131e31621028a5f2f46b3c943278d41c3fb3`](https://github.com/darktable-org/darktable/commit/40c6131e31621028a5f2f46b3c943278d41c3fb3) — `imageop: ignore drags that do not start on a module header` | In `src/develop/imageop.c::_on_drag_motion()`, accepts a drag only when its source is the expander's header event box; child-widget drags (including mask-list interactions) must not trigger module reordering. | Retained C now checks `src_expander` is non-NULL and `src_header` equals `dtgtk_expander_get_header_event_box(DTGTK_EXPANDER(src_expander))` before resolving the source module. The default GTK4 module list is generated from a static catalog and sorts live modules first within each group (`crates/c41-ui/src/darkroom/mod.rs::populate_modules`); it has no user-controlled module-reorder drag path, so this specific issue does not apply to the default Rust UI. | **APPLY — S9, optional retained-C GTK3 drag/reorder behavior.** Prevents non-header child drags from being interpreted as module moves; no Rust GTK4 behavior change or parity claim beyond the absence of this reorder path. A focused non-GTK test is not practical: the guard depends on GTK widget ancestry/event-box identity and `_on_drag_motion()`'s GDK context/dev module state; extracting a test-only predicate would not exercise that behavior. |
+
 ## Remaining work
 
 The module, RAW/formats, and workflow/runtime matrices remain conservative inventories.

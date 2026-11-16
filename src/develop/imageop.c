@@ -3086,6 +3086,10 @@ static gboolean _on_drag_motion(GtkWidget *widget,
   GtkWidget *src_header = gtk_drag_get_source_widget(dc);
   if(!src_header) return TRUE;
   GtkWidget *src_expander = gtk_widget_get_ancestor(src_header, DTGTK_TYPE_EXPANDER);
+  // Only module-header drags may reorder modules; ignore drags from child widgets.
+  if(!src_expander
+     || src_header != dtgtk_expander_get_header_event_box(DTGTK_EXPANDER(src_expander)))
+    return TRUE;
 
   dt_iop_module_t *src = NULL;
   for(GList *iop = darktable.develop->iop; iop; iop = iop->next)
