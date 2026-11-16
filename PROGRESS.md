@@ -10701,3 +10701,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review and correction.** Independent same-model review found and fixed unchecked `gp_file_new_from_fd()` failures, in-place sorting of the caller's list, and an incorrectly detached triage row. The first Docker compile then failed at `src/common/camera_control.c:2148:47` with `error: expected ')' before '{' token`; added the missing close parenthesis and obtained a final independent APPROVE with no findings. Reviewers did not build or test.
 
 **Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 183 steps; all seven CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` while generating `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build, hardware-camera test, or deployment.
+
+## 2026-11-16 17:42 UTC — S9: free retained camera property records
+
+**Change.** Applied pinned darktable `5339fe1624034a5454ef2bd6ed12cbf6102a9cb0` in `src/libs/camera.c::_lib_property_free()`: after releasing each property's owned widget references and strings, free the allocated `dt_lib_camera_property_t` record itself. The records are allocated by `_lib_property_add_new()`, stored in `lib->gui.properties`, and released through `g_list_free_full(..., _lib_property_free)` when leaving the optional retained-C GTK3 camera view. Added an APPLY—S9 row scoped to this camera UI; no Rust parity claim. A focused lifecycle test is impractical without camera hardware because property population depends on live camera discovery and GTK widgets.
+
+**Review.** Independent same-model senior review APPROVED with no findings; confirmed one allocation/list-owner path and no second record free. Reviewer did not build or test.
+
+**Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) rebuilt the camera module in 8 steps; all seven CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` while generating `unknown-version`. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.

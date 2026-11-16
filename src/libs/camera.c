@@ -159,6 +159,7 @@ static void _lib_property_free(gpointer data)
   g_object_unref(prop->values);
   free(prop->name);
   free(prop->property_name);
+  free(prop);
 }
 
 static gint _compare_property_by_name(gconstpointer a, gconstpointer b)
