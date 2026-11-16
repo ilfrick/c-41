@@ -11,6 +11,11 @@
 #include "win/main_wrapper.h"
 #endif
 
+extern gboolean _iop_validate_params(dt_introspection_field_t *field,
+                                      gpointer params,
+                                      const gboolean report,
+                                      const char *name);
+
 typedef struct test_params_t
 {
   int8_t link;
@@ -84,10 +89,34 @@ static void test_int8_default_does_not_overwrite_neighbor(void **state)
   assert_null(module.default_params);
 }
 
+static void test_int8_validation_accepts_negative_link(void **state)
+{
+  (void)state;
+
+  int8_t link = -1;
+  dt_introspection_field_t field = {
+    .Int8 = {
+      .header = {
+        .type = DT_INTROSPECTION_TYPE_INT8,
+        .type_name = "int8_t",
+        .name = "link",
+        .size = sizeof(int8_t),
+        .offset = 0,
+      },
+      .Min = INT8_MIN,
+      .Max = INT8_MAX,
+      .Default = (char)-1,
+    },
+  };
+
+  assert_true(_iop_validate_params(&field, &link, FALSE, "fake-iop"));
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(test_int8_default_does_not_overwrite_neighbor),
+    cmocka_unit_test(test_int8_validation_accepts_negative_link),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }
