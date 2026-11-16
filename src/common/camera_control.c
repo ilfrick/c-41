@@ -364,23 +364,39 @@ static void _camera_process_job(const dt_camctl_t *c,
         int handle = g_open(output, O_CREAT | O_WRONLY | O_BINARY, 0666);
         if(handle != -1)
         {
-          gp_file_new_from_fd(&destination, handle);
-          if(gp_camera_file_get(camera->gpcam, fp.folder,
-                                fp.name, GP_FILE_TYPE_NORMAL, destination,
-                                c->gpcontext) == GP_OK)
+          destination = NULL;
+          const int file_result = gp_file_new_from_fd(&destination, handle);
+          if(file_result == GP_OK && destination)
           {
-            // Notify listeners of captured image
-            _dispatch_camera_image_downloaded(c, camera, NULL, NULL, output);
+            if(gp_camera_file_get(camera->gpcam, fp.folder,
+                                  fp.name, GP_FILE_TYPE_NORMAL, destination,
+                                  c->gpcontext) == GP_OK)
+            {
+              // Notify listeners of captured image
+              _dispatch_camera_image_downloaded(c, camera, NULL, NULL, output);
+            }
+            else
+              dt_print(DT_DEBUG_CAMCTL,
+                       "[camera_control] failed to download file %s", output);
+            gp_file_free(destination);
           }
           else
+          {
+            if(destination)
+              gp_file_free(destination);
+            else
+              close(handle);
             dt_print(DT_DEBUG_CAMCTL,
-                     "[camera_control] failed to download file %s", output);
-          close(handle);
+                     "[camera_control] failed to create file wrapper for %s: %s",
+                     output, file_result == GP_OK ? "no wrapper returned"
+                                                  : gp_result_as_string(file_result));
+          }
         }
         else
           dt_print(DT_DEBUG_CAMCTL,
                    "[camera_control] failed to download file %s", output);
         g_free(output);
+        g_free((char *)fname);
       }
       else
         dt_print(DT_DEBUG_CAMCTL,
@@ -1301,7 +1317,7 @@ void dt_camctl_import(const dt_camctl_t *c,
                       const dt_camera_t *cam,
                       GList *images)
 {
-  GList *ifiles = g_list_sort(images, (GCompareFunc)_sort_filename);
+  GList *ifiles = g_list_sort(g_list_copy(images), (GCompareFunc)_sort_filename);
   char *prev_file = NULL;
   char *prev_output = NULL;
 
@@ -1372,6 +1388,7 @@ void dt_camctl_import(const dt_camctl_t *c,
       }
 
       output = g_build_filename(output_path, fname, (char *)NULL);
+      g_free((char *)fname);
     }
 
     if(!g_file_set_contents(output, data, size, NULL))
@@ -1384,6 +1401,7 @@ void dt_camctl_import(const dt_camctl_t *c,
     prev_output = output;
     prev_file = file;
   }
+  g_list_free(ifiles);
   g_free(prev_output);
 
   _dispatch_control_status(c, CAMERA_CONTROL_AVAILABLE);
@@ -2116,17 +2134,18 @@ static void _camera_poll_events(const dt_camctl_t *c,
                                 const dt_camera_t *cam)
 {
   CameraEventType event;
-  gpointer data;
-  if(gp_camera_wait_for_event(cam->gpcam, 30, &event, &data, c->gpcontext) == GP_OK)
+  gpointer data = NULL;
+  if(gp_camera_wait_for_event(cam->gpcam, 30, &event, &data, c->gpcontext) != GP_OK)
+    return;
+
   {
     if(event == GP_EVENT_UNKNOWN)
     {
       /* this is really some undefined behavior, seems like it's
       camera driver dependent... very ugly! */
-      if(strstr((char *)data, "4006") || // Nikon PTP driver
+      if(data && (strstr((char *)data, "4006") || // Nikon PTP driver
          (strstr((char *)data, "PTP Property")
-          && strstr((char *)data, "changed")) // Some Canon driver maybe all ??
-         )
+          && strstr((char *)data, "changed")))) // Some Canon driver maybe all ??
       {
         // Property change event occurred on camera
         // let's update cache and signalling
@@ -2159,6 +2178,7 @@ static void _camera_poll_events(const dt_camctl_t *c,
                   _camera_configuration_single_update(c, cam, name);
                   g_free(name);
                 }
+                free(data);
                 return;
               }
             }
@@ -2186,6 +2206,7 @@ static void _camera_poll_events(const dt_camctl_t *c,
         const char *output_path = _dispatch_request_image_path(c, NULL, cam);
         if(!output_path) output_path = "/tmp";
         const char *fname = _dispatch_request_image_filename(c, fp->name, NULL, cam);
+        const gboolean fname_allocated = (fname != NULL);
         if(!fname) fname = fp->name;
 
         char *output = g_build_filename(output_path, fname, (char *)NULL);
@@ -2193,26 +2214,43 @@ static void _camera_poll_events(const dt_camctl_t *c,
         int handle = g_open(output, O_CREAT | O_WRONLY | O_BINARY, 0666);
         if(handle != -1)
         {
-          gp_file_new_from_fd(&destination, handle);
-          if(gp_camera_file_get(cam->gpcam, fp->folder,
-                                fp->name, GP_FILE_TYPE_NORMAL, destination,
-                                c->gpcontext) == GP_OK)
+          destination = NULL;
+          const int file_result = gp_file_new_from_fd(&destination, handle);
+          if(file_result == GP_OK && destination)
           {
-            // Notify listeners of captured image
-            _dispatch_camera_image_downloaded(c, cam, NULL, NULL, output);
+            if(gp_camera_file_get(cam->gpcam, fp->folder,
+                                  fp->name, GP_FILE_TYPE_NORMAL, destination,
+                                  c->gpcontext) == GP_OK)
+            {
+              // Notify listeners of captured image
+              _dispatch_camera_image_downloaded(c, cam, NULL, NULL, output);
+            }
+            else
+              dt_print(DT_DEBUG_CAMCTL,
+                       "[camera_control] failed to download file %s", output);
+            gp_file_free(destination);
           }
           else
+          {
+            if(destination)
+              gp_file_free(destination);
+            else
+              close(handle);
             dt_print(DT_DEBUG_CAMCTL,
-                     "[camera_control] failed to download file %s", output);
-          close(handle);
+                     "[camera_control] failed to create file wrapper for %s: %s",
+                     output, file_result == GP_OK ? "no wrapper returned"
+                                                  : gp_result_as_string(file_result));
+          }
         }
         else
           dt_print(DT_DEBUG_CAMCTL,
                    "[camera_control] failed to download file %s", output);
         g_free(output);
+        if(fname_allocated) g_free((char *)fname);
       }
     }
   }
+  free(data);
 }
 
 
