@@ -10616,6 +10616,12 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 
 **Verification.** `git diff --check` passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed all 182 steps; all six CTests passed. The disposable root container emitted Git's nonfatal `dubious ownership` warning for `/src` while generating `unknown-version`; compilation/link and tests succeeded. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build.
 
+## 2026-11-16 14:16 UTC — Correct duplicate S9 shortcut triage row
+
+**Correction.** Removed duplicate copies and an extra table cell accidentally introduced while adding the `7d65cdf2f32ada2354461ba48e13e74c68042096` S9 row. Kept one reviewed row and clarified that the C GTK3 shortcut dispatcher is in the manually launched `/usr/local/bin/darkroom` executable in the optional full-C image; its default autostart is `c41-rs`.
+
+**Review and verification.** Independent same-model senior reviewer confirmed the diff removes duplicate rows, the remaining row has four columns, the upstream re-lookup fix is accurately described, and the Rust-vs-full-C scope evidence is correct. `git diff --check` passed. No source changed in this correction; the prior code commit's C/Rust validation remains recorded above. Push hook will rerun all four CI gates.
+
 ## 2026-11-16 14:00 UTC — S9: revalidate shortcut key after delayed release
 
 **Change.** Applied pinned darktable `7d65cdf2f32ada2354461ba48e13e74c68042096` in retained `src/gui/accelerators.c::dt_shortcut_key_release()`: after `_interrupt_delayed_release(TRUE)`, re-find the pressed-key node and return if it was removed. The pending delayed release can complete mapping and `_ungrab_grab_widget()` can free `_pressed_keys`, invalidating the previously saved node. Added an APPLY — S9 optional retained-C shortcut-mapping lifetime row to `docs/parity-inventory/commit-triage.md`. The C dispatcher is live in the opt-in full-C GTK3 executable; default `c41-rs` GTK4 UI does not initialize it. No targeted ASan test was added because reproducing the sequence requires coordinated GTK event and delayed-release processing; no `PARITY_AUDIT.md` entry matched.
