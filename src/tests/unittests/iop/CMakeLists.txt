@@ -11,8 +11,17 @@ add_cmocka_mock_test(test_wb_late_correction
                      SOURCES test_wb_late_correction.c
                      LINK_LIBRARIES lib_darktable cmocka)
 
+add_cmocka_mock_test(test_hazeremoval_quick_select
+                     SOURCES test_hazeremoval_quick_select.c
+                     LINK_LIBRARIES lib_darktable cmocka)
+if(TARGET c41_core)
+  # hazeremoval.c is included directly and calls Rust FFI kernels.
+  target_link_libraries(test_hazeremoval_quick_select PRIVATE c41_core)
+endif()
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_filmicrgb lib_darktable)
     _copy_required_library(test_wb_late_correction lib_darktable)
+    _copy_required_library(test_hazeremoval_quick_select lib_darktable)
 endif(WIN32)

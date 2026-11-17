@@ -363,7 +363,6 @@ static float *_partition(float *first,
     }
     return first;
   }
-  last++;
   while(TRUE)
   {
     // scan from start until we find an element which needs to be swapped to the second half
@@ -399,7 +398,7 @@ void _quick_select(float *first,
   {
     // select pivot by median of three heuristic for better performance
     float *p1 = first;
-    float *p3 = compatibility_mode ? first + (last - first) / 2 : nth;
+    float *p3 = first + (last - first) / 2;
     float *pivot = last - 1; // put median in last to avoid additional swap
 
     if(!(*p1 < *pivot))
