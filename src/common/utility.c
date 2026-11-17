@@ -763,8 +763,8 @@ gchar *dt_util_normalize_path(const gchar *_input)
     if(g_str_has_prefix(input, "file://")) // in this case we should take care of %XX encodings in the string
                                            // (for example %20 = ' ')
     {
-      input += strlen("file://");
-      filename = g_uri_unescape_string(input, NULL);
+      // Keep input unchanged so the allocated buffer can be freed below.
+      filename = g_uri_unescape_string(input + strlen("file://"), NULL);
     }
     else
       filename = g_strdup(input);
