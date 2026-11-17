@@ -25,6 +25,13 @@ add_cmocka_mock_test(test_capture_mask
 target_include_directories(test_capture_mask PRIVATE ${CMAKE_SOURCE_DIR}/data/kernels)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_cmocka_mock_test(test_denoiseprofile_legacy_params
+                       SOURCES test_denoiseprofile_legacy_params.c
+                       LINK_LIBRARIES lib_darktable cmocka)
+  if(TARGET c41_core)
+    target_link_libraries(test_denoiseprofile_legacy_params PRIVATE c41_core)
+  endif()
+
   add_cmocka_mock_test(test_highlights_legacy_params
                        SOURCES test_highlights_legacy_params.c
                        LINK_LIBRARIES lib_darktable cmocka)
