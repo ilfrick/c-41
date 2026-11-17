@@ -1,3 +1,7 @@
+add_cmocka_mock_test(test_imageio_rgbe_validate
+                     SOURCES test_imageio_rgbe_validate.c
+                     LINK_LIBRARIES cmocka)
+
 add_cmocka_mock_test(test_dng_opcode
                      SOURCES test_dng_opcode.c
                      LINK_LIBRARIES lib_darktable cmocka)

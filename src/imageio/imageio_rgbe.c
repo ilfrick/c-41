@@ -19,6 +19,7 @@
 #include "common/matrices.h"
 #include "develop/imageop.h"         // for IOP_CS_RGB
 #include "imageio/imageio_rgbe.h"
+#include "imageio/imageio_rgbe_validate.h"
 #include "rust_ffi/darkroom_core.h"  // for darkroom_rgbe_clamp_pack
 
 #include <ctype.h>
@@ -216,8 +217,8 @@ int RGBE_ReadHeader(FILE *fp, int *width, int *height, rgbe_header_info *info)
     if(fgets(buf, sizeof(buf) / sizeof(buf[0]), fp) == 0)
       return rgbe_error(rgbe_read_error, NULL);
 
-  if(sscanf(buf, "-Y %d +X %d", height, width) < 2)
-    return rgbe_error(rgbe_format_error, "missing image size specifier");
+  if(!dt_imageio_rgbe_parse_dimensions_line(buf, height, width))
+    return rgbe_error(rgbe_format_error, "missing or out-of-range image size specifier");
 
   return RGBE_RETURN_SUCCESS;
 }
@@ -449,7 +450,12 @@ dt_imageio_retval_t dt_imageio_open_rgbe(dt_image_t *img,
     return DT_IMAGEIO_LOAD_FAILED;
   }
 
-  const size_t npixels = (size_t)img->width * img->height;
+  size_t npixels;
+  if(!dt_imageio_rgbe_validate_dimensions(img->width, img->height, &npixels))
+  {
+    fclose(f);
+    return DT_IMAGEIO_FILE_CORRUPTED;
+  }
 
   // The decoder writes three RGB channels to rgbe_buf, so size = number of pixels * 3
   float *rgbe_buf = dt_alloc_align_float(npixels * 3);
