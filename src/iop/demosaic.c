@@ -236,6 +236,7 @@ typedef struct dt_iop_demosaic_global_data_t
   int gaussian_9x9_div;
   int prefill_clip_mask;
   int prepare_blend;
+  int capture_erode_mask;
   int modify_blend;
   int show_blend_mask;
   int capture_result;
@@ -1283,6 +1284,7 @@ void init_global(dt_iop_module_so_t *self)
   gd->gaussian_9x9_div = dt_opencl_create_kernel(capt, "kernel_9x9_div");
   gd->prefill_clip_mask = dt_opencl_create_kernel(capt, "prefill_clip_mask");
   gd->prepare_blend = dt_opencl_create_kernel(capt, "prepare_blend");
+  gd->capture_erode_mask = dt_opencl_create_kernel(capt, "capture_erode_mask");
   gd->modify_blend = dt_opencl_create_kernel(capt, "modify_blend");
   gd->show_blend_mask = dt_opencl_create_kernel(capt, "show_blend_mask");
   gd->capture_result = dt_opencl_create_kernel(capt, "capture_result");
@@ -1345,6 +1347,7 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->gaussian_9x9_div);
   dt_opencl_free_kernel(gd->prefill_clip_mask);
   dt_opencl_free_kernel(gd->prepare_blend);
+  dt_opencl_free_kernel(gd->capture_erode_mask);
   dt_opencl_free_kernel(gd->modify_blend);
   dt_opencl_free_kernel(gd->show_blend_mask);
   dt_opencl_free_kernel(gd->capture_result);

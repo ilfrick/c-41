@@ -552,9 +552,6 @@ static int _capture_sharpen_cl(dt_iop_module_t *self,
                                const uint32_t filters)
 {
   dt_dev_pixelpipe_t *pipe = piece->pipe;
-
-  const int pixels = width * height;
-  const int bsize = sizeof(float) * pixels;
   const int devid = piece->pipe->devid;
 
   const dt_iop_demosaic_data_t *const d = piece->data;
@@ -567,6 +564,11 @@ static int _capture_sharpen_cl(dt_iop_module_t *self,
   }
 
   if(!d->cs_enabled && !showmask) return CL_SUCCESS;
+
+  if(width <= 0 || height <= 0 || width > G_MAXINT / height) return CL_INVALID_VALUE;
+  const int pixels = width * height;
+  if((size_t)pixels > G_MAXSIZE / sizeof(float)) return CL_INVALID_VALUE;
+  const size_t bsize = sizeof(float) * (size_t)pixels;
 
   const dt_iop_buffer_dsc_t *dsc = &pipe->dsc;
   const gboolean wbon = dsc->temperature.enabled;
@@ -582,10 +584,11 @@ static int _capture_sharpen_cl(dt_iop_module_t *self,
   cl_mem blendmask = dt_opencl_alloc_device_buffer(devid, bsize);
   cl_mem luminance = dt_opencl_alloc_device_buffer(devid, bsize);
   cl_mem tmp2 = dt_opencl_alloc_device_buffer(devid, bsize);
+  cl_mem safe_mask = dt_opencl_alloc_device_buffer(devid, bsize);
   cl_mem tmp1 = dt_opencl_alloc_device_buffer(devid, bsize);
   cl_mem dev_rgb = dt_opencl_duplicate_image(devid, dev_out);
 
-  if(!blendmask || !luminance || !tmp2 || !tmp1 || !dev_rgb) goto finish;
+  if(!blendmask || !luminance || !tmp2 || !safe_mask || !tmp1 || !dev_rgb) goto finish;
 
   err = dt_opencl_enqueue_kernel_2d_args(devid, gd->prefill_clip_mask, width, height,
           CLARG(tmp2), CLARG(width), CLARG(height));
@@ -596,15 +599,19 @@ static int _capture_sharpen_cl(dt_iop_module_t *self,
           CLARG(icoeffs), CLARG(width), CLARG(height));
   if(err != CL_SUCCESS) goto finish;
 
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->modify_blend, width, height,
-          CLARG(tmp2), CLARG(tmp1), CLARG(luminance), CLARG(d->cs_thrs), CLARG(width), CLARG(height));
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->capture_erode_mask, width, height,
+          CLARG(tmp2), CLARG(safe_mask), CLARG(width), CLARG(height));
   if(err != CL_SUCCESS) goto finish;
 
-  err = dt_gaussian_fast_blur_cl_buffer(devid, tmp2, blendmask, width, height, 2.0f, 1, 0.0f, 1.0f);
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->modify_blend, width, height,
+          CLARG(safe_mask), CLARG(tmp1), CLARG(luminance), CLARG(d->cs_thrs), CLARG(width), CLARG(height));
+  if(err != CL_SUCCESS) goto finish;
+
+  err = dt_gaussian_fast_blur_cl_buffer(devid, safe_mask, blendmask, width, height, 2.0f, 1, 0.0f, 1.0f);
   if(err != CL_SUCCESS) goto finish;
 
   err = dt_opencl_enqueue_kernel_1d_args(devid, gd->final_blend, pixels,
-          CLARG(blendmask), CLARG(tmp2), CLARG(pixels));
+          CLARG(blendmask), CLARG(safe_mask), CLARG(pixels));
   if(err != CL_SUCCESS) goto finish;
 
   if(showmask)
@@ -662,6 +669,7 @@ static int _capture_sharpen_cl(dt_iop_module_t *self,
   dt_opencl_release_mem_object(blendmask);
   dt_opencl_release_mem_object(dev_rgb);
   dt_opencl_release_mem_object(tmp2);
+  dt_opencl_release_mem_object(safe_mask);
   dt_opencl_release_mem_object(tmp1);
   dt_opencl_release_mem_object(luminance);
 

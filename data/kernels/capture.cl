@@ -17,6 +17,7 @@
 */
 
 #include "common.h"
+#include "capture_mask_shared.h"
 
 #define CAPTURE_KERNEL_ALIGN 32
 #define CAPTURE_YMIN 0.001f
@@ -179,6 +180,17 @@ __kernel void prefill_clip_mask(global float *mask,
   mask[i] = 1.0f;
 }
 
+__kernel void capture_erode_mask(global const float *in, global float *out,
+                                 const int width, const int height)
+{
+  const int col = get_global_id(0);
+  const int row = get_global_id(1);
+  if(col >= width || row >= height) return;
+  const int k = mad24(row, width, col);
+  const bool interior = C41_CAPTURE_MASK_INTERIOR_21(col, row, width, height);
+  out[k] = interior && C41_CAPTURE_MASK_SAFE_21(in + k, width) ? 1.0f : 0.0f;
+}
+
 __kernel void prepare_blend(__read_only image2d_t cfa,
                             __read_only image2d_t dev_out,
                             const int filters,
@@ -202,22 +214,16 @@ __kernel void prepare_blend(__read_only image2d_t cfa,
   const int k = mad24(row, w, col);
   Yold[k] = Y;
 
-  if(row > 1 && col > 1 && (row < height-2) && (col < w -2))
+  if(C41_CAPTURE_MASK_INTERIOR_21(col, row, w, height))
   {
-    const int w2 = 2 * w;
     const int color = fcol(row, col, filters, xtrans);
     const float val = Areadsingle(cfa, col, row);
-    if(val > whites[color] || Y < CAPTURE_YMIN)
-    {
-      mask[k-w2-1] = mask[k-w2]  = mask[k-w2+1] =
-      mask[k-w-2]  = mask[k-w-1] = mask[k-w ]   = mask[k-w+1] = mask[k-w+2] =
-      mask[k-2]    = mask[k-1]   = mask[k]      = mask[k+1]   = mask[k+2] =
-      mask[k+w-2]  = mask[k+w-1] = mask[k+w]    = mask[k+w+1] = mask[k+w+2] =
-      mask[k+w2-1] = mask[k+w2]  = mask[k+w2+1] = 0.0f;
-    }
+    mask[k] = val > whites[color] || Y < CAPTURE_YMIN ? 0.0f : 1.0f;
   }
   else
-    mask[k] = 0.0f;
+    // Keep border entries neutral for interior erosion; output border remains
+    // zero in capture_erode_mask, matching the previous mask semantics.
+    mask[k] = 1.0f;
 }
 
 __kernel void modify_blend(global float *blend,
