@@ -395,10 +395,10 @@ pub unsafe extern "C" fn darkroom_xtrans_fdc(
                             let g = 3.0 * rg(0) - 2.0 * rg(hd) - rg(hd1);
                             let mut c = 0isize;
                             while c < 4 {
-                                let val = (g
-                                    + 2.0 * rgb[(rfx + hd * 3 + c) as usize]
-                                    + rgb[(rfx + hd1 * 3 + c) as usize])
-                                    / 3.0;
+                                let val = super::xtrans_chroma_third(
+                                    g + 2.0 * rgb[(rfx + hd * 3 + c) as usize]
+                                        + rgb[(rfx + hd1 * 3 + c) as usize],
+                                );
                                 rgb[(rfx + c) as usize] = val;
                                 redblue[d][c as usize] = val;
                                 c += 2;

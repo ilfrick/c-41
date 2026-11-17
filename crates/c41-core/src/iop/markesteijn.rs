@@ -12,6 +12,7 @@
 //! `_vng_lininterpolate` call stays in C.
 
 use crate::raw;
+use super::xtrans_chroma_third;
 
 const TS: usize = 122; // DT_MARKESTEIJN_TS
 
@@ -402,10 +403,10 @@ pub unsafe extern "C" fn darkroom_xtrans_markesteijn(
                                 let g = 3.0 * rg(0) - 2.0 * rg(hd) - rg(hd1);
                                 let mut c = 0isize;
                                 while c < 4 {
-                                    rgb[(rfx + c) as usize] = (g
-                                        + 2.0 * rgb[(rfx + hd * 3 + c) as usize]
-                                        + rgb[(rfx + hd1 * 3 + c) as usize])
-                                        / 3.0;
+                                    rgb[(rfx + c) as usize] = xtrans_chroma_third(
+                                        g + 2.0 * rgb[(rfx + hd * 3 + c) as usize]
+                                            + rgb[(rfx + hd1 * 3 + c) as usize],
+                                    );
                                     c += 2;
                                 }
                             } else {

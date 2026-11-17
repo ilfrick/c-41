@@ -90,6 +90,20 @@ pub mod cacorrect;
 pub mod geometry;
 pub mod colorharmonizer;
 
+#[inline]
+pub(crate) fn xtrans_chroma_third(value: f32) -> f32 {
+    value * (1.0f32 / 3.0f32)
+}
+
+#[cfg(test)]
+mod xtrans_chroma_third_tests {
+    #[test]
+    fn uses_rounded_reciprocal_multiplication() {
+        let value = f32::from_bits(0xbd95_c3b0);
+        assert_eq!(super::xtrans_chroma_third(value).to_bits(), 0xbcc7_af96);
+    }
+}
+
 use crate::{params::IopParams, roi::RoiIn, Result};
 
 /// Placeholder for an OpenCL device buffer.
