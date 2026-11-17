@@ -299,6 +299,11 @@ struct PreviewCtx {
     /// the values only once the user edits (`rwp_on`), where they override
     /// these — see [`crate::preview::PreviewParams::rawprepare_opts`].
     rawprepare_levels: Rc<RefCell<Option<([f32; 4], f32)>>>,
+    /// Whether the accepted current raw decode found an invalid white point
+    /// while the Raw black/white point override is enabled. The row is rebuilt
+    /// after the first decode, so keep state separately from its weak widget.
+    rawprepare_warning: Rc<std::cell::Cell<bool>>,
+    rawprepare_warning_icon: glib::WeakRef<gtk4::Image>,
     /// Path of the image being edited. [`spawn_decode`] reads it from here so
     /// any module row (whose closures only capture `ctx`) can request a full
     /// re-decode — needed by highlight reconstruction, whose options live in
@@ -1345,6 +1350,42 @@ fn apply_geometry_to_base(ctx: &PreviewCtx) {
     render_preview(ctx);
 }
 
+/// Match rawimage's inclusive fallback test for the exact level arrays passed
+/// to normalization. `Some(opts)` is the rawprepare override (scalar white
+/// broadcast across channels); `None` uses the source file's level arrays.
+fn rawprepare_white_point_invalid(
+    opts: Option<c41_core::RawPrepareOpts>,
+    file_black: [f32; 4],
+    file_white: [f32; 4],
+) -> bool {
+    let (black, white) = match opts {
+        Some(opts) => (opts.black, [opts.white; 4]),
+        None => (file_black, file_white),
+    };
+    let max_black = black.into_iter().fold(0.0_f32, f32::max);
+    white.iter().any(|&level| level <= max_black)
+}
+
+/// Refresh only the warning icon owned by the rawprepare row; its weak ref is
+/// replaced whenever the panel rebuilds after the first successful decode.
+fn refresh_rawprepare_warning(ctx: &PreviewCtx) {
+    if let Some(icon) = ctx.rawprepare_warning_icon.upgrade() {
+        let visible = ctx.rawprepare_warning.get();
+        let label = if visible { "Invalid white point" } else { "" };
+        let description = if visible {
+            "The white point is not above the black level. The maximum value is used instead; set a correct white point."
+        } else {
+            ""
+        };
+        icon.set_visible(visible);
+        icon.set_tooltip_text(visible.then_some(description));
+        icon.update_property(&[
+            gtk4::accessible::Property::Label(label),
+            gtk4::accessible::Property::Description(description),
+        ]);
+    }
+}
+
 /// Decode + downscale the image off the main thread, then display it. Reads its
 /// inputs from `ctx`: [`PreviewCtx::decode_path`], [`PreviewCtx::decode_method`],
 /// and the live params' decode-stage options — highlight reconstruction, hot
@@ -1429,6 +1470,19 @@ fn spawn_decode(ctx: &PreviewCtx) {
                     clean_make,
                     clean_model,
                 )) => {
+                    // This warning mirrors pinned rawprepare's enabled-module
+                    // behavior: only an enabled override owns a warning. Test
+                    // the same effective level inputs as this decode, before
+                    // the first-decode panel rebuild can replace the row widget.
+                    ctx.rawprepare_warning.set(
+                        rawprepare.is_some()
+                            && rawprepare_white_point_invalid(
+                                rawprepare,
+                                blacklevels,
+                                whitelevels,
+                            ),
+                    );
+                    refresh_rawprepare_warning(&ctx);
                     // The first completed decode seeds the raw black/white row
                     // with the FILE's own levels (sensor units; before that the
                     // row shows inert sentinels). Only the None→Some transition
@@ -1889,6 +1943,8 @@ pub fn darkroom_page(
         history_rec,
         demosaic_row: glib::WeakRef::new(),
         rawprepare_levels: Rc::new(RefCell::new(None)),
+        rawprepare_warning: Rc::new(std::cell::Cell::new(false)),
+        rawprepare_warning_icon: glib::WeakRef::new(),
         decode_path: Rc::new(RefCell::new(file_path.to_string())),
         decode_method: Rc::new(std::cell::Cell::new(
             crate::persist::load_demosaic(db_path, file_path),
@@ -5160,6 +5216,10 @@ fn rawprepare_module_row(ctx: &PreviewCtx) -> adw::ExpanderRow {
     add_rwp_slider(&row, ctx, "Black B", seed2, 2, baseline);
     add_rwp_slider(&row, ctx, "Black E", seed3, 3, baseline);
     add_rwp_slider(&row, ctx, "White point", seedw, 4, baseline);
+    let warning = gtk4::Image::from_icon_name("dialog-warning-symbolic");
+    ctx.rawprepare_warning_icon.set(Some(&warning));
+    row.add_suffix(&warning);
+    refresh_rawprepare_warning(ctx);
     let reset = gtk4::Button::builder()
         .icon_name("edit-clear-symbolic")
         .tooltip_text("Reset Raw black/white point to defaults")
@@ -6681,6 +6741,38 @@ mod tests {
             is_live_module("Raw black/white point"),
             "the wired rawprepare module must read as live"
         );
+    }
+
+    #[test]
+    fn rawprepare_warning_matches_file_and_override_decode_inputs() {
+        let file_black = [100.0, 200.0, 300.0, 400.0];
+        let valid_file_white = [500.0; 4];
+        assert!(!rawprepare_white_point_invalid(
+            None,
+            file_black,
+            valid_file_white
+        ));
+        assert!(rawprepare_white_point_invalid(None, file_black, [400.0; 4]));
+
+        let opts = c41_core::RawPrepareOpts {
+            black: [100.0, 200.0, 300.0, 400.0],
+            white: 400.0,
+        };
+        // Equality with max black follows pinned darktable's inclusive test.
+        assert!(rawprepare_white_point_invalid(
+            Some(opts),
+            file_black,
+            valid_file_white
+        ));
+        let valid_override = c41_core::RawPrepareOpts {
+            white: 401.0,
+            ..opts
+        };
+        assert!(!rawprepare_white_point_invalid(
+            Some(valid_override),
+            file_black,
+            [0.0; 4],
+        ));
     }
 
     /// Every live-module label must still exist verbatim in the catalog, else

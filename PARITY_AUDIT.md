@@ -283,10 +283,14 @@ the C module are not surfaced (only black/white levels); (b) **resolved in the
 S9 rawprepare fallback increment:** when white is at or below the maximum black
 level, normalization now uses `UINT16_MAX` for all CFA colours, matching
 `rawprepare.c` and covered for Bayer, X-Trans, and `load_with` overrides;
-(c) rawloader's black-level source is used for the file defaults (cameras that
-report 0 and expect the masked-black do not get a border estimate —
-pre-existing, documented in `rawimage.rs`); (d) history jump/undo/redo restores
-the params without a re-decode (shared decode-level gap with Hot pixels / HL).
+(c) the GTK4 row's warning icon/tooltip and accessible label/description reflect
+only an invalid enabled override after the accepted current-generation decode;
+it does not warn on invalid file-level values when the raw module is disabled,
+matching the pinned enabled-module semantics; (d) rawloader's black-level source
+is used for the file defaults (cameras that report 0 and expect the masked-black
+do not get a border estimate — pre-existing, documented in `rawimage.rs`);
+(e) history jump/undo/redo restores the params without a re-decode (shared
+decode-level gap with Hot pixels / HL).
 
 `Demosaic` is one of the five elsewhere-driven rows: its algorithm
 dropdown at the top of the right panel (`mod.rs:1978-2014`, handler at
