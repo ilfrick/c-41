@@ -1154,7 +1154,12 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
 
   int rep = 0;
   if(form->functions)
+  {
+    // Serialize point-mutating callbacks against the pixelpipe form snapshot.
+    dt_pthread_mutex_lock(&darktable.develop->history_mutex);
     rep = form->functions->mouse_moved(module, pzx, pzy, pressure, which, zoom_scale, form, 0, gui, 0);
+    dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
+  }
 
   if(gui) _set_hinter_message(gui, form);
 
@@ -1179,9 +1184,12 @@ gboolean dt_masks_events_button_released(dt_iop_module_t *module,
 
   if(form->functions)
   {
+    // Serialize point-mutating callbacks against the pixelpipe form snapshot.
+    dt_pthread_mutex_lock(&dev->history_mutex);
     const int ret =
       form->functions->button_released(module, pzx, pzy, which, state, form, 0, gui, 0);
     form->functions->mouse_moved(module, pzx, pzy, 0, which, zoom_scale, form, 0, gui, 0);
+    dt_pthread_mutex_unlock(&dev->history_mutex);
     return ret;
   }
 
@@ -1223,11 +1231,15 @@ gboolean dt_masks_events_button_pressed(dt_iop_module_t *module,
   }
 
   if(form->functions)
-    return form->functions->button_pressed(module, pzx, pzy, pressure,
-                                           which, type, state, form, 0, gui, 0)
-      || which == 3; // swallow right-clicks even when not handled so
-                     // right-drag rotate is disabled when forms
-                     // visible
+  {
+    // Serialize point-mutating callbacks against the pixelpipe form snapshot.
+    dt_pthread_mutex_lock(&darktable.develop->history_mutex);
+    const gboolean ret = form->functions->button_pressed(
+                           module, pzx, pzy, pressure, which, type, state, form, 0, gui, 0) ||
+                         which == 3; // swallow right-clicks even when not handled
+    dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
+    return ret;
+  }
   return FALSE;
 }
 
@@ -1244,9 +1256,14 @@ gboolean dt_masks_events_mouse_scrolled(dt_iop_module_t *module,
   const gboolean incr = dt_mask_scroll_increases(up);
 
   if(form->functions)
+  {
+    // Serialize point-mutating callbacks against the pixelpipe form snapshot.
+    dt_pthread_mutex_lock(&darktable.develop->history_mutex);
     ret = (form->functions->mouse_scrolled(module, pzx, pzy,
                                           incr ? 1 : 0,
                                           state, form, 0, gui, 0)) != 0;
+    dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
+  }
 
   if(gui)
   {

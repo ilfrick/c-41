@@ -3087,9 +3087,11 @@ gboolean dt_dev_pixelpipe_process(dt_dev_pixelpipe_t *pipe,
   dt_dev_zoom_pos_t pts = { zx, zy, zx + 1000.f, zy, zx, zy + 1000.f };
   dt_dev_distort_backtransform_plus(dev, pipe, 0.0f, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, pts, 3);
 
-  // get a snapshot of mask list
+  // Serialize this snapshot against the form callbacks that mutate points.
+  dt_pthread_mutex_lock(&dev->history_mutex);
   if(pipe->forms) g_list_free_full(pipe->forms, (void (*)(void *))dt_masks_free_form);
   pipe->forms = dt_masks_dup_forms_deep(dev->forms, NULL);
+  dt_pthread_mutex_unlock(&dev->history_mutex);
 
   //  go through list of modules from the end:
   const guint pos = g_list_length(pipe->iop);
