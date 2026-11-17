@@ -94,6 +94,8 @@ La prima analisi ha evidenziato: `1067c653c0`/`23d5544c8d` (Contrast & Texture);
 
 Pinned `87274529db65f9d33cb5655af5313f6daad906af` è **PARTIAL APPLY, S9** per la gestione non terminante del fallimento di allocazione del profilo ICC JPEG in `src/imageio/imageio_jpeg.c::read_icc_profile()`: `g_try_malloc()` rende raggiungibile il ramo `FALSE` già presente, e `src/iop/colorin.c::reload_defaults()` tratta un profilo mancante come assenza di ICC. Non è un port completo degli allocator né una claim di parity JPEG ICC Rust; non esiste un test deterministico di OOM senza aggiungere un seam di injection.
 
+Pinned `0b47316b1ce76f394097a9d8e5b4c0e925e52153` è **PARTIAL APPLY, S9** per il lifecycle safety del popup Bauhaus nel percorso GTK3 C mantenuto: `src/bauhaus/bauhaus.c` chiude il popup se il widget attivo viene distrutto. Il percorso è confinato alla GUI GTK3 legacy (`src/iop/bilat.c` / `src/views/darkroom.c`); la UI Rust GTK4 non usa Bauhaus e non c’è un test isolato del lifecycle senza setup GTK del popup. Nessun claim di parity Rust GTK4.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.
