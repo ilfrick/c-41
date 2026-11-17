@@ -10781,3 +10781,13 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior review APPROVED with no findings. It confirmed the 4-channel, no-matrix and 1-channel reductions, plus the real-helper test's safety and sensitivity across OpenMP partitions. Optional follow-up: add dedicated no-matrix and 1-channel tests; not added in this bounded increment.
 
 **Verification.** `git diff --check` and a whitespace check of the new test passed. Mounted-source Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`; built-in `-Werror`) passed and all 10 CTests passed, including `test_color_picker`. The first run printed `fatal: detected dubious ownership in repository at '/src'` while generating `unknown-version`; reran after `git config --global --add safe.directory /src`, which produced `5.5.0+2256~g1d9edf3b07-dirty` and passed. `scripts/ci-local.sh` exit code was explicitly captured as 0; all four gates passed. No host C build or deployment.
+
+## 2026-11-17 07:29 UTC — S9: suppress transient tethering PTP errors
+
+**Prior-increment follow-up.** Color-picker commit `c80416e2361a7d673e0e00b11047f8f2b73b05ae` is on both remotes, and its required GitHub CMake/Rust and Docker image workflows are green.
+
+**Change.** Applied the selected retained-C behavior from pinned `b54f53492b59f27d44ccf9cfb628b619aa71e8f4`: classify PTP `device busy`/`0x2019` messages case-insensitively as transient, debug-log them, and return before user-facing control logging or fatal handling. C-41's non-PTP user-facing log path and existing disconnect/fatal behavior are unchanged. Added an internal pure classifier seam and table-driven `test_camera_control` coverage for case variants, both transient markers, fatal PTP, non-PTP and NULL. Updated S9 triage, corrected the stale applied status for `40c6131`, and clarified in `ROADMAP.md` that color-picker row precision is retained-C only while Rust remains point-sampling.
+
+**Review.** Independent same-model senior review APPROVED with no findings. Added the focused classifier table test per reviewer suggestion; a callback-level test was not added because it would require disproportionate camera/GTK/global-log mocking.
+
+**Verification.** Mounted-source Docker Release/Ninja build regenerated CMake and completed all 446 steps with built-in `-Werror`; CTest reported 11/11 passed and explicit exit code 0, including `test_camera_control`. `scripts/ci-local.sh` explicit exit code 0; all four gates passed. No host C build or deployment.

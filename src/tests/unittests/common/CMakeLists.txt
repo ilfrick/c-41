@@ -37,3 +37,11 @@ add_cmocka_mock_test(test_color_picker
 if(WIN32)
     _copy_required_library(test_color_picker lib_darktable)
 endif(WIN32)
+
+add_cmocka_mock_test(test_camera_control
+                     SOURCES test_camera_control.c
+                     LINK_LIBRARIES lib_darktable cmocka)
+
+if(WIN32)
+    _copy_required_library(test_camera_control lib_darktable)
+endif(WIN32)

@@ -272,6 +272,9 @@ typedef struct dt_camera_files_t
   time_t timestamp;
 } dt_camera_files_t;
 
+/** Internal pure classifier for transient gphoto PTP errors; not a stable public API. */
+gboolean dt_camctl_ptp_error_is_transient(const gchar *text);
+
 /** Initializes the gphoto and cam control, returns NULL if failed */
 dt_camctl_t *dt_camctl_new();
 /** Destroys the camera control */

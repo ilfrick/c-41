@@ -184,6 +184,24 @@ static void _disable_debug()
   gp_log_remove_func(logid);
 }
 
+static gboolean _camctl_ptp_error_is_transient_lower(const gchar *lower)
+{
+  if(!lower) return FALSE;
+  /* Camera temporarily busy (common during live view). */
+  return g_strstr_len(lower, -1, "ptp")
+      && (g_strstr_len(lower, -1, "device busy")
+          || g_strstr_len(lower, -1, "0x2019"));
+}
+
+gboolean dt_camctl_ptp_error_is_transient(const gchar *text)
+{
+  if(!text) return FALSE;
+  gchar *lower = g_ascii_strdown(text, -1);
+  const gboolean transient = _camctl_ptp_error_is_transient_lower(lower);
+  g_free(lower);
+  return transient;
+}
+
 static gboolean _camctl_ptp_error_is_fatal(const gchar *lower)
 {
   if(!lower) return FALSE;
@@ -221,6 +239,14 @@ static void _error_func_dispatch25(GPContext *context,
   {
     g_free(lower);
     dt_control_log(_("camera error: %s"), text);
+    return;
+  }
+
+  if(_camctl_ptp_error_is_transient_lower(lower))
+  {
+    g_free(lower);
+    dt_print(DT_DEBUG_CAMCTL,
+             "[camera_control] ignoring transient PTP error: %s", text);
     return;
   }
 
