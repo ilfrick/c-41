@@ -10757,3 +10757,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior review APPROVED with no findings. Verified `dt_conf_init()` duplicates the strings before the source entry list is freed and confirmed the documented early-exit limitation.
 
 **Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) passed; all nine CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
+
+## 2026-11-17 00:41 UTC — S9: free pre-init location paths
+
+**Change.** Applied pinned darktable `96c76e8f0ebebcdae69fcc622dc9a264e0269711` in `src/common/darktable.c::dt_init()`: before clearing `darktable` with `memset`, free its seven owned location paths (`datadir`, `sharedir`, `plugindir`, `localedir`, `tmpdir`, `configdir`, `cachedir`). This closes the leak when `darktable-cli` and `darktable-generate-cache` call `dt_loc_init()` before `dt_init()` to find the locale directory. Added an APPLY—S9 row scoped to retained-C CLI/cache startup; no Rust parity claim. No isolated leak test added because exercising `dt_init()` requires broad initialization. No matching `PARITY_AUDIT.md` item was found.
+
+**Review.** Independent same-model senior review APPROVED with no findings. Confirmed exact pinned seven-field order, heap ownership, safe NULL handling, and both early `dt_loc_init()` callers.
+
+**Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) passed; all nine CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
