@@ -159,8 +159,7 @@ fn fast_hypot(x: f32, y: f32) -> f32 {
 ///
 /// Port of `_laplacian` (focus_peaking.h:38):
 /// `(hypot(E-W, S-N) + hypot(SE-NW, SW-NE)) / 2`. Reads go through
-/// `read_clamped` (see its doc — C's bottom-right far-corner read is one
-/// element past the allocation).
+/// `read_clamped` to keep direct Rust calls safe with undersized input slices.
 fn laplacian(luma: &[f32], index: &[usize; 8]) -> f32 {
     let r = |k: usize| read_clamped(luma, k);
     let l1 = fast_hypot(r(index[4]) - r(index[3]), r(index[6]) - r(index[1]));
@@ -168,18 +167,11 @@ fn laplacian(luma: &[f32], index: &[usize; 8]) -> f32 {
     (l1 + l2) / 2.0f32
 }
 
-/// Read `luma[k]`, clamping the index to the last element.
+/// Read `luma[k]`, clamping indices to the last available input element.
 ///
-/// C's far-ring read for the single interior corner pixel `(h-3, w-2)`
-/// computes index `h*w` — one float past the allocation (a pre-existing
-/// upstream quirk; the value read is indeterminate malloc padding). The
-/// kernel substitutes the last element (`h*w - 1`, one element *before*
-/// that address) there: a determinate value in place of C's garbage read.
-/// The perturbed gradient does not stay confined to that one pixel — it
-/// spreads through the `dt_box_mean` and `fast_surface_blur` passes that
-/// follow — but its magnitude is tiny and the result is deterministic,
-/// which C's was not. All in-bounds (including row-wrap) indices are
-/// untouched.
+/// `gradients` accepts independently sized input/output slices. Clamping
+/// keeps direct Rust calls with an undersized `luma` slice from panicking;
+/// the normal two-pixel border keeps far-ring neighbors in bounds.
 #[inline]
 fn read_clamped(luma: &[f32], k: usize) -> f32 {
     luma[k.min(luma.len() - 1)]
@@ -188,10 +180,10 @@ fn read_clamped(luma: &[f32], k: usize) -> f32 {
 /// Compute the focus-peaking gradient buffer in place on `luma_ds`.
 ///
 /// Port of the `DT_OMP_FOR(collapse(2))` loop at focus_peaking.h:95.
-/// Border pixels (i < 2, i+2 >= height, j < 2, j+2 > width — behaviorally
-/// equivalent to C's `i >= height-2` / `j > width-2` for all dimensions:
-/// for dims ≤ 3 C's int wrap disables the other clause exactly where the
-/// `i < 2`/`j < 2` clauses already fire) are zeroed; interior pixels get
+/// Border pixels (`i < 2`, `i + 2 >= height`, `j < 2`, or `j + 2 >= width`).
+/// The right-edge comparison follows pinned darktable `43189510fc5724aaad8b7ea8de404db3a22ca1b5`:
+/// the penultimate column is border so the two-pixel far-neighbor cannot
+/// wrap into the next row. Interior pixels get
 /// `laplacian(close) - 0.67 * (laplacian(far) - 2^-8)`.
 pub fn gradients(luma: &[f32], luma_ds: &mut [f32], width: usize, height: usize) {
     if width == 0 || height == 0 || luma.is_empty() {
@@ -201,7 +193,7 @@ pub fn gradients(luma: &[f32], luma_ds: &mut [f32], width: usize, height: usize)
     for p in 0..n {
         let i = p / width;
         let j = p % width;
-        let border = i < 2 || i + 2 >= height || j < 2 || j + 2 > width;
+        let border = i < 2 || i + 2 >= height || j < 2 || j + 2 >= width;
         if border {
             // ensure defined value for borders
             luma_ds[p] = 0.0f32;
@@ -373,7 +365,7 @@ fn ref_gradients(luma: &[f32], luma_ds: &mut [f32], width: usize, height: usize)
     for p in 0..n {
         let i = p / width;
         let j = p % width;
-        let is_border = (i < 2) || (i + 2 >= height) || (j < 2) || (j + 2 > width);
+        let is_border = (i < 2) || (i + 2 >= height) || (j < 2) || (j + 2 >= width);
         if is_border {
             luma_ds[p] = 0.0;
             continue;
@@ -689,7 +681,7 @@ mod tests {
         for i in 0..6 {
             for j in 0..6 {
                 let v = ds[i * 6 + j];
-                if i < 2 || i + 2 >= 6 || j < 2 || j + 2 > 6 {
+                if i < 2 || i + 2 >= 6 || j < 2 || j + 2 >= 6 {
                     assert_eq!(v, 0.0, "border at {i},{j}");
                 } else {
                     assert_eq!(v, expected, "interior at {i},{j}");
@@ -699,17 +691,16 @@ mod tests {
     }
 
     #[test]
-    fn gradients_border_condition_matches_c_quirks() {
-        // Interior is i in [2, h-3], j in [2, w-2] (C: `i >= h-2` border,
-        // `j > w-2` border — note the inclusive j bound). For a 6x6 image
-        // that is i in 2..=3, j in 2..=4. Constant luma gives interior
-        // pixels the uniform 0.67*2^-8 value, borders 0.
+    fn gradients_border_condition_matches_pinned_fix() {
+        // Interior is i in [2, h-3], j in [2, w-3], matching pinned
+        // `43189510` (`j >= width - 2` is border). For 6x6 this is
+        // i in 2..=3, j in 2..=3.
         let luma = vec![0.5f32; 6 * 6];
         let mut ds = vec![-1.0f32; 6 * 6];
         gradients(&luma, &mut ds, 6, 6);
         for i in 0..6 {
             for j in 0..6 {
-                let interior = (2..=3).contains(&i) && (2..=4).contains(&j);
+                let interior = (2..=3).contains(&i) && (2..=3).contains(&j);
                 if interior {
                     assert!(ds[i * 6 + j] != 0.0, "interior at {i},{j} must be painted");
                 } else {
@@ -720,19 +711,52 @@ mod tests {
     }
 
     #[test]
-    fn gradients_corner_far_index_read_is_clamped_not_oob() {
-        // The (h-3, w-2) interior corner computes far SE index h*w in C —
-        // one element past the allocation. The kernel must substitute the
-        // last element (no panic, no OOB) and stay deterministic.
-        let mut luma = vec![0.0f32; 6 * 6];
-        lcg_fill(&mut luma, 0xF00D, 1.0);
-        let mut ds = vec![f32::NAN; 6 * 6];
-        gradients(&luma, &mut ds, 6, 6);
-        assert!(ds.iter().all(|v| v.is_finite()));
-        // Cross-check the corner pixel against the reference
-        let mut ds_ref = vec![f32::NAN; 6 * 6];
-        ref_gradients(&luma, &mut ds_ref, 6, 6);
-        assert_eq!(ds[3 * 6 + 4].to_bits(), ds_ref[3 * 6 + 4].to_bits());
+    fn gradients_dimensions_below_two_pixel_interior_are_zero() {
+        for (width, height) in [(4, 6), (6, 4), (4, 4), (2, 2), (1, 5), (5, 1)] {
+            let luma = vec![0.5f32; width * height];
+            let mut ds = vec![f32::NAN; width * height];
+            gradients(&luma, &mut ds, width, height);
+            assert!(ds.iter().all(|value| *value == 0.0));
+        }
+    }
+
+    #[test]
+    fn gradients_penultimate_column_is_border_not_row_wrap() {
+        let width = 6;
+        let height = 6;
+        let luma = vec![0.5f32; width * height];
+        let mut ds = vec![f32::NAN; width * height];
+        gradients(&luma, &mut ds, width, height);
+        let i = height - 3;
+        let expected_interior = 0.0f32 - 0.67f32 * (0.0f32 - 0.00390625f32);
+        assert_eq!(ds[i * width + width - 2], 0.0);
+        assert_eq!(ds[i * width + width - 3], expected_interior);
+    }
+
+    #[test]
+    fn gradients_clamps_undersized_luma_slice() {
+        let width = 6;
+        let height = 6;
+        let luma: Vec<f32> = (0..20).map(|value| value as f32).collect();
+        let mut direct = vec![f32::NAN; width * height];
+        gradients(&luma, &mut direct, width, height);
+        assert!(direct.iter().all(|value| value.is_finite()));
+
+        // At (2,3), close indices [8,9,10,14,16,20,21,22] clamp to
+        // [8,9,10,14,16,19,19,19]; far indices [1,3,5,13,17,25,27,29]
+        // clamp to [1,3,5,13,17,19,19,19]. Ring values use the documented
+        // [NW,N,NE,W,E,SW,S,SE] order and are independent of get_indices().
+        // Keep the expected-value operations identical to `fast_hypot`.
+        let fast_hypot = |x: f32, y: f32| (x * x + y * y).sqrt();
+        let laplacian_from_ring = |ring: [f32; 8]| {
+            let l1 = fast_hypot(ring[4] - ring[3], ring[6] - ring[1]);
+            let l2 = fast_hypot(ring[7] - ring[0], ring[5] - ring[2]);
+            (l1 + l2) / 2.0
+        };
+        let lap_close = laplacian_from_ring([8.0, 9.0, 10.0, 14.0, 16.0, 19.0, 19.0, 19.0]);
+        let lap_far = laplacian_from_ring([1.0, 3.0, 5.0, 13.0, 17.0, 19.0, 19.0, 19.0]);
+        let expected = lap_close - 0.67f32 * (lap_far - 0.00390625f32);
+        assert_eq!(direct[2 * width + 3].to_bits(), expected.to_bits());
     }
 
     #[test]
@@ -749,8 +773,7 @@ mod tests {
     #[test]
     fn gradients_odd_nonsquare_matches_reference() {
         // Odd, non-square dims pin the asymmetric border bounds
-        // (i+2 >= h vs j+2 > w) and exercise the far-ring row-wrap at
-        // j = w-2 against the reference.
+        // (i+2 >= h vs j+2 >= w) against the reference.
         let mut luma = vec![0.0f32; 7 * 5];
         lcg_fill(&mut luma, 0x5E17, 1.0);
         let mut direct = vec![0.0f32; 7 * 5];
@@ -758,9 +781,9 @@ mod tests {
         gradients(&luma, &mut direct, 7, 5);
         ref_gradients(&luma, &mut reference, 7, 5);
         assert_eq!(direct, reference);
-        // Interior for 7x5: i in 2..=2, j in 2..=5 — exactly one row
+        // Interior for 7x5: i in 2..=2, j in 2..=4 — exactly one row
         for j in 0..7 {
-            let interior = (2..=5).contains(&j);
+            let interior = (2..=4).contains(&j);
             assert_eq!(direct[2 * 7 + j] != 0.0, interior, "at 2,{j}");
         }
     }
