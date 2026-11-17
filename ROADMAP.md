@@ -96,6 +96,8 @@ Pinned `87274529db65f9d33cb5655af5313f6daad906af` è **PARTIAL APPLY, S9** per l
 
 Pinned `0b47316b1ce76f394097a9d8e5b4c0e925e52153` è **PARTIAL APPLY, S9** per il lifecycle safety del popup Bauhaus nel percorso GTK3 C mantenuto: `src/bauhaus/bauhaus.c` chiude il popup se il widget attivo viene distrutto. Il percorso è confinato alla GUI GTK3 legacy (`src/iop/bilat.c` / `src/views/darkroom.c`); la UI Rust GTK4 non usa Bauhaus e non c’è un test isolato del lifecycle senza setup GTK del popup. Nessun claim di parity Rust GTK4.
 
+Pinned `175b41e518d5b89f743fae27295345bc0e73595d` è **APPLIED, S9** per il TIFF malformed senza `PhotometricInterpretation`: `src/imageio/imageio_tiff.c::dt_imageio_open_tiff()` ora rifiuta il file come `DT_IMAGEIO_FILE_CORRUPTED` e chiude l’handle TIFF prima del ritorno. Il test CMocka costruisce un TIFF minimo senza il tag e percorre il loader reale. È una correzione del percorso retained-C, non una claim di parity dell’import Rust.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.

@@ -2,6 +2,14 @@ add_cmocka_mock_test(test_imageio_rgbe_validate
                      SOURCES test_imageio_rgbe_validate.c
                      LINK_LIBRARIES cmocka)
 
+add_cmocka_mock_test(test_imageio_tiff_photometric
+                     SOURCES test_imageio_tiff_photometric.c
+                     LINK_LIBRARIES lib_darktable cmocka)
+
+if(WIN32)
+    _copy_required_library(test_imageio_tiff_photometric lib_darktable)
+endif(WIN32)
+
 add_cmocka_mock_test(test_dng_opcode
                      SOURCES test_dng_opcode.c
                      LINK_LIBRARIES lib_darktable cmocka)

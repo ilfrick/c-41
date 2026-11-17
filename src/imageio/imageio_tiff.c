@@ -359,7 +359,14 @@ dt_imageio_retval_t dt_imageio_open_tiff(dt_image_t *img,
   TIFFGetFieldDefaulted(t.tiff, TIFFTAG_SAMPLESPERPIXEL, &t.spp);
   TIFFGetFieldDefaulted(t.tiff, TIFFTAG_SAMPLEFORMAT, &t.sampleformat);
   TIFFGetField(t.tiff, TIFFTAG_PLANARCONFIG, &config);
-  TIFFGetField(t.tiff, TIFFTAG_PHOTOMETRIC, &photometric);
+  if(!TIFFGetField(t.tiff, TIFFTAG_PHOTOMETRIC, &photometric))
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[tiff_open] missing photometric interpretation in '%s'",
+             filename);
+    TIFFClose(t.tiff);
+    return DT_IMAGEIO_FILE_CORRUPTED;
+  }
 
   // Citing the TIFF 6.0 specification for SampleFormat:
   // A reader would typically treat an image with "undefined" data as
