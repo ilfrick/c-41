@@ -59,6 +59,8 @@ DT_MODULE(1)
 
 #include "modulegroups.h"
 
+static gint _basics_item_find(gconstpointer a, gconstpointer b);
+
 typedef enum dt_lib_modulegroups_basic_item_position_t
 {
   NORMAL,
@@ -1399,6 +1401,10 @@ static void _preset_from_string(dt_lib_module_t *self, gchar *txt, gboolean edit
 
       for(int j = 3; j < g_strv_length(gr2); j++)
       {
+        // Skip duplicates: older layouts could save the same entry several times (#19830).
+        if(g_list_find_custom(edition ? d->edit_basics : d->basics, gr2[j], _basics_item_find))
+          continue;
+
         dt_lib_modulegroups_basic_item_t *item = g_malloc0(sizeof(dt_lib_modulegroups_basic_item_t));
         if(!item)
           continue;
