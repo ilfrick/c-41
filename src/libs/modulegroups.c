@@ -3863,7 +3863,7 @@ static void _manage_editor_load(const char *preset,
   const gchar *sel_preset = gtk_combo_box_get_active_id(GTK_COMBO_BOX(d->presets_combo));
 
   // get all presets groups
-  if(d->edit_groups) _manage_editor_groups_cleanup(self, TRUE);
+  _manage_editor_groups_cleanup(self, TRUE);
   if(d->edit_preset) g_free(d->edit_preset);
   d->edit_groups = NULL;
   d->edit_preset = NULL;
@@ -4035,7 +4035,7 @@ static void _manage_editor_destroy(GtkWidget *widget,
   _manage_editor_save(self);
 
   // and we free editing data
-  if(d->edit_groups) _manage_editor_groups_cleanup(self, TRUE);
+  _manage_editor_groups_cleanup(self, TRUE);
   if(d->edit_preset) g_free(d->edit_preset);
   d->edit_groups = NULL;
   d->edit_preset = NULL;
