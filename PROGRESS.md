@@ -10749,3 +10749,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior review APPROVED with no findings. Verified each owned string is freed exactly once after last use on every relevant path, and the `dt_conf_get_string_const()` copy follows its borrowed-string contract. The first development delegate timed out before editing after unnecessary agent-file discovery; resuming that session with a strict repository scope completed the change without touching protected installers.
 
 **Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) passed; all nine CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
+
+## 2026-11-17 00:30 UTC — S9: free config-override entry strings
+
+**Change.** Applied pinned darktable `eff5cfdbfc99fe91784cb681d09ed3403bae2491` (first parent `96c76e8f0ebebcdae69fcc622dc9a264e0269711`) in `src/common/darktable.c::dt_init()`: release each `config_override` entry with `dt_conf_string_entry_free` after both `dt_conf_init()` calls, freeing its separately allocated key, value, and struct. Added an APPLY—S9 row scoped to normal retained-C startup; no Rust parity claim. Argument-error, GIMP, and user-directory failure returns still bypass this cleanup and remain separate issues; `harvest-masks`/`print-paths` are absent. No focused test target exists and no harness was added. No matching `PARITY_AUDIT.md` item was found.
+
+**Review.** Independent same-model senior review APPROVED with no findings. Verified `dt_conf_init()` duplicates the strings before the source entry list is freed and confirmed the documented early-exit limitation.
+
+**Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) passed; all nine CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
