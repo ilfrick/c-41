@@ -10741,3 +10741,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior review APPROVED. Verified `_get_pragma_string_val()` returns a `g_strdup`-allocated value, branches free it exactly once, no use follows the fallback cleanup, and the triage scope/test rationale are accurate.
 
 **Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) completed 185 steps; all nine CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
+
+## 2026-11-17 00:20 UTC — S9: release retained-C config strings
+
+**Change.** Applied pinned darktable `ee6dd415dffbff90a30bc9cfed3a85a230fb31a3` in `src/common/darktable.c::dt_init()` and `src/common/l10n.c::dt_l10n_init()`. Treat allocated `dt_conf_get_string()` results as owned `gchar *`; release `dbname` after its final restore use and `dblabel` on database-init failure, database-lock failure, and normal continuation. In localization, duplicate the borrowed `dt_conf_get_string_const()` result instead of leaking an intermediate allocation from `dt_conf_get_string()`. Added an APPLY—S9 row scoped to retained-C startup/localization; no Rust parity claim. The pinned cleanup omits the database-init failure return, so the port covers it. No focused test was added because exercising these startup cleanup paths requires broad initialization/leak-sanitizer setup. No matching `PARITY_AUDIT.md` item was found.
+
+**Review.** Independent same-model senior review APPROVED with no findings. Verified each owned string is freed exactly once after last use on every relevant path, and the `dt_conf_get_string_const()` copy follows its borrowed-string contract. The first development delegate timed out before editing after unnecessary agent-file discovery; resuming that session with a strict repository scope completed the change without touching protected installers.
+
+**Verification.** `git diff --check` passed. Mounted-source root Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) passed; all nine CTests passed. `scripts/ci-local.sh` exited 0; all four gates passed. No host C build or deployment.
