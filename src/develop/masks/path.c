@@ -28,6 +28,8 @@
 #include "develop/openmp_maths.h"
 #include "rust_ffi/darkroom_core.h"
 #include <assert.h>
+#include <limits.h>
+#include <math.h>
 
 static void _path_bounding_box_raw(const float *const points,
                                    const float *border,
@@ -605,6 +607,13 @@ static void _path_points_fill_border_gaps(float *cmax,
                                           dt_masks_intbuf_t *fill_seg_indexes,
                                           const gboolean clockwise)
 {
+  // Invalid coordinates can produce non-finite angles/radii and an unsafe
+  // arc length. Reject them before doing any geometry calculations.
+  if(bmin[0] == DT_INVALID_COORDINATE || bmin[1] == DT_INVALID_COORDINATE
+     || bmax[0] == DT_INVALID_COORDINATE || bmax[1] == DT_INVALID_COORDINATE
+     || cmax[0] == DT_INVALID_COORDINATE || cmax[1] == DT_INVALID_COORDINATE)
+    return;
+
   // we want to find the start and end angles
   double a1 = angle_2d(bmin[0], bmin[1], cmax[0], cmax[1]);
   double a2 = angle_2d(bmax[0], bmax[1], cmax[0], cmax[1]);
@@ -626,12 +635,13 @@ static void _path_points_fill_border_gaps(float *cmax,
   const float r2 = dt_fast_hypotf(bmax[1] - cmax[1], bmax[0] - cmax[0]);
 
   // and the max length of the circle arc
-  int l = 0;
-  if(a2 > a1)
-    l = (a2 - a1) * fmaxf(r1, r2);
-  else
-    l = (a1 - a2) * fmaxf(r1, r2);
-  if(l < 2) return;
+  const float radius = fmaxf(r1, r2);
+  if(!isfinite(r1) || !isfinite(r2) || !isfinite(radius)) return;
+  const double arc_len = (a2 > a1 ? (a2 - a1) : (a1 - a2)) * (double)radius;
+  // l <= INT_MAX/4 keeps 2*(l-1) positive and representable. The check below
+  // also accounts for the current buffer position before adding that count.
+  if(!isfinite(arc_len) || arc_len < 2.0 || arc_len > (double)(INT_MAX / 4)) return;
+  const int l = (int)arc_len;
 
   // and now we add the points
   const float incra = (a2 - a1) / l;
@@ -640,8 +650,13 @@ static void _path_points_fill_border_gaps(float *cmax,
   float aa = a1 + incra;
 
   // remember the indexes of the points we add
-  const int start_pt_index = dt_masks_dynbuf_position(dpoints)/2;
-  dt_masks_intbuf_add2(fill_seg_indexes, start_pt_index, start_pt_index + 2*(l-1));
+  const size_t start_pos = dt_masks_dynbuf_position(dpoints) / 2;
+  const int index_count = 2 * (l - 1);
+  if(start_pos > (size_t)INT_MAX
+     || (size_t)index_count > (size_t)INT_MAX - start_pos) return;
+  const int start_pt_index = (int)start_pos;
+  const int end_pt_index = start_pt_index + index_count;
+  dt_masks_intbuf_add2(fill_seg_indexes, start_pt_index, end_pt_index);
 
   // allocate entries in the dynbufs
   float *dpoints_ptr = dt_masks_dynbuf_reserve_n(dpoints, 2*(l-1));
