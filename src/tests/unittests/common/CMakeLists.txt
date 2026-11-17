@@ -6,6 +6,14 @@ if(WIN32)
     _copy_required_library(test_dng_opcode lib_darktable)
 endif(WIN32)
 
+add_cmocka_mock_test(test_commasubstring
+                     SOURCES test_commasubstring.c
+                     LINK_LIBRARIES lib_darktable cmocka)
+
+if(WIN32)
+    _copy_required_library(test_commasubstring lib_darktable)
+endif(WIN32)
+
 add_cmocka_mock_test(test_iop_introspection
                      SOURCES test_iop_introspection.c
                      LINK_LIBRARIES lib_darktable cmocka)
