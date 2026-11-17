@@ -459,7 +459,7 @@ static boolean read_icc_profile(const j_decompress_ptr dinfo,
   if(total_length == 0) return FALSE; /* found only empty markers? */
 
   /* Allocate space for assembled data */
-  icc_data = (JOCTET *)g_malloc(total_length * sizeof(JOCTET));
+  icc_data = (JOCTET *)g_try_malloc(total_length * sizeof(JOCTET));
   if(!icc_data)
     return FALSE; /* unable to allocate memory for ICC data */
 
