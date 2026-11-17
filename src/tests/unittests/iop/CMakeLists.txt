@@ -24,6 +24,15 @@ add_cmocka_mock_test(test_capture_mask
                      LINK_LIBRARIES lib_darktable cmocka)
 target_include_directories(test_capture_mask PRIVATE ${CMAKE_SOURCE_DIR}/data/kernels)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_cmocka_mock_test(test_highlights_legacy_params
+                       SOURCES test_highlights_legacy_params.c
+                       LINK_LIBRARIES lib_darktable cmocka)
+  if(TARGET c41_core)
+    target_link_libraries(test_highlights_legacy_params PRIVATE c41_core)
+  endif()
+endif()
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_filmicrgb lib_darktable)
