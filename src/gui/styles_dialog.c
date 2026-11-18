@@ -836,6 +836,15 @@ static gboolean _gui_styles_dialog_run(const gboolean edit,
     else
     {
       dt_control_log(_("can't create style out of unaltered image"));
+      /* Destroy the views first, then release our creator refs to their list stores. */
+      gtk_widget_destroy(GTK_WIDGET(dialog));
+      g_object_unref(liststore);
+      g_object_unref(liststore_new);
+      g_object_unref(is_active_pb);
+      g_object_unref(is_inactive_pb);
+      g_object_unref(mask);
+      g_free(sd->nameorig);
+      g_free(sd);
       return TRUE;
     }
   }
