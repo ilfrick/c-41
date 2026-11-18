@@ -271,9 +271,6 @@ static void _gui_styles_new_style_response(GtkDialog *dialog,
       return;
     }
   }
-
-  // finalize the dialog
-  g_free(g->nameorig);
 }
 
 static void _gui_styles_edit_style_response(GtkDialog *dialog,
@@ -350,9 +347,6 @@ static void _gui_styles_edit_style_response(GtkDialog *dialog,
       return;
     }
   }
-
-  // finalize the dialog
-  g_free(g->nameorig);
 }
 
 static void _gui_styles_item_toggled(GtkCellRendererToggle *cell,
@@ -872,6 +866,8 @@ static gboolean _gui_styles_dialog_run(const gboolean edit,
   gtk_widget_destroy(GTK_WIDGET(dialog));
   g_object_unref(is_active_pb);
   g_object_unref(is_inactive_pb);
+  g_object_unref(mask);
+  g_free(sd->nameorig);
   g_free(sd);
 
   return res;
