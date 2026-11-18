@@ -116,6 +116,11 @@ add_iop(rotatepixels "rotatepixels.c")
 add_iop(scalepixels "scalepixels.c")
 add_iop(atrous "atrous.c")
 add_iop(cacorrect "cacorrect.c")
+# Strict math preserves CACorrect's exact-zero and near-tie CPU decisions.
+# Reassociation and FMA contraction can otherwise diverge from its OpenCL twin.
+if(HAVE_FFP_CONTRACT_OFF)
+  target_compile_options(cacorrect PRIVATE "-fno-fast-math;-ffp-contract=off")
+endif()
 add_iop(overexposed "overexposed.c")
 add_iop(hotpixels "hotpixels.c")
 add_iop(lowlight "lowlight.c")

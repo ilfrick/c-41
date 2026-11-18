@@ -9,6 +9,7 @@ if(USE_AI)
   add_subdirectory(ai)
 endif(USE_AI)
 
+include(CheckCCompilerFlag)
 include(CheckCSourceCompiles)
 include(CheckCXXSymbolExists)
 
@@ -1157,6 +1158,9 @@ add_subdirectory(views ${DARKTABLE_LIBDIR}/views)
 
 # Compile lighttable modules
 add_subdirectory(libs ${DARKTABLE_LIBDIR}/plugins/lighttable)
+
+# CACorrect needs strict FP options; probe support before configuring IOP targets.
+check_c_compiler_flag("-ffp-contract=off" HAVE_FFP_CONTRACT_OFF)
 
 # Compile darkroom modules
 add_subdirectory(iop ${DARKTABLE_LIBDIR}/plugins)

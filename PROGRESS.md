@@ -11026,4 +11026,14 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 
 **Verification.** `git diff --check` passed. Mounted Docker Release/Ninja build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) compiled `src/gui/styles_dialog.c` and exited 0 (`CMAKE_BUILD_AND_CTEST_EXIT_CODE=0`); CTest passed 21/21. `scripts/ci-local.sh` exited 0 (`CI_LOCAL_EXIT_CODE=0`); all four CI gates passed, including release workspace tests and release binary build. No host C build or manual global `-Werror`.
 
-No commit/push yet. S9 remains selective and incomplete.
+**Delivery.** Committed as `1440c63005d61c5442fceb048f660fb5201be3d1`; direct `git ls-remote` checks against both configured `origin` push URLs returned that `master` SHA. A reviewer noticed local `refs/remotes/gitea/master` was stale at `ee4581c4db3c2bafa0631be38d3425e12f58b0c0`; direct checks confirmed the remote SHA and `git fetch gitea master` refreshed the local tracking ref to `1440c630...`. Required GitHub CMake + Rust and Docker checks completed successfully. S9 remains selective and incomplete.
+
+## 2026-11-18 09:47 UTC — S9: strict floating-point options for retained-C CACorrect
+
+**Change.** Applied pinned darktable `533582354bc708ce8cd2f824b24367350626288c`: detect `-ffp-contract=off` support before configuring IOPs and apply `-fno-fast-math;-ffp-contract=off` only to target `cacorrect`. This protects the retained-C module's exact-zero/near-tie CPU decisions; Rust contains partial FFI kernels but no CACorrect pipeline stage. Updated S9 triage and Roadmap; no matching `PARITY_AUDIT.md` item exists.
+
+**Review.** Independent same-model senior review APPROVED the full diff with no BLOCKER/MAJOR/MINOR findings.
+
+**Verification.** Initial Docker Release/Ninja build succeeded and CTest passed 21/21, but the first compile-command verifier falsely exited 1 with `AssertionError: expected exactly one cacorrect.c command, found 0` because it searched for the original C file as a standalone translation unit. `add_iop()` compiles generated `introspection_cacorrect.c`, which includes `src/iop/cacorrect.c`; the corrected verifier confirmed the generated command contains `-ffast-math -fno-fast-math -ffp-contract=off` in that order and `HAVE_FFP_CONTRACT_OFF:INTERNAL=1`. A later post-review non-root configure against root-owned cached build outputs failed and its inline verifier heredoc was malformed; corrected by running a disposable root Docker container with `/src` marked safe and the standalone verifier script mounted read-only. Final mounted Docker Release/Ninja build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) and CTest passed 21/21 (`DOCKER_CACORRECT_FINAL_EXIT_CODE=0`). `scripts/ci-local.sh` exited 0; all four gates passed, including release tests and binary build. No CPU/OpenCL image differential or device runtime test was available; no Rust CACorrect parity claim.
+
+**Delivery at entry time.** The CACorrect change is staged but not yet committed or pushed; only the preceding style-dialog increment has been delivered. S9 remains selective and incomplete.
