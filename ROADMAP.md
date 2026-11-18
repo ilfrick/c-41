@@ -104,6 +104,8 @@ Pinned `bbb9d73772489367557c995ac944eb6ec7d4b36b` è **PARTIAL APPLY, S9** per s
 
 Pinned `8c67c82bb568a27c786956f2affa1bda87dcdfb5` is **PARTIAL APPLY, S9** only for the two `_default_process_tiling_cl_roi()` byte-offset expressions: casting tile deltas to `size_t` before pitch/bytes-per-pixel multiplication prevents signed-int overflow past 2 GiB. No other tiled finalscale/resampling/OpenCL-upscale subhunks or Rust/OpenCL parity are claimed; no large-buffer OpenCL runtime test is available. Pinned `533582354bc708ce8cd2f824b24367350626288c` is **APPLIED, S9** for retained-C target `cacorrect` only: CMake probes `-ffp-contract=off`, then target options override the Release fast-math flags with `-fno-fast-math;-ffp-contract=off`. The generated Release compile command confirms option order; no CPU/OpenCL image differential or device runtime test, and no Rust CACorrect pipeline/parity claim.
 
+Pinned `3ee62293fb661eec1d218ee97d0208b820d83457` and `b849d865c6b4d9bc706d352cc70d1d1bdebb467f` are **PARTIAL APPLY, S9** for retained-C `src/control/jobs/control_jobs.c::_get_image_list()`: empty selections return an empty string, while allocation failure propagates to both remove/delete jobs, which abort before SQL safety checks or filesystem work. This adapts pinned's empty-string OOM fallback because C-41 callers would otherwise continue destructively with incomplete data. No deterministic allocation-failure test seam or Rust control/UI parity claim.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.

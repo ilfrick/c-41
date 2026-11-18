@@ -849,8 +849,25 @@ static int32_t _control_monochrome_images_job_run(dt_job_t *job)
 static char *_get_image_list(GList *l)
 {
   const guint size = g_list_length(l);
+  if(size == 0)
+  {
+    char *empty = strdup("");
+    if(empty == NULL)
+      dt_print(DT_DEBUG_ALWAYS,
+               "[control_jobs] failed to allocate empty image list in _get_image_list");
+    return empty;
+  }
+
   char num[8];
   char *buffer = calloc(size, sizeof(num));
+  if(buffer == NULL)
+  {
+    dt_print(DT_DEBUG_ALWAYS,
+             "[control_jobs] failed to allocate memory in _get_image_list");
+    // Returning an empty list would bypass safety checks in both callers.
+    return NULL;
+  }
+
   gboolean first = TRUE;
 
   buffer[0] = '\0';
@@ -924,6 +941,8 @@ static int32_t _control_remove_images_job_run(dt_job_t *job)
   dt_control_image_enumerator_t *params = dt_control_job_get_params(job);
   GList *t = params->index;
   char *imgs = _get_image_list(t);
+  if(imgs == NULL)
+    return 1;
   const guint total = g_list_length(t);
   dt_control_job_set_progress_message(job, ngettext("removing %d image",
                                                     "removing %d images", total), total);
@@ -1234,6 +1253,8 @@ static int32_t _control_delete_images_job_run(dt_job_t *job)
   dt_control_image_enumerator_t *params = dt_control_job_get_params(job);
   GList *t = params->index;
   char *imgs = _get_image_list(t);
+  if(imgs == NULL)
+    return 1;
   char imgidstr[25] = { 0 };
   const guint total = g_list_length(t);
   double fraction = 0.0f;
