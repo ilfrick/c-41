@@ -98,6 +98,8 @@ Pinned `0b47316b1ce76f394097a9d8e5b4c0e925e52153` è **PARTIAL APPLY, S9** per i
 
 Pinned `175b41e518d5b89f743fae27295345bc0e73595d` è **APPLIED, S9** per il TIFF malformed senza `PhotometricInterpretation`: `src/imageio/imageio_tiff.c::dt_imageio_open_tiff()` ora rifiuta il file come `DT_IMAGEIO_FILE_CORRUPTED` e chiude l’handle TIFF prima del ritorno. Il test CMocka costruisce un TIFF minimo senza il tag e percorre il loader reale. È una correzione del percorso retained-C, non una claim di parity dell’import Rust.
 
+Pinned `cb7d7d835619164209a5ca53757f6565ad401d35` è **PARTIAL APPLY, S9** per l’allocazione del buffer preview retained-C: `dt_imageio_preview()` ora restituisce `NULL` se `dt_alloc_aligned()` fallisce, prima che l’export raggiunga `_preview_write_image()` e scriva in un buffer nullo. `dt_gui_get_style_preview()` propaga il valore e `_preview_draw()` controlla la surface. Nessun test deterministico senza seam di allocator injection; nessuna parity di preview Rust.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.
