@@ -100,7 +100,7 @@ Pinned `175b41e518d5b89f743fae27295345bc0e73595d` è **APPLIED, S9** per il TIFF
 
 Pinned `cb7d7d835619164209a5ca53757f6565ad401d35` è **PARTIAL APPLY, S9** per l’allocazione del buffer preview retained-C: `dt_imageio_preview()` ora restituisce `NULL` se `dt_alloc_aligned()` fallisce, prima che l’export raggiunga `_preview_write_image()` e scriva in un buffer nullo. `dt_gui_get_style_preview()` propaga il valore e `_preview_draw()` controlla la surface. Nessun test deterministico senza seam di allocator injection; nessuna parity di preview Rust.
 
-Pinned `bbb9d73772489367557c995ac944eb6ec7d4b36b` è **PARTIAL APPLY, S9** per due soli leak di ownership retained-C: `_popup_date_update()` rilascia il `GDateTime` owned dopo l’ultimo uso; `dt_collection_split_operator_exposure()` libera le stringhe `n1`/`n2` fetched nei tre rami inversi `1/x` dopo aver creato la forma normalizzata. Un test CMocka verifica gli output dei rami range e confronto inversi (non è un leak detector); non si afferma parity della UI Rust GTK4 né delle altre sub-modifiche upstream.
+Pinned `bbb9d73772489367557c995ac944eb6ec7d4b36b` è **PARTIAL APPLY, S9** per tre soli leak di ownership retained-C: `_popup_date_update()` rilascia il `GDateTime` owned; `dt_collection_split_operator_exposure()` libera `n1`/`n2` dopo aver creato le forme inverse `1/x`; `_camctl_update_cameras()` ora distrugge correttamente `testcam` (modello, porta e wrapper) sui due exit di polling. Il test CMocka copre gli output range/confronto inversi, non il leak; non c’è un test stretto senza simulazione hardware GPhoto. Non si afferma parity Rust GTK4 né delle altre sub-modifiche upstream.
 
 ## 6. Filone D — Agent-native editing, Phase 9
 
