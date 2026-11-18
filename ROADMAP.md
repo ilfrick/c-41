@@ -102,6 +102,8 @@ Pinned `cb7d7d835619164209a5ca53757f6565ad401d35` è **PARTIAL APPLY, S9** per l
 
 Pinned `bbb9d73772489367557c995ac944eb6ec7d4b36b` è **PARTIAL APPLY, S9** per sei soli gruppi di fix ownership retained-C: `_popup_date_update()` rilascia il `GDateTime`; `dt_collection_split_operator_exposure()` libera `n1`/`n2` dopo aver creato le forme inverse `1/x`; `_camctl_update_cameras()` distrugge `testcam` (modello, porta e wrapper) sui due exit; `_import_extended_clicked()` libera `localized_file` dopo che `g_build_filename()` ne ha duplicato il contenuto; i callback styles liberano i nodi temporanei `result`/`update` e `newname` soltanto quando non trasferito via `g->newname`; `_gui_styles_dialog_run()` rilascia `mask` e `sd->nameorig` nel teardown normale, spostando la liberazione di `nameorig` dai callback al proprietario. Il test CMocka copre gli output range/confronto inversi, non i leak; non ci sono test stretti per GPhoto o lifecycle GTK. L’early-exit empty-history di styles dialog e parity Rust GTK4 restano non affermati.
 
+Pinned `8c67c82bb568a27c786956f2affa1bda87dcdfb5` is **PARTIAL APPLY, S9** only for the two `_default_process_tiling_cl_roi()` byte-offset expressions: casting tile deltas to `size_t` before pitch/bytes-per-pixel multiplication prevents signed-int overflow past 2 GiB. No other tiled finalscale/resampling/OpenCL-upscale subhunks or Rust/OpenCL parity are claimed; no large-buffer OpenCL runtime test is available.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.
