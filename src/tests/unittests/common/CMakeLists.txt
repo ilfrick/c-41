@@ -72,6 +72,14 @@ if(WIN32)
     _copy_required_library(test_color_harmony_get lib_darktable)
 endif(WIN32)
 
+add_cmocka_mock_test(test_pixelpipe_cache_export_profile
+                     SOURCES test_pixelpipe_cache_export_profile.c
+                     LINK_LIBRARIES lib_darktable cmocka)
+
+if(WIN32)
+    _copy_required_library(test_pixelpipe_cache_export_profile lib_darktable)
+endif(WIN32)
+
 add_cmocka_mock_test(test_color_picker
                      SOURCES test_color_picker.c
                      LINK_LIBRARIES lib_darktable cmocka)

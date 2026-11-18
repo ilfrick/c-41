@@ -109,6 +109,13 @@ dt_ioppr_set_pipe_input_profile_info(struct dt_develop_t *dev,
                                      const int intent, const dt_colormatrix_t matrix_in);
 
 dt_iop_order_iccprofile_info_t *
+dt_ioppr_set_pipe_export_profile_info(struct dt_develop_t *dev,
+                                       struct dt_dev_pixelpipe_t *pipe,
+                                       const dt_colorspaces_color_profile_type_t type,
+                                       const char *filename,
+                                       const int intent);
+
+dt_iop_order_iccprofile_info_t *
 dt_ioppr_set_pipe_output_profile_info(struct dt_develop_t *dev,
                                       struct dt_dev_pixelpipe_t *pipe,
                                       const dt_colorspaces_color_profile_type_t type,
