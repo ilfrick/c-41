@@ -11049,3 +11049,15 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The preceding CACorrect entry recorded its state at entry time. It was later committed as `8da679b9c9b9bd16513c4dd3c4703c5c7c237a60`; pre-push `scripts/ci-local.sh` passed all four gates. Initial GitHub Docker check failed on Docker Hub `toomanyrequests: retry-after: 348.329µs, allowed: 44000/minute`; rerunning via `gh --repo ilfrick/c-41` succeeded. CMake+Rust check run `134722159001` and Docker rerun `134724295483` completed successfully; direct checks of both origin push URLs and local `origin/master`/`gitea/master` match the commit.
 
 **Delivery at entry time.** Control-job changes are staged but not yet committed or pushed. S9 remains selective and incomplete.
+
+## 2026-11-18 11:59 UTC — S9: thumbnail filename ownership
+
+**Change.** Applied pinned darktable `06ab26a51711cbec27e087546851dd52c3329538` in retained-C `src/dtgtk/thumbnail.c::dt_thumbnail_reload_infos()`: free the thumbnail-owned prior `thumb->filename` before replacing it with `g_strdup(img->filename)`. Metadata-change and refresh paths reload visible thumbnails repeatedly; `dt_thumbnail_destroy()` previously freed only the final value. Updated S9 triage and Roadmap; no matching `PARITY_AUDIT.md` item. No focused GTK lifecycle test or Rust GTK4 parity claim.
+
+**Review.** Independent same-model senior reviewer APPROVED the full diff with no findings; confirmed `dt_thumbnail_new()` zero-initializes the struct, the filename is owned, and destruction frees the current value once. A repeated-reload lifecycle test was suggested as future work, not a blocker.
+
+**Verification.** `git diff --check` passed. Mounted Docker Release/Ninja build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, built-in `-Werror`) exited 0 (`DOCKER_THUMBNAIL_BUILD_EXIT_CODE=0`); CTest passed 21/21. `scripts/ci-local.sh` exited 0 (`CI_LOCAL_EXIT_CODE=0`); all four gates passed. No host C build or manual global `-Werror`.
+
+**Prior delivery correction.** The preceding control-job entry recorded its staged/uncommitted state at entry time. It was committed as `51a914b4cbab7882d92ac4e49c13d2f847c08c86`; push/pre-push CI exited 0, and both direct origin push URLs plus local `origin/master`/`gitea/master` were verified at that SHA. GitHub Fork CI run `44291512634` / check `134757616116` and Docker run `44291513007` / check `134757617152` completed successfully.
+
+**Delivery at entry time.** Thumbnail filename fix is staged but not yet committed or pushed. S9 remains selective and incomplete.
