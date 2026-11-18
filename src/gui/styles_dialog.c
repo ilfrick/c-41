@@ -239,6 +239,8 @@ static void _gui_styles_new_style_response(GtkDialog *dialog,
         else
         {
          /* on RESPONSE_NO and escape key return to dialog */
+          g_list_free(result);
+          if(!g->newname) g_free(newname);
           return;
         }
       }
@@ -268,8 +270,9 @@ static void _gui_styles_new_style_response(GtkDialog *dialog,
       gtk_window_set_title(GTK_WINDOW(dlg_changename), _("unnamed style"));
       gtk_dialog_run(GTK_DIALOG(dlg_changename));
       gtk_widget_destroy(dlg_changename);
-      return;
     }
+    g_list_free(result);
+    if(!g->newname) g_free(newname);
   }
 }
 
@@ -344,8 +347,10 @@ static void _gui_styles_edit_style_response(GtkDialog *dialog,
       gtk_window_set_title(GTK_WINDOW(dlg_changename), _("unnamed style"));
       gtk_dialog_run(GTK_DIALOG(dlg_changename));
       gtk_widget_destroy(dlg_changename);
-      return;
     }
+    g_list_free(result);
+    g_list_free(update);
+    if(!g->newname) g_free(newname);
   }
 }
 
