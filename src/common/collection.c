@@ -1199,7 +1199,10 @@ void dt_collection_split_operator_exposure(const gchar *input,
     gchar *inv = g_match_info_fetch(match_info, 1);
 
     if(strstr(inv, "1/") != NULL)
+    {
       *number1 = g_strdup_printf("1.0/%s", n1);
+      g_free(n1);
+    }
     else
       *number1 = n1;
     g_free(inv);
@@ -1208,7 +1211,10 @@ void dt_collection_split_operator_exposure(const gchar *input,
     inv = g_match_info_fetch(match_info, 4);
 
     if(strstr(inv, "1/") != NULL)
+    {
       *number2 = g_strdup_printf("1.0/%s", n2);
+      g_free(n2);
+    }
     else
       *number2 = n2;
     g_free(inv);
@@ -1234,7 +1240,10 @@ void dt_collection_split_operator_exposure(const gchar *input,
     gchar *inv = g_match_info_fetch(match_info, 2);
 
     if(strstr(inv, "1/") != NULL)
+    {
       *number1 = g_strdup_printf("1.0/%s", n1);
+      g_free(n1);
+    }
     else
       *number1 = n1;
     g_free(inv);

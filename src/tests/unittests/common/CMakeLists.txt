@@ -40,6 +40,14 @@ if(WIN32)
     _copy_required_library(test_commasubstring lib_darktable)
 endif(WIN32)
 
+add_cmocka_mock_test(test_collection_split_operator_exposure
+                     SOURCES test_collection_split_operator_exposure.c
+                     LINK_LIBRARIES lib_darktable cmocka)
+
+if(WIN32)
+    _copy_required_library(test_collection_split_operator_exposure lib_darktable)
+endif(WIN32)
+
 add_cmocka_mock_test(test_iop_introspection
                      SOURCES test_iop_introspection.c
                      LINK_LIBRARIES lib_darktable cmocka)
