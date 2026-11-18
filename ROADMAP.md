@@ -100,6 +100,8 @@ Pinned `175b41e518d5b89f743fae27295345bc0e73595d` è **APPLIED, S9** per il TIFF
 
 Pinned `cb7d7d835619164209a5ca53757f6565ad401d35` è **PARTIAL APPLY, S9** per l’allocazione del buffer preview retained-C: `dt_imageio_preview()` ora restituisce `NULL` se `dt_alloc_aligned()` fallisce, prima che l’export raggiunga `_preview_write_image()` e scriva in un buffer nullo. `dt_gui_get_style_preview()` propaga il valore e `_preview_draw()` controlla la surface. Nessun test deterministico senza seam di allocator injection; nessuna parity di preview Rust.
 
+Pinned `bbb9d73772489367557c995ac944eb6ec7d4b36b` è **APPLIED, S9** soltanto per il leak del `GDateTime` in `_popup_date_update()` del percorso retained-C `dtgtk`: `g_date_time_unref(dt)` viene eseguito dopo l’ultimo uso. La funzione è raggiunta dal popup date-range; non si afferma parity della UI Rust GTK4. Non c’è un test GTK/leak stretto per questo callback.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.

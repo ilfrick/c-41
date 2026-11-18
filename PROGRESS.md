@@ -10945,3 +10945,11 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Review.** Independent same-model senior reviewer APPROVED with no findings.
 
 **Verification.** `git diff --check` passed. Mounted Docker Release/Ninja C build exited 0 (`CMAKE_BUILD_EXIT_CODE=0`); CTest passed 19/19 (`CTEST_EXIT_CODE=0`). `scripts/ci-local.sh` exited 0, all four gates passed. No manual global `-Werror`, host C build, or deployment. Prior RawSpeed commit `e35219457cec33f5139f977865d8aebe8b122cc8` completed delivery: pre-push gates passed, both remotes match, Fork CI run `44210211869` and Docker run `44210212036` completed successfully; check runs `134486342137` and `134486343122` are green. Current preview increment is not yet committed/pushed; S9 remains selective and incomplete.
+
+## 2026-11-18 02:11 UTC — S9: release date-range popup timestamp
+
+**Change.** Applied pinned darktable `bbb9d73772489367557c995ac944eb6ec7d4b36b` in `src/dtgtk/range.c::_popup_date_update()`: unref the owned `GDateTime` after its final use. Both `dt_datetime_gtimespan_to_gdatetime()` (`g_date_time_add()`) and the `g_date_time_new_now_utc()` fallback return owned references. The callback is used by the retained-C date-range popup; no Rust GTK4 parity claim. Added APPLIED—S9 evidence to `docs/parity-inventory/commit-triage.md` and `ROADMAP.md`; no matching `PARITY_AUDIT.md` item or focused GTK leak-test seam.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings: `dt` is owned/non-NULL on both paths, cleanup follows its last use, and there is no intervening early return.
+
+**Verification.** `git diff --check` passed. Mounted Docker Release/Ninja C build (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=ON`, built-in `-Werror`) exited 0 (`CMAKE_BUILD_EXIT_CODE=0`); CTest passed 19/19 (`CTEST_EXIT_CODE=0`). CMake emitted nonfatal missing-LLVM/OpenCL-compiler and stale OpenJPEG imported-target warnings; source mount also emitted the known nonfatal `/src` dubious-ownership notice. `scripts/ci-local.sh` exited 0 (`CI_LOCAL_EXIT_CODE=0`), all four gates passed including 599 tests. No manual global `-Werror`, host C build, or deployment. No commit/push yet; S9 remains selective and incomplete.
