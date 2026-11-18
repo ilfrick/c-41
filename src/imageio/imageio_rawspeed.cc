@@ -186,9 +186,15 @@ dt_imageio_retval_t dt_imageio_open_rawspeed(dt_image_t *img,
   {
     dt_rawspeed_load_meta();
 
-    dt_pthread_mutex_lock(&darktable.readFile_mutex);
-    auto [storage, storageBuf] = f.readFile();
-    dt_pthread_mutex_unlock(&darktable.readFile_mutex);
+    auto [storage, storageBuf] = [&f]()
+    {
+      struct ReadFileMutexGuard
+      {
+        ReadFileMutexGuard() { dt_pthread_mutex_lock(&darktable.readFile_mutex); }
+        ~ReadFileMutexGuard() { dt_pthread_mutex_unlock(&darktable.readFile_mutex); }
+      } guard;
+      return f.readFile();
+    }();
 
     RawParser t(storageBuf);
     std::unique_ptr<RawDecoder> d = t.getDecoder(meta);

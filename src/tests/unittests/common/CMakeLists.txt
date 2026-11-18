@@ -6,6 +6,20 @@ add_cmocka_mock_test(test_imageio_tiff_photometric
                      SOURCES test_imageio_tiff_photometric.c
                      LINK_LIBRARIES lib_darktable cmocka)
 
+add_cmocka_mock_test(test_imageio_rawspeed_mutex
+                     SOURCES test_imageio_rawspeed_mutex.cc
+                     LINK_LIBRARIES lib_darktable cmocka rawspeed)
+target_include_directories(test_imageio_rawspeed_mutex PRIVATE
+                           ${CMAKE_SOURCE_DIR}/src/external/rawspeed/src/librawspeed
+                           $<TARGET_PROPERTY:rawspeed,INTERFACE_INCLUDE_DIRECTORIES>)
+target_compile_features(test_imageio_rawspeed_mutex PRIVATE cxx_std_20)
+target_compile_definitions(test_imageio_rawspeed_mutex PRIVATE
+                           RAWSPEED_CAMERAS_FILE=\"${CMAKE_SOURCE_DIR}/src/external/rawspeed/data/cameras.xml\")
+set_tests_properties(test_imageio_rawspeed_mutex PROPERTIES TIMEOUT 10)
+if(WIN32)
+    _copy_required_library(test_imageio_rawspeed_mutex lib_darktable)
+endif(WIN32)
+
 if(WIN32)
     _copy_required_library(test_imageio_tiff_photometric lib_darktable)
 endif(WIN32)
