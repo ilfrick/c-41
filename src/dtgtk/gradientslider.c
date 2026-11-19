@@ -402,12 +402,7 @@ static gboolean _gradient_slider_button_release(GtkWidget *widget,
 
   if(event->button == GDK_BUTTON_PRIMARY && selected != -1 && gslider->do_reset == FALSE)
   {
-    // First get some dimension info
     gslider->is_changed = TRUE;
-    const gdouble newposition = _get_position_from_screen(widget, event->x);
-    const gint direction = gslider->position[selected] <= newposition ? MOVE_RIGHT : MOVE_LEFT;
-
-    _slider_move(widget, selected, newposition, direction);
 
     gtk_widget_queue_draw(widget);
 

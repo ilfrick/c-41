@@ -106,6 +106,8 @@ Pinned `8c67c82bb568a27c786956f2affa1bda87dcdfb5` is **PARTIAL APPLY, S9** only 
 
 Pinned `3ee62293fb661eec1d218ee97d0208b820d83457` and `b849d865c6b4d9bc706d352cc70d1d1bdebb467f` are **PARTIAL APPLY, S9** for retained-C `src/control/jobs/control_jobs.c::_get_image_list()`: empty selections return an empty string, while allocation failure propagates to both remove/delete jobs, which abort before SQL safety checks or filesystem work. This adapts pinned's empty-string OOM fallback because C-41 callers would otherwise continue destructively with incomplete data. No deterministic allocation-failure test seam or Rust control/UI parity claim.
 
+Pinned `fd127daf545086f4f2bd192b6ab36205fb29472f` è **APPLIED, S9** in `src/dtgtk/gradientslider.c`: primary button release no longer derives marker position from release coordinates or calls `_slider_move()`, preventing cancelled/fake `(0,0)` releases from moving it. The retained GTK3 paths are reachable from `src/iop/relight.c:237` and `src/iop/retouch.c:2590`; no headless widget regression test was added because the existing CMocka setup lacks a robust GTK event harness.
+
 Pinned `06ab26a51711cbec27e087546851dd52c3329538` is **APPLIED, S9** for retained-C `dt_thumbnail_reload_infos()`, freeing the owned prior `thumb->filename` before replacement. Repeated thumbnail refresh/metadata reloads no longer leak each replaced filename. No focused GTK lifecycle test or Rust GTK4 parity claim.
 
 ## 6. Filone D — Agent-native editing, Phase 9

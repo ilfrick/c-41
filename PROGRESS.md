@@ -11101,3 +11101,15 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The 2026-11-19 18:50 popup entry says its change was not yet committed/pushed at entry time. It was delivered as `9ca75469a5b446a5a636e714b0cbb96159c302cb`; both GitHub/Gitea master refs match, and required GitHub CMake+Rust check `135802982022` and Docker check `135802981054` succeeded. The full-C workflow was skipped as on-demand.
 
 **Delivery at entry time.** The TIFF classifier change is reviewed and locally verified but not yet committed/pushed. S9 remains selective and incomplete.
+
+## 2026-11-19 21:16 UTC — S9: preserve gradient-slider marker on release
+
+**Change.** Ported pinned darktable `fd127daf545086f4f2bd192b6ab36205fb29472f` to retained `src/dtgtk/gradientslider.c::_gradient_slider_button_release()`: primary release no longer derives a marker position from release coordinates or calls `_slider_move()`. This prevents a cancelled/synthetic `(0,0)` release from moving the selected marker, while preserving motion-driven movement, `is_changed`, redraw, drag/timeout cleanup, and `value-changed`. Reachable GTK3 callers include `src/iop/relight.c:237` and `src/iop/retouch.c:2590`; this is not Rust GTK4 slider parity. Updated triage and Roadmap.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. No focused widget regression test was added: the CMocka setup has no gradient-slider widget/event harness, and testing requires GTK event/widget initialization or an invasive seam.
+
+**Verification.** Mounted Docker Release/Ninja C build with `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_AI=ON`, built-in `-Werror`, verified ONNX Runtime 1.24.4, and mounted Cargo/Rustup exited 0; CTest passed 22/22. `scripts/ci-local.sh` exited 0; all four gates passed. `git diff --check HEAD` passed. No host C build or manual global `-Werror`. The suite compiled this handler but did not exercise a live GTK release event.
+
+**Prior delivery correction.** The 2026-11-19 20:33 TIFF entry records the change as not yet committed/pushed at entry time. It was delivered as `e54898be894b435490a3e98173fcaecd41acbff2`; GitHub and Gitea master refs and local tracking refs match. GitHub check+test+clippy `135867078694`, CMake+Rust `135867079390`, and Docker image `135867079536` succeeded; full-C check `135867082500` was skipped as on-demand.
+
+**Delivery at entry time.** The gradient-slider correction is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
