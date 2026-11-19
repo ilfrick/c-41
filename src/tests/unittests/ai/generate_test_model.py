@@ -18,19 +18,18 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 
-def main():
-    out_dir = os.path.join(sys.argv[1] if len(sys.argv) > 1 else "models",
-                           "test-multiply")
+def _build(out_dir, model_id, name, shape):
     os.makedirs(out_dir, exist_ok=True)
 
-    # Create model: y = x * 2
-    X = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, 4, 4])
-    Y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3, 4, 4])
+    X = helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)
+    Y = helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)
     const_2 = numpy_helper.from_array(
         np.array([2.0], dtype=np.float32), name="const_2"
     )
     mul_node = helper.make_node("Mul", ["x", "const_2"], ["y"])
-    graph = helper.make_graph([mul_node], "test_multiply", [X], [Y], [const_2])
+    graph = helper.make_graph(
+        [mul_node], model_id.replace("-", "_"), [X], [Y], [const_2]
+    )
     model = helper.make_model(
         graph, opset_imports=[helper.make_opsetid("", 13)]
     )
@@ -41,8 +40,8 @@ def main():
 
     # Create config.json
     config = {
-        "id": "test-multiply",
-        "name": "Test Multiply",
+        "id": model_id,
+        "name": name,
         "description": "Test model: y = x * 2",
         "task": "test",
         "backend": "onnx",
@@ -52,7 +51,16 @@ def main():
         json.dump(config, f, indent=2)
         f.write("\n")
 
-    print(f"Generated test model in {out_dir}")
+    print(f"Generated {model_id} in {out_dir}")
+
+
+def main():
+    base = sys.argv[1] if len(sys.argv) > 1 else "models"
+    _build(os.path.join(base, "test-multiply"), "test-multiply",
+           "Test Multiply", [1, 3, 4, 4])
+    _build(os.path.join(base, "test-multiply-dynamic"),
+           "test-multiply-dynamic", "Test Multiply Dynamic",
+           [1, 3, "H", "W"])
 
 
 if __name__ == "__main__":

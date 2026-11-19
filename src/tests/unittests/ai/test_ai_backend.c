@@ -73,9 +73,16 @@ static void test_env_init(void **state)
 static void test_model_discovery(void **state)
 {
   const int count = dt_ai_get_model_count(env);
-  assert_int_equal(count, 1);
+  assert_int_equal(count, 2);
 
-  const dt_ai_model_info_t *info = dt_ai_get_model_info_by_index(env, 0);
+  // Discovery order is not defined; locate the static fixture by ID.
+  const dt_ai_model_info_t *info = NULL;
+  for(int i = 0; i < count; i++)
+  {
+    const dt_ai_model_info_t *m = dt_ai_get_model_info_by_index(env, i);
+    assert_non_null(m);
+    if(!strcmp(m->id, "test-multiply")) info = m;
+  }
   assert_non_null(info);
   assert_string_equal(info->id, "test-multiply");
   assert_string_equal(info->name, "Test Multiply");
@@ -369,6 +376,95 @@ static void test_env_init_empty(void **state)
   dt_ai_env_destroy(e2);
 }
 
+// Verify an undersized caller buffer is rejected on ORT's dynamic-output path.
+static void test_dynamic_output_undersized(void **state)
+{
+  dt_ai_context_t *ctx = dt_ai_load_model(env, "test-multiply-dynamic",
+                                          NULL, DT_AI_PROVIDER_CPU);
+  assert_non_null(ctx);
+
+  int64_t model_shape[8];
+  const int model_ndim = dt_ai_get_output_shape(ctx, 0, model_shape, 8);
+  assert_int_equal(model_ndim, 4);
+  assert_true(model_shape[2] <= 0 || model_shape[3] <= 0);
+
+  float input_data[48];
+  for(int i = 0; i < 48; i++) input_data[i] = 1.0f;
+  int64_t in_shape[] = { 1, 3, 4, 4 };
+  dt_ai_tensor_t input = {
+    .data = input_data, .type = DT_AI_FLOAT, .shape = in_shape, .ndim = 4
+  };
+
+  const float canary = -12345.0f;
+
+  // A sufficiently sized dynamic output succeeds and reports ORT's shape.
+  float success_data[64];
+  for(int i = 0; i < 64; i++) success_data[i] = canary;
+  int64_t success_shape[] = { 1, 3, 8, 2 };
+  dt_ai_tensor_t success_output = {
+    .data = success_data, .type = DT_AI_FLOAT,
+    .shape = success_shape, .ndim = 4
+  };
+  const int success_ret = dt_ai_run(ctx, &input, 1, &success_output, 1);
+  assert_int_equal(success_ret, 0);
+  assert_int_equal(success_output.ndim, 4);
+  assert_int_equal(success_shape[0], 1);
+  assert_int_equal(success_shape[1], 3);
+  assert_int_equal(success_shape[2], 4);
+  assert_int_equal(success_shape[3], 4);
+  for(int i = 0; i < 48; i++)
+    assert_float_equal(success_data[i], 2.0f, 0.0f);
+  for(int i = 48; i < 64; i++)
+    assert_float_equal(success_data[i], canary, 0.0f);
+
+  float output_data[64];
+  for(int i = 0; i < 64; i++) output_data[i] = canary;
+  int64_t out_shape[] = { 1, 3, 2, 2 };
+  dt_ai_tensor_t output = {
+    .data = output_data, .type = DT_AI_FLOAT, .shape = out_shape, .ndim = 4
+  };
+
+  const int ret = dt_ai_run(ctx, &input, 1, &output, 1);
+  assert_int_not_equal(ret, 0);
+  assert_int_equal(output.ndim, 4);
+  assert_int_equal(out_shape[0], 1);
+  assert_int_equal(out_shape[1], 3);
+  assert_int_equal(out_shape[2], 2);
+  assert_int_equal(out_shape[3], 2);
+  for(int i = 0; i < 64; i++)
+    assert_float_equal(output_data[i], canary, 0.0f);
+
+  // A missing shape buffer must be rejected without writing through NULL.
+  for(int i = 0; i < 64; i++) output_data[i] = canary;
+  dt_ai_tensor_t null_shape_output = {
+    .data = output_data, .type = DT_AI_FLOAT, .shape = NULL, .ndim = 4
+  };
+  const int null_shape_ret = dt_ai_run(ctx, &input, 1, &null_shape_output, 1);
+  assert_int_not_equal(null_shape_ret, 0);
+  assert_int_equal(null_shape_output.ndim, 4);
+  for(int i = 0; i < 64; i++)
+    assert_float_equal(output_data[i], canary, 0.0f);
+
+  // A negative rank must not become a huge capacity via size_t conversion.
+  for(int i = 0; i < 64; i++) output_data[i] = canary;
+  int64_t negative_rank_shape[] = { 1, 3, 2, 2 };
+  dt_ai_tensor_t negative_rank_output = {
+    .data = output_data, .type = DT_AI_FLOAT,
+    .shape = negative_rank_shape, .ndim = -1
+  };
+  const int negative_rank_ret = dt_ai_run(ctx, &input, 1, &negative_rank_output, 1);
+  assert_int_not_equal(negative_rank_ret, 0);
+  assert_int_equal(negative_rank_output.ndim, -1);
+  assert_int_equal(negative_rank_shape[0], 1);
+  assert_int_equal(negative_rank_shape[1], 3);
+  assert_int_equal(negative_rank_shape[2], 2);
+  assert_int_equal(negative_rank_shape[3], 2);
+  for(int i = 0; i < 64; i++)
+    assert_float_equal(output_data[i], canary, 0.0f);
+
+  dt_ai_unload_model(ctx);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -389,6 +485,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_env_refresh),
     cmocka_unit_test(test_load_opt_levels),
     cmocka_unit_test(test_env_init_empty),
+    cmocka_unit_test(test_dynamic_output_undersized),
   };
 
   return cmocka_run_group_tests(tests, group_setup, group_teardown);

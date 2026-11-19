@@ -367,7 +367,10 @@ typedef enum {
 } dt_ai_dtype_t;
 
 /**
- * @brief Tensor descriptor for I/O
+ * @brief Tensor descriptor for I/O.
+ * For inputs, `shape` contains `ndim` dimensions. For outputs, `ndim` also
+ * describes the writable capacity of `shape`; it must be at least the runtime
+ * output rank, and is updated to that rank only after a successful inference.
  */
 typedef struct dt_ai_tensor_t {
   void *data;         ///< Pointer to raw data buffer

@@ -36,10 +36,38 @@ void dt_print_ext(const char *msg, ...)
 
 gchar *dt_conf_get_string(const char *name)
 {
-  return g_strdup("cpu");
+  if(g_strcmp0(name, "plugins/ai/provider") == 0) return g_strdup("cpu");
+  return g_strdup("");
+}
+
+int dt_conf_get_int(const char *name)
+{
+  (void)name;
+  return 0;
+}
+
+gboolean dt_conf_get_bool(const char *name)
+{
+  // Enable the AI environment under test; unrelated toggles stay disabled.
+  return g_strcmp0(name, "plugins/ai/enabled") == 0;
+}
+
+gboolean dt_conf_key_exists(const char *key)
+{
+  (void)key;
+  return FALSE;
 }
 
 void dt_loc_get_user_config_dir(char *configdir, size_t bufsize)
 {
   if(configdir && bufsize > 0) configdir[0] = '\0';
+}
+
+void dt_loc_get_user_cache_dir(char *cachedir, size_t bufsize)
+{
+  if(!cachedir || bufsize == 0) return;
+
+  static gchar *path = NULL;
+  if(!path) path = g_dir_make_tmp("c41-ai-test-cache-XXXXXX", NULL);
+  g_strlcpy(cachedir, path ? path : g_get_tmp_dir(), bufsize);
 }

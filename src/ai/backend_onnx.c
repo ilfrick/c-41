@@ -1095,10 +1095,12 @@ static gboolean _map_onnx_type(ONNXTensorElementDataType onnx_type, dt_ai_dtype_
 }
 
 // compute total element count from shape dimensions with overflow checking.
-// returns the product of all shape dimensions, or -1 if any dimension is
-// non-positive or the multiplication would overflow int64_t
+// returns the product of all shape dimensions, or -1 for an invalid shape or
+// if the multiplication would overflow int64_t
 static int64_t _safe_element_count(const int64_t *shape, int ndim)
 {
+  if(ndim < 0 || (ndim > 0 && !shape)) return -1;
+
   int64_t count = 1;
   for(int i = 0; i < ndim; i++)
   {
@@ -2347,6 +2349,32 @@ int dt_ai_run(
         || (outputs[i].type == DT_AI_FLOAT && ctx->output_types[i] == DT_AI_FLOAT16);
       if(!ort_allocated || !output_tensors[i]) continue;
 
+      // Preserve the caller's reserved capacity before ORT dimensions replace
+      // the shape below. A missing shape array cannot receive non-scalar
+      // dimensions, and a negative rank must not be cast to size_t below.
+      const gboolean caller_allocated = outputs[i].data != NULL;
+      if(outputs[i].ndim < 0 || (outputs[i].ndim > 0 && !outputs[i].shape))
+      {
+        dt_print(DT_DEBUG_AI, "[darktable_ai] invalid shape buffer for output[%d]", i);
+        ret = -3;
+        break;
+      }
+      const int64_t caller_capacity
+        = _safe_element_count(outputs[i].shape, outputs[i].ndim);
+
+      // Only FLOAT16 -> FLOAT conversion is supported; other conversions
+      // would interpret ORT's buffer with the wrong element width.
+      if(ctx->output_types[i] != outputs[i].type
+         && !(ctx->output_types[i] == DT_AI_FLOAT16
+              && outputs[i].type == DT_AI_FLOAT))
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[darktable_ai] output[%d] is type %d, cannot deliver as %d",
+                 i, ctx->output_types[i], outputs[i].type);
+        ret = -3;
+        break;
+      }
+
       void *raw_data = NULL;
       status = g_ort.api->GetTensorMutableData(output_tensors[i], &raw_data);
       if(status)
@@ -2355,7 +2383,8 @@ int dt_ai_run(
                  "[darktable_ai] GetTensorMutableData output[%d] failed: %s",
                  i, g_ort.api->GetErrorMessage(status));
         g_ort.api->ReleaseStatus(status);
-        continue;
+        ret = -3;
+        break;
       }
 
       // query ORT's actual tensor size to avoid reading past its allocation.
@@ -2368,55 +2397,77 @@ int dt_ai_run(
         dt_print(DT_DEBUG_AI, "[darktable_ai] GetTensorTypeAndShape output[%d] failed: %s",
                  i, g_ort.api->GetErrorMessage(status));
         g_ort.api->ReleaseStatus(status);
-        continue;
+        ret = -3;
+        break;
       }
-      // update caller's shape array with actual ORT output dimensions.
-      // this is essential for dynamic-shape models where the caller's
-      // pre-assumed shape may differ from what ORT actually produced.
+      // Resolve dimensions into temporary storage. Do not mutate the caller's
+      // descriptor until the output is validated and copied successfully.
       size_t actual_ndim = 0;
+      g_autofree int64_t *actual_shape = NULL;
+      gboolean shape_resolved = FALSE;
       OrtStatus *dim_st = g_ort.api->GetDimensionsCount(tensor_info, &actual_ndim);
-      if(!dim_st && actual_ndim > 0 && (int)actual_ndim <= outputs[i].ndim)
+      if(!dim_st && actual_ndim == 0)
       {
-        OrtStatus *get_st = g_ort.api->GetDimensions(tensor_info, outputs[i].shape, actual_ndim);
-        if(!get_st)
-          outputs[i].ndim = (int)actual_ndim;
-        else
-          g_ort.api->ReleaseStatus(get_st);
+        // A scalar has rank zero and one element; no dimensions need copying.
+        shape_resolved = TRUE;
+      }
+      else if(!dim_st && outputs[i].shape
+              && actual_ndim <= (size_t)outputs[i].ndim
+              && actual_ndim <= INT_MAX)
+      {
+        actual_shape = g_try_new(int64_t, actual_ndim);
+        if(actual_shape)
+        {
+          OrtStatus *get_st = g_ort.api->GetDimensions(tensor_info, actual_shape, actual_ndim);
+          if(!get_st)
+            shape_resolved = TRUE;
+          else
+            g_ort.api->ReleaseStatus(get_st);
+        }
       }
       if(dim_st) g_ort.api->ReleaseStatus(dim_st);
 
       size_t ort_element_count = 0;
       status = g_ort.api->GetTensorShapeElementCount(tensor_info, &ort_element_count);
-      g_ort.api->ReleaseTensorTypeAndShapeInfo(tensor_info);
       if(status)
       {
         dt_print(DT_DEBUG_AI, "[darktable_ai] GetTensorShapeElementCount output[%d] failed: %s",
                  i, g_ort.api->GetErrorMessage(status));
         g_ort.api->ReleaseStatus(status);
-        continue;
+        g_ort.api->ReleaseTensorTypeAndShapeInfo(tensor_info);
+        ret = -3;
+        break;
       }
 
-      const int64_t caller_count
-        = _safe_element_count(outputs[i].shape, outputs[i].ndim);
-      if(caller_count < 0)
+      if(!shape_resolved || ort_element_count > INT64_MAX)
+      {
+        dt_print(DT_DEBUG_AI, "[darktable_ai] output[%d] shape did not resolve", i);
+        g_ort.api->ReleaseTensorTypeAndShapeInfo(tensor_info);
+        ret = -3;
+        break;
+      }
+      const int64_t resolved_count
+        = _safe_element_count(actual_shape, (int)actual_ndim);
+      if(resolved_count < 0 || (uint64_t)resolved_count != ort_element_count)
+      {
+        dt_print(DT_DEBUG_AI, "[darktable_ai] output[%d] shape did not resolve", i);
+        g_ort.api->ReleaseTensorTypeAndShapeInfo(tensor_info);
+        ret = -3;
+        break;
+      }
+      g_ort.api->ReleaseTensorTypeAndShapeInfo(tensor_info);
+
+      if(caller_allocated
+         && (caller_capacity < 0 || ort_element_count > (uint64_t)caller_capacity))
       {
         dt_print(DT_DEBUG_AI,
-                 "[darktable_ai] invalid shape for output[%d] post-copy", i);
-        continue;
+                 "[darktable_ai] output[%d] needs %zu elements, caller reserved %"
+                 PRId64,
+                 i, ort_element_count, caller_capacity);
+        ret = -3;
+        break;
       }
-
-      // use the smaller of ORT's actual size and caller's expected size
-      const int64_t element_count = ((int64_t)ort_element_count < caller_count)
-        ? (int64_t)ort_element_count
-        : caller_count;
-
-      if(element_count != caller_count)
-      {
-        dt_print(DT_DEBUG_AI,
-                 "[darktable_ai] output[%d] shape mismatch: ORT has %zu elements, "
-                 "caller expects %" PRId64,
-                 i, ort_element_count, caller_count);
-      }
+      const int64_t element_count = (int64_t)ort_element_count;
 
       // allocate caller buffer if NULL (dynamic output, caller
       // couldn't pre-allocate because shapes were unknown)
@@ -2429,7 +2480,15 @@ int dt_ai_run(
           dt_print(DT_DEBUG_AI,
                    "[darktable_ai] unknown dtype %d for output[%d]",
                    outputs[i].type, i);
-          continue;
+          ret = -3;
+          break;
+        }
+        if(ort_element_count > SIZE_MAX / type_size)
+        {
+          dt_print(DT_DEBUG_AI,
+                   "[darktable_ai] tensor size overflow for output[%d]", i);
+          ret = -3;
+          break;
         }
         outputs[i].data = g_try_malloc(ort_element_count * type_size);
         if(!outputs[i].data)
@@ -2437,7 +2496,8 @@ int dt_ai_run(
           dt_print(DT_DEBUG_AI,
                    "[darktable_ai] failed to allocate output[%d] (%zu elements)",
                    i, ort_element_count);
-          continue;
+          ret = -3;
+          break;
         }
       }
 
@@ -2459,10 +2519,15 @@ int dt_ai_run(
           dt_print(DT_DEBUG_AI,
                    "[darktable_ai] unknown dtype %d for output[%d] post-copy",
                    outputs[i].type, i);
-          continue;
+          ret = -3;
+          break;
         }
         memcpy(outputs[i].data, raw_data, element_count * type_size);
       }
+
+      if(actual_ndim > 0)
+        memcpy(outputs[i].shape, actual_shape, actual_ndim * sizeof(*actual_shape));
+      outputs[i].ndim = (int)actual_ndim;
     }
   }
 
