@@ -11,8 +11,8 @@
 //! - 8bpp: if `abs(r - g) > 2 || abs(r - b) > 2 || abs(g - b) > 2`, set
 //!   the shared flag to 3 (otherwise leave it);
 //! - 16-bit: the same shape with threshold 165 instead of 2;
-//! - float: clamp each lane up at 0.001 (`MAX(v, 0.001f)`) and trip when
-//!   any pairwise ratio's absolute value exceeds 1.01.
+//! - float: trip when any pair fails `feqf(a, b, 0.01f)`, where
+//!   `feqf` is `fabsf(a - b) < eps`.
 //!
 //! Bit-exactness notes (all three branches):
 //! - The C flag is written idempotently (1 -> 3 only, never back), so
@@ -24,13 +24,9 @@
 //!   `abs((int)a - (int)b)` on inputs of that width, with the same
 //!   strict-greater-than threshold spelling (a lane pair differing by
 //!   exactly the threshold still counts as grey).
-//! - The float branch spells the clamp as the C `MAX(v, 0.001f)` ternary
-//!   (`v > 0.001f ? v : 0.001f`, via glib), written here as an explicit
-//!   branch so NaN and sub-floor inputs (zeros, negatives) take the floor
-//!   exactly as in C rather than depending on any `f32::max` NaN rule.
-//!   Division, `fabsf`, and the `> 1.01f` comparison are plain IEEE-754
-//!   single-precision on both sides, issued in the same order, so the
-//!   verdict is bit-identical lane for lane.
+//! - The float branch matches pinned `feqf`: each pair is equal iff
+//!   `fabsf(a - b) < 0.01f`. Negating that comparison also makes NaN
+//!   differences trip, since `NaN < eps` is false in C and Rust.
 //! - The 1-pixel border is never read, as in C: pipeline edge artefacts
 //!   are excluded from the decision on both sides.
 //! - The `shortfile` / dims-greater-than-4 / bpp gates stay in C; the
@@ -224,30 +220,12 @@ fn ref_tiff_u16_is_grayscale(inp: &[u16], width: usize, height: usize) -> bool {
     true
 }
 
-/// Clamp one float lane exactly as the C `MAX(v, 0.001f)` ternary does:
-/// `v > 0.001f ? v : 0.001f`. The explicit branch (rather than
-/// `f32::max`) keeps NaN on the floor side just like the C comparison
-/// (`NaN > 0.001f` is false), so zeros, negatives, and NaNs all read as
-/// 0.001 on both sides.
-#[inline]
-fn clamp_floor(v: f32) -> f32 {
-    if v > 0.001f32 {
-        v
-    } else {
-        0.001f32
-    }
-}
-
-/// True when one float pixel's R/G/B lanes trip the C ratio test:
-/// `fabsf(cr / cg) > 1.01f` for any of the three lane pairs after the
-/// `clamp_floor` step. Shared by the kernel and the divergent reference
-/// below so the two cannot drift on the spelling while still differing
-/// structurally.
+/// True when any channel pair fails pinned `feqf(a, b, 0.01f)`, whose
+/// definition is `fabsf(a - b) < eps`.
 fn f32_triple_differs(r: f32, g: f32, b: f32) -> bool {
-    let cr = clamp_floor(r);
-    let cg = clamp_floor(g);
-    let cb = clamp_floor(b);
-    (cr / cg).abs() > 1.01f32 || (cr / cb).abs() > 1.01f32 || (cg / cb).abs() > 1.01f32
+    !((r - g).abs() < 0.01f32)
+        || !((r - b).abs() < 0.01f32)
+        || !((g - b).abs() < 0.01f32)
 }
 
 /// Scan the interior of a float RGBA buffer for colour.
@@ -255,7 +233,7 @@ fn f32_triple_differs(r: f32, g: f32, b: f32) -> bool {
 /// Port of the former element-wise loop in the `d->bpp == 32 ||
 /// (d->bpp == 16 && d->pixelformat)` branch of `write_image()`
 /// (`src/imageio/format/tiff.c`): returns false at the first interior
-/// pixel whose clamped R/G/B lanes trip `f32_triple_differs`, true when
+/// pixel whose R/G/B lanes trip `f32_triple_differs`, true when
 /// the whole interior is grey. Same traversal, guards, and
 /// schedule-independence argument as `tiff_u8_is_grayscale`; `width` and
 /// `height` are the full-frame dims and `inp` holds `4 * width * height`
@@ -294,7 +272,7 @@ pub fn tiff_f32_is_grayscale(inp: &[f32], width: usize, height: usize) -> bool {
 
 /// Structurally divergent reference for `tiff_f32_is_grayscale`: the same
 /// chunks-and-combinators traversal as `ref_tiff_u8_is_grayscale` over
-/// f32 lanes with the ratio predicate shared by construction.
+/// f32 lanes with an independent direct encoding of pinned `feqf` semantics.
 /// Same well-formed-buffers precondition for the sweep; short buffers
 /// scan only the whole rows present.
 #[cfg(test)]
@@ -319,7 +297,12 @@ fn ref_tiff_f32_is_grayscale(inp: &[f32], width: usize, height: usize) -> bool {
         .take(rows - 2)
     {
         for q in row.chunks_exact(4).skip(1).take(width - 2) {
-            if f32_triple_differs(q[0], q[1], q[2]) {
+            // Direct pinned feqf semantics, intentionally independent of
+            // the production predicate: fabsf(a - b) < eps.
+            if !((q[0] - q[1]).abs() < 0.01f32)
+                || !((q[0] - q[2]).abs() < 0.01f32)
+                || !((q[1] - q[2]).abs() < 0.01f32)
+            {
                 return false;
             }
         }
@@ -408,9 +391,9 @@ pub unsafe extern "C" fn darkroom_tiff_u16_is_grayscale(
 /// # Safety
 /// `inp` must hold at least `4 * width * height` f32 lanes (the C caller
 /// passes the float RGBA export buffer for a `width * height` image).
-/// Returns 1 when every interior pixel is grey (clamped pairwise ratios
-/// within 1.01), 0 as soon as one pixel differs. Null pointers,
-/// degenerate dims, and overflowing dim products are guarded no-ops
+/// Returns 1 when every interior pixel has all channel-pair differences
+/// strictly below 0.01, 0 as soon as one pair is not equal by pinned feqf.
+/// Null pointers, degenerate dims, and overflowing dim products are guarded no-ops
 /// returning 1 (no evidence of colour, so the C header keeps its
 /// grayscale assumption — the same value the C flag holds when the loop
 /// never trips).
@@ -852,10 +835,8 @@ mod tests {
         buf
     }
 
-    // Solid grey frames stay grayscale on every rail, including zeros,
-    // negatives, and sub-floor values (all clamped to 0.001 before the
-    // ratio, so they read as equal); the alpha lane is never read, so
-    // garbage there must not matter.
+    // Solid grey frames stay grayscale at varied values; the alpha lane
+    // is never read, so garbage there must not matter.
     #[test]
     fn solid_grey_is_grayscale_f32() {
         for v in [0.0f32, -3.5, 0.0005, 0.001, 0.5, 1.0, 100.0] {
@@ -870,13 +851,8 @@ mod tests {
         assert!(tiff_f32_is_grayscale(&buf, 3, 3));
     }
 
-    // Each lane pair can trip the scan (ratio 2.0 through that pair),
-    // and the threshold is strictly greater-than: a ratio of exactly
-    // 1.01f still counts as grey (exact in f32: x * 1.0 == x and
-    // x / 1.0 == x), while 1.02 trips. Note the C spells each pair in
-    // one direction only (r/g, r/b, g/b), so a lane that is SMALLER than
-    // its partners trips through a later pair, not its own: [1,2,1]
-    // trips via (g,b), and [1,1,0.5] via (r,b) and (g,b) together.
+    // Pinned feqf uses a strict absolute-difference threshold: exactly
+    // 0.01 is not equal, while smaller differences are equal.
     #[test]
     fn each_pair_trips_and_threshold_is_strict_f32() {
         let plant = |w: usize, h: usize, x: usize, y: usize, px: [f32; 4]| {
@@ -893,53 +869,30 @@ mod tests {
         assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.0, 1.0, 0.5, 1.0]), 5, 5));
         // g-b pair at another interior spot
         assert!(!tiff_f32_is_grayscale(&plant(5, 5, 1, 3, [1.0, 2.0, 1.0, 1.0]), 5, 5));
-        // boundary: exactly 1.01 stays grey, 1.02 does not
-        assert!(tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.01, 1.0, 1.0, 1.0]), 5, 5));
-        assert!(ref_tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.01, 1.0, 1.0, 1.0]), 5, 5));
-        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.02, 1.0, 1.0, 1.0]), 5, 5));
-        // just under the threshold stays grey
-        assert!(tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.009, 1.0, 1.0, 1.0]), 5, 5));
-        // a below-one ratio whose inverse exceeds the threshold trips
-        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [1.0, 0.5, 1.0, 1.0]), 5, 5));
+        // Exact difference is not equal because feqf uses strict <.
+        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [0.01, 0.0, 0.0, 1.0]), 5, 5));
+        assert!(!ref_tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [0.01, 0.0, 0.0, 1.0]), 5, 5));
+        assert!(!tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [0.0101, 0.0, 0.0, 1.0]), 5, 5));
+        assert!(tiff_f32_is_grayscale(&plant(5, 5, 2, 2, [0.009, 0.0, 0.0, 1.0]), 5, 5));
     }
 
-    // The 0.001 clamp happens before the ratio: values that would trip
-    // unclamped (raw ratio far above 1.01) stay grey once both sides hit
-    // the floor. NaN takes the floor too (NaN > 0.001 is false, as in C),
-    // so NaN lanes read as grey with no divergence between languages.
+    // Pairwise differences are absolute; near-black values remain
+    // grayscale when their pairwise distances are below tolerance, while
+    // NaN trips because !(NaN < eps) is true in C and Rust.
     #[test]
-    fn clamp_floor_before_ratio_f32() {
+    fn near_black_and_nan_f32() {
         let plant = |px: [f32; 4]| {
             let mut buf = grey_frame_f32(5, 5, 1.0, 1.0);
             let b = 4 * (2 * 5 + 2);
             buf[b..b + 4].copy_from_slice(&px);
             buf
         };
-        // raw ratios up to 1.8 that would trip unclamped stay grey once
-        // every lane hits the floor (all three clamp to 0.001)
-        assert!(tiff_f32_is_grayscale(&plant([0.0005, 0.0009, 0.0008, 1.0]), 5, 5));
-        // all zeros: every lane clamps to the floor, ratio exactly 1
+        assert!(tiff_f32_is_grayscale(&plant([0.002, 0.001, 0.001, 1.0]), 5, 5));
+        assert!(ref_tiff_f32_is_grayscale(&plant([0.002, 0.001, 0.001, 1.0]), 5, 5));
         assert!(tiff_f32_is_grayscale(&plant([0.0, 0.0, 0.0, 1.0]), 5, 5));
-        // negatives clamp the same way
-        assert!(tiff_f32_is_grayscale(&plant([-5.0, -0.2, 0.0, 1.0]), 5, 5));
-        // NaN lanes are grey, in kernel and reference alike
-        assert!(tiff_f32_is_grayscale(&plant([f32::NAN, 1.0, 1.0, 1.0]), 5, 5));
-        assert!(ref_tiff_f32_is_grayscale(&plant([f32::NAN, 1.0, 1.0, 1.0]), 5, 5));
-        assert!(tiff_f32_is_grayscale(
-            &plant([f32::NAN, f32::NAN, f32::NAN, f32::NAN]),
-            5,
-            5
-        ));
-        // a clamped lane against a live one still trips when the ratio
-        // genuinely exceeds the threshold in a tested direction
-        // (0.5 / 0.001 = 500 via the (r,g) pair)
-        assert!(!tiff_f32_is_grayscale(&plant([0.5, 0.0, 0.0, 1.0]), 5, 5));
-        // directional asymmetry is C's own: each pair is tested in one
-        // direction only, so a dark lane 0 against bright lanes 1 and 2
-        // reads grey (0.001/0.5 and 0.001/0.5 both below 1.01, and
-        // 0.5/0.5 is 1) — mirrored exactly, not "fixed"
-        assert!(tiff_f32_is_grayscale(&plant([0.0, 0.5, 0.5, 1.0]), 5, 5));
-        assert!(ref_tiff_f32_is_grayscale(&plant([0.0, 0.5, 0.5, 1.0]), 5, 5));
+        assert!(!tiff_f32_is_grayscale(&plant([f32::NAN, 1.0, 1.0, 1.0]), 5, 5));
+        assert!(!ref_tiff_f32_is_grayscale(&plant([f32::NAN, 1.0, 1.0, 1.0]), 5, 5));
+        assert!(!tiff_f32_is_grayscale(&plant([f32::NAN, f32::NAN, f32::NAN, 1.0]), 5, 5));
     }
 
     // The 1-pixel border is never read: colour anywhere on the outer
@@ -970,29 +923,13 @@ mod tests {
     }
 
     // Kernel and reference must agree exactly over several shapes, over
-    // magnitudes spanning the clamp floor (sub-floor, floor neighbourhood,
-    // unit, large) plus negatives and sparse planted colour pixels (both
-    // verdicts exercised).
+    // magnitudes spanning near-black through large values, plus sparse
+    // planted colour pixels (both verdicts exercised).
     #[test]
     fn matches_reference_over_sweep_f32() {
-        // Magnitudes chosen to straddle the 0.001 floor and the 1.01
-        // ratio: exact lanes, bit patterns via u32 shares, and
-        // near-threshold neighbours.
-        let mags = [
-            0.0f32,
-            -2.0,
-            0.0004,
-            0.0009,
-            0.001,
-            0.00101,
-            0.5,
-            1.0,
-            1.009,
-            1.01,
-            1.02,
-            3.25,
-            1e6,
-        ];
+        // Varied magnitudes and absolute channel offsets exercise the
+        // 0.01 pairwise threshold across the input range.
+        let mags = [0.0f32, -2.0, 0.0004, 0.5, 1.0, 3.25, 1e6];
         let shapes = [
             (1usize, 1usize),
             (2, 5),
@@ -1010,12 +947,12 @@ mod tests {
             for (i, q) in buf.chunks_exact_mut(4).enumerate() {
                 let pick = (i.wrapping_mul(2_654_435_761).wrapping_add(si)) % mags.len();
                 let base = mags[pick];
-                // neighbour lanes: same magnitude, one scaled by a
-                // near-threshold factor so some quads trip and most do not
-                let tweak = [1.0f32, 1.005, 1.02, 0.999, 0.5][i % 5];
+                // Absolute offsets straddle the tolerance independently
+                // of the channel magnitude.
+                let tweak = [0.0f32, 0.004, 0.009, 0.01, 0.02][i % 5];
                 q[0] = base;
-                q[1] = base * tweak;
-                q[2] = base / tweak;
+                q[1] = base + tweak;
+                q[2] = base - tweak;
                 q[3] = (i % 251) as f32;
             }
             assert_eq!(

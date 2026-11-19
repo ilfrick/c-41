@@ -176,9 +176,9 @@ int write_image(dt_imageio_module_data_t *d_tmp, const char *filename, const voi
       // Grayscale scan ported to Rust FFI (darkroom_tiff_f32_is_grayscale
       // in crates/c41-core/src/tiff.rs): result-identical serial scan of
       // the same 1-px-border-excluded interior, tripping on the first
-      // pixel whose 0.001-clamped R/G/B lane ratios exceed 1.01. The C
-      // flag was written idempotently, so the OpenMP schedule could not
-      // change the outcome.
+      // pixel with a channel-pair difference not strictly below 0.01,
+      // matching pinned feqf semantics. The C flag was written
+      // idempotently, so the OpenMP schedule could not change the outcome.
       if(!darkroom_tiff_f32_is_grayscale((const float *)in_void,
                                          (size_t)d->global.width,
                                          (size_t)d->global.height))

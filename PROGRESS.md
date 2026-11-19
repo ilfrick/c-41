@@ -11087,3 +11087,17 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The ONNX output-safety increment recorded above at entry-time as uncommitted was committed as `523ec0501fb5c5f2208b954b761fa0e6e8138256`, pushed through both configured origin URLs, and verified at matching GitHub/Gitea refs and local tracking refs. GitHub CMake+Rust run `44584743127`/job `135774538487` and Docker run `44584743157`/job `135774533198` succeeded; full-C image was skipped as on-demand.
 
 **Delivery at entry time.** Preset-popup correction and evidence are validated but not yet committed/pushed. S9 remains selective and incomplete.
+
+## 2026-11-19 20:33 UTC — S9: correct float TIFF monochrome classification
+
+**Change.** Ported pinned darktable `8c3b4a2ea5c0d167c9566cf2821662e20b2b8ea4` to the active C-to-Rust TIFF float classifier: `crates/c41-core/src/tiff.rs` now applies pairwise `!feqf(a, b, 0.01f)` semantics, with an independent reference and near-black, strict-threshold, beyond-tolerance and NaN tests. Updated the retained C call-site comment. u8/u16 paths are unchanged; no broad TIFF/Rust parity claim. The triage row is APPLIED; corrected the stale JPEG `27fb7ad...` APPLY row to APPLIED based on the existing casts from C-41 ancestor `ac5e8b7f8c`. Updated Roadmap; `PARITY_AUDIT.md` has no matching TIFF grayscale gap.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. The optional adjacent-float suggestion was not adopted: the strict-boundary test uses `0.01f32 - 0.0f32`, which yields exactly the `0.01f32` threshold value.
+
+**Verification.** Mounted Docker Release/Ninja C build with `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_AI=ON`, built-in `-Werror`, verified ONNX Runtime 1.24.4, and mounted Cargo/Rustup exited 0; CTest passed 22/22. `scripts/ci-local.sh` exited 0; all four gates passed. `git diff --check HEAD` passed. No host C build or manual global `-Werror`.
+
+**Failures and corrections.** A focused host `cargo test -p c41-core tiff::tests` could not link because host `lensfun`, `gphoto2`, and `gphoto2_port` libraries are unavailable; the Docker C/CTest and full project gates above passed. No repository dependency changes were made.
+
+**Prior delivery correction.** The 2026-11-19 18:50 popup entry says its change was not yet committed/pushed at entry time. It was delivered as `9ca75469a5b446a5a636e714b0cbb96159c302cb`; both GitHub/Gitea master refs match, and required GitHub CMake+Rust check `135802982022` and Docker check `135802981054` succeeded. The full-C workflow was skipped as on-demand.
+
+**Delivery at entry time.** The TIFF classifier change is reviewed and locally verified but not yet committed/pushed. S9 remains selective and incomplete.
