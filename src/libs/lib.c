@@ -1078,7 +1078,7 @@ static gboolean _lib_plugin_arrow_button_press(GtkWidget *w,
   else if(e->button == GDK_BUTTON_SECONDARY)
   {
     if(gtk_widget_get_sensitive(module->presets_button))
-      _presets_popup_callback(NULL, NULL, module);
+      _presets_popup_callback(GTK_BUTTON(module->presets_button), NULL, module);
 
     return TRUE;
   }
@@ -1707,7 +1707,7 @@ static float _action_process(gpointer target,
       break;
     case DT_ACTION_ELEMENT_PRESETS:
       if(module->get_params || module->set_preferences)
-        _presets_popup_callback(NULL, NULL, module);
+        _presets_popup_callback(GTK_BUTTON(module->presets_button), NULL, module);
       break;
     }
   }

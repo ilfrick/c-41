@@ -11075,3 +11075,15 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The 2026-11-18 thumbnail entry records its state at entry time. Thumbnail fix `6acbae167c8465305a594f408465900b53de9966` was subsequently committed and pushed to both origin URLs; local `origin/master` and `gitea/master` matched. GitHub CMake+Rust run `44300171201`/check `134787535758` and Docker run `44300171102`/check `134787534930` completed successfully.
 
 **Delivery at entry time.** ONNX output-safety changes are staged/uncommitted; commit and dual-push verification remain. S9 remains selective and incomplete.
+
+## 2026-11-19 18:50 UTC — S9: anchor library preset popup actions
+
+**Change.** Ported pinned darktable `5dc2392e865edeb56b16412ca02812a3d6397c68` to retained `src/libs/lib.c`: both the header secondary-click callback and C-41's `DT_ACTION_ELEMENT_PRESETS` fallback now pass `GTK_BUTTON(module->presets_button)` instead of NULL. `_presets_popup_callback()` uses the button to anchor the preset popup's action group; passing NULL can leave module preferences without an action group and crash (reported for `metadata_view`). Updated the S9 triage and Roadmap. This is GTK3 retained-C only; no Rust GTK4 parity claim.
+
+**Review.** Fresh independent same-model senior review APPROVED the full diff with no findings or suggestions. It confirmed the button is created before these handlers are reachable and both paths pass it correctly. No narrow headless test is available: reproducing the failure requires live GTK popup/action-group and module state. The full CTest suite compiles the path but does not exercise the right-click interaction.
+
+**Verification.** Mounted Docker Release/Ninja build with `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_AI=ON`, built-in `-Werror`, verified ONNX Runtime 1.24.4 and mounted Cargo/Rustup completed and linked with exit 0; CTest passed 22/22. `scripts/ci-local.sh` exited 0; all four gates passed. `git diff --check HEAD` passed.
+
+**Prior delivery correction.** The ONNX output-safety increment recorded above at entry-time as uncommitted was committed as `523ec0501fb5c5f2208b954b761fa0e6e8138256`, pushed through both configured origin URLs, and verified at matching GitHub/Gitea refs and local tracking refs. GitHub CMake+Rust run `44584743127`/job `135774538487` and Docker run `44584743157`/job `135774533198` succeeded; full-C image was skipped as on-demand.
+
+**Delivery at entry time.** Preset-popup correction and evidence are validated but not yet committed/pushed. S9 remains selective and incomplete.
