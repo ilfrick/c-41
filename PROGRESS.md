@@ -11113,3 +11113,15 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The 2026-11-19 20:33 TIFF entry records the change as not yet committed/pushed at entry time. It was delivered as `e54898be894b435490a3e98173fcaecd41acbff2`; GitHub and Gitea master refs and local tracking refs match. GitHub check+test+clippy `135867078694`, CMake+Rust `135867079390`, and Docker image `135867079536` succeeded; full-C check `135867082500` was skipped as on-demand.
 
 **Delivery at entry time.** The gradient-slider correction is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+
+## 2026-11-19 21:50 UTC — S9: release Lua thread reference
+
+**Change.** Ported pinned darktable `4ba81d1b0d0232e2e07580863b434dd0c857a8c7` in `src/lua/call.c::dt_lua_init_call()`: `g_thread_new("lua thread",lua_thread_main,NULL)` is now wrapped with `g_thread_unref()`, releasing the caller-owned reference to the long-running, non-joined Lua thread. Execution/lifecycle behavior is unchanged. Added the scoped retained-C APPLIED row to `docs/parity-inventory/commit-triage.md` and updated `ROADMAP.md`; `USE_LUA=ON` is enabled in the Docker build. No Rust Lua parity claim.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. A focused reference-count/lifecycle test was not added because no robust existing seam is available; this is recorded in triage.
+
+**Verification.** Mounted Docker Release/Ninja build with `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_AI=ON`, built-in `-Werror`, verified ONNX Runtime 1.24.4, and Cargo/Rustup mounted: build exited 0 and CTest passed 22/22. `scripts/ci-local.sh` exited 0; `cargo check --workspace`, `cargo clippy --workspace`, `cargo test --workspace --release`, and `cargo build --release -p c41 --bin c41-rs` all passed. `git diff --check HEAD` passed. No host C build or manual global `-Werror`.
+
+**Prior delivery correction.** The 2026-11-19 21:16 slider entry records the change as not yet committed/pushed at entry time. It was delivered as `a0c93542d085b6e4983f5594c68d9830b68c3acf`, dual-pushed with both GitHub/Gitea refs verified. GitHub CMake+Rust check `135892998357` and Docker check `135892997793` succeeded; full-C was skipped as on-demand.
+
+**Delivery at entry time.** The Lua reference fix is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
