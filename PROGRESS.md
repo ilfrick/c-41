@@ -11137,3 +11137,17 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The 2026-11-19 21:50 Lua entry records its change as not yet committed/pushed at entry time. It was delivered as `ef01220dab234984856f04013e0cdc894f76e9d1`, dual-pushed with GitHub and Gitea master refs verified. GitHub Fork CI `44623671884` and Docker run `44623671897` succeeded; full-C was skipped as on-demand.
 
 **Delivery at entry time.** The GPX filename fix is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+
+## 2026-11-19 23:50 UTC — S9: avoid redundant preset-label updates
+
+**Change.** Ported pinned darktable `3b88968d8751a65f2bee85fa858e0c6bae4fa3ef` in retained `src/libs/lib.c::_set_module_preset_label()`: read the current GTK label text and skip `gtk_label_set_text()` when the generated text is unchanged. This prevents redundant GTK label updates from retriggering the update loop through preset application (`src/libs/lib.c:395`) and `dt_lib_gui_update()` (`src/libs/lib.c:923`); existing label generation remains unchanged. Added the scoped APPLIED row to `docs/parity-inventory/commit-triage.md` and updated the S9 Roadmap summary. No matching `PARITY_AUDIT.md` item; no Rust GTK4 UI parity claim.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. `gtk_label_get_text()`'s label-owned pointer remains valid through candidate generation and comparison, until the label is changed.
+
+**Verification.** Mounted Docker Release/Ninja C build with `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_AI=ON`, built-in `-Werror`, verified ONNX Runtime 1.24.4, and mounted Cargo/Rustup exited 0. The incremental build compiled `src/libs/lib.c` (`[6/197]`); CTest passed 22/22. `scripts/ci-local.sh` exited 0; all four gates passed, including 599 release tests and the release binary link. `git diff --check HEAD` passed. No host C build or manual global `-Werror`.
+
+**Test limitation.** No focused GTK label-update test was added: the repository has no library-widget test harness or isolated recursive-update seam, and the CTest suite does not exercise a live GTK widget update loop.
+
+**Prior delivery correction.** The 2026-11-19 22:53 GPX entry says the change was not yet committed/pushed at entry time. It was delivered as `520c413e7b90d8934b1ed3c3c10e027e1dfc6675`; direct and tracking GitHub/Gitea master refs match. GitHub CMake+Rust run `44633301813` and Docker run `44633302161` succeeded; the full-C workflow was skipped as on-demand.
+
+**Delivery at entry time.** The preset-label guard is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
