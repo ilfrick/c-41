@@ -201,8 +201,7 @@ static void _apply_filmroll_gpx(dt_film_t *cfr)
     while((dfn = g_dir_read_name(cfr->dir)) != NULL)
     {
       /* check if we have a gpx to be auto applied to filmroll */
-      const size_t len = strlen(dfn);
-      if(strcmp(dfn + len - 4, ".gpx") == 0 || strcmp(dfn + len - 4, ".GPX") == 0)
+      if(g_str_has_suffix(dfn, ".gpx") || g_str_has_suffix(dfn, ".GPX"))
       {
         gchar *gpx_file = g_build_path(G_DIR_SEPARATOR_S, cfr->dirname, dfn, NULL);
         gchar *tz = dt_conf_get_string("plugins/lighttable/geotagging/tz");

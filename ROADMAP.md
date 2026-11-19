@@ -110,6 +110,8 @@ Pinned `fd127daf545086f4f2bd192b6ab36205fb29472f` è **APPLIED, S9** in `src/dtg
 
 Pinned `06ab26a51711cbec27e087546851dd52c3329538` is **APPLIED, S9** for retained-C `dt_thumbnail_reload_infos()`, freeing the owned prior `thumb->filename` before replacement. Repeated thumbnail refresh/metadata reloads no longer leak each replaced filename. No focused GTK lifecycle test or Rust GTK4 parity claim.
 
+Pinned `c853b766ec958a6a9dc0e6eee9e234ac6d0ae836` is **APPLIED, S9** in retained-C `src/control/jobs/film_jobs.c::_apply_filmroll_gpx()`: GLib suffix checks replace `dfn + strlen(dfn) - 4`, preventing an out-of-bounds read for short directory entry names while retaining the `.gpx`/`.GPX` case-sensitive matches. The active import flow reaches the scan at lines 313 and 372. No focused test was added because exercising the static helper entails directory enumeration and geotag side effects; a narrow robust test would need an invasive seam or filesystem/environment-dependent setup. No broader import or Rust parity claim.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.

@@ -11125,3 +11125,15 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The 2026-11-19 21:16 slider entry records the change as not yet committed/pushed at entry time. It was delivered as `a0c93542d085b6e4983f5594c68d9830b68c3acf`, dual-pushed with both GitHub/Gitea refs verified. GitHub CMake+Rust check `135892998357` and Docker check `135892997793` succeeded; full-C was skipped as on-demand.
 
 **Delivery at entry time.** The Lua reference fix is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+
+## 2026-11-19 22:53 UTC — S9: guard short GPX filenames during film import
+
+**Change.** Ported pinned darktable `c853b766ec958a6a9dc0e6eee9e234ac6d0ae836` in retained-C `src/control/jobs/film_jobs.c::_apply_filmroll_gpx()`: replaced `dfn + strlen(dfn) - 4` suffix checks with `g_str_has_suffix(dfn, ".gpx") || g_str_has_suffix(dfn, ".GPX")`. This preserves the exact case-sensitive accepted suffixes while avoiding out-of-bounds pointer formation/read for imported directory entries shorter than four bytes. The scan is reached at `src/control/jobs/film_jobs.c:313` and `:372`. Added the narrowly scoped APPLIED S9 triage row and Roadmap evidence; no matching parity-audit item. No broader import or Rust parity claim.
+
+**Review.** Independent same-model senior reviewer APPROVED with no findings. The reviewer suggested a temporary-directory integration test if a suitable import harness exists. A focused search found no film-import/GPX test under `src/tests`; exercising the static helper through production flow also triggers directory enumeration and geotag side effects. No test was added; this limitation is recorded in triage.
+
+**Verification.** Mounted Docker Release/Ninja C build with source read-only, `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_AI=ON`, `USE_LUA=ON`, built-in `-Werror`, verified ONNX Runtime 1.24.4, and mounted Cargo/Rustup exited 0; CTest passed 22/22. The build compiled `src/control/jobs/film_jobs.c` as `[6/197]`. `scripts/ci-local.sh` exited 0; all four gates passed. `git diff --check HEAD` passed. No host C build or manual global `-Werror`.
+
+**Prior delivery correction.** The 2026-11-19 21:50 Lua entry records its change as not yet committed/pushed at entry time. It was delivered as `ef01220dab234984856f04013e0cdc894f76e9d1`, dual-pushed with GitHub and Gitea master refs verified. GitHub Fork CI `44623671884` and Docker run `44623671897` succeeded; full-C was skipped as on-demand.
+
+**Delivery at entry time.** The GPX filename fix is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
