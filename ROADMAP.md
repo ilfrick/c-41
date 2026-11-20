@@ -122,6 +122,8 @@ Pinned `aede6e791b0e213ed22c69e1fd93c57d1e0cd1b3` is **APPLIED, S9** for retaine
 
 Pinned `a8132f49e3ded79092c50d64916b099f870ffc87` is **APPLIED, S9** for retained optional C `src/imageio/format/jxl.c::write_image()`: use `g_try_realloc()` for codestream growth, check a temporary pointer, and leave `out_buf` intact for shared cleanup if allocation fails. JXL is enabled in the Docker CMake build (`USE_JXL=ON`), though the production Docker image is Cargo-only; no allocator-failure test seam or Rust exporter parity claim.
 
+Pinned `f52993027d5c13e6f6d41a96e5fd483d8f519297` is **PARTIAL APPLY, S9** for retained `src/views/darkroom.c::enter()`: restore focus only when `plugins/darkroom/<op>/expanded` is true. Use the per-operation preference because C-41 initializes `module->expanded` only for `multi_priority == 0`. The pinned multi-instance reconciliation and CSS change remain deferred; no Rust focus parity claim or focused GTK test seam.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.

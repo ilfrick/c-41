@@ -11228,4 +11228,16 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 
 **Test limitation.** No deterministic JXL allocator-failure seam exists; the Docker build/CTest validates compilation but does not directly exercise `g_try_realloc()` failure recovery.
 
-**Delivery at entry time.** The JXL codestream allocation fix is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+**Prior delivery correction.** The 2026-11-20 07:51 UTC JXL entry records the fix as not yet committed/pushed at entry time. It was delivered as `7a41c8cbcf9594b7626fcc3970a15afd32f9b4b1`; direct GitHub/Gitea master refs match. Pre-push four-gate CI passed; GitHub CMake+Rust `44700427240` and Docker `44700426955` succeeded. Full-C and platform matrix jobs were skipped.
+
+## 2026-11-20 09:25 UTC — S9: avoid restoring focus onto collapsed darkroom operation
+
+**Change.** Ported the narrow retained-C behavior from pinned darktable `f52993027d5c13e6f6d41a96e5fd483d8f519297` in `src/views/darkroom.c::enter()`. Collapsing the active module clears focus but leaves `plugins/darkroom/active` naming that operation. Darkroom entry now reads its persisted `plugins/darkroom/<op>/expanded` value and restores focus only if the operation was left expanded; otherwise it clears focus. Read the per-operation preference rather than `module->expanded`, which C-41 initializes only for `multi_priority == 0`. This is **PARTIAL APPLY**: the pinned `_expand_focused_instance()` multi-instance reconciliation and CSS focused-border delta remain deferred. No matching `PARITY_AUDIT.md` item or Rust focus-parity claim.
+
+**Review.** Independent same-model senior review APPROVED with no findings. It confirmed the preference key, in-scope `option[1024]` buffer, safe `dt_iop_request_focus(NULL)` behavior, and harmless repeated focus calls for matching instances. The reviewer noted that a `break` could clarify the loop, but the pinned implementation also loops; no change was needed.
+
+**Verification.** Mounted Docker Release/Ninja build used source read-only and the existing CMake configuration (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_JXL=ON`), built-in `-Werror`; it compiled `src/views/darkroom.c` at `[7/8]` and linked the darkroom plugin. CTest passed 21/21; Docker command exited 0. `scripts/ci-local.sh` exited 0; all four gates passed, including release tests and release binary link. `git diff --check HEAD` passed before this progress append.
+
+**Test limitation.** No focused GTK regression-test seam exists for darkroom entry/focus restoration; the Docker build and CTests validate compilation but do not exercise this UI behavior.
+
+**Delivery at entry time.** The collapsed-focus guard is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
