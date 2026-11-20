@@ -134,6 +134,19 @@ static _images_job_data_t* _dup_images_job_data_t(_images_job_data_t *data)
   return d;
 }
 
+static void _free_images_job_data(_images_job_data_t *data,
+                                  const gboolean free_style_strings)
+{
+  if(!data) return;
+
+  g_list_free(data->imgs);
+  if(free_style_strings)
+    g_list_free_full(data->styles, g_free);
+  else
+    g_list_free(data->styles);
+  g_free(data);
+}
+
 static inline gboolean _job_cancelled(dt_job_t *job)
 {
   return dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED;
@@ -2382,9 +2395,14 @@ static void _add_history_job_data(const char *title,
                                   dt_job_execute_callback execute,
                                   _images_job_data_t *images_job_data)
 {
+  // nothing below will take ownership of the data
   if(!images_job_data->imgs || !execute)
+  {
+    _free_images_job_data(images_job_data, TRUE);
     return;
+  }
 
+  gboolean style_strings_owned_by_sync_job = FALSE;
   GList *link = darktable.develop
     ? g_list_find(images_job_data->imgs,
                   GINT_TO_POINTER(darktable.develop->image_storage.id))
@@ -2400,20 +2418,35 @@ static void _add_history_job_data(const char *title,
 
     images_job_data->imgs = g_list_remove_link(images_job_data->imgs, link);
 
-    dt_control_add_job(DT_JOB_QUEUE_SYNCHRONOUS,
-                       _control_generic_images_job_create(execute, title, 0,
-                                                          (gpointer)d,
-                                                          PROGRESS_BLOCKING, FALSE));
+    dt_job_t *sync_job = _control_generic_images_job_create(execute, title, 0,
+                                                            (gpointer)d,
+                                                            PROGRESS_BLOCKING, FALSE);
+    if(sync_job)
+    {
+      dt_control_add_job(DT_JOB_QUEUE_SYNCHRONOUS, sync_job);
+      style_strings_owned_by_sync_job = TRUE;
+    }
+    else
+      _free_images_job_data(d, FALSE);
   }
   // if there are any images left in the list after removing the
   // darkroom image, process them asynchronously but block user
   // interactions other than cancellation
   if(images_job_data->imgs)
   {
-    dt_control_add_job(DT_JOB_QUEUE_USER_FG,
-                       _control_generic_images_job_create(execute, title, 0,
-                                                          (gpointer)images_job_data,
-                                                          PROGRESS_BLOCKING, FALSE));
+    dt_job_t *async_job = _control_generic_images_job_create(execute, title, 0,
+                                                             (gpointer)images_job_data,
+                                                             PROGRESS_BLOCKING, FALSE);
+    if(async_job)
+      dt_control_add_job(DT_JOB_QUEUE_USER_FG, async_job);
+    else
+      _free_images_job_data(images_job_data, !style_strings_owned_by_sync_job);
+  }
+  else
+  {
+    // nothing left for a job either. the strings behind styles belong to
+    // the synchronous job above, if one successfully took ownership
+    _free_images_job_data(images_job_data, !style_strings_owned_by_sync_job);
   }
 }
 
