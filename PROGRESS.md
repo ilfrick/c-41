@@ -11216,4 +11216,16 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 
 **Test limitation.** The HEIF-enabled build and CTests do not inject a `heif_image_add_plane()` allocation failure; no focused libheif failure-test seam was identified.
 
-**Delivery at entry time.** The HEIF plane-allocation guard is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+**Prior delivery correction.** The 2026-11-20 07:11 UTC HEIF plane-allocation entry records the guard as not yet committed/pushed at entry time. It was delivered as `d5e45dc293829f061d0ec7e1cf2cb16e4ec3c934`; direct GitHub/Gitea master refs match. Pre-push four-gate CI passed; GitHub CMake+Rust `44693936485` and Docker `44693936465` succeeded; full-C and Darkroom workflows were skipped on demand.
+
+## 2026-11-20 07:51 UTC — S9: preserve JXL codestream buffer on realloc failure
+
+**Change.** Ported pinned darktable `a8132f49e3ded79092c50d64916b099f870ffc87` in retained optional C `src/imageio/format/jxl.c::write_image()`. The old `g_realloc()` aborts on OOM, making the following NULL check ineffective. The code now calls `g_try_realloc()` into `uint8_t *reallocated_buf`, invokes `JXL_FAIL()` if it returns NULL, and assigns `out_buf` only after success. Because `g_try_realloc()` preserves the old allocation on failure, the shared `end` cleanup still frees it; on success, the cursor is restored from the saved offset. The pinned one-line change was not applied verbatim because overwriting `out_buf` with NULL would leak the original buffer. JXL is enabled in the CMake build (`USE_JXL=ON`); the production Docker image is Cargo-only, so this is a retained optional C path, not a production-image or Rust JXL exporter parity claim. Added a scoped S9 triage row and Roadmap note; no matching `PARITY_AUDIT.md` item.
+
+**Review.** Independent same-model senior review APPROVED with no findings. It verified `g_try_realloc()` failure preserves `out_buf`, `JXL_FAIL()` reaches shared cleanup, and the successful path restores the output cursor. A focused allocation-failure test seam could verify recovery if added later.
+
+**Verification.** Mounted Docker Release/Ninja build used source read-only and JXL-enabled CMake configuration; it compiled `src/imageio/format/jxl.c` at `[9/199]`, linked the JPEG XL plugin, and CTest passed 21/21. Docker build/test command exited 0; CMake was configured with `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_JXL=ON`, built-in `-Werror`; no manual global `-Werror`. `scripts/ci-local.sh` exited 0; all four gates passed, including release tests and release binary link. `git diff --check HEAD` passed after the progress update.
+
+**Test limitation.** No deterministic JXL allocator-failure seam exists; the Docker build/CTest validates compilation but does not directly exercise `g_try_realloc()` failure recovery.
+
+**Delivery at entry time.** The JXL codestream allocation fix is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.

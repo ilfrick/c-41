@@ -120,6 +120,8 @@ Pinned `bf541457f5abbe74dbbd6d907f3dc3e227cb8102` and follow-up `227b4336e8c7200
 
 Pinned `aede6e791b0e213ed22c69e1fd93c57d1e0cd1b3` is **APPLIED, S9** for retained optional C `src/imageio/format/heif.c::write_image()`: check `heif_image_add_plane()` and release the locally owned image before returning failure. This occurs before context/encoder creation; no focused libheif allocation-failure test seam or Rust HEIF exporter parity claim.
 
+Pinned `a8132f49e3ded79092c50d64916b099f870ffc87` is **APPLIED, S9** for retained optional C `src/imageio/format/jxl.c::write_image()`: use `g_try_realloc()` for codestream growth, check a temporary pointer, and leave `out_buf` intact for shared cleanup if allocation fails. JXL is enabled in the Docker CMake build (`USE_JXL=ON`), though the production Docker image is Cargo-only; no allocator-failure test seam or Rust exporter parity claim.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.
