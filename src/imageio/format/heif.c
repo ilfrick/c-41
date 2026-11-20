@@ -410,18 +410,22 @@ int write_image(dt_imageio_module_data_t *data,
   if(exif && exif_len > 0)
   {
     char *xmp_string = dt_exif_xmp_read_string(imgid);
-    const size_t xmp_len = strlen(xmp_string);
-    if(xmp_string && (xmp_len > 0))
+    if(xmp_string)
     {
-      err = heif_context_add_XMP_metadata(context, handle, xmp_string, xmp_len);
-      g_free(xmp_string);
-      if(err.code != heif_error_Ok)
+      const size_t xmp_len = strlen(xmp_string);
+      if(xmp_len > 0)
       {
-         dt_print(DT_DEBUG_ALWAYS,
-                  "[heif export] failed to save XMP metadata: %s (%d)",
-                  err.message, err.code);
-         return 1; // failure
+        err = heif_context_add_XMP_metadata(context, handle, xmp_string, xmp_len);
+        if(err.code != heif_error_Ok)
+        {
+          g_free(xmp_string);
+          dt_print(DT_DEBUG_ALWAYS,
+                   "[heif export] failed to save XMP metadata: %s (%d)",
+                   err.message, err.code);
+          return 1; // failure
+        }
       }
+      g_free(xmp_string);
     }
   }
 

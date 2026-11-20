@@ -11192,4 +11192,16 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 
 **Prior delivery correction.** The 2026-11-20 03:19 UTC history-job entry records the fix as not yet committed/pushed at entry time. It was delivered as `0424ffedcba69154ba36c7098963b2f4471be095`; direct GitHub/Gitea master refs match. GitHub Fork CI `44668056179` and Docker `44668056073` succeeded; Darkroom CI `44668056039` was skipped as on-demand.
 
-**Delivery at entry time.** The thumbnail fallback fix is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+**Prior delivery correction.** The 2026-11-20 04:21 UTC thumbnail entry records the fallback fix as not yet committed/pushed at entry time. It was delivered as `b1e1f3316204e97f1f7f99a72dca640bf85cca87`; direct GitHub/Gitea master refs match. Pre-push four-gate CI passed on both push URLs; GitHub Fork CI `44676289361` and Docker `44676289206` succeeded; full-C `44676289213` was skipped on demand.
+
+## 2026-11-20 06:20 UTC — S9: guard HEIF XMP length against NULL
+
+**Change.** Ported the final pinned behavior from darktable `bf541457f5abbe74dbbd6d907f3dc3e227cb8102` and follow-up `227b4336e8c7200af374d377f3c3ab99373b817a` to retained optional C `src/imageio/format/heif.c::write_image()`. C-41 previously called `strlen(xmp_string)` before checking the pointer, while `dt_exif_xmp_read_string()` can return NULL on an Exiv2 exception (`src/common/exif.cc:5441`). The code now checks non-NULL first, preserves the full `strlen()` byte count (the initial pinned guard's precedence mistake was corrected by `227b`), skips metadata insertion for an empty string, and frees the owned result on empty, success, and metadata-add error paths. `USE_HEIF=ON` is enabled in the Docker C build and links libheif. Also reconciled the stale WebP triage row: C-41 already contains the RGBX-import error check and guarded `fclose(out)` from `cd9c036ecb0f23247328f6039a167fad77adff1d`. Updated the scoped S9 triage and Roadmap notes. No matching `PARITY_AUDIT.md` item, no direct HEIF XMP error-injection test seam, and no Rust exporter parity claim.
+
+**Review.** Independent same-model senior review APPROVED with no findings after tracing the NULL, empty, nonempty, and metadata-add error paths, and confirming the pinned final string-length semantics.
+
+**Verification.** Mounted Docker Release/Ninja build used source read-only with `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_HEIF=ON`, `USE_AI=OFF`, built-in `-Werror`; no manual global `-Werror`. It compiled `src/imageio/format/heif.c` at `[18/199]`, linked `libheif.so`, and CTest passed 21/21; Docker command exited 0. `scripts/ci-local.sh` exited 0 and reported all four gates passed, including release tests and release binary link. `git diff --check HEAD` passed.
+
+**Test limitation.** CTest validates the HEIF-enabled C build but does not exercise a NULL XMP return or export behavior; no focused HEIF export test seam was found.
+
+**Delivery at entry time.** The HEIF XMP guard is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
