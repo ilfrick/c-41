@@ -11253,3 +11253,13 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Test limitation.** No focused GTK test seam exists for the W-key full-preview action; CTest and the Docker build validate compilation but do not exercise this UI state restoration at runtime.
 
 **Delivery at entry time.** The saved-module mask-state target is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+
+## 2026-11-20 20:30 UTC — S9: pair right-click release in shortcut mapping
+
+**Change.** Applied pinned darktable `bade7068264e5b7c750f92f04cb8683c6a3377db7` in retained GTK3 `src/libs/tools/global_toolbox.c::_main_do_event_keymap()`. Track a grabbed secondary-button press and pass through its paired release only when the release comes from the same `GdkDevice`. Clear pending state when a new ordinary secondary press starts, when mapping mode toggles, and during module cleanup. This is optional retained GTK3 behavior; no GTK event-test seam exists and no Rust GTK4 parity is claimed.
+
+**Review.** Independent senior review found a stale-pending-state case if press/release device pointers differ. Fixed by always clearing the pending state on release and suppressing the normal secondary-click action only for a matching device.
+
+**Verification.** `scripts/ci-local.sh` completed successfully; its final output states “All four CI steps passed.” `git diff --check` passed. No focused GTK event regression test is available.
+
+**Delivery at entry time.** Not yet committed or pushed. S9 remains selective and incomplete.

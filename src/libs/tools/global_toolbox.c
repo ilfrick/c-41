@@ -43,6 +43,9 @@ typedef struct dt_lib_tool_preferences_t
   GtkWidget *over_culling_label, *over_culling_r0, *over_culling_r3, *over_culling_r4, *over_culling_r6,
       *over_culling_timeout, *over_culling_tt;
   gboolean disable_over_events;
+  gboolean key_click;
+  // Referenced only while a right-button release is pending.
+  GdkDevice *key_click_device;
 } dt_lib_tool_preferences_t;
 
 /* callback for grouping button */
@@ -54,6 +57,14 @@ static void _lib_help_button_clicked(GtkWidget *widget, gpointer user_data);
 /* callbacks for key mapping button */
 static void _lib_keymap_button_clicked(GtkWidget *widget, gpointer user_data);
 static gboolean _lib_keymap_button_press_release(GtkWidget *button, GdkEventButton *event, gpointer user_data);
+
+static void _clear_pending_key_click(dt_lib_tool_preferences_t *d)
+{
+  d->key_click = FALSE;
+  if(d->key_click_device)
+    g_object_unref(d->key_click_device);
+  d->key_click_device = NULL;
+}
 
 const char *name(dt_lib_module_t *self)
 {
@@ -523,6 +534,8 @@ void gui_init(dt_lib_module_t *self)
 
 void gui_cleanup(dt_lib_module_t *self)
 {
+  dt_lib_tool_preferences_t *d = self->data;
+  if(d) _clear_pending_key_click(d);
   g_free(self->data);
   self->data = NULL;
 }
@@ -700,7 +713,19 @@ static void _main_do_event_keymap(GdkEvent *event, gpointer data)
     break;
   case GDK_BUTTON_PRESS:
     if(gdk_display_device_is_grabbed(gdk_window_get_display(event->button.window), event->button.device))
+    {
+      if(event->button.button == GDK_BUTTON_SECONDARY)
+      {
+        _clear_pending_key_click(d);
+        d->key_click = TRUE;
+        if(event->button.device)
+          d->key_click_device = g_object_ref(event->button.device);
+      }
       break;
+    }
+
+    if(event->button.button == GDK_BUTTON_SECONDARY)
+      _clear_pending_key_click(d);
 
     GtkWidget *main_window = dt_ui_main_window(darktable.gui->ui);
     if(gtk_widget_get_toplevel(event_widget) != main_window)
@@ -745,6 +770,13 @@ static void _main_do_event_keymap(GdkEvent *event, gpointer data)
     if(event->button.button != GDK_BUTTON_SECONDARY)
       break;
 
+    if(d->key_click)
+    {
+      const gboolean paired_device = event->button.device == d->key_click_device;
+      _clear_pending_key_click(d);
+      if(paired_device) break;
+    }
+
     if(dt_gui_long_click(event->button.time, click_time))
       dt_shortcut_copy_lua(NULL, NULL);
     else
@@ -776,6 +808,9 @@ static void _lib_help_button_clicked(GtkWidget *widget, gpointer user_data)
 
 static void _lib_keymap_button_clicked(GtkWidget *widget, gpointer user_data)
 {
+  dt_lib_tool_preferences_t *d = user_data;
+  _clear_pending_key_click(d);
+
   if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget)))
   {
     dt_control_forbid_change_cursor();
