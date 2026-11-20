@@ -124,6 +124,8 @@ Pinned `a8132f49e3ded79092c50d64916b099f870ffc87` is **APPLIED, S9** for retaine
 
 Pinned `f52993027d5c13e6f6d41a96e5fd483d8f519297` is **PARTIAL APPLY, S9** for retained `src/views/darkroom.c::enter()`: restore focus only when `plugins/darkroom/<op>/expanded` is true. Use the per-operation preference because C-41 initializes `module->expanded` only for `multi_priority == 0`. The pinned multi-instance reconciliation and CSS change remain deferred; no Rust focus parity claim or focused GTK test seam.
 
+Pinned `976fdb2d0c5f4cd936ab03e4a8bc9b32fd5b8d97` is **PARTIAL APPLY, S9** for retained `src/views/darkroom.c::_action_process_preview()`: restore mask edit mode on `full_preview_last_module`, not whichever module is currently focused. C-41's `dt_masks_set_edit_mode()` is NULL-safe, so this is not a null-dereference fix. Entry-side mask-state reset and focus-handling changes remain deferred; no focused GTK test seam or Rust parity claim.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.

@@ -11240,4 +11240,16 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 
 **Test limitation.** No focused GTK regression-test seam exists for darkroom entry/focus restoration; the Docker build and CTests validate compilation but do not exercise this UI behavior.
 
-**Delivery at entry time.** The collapsed-focus guard is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+**Prior delivery correction.** The 2026-11-20 09:25 UTC collapsed-focus entry records the guard as not yet committed/pushed at entry time. It was delivered as `7372d9b6a5ae5049c317674b23b9c293d61c289b`; direct GitHub/Gitea master refs match. Pre-push four-gate CI passed; GitHub CMake+Rust `44711323131` and Docker `44711323221` succeeded. Full-C and platform matrix jobs were skipped.
+
+## 2026-11-20 09:55 UTC — S9: restore mask edit state on saved full-preview module
+
+**Change.** Ported the narrow saved-module target from pinned darktable `976fdb2d0c5f4cd936ab03e4a8bc9b32fd5b8d97` in retained `src/views/darkroom.c::_action_process_preview()`. On full-preview exit, C-41 restored focus to `full_preview_last_module` but applied `full_preview_masks_state` to `dt_dev_gui_module()`. `dt_iop_request_focus()` can return early during `DT_IN_GUI_UPDATE()`, leaving the current module different from the saved one. The mask edit state is now applied directly to `full_preview_last_module`. `dt_masks_set_edit_mode()` already returns for NULL or missing blend data, so this is not a NULL-dereference fix. Only the saved-module target is ported; pinned entry-side mask-state reset and focus changes remain deferred. No matching `PARITY_AUDIT.md` item or Rust focus/mask parity claim.
+
+**Review.** Independent same-model senior review APPROVED with no findings. It confirmed the saved pointer is the correct target, is retained in existing develop state, and remains safe when NULL. A focused regression test is suggested if a GTK test seam becomes available.
+
+**Verification.** Mounted Docker Release/Ninja build used source read-only and the existing CMake configuration (`SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_JXL=ON`), built-in `-Werror`; it compiled `src/views/darkroom.c` at `[19/199]`. CTest passed 21/21; Docker command exited 0. `scripts/ci-local.sh` exited 0; all four gates passed, including release tests and release binary link. `git diff --check HEAD` passed before this progress append.
+
+**Test limitation.** No focused GTK test seam exists for the W-key full-preview action; CTest and the Docker build validate compilation but do not exercise this UI state restoration at runtime.
+
+**Delivery at entry time.** The saved-module mask-state target is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.

@@ -2502,7 +2502,7 @@ static float _action_process_preview(gpointer target,
                          0.0f, 0, -1.0f, -1.0f, TRUE);
         lib->full_preview = FALSE;
         dt_iop_request_focus(lib->full_preview_last_module);
-        dt_masks_set_edit_mode(dt_dev_gui_module(), lib->full_preview_masks_state);
+        dt_masks_set_edit_mode(lib->full_preview_last_module, lib->full_preview_masks_state);
         dt_dev_invalidate(darktable.develop);
         dt_control_queue_redraw_center();
         dt_control_navigation_redraw();
