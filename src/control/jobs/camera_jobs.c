@@ -74,7 +74,14 @@ static int32_t dt_camera_capture_job_run(dt_job_t *job)
   dt_camera_capture_t *params = dt_control_job_get_params(job);
   double fraction = 0;
 
-  int total = params->brackets ? params->count * params->brackets : params->count;
+  const guint64 frames_per_sequence = (guint64)params->brackets * 2 + 1;
+  if(params->count == 0
+     || (guint64)params->count > (guint64)G_MAXINT / frames_per_sequence)
+  {
+    dt_control_log(_("invalid number of camera capture frames"));
+    return 1;
+  }
+  const int total = (int)((guint64)params->count * frames_per_sequence);
   dt_control_job_set_progress_message(job,
            ngettext("capturing %d image", "capturing %d images", total), total);
 

@@ -11151,3 +11151,17 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The 2026-11-19 22:53 GPX entry says the change was not yet committed/pushed at entry time. It was delivered as `520c413e7b90d8934b1ed3c3c10e027e1dfc6675`; direct and tracking GitHub/Gitea master refs match. GitHub CMake+Rust run `44633301813` and Docker run `44633302161` succeeded; the full-C workflow was skipped as on-demand.
 
 **Delivery at entry time.** The preset-label guard is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+
+## 2026-11-20 01:00 UTC — S9: report complete tethered bracket-capture progress
+
+**Change.** Ported pinned darktable `9ec06daae5a74f5be4b0381ff470d8bc03cc9c65` in retained-C `src/control/jobs/camera_jobs.c::dt_camera_capture_job_run()`. The old total counted only `count * brackets`, while the capture loop emits `(2 * brackets + 1)` frames per sequence item. The total now matches the loop. Because `camera_jobs.h:28-29` accepts unrestricted `uint32_t` values, compute `frames_per_sequence` in `guint64`, reject zero count or a total above `G_MAXINT` before device access, then multiply and convert only after the division bound guarantees it fits. This avoids `uint64_t` intermediate overflow, invalid `int` conversion, and zero/invalid progress denominators. The active UI caller at `src/libs/camera.c:221-241,478-479` limits count to 1–9999 and brackets to 1–5 (maximum 109,989); unrelated upstream jobcode/session changes were not ported because C-41 uses them. Added a scoped PARTIAL APPLY triage row and Roadmap note; no matching `PARITY_AUDIT.md` item and no broader camera/Rust parity claim.
+
+**Review and correction.** First independent review BLOCKED the initial expression because the internal `uint32_t` job API permits values beyond the UI limits, where the multiplication or `int` total could overflow. Replaced it with widened frames-per-sequence plus division-before-multiplication validation. Fresh independent same-model review APPROVED: the loop correspondence, guard and return path are safe; zero and oversized counts are rejected before hardware access. No findings.
+
+**Verification.** Mounted Docker Release/Ninja C build with source read-only, `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_AI=ON`, built-in `-Werror`, verified ONNX Runtime 1.24.4, and mounted Cargo/Rustup exited 0. It compiled `src/control/jobs/camera_jobs.c` (`[6/197]`); CTest passed 22/22. `scripts/ci-local.sh` exited 0; all four gates passed, including release tests and the final binary link. `git diff --check HEAD` passed. No host C build or manual global `-Werror`.
+
+**Test limitation.** No camera hardware/job-progress test harness exists; CTest validates the compiled build but does not exercise tethered capture progress at runtime.
+
+**Prior delivery correction.** The 2026-11-19 23:50 preset-label entry records the guard as not yet committed/pushed at entry time. It was delivered as `1b53628c3630d0611e3fe93c27cd5316811332e2`; both direct remotes and local HEAD/origin/master/gitea/master match. Pre-push four-gate CI passed; GitHub Fork CI `44642701975` and Docker run `44642702068` succeeded; full-C `44642701965` was skipped as on-demand.
+
+**Delivery at entry time.** The bracket-progress fix is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
