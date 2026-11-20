@@ -114,6 +114,8 @@ Pinned `c853b766ec958a6a9dc0e6eee9e234ac6d0ae836` is **APPLIED, S9** in retained
 
 Pinned `7922406c626afcb636cdfb8513b0864e163cb293` is **APPLIED, S9** for retained-C `src/control/jobs/control_jobs.c::_add_history_job_data()`: release the original job-data struct and GList nodes when no job takes ownership, either on empty/no-execute early return or when the darkroom image is the only item and only the synchronous copy is queued. `_dup_images_job_data_t()` copies list nodes but shares style-string pointers; original style nodes use `g_list_free()` when a synchronous job owns those strings. If synchronous/asynchronous job construction fails, clean the unowned struct/list nodes and free style strings only when no successfully created job owns them. Empty history-paste selections reach this path from active copy-history/thumbnail actions. No focused test seam for the static helper/job queue or Rust control/UI parity claim.
 
+Pinned `7a8c753138173cf32814b67e38dfeaf0f33943b4` is **APPLIED, S9** for retained GTK3 `src/dtgtk/thumbnail.c::_event_image_draw()`: a `DT_VIEW_SURFACE_SMALLER` result with `thumb->img_surf` available is a usable fallback, so keep the 250 ms redraw retry but clear the stale busy overlay. Non-OK results without a usable surface remain busy. `DT_VIEW_SURFACE_SMALLER` is returned when the requested mipmap differs from the returned surface; no focused GTK UI test seam exists. No Rust GTK4 thumbnail parity claim.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.

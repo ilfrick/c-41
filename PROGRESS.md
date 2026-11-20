@@ -11179,3 +11179,17 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 **Prior delivery correction.** The 2026-11-20 01:00 UTC bracket-progress entry records the change as not yet committed/pushed at entry time. It was delivered as `dbcb496330251d16e0a4afac9193113c3d0129bd`; direct GitHub/Gitea master refs match. GitHub Fork CI `44652942110` and Docker run `44652942308` succeeded; full-C `44652942127` was skipped as on-demand.
 
 **Delivery at entry time.** The history-job ownership fix is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+
+## 2026-11-20 04:21 UTC — S9: hide busy overlay for usable fallback thumbnails
+
+**Change.** Ported pinned darktable `7a8c753138173cf32814b67e38dfeaf0f33943b4` in retained GTK3 `src/dtgtk/thumbnail.c::_event_image_draw()`. On a non-OK surface result, C-41 now sets `thumb->busy = (res != DT_VIEW_SURFACE_SMALLER || !thumb->img_surf);`: a smaller usable mipmap remains visible without the stale “working…” overlay, while the retry is still scheduled; other errors or a missing surface remain busy. The displayed result is assigned at `src/dtgtk/thumbnail.c:802-808`; the retry is reachable through `_thumb_expose_again()` and `gtk_widget_queue_draw()` at `:315-324`. `src/views/view.c:1023-1029` returns `DT_VIEW_SURFACE_SMALLER` for a mip-size mismatch; `src/CMakeLists.txt:149` compiles the retained GTK3 file and `_event_image_draw` is connected at `src/dtgtk/thumbnail.c:1511`. Added a scoped S9 row and Roadmap note. No matching `PARITY_AUDIT.md` item or Rust GTK4 thumbnail parity claim.
+
+**Review.** Independent same-model senior review APPROVED with no findings. It traced fallback surface assignment/ref-count checks, KO behavior, retry scheduling, later OK-state reset, and the pinned delta. Suggestion only: add a UI regression test if a suitable test seam appears.
+
+**Verification.** Mounted Docker Release/Ninja C build with source read-only, `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_AI=OFF`, built-in `-Werror`; `/src` marked safe and Cargo/Rustup mounted under `/root`. Build exited 0 after 196 steps; it compiled `src/dtgtk/thumbnail.c` at `[7/196]`, linked the C application, and CTest passed 21/21. `scripts/ci-local.sh` exited 0; all four gates passed, including release tests (599 passed, 0 failed) and release binary link. `git diff --check HEAD` passed. No manual global `-Werror`.
+
+**Test limitation.** No direct GTK thumbnail UI test seam was identified; CTest validates the C build but does not exercise the fallback rendering/retry state at runtime.
+
+**Prior delivery correction.** The 2026-11-20 03:19 UTC history-job entry records the fix as not yet committed/pushed at entry time. It was delivered as `0424ffedcba69154ba36c7098963b2f4471be095`; direct GitHub/Gitea master refs match. GitHub Fork CI `44668056179` and Docker `44668056073` succeeded; Darkroom CI `44668056039` was skipped as on-demand.
+
+**Delivery at entry time.** The thumbnail fallback fix is reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.

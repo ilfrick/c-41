@@ -850,10 +850,11 @@ static gboolean _event_image_draw(GtkWidget *widget,
         _thumb_resize_overlays(thumb);
     }
 
-    // if we don't have the right size of the image now, we reload it again
+    // A smaller mipmap is usable while the requested surface loads. Keep
+    // retrying without covering an available fallback with the busy overlay.
     if(res != DT_VIEW_SURFACE_OK)
     {
-      thumb->busy = TRUE;
+      thumb->busy = (res != DT_VIEW_SURFACE_SMALLER || !thumb->img_surf);
       if(!thumb->expose_again_timeout_id)
         thumb->expose_again_timeout_id = g_timeout_add(250, _thumb_expose_again, thumb);
     }
