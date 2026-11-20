@@ -11204,4 +11204,16 @@ After formatting only the new Rust lines and updating ROADMAP/PROGRESS, ran `scr
 
 **Test limitation.** CTest validates the HEIF-enabled C build but does not exercise a NULL XMP return or export behavior; no focused HEIF export test seam was found.
 
-**Delivery at entry time.** The HEIF XMP guard is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.
+**Prior delivery correction.** The 2026-11-20 06:20 UTC HEIF XMP entry records the guard as not yet committed/pushed at entry time. It was delivered as `eac05f5b2cbc9ef75b805479afe973a57dbb2853`; direct GitHub/Gitea master refs match. Pre-push all four gates passed; GitHub Fork CI `44688068717` and Docker `44688068735` succeeded; Darkroom CI `44688068804` was skipped on demand.
+
+## 2026-11-20 07:11 UTC — S9: handle HEIF plane-allocation failure
+
+**Change.** Ported pinned darktable `aede6e791b0e213ed22c69e1fd93c57d1e0cd1b3` in retained optional C `src/imageio/format/heif.c::write_image()`. C-41 previously ignored the `heif_image_add_plane()` result, then attempted to access/process its plane even if allocation failed. It now checks `err.code`, logs the failure, releases the still-locally-owned `image`, and returns before plane access. At this point no context or encoder has been created, so no other resource needs cleanup. Added a scoped S9 triage row and Roadmap note. No matching `PARITY_AUDIT.md` item, no focused libheif allocation-failure test seam, and no Rust HEIF exporter parity claim.
+
+**Review.** Independent same-model senior review APPROVED with no findings. It confirmed the image is locally owned after successful creation, the error branch is before plane access and before context/encoder creation, and the documentation is correctly scoped.
+
+**Verification.** Mounted Docker Release/Ninja C build compiled `src/imageio/format/heif.c` at `[7/8]` and linked the HEIF plugin. Source was read-only; CMake used `SOURCE_PACKAGE=OFF`, `BUILD_TESTING=ON`, `USE_OPENCL=OFF`, `USE_HEIF=ON`, `USE_AI=OFF`, and built-in `-Werror` (no manual global `-Werror`). CTest passed 21/21; Docker command exited 0. `scripts/ci-local.sh` exited 0 and reported all four gates passed, including release tests and release binary link. `git diff --check HEAD` passed.
+
+**Test limitation.** The HEIF-enabled build and CTests do not inject a `heif_image_add_plane()` allocation failure; no focused libheif failure-test seam was identified.
+
+**Delivery at entry time.** The HEIF plane-allocation guard is independently reviewed and locally validated but not yet committed/pushed. S9 remains selective and incomplete.

@@ -118,6 +118,8 @@ Pinned `7a8c753138173cf32814b67e38dfeaf0f33943b4` is **APPLIED, S9** for retaine
 
 Pinned `bf541457f5abbe74dbbd6d907f3dc3e227cb8102` and follow-up `227b4336e8c7200af374d377f3c3ab99373b817a` are **APPLIED, S9** for retained optional C `src/imageio/format/heif.c::write_image()`: check `dt_exif_xmp_read_string()` before `strlen()` because it can return NULL on an Exiv2 exception; preserve the full byte length (the initial upstream guard's precedence error was corrected by `227b`), and release the owned string even when empty. The `USE_HEIF` path is built with libheif in Docker; no focused XMP-export error test seam or Rust HEIF exporter parity claim.
 
+Pinned `aede6e791b0e213ed22c69e1fd93c57d1e0cd1b3` is **APPLIED, S9** for retained optional C `src/imageio/format/heif.c::write_image()`: check `heif_image_add_plane()` and release the locally owned image before returning failure. This occurs before context/encoder creation; no focused libheif allocation-failure test seam or Rust HEIF exporter parity claim.
+
 ## 6. Filone D — Agent-native editing, Phase 9
 
 MCP locale su **stdio** è il primo adattatore; il contratto stabile è una API Rust versionata e indipendente dal protocollo. Niente listener di rete, shell/eval, accesso arbitrario al filesystem o manipolazione GTK in v1.
